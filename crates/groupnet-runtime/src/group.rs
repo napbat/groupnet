@@ -1,7 +1,9 @@
-use groupnet_core::{Command, GroupId, NodeId};
+use groupnet_core::{Command, GroupId, NodeId, Status};
 use tokio::sync::{mpsc, watch};
 
-use crate::driver::{Event, MembersSnapshot, MetaSnapshot, NodeStatesSnapshot};
+use crate::driver::{
+    Event, GroupViews, MembersSnapshot, MetaSnapshot, NodeStatesSnapshot, StatusesSnapshot,
+};
 
 /// A transactional batch of shard-local operations, built inside
 /// [`Group::sync`]. Operations are collected and handed to the group actor to
@@ -34,6 +36,7 @@ pub struct Group {
     coord_rx: watch::Receiver<Option<NodeId>>,
     meta_rx: watch::Receiver<MetaSnapshot>,
     members_rx: watch::Receiver<MembersSnapshot>,
+    statuses_rx: watch::Receiver<StatusesSnapshot>,
     node_states_rx: watch::Receiver<NodeStatesSnapshot>,
 }
 
@@ -42,19 +45,17 @@ impl Group {
         id: GroupId,
         local: NodeId,
         tx: mpsc::UnboundedSender<Event>,
-        coord_rx: watch::Receiver<Option<NodeId>>,
-        meta_rx: watch::Receiver<MetaSnapshot>,
-        members_rx: watch::Receiver<MembersSnapshot>,
-        node_states_rx: watch::Receiver<NodeStatesSnapshot>,
+        views: GroupViews,
     ) -> Self {
         Self {
             id,
             local,
             tx,
-            coord_rx,
-            meta_rx,
-            members_rx,
-            node_states_rx,
+            coord_rx: views.coordinator,
+            meta_rx: views.metadata,
+            members_rx: views.members,
+            statuses_rx: views.statuses,
+            node_states_rx: views.node_states,
         }
     }
 
@@ -82,6 +83,26 @@ impl Group {
     #[must_use]
     pub fn members(&self) -> Vec<NodeId> {
         self.members_rx.borrow().as_ref().clone()
+    }
+
+    /// The status ([`Status::Alive`]/`Suspect`/`Dead`) this node currently perceives
+    /// for `node`, or `None` if it is unknown. Unlike [`members`](Self::members)
+    /// (the not-`Dead` set), this exposes the Alive/Suspect distinction a router
+    /// needs to route *around* a suspected peer before it is declared dead.
+    #[must_use]
+    pub fn member_status(&self, node: &NodeId) -> Option<Status> {
+        self.statuses_rx.borrow().get(node).copied()
+    }
+
+    /// A snapshot of every known member and its status, in id order (includes
+    /// `Suspect` members and not-yet-reaped `Dead` tombstones).
+    #[must_use]
+    pub fn statuses(&self) -> Vec<(NodeId, Status)> {
+        self.statuses_rx
+            .borrow()
+            .iter()
+            .map(|(n, s)| (n.clone(), *s))
+            .collect()
     }
 
     /// Reads a metadata value as this node currently sees it. Values propagate
@@ -123,6 +144,13 @@ impl Group {
     /// Leaves the group (best-effort).
     pub fn leave(&self) {
         let _ = self.tx.send(Event::Local(Command::Leave));
+    }
+
+    /// Introduce a peer learned out-of-band (e.g. from an external roster / service
+    /// discovery) so this node starts gossiping to it without waiting to be contacted
+    /// first. Idempotent; complements build-time [`seed`](crate::NodeBuilder::seed).
+    pub fn add_peer(&self, node: NodeId) {
+        let _ = self.tx.send(Event::Local(Command::AddPeer(node)));
     }
 
     /// The command channel into this group's actor (for internal wiring, e.g.

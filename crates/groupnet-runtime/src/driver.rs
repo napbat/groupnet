@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Command, Effect, GroupEngine, GroupId, NodeId, Time};
+use groupnet_core::{Command, Effect, GroupEngine, GroupId, NodeId, Status, Time};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
@@ -21,6 +21,11 @@ pub(crate) type MetaSnapshot = Arc<BTreeMap<String, String>>;
 
 /// A published, read-only snapshot of a group's live members (id order).
 pub(crate) type MembersSnapshot = Arc<Vec<NodeId>>;
+
+/// A published, read-only snapshot of every known member's status (Alive/Suspect,
+/// plus not-yet-reaped Dead tombstones), so readers can route *around* a suspected
+/// peer that [`MembersSnapshot`] (the not-`Dead` set) still lists.
+pub(crate) type StatusesSnapshot = Arc<BTreeMap<NodeId, Status>>;
 
 /// A published, read-only snapshot of every node's app-defined state.
 pub(crate) type NodeStatesSnapshot = Arc<BTreeMap<NodeId, Vec<u8>>>;
@@ -37,7 +42,18 @@ pub(crate) struct Publishers {
     pub coordinator: watch::Sender<Option<NodeId>>,
     pub metadata: watch::Sender<MetaSnapshot>,
     pub members: watch::Sender<MembersSnapshot>,
+    pub statuses: watch::Sender<StatusesSnapshot>,
     pub node_states: watch::Sender<NodeStatesSnapshot>,
+}
+
+/// The `watch` receivers a [`Group`](crate::Group) reads its published state
+/// through — the read-side mirror of [`Publishers`].
+pub(crate) struct GroupViews {
+    pub coordinator: watch::Receiver<Option<NodeId>>,
+    pub metadata: watch::Receiver<MetaSnapshot>,
+    pub members: watch::Receiver<MembersSnapshot>,
+    pub statuses: watch::Receiver<StatusesSnapshot>,
+    pub node_states: watch::Receiver<NodeStatesSnapshot>,
 }
 
 /// Maps wall-clock elapsed time onto the engine's logical [`Time`]. This is the
@@ -103,6 +119,11 @@ pub(crate) async fn group_task<T: Transport>(
         if members_dirty {
             let snapshot: Vec<NodeId> = engine.members().cloned().collect();
             let _ = publishers.members.send(Arc::new(snapshot));
+            let statuses: BTreeMap<NodeId, Status> = engine
+                .member_statuses()
+                .map(|(n, s)| (n.clone(), s))
+                .collect();
+            let _ = publishers.statuses.send(Arc::new(statuses));
             announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
         }
         if state_dirty {

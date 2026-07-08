@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Config, GroupEngine, GroupId, NodeId};
+use groupnet_core::{Config, GroupEngine, GroupId, NodeId, Status};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
-use crate::driver::{Event, Publishers, group_task};
+use crate::driver::{Event, GroupViews, Publishers, group_task};
 use crate::group::Group;
 use crate::routing::Routing;
 
@@ -109,6 +109,11 @@ impl<T: Transport> Node<T> {
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let initial_members: Vec<NodeId> = engine.members().cloned().collect();
         let (members_tx, members_rx) = watch::channel(Arc::new(initial_members));
+        let initial_statuses: BTreeMap<NodeId, Status> = engine
+            .member_statuses()
+            .map(|(n, s)| (n.clone(), s))
+            .collect();
+        let (statuses_tx, statuses_rx) = watch::channel(Arc::new(initial_statuses));
         let (node_states_tx, node_states_rx) = watch::channel(Arc::new(BTreeMap::new()));
 
         self.inner
@@ -137,6 +142,7 @@ impl<T: Transport> Node<T> {
                 coordinator: coord_tx,
                 metadata: meta_tx,
                 members: members_tx,
+                statuses: statuses_tx,
                 node_states: node_states_tx,
             },
             routing,
@@ -148,10 +154,13 @@ impl<T: Transport> Node<T> {
             group,
             self.inner.id.clone(),
             tx,
-            coord_rx,
-            meta_rx,
-            members_rx,
-            node_states_rx,
+            GroupViews {
+                coordinator: coord_rx,
+                metadata: meta_rx,
+                members: members_rx,
+                statuses: statuses_rx,
+                node_states: node_states_rx,
+            },
         )
     }
 }

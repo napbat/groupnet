@@ -31,6 +31,12 @@ pub enum Command {
     SetLocalState(Vec<u8>),
     /// This node voluntarily leaves the group.
     Leave,
+    /// Introduce a peer learned out-of-band (e.g. from an external roster / service
+    /// discovery) so the failure detector starts probing it without waiting to be
+    /// contacted first. Idempotent; complements build-time [`seed`]ing.
+    ///
+    /// [`seed`]: crate::GroupEngine
+    AddPeer(NodeId),
 }
 
 /// An intent the engine emits in response to an event. The driver carries it
@@ -205,6 +211,14 @@ impl GroupEngine {
         self.members.get(node).map(|m| m.status)
     }
 
+    /// Iterates every known member with its status, in id order — including
+    /// `Suspect` members and `Dead` tombstones that have not yet been reaped. A
+    /// consumer that needs the Alive/Suspect/Dead distinction (not just the
+    /// not-`Dead` set [`members`](Self::members) yields) reads this.
+    pub fn member_statuses(&self) -> impl Iterator<Item = (&NodeId, Status)> {
+        self.members.iter().map(|(node, m)| (node, m.status))
+    }
+
     /// The app-defined per-node state a node last advertised, if known.
     #[must_use]
     pub fn node_state(&self, node: &NodeId) -> Option<&[u8]> {
@@ -287,6 +301,19 @@ impl GroupEngine {
                 if let Some(m) = self.members.get_mut(&self.local) {
                     m.status = Status::Dead;
                 }
+                let mut effects = vec![Effect::MembershipChanged];
+                effects.extend(self.recompute_coordinator());
+                effects
+            }
+            Command::AddPeer(node) => {
+                // Learn a peer out-of-band so we start probing it even before any
+                // gossip has been exchanged. Idempotent: a known node (or self) is
+                // left untouched; a new one is inserted Alive at incarnation 0, which
+                // any real advertised state supersedes.
+                if node == self.local || self.members.contains_key(&node) {
+                    return Vec::new();
+                }
+                self.members.insert(node, Member::new(0, Status::Alive));
                 let mut effects = vec![Effect::MembershipChanged];
                 effects.extend(self.recompute_coordinator());
                 effects

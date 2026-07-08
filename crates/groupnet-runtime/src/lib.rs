@@ -44,5 +44,6 @@ mod node;
 mod routing;
 
 pub use group::{Group, SyncCtx};
+pub use groupnet_core::Status;
 pub use node::{Node, NodeBuilder};
 pub use routing::Routing;
