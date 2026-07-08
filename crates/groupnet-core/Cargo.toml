@@ -1,0 +1,15 @@
+[package]
+name = "groupnet-core"
+description = "Sans-IO deterministic coordination state machine for Groupnet. No I/O, no clock, no async, no dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Intentionally empty. The core is a pure state machine; it must stay dep-free
+# so it can be simulated, fuzzed, and (later) compiled no_std.
+[dependencies]
+
+[lints]
+workspace = true

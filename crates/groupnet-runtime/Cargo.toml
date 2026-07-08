@@ -1,0 +1,18 @@
+[package]
+name = "groupnet-runtime"
+description = "Async, group-per-task driver for Groupnet: turns the sans-IO core into an ergonomic Node/Group API over a bound Transport."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The only layer that needs an async runtime, so it's the only crate that pulls
+# in tokio — and only a narrow slice of it.
+[dependencies]
+groupnet-core = { workspace = true }
+groupnet-transport = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

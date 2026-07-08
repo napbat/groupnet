@@ -1,0 +1,16 @@
+[package]
+name = "groupnet-sim"
+description = "Deterministic, single-threaded simulation driver for Groupnet — a virtual clock and in-memory network for reproducible tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Drives the sans-IO core directly. No async runtime, no transport, no external
+# dependencies — determinism by construction.
+[dependencies]
+groupnet-core = { workspace = true }
+
+[lints]
+workspace = true

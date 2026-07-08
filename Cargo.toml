@@ -1,6 +1,37 @@
-[package]
-name = "groupnet"
+# Virtual workspace root. No package here — every crate lives under crates/.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/napbat/groupnet"
 
-[dependencies]
+# Internal crates are referenced by path so the workspace builds standalone,
+# and by version so it can be published to a registry unchanged.
+[workspace.dependencies]
+groupnet-core = { path = "crates/groupnet-core", version = "0.1.0" }
+groupnet-transport = { path = "crates/groupnet-transport", version = "0.1.0" }
+groupnet-runtime = { path = "crates/groupnet-runtime", version = "0.1.0" }
+groupnet-sim = { path = "crates/groupnet-sim", version = "0.1.0" }
+
+# The single external dependency in the whole tree, and only the async runtime
+# layer pulls it in. Feature set is deliberately narrow.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+] }
+
+# Lints applied to every crate. Keep the tree thin, safe, and honest.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,25 @@
+[package]
+name = "groupnet"
+description = "A deterministic, leaderless coordination fabric for sharded distributed systems — the umbrella crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# `runtime` (the async Node/Group API + tokio) is on by default. `sim` (the
+# deterministic simulator) is opt-in. Depend on this crate with
+# `default-features = false` for just the sans-IO core + transport trait.
+default = ["runtime"]
+runtime = ["dep:groupnet-runtime"]
+sim = ["dep:groupnet-sim"]
+
+[dependencies]
+groupnet-core = { workspace = true }
+groupnet-transport = { workspace = true }
+groupnet-runtime = { workspace = true, optional = true }
+groupnet-sim = { workspace = true, optional = true }
+
+[lints]
+workspace = true

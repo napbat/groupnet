@@ -1,0 +1,14 @@
+[package]
+name = "groupnet-transport"
+description = "The pluggable Transport trait for Groupnet: bind TCP, UDP, IPC, or shared memory."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+groupnet-core = { workspace = true }
+
+[lints]
+workspace = true
