@@ -22,6 +22,9 @@ pub(crate) type MetaSnapshot = Arc<BTreeMap<String, String>>;
 /// A published, read-only snapshot of a group's live members (id order).
 pub(crate) type MembersSnapshot = Arc<Vec<NodeId>>;
 
+/// A published, read-only snapshot of every node's app-defined state.
+pub(crate) type NodeStatesSnapshot = Arc<BTreeMap<NodeId, Vec<u8>>>;
+
 /// An event delivered to a group actor: either a decoded network frame or a
 /// local command from the [`Group`](crate::Group) handle.
 pub(crate) enum Event {
@@ -34,6 +37,7 @@ pub(crate) struct Publishers {
     pub coordinator: watch::Sender<Option<NodeId>>,
     pub metadata: watch::Sender<MetaSnapshot>,
     pub members: watch::Sender<MembersSnapshot>,
+    pub node_states: watch::Sender<NodeStatesSnapshot>,
 }
 
 /// Maps wall-clock elapsed time onto the engine's logical [`Time`]. This is the
@@ -84,6 +88,9 @@ pub(crate) async fn group_task<T: Transport>(
         let members_dirty = effects
             .iter()
             .any(|e| matches!(e, Effect::MembershipChanged));
+        let state_dirty = effects
+            .iter()
+            .any(|e| matches!(e, Effect::NodeStateChanged { .. }));
         dispatch(&transport, &publishers.coordinator, effects).await;
         // Republish snapshots; readers borrow them lock-free.
         if meta_dirty {
@@ -97,6 +104,13 @@ pub(crate) async fn group_task<T: Transport>(
             let snapshot: Vec<NodeId> = engine.members().cloned().collect();
             let _ = publishers.members.send(Arc::new(snapshot));
             announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
+        }
+        if state_dirty {
+            let snapshot: BTreeMap<NodeId, Vec<u8>> = engine
+                .node_states_iter()
+                .map(|(n, s)| (n.clone(), s.to_vec()))
+                .collect();
+            let _ = publishers.node_states.send(Arc::new(snapshot));
         }
     }
 }
@@ -145,9 +159,11 @@ async fn dispatch<T: Transport>(
                 let _ = coord_tx.send(coordinator);
             }
             // ArmTimer is advisory — this driver uses a fixed-interval ticker.
-            // Membership/metadata change signals aren't surfaced yet.
+            // Membership/metadata/state change signals are surfaced by
+            // republishing snapshots in `group_task`, not here.
             Effect::ArmTimer { .. }
             | Effect::MembershipChanged
+            | Effect::NodeStateChanged { .. }
             | Effect::MetadataChanged { .. } => {}
         }
     }

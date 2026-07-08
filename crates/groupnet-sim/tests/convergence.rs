@@ -252,3 +252,53 @@ fn voluntary_leave_removes_node_and_sticks() {
         assert_eq!(sim.member_count(id), 2);
     }
 }
+
+#[test]
+fn per_node_state_converges_cluster_wide() {
+    let group = GroupId::new("shard-42");
+    let ids = node_ids(&["node-a", "node-b", "node-c"]);
+
+    let mut sim = build(&group, &ids, 10, 0);
+    sim.run_until(Time(1_000));
+
+    // Each node advertises its own app-defined state (e.g. its capacity weight).
+    for (i, id) in ids.iter().enumerate() {
+        sim.command(
+            id,
+            Command::SetLocalState(format!("weight={i}").into_bytes()),
+        );
+    }
+    sim.run_until(Time(5_000));
+
+    // Every node converges on every node's self-authored state.
+    for observer in &ids {
+        for (i, node) in ids.iter().enumerate() {
+            assert_eq!(
+                sim.state_of(observer, node).as_deref(),
+                Some(format!("weight={i}").as_bytes()),
+                "{observer} did not converge on {node}'s state"
+            );
+        }
+    }
+}
+
+#[test]
+fn per_node_state_update_supersedes_cluster_wide() {
+    let group = GroupId::new("shard-42");
+    let ids = node_ids(&["node-a", "node-b", "node-c"]);
+
+    let mut sim = build(&group, &ids, 10, 0);
+    sim.run_until(Time(1_000));
+
+    sim.command(&ids[0], Command::SetLocalState(b"ready=false".to_vec()));
+    sim.run_until(Time(2_000));
+    sim.command(&ids[0], Command::SetLocalState(b"ready=true".to_vec()));
+    sim.run_until(Time(5_000));
+
+    for observer in &ids {
+        assert_eq!(
+            sim.state_of(observer, &ids[0]).as_deref(),
+            Some(&b"ready=true"[..])
+        );
+    }
+}

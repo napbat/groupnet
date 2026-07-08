@@ -37,8 +37,10 @@ pub enum Kind {
     IndirectAck,
 }
 
-/// One member's status as the sender sees it, for last-writer-wins merge by
-/// `(incarnation, status)` (see the engine's SWIM merge rules).
+/// One member's status and app-defined state as the sender sees it. Liveness
+/// (`incarnation`/`status`) and app state (`state_version`/`state`) are merged
+/// independently — a node authors its own state, versioned separately from its
+/// SWIM incarnation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberDelta {
     /// The node this entry describes.
@@ -47,6 +49,12 @@ pub struct MemberDelta {
     pub incarnation: u64,
     /// Status code (engine-defined; `0 = alive, 1 = suspect, 2 = dead`).
     pub status: u8,
+    /// Monotonic version of `state`, bumped each time the node updates it.
+    pub state_version: u64,
+    /// Opaque app-defined per-node state (e.g. capacity weight, readiness,
+    /// replication progress). Groupnet disseminates and version-orders it but
+    /// never interprets it.
+    pub state: Vec<u8>,
 }
 
 /// One metadata key's value plus its last-writer-wins timestamp.
@@ -126,6 +134,8 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
         put_str(&mut out, m.node.as_str());
         put_u64(&mut out, m.incarnation);
         out.push(m.status);
+        put_u64(&mut out, m.state_version);
+        put_bytes(&mut out, &m.state);
     }
 
     put_u32(&mut out, frame.metadata.len() as u32);
@@ -159,10 +169,14 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
         let node = NodeId::new(get_str(&mut cur)?);
         let incarnation = get_u64(&mut cur)?;
         let status = take_u8(&mut cur)?;
+        let state_version = get_u64(&mut cur)?;
+        let state = get_bytes(&mut cur)?;
         members.push(MemberDelta {
             node,
             incarnation,
             status,
+            state_version,
+            state,
         });
     }
 
@@ -210,8 +224,22 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
-    put_u32(out, s.len() as u32);
-    out.extend_from_slice(s.as_bytes());
+    put_bytes(out, s.as_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
+}
+
+fn get_bytes(cur: &mut &[u8]) -> Option<Vec<u8>> {
+    let len = get_u32(cur)? as usize;
+    if cur.len() < len {
+        return None;
+    }
+    let (head, rest) = cur.split_at(len);
+    *cur = rest;
+    Some(head.to_vec())
 }
 
 fn take_u8(cur: &mut &[u8]) -> Option<u8> {
@@ -262,11 +290,15 @@ mod tests {
                     node: NodeId::new("node-a"),
                     incarnation: 2,
                     status: 0,
+                    state_version: 7,
+                    state: vec![1, 2, 3],
                 },
                 MemberDelta {
                     node: NodeId::new("node-b"),
                     incarnation: 5,
                     status: 1,
+                    state_version: 0,
+                    state: vec![],
                 },
             ],
             metadata: vec![MetaDelta {

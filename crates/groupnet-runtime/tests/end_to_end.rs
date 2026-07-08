@@ -65,6 +65,24 @@ async fn three_nodes_converge_over_mem_transport() {
     }
     assert!(propagated, "metadata did not propagate to all nodes");
 
+    // Each node advertises app-defined per-node state; it must reach every node.
+    for (i, g) in groups.iter().enumerate() {
+        g.set_state(format!("weight={i}"));
+    }
+    let mut states_converged = false;
+    for _ in 0..100 {
+        if groups.iter().all(|g| {
+            ids.iter().enumerate().all(|(i, id)| {
+                g.node_state(id).as_deref() == Some(format!("weight={i}").as_bytes())
+            })
+        }) {
+            states_converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(states_converged, "per-node state did not converge");
+
     // Membership converged to all three over the live read path.
     assert!(groups.iter().all(|g| g.members().len() == 3));
 

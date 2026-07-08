@@ -1,7 +1,7 @@
 use groupnet_core::{Command, GroupId, NodeId};
 use tokio::sync::{mpsc, watch};
 
-use crate::driver::{Event, MembersSnapshot, MetaSnapshot};
+use crate::driver::{Event, MembersSnapshot, MetaSnapshot, NodeStatesSnapshot};
 
 /// A transactional batch of shard-local operations, built inside
 /// [`Group::sync`]. Operations are collected and handed to the group actor to
@@ -34,6 +34,7 @@ pub struct Group {
     coord_rx: watch::Receiver<Option<NodeId>>,
     meta_rx: watch::Receiver<MetaSnapshot>,
     members_rx: watch::Receiver<MembersSnapshot>,
+    node_states_rx: watch::Receiver<NodeStatesSnapshot>,
 }
 
 impl Group {
@@ -44,6 +45,7 @@ impl Group {
         coord_rx: watch::Receiver<Option<NodeId>>,
         meta_rx: watch::Receiver<MetaSnapshot>,
         members_rx: watch::Receiver<MembersSnapshot>,
+        node_states_rx: watch::Receiver<NodeStatesSnapshot>,
     ) -> Self {
         Self {
             id,
@@ -52,6 +54,7 @@ impl Group {
             coord_rx,
             meta_rx,
             members_rx,
+            node_states_rx,
         }
     }
 
@@ -87,6 +90,21 @@ impl Group {
     #[must_use]
     pub fn metadata(&self, key: &str) -> Option<String> {
         self.meta_rx.borrow().get(key).cloned()
+    }
+
+    /// Replaces this node's app-defined per-node state (capacity weight,
+    /// readiness, replication progress — whatever the application encodes). It
+    /// is gossiped to every peer and readable there via [`node_state`](Self::node_state).
+    pub fn set_state(&self, state: impl Into<Vec<u8>>) {
+        let _ = self
+            .tx
+            .send(Event::Local(Command::SetLocalState(state.into())));
+    }
+
+    /// Reads the app-defined state `node` last advertised, as this node sees it.
+    #[must_use]
+    pub fn node_state(&self, node: &NodeId) -> Option<Vec<u8>> {
+        self.node_states_rx.borrow().get(node).cloned()
     }
 
     /// Runs a batch of shard-local operations against the group.

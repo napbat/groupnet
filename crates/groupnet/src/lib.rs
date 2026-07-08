@@ -5,7 +5,7 @@
 //!
 //! | Layer | Crate | Role |
 //! |-------|-------|------|
-//! | core | [`groupnet_core`] | sans-IO state machine — pure, deterministic, dep-free |
+//! | core | [`groupnet_core`] | sans-IO state machine + [`placement`] (weighted HA-hash) — pure, deterministic, dep-free |
 //! | control transport | [`groupnet_transport`] | the datagram [`Transport`] trait you bind |
 //! | control bindings | `groupnet-transport-{mem,udp}` | re-exported as [`mem`] / [`udp`] |
 //! | data plane | [`groupnet_transport`]`::bulk` | stream `BulkTransport` + framing — re-exported as [`bulk`] *(feature `bulk`)* |
@@ -38,9 +38,11 @@
 //! For just the engine and trait (no async runtime), depend with
 //! `default-features = false`.
 
-// Core types and the wire protocol are always available.
+// Core types, the placement primitive, and the wire protocol are always
+// available.
 pub use groupnet_core::{
-    Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, VersionedValue, wire,
+    Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, VersionedValue, placement,
+    wire,
 };
 pub use groupnet_transport::{Inbound, Transport};
 

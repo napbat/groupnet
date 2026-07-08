@@ -26,10 +26,10 @@
 //! [`groupnet-sim`]: https://docs.rs/groupnet-sim
 //! [`groupnet-runtime`]: https://docs.rs/groupnet-runtime
 
-mod coord;
 mod engine;
 mod id;
 
+pub mod placement;
 pub mod wire;
 
 pub use engine::{Command, Config, Effect, GroupEngine, Status, VersionedValue};

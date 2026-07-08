@@ -109,6 +109,7 @@ impl<T: Transport> Node<T> {
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let initial_members: Vec<NodeId> = engine.members().cloned().collect();
         let (members_tx, members_rx) = watch::channel(Arc::new(initial_members));
+        let (node_states_tx, node_states_rx) = watch::channel(Arc::new(BTreeMap::new()));
 
         self.inner
             .routes
@@ -134,6 +135,7 @@ impl<T: Transport> Node<T> {
                 coordinator: coord_tx,
                 metadata: meta_tx,
                 members: members_tx,
+                node_states: node_states_tx,
             },
             routing,
             self.inner.start,
@@ -147,6 +149,7 @@ impl<T: Transport> Node<T> {
             coord_rx,
             meta_rx,
             members_rx,
+            node_states_rx,
         )
     }
 }

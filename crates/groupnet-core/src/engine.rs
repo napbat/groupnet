@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{GroupId, NodeId};
-use crate::{Time, coord, wire};
+use crate::{Time, placement, wire};
 
 /// Tunables for a single group's gossip and failure detection.
 #[derive(Clone, Debug)]
@@ -72,6 +72,11 @@ struct Member {
     /// When *this* node first observed the member as `Dead` (for gossip TTL and
     /// reaping). Only meaningful while `status == Dead`.
     dead_since: Time,
+    /// Monotonic version of `state`, authored by the member itself.
+    state_version: u64,
+    /// Opaque app-defined per-node state; merged by `state_version`,
+    /// independently of liveness.
+    state: Vec<u8>,
 }
 
 /// A local instruction to the engine, applied via [`GroupEngine::apply`].
@@ -84,6 +89,9 @@ pub enum Command {
         /// New value.
         value: String,
     },
+    /// Replace this node's app-defined per-node state (weight, readiness,
+    /// progress — whatever the application encodes). Disseminated to peers.
+    SetLocalState(Vec<u8>),
     /// This node voluntarily leaves the group.
     Leave,
 }
@@ -113,6 +121,12 @@ pub enum Effect {
     },
     /// The membership set or a member's status changed.
     MembershipChanged,
+    /// A node's app-defined per-node state changed (local write or merged
+    /// delta).
+    NodeStateChanged {
+        /// The node whose state changed.
+        node: NodeId,
+    },
     /// A metadata key took a new value (from a local write or a merged delta).
     MetadataChanged {
         /// The key that changed.
@@ -256,6 +270,28 @@ impl GroupEngine {
         self.members.get(node).map(|m| m.status)
     }
 
+    /// The app-defined per-node state a node last advertised, if known.
+    #[must_use]
+    pub fn node_state(&self, node: &NodeId) -> Option<&[u8]> {
+        self.members.get(node).map(|m| m.state.as_slice())
+    }
+
+    /// This node's own current app-defined state.
+    #[must_use]
+    pub fn local_state(&self) -> &[u8] {
+        self.members
+            .get(&self.local)
+            .map_or(&[], |m| m.state.as_slice())
+    }
+
+    /// Iterates every node that has advertised non-empty app state, in id order.
+    pub fn node_states_iter(&self) -> impl Iterator<Item = (&NodeId, &[u8])> {
+        self.members
+            .iter()
+            .filter(|(_, m)| !m.state.is_empty())
+            .map(|(node, m)| (node, m.state.as_slice()))
+    }
+
     /// Reads a shard-local metadata value.
     #[must_use]
     pub fn metadata(&self, key: &str) -> Option<&str> {
@@ -298,6 +334,17 @@ impl GroupEngine {
                     },
                 );
                 vec![Effect::MetadataChanged { key, value }]
+            }
+            Command::SetLocalState(state) => {
+                // A node is the sole author of its own state; bump the version so
+                // the update supersedes prior copies at every peer.
+                if let Some(m) = self.members.get_mut(&self.local) {
+                    m.state_version += 1;
+                    m.state = state;
+                }
+                vec![Effect::NodeStateChanged {
+                    node: self.local.clone(),
+                }]
             }
             Command::Leave => {
                 // Declare ourselves Dead at our current incarnation and stop
@@ -529,10 +576,13 @@ impl GroupEngine {
 
     // ---- merge -----------------------------------------------------------
 
-    /// Merges incoming member deltas by SWIM precedence, refuting any suspicion
-    /// about ourselves.
+    /// Merges incoming member deltas. Liveness (`incarnation`/`status`, by SWIM
+    /// precedence) and app state (`state_version`, by last-writer-wins) are
+    /// merged *independently* — a status update never clobbers state, and vice
+    /// versa. Also refutes any suspicion about ourselves.
     fn merge_members(&mut self, deltas: Vec<wire::MemberDelta>, now: Time) -> Vec<Effect> {
-        let mut changed = false;
+        let mut membership_changed = false;
+        let mut state_changed: Vec<NodeId> = Vec::new();
         let mut refute_to: Option<u64> = None;
 
         for delta in deltas {
@@ -541,27 +591,73 @@ impl GroupEngine {
             };
 
             if delta.node == self.local {
-                if !self.leaving && status != Status::Alive && delta.incarnation >= self.incarnation
-                {
-                    let target = delta.incarnation + 1;
-                    refute_to = Some(refute_to.map_or(target, |t| t.max(target)));
+                // Refute a false suspicion, AND handle restart: if a peer
+                // remembers us at a higher incarnation than our (possibly fresh)
+                // one, out-incarnate it so our announcements aren't ignored as
+                // stale.
+                if !self.leaving {
+                    let false_suspicion =
+                        status != Status::Alive && delta.incarnation >= self.incarnation;
+                    let peer_ahead = delta.incarnation > self.incarnation;
+                    if false_suspicion || peer_ahead {
+                        let target = delta.incarnation + 1;
+                        refute_to = Some(refute_to.map_or(target, |t| t.max(target)));
+                    }
+                }
+                // We are the sole author of our own state *value* — never adopt
+                // a peer's. But if a peer remembers a higher version than ours
+                // (e.g. we restarted and reset to 0), bump *above* it and keep
+                // re-advertising our own value so it supersedes. In steady state
+                // no peer is ever ahead of us here.
+                if delta.state_version > self.members[&self.local].state_version {
+                    let m = self.members.get_mut(&self.local).expect("self present");
+                    m.state_version = delta.state_version.saturating_add(1);
+                    state_changed.push(self.local.clone());
                 }
                 continue;
             }
 
-            let wins = match self.members.get(&delta.node) {
-                Some(cur) => supersedes(cur, delta.incarnation, status),
-                None => true,
-            };
-            if wins {
-                let mut member = Member::new(delta.incarnation, status);
-                if status == Status::Suspect {
-                    member.suspect_since = now; // our suspicion clock starts now
-                } else if status == Status::Dead {
-                    member.dead_since = now; // start the tombstone's reap clock
+            match self.members.get(&delta.node) {
+                None => {
+                    // Unknown node: adopt its liveness and state wholesale.
+                    let carries_state = delta.state_version > 0;
+                    let mut member = Member::new(delta.incarnation, status);
+                    match status {
+                        Status::Suspect => member.suspect_since = now,
+                        Status::Dead => member.dead_since = now,
+                        Status::Alive => {}
+                    }
+                    member.state_version = delta.state_version;
+                    member.state = delta.state;
+                    self.members.insert(delta.node.clone(), member);
+                    membership_changed = true;
+                    if carries_state {
+                        state_changed.push(delta.node);
+                    }
                 }
-                self.members.insert(delta.node, member);
-                changed = true;
+                Some(cur) => {
+                    let status_wins = supersedes(cur, delta.incarnation, status);
+                    let state_wins = delta.state_version > cur.state_version;
+                    if !status_wins && !state_wins {
+                        continue;
+                    }
+                    let member = self.members.get_mut(&delta.node).expect("present");
+                    if status_wins {
+                        member.incarnation = delta.incarnation;
+                        member.status = status;
+                        match status {
+                            Status::Suspect => member.suspect_since = now,
+                            Status::Dead => member.dead_since = now,
+                            Status::Alive => {}
+                        }
+                        membership_changed = true;
+                    }
+                    if state_wins {
+                        member.state_version = delta.state_version;
+                        member.state = delta.state;
+                        state_changed.push(delta.node);
+                    }
+                }
             }
         }
 
@@ -571,14 +667,17 @@ impl GroupEngine {
                 m.incarnation = new_incarnation;
                 m.status = Status::Alive;
             }
-            changed = true;
+            membership_changed = true;
         }
 
-        if !changed {
-            return Vec::new();
+        let mut effects = Vec::new();
+        if membership_changed {
+            effects.push(Effect::MembershipChanged);
+            effects.extend(self.recompute_coordinator());
         }
-        let mut effects = vec![Effect::MembershipChanged];
-        effects.extend(self.recompute_coordinator());
+        for node in state_changed {
+            effects.push(Effect::NodeStateChanged { node });
+        }
         effects
     }
 
@@ -666,6 +765,8 @@ impl GroupEngine {
                     node: node.clone(),
                     incarnation: m.incarnation,
                     status: status_to_wire(m.status),
+                    state_version: m.state_version,
+                    state: m.state.clone(),
                 })
                 .collect(),
             metadata: self
@@ -689,10 +790,11 @@ impl GroupEngine {
     }
 
     fn compute_coordinator(&self) -> Option<NodeId> {
-        // Coordinator is chosen among live members (Alive or Suspect); a Dead
-        // node is never a candidate.
+        // The coordinator is just the placement owner of the group id among live
+        // members (Alive or Suspect); a Dead node is never a candidate. Same
+        // HA-hash the public `placement` API exposes.
         let live: BTreeSet<NodeId> = self.members().cloned().collect();
-        coord::select(&self.group, &live)
+        placement::owner(self.group.as_str(), &live)
     }
 
     fn recompute_coordinator(&mut self) -> Vec<Effect> {
@@ -728,6 +830,8 @@ impl Member {
             status,
             suspect_since: Time::ZERO,
             dead_since: Time::ZERO,
+            state_version: 0,
+            state: Vec::new(),
         }
     }
 }
@@ -796,6 +900,8 @@ mod tests {
             node: NodeId::new(node),
             incarnation: inc,
             status: status_to_wire(status),
+            state_version: 0,
+            state: Vec::new(),
         }
     }
 
@@ -820,10 +926,7 @@ mod tests {
         );
         assert_eq!(a.members().count(), 2);
         let set: BTreeSet<NodeId> = [NodeId::new("a"), NodeId::new("b")].into_iter().collect();
-        assert_eq!(
-            a.coordinator().cloned(),
-            coord::select(&GroupId::new("g"), &set)
-        );
+        assert_eq!(a.coordinator().cloned(), placement::owner("g", &set));
     }
 
     #[test]
@@ -1001,5 +1104,81 @@ mod tests {
 
         a.on_message(NodeId::new("z"), &meta(1, "z", "stale"), Time(2));
         assert_eq!(a.metadata("k"), Some("local")); // stale ignored
+    }
+
+    /// A member delta carrying only app state (alive, no liveness change).
+    fn state_delta(node: &str, version: u64, state: &[u8]) -> wire::MemberDelta {
+        wire::MemberDelta {
+            node: NodeId::new(node),
+            incarnation: 0,
+            status: status_to_wire(Status::Alive),
+            state_version: version,
+            state: state.to_vec(),
+        }
+    }
+
+    #[test]
+    fn per_node_state_merges_by_last_writer_wins() {
+        let mut a = engine("a", &["b"]);
+
+        // Learn b's state at version 2.
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![state_delta("b", 2, b"v2")], vec![]),
+            Time(1),
+        );
+        assert_eq!(a.node_state(&NodeId::new("b")), Some(&b"v2"[..]));
+
+        // A newer version wins; a stale one is ignored.
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![state_delta("b", 3, b"v3")], vec![]),
+            Time(2),
+        );
+        assert_eq!(a.node_state(&NodeId::new("b")), Some(&b"v3"[..]));
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![state_delta("b", 1, b"old")], vec![]),
+            Time(3),
+        );
+        assert_eq!(a.node_state(&NodeId::new("b")), Some(&b"v3"[..]));
+    }
+
+    #[test]
+    fn a_node_authors_only_its_own_state() {
+        let mut a = engine("a", &["b"]);
+        a.apply(Command::SetLocalState(b"mine".to_vec()));
+        assert_eq!(a.local_state(), b"mine");
+
+        // A peer's claim about *our* state is ignored — we're the sole author.
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![state_delta("a", 999, b"forged")], vec![]),
+            Time(1),
+        );
+        assert_eq!(a.local_state(), b"mine");
+    }
+
+    #[test]
+    fn state_and_liveness_merge_independently() {
+        let mut a = engine("a", &["b"]);
+        // Learn b alive with state v1.
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![state_delta("b", 1, b"s1")], vec![]),
+            Time(1),
+        );
+        // A pure liveness update (suspect, no newer state) must not wipe state.
+        a.on_message(
+            NodeId::new("c"),
+            &gossip_frame(vec![member("b", 0, Status::Suspect)], vec![]),
+            Time(2),
+        );
+        assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Suspect));
+        assert_eq!(
+            a.node_state(&NodeId::new("b")),
+            Some(&b"s1"[..]),
+            "state survived a status change"
+        );
     }
 }

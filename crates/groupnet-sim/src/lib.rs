@@ -127,6 +127,21 @@ impl Simulation {
         self.blocked.insert((from.clone(), to.clone()));
     }
 
+    /// Restores the directed link `from -> to`.
+    pub fn heal(&mut self, from: &NodeId, to: &NodeId) {
+        self.blocked.remove(&(from.clone(), to.clone()));
+    }
+
+    /// Restores every partitioned link.
+    pub fn heal_all(&mut self) {
+        self.blocked.clear();
+    }
+
+    /// Changes the per-message loss probability mid-run (0..=100).
+    pub fn set_loss(&mut self, percent: u8) {
+        self.loss_percent = percent.min(100);
+    }
+
     /// Sets deterministic per-message packet loss (`percent` of 0..=100).
     /// Reproducible run-to-run; no randomness is used anywhere. Each message is
     /// dropped independently based on a hash of its scheduling sequence.
@@ -236,6 +251,50 @@ impl Simulation {
             .and_then(|e| e.member_status(node))
     }
 
+    /// The app-defined per-node state that `observer` currently holds for
+    /// `node`.
+    #[must_use]
+    pub fn state_of(&self, observer: &NodeId, node: &NodeId) -> Option<Vec<u8>> {
+        self.engines
+            .get(observer)
+            .and_then(|e| e.node_state(node).map(<[u8]>::to_vec))
+    }
+
+    /// The ids of every engine currently in the simulation.
+    #[must_use]
+    pub fn nodes(&self) -> Vec<NodeId> {
+        self.engines.keys().cloned().collect()
+    }
+
+    /// The live members (not `Dead`) that `observer` currently sees.
+    #[must_use]
+    pub fn members_of(&self, observer: &NodeId) -> BTreeSet<NodeId> {
+        self.engines
+            .get(observer)
+            .map(|e| e.members().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// `observer`'s full metadata view.
+    #[must_use]
+    pub fn metadata_snapshot(&self, observer: &NodeId) -> BTreeMap<String, String> {
+        self.engines.get(observer).map_or_else(BTreeMap::new, |e| {
+            e.metadata_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect()
+        })
+    }
+
+    /// `observer`'s full per-node app-state view.
+    #[must_use]
+    pub fn state_snapshot(&self, observer: &NodeId) -> BTreeMap<NodeId, Vec<u8>> {
+        self.engines.get(observer).map_or_else(BTreeMap::new, |e| {
+            e.node_states_iter()
+                .map(|(n, s)| (n.clone(), s.to_vec()))
+                .collect()
+        })
+    }
+
     /// Whether every node has converged on the same (non-`None`) coordinator.
     #[must_use]
     pub fn all_agree_on_coordinator(&self) -> bool {
@@ -268,7 +327,9 @@ impl Simulation {
                 Effect::CoordinatorChanged { coordinator } => {
                     self.coordinator_log.push((node.clone(), coordinator));
                 }
-                Effect::MembershipChanged | Effect::MetadataChanged { .. } => {}
+                Effect::MembershipChanged
+                | Effect::NodeStateChanged { .. }
+                | Effect::MetadataChanged { .. } => {}
             }
         }
     }
