@@ -219,7 +219,7 @@ pub fn peek_group(bytes: &[u8]) -> Option<GroupId> {
     Some(GroupId::new(get_str(&mut cur)?))
 }
 
-// ---- minimal little-endian codec helpers ---------------------------------
+// Minimal little-endian codec primitives.
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());

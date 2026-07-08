@@ -166,8 +166,6 @@ impl GroupEngine {
         engine
     }
 
-    // ---- reads -----------------------------------------------------------
-
     /// The group this engine belongs to.
     #[must_use]
     pub fn group(&self) -> &GroupId {
@@ -241,8 +239,6 @@ impl GroupEngine {
             .iter()
             .map(|(k, v)| (k.as_str(), v.value.as_str()))
     }
-
-    // ---- lifecycle -------------------------------------------------------
 
     /// Primes the engine: announces this node and arms the first timers. A
     /// driver calls this once, right after construction, passing current time.
@@ -396,8 +392,6 @@ impl GroupEngine {
         effects
     }
 
-    // ---- failure detection ----------------------------------------------
-
     fn probe(&mut self, now: Time) -> Vec<Effect> {
         if self.pending.is_some() {
             return Vec::new(); // one probe outstanding at a time
@@ -510,8 +504,6 @@ impl GroupEngine {
             self.members.remove(&node);
         }
     }
-
-    // ---- merge -----------------------------------------------------------
 
     /// Merges incoming member deltas. Liveness (`incarnation`/`status`, by SWIM
     /// precedence) and app state (`state_version`, by last-writer-wins) are
@@ -648,8 +640,6 @@ impl GroupEngine {
         }
         effects
     }
-
-    // ---- helpers ---------------------------------------------------------
 
     /// Live members (excluding self) we may probe or gossip to.
     fn probe_candidates(&self) -> impl Iterator<Item = &NodeId> {

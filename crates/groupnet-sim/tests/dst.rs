@@ -74,7 +74,7 @@ fn run_scenario(seed: u64) {
         now += u64::from(30 + rng.below(120));
         sim.run_until(Time(now));
 
-        // ---- safety: must hold at every step, even mid-chaos ----
+        // Safety: must hold at every step, even mid-chaos.
         for node in &alive {
             assert!(
                 sim.members_of(node).contains(node),
@@ -88,7 +88,7 @@ fn run_scenario(seed: u64) {
             }
         }
 
-        // ---- inject one fault ----
+        // Inject one fault.
         match rng.below(6) {
             0 if alive.len() > 2 => {
                 let victim = pick(&alive, &mut rng);
@@ -135,7 +135,7 @@ fn run_scenario(seed: u64) {
         }
     }
 
-    // ---- converge under fair conditions, then assert liveness ----
+    // Converge under fair conditions, then assert liveness.
     sim.heal_all();
     sim.set_loss(0);
     now += 20_000;
