@@ -23,10 +23,10 @@ impl SyncCtx {
 
 /// A handle to this node's participation in one group.
 ///
-/// Cheap to hold; all state lives in the group's actor task. Reads
+/// Cheap to clone and hold; all state lives in the group's actor task. Reads
 /// ([`coordinator`](Self::coordinator), [`is_coordinator`](Self::is_coordinator))
 /// are lock-free snapshots via a `watch` channel.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Group {
     id: GroupId,
     local: NodeId,
@@ -105,5 +105,11 @@ impl Group {
     /// Leaves the group (best-effort).
     pub fn leave(&self) {
         let _ = self.tx.send(Event::Local(Command::Leave));
+    }
+
+    /// The command channel into this group's actor (for internal wiring, e.g.
+    /// publishing coordinator identity into the routing group).
+    pub(crate) fn command_sender(&self) -> mpsc::UnboundedSender<Event> {
+        self.tx.clone()
     }
 }

@@ -7,12 +7,18 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# The only layer that needs an async runtime, so it's the only crate that pulls
-# in tokio — and only a narrow slice of it.
+# Transport-agnostic: this crate depends only on the trait, never on a concrete
+# binding. It's the only layer that needs an async runtime, so it's the only
+# crate here that pulls in tokio — and only a narrow slice of it.
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
 tokio = { workspace = true }
+
+# Concrete transports are pulled in only to exercise the tests.
+[dev-dependencies]
+groupnet-transport-mem = { workspace = true }
+groupnet-transport-udp = { workspace = true }
 
 [lints]
 workspace = true

@@ -5,16 +5,18 @@
 //! them across every core with no shared lock on the hot path — the classic
 //! single-writer-per-shard model.
 //!
-//! You bind a [`Transport`] and get a [`Node`]; from it you [`join_group`] to
-//! get a [`Group`] handle:
+//! You bind any [`Transport`] and get a [`Node`]; from it you [`join_group`] to
+//! get a [`Group`] handle. This crate is **transport-agnostic** — the concrete
+//! bindings live in their own crates (`groupnet-transport-mem`,
+//! `groupnet-transport-udp`, …), or you implement the trait yourself:
 //!
 //! ```no_run
-//! use groupnet_runtime::{Node, mem::Network};
+//! use groupnet_runtime::Node;
 //! use groupnet_core::NodeId;
+//! use groupnet_transport::Transport;
 //!
-//! # async fn demo() {
-//! let net = Network::new(); // any Transport impl works here
-//! let node = Node::builder(NodeId::new("node-a"), net.endpoint(NodeId::new("node-a")))
+//! # async fn demo<T: Transport>(transport: T) {
+//! let node = Node::builder(NodeId::new("node-a"), transport)
 //!     .seed(NodeId::new("node-b"))
 //!     .spawn();
 //!
@@ -39,8 +41,8 @@
 mod driver;
 mod group;
 mod node;
-
-pub mod mem;
+mod routing;
 
 pub use group::{Group, SyncCtx};
 pub use node::{Node, NodeBuilder};
+pub use routing::Routing;

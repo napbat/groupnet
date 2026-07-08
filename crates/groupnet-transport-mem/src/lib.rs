@@ -1,11 +1,23 @@
-//! An in-process [`Transport`] over Tokio channels.
+//! # groupnet-transport-mem
 //!
-//! Useful for integration tests and examples: stand up several [`Node`]s on one
-//! [`Network`] and they gossip as if over a real link — minus the sockets. It
-//! honours the best-effort contract (sending to an unknown peer is a silent
-//! drop, never an error).
+//! An in-process [`Transport`] over Tokio channels — a concrete binding of
+//! Groupnet's transport-agnostic trait.
 //!
-//! [`Node`]: crate::Node
+//! Useful for integration tests, examples, and single-process clusters: stand up
+//! several nodes on one [`Network`] and they gossip as if over a real link,
+//! minus the sockets. It honours the best-effort contract (sending to an unknown
+//! peer is a silent drop, never an error).
+//!
+//! ```
+//! use groupnet_transport_mem::Network;
+//! use groupnet_core::NodeId;
+//!
+//! let net = Network::new();
+//! let _a = net.endpoint(NodeId::new("node-a"));
+//! let _b = net.endpoint(NodeId::new("node-b"));
+//! ```
+//!
+//! [`Transport`]: groupnet_transport::Transport
 
 use std::collections::HashMap;
 use std::fmt;

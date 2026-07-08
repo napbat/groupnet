@@ -10,10 +10,15 @@ pub struct Config {
     pub gossip_interval_ms: u64,
     /// How often to probe a member for liveness.
     pub probe_interval_ms: u64,
-    /// How long to wait for a probe ack before suspecting the target.
+    /// How long to wait for a probe ack before escalating / suspecting.
     pub probe_timeout_ms: u64,
     /// How long a member may stay `Suspect` before it is declared `Dead`.
     pub suspect_timeout_ms: u64,
+    /// How long a `Dead` tombstone is gossiped. After this it stops being
+    /// re-advertised; after `2×` it is reaped from the table.
+    pub dead_timeout_ms: u64,
+    /// How many indirect probers to enlist when a direct probe goes unanswered.
+    pub indirect_probes: usize,
     /// Maximum peers to disseminate to per gossip round.
     pub fanout: usize,
 }
@@ -25,6 +30,8 @@ impl Default for Config {
             probe_interval_ms: 100,
             probe_timeout_ms: 50,
             suspect_timeout_ms: 500,
+            dead_timeout_ms: 10_000,
+            indirect_probes: 2,
             fanout: 3,
         }
     }
@@ -62,6 +69,9 @@ struct Member {
     /// When *this* node first observed the member as `Suspect` (for the
     /// suspicion timeout). Only meaningful while `status == Suspect`.
     suspect_since: Time,
+    /// When *this* node first observed the member as `Dead` (for gossip TTL and
+    /// reaping). Only meaningful while `status == Dead`.
+    dead_since: Time,
 }
 
 /// A local instruction to the engine, applied via [`GroupEngine::apply`].
@@ -112,6 +122,23 @@ pub enum Effect {
     },
 }
 
+/// Which phase of failure detection an outstanding probe is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbePhase {
+    /// A direct `Ping` we sent ourselves.
+    Direct,
+    /// We asked indirect probers to reach the target after a direct miss.
+    Indirect,
+}
+
+/// The probe currently awaiting a response.
+#[derive(Clone, Debug)]
+struct Pending {
+    target: NodeId,
+    deadline: Time,
+    phase: ProbePhase,
+}
+
 /// The per-group coordination state machine.
 ///
 /// One instance owns the state of exactly one group on one node. It is a plain
@@ -120,10 +147,10 @@ pub enum Effect {
 /// [`on_tick`](Self::on_tick), [`apply`](Self::apply)) and executing the
 /// [`Effect`]s it returns.
 ///
-/// Membership uses a SWIM-style protocol: direct liveness probes
-/// (`Ping`/`Ack`), a `Suspect` state with a refutation window, and
-/// last-writer-wins merge keyed by per-node incarnation numbers. Indirect
-/// probes (`ping-req`) are not yet implemented.
+/// Membership uses a SWIM-style protocol: direct liveness probes with indirect
+/// (`ping-req`) fallback, a `Suspect` state with a refutation window,
+/// last-writer-wins merge keyed by per-node incarnation numbers, and reaping of
+/// stale `Dead` tombstones.
 #[derive(Debug)]
 pub struct GroupEngine {
     group: GroupId,
@@ -133,8 +160,7 @@ pub struct GroupEngine {
     /// Set once the local node has voluntarily left (so it won't refute its own
     /// death).
     leaving: bool,
-    /// All known members, including self. Dead entries are retained as
-    /// tombstones (not reaped in this scaffold).
+    /// All known members, including self.
     members: BTreeMap<NodeId, Member>,
     /// Bootstrap contacts to disseminate toward before membership is learned.
     seeds: BTreeSet<NodeId>,
@@ -145,14 +171,11 @@ pub struct GroupEngine {
     next_probe: Time,
     /// Round-robin cursor over probe candidates.
     probe_cursor: usize,
-    /// The outstanding probe awaiting an ack, if any.
+    /// The outstanding probe awaiting a response, if any.
     pending: Option<Pending>,
-}
-
-#[derive(Clone, Debug)]
-struct Pending {
-    target: NodeId,
-    deadline: Time,
+    /// As an indirect prober: target -> the origins waiting for us to relay an
+    /// ack about it.
+    relaying: BTreeMap<NodeId, BTreeSet<NodeId>>,
 }
 
 impl GroupEngine {
@@ -167,14 +190,7 @@ impl GroupEngine {
         config: Config,
     ) -> Self {
         let mut members = BTreeMap::new();
-        members.insert(
-            local.clone(),
-            Member {
-                incarnation: 0,
-                status: Status::Alive,
-                suspect_since: Time::ZERO,
-            },
-        );
+        members.insert(local.clone(), Member::new(0, Status::Alive));
         let seeds = seeds
             .into_iter()
             .filter(|p| *p != local)
@@ -193,6 +209,7 @@ impl GroupEngine {
             next_probe: Time::ZERO,
             probe_cursor: 0,
             pending: None,
+            relaying: BTreeMap::new(),
         };
         engine.coordinator = engine.compute_coordinator();
         engine
@@ -232,7 +249,8 @@ impl GroupEngine {
             .map(|(n, _)| n)
     }
 
-    /// The status of a specific node, if known (including `Dead` tombstones).
+    /// The status of a specific node, if known (including `Dead` tombstones,
+    /// until they are reaped).
     #[must_use]
     pub fn member_status(&self, node: &NodeId) -> Option<Status> {
         self.members.get(node).map(|m| m.status)
@@ -258,7 +276,7 @@ impl GroupEngine {
     pub fn start(&mut self, now: Time) -> Vec<Effect> {
         self.next_gossip = now.saturating_add(self.config.gossip_interval_ms);
         self.next_probe = now.saturating_add(self.config.probe_interval_ms);
-        let mut effects = self.gossip();
+        let mut effects = self.gossip(now);
         effects.push(self.arm_timer());
         effects
     }
@@ -284,14 +302,13 @@ impl GroupEngine {
             Command::Leave => {
                 // Declare ourselves Dead at our current incarnation and stop
                 // refuting. Dead supersedes Alive at equal incarnation, so the
-                // leave sticks as it disseminates.
+                // leave sticks as it disseminates on the next gossip round.
                 self.leaving = true;
                 if let Some(m) = self.members.get_mut(&self.local) {
                     m.status = Status::Dead;
                 }
                 let mut effects = vec![Effect::MembershipChanged];
                 effects.extend(self.recompute_coordinator());
-                effects.extend(self.gossip()); // push the leave out immediately
                 effects
             }
         }
@@ -311,16 +328,39 @@ impl GroupEngine {
 
         match frame.kind {
             wire::Kind::Ping => {
-                // Prove we're alive by replying with our current view.
-                let ack = self.make_frame(wire::Kind::Ack);
-                effects.push(Effect::Send {
-                    to: from,
-                    wire: ack,
-                });
+                effects.push(self.frame_to(from, wire::Kind::Ack, None, now));
             }
             wire::Kind::Ack => {
-                if self.pending.as_ref().is_some_and(|p| p.target == from) {
-                    self.pending = None; // liveness confirmed
+                self.clear_pending_if(&from);
+                // As an indirect prober: relay this proof of life to any origins
+                // waiting on `from`.
+                if let Some(origins) = self.relaying.remove(&from) {
+                    for origin in origins {
+                        effects.push(self.frame_to(
+                            origin,
+                            wire::Kind::IndirectAck,
+                            Some(from.clone()),
+                            now,
+                        ));
+                    }
+                }
+            }
+            wire::Kind::PingReq => {
+                // We were asked to probe `frame.target` on `from`'s behalf.
+                if let Some(target) = frame.target {
+                    if target != self.local {
+                        self.relaying
+                            .entry(target.clone())
+                            .or_default()
+                            .insert(from);
+                        effects.push(self.frame_to(target, wire::Kind::Ping, None, now));
+                    }
+                }
+            }
+            wire::Kind::IndirectAck => {
+                // A prober reports our probe target is alive.
+                if let Some(target) = frame.target {
+                    self.clear_pending_if(&target);
                 }
             }
             wire::Kind::Gossip => {}
@@ -328,30 +368,44 @@ impl GroupEngine {
         effects
     }
 
-    /// Advances logical time: expires probe acks and suspicions, and emits
-    /// probe / gossip rounds when due. Safe to call more often than requested.
+    /// Advances logical time: escalates or expires probes, ages out suspicions
+    /// and tombstones, and emits probe / gossip rounds when due.
     pub fn on_tick(&mut self, now: Time) -> Vec<Effect> {
         let mut effects = Vec::new();
 
-        // 1. An outstanding probe whose ack window elapsed -> suspect it.
-        if self.pending.as_ref().is_some_and(|p| now >= p.deadline) {
-            let target = self.pending.take().expect("checked").target;
-            effects.extend(self.suspect(&target, now));
+        // 1. A probe whose window elapsed: escalate a direct miss to indirect,
+        //    or declare an indirect miss suspect.
+        let expired = self
+            .pending
+            .as_ref()
+            .filter(|p| now >= p.deadline)
+            .map(|p| (p.target.clone(), p.phase));
+        if let Some((target, phase)) = expired {
+            match phase {
+                ProbePhase::Direct => effects.extend(self.escalate_indirect(&target, now)),
+                ProbePhase::Indirect => {
+                    self.pending = None;
+                    effects.extend(self.suspect(&target, now));
+                }
+            }
         }
 
         // 2. Suspects past their suspicion window -> dead.
         effects.extend(self.reap_suspects(now));
 
-        // 3. Send the next liveness probe.
+        // 3. Dead tombstones past their reap window -> removed entirely.
+        self.reap_dead(now);
+
+        // 4. Send the next liveness probe.
         if now >= self.next_probe {
             self.next_probe = now.saturating_add(self.config.probe_interval_ms);
             effects.extend(self.probe(now));
         }
 
-        // 4. Disseminate the full view.
+        // 5. Disseminate the full view.
         if now >= self.next_gossip {
             self.next_gossip = now.saturating_add(self.config.gossip_interval_ms);
-            effects.extend(self.gossip());
+            effects.extend(self.gossip(now));
         }
 
         effects.push(self.arm_timer());
@@ -373,11 +427,41 @@ impl GroupEngine {
         self.pending = Some(Pending {
             target: target.clone(),
             deadline: now.saturating_add(self.config.probe_timeout_ms),
+            phase: ProbePhase::Direct,
         });
-        vec![Effect::Send {
-            to: target,
-            wire: self.make_frame(wire::Kind::Ping),
-        }]
+        vec![self.frame_to(target, wire::Kind::Ping, None, now)]
+    }
+
+    /// A direct probe missed: enlist indirect probers instead of suspecting
+    /// outright. This is what prevents a single dropped packet or one-way link
+    /// from falsely killing a healthy node.
+    fn escalate_indirect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
+        let probers: Vec<NodeId> = self
+            .probe_candidates()
+            .filter(|n| **n != *target)
+            .take(self.config.indirect_probes.max(1))
+            .cloned()
+            .collect();
+        if probers.is_empty() {
+            // No one to ask (tiny cluster) — fall back to direct suspicion.
+            self.pending = None;
+            return self.suspect(target, now);
+        }
+        self.pending = Some(Pending {
+            target: target.clone(),
+            deadline: now.saturating_add(self.config.probe_timeout_ms),
+            phase: ProbePhase::Indirect,
+        });
+        probers
+            .into_iter()
+            .map(|p| self.frame_to(p, wire::Kind::PingReq, Some(target.clone()), now))
+            .collect()
+    }
+
+    fn clear_pending_if(&mut self, target: &NodeId) {
+        if self.pending.as_ref().is_some_and(|p| p.target == *target) {
+            self.pending = None;
+        }
     }
 
     fn suspect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
@@ -415,11 +499,32 @@ impl GroupEngine {
         for node in &dead {
             if let Some(m) = self.members.get_mut(node) {
                 m.status = Status::Dead;
+                m.dead_since = now;
             }
         }
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
         effects
+    }
+
+    /// Removes `Dead` tombstones that have aged past `2×dead_timeout`. By then
+    /// they have stopped being gossiped (see `should_gossip`), so no peer
+    /// re-teaches them and the removal converges.
+    fn reap_dead(&mut self, now: Time) {
+        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
+        let stale: Vec<NodeId> = self
+            .members
+            .iter()
+            .filter(|(node, m)| {
+                **node != self.local
+                    && m.status == Status::Dead
+                    && now >= m.dead_since.saturating_add(reap_after)
+            })
+            .map(|(node, _)| node.clone())
+            .collect();
+        for node in stale {
+            self.members.remove(&node);
+        }
     }
 
     // ---- merge -----------------------------------------------------------
@@ -436,8 +541,6 @@ impl GroupEngine {
             };
 
             if delta.node == self.local {
-                // Someone thinks we're suspect/dead: refute by out-incarnating,
-                // unless we're deliberately leaving.
                 if !self.leaving && status != Status::Alive && delta.incarnation >= self.incarnation
                 {
                     let target = delta.incarnation + 1;
@@ -446,25 +549,19 @@ impl GroupEngine {
                 continue;
             }
 
-            match self.members.get(&delta.node) {
-                Some(cur) if !supersedes(cur, delta.incarnation, status) => {}
-                existing => {
-                    let suspect_since = if status == Status::Suspect {
-                        now // our suspicion clock for this member starts now
-                    } else {
-                        Time::ZERO
-                    };
-                    let _ = existing;
-                    self.members.insert(
-                        delta.node,
-                        Member {
-                            incarnation: delta.incarnation,
-                            status,
-                            suspect_since,
-                        },
-                    );
-                    changed = true;
+            let wins = match self.members.get(&delta.node) {
+                Some(cur) => supersedes(cur, delta.incarnation, status),
+                None => true,
+            };
+            if wins {
+                let mut member = Member::new(delta.incarnation, status);
+                if status == Status::Suspect {
+                    member.suspect_since = now; // our suspicion clock starts now
+                } else if status == Status::Dead {
+                    member.dead_since = now; // start the tombstone's reap clock
                 }
+                self.members.insert(delta.node, member);
+                changed = true;
             }
         }
 
@@ -518,8 +615,7 @@ impl GroupEngine {
 
     // ---- helpers ---------------------------------------------------------
 
-    /// Nodes we may probe or gossip to: live members (excluding self) plus any
-    /// seeds we haven't confirmed yet.
+    /// Live members (excluding self) we may probe or gossip to.
     fn probe_candidates(&self) -> impl Iterator<Item = &NodeId> {
         self.members
             .iter()
@@ -533,12 +629,12 @@ impl GroupEngine {
         set.into_iter().collect()
     }
 
-    fn gossip(&self) -> Vec<Effect> {
+    fn gossip(&self, now: Time) -> Vec<Effect> {
         let targets = self.dissemination_targets();
         if targets.is_empty() {
             return Vec::new();
         }
-        let frame = self.make_frame(wire::Kind::Gossip);
+        let frame = self.encode_frame(wire::Kind::Gossip, None, now);
         targets
             .into_iter()
             .take(self.config.fanout.max(1))
@@ -549,13 +645,23 @@ impl GroupEngine {
             .collect()
     }
 
-    fn make_frame(&self, kind: wire::Kind) -> Vec<u8> {
+    /// Builds a `Send` effect of `kind` addressed to `to`.
+    fn frame_to(&self, to: NodeId, kind: wire::Kind, target: Option<NodeId>, now: Time) -> Effect {
+        Effect::Send {
+            to,
+            wire: self.encode_frame(kind, target, now),
+        }
+    }
+
+    fn encode_frame(&self, kind: wire::Kind, target: Option<NodeId>, now: Time) -> Vec<u8> {
         wire::encode(&wire::Frame {
             kind,
             group: self.group.clone(),
+            target,
             members: self
                 .members
                 .iter()
+                .filter(|(_, m)| self.should_gossip(m, now))
                 .map(|(node, m)| wire::MemberDelta {
                     node: node.clone(),
                     incarnation: m.incarnation,
@@ -573,6 +679,13 @@ impl GroupEngine {
                 })
                 .collect(),
         })
+    }
+
+    /// A `Dead` member is advertised only until `dead_timeout` elapses; after
+    /// that peers are assumed to know, and dropping it from gossip lets everyone
+    /// reap the tombstone without re-teaching each other.
+    fn should_gossip(&self, m: &Member, now: Time) -> bool {
+        m.status != Status::Dead || now < m.dead_since.saturating_add(self.config.dead_timeout_ms)
     }
 
     fn compute_coordinator(&self) -> Option<NodeId> {
@@ -605,6 +718,17 @@ impl GroupEngine {
             }
         }
         Effect::ArmTimer { at }
+    }
+}
+
+impl Member {
+    fn new(incarnation: u64, status: Status) -> Self {
+        Self {
+            incarnation,
+            status,
+            suspect_since: Time::ZERO,
+            dead_since: Time::ZERO,
+        }
     }
 }
 
@@ -661,16 +785,17 @@ mod tests {
         wire::encode(&wire::Frame {
             kind: wire::Kind::Gossip,
             group: GroupId::new("g"),
+            target: None,
             members,
             metadata,
         })
     }
 
-    fn alive(node: &str, inc: u64) -> wire::MemberDelta {
+    fn member(node: &str, inc: u64, status: Status) -> wire::MemberDelta {
         wire::MemberDelta {
             node: NodeId::new(node),
             incarnation: inc,
-            status: status_to_wire(Status::Alive),
+            status: status_to_wire(status),
         }
     }
 
@@ -690,7 +815,7 @@ mod tests {
         let mut a = engine("a", &["b"]);
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![alive("b", 0)], vec![]),
+            &gossip_frame(vec![member("b", 0, Status::Alive)], vec![]),
             Time(1),
         );
         assert_eq!(a.members().count(), 2);
@@ -702,55 +827,129 @@ mod tests {
     }
 
     #[test]
-    fn unanswered_probe_leads_to_suspect_then_dead() {
+    fn two_node_probe_leads_to_suspect_then_dead() {
         let cfg = Config {
             probe_interval_ms: 100,
             probe_timeout_ms: 50,
             suspect_timeout_ms: 200,
             gossip_interval_ms: 100,
-            fanout: 3,
+            ..Config::default()
         };
         let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [NodeId::new("b")], cfg);
-        // Learn b as alive.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![alive("b", 0)], vec![]),
+            &gossip_frame(vec![member("b", 0, Status::Alive)], vec![]),
             Time(1),
         );
         a.start(Time(1));
 
-        // Probe fires; b never acks. After probe_timeout, b is suspect.
-        a.on_tick(Time(101)); // sends the probe (deadline 151)
-        a.on_tick(Time(160)); // ack window elapsed -> suspect
+        // With no third node to relay, a direct miss falls straight through to
+        // suspicion.
+        a.on_tick(Time(101)); // sends the direct probe (deadline 151)
+        a.on_tick(Time(160)); // window elapsed, no probers -> suspect
         assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Suspect));
 
-        // After the suspicion window, b is dead and drops out of membership.
-        a.on_tick(Time(400));
+        a.on_tick(Time(400)); // suspicion window elapsed -> dead
         assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Dead));
         assert!(!a.members().any(|n| *n == NodeId::new("b")));
     }
 
     #[test]
-    fn refutes_false_suspicion_about_self() {
-        let mut a = engine("a", &["b"]);
-        // b claims a is suspect at incarnation 0.
+    fn direct_miss_escalates_to_indirect_before_suspecting() {
+        let cfg = Config {
+            probe_interval_ms: 1000,
+            probe_timeout_ms: 50,
+            ..Config::default()
+        };
+        let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], cfg);
+        // Learn b and c.
         a.on_message(
             NodeId::new("b"),
             &gossip_frame(
-                vec![wire::MemberDelta {
-                    node: NodeId::new("a"),
-                    incarnation: 0,
-                    status: status_to_wire(Status::Suspect),
-                }],
+                vec![member("b", 0, Status::Alive), member("c", 0, Status::Alive)],
                 vec![],
             ),
             Time(1),
         );
-        // a must still consider itself alive, at a higher incarnation.
+        a.start(Time(1));
+
+        a.on_tick(Time(1001)); // direct probe to first candidate (b)
+        let effects = a.on_tick(Time(1100)); // direct miss -> ping-req, NOT suspect
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send { to, .. } if *to == NodeId::new("c"))),
+            "should ask c to probe b indirectly"
+        );
+        assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Alive));
+
+        // An indirect ack keeps b alive.
+        a.on_message(
+            NodeId::new("c"),
+            &wire::encode(&wire::Frame {
+                kind: wire::Kind::IndirectAck,
+                group: GroupId::new("g"),
+                target: Some(NodeId::new("b")),
+                members: vec![],
+                metadata: vec![],
+            }),
+            Time(1120),
+        );
+        a.on_tick(Time(2000));
+        assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Alive));
+    }
+
+    #[test]
+    fn ping_req_makes_us_probe_and_relay() {
+        let mut p = engine("p", &[]);
+        // origin o asks p to probe t.
+        let effects = p.on_message(
+            NodeId::new("o"),
+            &wire::encode(&wire::Frame {
+                kind: wire::Kind::PingReq,
+                group: GroupId::new("g"),
+                target: Some(NodeId::new("t")),
+                members: vec![],
+                metadata: vec![],
+            }),
+            Time(1),
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send { to, .. } if *to == NodeId::new("t"))),
+            "prober should ping the target"
+        );
+        // When t acks, we relay an IndirectAck back to the origin o.
+        let ack = p.on_message(
+            NodeId::new("t"),
+            &wire::encode(&wire::Frame {
+                kind: wire::Kind::Ack,
+                group: GroupId::new("g"),
+                target: None,
+                members: vec![],
+                metadata: vec![],
+            }),
+            Time(3),
+        );
+        assert!(
+            ack.iter()
+                .any(|e| matches!(e, Effect::Send { to, .. } if *to == NodeId::new("o"))),
+            "should relay an indirect ack to the origin"
+        );
+    }
+
+    #[test]
+    fn refutes_false_suspicion_about_self() {
+        let mut a = engine("a", &["b"]);
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![member("a", 0, Status::Suspect)], vec![]),
+            Time(1),
+        );
         assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Alive));
-        // The refutation must bump our incarnation above the suspect's, so the
-        // re-asserted Alive supersedes it as it disseminates.
-        let frame = wire::decode(&a.make_frame(wire::Kind::Gossip)).expect("valid frame");
+        let frame =
+            wire::decode(&a.encode_frame(wire::Kind::Gossip, None, Time(2))).expect("frame");
         let self_delta = frame
             .members
             .iter()
@@ -768,18 +967,9 @@ mod tests {
         let mut a = engine("a", &["b"]);
         a.apply(Command::Leave);
         assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Dead));
-        // Even hearing itself alive again shouldn't resurrect a leaver here:
-        // a Dead-about-self arrives and is simply ignored (we don't refute).
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(
-                vec![wire::MemberDelta {
-                    node: NodeId::new("a"),
-                    incarnation: 0,
-                    status: status_to_wire(Status::Dead),
-                }],
-                vec![],
-            ),
+            &gossip_frame(vec![member("a", 0, Status::Dead)], vec![]),
             Time(1),
         );
         assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Dead));

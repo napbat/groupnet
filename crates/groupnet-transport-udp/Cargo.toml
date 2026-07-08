@@ -1,0 +1,18 @@
+[package]
+name = "groupnet-transport-udp"
+description = "UDP Transport binding for Groupnet — best-effort datagrams over real sockets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Depends only on the trait + id type, plus tokio's networking slice. The
+# runtime never needs to know this crate exists.
+[dependencies]
+groupnet-core = { workspace = true }
+groupnet-transport = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["net"] }
+
+[lints]
+workspace = true

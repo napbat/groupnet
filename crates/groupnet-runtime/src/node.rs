@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use groupnet_core::{Config, GroupEngine, GroupId, NodeId};
@@ -8,6 +8,11 @@ use tokio::sync::{mpsc, watch};
 
 use crate::driver::{Event, Publishers, group_task};
 use crate::group::Group;
+use crate::routing::Routing;
+
+/// The reserved group every node joins to disseminate the inter-group routing
+/// table. Its metadata holds `owner:<resource>` and `coord:<group>` entries.
+pub(crate) const ROUTING_GROUP: &str = "__groupnet_routing__";
 
 struct Inner<T: Transport> {
     id: NodeId,
@@ -16,6 +21,8 @@ struct Inner<T: Transport> {
     config: Config,
     routes: Mutex<HashMap<GroupId, mpsc::UnboundedSender<Event>>>,
     start: Instant,
+    /// The routing system group, joined once at spawn.
+    routing: OnceLock<Group>,
 }
 
 /// A running Groupnet node: owns a bound transport and hosts group
@@ -63,7 +70,28 @@ impl<T: Transport> Node<T> {
     /// Idempotency note: this scaffold does not dedupe repeated joins of the
     /// same group; call it once per group per node.
     pub fn join_group(&self, group: impl Into<GroupId>) -> Group {
-        let group = group.into();
+        // Real groups announce their coordinator into the routing group.
+        let routing = self.inner.routing.get().map(|g| g.command_sender());
+        self.spawn_group(group.into(), routing)
+    }
+
+    /// The inter-group routing table: look up which group owns a resource and
+    /// which node coordinates it, from any node in the cluster.
+    #[must_use]
+    pub fn routing(&self) -> Routing {
+        let group = self
+            .inner
+            .routing
+            .get()
+            .expect("routing group is joined at spawn")
+            .clone();
+        Routing::new(group)
+    }
+
+    /// Spawns a group actor. `routing` is the routing group's command channel
+    /// (so this group can publish its coordinator), or `None` for the routing
+    /// group itself.
+    fn spawn_group(&self, group: GroupId, routing: Option<mpsc::UnboundedSender<Event>>) -> Group {
         let (tx, rx) = mpsc::unbounded_channel();
 
         let engine = GroupEngine::new(
@@ -73,10 +101,10 @@ impl<T: Transport> Node<T> {
             self.inner.config.clone(),
         );
 
-        // Seed the readable coordinator view from the engine's current truth.
-        // The engine only emits `CoordinatorChanged` on an actual *change*, so a
-        // node that is (and stays) its own coordinator would otherwise never
-        // publish an initial value.
+        // Seed the readable views from the engine's current truth. The engine
+        // only emits change effects on an actual change, so a node that is (and
+        // stays) its own coordinator would otherwise never publish an initial
+        // value.
         let (coord_tx, coord_rx) = watch::channel(engine.coordinator().cloned());
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let initial_members: Vec<NodeId> = engine.members().cloned().collect();
@@ -107,6 +135,7 @@ impl<T: Transport> Node<T> {
                 metadata: meta_tx,
                 members: members_tx,
             },
+            routing,
             self.inner.start,
             tick_period,
         ));
@@ -165,9 +194,14 @@ impl<T: Transport> NodeBuilder<T> {
             config: self.config,
             routes: Mutex::new(HashMap::new()),
             start: Instant::now(),
+            routing: OnceLock::new(),
         });
         tokio::spawn(recv_loop(inner.clone()));
-        Node { inner }
+        let node = Node { inner };
+        // Join the reserved routing group (no coordinator publisher of its own).
+        let routing_group = node.spawn_group(GroupId::new(ROUTING_GROUP), None);
+        let _ = node.inner.routing.set(routing_group);
+        node
     }
 }
 

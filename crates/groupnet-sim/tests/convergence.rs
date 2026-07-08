@@ -179,6 +179,61 @@ fn detects_and_removes_a_crashed_node() {
 }
 
 #[test]
+fn indirect_probe_prevents_false_positive_under_partition() {
+    let group = GroupId::new("shard-42");
+    let ids = node_ids(&["node-a", "node-b", "node-c"]);
+
+    let mut sim = build(&group, &ids, 10, 0);
+    sim.run_until(Time(2_000));
+
+    // Sever the *direct* link between a and c in both directions. They can still
+    // reach each other indirectly through b, so ping-req must keep both alive —
+    // no node should ever be marked Dead.
+    sim.block(&ids[0], &ids[2]);
+    sim.block(&ids[2], &ids[0]);
+    sim.run_until(Time(20_000));
+
+    for observer in &ids {
+        for node in &ids {
+            assert_ne!(
+                sim.status_of(observer, node),
+                Some(Status::Dead),
+                "{observer} wrongly killed {node} despite indirect reachability"
+            );
+        }
+        assert_eq!(sim.member_count(observer), 3);
+    }
+}
+
+#[test]
+fn dead_tombstones_are_reaped() {
+    let group = GroupId::new("shard-42");
+    let ids = node_ids(&["node-a", "node-b", "node-c", "node-d"]);
+
+    // Small dead_timeout so the reap window is reached quickly in the sim.
+    let cfg = Config {
+        dead_timeout_ms: 1_000,
+        ..Config::default()
+    };
+    let mut sim = build_with(&group, &ids, 10, 0, cfg);
+    sim.run_until(Time(2_000));
+
+    let dead = ids[3].clone();
+    sim.crash(&dead);
+    // Detected + declared Dead, then gossiped for dead_timeout, then reaped at
+    // 2×dead_timeout — with no peer re-teaching it.
+    sim.run_until(Time(12_000));
+
+    for id in &ids[..3] {
+        assert_eq!(
+            sim.status_of(id, &dead),
+            None,
+            "{id} never reaped the dead tombstone"
+        );
+    }
+}
+
+#[test]
 fn voluntary_leave_removes_node_and_sticks() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c"]);

@@ -28,7 +28,7 @@
 //! [`groupnet-runtime`]: https://docs.rs/groupnet-runtime
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use groupnet_core::{Command, Effect, GroupEngine, NodeId, Status, Time};
 
@@ -82,6 +82,8 @@ pub struct Simulation {
     seq: u64,
     /// Deterministic per-message loss probability, 0..=100 percent.
     loss_percent: u8,
+    /// Directed links that drop every message (a one-way partition).
+    blocked: BTreeSet<(NodeId, NodeId)>,
     /// Observed coordinator transitions, in the order the sim saw them.
     pub coordinator_log: Vec<(NodeId, Option<NodeId>)>,
 }
@@ -114,8 +116,15 @@ impl Simulation {
             queue: BinaryHeap::new(),
             seq: 0,
             loss_percent: 0,
+            blocked: BTreeSet::new(),
             coordinator_log: Vec::new(),
         }
+    }
+
+    /// Drops every message on the directed link `from -> to`, modelling a
+    /// one-way partition. Call twice (both directions) for a full partition.
+    pub fn block(&mut self, from: &NodeId, to: &NodeId) {
+        self.blocked.insert((from.clone(), to.clone()));
     }
 
     /// Sets deterministic per-message packet loss (`percent` of 0..=100).
@@ -150,6 +159,9 @@ impl Simulation {
                 Kind::Deliver { to, from, wire } => {
                     if self.loss_percent != 0 && mix(seq) % 100 < u64::from(self.loss_percent) {
                         continue; // deterministic per-message drop
+                    }
+                    if self.blocked.contains(&(from.clone(), to.clone())) {
+                        continue; // partitioned link
                     }
                     let effects = match self.engines.get_mut(&to) {
                         Some(engine) => engine.on_message(from, &wire, now),

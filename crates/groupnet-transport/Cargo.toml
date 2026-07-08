@@ -1,14 +1,26 @@
 [package]
 name = "groupnet-transport"
-description = "The pluggable Transport trait for Groupnet: bind TCP, UDP, IPC, or shared memory."
+description = "Groupnet transport traits: the dep-free control-plane Transport, and an opt-in data-plane BulkTransport (feature `bulk`)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Default is the control-plane trait only — dependency-free (just groupnet-core).
+# `bulk` adds the data-plane stream trait + framing and pulls its deps.
+bulk = ["dep:bytes", "dep:futures-util", "dep:zerocopy"]
+
 [dependencies]
 groupnet-core = { workspace = true }
+# Data-plane only — inert unless the `bulk` feature is enabled.
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["io"], optional = true }
+zerocopy = { version = "0.8", features = ["derive"], optional = true }
+
+[dev-dependencies]
+futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [lints]
 workspace = true

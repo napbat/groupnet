@@ -29,6 +29,12 @@ pub enum Kind {
     Ping,
     /// A reply to a [`Kind::Ping`], proving the sender is alive.
     Ack,
+    /// "Please probe [`Frame::target`] on my behalf" — sent to indirect probers
+    /// after a direct probe goes unanswered.
+    PingReq,
+    /// "[`Frame::target`] answered my relayed probe" — an indirect prober's
+    /// report back to the origin that the target is alive.
+    IndirectAck,
 }
 
 /// One member's status as the sender sees it, for last-writer-wins merge by
@@ -64,6 +70,9 @@ pub struct Frame {
     pub kind: Kind,
     /// The group it concerns.
     pub group: GroupId,
+    /// The subject of a [`Kind::PingReq`] / [`Kind::IndirectAck`]; `None`
+    /// otherwise.
+    pub target: Option<NodeId>,
     /// Member states the sender currently holds.
     pub members: Vec<MemberDelta>,
     /// Metadata entries the sender currently holds.
@@ -73,12 +82,16 @@ pub struct Frame {
 const KIND_GOSSIP: u8 = 1;
 const KIND_PING: u8 = 2;
 const KIND_ACK: u8 = 3;
+const KIND_PING_REQ: u8 = 4;
+const KIND_INDIRECT_ACK: u8 = 5;
 
 fn kind_to_u8(k: Kind) -> u8 {
     match k {
         Kind::Gossip => KIND_GOSSIP,
         Kind::Ping => KIND_PING,
         Kind::Ack => KIND_ACK,
+        Kind::PingReq => KIND_PING_REQ,
+        Kind::IndirectAck => KIND_INDIRECT_ACK,
     }
 }
 
@@ -87,6 +100,8 @@ fn kind_from_u8(b: u8) -> Option<Kind> {
         KIND_GOSSIP => Some(Kind::Gossip),
         KIND_PING => Some(Kind::Ping),
         KIND_ACK => Some(Kind::Ack),
+        KIND_PING_REQ => Some(Kind::PingReq),
+        KIND_INDIRECT_ACK => Some(Kind::IndirectAck),
         _ => None,
     }
 }
@@ -97,6 +112,14 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(kind_to_u8(frame.kind));
     put_str(&mut out, frame.group.as_str());
+
+    match &frame.target {
+        Some(t) => {
+            out.push(1);
+            put_str(&mut out, t.as_str());
+        }
+        None => out.push(0),
+    }
 
     put_u32(&mut out, frame.members.len() as u32);
     for m in &frame.members {
@@ -123,6 +146,12 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
     let mut cur = bytes;
     let kind = kind_from_u8(take_u8(&mut cur)?)?;
     let group = GroupId::new(get_str(&mut cur)?);
+
+    let target = match take_u8(&mut cur)? {
+        0 => None,
+        1 => Some(NodeId::new(get_str(&mut cur)?)),
+        _ => return None,
+    };
 
     let n = get_u32(&mut cur)? as usize;
     let mut members = Vec::with_capacity(n.min(1024));
@@ -155,6 +184,7 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
     Some(Frame {
         kind,
         group,
+        target,
         members,
         metadata,
     })
@@ -224,8 +254,9 @@ mod tests {
 
     fn sample() -> Frame {
         Frame {
-            kind: Kind::Ping,
+            kind: Kind::PingReq,
             group: GroupId::new("shard-42"),
+            target: Some(NodeId::new("node-c")),
             members: vec![
                 MemberDelta {
                     node: NodeId::new("node-a"),

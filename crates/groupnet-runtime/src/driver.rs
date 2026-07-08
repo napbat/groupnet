@@ -6,10 +6,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Command, Effect, GroupEngine, NodeId, Time};
+use groupnet_core::{Command, Effect, GroupEngine, GroupId, NodeId, Time};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
+
+/// Formats the routing-table key under which a group's coordinator is published.
+pub(crate) fn coordinator_key(group: &GroupId) -> String {
+    format!("coord:{group}")
+}
 
 /// A published, read-only snapshot of a group's metadata.
 pub(crate) type MetaSnapshot = Arc<BTreeMap<String, String>>;
@@ -43,6 +48,9 @@ pub(crate) async fn group_task<T: Transport>(
     mut inbox: mpsc::UnboundedReceiver<Event>,
     transport: Arc<T>,
     publishers: Publishers,
+    // When this group's coordinator becomes us, announce it into the routing
+    // group through this channel. `None` for the routing group itself.
+    routing: Option<mpsc::UnboundedSender<Event>>,
     start: Instant,
     tick_period: Duration,
 ) {
@@ -54,6 +62,10 @@ pub(crate) async fn group_task<T: Transport>(
     // interval; the engine is idempotent under early/extra ticks. If we fall
     // behind, skip missed ticks rather than firing a burst.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // The coordinator we last published to the routing table.
+    let mut announced_coordinator: Option<NodeId> = None;
+    announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
 
     loop {
         let effects = tokio::select! {
@@ -84,8 +96,35 @@ pub(crate) async fn group_task<T: Transport>(
         if members_dirty {
             let snapshot: Vec<NodeId> = engine.members().cloned().collect();
             let _ = publishers.members.send(Arc::new(snapshot));
+            announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
         }
     }
+}
+
+/// Publishes the coordinator this node currently *observes* for its group into
+/// the routing table, whenever that observation changes.
+///
+/// Every member publishes — not just the coordinator itself. Because
+/// coordinator selection is deterministic, all members eventually write the
+/// same value, so last-writer-wins converges on the correct coordinator with no
+/// risk of a stale self-announcement lingering.
+fn announce_coordinator(
+    engine: &GroupEngine,
+    routing: Option<&mpsc::UnboundedSender<Event>>,
+    announced: &mut Option<NodeId>,
+) {
+    let Some(routing) = routing else { return };
+    let current = engine.coordinator().cloned();
+    if current == *announced {
+        return;
+    }
+    if let Some(coordinator) = &current {
+        let _ = routing.send(Event::Local(Command::UpdateMetadata {
+            key: coordinator_key(engine.group()),
+            value: coordinator.to_string(),
+        }));
+    }
+    *announced = current;
 }
 
 async fn dispatch<T: Transport>(

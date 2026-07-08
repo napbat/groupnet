@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use groupnet_core::NodeId;
 use groupnet_runtime::Node;
-use groupnet_runtime::mem::Network;
+use groupnet_transport_mem::Network;
 
 #[tokio::test]
 async fn three_nodes_converge_over_mem_transport() {

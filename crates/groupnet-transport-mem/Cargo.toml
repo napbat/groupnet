@@ -1,0 +1,18 @@
+[package]
+name = "groupnet-transport-mem"
+description = "In-process (in-memory) Transport binding for Groupnet — for tests, examples, and single-process clusters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A concrete Transport binding depends only on the trait and the id type — never
+# on the runtime. It pulls just tokio's channel/sync slice.
+[dependencies]
+groupnet-core = { workspace = true }
+groupnet-transport = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[lints]
+workspace = true

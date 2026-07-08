@@ -8,16 +8,26 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# `runtime` (the async Node/Group API + tokio) is on by default. `sim` (the
-# deterministic simulator) is opt-in. Depend on this crate with
+# `runtime` (the async Node/Group API + tokio) and `mem` (the in-memory
+# transport) are on by default so the basic example works out of the box. `udp`
+# (real sockets) and `sim` (the deterministic simulator) are opt-in. Depend with
 # `default-features = false` for just the sans-IO core + transport trait.
-default = ["runtime"]
+default = ["runtime", "mem"]
 runtime = ["dep:groupnet-runtime"]
+mem = ["dep:groupnet-transport-mem"]
+udp = ["dep:groupnet-transport-udp"]
+# Data plane: `bulk` is the stream trait + framing (in groupnet-transport);
+# `tcp` is the TCP binding.
+bulk = ["groupnet-transport/bulk"]
+tcp = ["bulk", "dep:groupnet-transport-tcp"]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
+groupnet-transport-mem = { workspace = true, optional = true }
+groupnet-transport-udp = { workspace = true, optional = true }
+groupnet-transport-tcp = { workspace = true, optional = true }
 groupnet-runtime = { workspace = true, optional = true }
 groupnet-sim = { workspace = true, optional = true }
 

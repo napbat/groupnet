@@ -1,7 +1,15 @@
 //! # groupnet-transport
 //!
-//! The single extension point most users implement: a best-effort,
-//! message-oriented transport that Groupnet's runtime drives.
+//! Groupnet's transport traits. Two planes, two shapes:
+//!
+//! * **Control plane** — the [`Transport`] trait below: best-effort,
+//!   message-oriented datagrams (gossip, membership, routing). Always available,
+//!   and this crate is **dependency-free** at the default feature set.
+//! * **Data plane** — the [`bulk`] module (feature `bulk`): reliable, ordered
+//!   byte *streams* for replication and bulk transfer. Opt-in, because it pulls
+//!   `futures-io` / `bytes` / `zerocopy` — none of which the control plane needs.
+//!
+//! Bindings for either live in their own `groupnet-transport-*` crates.
 //!
 //! ## Contract
 //!
@@ -28,6 +36,11 @@ use std::error::Error;
 use std::future::Future;
 
 use groupnet_core::NodeId;
+
+/// Data-plane stream transport (feature `bulk`): `BulkTransport`, `DataStream`,
+/// `DataPlane`.
+#[cfg(feature = "bulk")]
+pub mod bulk;
 
 /// A message received from a peer.
 #[derive(Clone, Debug)]
@@ -57,9 +70,3 @@ pub trait Transport: Send + Sync + 'static {
     /// Awaits the next inbound datagram. Returning `Err` ends the receive loop.
     fn recv(&self) -> impl Future<Output = Result<Inbound, Self::Error>> + Send;
 }
-
-// FUTURE: an opt-in `BulkTransport: Transport` capability for large, ordered,
-// one-shot state transfer (anti-entropy / snapshot sync). That path is genuinely
-// stream-shaped and would expose `open(&self, to) -> impl AsyncRead + AsyncWrite`.
-// It is intentionally omitted here so the hot gossip path stays datagram-only
-// and this crate stays dependency-free.
