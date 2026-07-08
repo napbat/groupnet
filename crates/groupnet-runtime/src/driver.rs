@@ -14,11 +14,21 @@ use tokio::time::MissedTickBehavior;
 /// A published, read-only snapshot of a group's metadata.
 pub(crate) type MetaSnapshot = Arc<BTreeMap<String, String>>;
 
+/// A published, read-only snapshot of a group's live members (id order).
+pub(crate) type MembersSnapshot = Arc<Vec<NodeId>>;
+
 /// An event delivered to a group actor: either a decoded network frame or a
 /// local command from the [`Group`](crate::Group) handle.
 pub(crate) enum Event {
     Message { from: NodeId, wire: Vec<u8> },
     Local(Command),
+}
+
+/// The `watch` senders a group actor publishes its readable state through.
+pub(crate) struct Publishers {
+    pub coordinator: watch::Sender<Option<NodeId>>,
+    pub metadata: watch::Sender<MetaSnapshot>,
+    pub members: watch::Sender<MembersSnapshot>,
 }
 
 /// Maps wall-clock elapsed time onto the engine's logical [`Time`]. This is the
@@ -32,13 +42,12 @@ pub(crate) async fn group_task<T: Transport>(
     mut engine: GroupEngine,
     mut inbox: mpsc::UnboundedReceiver<Event>,
     transport: Arc<T>,
-    coord_tx: watch::Sender<Option<NodeId>>,
-    meta_tx: watch::Sender<MetaSnapshot>,
+    publishers: Publishers,
     start: Instant,
     tick_period: Duration,
 ) {
     let boot = engine.start(now_since(start));
-    dispatch(&transport, &coord_tx, boot).await;
+    dispatch(&transport, &publishers.coordinator, boot).await;
 
     let mut ticker = tokio::time::interval(tick_period);
     // We approximate the engine's precise ArmTimer deadlines with a fixed
@@ -49,7 +58,9 @@ pub(crate) async fn group_task<T: Transport>(
     loop {
         let effects = tokio::select! {
             maybe = inbox.recv() => match maybe {
-                Some(Event::Message { from, wire }) => engine.on_message(from, &wire),
+                Some(Event::Message { from, wire }) => {
+                    engine.on_message(from, &wire, now_since(start))
+                }
                 Some(Event::Local(cmd)) => engine.apply(cmd),
                 None => break, // handle and all route senders dropped
             },
@@ -58,14 +69,21 @@ pub(crate) async fn group_task<T: Transport>(
         let meta_dirty = effects
             .iter()
             .any(|e| matches!(e, Effect::MetadataChanged { .. }));
-        dispatch(&transport, &coord_tx, effects).await;
+        let members_dirty = effects
+            .iter()
+            .any(|e| matches!(e, Effect::MembershipChanged));
+        dispatch(&transport, &publishers.coordinator, effects).await;
+        // Republish snapshots; readers borrow them lock-free.
         if meta_dirty {
-            // Republish the full snapshot; readers borrow it lock-free.
             let snapshot: BTreeMap<String, String> = engine
                 .metadata_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
-            let _ = meta_tx.send(Arc::new(snapshot));
+            let _ = publishers.metadata.send(Arc::new(snapshot));
+        }
+        if members_dirty {
+            let snapshot: Vec<NodeId> = engine.members().cloned().collect();
+            let _ = publishers.members.send(Arc::new(snapshot));
         }
     }
 }

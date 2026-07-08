@@ -32,7 +32,7 @@
 
 // Core types and the wire protocol are always available.
 pub use groupnet_core::{
-    Command, Config, Effect, GroupEngine, GroupId, NodeId, Time, VersionedValue, wire,
+    Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, VersionedValue, wire,
 };
 pub use groupnet_transport::{Inbound, Transport};
 

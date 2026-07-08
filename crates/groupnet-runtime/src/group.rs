@@ -1,7 +1,7 @@
 use groupnet_core::{Command, GroupId, NodeId};
 use tokio::sync::{mpsc, watch};
 
-use crate::driver::{Event, MetaSnapshot};
+use crate::driver::{Event, MembersSnapshot, MetaSnapshot};
 
 /// A transactional batch of shard-local operations, built inside
 /// [`Group::sync`]. Operations are collected and handed to the group actor to
@@ -33,6 +33,7 @@ pub struct Group {
     tx: mpsc::UnboundedSender<Event>,
     coord_rx: watch::Receiver<Option<NodeId>>,
     meta_rx: watch::Receiver<MetaSnapshot>,
+    members_rx: watch::Receiver<MembersSnapshot>,
 }
 
 impl Group {
@@ -42,6 +43,7 @@ impl Group {
         tx: mpsc::UnboundedSender<Event>,
         coord_rx: watch::Receiver<Option<NodeId>>,
         meta_rx: watch::Receiver<MetaSnapshot>,
+        members_rx: watch::Receiver<MembersSnapshot>,
     ) -> Self {
         Self {
             id,
@@ -49,6 +51,7 @@ impl Group {
             tx,
             coord_rx,
             meta_rx,
+            members_rx,
         }
     }
 
@@ -69,6 +72,13 @@ impl Group {
     #[must_use]
     pub fn is_coordinator(&self) -> bool {
         self.coord_rx.borrow().as_ref() == Some(&self.local)
+    }
+
+    /// The current live members (anything not `Dead`), in id order. Failed and
+    /// departed nodes drop out once failure detection converges.
+    #[must_use]
+    pub fn members(&self) -> Vec<NodeId> {
+        self.members_rx.borrow().as_ref().clone()
     }
 
     /// Reads a metadata value as this node currently sees it. Values propagate

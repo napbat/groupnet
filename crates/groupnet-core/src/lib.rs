@@ -32,7 +32,7 @@ mod id;
 
 pub mod wire;
 
-pub use engine::{Command, Config, Effect, GroupEngine, VersionedValue};
+pub use engine::{Command, Config, Effect, GroupEngine, Status, VersionedValue};
 pub use id::{GroupId, NodeId};
 
 /// A logical, monotonic timestamp in milliseconds since a driver-chosen epoch.

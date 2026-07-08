@@ -65,6 +65,25 @@ async fn three_nodes_converge_over_mem_transport() {
     }
     assert!(propagated, "metadata did not propagate to all nodes");
 
+    // Membership converged to all three over the live read path.
+    assert!(groups.iter().all(|g| g.members().len() == 3));
+
+    // node-c leaves gracefully; the other two must drop it from their view.
+    let leaver = ids[2].clone();
+    groups[2].leave();
+    let mut removed = false;
+    for _ in 0..150 {
+        if groups[..2].iter().all(|g| !g.members().contains(&leaver)) {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(removed, "graceful leave did not propagate");
+    for g in &groups[..2] {
+        assert_eq!(g.members().len(), 2);
+    }
+
     // Keep nodes alive until the end of the test.
     drop(nodes);
 }

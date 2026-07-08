@@ -30,7 +30,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
-use groupnet_core::{Command, Effect, GroupEngine, NodeId, Time};
+use groupnet_core::{Command, Effect, GroupEngine, NodeId, Status, Time};
 
 /// One scheduled future event in the simulation.
 struct Event {
@@ -144,6 +144,7 @@ impl Simulation {
             }
             let event = self.queue.pop().expect("peeked");
             self.now = event.at;
+            let now = self.now;
             let seq = event.seq;
             match event.kind {
                 Kind::Deliver { to, from, wire } => {
@@ -151,7 +152,7 @@ impl Simulation {
                         continue; // deterministic per-message drop
                     }
                     let effects = match self.engines.get_mut(&to) {
-                        Some(engine) => engine.on_message(from, &wire),
+                        Some(engine) => engine.on_message(from, &wire, now),
                         None => continue,
                     };
                     self.dispatch(&to, effects);
@@ -197,6 +198,30 @@ impl Simulation {
         self.engines
             .get(node)
             .and_then(|e| e.metadata(key).map(str::to_owned))
+    }
+
+    /// Abruptly removes `node` from the simulation — it stops sending acks and
+    /// gossip, modelling a crash. Survivors must detect it via failure
+    /// detection.
+    pub fn crash(&mut self, node: &NodeId) {
+        self.engines.remove(node);
+    }
+
+    /// Whether `observer` currently considers `node` a live member (present and
+    /// not `Dead`).
+    #[must_use]
+    pub fn is_member(&self, observer: &NodeId, node: &NodeId) -> bool {
+        self.engines
+            .get(observer)
+            .is_some_and(|e| e.members().any(|n| n == node))
+    }
+
+    /// The status `observer` holds for `node`, if any (including `Dead`).
+    #[must_use]
+    pub fn status_of(&self, observer: &NodeId, node: &NodeId) -> Option<Status> {
+        self.engines
+            .get(observer)
+            .and_then(|e| e.member_status(node))
     }
 
     /// Whether every node has converged on the same (non-`None`) coordinator.

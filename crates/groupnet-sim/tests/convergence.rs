@@ -1,7 +1,7 @@
 //! End-to-end determinism tests: the same core, driven by a virtual clock,
 //! must converge every node on one coordinator — reproducibly.
 
-use groupnet_core::{Command, Config, GroupEngine, GroupId, NodeId, Time};
+use groupnet_core::{Command, Config, GroupEngine, GroupId, NodeId, Status, Time};
 use groupnet_sim::Simulation;
 
 fn node_ids(names: &[&str]) -> Vec<NodeId> {
@@ -9,6 +9,16 @@ fn node_ids(names: &[&str]) -> Vec<NodeId> {
 }
 
 fn build(group: &GroupId, ids: &[NodeId], latency: u64, loss_percent: u8) -> Simulation {
+    build_with(group, ids, latency, loss_percent, Config::default())
+}
+
+fn build_with(
+    group: &GroupId,
+    ids: &[NodeId],
+    latency: u64,
+    loss_percent: u8,
+    config: Config,
+) -> Simulation {
     let mut sim = Simulation::new(latency).with_loss(loss_percent);
     for id in ids {
         let seeds = ids.iter().filter(|x| *x != id).cloned();
@@ -16,7 +26,7 @@ fn build(group: &GroupId, ids: &[NodeId], latency: u64, loss_percent: u8) -> Sim
             group.clone(),
             id.clone(),
             seeds,
-            Config::default(),
+            config.clone(),
         ));
     }
     sim
@@ -41,8 +51,16 @@ fn converges_despite_deterministic_loss() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c", "node-d"]);
 
-    // Drop a third of all messages: gossip's redundancy must still converge.
-    let mut sim = build(&group, &ids, 10, 33);
+    // This test isolates *dissemination* under loss, so we disable failure
+    // detection: with only direct probes, 33% loss would produce false
+    // positives (the exact problem indirect probes / ping-req solve). Gossip's
+    // redundancy must still carry membership to convergence.
+    let cfg = Config {
+        probe_timeout_ms: 10_000_000,
+        suspect_timeout_ms: 10_000_000,
+        ..Config::default()
+    };
+    let mut sim = build_with(&group, &ids, 10, 33, cfg);
     sim.run_until(Time(10_000));
 
     assert!(sim.all_agree_on_coordinator());
@@ -126,5 +144,56 @@ fn latest_write_wins_across_nodes() {
 
     for id in &ids {
         assert_eq!(sim.metadata_of(id, "routing").as_deref(), Some("v2"));
+    }
+}
+
+#[test]
+fn detects_and_removes_a_crashed_node() {
+    let group = GroupId::new("shard-42");
+    let ids = node_ids(&["node-a", "node-b", "node-c", "node-d"]);
+
+    let mut sim = build(&group, &ids, 10, 0);
+    sim.run_until(Time(2_000));
+    for id in &ids {
+        assert_eq!(sim.member_count(id), 4, "did not converge before crash");
+    }
+
+    // node-d crashes: it stops acking probes and gossiping.
+    let dead = ids[3].clone();
+    sim.crash(&dead);
+    sim.run_until(Time(14_000));
+
+    // Survivors detect it, mark it Dead, and drop it from the live set.
+    for id in &ids[..3] {
+        assert_eq!(
+            sim.status_of(id, &dead),
+            Some(Status::Dead),
+            "{id} still trusts crashed node"
+        );
+        assert!(!sim.is_member(id, &dead));
+        assert_eq!(sim.member_count(id), 3);
+    }
+    // The coordinator must be a survivor, and all survivors agree.
+    assert!(sim.all_agree_on_coordinator());
+    assert_ne!(sim.coordinator_of(&ids[0]), Some(dead));
+}
+
+#[test]
+fn voluntary_leave_removes_node_and_sticks() {
+    let group = GroupId::new("shard-42");
+    let ids = node_ids(&["node-a", "node-b", "node-c"]);
+
+    let mut sim = build(&group, &ids, 10, 0);
+    sim.run_until(Time(2_000));
+
+    // node-c leaves gracefully; the leave must disseminate and not be refuted
+    // (a grow-set could never express this).
+    let gone = ids[2].clone();
+    sim.command(&gone, Command::Leave);
+    sim.run_until(Time(6_000));
+
+    for id in &ids[..2] {
+        assert_eq!(sim.status_of(id, &gone), Some(Status::Dead));
+        assert_eq!(sim.member_count(id), 2);
     }
 }

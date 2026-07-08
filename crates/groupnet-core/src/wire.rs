@@ -4,22 +4,46 @@
 //! ever move opaque `&[u8]` — a TCP, UDP, IPC, or shared-memory binding never
 //! re-encodes the protocol and so can never drift out of sync with it.
 //!
-//! The codec is a small hand-rolled length-prefixed format (little-endian).
-//! It's deliberately dependency-free; swap it for `postcard`/`bincode` later if
-//! the protocol grows, but keep this crate dep-free by default.
+//! Every message is a [`Frame`] with a [`Kind`] (gossip / ping / ack) plus the
+//! sender's current membership and metadata view, piggybacked for
+//! infection-style dissemination. The codec is a small hand-rolled
+//! length-prefixed format (little-endian), deliberately dependency-free.
 //!
-//! **Invariant:** every message encodes its [`GroupId`] immediately after the
-//! one-byte tag. [`peek_group`] relies on this so a driver can demux an inbound
-//! frame to the right group without fully decoding it.
+//! **Invariant:** a frame encodes its [`GroupId`] immediately after the
+//! one-byte kind tag, so [`peek_group`] can demux an inbound frame to the right
+//! group without fully decoding it.
+//!
+//! Member status is carried as a raw `u8`; the engine owns the `Status` enum
+//! and its mapping, keeping this module pure serialization.
 //!
 //! [`Transport`]: https://docs.rs/groupnet-transport
 
 use crate::{GroupId, NodeId};
 
-const TAG_GOSSIP: u8 = 1;
+/// What a [`Frame`] is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Periodic anti-entropy dissemination.
+    Gossip,
+    /// A liveness probe; the receiver must reply with [`Kind::Ack`].
+    Ping,
+    /// A reply to a [`Kind::Ping`], proving the sender is alive.
+    Ack,
+}
 
-/// A single metadata key's value plus its last-writer-wins timestamp. Receivers
-/// keep the entry with the greater `(version, writer)` — a per-key LWW-register.
+/// One member's status as the sender sees it, for last-writer-wins merge by
+/// `(incarnation, status)` (see the engine's SWIM merge rules).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberDelta {
+    /// The node this entry describes.
+    pub node: NodeId,
+    /// The node's incarnation number (bumped by the node itself to refute).
+    pub incarnation: u64,
+    /// Status code (engine-defined; `0 = alive, 1 = suspect, 2 = dead`).
+    pub status: u8,
+}
+
+/// One metadata key's value plus its last-writer-wins timestamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetaDelta {
     /// Metadata key.
@@ -32,87 +56,108 @@ pub struct MetaDelta {
     pub value: String,
 }
 
-/// A protocol message exchanged between nodes.
+/// A protocol frame: a kind plus the sender's piggybacked membership and
+/// metadata view.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Msg {
-    /// A gossip round carrying the sender's current membership view and its
-    /// metadata entries. Receivers merge membership by set union (grow-set in
-    /// this scaffold) and metadata by last-writer-wins.
-    Gossip {
-        /// The group this delta concerns.
-        group: GroupId,
-        /// Members the sender currently knows about.
-        members: Vec<NodeId>,
-        /// Metadata entries the sender currently holds.
-        metadata: Vec<MetaDelta>,
-    },
+pub struct Frame {
+    /// What this frame is for.
+    pub kind: Kind,
+    /// The group it concerns.
+    pub group: GroupId,
+    /// Member states the sender currently holds.
+    pub members: Vec<MemberDelta>,
+    /// Metadata entries the sender currently holds.
+    pub metadata: Vec<MetaDelta>,
 }
 
-/// Encodes a message to bytes for a transport to ship.
+const KIND_GOSSIP: u8 = 1;
+const KIND_PING: u8 = 2;
+const KIND_ACK: u8 = 3;
+
+fn kind_to_u8(k: Kind) -> u8 {
+    match k {
+        Kind::Gossip => KIND_GOSSIP,
+        Kind::Ping => KIND_PING,
+        Kind::Ack => KIND_ACK,
+    }
+}
+
+fn kind_from_u8(b: u8) -> Option<Kind> {
+    match b {
+        KIND_GOSSIP => Some(Kind::Gossip),
+        KIND_PING => Some(Kind::Ping),
+        KIND_ACK => Some(Kind::Ack),
+        _ => None,
+    }
+}
+
+/// Encodes a frame to bytes for a transport to ship.
 #[must_use]
-pub fn encode(msg: &Msg) -> Vec<u8> {
+pub fn encode(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::new();
-    match msg {
-        Msg::Gossip {
-            group,
-            members,
-            metadata,
-        } => {
-            out.push(TAG_GOSSIP);
-            put_str(&mut out, group.as_str());
-            put_u32(&mut out, members.len() as u32);
-            for m in members {
-                put_str(&mut out, m.as_str());
-            }
-            put_u32(&mut out, metadata.len() as u32);
-            for d in metadata {
-                put_str(&mut out, &d.key);
-                put_u64(&mut out, d.version);
-                put_str(&mut out, d.writer.as_str());
-                put_str(&mut out, &d.value);
-            }
-        }
+    out.push(kind_to_u8(frame.kind));
+    put_str(&mut out, frame.group.as_str());
+
+    put_u32(&mut out, frame.members.len() as u32);
+    for m in &frame.members {
+        put_str(&mut out, m.node.as_str());
+        put_u64(&mut out, m.incarnation);
+        out.push(m.status);
+    }
+
+    put_u32(&mut out, frame.metadata.len() as u32);
+    for d in &frame.metadata {
+        put_str(&mut out, &d.key);
+        put_u64(&mut out, d.version);
+        put_str(&mut out, d.writer.as_str());
+        put_str(&mut out, &d.value);
     }
     out
 }
 
-/// Decodes a message previously produced by [`encode`]. Returns `None` on any
-/// malformed or truncated input — the engine treats undecodable frames as
-/// dropped, which is safe because the transport contract is best-effort anyway.
+/// Decodes a frame produced by [`encode`]. Returns `None` on any malformed or
+/// truncated input — the engine treats undecodable frames as dropped, which is
+/// safe because the transport contract is best-effort anyway.
 #[must_use]
-pub fn decode(bytes: &[u8]) -> Option<Msg> {
+pub fn decode(bytes: &[u8]) -> Option<Frame> {
     let mut cur = bytes;
-    let tag = take_u8(&mut cur)?;
-    match tag {
-        TAG_GOSSIP => {
-            let group = GroupId::new(get_str(&mut cur)?);
-            let n = get_u32(&mut cur)? as usize;
-            let mut members = Vec::with_capacity(n.min(1024));
-            for _ in 0..n {
-                members.push(NodeId::new(get_str(&mut cur)?));
-            }
-            let m = get_u32(&mut cur)? as usize;
-            let mut metadata = Vec::with_capacity(m.min(1024));
-            for _ in 0..m {
-                let key = get_str(&mut cur)?;
-                let version = get_u64(&mut cur)?;
-                let writer = NodeId::new(get_str(&mut cur)?);
-                let value = get_str(&mut cur)?;
-                metadata.push(MetaDelta {
-                    key,
-                    version,
-                    writer,
-                    value,
-                });
-            }
-            Some(Msg::Gossip {
-                group,
-                members,
-                metadata,
-            })
-        }
-        _ => None,
+    let kind = kind_from_u8(take_u8(&mut cur)?)?;
+    let group = GroupId::new(get_str(&mut cur)?);
+
+    let n = get_u32(&mut cur)? as usize;
+    let mut members = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let node = NodeId::new(get_str(&mut cur)?);
+        let incarnation = get_u64(&mut cur)?;
+        let status = take_u8(&mut cur)?;
+        members.push(MemberDelta {
+            node,
+            incarnation,
+            status,
+        });
     }
+
+    let m = get_u32(&mut cur)? as usize;
+    let mut metadata = Vec::with_capacity(m.min(1024));
+    for _ in 0..m {
+        let key = get_str(&mut cur)?;
+        let version = get_u64(&mut cur)?;
+        let writer = NodeId::new(get_str(&mut cur)?);
+        let value = get_str(&mut cur)?;
+        metadata.push(MetaDelta {
+            key,
+            version,
+            writer,
+            value,
+        });
+    }
+
+    Some(Frame {
+        kind,
+        group,
+        members,
+        metadata,
+    })
 }
 
 /// Cheaply reads just the [`GroupId`] from an encoded frame without decoding the
@@ -120,7 +165,7 @@ pub fn decode(bytes: &[u8]) -> Option<Msg> {
 #[must_use]
 pub fn peek_group(bytes: &[u8]) -> Option<GroupId> {
     let mut cur = bytes;
-    let _tag = take_u8(&mut cur)?;
+    let _kind = take_u8(&mut cur)?;
     Some(GroupId::new(get_str(&mut cur)?))
 }
 
@@ -177,43 +222,42 @@ fn get_str(cur: &mut &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trips() {
-        let msg = Msg::Gossip {
+    fn sample() -> Frame {
+        Frame {
+            kind: Kind::Ping,
             group: GroupId::new("shard-42"),
-            members: vec![NodeId::new("node-a"), NodeId::new("node-b")],
-            metadata: vec![
-                MetaDelta {
-                    key: "routing".into(),
-                    version: 3,
-                    writer: NodeId::new("node-a"),
-                    value: "v3".into(),
+            members: vec![
+                MemberDelta {
+                    node: NodeId::new("node-a"),
+                    incarnation: 2,
+                    status: 0,
                 },
-                MetaDelta {
-                    key: "shards".into(),
-                    version: 1,
-                    writer: NodeId::new("node-b"),
-                    value: "16".into(),
+                MemberDelta {
+                    node: NodeId::new("node-b"),
+                    incarnation: 5,
+                    status: 1,
                 },
             ],
-        };
-        let bytes = encode(&msg);
-        assert_eq!(decode(&bytes), Some(msg));
+            metadata: vec![MetaDelta {
+                key: "routing".into(),
+                version: 3,
+                writer: NodeId::new("node-a"),
+                value: "v3".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn round_trips() {
+        let frame = sample();
+        let bytes = encode(&frame);
+        assert_eq!(decode(&bytes), Some(frame));
         assert_eq!(peek_group(&bytes), Some(GroupId::new("shard-42")));
     }
 
     #[test]
     fn truncated_input_decodes_to_none_not_panic() {
-        let bytes = encode(&Msg::Gossip {
-            group: GroupId::new("g"),
-            members: vec![NodeId::new("n")],
-            metadata: vec![MetaDelta {
-                key: "k".into(),
-                version: 7,
-                writer: NodeId::new("n"),
-                value: "v".into(),
-            }],
-        });
+        let bytes = encode(&sample());
         for cut in 0..bytes.len() {
             let _ = decode(&bytes[..cut]); // must never panic
         }

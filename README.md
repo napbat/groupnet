@@ -80,10 +80,12 @@ pub trait Transport: Send + Sync + 'static {
 
 ## Coordinator selection
 
-The coordinator is *derived*, never elected: every node scores each member with
-rendezvous (highest-random-weight) hashing over `hash(group ‖ node)` and the
-highest score wins. This spreads coordinator load evenly across groups and stays
-stable under churn. The hash is a fixed FNV-1a so all nodes agree on every
+The coordinator is *derived*, never elected: every node scores each **live**
+member (Alive or Suspect — never Dead) with rendezvous (highest-random-weight)
+hashing over `hash(group ‖ node)` and the highest score wins. This spreads
+coordinator load evenly across groups and stays stable under churn; when a node
+dies or leaves it drops out of candidacy and the coordinator moves
+deterministically. The hash is a fixed FNV-1a so all nodes agree on every
 platform (`std`'s `DefaultHasher` is deliberately *not* stable and must never be
 used for cross-node agreement).
 
@@ -107,9 +109,17 @@ Scaffolded and honest about what's stubbed:
   value)` deltas; every node merges them as a per-key last-writer-wins register
   (`(version, writer)` tiebreak), so `sync`/`update_metadata` converges
   cluster-wide. Reads are a lock-free snapshot via `Group::metadata`.
-- **Real membership.** Members are a grow-set today. Production needs SWIM-style
-  failure detection with `suspect`/`dead` tombstones so `leave` and crashes
-  actually remove nodes.
+- ~~**Real membership.**~~ *Done.* SWIM-style membership: per-node incarnation
+  numbers, an `Alive`/`Suspect`/`Dead` state machine, direct liveness probes
+  (`Ping`/`Ack`), a suspicion window with self-refutation, and a real `leave`
+  that sticks. Crashes and departures drop nodes from the live set and from
+  coordinator candidacy. Read via `Group::members()`.
+- **Indirect probes (`ping-req`).** Failure detection is direct-only today, so a
+  lossy link can cause false positives (a wrongly-suspected node refutes, but
+  it's churn). SWIM's k indirect probers before declaring suspicion are the next
+  refinement.
+- **Dead-node reaping.** `Dead` entries are kept as tombstones and never GC'd;
+  production needs a bounded tombstone lifetime.
 - **Inter-group routing map.** The cluster-wide "which group owns which
   key-range" table (read-mostly, snapshot-published) is designed but not yet
   built.

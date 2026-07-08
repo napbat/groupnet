@@ -6,7 +6,7 @@ use groupnet_core::{Config, GroupEngine, GroupId, NodeId};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
-use crate::driver::{Event, group_task};
+use crate::driver::{Event, Publishers, group_task};
 use crate::group::Group;
 
 struct Inner<T: Transport> {
@@ -79,6 +79,8 @@ impl<T: Transport> Node<T> {
         // publish an initial value.
         let (coord_tx, coord_rx) = watch::channel(engine.coordinator().cloned());
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
+        let initial_members: Vec<NodeId> = engine.members().cloned().collect();
+        let (members_tx, members_rx) = watch::channel(Arc::new(initial_members));
 
         self.inner
             .routes
@@ -86,18 +88,37 @@ impl<T: Transport> Node<T> {
             .expect("routes mutex poisoned")
             .insert(group.clone(), tx.clone());
 
-        let tick_period = Duration::from_millis((self.inner.config.gossip_interval_ms / 2).max(1));
+        // Tick often enough to service the tightest engine deadline (probe
+        // timeouts are the shortest), so failure detection isn't lagged by a
+        // coarse gossip-only cadence.
+        let cfg = &self.inner.config;
+        let tick_ms = cfg
+            .gossip_interval_ms
+            .min(cfg.probe_interval_ms)
+            .min(cfg.probe_timeout_ms)
+            .max(2);
+        let tick_period = Duration::from_millis((tick_ms / 2).max(1));
         tokio::spawn(group_task(
             engine,
             rx,
             self.inner.transport.clone(),
-            coord_tx,
-            meta_tx,
+            Publishers {
+                coordinator: coord_tx,
+                metadata: meta_tx,
+                members: members_tx,
+            },
             self.inner.start,
             tick_period,
         ));
 
-        Group::new(group, self.inner.id.clone(), tx, coord_rx, meta_rx)
+        Group::new(
+            group,
+            self.inner.id.clone(),
+            tx,
+            coord_rx,
+            meta_rx,
+            members_rx,
+        )
     }
 }
 
