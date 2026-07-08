@@ -10,8 +10,6 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/napbat/groupnet"
 
-# Internal crates are referenced by path so the workspace builds standalone,
-# and by version so it can be published to a registry unchanged.
 [workspace.dependencies]
 groupnet-core = { path = "crates/groupnet-core", version = "0.1.0" }
 groupnet-transport = { path = "crates/groupnet-transport", version = "0.1.0" }
@@ -31,10 +29,14 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
 ] }
 
-# Lints applied to every crate. Keep the tree thin, safe, and honest.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"

@@ -32,6 +32,10 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use groupnet_core::{Command, Effect, GroupEngine, NodeId, Status, Time};
 
+mod rng;
+
+pub use rng::SplitMix64;
+
 /// One scheduled future event in the simulation.
 struct Event {
     at: Time,
@@ -86,16 +90,6 @@ pub struct Simulation {
     blocked: BTreeSet<(NodeId, NodeId)>,
     /// Observed coordinator transitions, in the order the sim saw them.
     pub coordinator_log: Vec<(NodeId, Option<NodeId>)>,
-}
-
-/// A splitmix64 finalizer: turns a sequential counter into a well-distributed
-/// value so loss decisions are deterministic yet don't alias with the (equally
-/// deterministic) send order — which a plain `seq % n` would.
-fn mix(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 impl std::fmt::Debug for Event {
@@ -172,7 +166,9 @@ impl Simulation {
             let seq = event.seq;
             match event.kind {
                 Kind::Deliver { to, from, wire } => {
-                    if self.loss_percent != 0 && mix(seq) % 100 < u64::from(self.loss_percent) {
+                    if self.loss_percent != 0
+                        && SplitMix64::hash(seq) % 100 < u64::from(self.loss_percent)
+                    {
                         continue; // deterministic per-message drop
                     }
                     if self.blocked.contains(&(from.clone(), to.clone())) {

@@ -1,26 +1,25 @@
 //! # Groupnet
 //!
 //! A deterministic, leaderless coordination fabric for systems that partition
-//! state into shard groups. This umbrella crate re-exports the layered pieces:
+//! state into shard groups. This umbrella crate re-exports the layered pieces as
+//! one namespaced hierarchy — each module mirrors an underlying crate:
 //!
-//! | Layer | Crate | Role |
-//! |-------|-------|------|
-//! | core | [`groupnet_core`] | sans-IO state machine + [`placement`] (weighted HA-hash) — pure, deterministic, dep-free |
-//! | control transport | [`groupnet_transport`] | the datagram [`Transport`] trait you bind |
-//! | control bindings | `groupnet-transport-{mem,udp}` | re-exported as [`mem`] / [`udp`] |
-//! | data plane | [`groupnet_transport`]`::bulk` | stream `BulkTransport` + framing — re-exported as [`bulk`] *(feature `bulk`)* |
-//! | data binding | `groupnet-transport-tcp` | TCP stream binding — re-exported as [`tcp`] *(feature `tcp`)* |
-//! | runtime | [`groupnet_runtime`] | async, group-per-task [`Node`]/[`Group`] driver + [`Routing`] *(feature `runtime`, default)* |
-//! | sim | [`groupnet_sim`] | deterministic single-threaded [`Simulation`] *(feature `sim`)* |
+//! | Module | Role |
+//! |--------|------|
+//! | [`core`] | sans-IO state machine, identity, weighted [`placement`](core::placement) (HA-hash), and the [`wire`](core::wire) protocol — pure, deterministic, dep-free |
+//! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) |
+//! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
+//! | [`sim`] | deterministic single-threaded [`Simulation`](sim::Simulation) *(feature `sim`)* |
 //!
 //! Two planes: the **control plane** (small best-effort datagrams — gossip,
 //! membership, routing) and the opt-in **data plane** (reliable byte streams —
-//! replication, bulk transfer). Both are transport-agnostic; bind whichever
-//! crate you want or your own impls.
+//! replication, bulk transfer). Both are transport-agnostic; use a bundled
+//! binding or implement the trait yourself.
 //!
 //! ```no_run
-//! use groupnet::{Node, NodeId};
-//! use groupnet::mem::Network;
+//! use groupnet::core::NodeId;
+//! use groupnet::runtime::Node;
+//! use groupnet::transport::mem::Network;
 //!
 //! # async fn demo() {
 //! let net = Network::new();
@@ -35,38 +34,47 @@
 //! # }
 //! ```
 //!
-//! For just the engine and trait (no async runtime), depend with
-//! `default-features = false`.
+//! Want fewer dependencies? Depend on the underlying crates directly
+//! (`groupnet-core`, `groupnet-transport`, …) rather than this facade — the split
+//! is what keeps the core dependency-free and the async runtime optional.
 
-// Core types, the placement primitive, and the wire protocol are always
-// available.
-pub use groupnet_core::{
-    Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, VersionedValue, placement,
-    wire,
-};
-pub use groupnet_transport::{Inbound, Transport};
+/// Sans-IO core: the deterministic [`GroupEngine`](core::GroupEngine), the
+/// identity types, weighted [`placement`](core::placement), and the
+/// [`wire`](core::wire) protocol. Pure, deterministic, dependency-free.
+pub use groupnet_core as core;
 
-/// Async runtime layer: `Node`, `Group`, and the routing table.
+/// Transport layer: the control-plane [`Transport`](transport::Transport) trait,
+/// the opt-in data-plane [`bulk`](transport::bulk) streams, and the concrete
+/// socket / in-memory bindings.
+pub mod transport {
+    pub use groupnet_transport::{Inbound, Transport};
+
+    /// Data-plane stream transport: `BulkTransport`, `DataStream`, `DataPlane`
+    /// *(feature `bulk`)*.
+    #[cfg(feature = "bulk")]
+    pub use groupnet_transport::bulk;
+
+    /// In-memory control-plane binding, for tests and single-process clusters
+    /// *(feature `mem`)*.
+    #[cfg(feature = "mem")]
+    pub use groupnet_transport_mem as mem;
+
+    /// UDP control-plane binding *(feature `udp`)*.
+    #[cfg(feature = "udp")]
+    pub use groupnet_transport_udp as udp;
+
+    /// TCP data-plane binding *(feature `tcp`)*.
+    #[cfg(feature = "tcp")]
+    pub use groupnet_transport_tcp as tcp;
+}
+
+/// Async runtime: the group-per-task [`Node`](runtime::Node) /
+/// [`Group`](runtime::Group) driver and the cluster [`Routing`](runtime::Routing)
+/// table.
 #[cfg(feature = "runtime")]
-pub use groupnet_runtime::{Group, Node, NodeBuilder, Routing, SyncCtx};
+pub use groupnet_runtime as runtime;
 
-/// In-memory control-plane transport binding (`groupnet-transport-mem`).
-#[cfg(feature = "mem")]
-pub use groupnet_transport_mem as mem;
-
-/// UDP control-plane transport binding (`groupnet-transport-udp`).
-#[cfg(feature = "udp")]
-pub use groupnet_transport_udp as udp;
-
-/// Data-plane stream transport: `BulkTransport`, `DataStream`, `DataPlane`
-/// (`groupnet-transport`'s `bulk` module).
-#[cfg(feature = "bulk")]
-pub use groupnet_transport::bulk;
-
-/// TCP data-plane binding (`groupnet-transport-tcp`).
-#[cfg(feature = "tcp")]
-pub use groupnet_transport_tcp as tcp;
-
-/// Deterministic simulation driver.
+/// Deterministic simulation driver ([`Simulation`](sim::Simulation)) and its
+/// seedable PRNG.
 #[cfg(feature = "sim")]
-pub use groupnet_sim::Simulation;
+pub use groupnet_sim as sim;

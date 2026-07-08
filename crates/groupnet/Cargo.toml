@@ -33,3 +33,8 @@ groupnet-sim = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+# The doc table and its links cover every layer, so render docs.rs with all
+# features on — otherwise the feature-gated modules (sim, tcp, …) go missing.
+[package.metadata.docs.rs]
+all-features = true

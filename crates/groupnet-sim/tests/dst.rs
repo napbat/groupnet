@@ -17,24 +17,11 @@ use std::collections::BTreeSet;
 
 use groupnet_core::Time;
 use groupnet_core::{Command, Config, GroupEngine, GroupId, NodeId, Status, placement};
-use groupnet_sim::Simulation;
+use groupnet_sim::{Simulation, SplitMix64};
 
-/// splitmix64 — deterministic, seedable.
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed ^ 0x9e37_79b9_7f4a_7c15)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: u32) -> u32 {
-        (self.next_u64() % u64::from(n.max(1))) as u32
-    }
+/// Seeds the shared deterministic PRNG so each fault schedule is reproducible.
+fn rng(seed: u64) -> SplitMix64 {
+    SplitMix64::new(seed ^ 0x9e37_79b9_7f4a_7c15)
 }
 
 fn cfg() -> Config {
@@ -55,7 +42,7 @@ fn engine(group: &GroupId, id: &NodeId, alive: &BTreeSet<NodeId>) -> GroupEngine
     GroupEngine::new(group.clone(), id.clone(), seeds, cfg())
 }
 
-fn pick(set: &BTreeSet<NodeId>, rng: &mut Rng) -> NodeId {
+fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     v[rng.below(v.len() as u32) as usize].clone()
 }
@@ -68,7 +55,7 @@ fn dst_safety_and_liveness_across_seeds() {
 }
 
 fn run_scenario(seed: u64) {
-    let mut rng = Rng::new(seed);
+    let mut rng = rng(seed);
     let group = GroupId::new("shard");
     let n = 3 + rng.below(4); // 3..=6 nodes
     let all: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();

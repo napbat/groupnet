@@ -119,14 +119,16 @@ impl<T: Transport> Node<T> {
 
         // Tick often enough to service the tightest engine deadline (probe
         // timeouts are the shortest), so failure detection isn't lagged by a
-        // coarse gossip-only cadence.
+        // coarse gossip-only cadence. Sampling at `TICKS_PER_DEADLINE`× the
+        // tightest deadline bounds how late a deadline can fire to one tick; the
+        // engine is idempotent under early/extra ticks, so oversampling is safe.
+        const TICKS_PER_DEADLINE: u64 = 2;
         let cfg = &self.inner.config;
-        let tick_ms = cfg
+        let tightest_deadline_ms = cfg
             .gossip_interval_ms
             .min(cfg.probe_interval_ms)
-            .min(cfg.probe_timeout_ms)
-            .max(2);
-        let tick_period = Duration::from_millis((tick_ms / 2).max(1));
+            .min(cfg.probe_timeout_ms);
+        let tick_period = Duration::from_millis((tightest_deadline_ms / TICKS_PER_DEADLINE).max(1));
         tokio::spawn(group_task(
             engine,
             rx,

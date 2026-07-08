@@ -113,18 +113,17 @@ mod tests {
 
     /// SplitMix64 — a tiny deterministic PRNG so these property tests explore
     /// thousands of configurations reproducibly (no external test deps, matching
-    /// the house style).
+    /// the house style). It's exactly the production [`mix64`] finalizer applied
+    /// to a golden-ratio-strided counter, so the mixing constants live in one
+    /// place.
     struct Rng(u64);
     impl Rng {
         fn new(seed: u64) -> Self {
             Self(seed)
         }
         fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
+            self.0 = self.0.wrapping_add(GOLDEN);
+            mix64(self.0)
         }
         fn below(&mut self, n: u32) -> u32 {
             (self.next_u64() % u64::from(n)) as u32

@@ -27,6 +27,11 @@ use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
 use tokio::net::{ToSocketAddrs, UdpSocket};
 
+/// Receive-buffer size: the largest possible UDP payload (the length field is
+/// 16 bits), so any single datagram is read in one `recv_from` with no
+/// truncation.
+const MAX_DATAGRAM: usize = 65_535;
+
 /// A UDP-backed transport endpoint.
 #[derive(Debug)]
 pub struct UdpTransport {
@@ -102,7 +107,7 @@ impl Transport for UdpTransport {
     }
 
     async fn recv(&self) -> io::Result<Inbound> {
-        let mut buf = vec![0u8; 65_535];
+        let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             let (n, addr) = self.socket.recv_from(&mut buf).await?;
             let from = self

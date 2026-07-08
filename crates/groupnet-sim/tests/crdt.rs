@@ -12,23 +12,12 @@ use std::collections::BTreeSet;
 
 use groupnet_core::Time;
 use groupnet_core::{Command, Config, GroupEngine, GroupId, NodeId};
-use groupnet_sim::Simulation;
+use groupnet_sim::{Simulation, SplitMix64};
 
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed ^ 0xda3e_39cb_94b9_5bdb)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: u32) -> u32 {
-        (self.next_u64() % u64::from(n.max(1))) as u32
-    }
+/// Seeds the shared deterministic PRNG, decorrelating this test's seed space
+/// from any other that shares the same integer seeds.
+fn rng(seed: u64) -> SplitMix64 {
+    SplitMix64::new(seed ^ 0xda3e_39cb_94b9_5bdb)
 }
 
 /// A node's PN-Counter contribution: how much it has incremented and decremented.
@@ -53,7 +42,7 @@ fn pn_counter_on_per_node_state_converges_under_faults() {
 }
 
 fn run(seed: u64) {
-    let mut rng = Rng::new(seed);
+    let mut rng = rng(seed);
     let group = GroupId::new("counter");
     let n = 3 + rng.below(4);
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();

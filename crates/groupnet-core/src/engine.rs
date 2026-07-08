@@ -1,53 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{GroupId, NodeId};
-use crate::{Time, placement, wire};
-
-/// Tunables for a single group's gossip and failure detection.
-#[derive(Clone, Debug)]
-pub struct Config {
-    /// How often (ms of logical time) to disseminate the full view.
-    pub gossip_interval_ms: u64,
-    /// How often to probe a member for liveness.
-    pub probe_interval_ms: u64,
-    /// How long to wait for a probe ack before escalating / suspecting.
-    pub probe_timeout_ms: u64,
-    /// How long a member may stay `Suspect` before it is declared `Dead`.
-    pub suspect_timeout_ms: u64,
-    /// How long a `Dead` tombstone is gossiped. After this it stops being
-    /// re-advertised; after `2×` it is reaped from the table.
-    pub dead_timeout_ms: u64,
-    /// How many indirect probers to enlist when a direct probe goes unanswered.
-    pub indirect_probes: usize,
-    /// Maximum peers to disseminate to per gossip round.
-    pub fanout: usize,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            gossip_interval_ms: 200,
-            probe_interval_ms: 100,
-            probe_timeout_ms: 50,
-            suspect_timeout_ms: 500,
-            dead_timeout_ms: 10_000,
-            indirect_probes: 2,
-            fanout: 3,
-        }
-    }
-}
-
-/// A member's liveness status. Ordered by precedence: a higher-precedence
-/// status wins ties at equal incarnation during merge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    /// Believed healthy.
-    Alive,
-    /// A probe went unanswered; awaiting refutation or death.
-    Suspect,
-    /// Confirmed gone (failed or voluntarily left). Terminal.
-    Dead,
-}
+use crate::config::Config;
+use crate::membership::{Member, Status};
+use crate::{GroupId, NodeId, Time, placement, wire};
 
 /// A metadata value tagged with a version and its writer, resolved by
 /// last-writer-wins with a deterministic `(version, writer)` tiebreak.
@@ -59,24 +14,6 @@ pub struct VersionedValue {
     pub version: u64,
     /// The node that produced this version (tiebreaker).
     pub writer: NodeId,
-}
-
-/// A member's local record.
-#[derive(Clone, Debug)]
-struct Member {
-    incarnation: u64,
-    status: Status,
-    /// When *this* node first observed the member as `Suspect` (for the
-    /// suspicion timeout). Only meaningful while `status == Suspect`.
-    suspect_since: Time,
-    /// When *this* node first observed the member as `Dead` (for gossip TTL and
-    /// reaping). Only meaningful while `status == Dead`.
-    dead_since: Time,
-    /// Monotonic version of `state`, authored by the member itself.
-    state_version: u64,
-    /// Opaque app-defined per-node state; merged by `state_version`,
-    /// independently of liveness.
-    state: Vec<u8>,
 }
 
 /// A local instruction to the engine, applied via [`GroupEngine::apply`].
@@ -586,7 +523,7 @@ impl GroupEngine {
         let mut refute_to: Option<u64> = None;
 
         for delta in deltas {
-            let Some(status) = status_from_wire(delta.status) else {
+            let Some(status) = Status::from_wire(delta.status) else {
                 continue; // unknown status code — ignore
             };
 
@@ -636,7 +573,7 @@ impl GroupEngine {
                     }
                 }
                 Some(cur) => {
-                    let status_wins = supersedes(cur, delta.incarnation, status);
+                    let status_wins = cur.superseded_by(delta.incarnation, status);
                     let state_wins = delta.state_version > cur.state_version;
                     if !status_wins && !state_wins {
                         continue;
@@ -764,7 +701,7 @@ impl GroupEngine {
                 .map(|(node, m)| wire::MemberDelta {
                     node: node.clone(),
                     incarnation: m.incarnation,
-                    status: status_to_wire(m.status),
+                    status: m.status.to_wire(),
                     state_version: m.state_version,
                     state: m.state.clone(),
                 })
@@ -823,55 +760,6 @@ impl GroupEngine {
     }
 }
 
-impl Member {
-    fn new(incarnation: u64, status: Status) -> Self {
-        Self {
-            incarnation,
-            status,
-            suspect_since: Time::ZERO,
-            dead_since: Time::ZERO,
-            state_version: 0,
-            state: Vec::new(),
-        }
-    }
-}
-
-/// SWIM merge precedence: does `(incarnation, status)` override `cur`?
-///
-/// * `Alive` overrides only a strictly newer incarnation (you must
-///   out-incarnate to refute).
-/// * `Suspect` overrides an alive member at equal-or-newer incarnation, or a
-///   suspect at strictly newer; never a dead one.
-/// * `Dead` overrides anything not already dead at equal-or-newer incarnation.
-fn supersedes(cur: &Member, incarnation: u64, status: Status) -> bool {
-    match status {
-        Status::Alive => incarnation > cur.incarnation,
-        Status::Suspect => match cur.status {
-            Status::Alive => incarnation >= cur.incarnation,
-            Status::Suspect => incarnation > cur.incarnation,
-            Status::Dead => false,
-        },
-        Status::Dead => cur.status != Status::Dead && incarnation >= cur.incarnation,
-    }
-}
-
-fn status_to_wire(s: Status) -> u8 {
-    match s {
-        Status::Alive => 0,
-        Status::Suspect => 1,
-        Status::Dead => 2,
-    }
-}
-
-fn status_from_wire(b: u8) -> Option<Status> {
-    match b {
-        0 => Some(Status::Alive),
-        1 => Some(Status::Suspect),
-        2 => Some(Status::Dead),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,7 +787,7 @@ mod tests {
         wire::MemberDelta {
             node: NodeId::new(node),
             incarnation: inc,
-            status: status_to_wire(status),
+            status: status.to_wire(),
             state_version: 0,
             state: Vec::new(),
         }
@@ -1058,7 +946,7 @@ mod tests {
             .iter()
             .find(|m| m.node == NodeId::new("a"))
             .expect("self in frame");
-        assert_eq!(self_delta.status, status_to_wire(Status::Alive));
+        assert_eq!(self_delta.status, Status::Alive.to_wire());
         assert!(
             self_delta.incarnation >= 1,
             "refutation should bump incarnation"
@@ -1111,7 +999,7 @@ mod tests {
         wire::MemberDelta {
             node: NodeId::new(node),
             incarnation: 0,
-            status: status_to_wire(Status::Alive),
+            status: Status::Alive.to_wire(),
             state_version: version,
             state: state.to_vec(),
         }

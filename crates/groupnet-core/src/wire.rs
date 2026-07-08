@@ -93,6 +93,12 @@ const KIND_ACK: u8 = 3;
 const KIND_PING_REQ: u8 = 4;
 const KIND_INDIRECT_ACK: u8 = 5;
 
+/// Caps how much a decoder pre-allocates from a frame's self-declared element
+/// count. A corrupt or hostile frame can claim a huge count, so we reserve at
+/// most this many slots up front and let the `Vec` grow as elements actually
+/// arrive — never trusting the claim enough to allocate on it.
+const MAX_PREALLOC: usize = 1024;
+
 fn kind_to_u8(k: Kind) -> u8 {
     match k {
         Kind::Gossip => KIND_GOSSIP,
@@ -164,7 +170,7 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
     };
 
     let n = get_u32(&mut cur)? as usize;
-    let mut members = Vec::with_capacity(n.min(1024));
+    let mut members = Vec::with_capacity(n.min(MAX_PREALLOC));
     for _ in 0..n {
         let node = NodeId::new(get_str(&mut cur)?);
         let incarnation = get_u64(&mut cur)?;
@@ -181,7 +187,7 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
     }
 
     let m = get_u32(&mut cur)? as usize;
-    let mut metadata = Vec::with_capacity(m.min(1024));
+    let mut metadata = Vec::with_capacity(m.min(MAX_PREALLOC));
     for _ in 0..m {
         let key = get_str(&mut cur)?;
         let version = get_u64(&mut cur)?;
