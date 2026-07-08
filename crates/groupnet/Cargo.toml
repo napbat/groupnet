@@ -31,6 +31,10 @@ groupnet-transport-tcp = { workspace = true, optional = true }
 groupnet-runtime = { workspace = true, optional = true }
 groupnet-sim = { workspace = true, optional = true }
 
+# The async examples drive the runtime, so they need a Tokio executor.
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+
 [lints]
 workspace = true
 

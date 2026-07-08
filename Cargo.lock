@@ -95,6 +95,7 @@ dependencies = [
  "groupnet-transport-mem",
  "groupnet-transport-tcp",
  "groupnet-transport-udp",
+ "tokio",
 ]
 
 [[package]]

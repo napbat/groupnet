@@ -64,11 +64,25 @@ The same core runs under both drivers: `groupnet-runtime` across threads in
 production, `groupnet-sim` in a single-threaded, reproducible event loop for
 tests.
 
+Most consumers pull the single `groupnet` facade, which mirrors each layer as a
+module — `groupnet::core`, `groupnet::transport` (with the `mem` / `udp` / `tcp` /
+`bulk` bindings nested under it), `groupnet::runtime`, and `groupnet::sim` — so
+you write `groupnet::transport::Transport`, never the underlying crate name.
+
 ## Example
 
+Runnable examples live in [`crates/groupnet/examples`](crates/groupnet/examples):
+
+```bash
+cargo run --example placement   # weighted HA-hash placement (sync, no I/O)
+cargo run --example cluster     # 3-node convergence, derived coordinator, metadata
+cargo run --example routing     # resolve a resource to its owner from any node
+```
+
 ```rust
-use groupnet::{Node, NodeId};
-use groupnet::mem::Network;
+use groupnet::core::NodeId;
+use groupnet::runtime::Node;
+use groupnet::transport::mem::Network;
 
 let net = Network::new(); // any Transport impl works here
 let node = Node::builder(NodeId::new("node-a"), net.endpoint(NodeId::new("node-a")))
@@ -86,7 +100,9 @@ Swap the in-memory transport for real UDP sockets without touching anything else
 — just bind a different `Transport`:
 
 ```rust
-use groupnet::udp::UdpTransport; // enable feature "udp"
+use groupnet::core::NodeId;
+use groupnet::runtime::Node;
+use groupnet::transport::udp::UdpTransport; // enable feature "udp"
 
 let transport = UdpTransport::bind(NodeId::new("node-a"), "0.0.0.0:7000").await?;
 transport.register_peer(NodeId::new("node-b"), "10.0.0.2:7000".parse()?);
@@ -115,8 +131,9 @@ ordered, backpressured streams. Framing is length-delimited with a
 as [`Bytes`](https://crates.io/crates/bytes) slices end-to-end:
 
 ```rust
-use groupnet::tcp::TcpTransport;        // feature "tcp"
-use groupnet::bulk::DataPlane;
+use groupnet::core::NodeId;
+use groupnet::transport::tcp::TcpTransport; // feature "tcp"
+use groupnet::transport::bulk::DataPlane;
 use bytes::Bytes;
 
 let tcp = TcpTransport::bind(NodeId::new("node-a"), "0.0.0.0:8000").await?;
@@ -144,6 +161,8 @@ are gossiped as an eventually-consistent, cluster-wide table (itself just LWW
 metadata in a reserved system group every node joins):
 
 ```rust
+use groupnet::core::{GroupId, NodeId};
+
 // The coordinator of the group that owns "users" claims the range:
 node.routing().claim("users", &GroupId::new("shard-1"));
 
@@ -159,9 +178,10 @@ member (Alive or Suspect — never Dead) with rendezvous (highest-random-weight)
 hashing over `hash(group ‖ node)` and the highest score wins. This spreads
 coordinator load evenly across groups and stays stable under churn; when a node
 dies or leaves it drops out of candidacy and the coordinator moves
-deterministically. The hash is a fixed FNV-1a so all nodes agree on every
-platform (`std`'s `DefaultHasher` is deliberately *not* stable and must never be
-used for cross-node agreement).
+deterministically. The hash is a fixed FNV-1a with a splitmix64 finalizer —
+integer-only, no floats — so all nodes agree byte-for-byte on every platform
+(`std`'s `DefaultHasher` is deliberately *not* stable and must never be used for
+cross-node agreement).
 
 The coordinator is **non-authoritative** — no write-ahead log, no quorum, no
 commit. During a partition two nodes may briefly compute different coordinators;
