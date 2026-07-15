@@ -475,7 +475,7 @@ impl GroupEngine {
         self.reap_dead(now);
 
         // 3b. Expired state entries and stale entry tombstones.
-        self.reap_entries(now);
+        effects.extend(self.reap_entries(now));
 
         // 4. Send the next liveness probe.
         if now >= self.next_probe {
@@ -933,18 +933,28 @@ impl GroupEngine {
     /// Drop expired TTL entries (they converge to absent everywhere once the
     /// author stops refreshing — no tombstone needed) and reap entry
     /// tombstones past `2×dead_timeout` (no longer gossiped after 1×, so no
-    /// peer re-teaches them).
-    fn reap_entries(&mut self, now: Time) {
+    /// peer re-teaches them). A TTL expiry is an observable state change and
+    /// emits [`Effect::NodeStateChanged`]; a tombstone reap is not (the key
+    /// already read as absent).
+    fn reap_entries(&mut self, now: Time) -> Vec<Effect> {
         let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
-        for member in self.members.values_mut() {
-            member.entries.retain(|_, e| {
+        let mut expired: Vec<(NodeId, String)> = Vec::new();
+        for (node, member) in &mut self.members {
+            member.entries.retain(|key, e| {
                 if e.tombstone {
                     now < e.tombstone_since.saturating_add(reap_after)
+                } else if e.expired(now) {
+                    expired.push((node.clone(), key.clone()));
+                    false
                 } else {
-                    !e.expired(now)
+                    true
                 }
             });
         }
+        expired
+            .into_iter()
+            .map(|(node, key)| Effect::NodeStateChanged { node, key })
+            .collect()
     }
 
     fn compute_coordinator(&self) -> Option<NodeId> {

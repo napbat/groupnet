@@ -8,8 +8,42 @@ use std::time::{Duration, Instant};
 
 use groupnet_core::{Command, Effect, GroupEngine, GroupId, NodeId, Status, Time};
 use groupnet_transport::Transport;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::MissedTickBehavior;
+
+/// A change notification a consumer can subscribe to via
+/// [`Group::events`](crate::Group::events). The stream is bounded: a slow
+/// subscriber observes `RecvError::Lagged` and must resync from the watch
+/// snapshots (which are always current) — events are edge triggers, not a
+/// reliable log.
+#[derive(Clone, Debug)]
+pub enum GroupEvent {
+    /// The observed coordinator changed.
+    CoordinatorChanged(Option<NodeId>),
+    /// The membership set or some member's status changed.
+    MembershipChanged,
+    /// One key of a node's app-defined state changed.
+    NodeStateChanged {
+        /// The node whose entry changed.
+        node: NodeId,
+        /// The key that changed.
+        key: String,
+    },
+    /// A metadata key took a new value.
+    MetadataChanged {
+        /// The key that changed.
+        key: String,
+    },
+}
+
+/// Capacity of the per-group event stream. Slow subscribers lag (and resync
+/// from snapshots) rather than growing memory.
+pub(crate) const EVENTS_CAPACITY: usize = 256;
+
+/// Capacity of a group actor's inbox. Network events beyond it are DROPPED
+/// (gossip is loss-tolerant by design); local commands use `try_send` and
+/// surface the miss to the caller.
+pub(crate) const INBOX_CAPACITY: usize = 1024;
 
 /// Formats the routing-table key under which a group's coordinator is published.
 pub(crate) fn coordinator_key(group: &GroupId) -> String {
@@ -27,8 +61,9 @@ pub(crate) type MembersSnapshot = Arc<Vec<NodeId>>;
 /// peer that [`MembersSnapshot`] (the not-`Dead` set) still lists.
 pub(crate) type StatusesSnapshot = Arc<BTreeMap<NodeId, Status>>;
 
-/// A published, read-only snapshot of every node's app-defined state.
-pub(crate) type NodeStatesSnapshot = Arc<BTreeMap<NodeId, Vec<u8>>>;
+/// A published, read-only snapshot of every node's keyed app-defined state
+/// (live entries only — tombstoned/expired keys are absent).
+pub(crate) type NodeEntriesSnapshot = Arc<BTreeMap<NodeId, BTreeMap<String, Vec<u8>>>>;
 
 /// An event delivered to a group actor: either a decoded network frame or a
 /// local command from the [`Group`](crate::Group) handle.
@@ -43,7 +78,8 @@ pub(crate) struct Publishers {
     pub metadata: watch::Sender<MetaSnapshot>,
     pub members: watch::Sender<MembersSnapshot>,
     pub statuses: watch::Sender<StatusesSnapshot>,
-    pub node_states: watch::Sender<NodeStatesSnapshot>,
+    pub entries: watch::Sender<NodeEntriesSnapshot>,
+    pub events: broadcast::Sender<GroupEvent>,
 }
 
 /// The `watch` receivers a [`Group`](crate::Group) reads its published state
@@ -53,7 +89,8 @@ pub(crate) struct GroupViews {
     pub metadata: watch::Receiver<MetaSnapshot>,
     pub members: watch::Receiver<MembersSnapshot>,
     pub statuses: watch::Receiver<StatusesSnapshot>,
-    pub node_states: watch::Receiver<NodeStatesSnapshot>,
+    pub entries: watch::Receiver<NodeEntriesSnapshot>,
+    pub events: broadcast::Sender<GroupEvent>,
 }
 
 /// Maps wall-clock elapsed time onto the engine's logical [`Time`]. This is the
@@ -65,12 +102,12 @@ pub(crate) fn now_since(start: Instant) -> Time {
 /// Runs a single group's engine as an actor until its inbox closes.
 pub(crate) async fn group_task<T: Transport>(
     mut engine: GroupEngine,
-    mut inbox: mpsc::UnboundedReceiver<Event>,
+    mut inbox: mpsc::Receiver<Event>,
     transport: Arc<T>,
     publishers: Publishers,
     // When this group's coordinator becomes us, announce it into the routing
     // group through this channel. `None` for the routing group itself.
-    routing: Option<mpsc::UnboundedSender<Event>>,
+    routing: Option<mpsc::Sender<Event>>,
     start: Instant,
     tick_period: Duration,
 ) {
@@ -107,6 +144,7 @@ pub(crate) async fn group_task<T: Transport>(
         let state_dirty = effects
             .iter()
             .any(|e| matches!(e, Effect::NodeStateChanged { .. }));
+        emit_events(&publishers.events, &effects);
         dispatch(&transport, &publishers.coordinator, effects).await;
         // Republish snapshots; readers borrow them lock-free.
         if meta_dirty {
@@ -127,12 +165,41 @@ pub(crate) async fn group_task<T: Transport>(
             announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
         }
         if state_dirty {
-            let snapshot: BTreeMap<NodeId, Vec<u8>> = engine
-                .node_states_iter()
-                .map(|(n, s)| (n.clone(), s.to_vec()))
-                .collect();
-            let _ = publishers.node_states.send(Arc::new(snapshot));
+            let mut snapshot: BTreeMap<NodeId, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
+            let nodes: Vec<NodeId> = engine.member_statuses().map(|(n, _)| n.clone()).collect();
+            for node in nodes {
+                let entries: BTreeMap<String, Vec<u8>> = engine
+                    .node_entries(&node)
+                    .map(|(k, v)| (k.to_owned(), v.to_vec()))
+                    .collect();
+                if !entries.is_empty() {
+                    snapshot.insert(node, entries);
+                }
+            }
+            let _ = publishers.entries.send(Arc::new(snapshot));
         }
+    }
+}
+
+/// Forwards the engine's change effects onto the bounded event stream (a full
+/// stream lags slow subscribers instead of buffering unboundedly).
+fn emit_events(events: &broadcast::Sender<GroupEvent>, effects: &[Effect]) {
+    for effect in effects {
+        let event = match effect {
+            Effect::CoordinatorChanged { coordinator } => {
+                GroupEvent::CoordinatorChanged(coordinator.clone())
+            }
+            Effect::MembershipChanged => GroupEvent::MembershipChanged,
+            Effect::NodeStateChanged { node, key } => GroupEvent::NodeStateChanged {
+                node: node.clone(),
+                key: key.clone(),
+            },
+            Effect::MetadataChanged { key, .. } => {
+                GroupEvent::MetadataChanged { key: key.clone() }
+            }
+            Effect::Send { .. } | Effect::ArmTimer { .. } => continue,
+        };
+        let _ = events.send(event); // no subscribers / lagged is fine
     }
 }
 
@@ -145,7 +212,7 @@ pub(crate) async fn group_task<T: Transport>(
 /// risk of a stale self-announcement lingering.
 fn announce_coordinator(
     engine: &GroupEngine,
-    routing: Option<&mpsc::UnboundedSender<Event>>,
+    routing: Option<&mpsc::Sender<Event>>,
     announced: &mut Option<NodeId>,
 ) {
     let Some(routing) = routing else { return };
@@ -154,7 +221,9 @@ fn announce_coordinator(
         return;
     }
     if let Some(coordinator) = &current {
-        let _ = routing.send(Event::Local(Command::UpdateMetadata {
+        // Best-effort under backpressure: a dropped announcement re-fires on
+        // the next coordinator change, and gossip converges the table anyway.
+        let _ = routing.try_send(Event::Local(Command::UpdateMetadata {
             key: coordinator_key(engine.group()),
             value: coordinator.to_string(),
         }));

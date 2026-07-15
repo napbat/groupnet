@@ -43,7 +43,8 @@ mod group;
 mod node;
 mod routing;
 
-pub use group::{Group, SyncCtx};
+pub use driver::GroupEvent;
+pub use group::{CommandRejected, Group, SyncCtx};
 pub use groupnet_core::Status;
 pub use node::{Node, NodeBuilder};
 pub use routing::Routing;
