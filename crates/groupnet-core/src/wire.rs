@@ -37,10 +37,30 @@ pub enum Kind {
     IndirectAck,
 }
 
+/// One key of a member's app-defined state, as the sender holds it. Each key
+/// is independently versioned by its owning node; `ttl_ms` lets receivers arm
+/// their own expiry, and `tombstone` disseminates an explicit delete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryDelta {
+    /// State key (application-defined; keys starting `~` are reserved for
+    /// groupnet itself, e.g. `~addr`, `~blob`).
+    pub key: String,
+    /// Monotonic per-key version, authored by the owning node.
+    pub version: u64,
+    /// TTL in ms (0 = none); receivers expire the entry `ttl_ms` after the
+    /// merge that adopted it, unless a fresher version refreshes it.
+    pub ttl_ms: u64,
+    /// Deletion marker.
+    pub tombstone: bool,
+    /// The value (empty when `tombstone`). Groupnet disseminates and
+    /// version-orders it but never interprets it.
+    pub value: Vec<u8>,
+}
+
 /// One member's status and app-defined state as the sender sees it. Liveness
-/// (`incarnation`/`status`) and app state (`state_version`/`state`) are merged
-/// independently — a node authors its own state, versioned separately from its
-/// SWIM incarnation.
+/// (`incarnation`/`status`) and per-key app state are merged independently —
+/// a node authors its own state, versioned separately from its SWIM
+/// incarnation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberDelta {
     /// The node this entry describes.
@@ -49,12 +69,8 @@ pub struct MemberDelta {
     pub incarnation: u64,
     /// Status code (engine-defined; `0 = alive, 1 = suspect, 2 = dead`).
     pub status: u8,
-    /// Monotonic version of `state`, bumped each time the node updates it.
-    pub state_version: u64,
-    /// Opaque app-defined per-node state (e.g. capacity weight, readiness,
-    /// replication progress). Groupnet disseminates and version-orders it but
-    /// never interprets it.
-    pub state: Vec<u8>,
+    /// The node's keyed state entries the sender currently holds.
+    pub entries: Vec<EntryDelta>,
 }
 
 /// One metadata key's value plus its last-writer-wins timestamp.
@@ -86,6 +102,13 @@ pub struct Frame {
     /// Metadata entries the sender currently holds.
     pub metadata: Vec<MetaDelta>,
 }
+
+/// Protocol version, the first byte of every frame. Bumped to 2 when per-node
+/// state became a keyed map (v1 frames — which began with a kind byte — are
+/// simply undecodable to a v2 node, and vice versa: gossip is loss-tolerant,
+/// so a mixed-version cluster degrades to two disjoint gossip meshes rather
+/// than misreading each other).
+const FRAME_VERSION: u8 = 2;
 
 const KIND_GOSSIP: u8 = 1;
 const KIND_PING: u8 = 2;
@@ -124,6 +147,7 @@ fn kind_from_u8(b: u8) -> Option<Kind> {
 #[must_use]
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::new();
+    out.push(FRAME_VERSION);
     out.push(kind_to_u8(frame.kind));
     put_str(&mut out, frame.group.as_str());
 
@@ -140,8 +164,14 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
         put_str(&mut out, m.node.as_str());
         put_u64(&mut out, m.incarnation);
         out.push(m.status);
-        put_u64(&mut out, m.state_version);
-        put_bytes(&mut out, &m.state);
+        put_u32(&mut out, m.entries.len() as u32);
+        for e in &m.entries {
+            put_str(&mut out, &e.key);
+            put_u64(&mut out, e.version);
+            put_u64(&mut out, e.ttl_ms);
+            out.push(u8::from(e.tombstone));
+            put_bytes(&mut out, &e.value);
+        }
     }
 
     put_u32(&mut out, frame.metadata.len() as u32);
@@ -160,6 +190,9 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
 #[must_use]
 pub fn decode(bytes: &[u8]) -> Option<Frame> {
     let mut cur = bytes;
+    if take_u8(&mut cur)? != FRAME_VERSION {
+        return None; // other protocol version — dropped, gossip is loss-tolerant
+    }
     let kind = kind_from_u8(take_u8(&mut cur)?)?;
     let group = GroupId::new(get_str(&mut cur)?);
 
@@ -175,15 +208,21 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
         let node = NodeId::new(get_str(&mut cur)?);
         let incarnation = get_u64(&mut cur)?;
         let status = take_u8(&mut cur)?;
-        let state_version = get_u64(&mut cur)?;
-        let state = get_bytes(&mut cur)?;
-        members.push(MemberDelta {
-            node,
-            incarnation,
-            status,
-            state_version,
-            state,
-        });
+        let k = get_u32(&mut cur)? as usize;
+        let mut entries = Vec::with_capacity(k.min(MAX_PREALLOC));
+        for _ in 0..k {
+            let key = get_str(&mut cur)?;
+            let version = get_u64(&mut cur)?;
+            let ttl_ms = get_u64(&mut cur)?;
+            let tombstone = match take_u8(&mut cur)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let value = get_bytes(&mut cur)?;
+            entries.push(EntryDelta { key, version, ttl_ms, tombstone, value });
+        }
+        members.push(MemberDelta { node, incarnation, status, entries });
     }
 
     let m = get_u32(&mut cur)? as usize;
@@ -215,6 +254,9 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
 #[must_use]
 pub fn peek_group(bytes: &[u8]) -> Option<GroupId> {
     let mut cur = bytes;
+    if take_u8(&mut cur)? != FRAME_VERSION {
+        return None;
+    }
     let _kind = take_u8(&mut cur)?;
     Some(GroupId::new(get_str(&mut cur)?))
 }
@@ -296,15 +338,35 @@ mod tests {
                     node: NodeId::new("node-a"),
                     incarnation: 2,
                     status: 0,
-                    state_version: 7,
-                    state: vec![1, 2, 3],
+                    entries: vec![
+                        EntryDelta {
+                            key: "~addr".into(),
+                            version: 7,
+                            ttl_ms: 0,
+                            tombstone: false,
+                            value: vec![1, 2, 3],
+                        },
+                        EntryDelta {
+                            key: "hot/3".into(),
+                            version: 12,
+                            ttl_ms: 120_000,
+                            tombstone: false,
+                            value: vec![9; 40],
+                        },
+                        EntryDelta {
+                            key: "old".into(),
+                            version: 4,
+                            ttl_ms: 0,
+                            tombstone: true,
+                            value: vec![],
+                        },
+                    ],
                 },
                 MemberDelta {
                     node: NodeId::new("node-b"),
                     incarnation: 5,
                     status: 1,
-                    state_version: 0,
-                    state: vec![],
+                    entries: vec![],
                 },
             ],
             metadata: vec![MetaDelta {

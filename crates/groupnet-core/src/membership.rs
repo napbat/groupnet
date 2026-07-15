@@ -52,8 +52,44 @@ impl Status {
     }
 }
 
+/// One key of a member's app-defined state.
+///
+/// Per-node state is a **keyed map** of independently-versioned entries, so an
+/// application can update one fact (an address, a readiness flag, one page of
+/// a progress map) without re-shipping or re-versioning the rest. Each entry
+/// is single-writer (its owning node), so a bare per-key version totally
+/// orders it — no writer tiebreak needed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StateEntry {
+    /// Monotonic per-key version, authored by the owning member.
+    pub(crate) version: u64,
+    /// The value. Meaningless when `tombstone` is set.
+    pub(crate) value: Vec<u8>,
+    /// TTL in ms as authored (0 = none). Carried on the wire so every receiver
+    /// can arm its own expiry.
+    pub(crate) ttl_ms: u64,
+    /// Local expiry stamp, computed at write/merge time from `ttl_ms` against
+    /// the *receiver's* clock ([`Time::MAX`] = never). Entries converge to
+    /// absent once the author stops refreshing them; small cross-node skew in
+    /// exactly when is inherent and documented.
+    pub(crate) expires_at: Time,
+    /// Deletion marker: gossiped for a while so peers drop the key too, then
+    /// reaped (same lifecycle shape as a Dead member tombstone).
+    pub(crate) tombstone: bool,
+    /// When this node first held the entry as a tombstone (for reaping).
+    pub(crate) tombstone_since: Time,
+}
+
+impl StateEntry {
+    /// Whether the entry has expired at `now` (tombstones don't expire — they
+    /// reap on their own schedule).
+    pub(crate) fn expired(&self, now: Time) -> bool {
+        !self.tombstone && now >= self.expires_at
+    }
+}
+
 /// One member's record, as this node currently sees it: SWIM liveness plus the
-/// opaque per-node state the member authors about itself.
+/// keyed per-node state the member authors about itself.
 ///
 /// Fields are `pub(crate)` because the engine is their sole manager; nothing
 /// outside the crate mutates a member directly.
@@ -69,11 +105,9 @@ pub(crate) struct Member {
     /// When *this* node first observed the member as `Dead` (for gossip TTL and
     /// reaping). Only meaningful while `status == Dead`.
     pub(crate) dead_since: Time,
-    /// Monotonic version of `state`, authored by the member itself.
-    pub(crate) state_version: u64,
-    /// Opaque app-defined per-node state; merged by `state_version`,
+    /// Keyed app-defined per-node state; each entry merged by its own version,
     /// independently of liveness.
-    pub(crate) state: Vec<u8>,
+    pub(crate) entries: std::collections::BTreeMap<String, StateEntry>,
 }
 
 impl Member {
@@ -84,8 +118,7 @@ impl Member {
             status,
             suspect_since: Time::ZERO,
             dead_since: Time::ZERO,
-            state_version: 0,
-            state: Vec::new(),
+            entries: std::collections::BTreeMap::new(),
         }
     }
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::Config;
-use crate::membership::{Member, Status};
+use crate::membership::{Member, StateEntry, Status};
 use crate::{GroupId, NodeId, Time, placement, wire};
 
 /// A metadata value tagged with a version and its writer, resolved by
@@ -26,9 +26,28 @@ pub enum Command {
         /// New value.
         value: String,
     },
-    /// Replace this node's app-defined per-node state (weight, readiness,
-    /// progress — whatever the application encodes). Disseminated to peers.
+    /// Replace this node's single-blob state — a compatibility shim over the
+    /// keyed model: exactly `SetLocalEntry` on the reserved key `~blob`.
     SetLocalState(Vec<u8>),
+    /// Set one key of this node's app-defined state (weight, readiness, an
+    /// address, one page of a progress map). Independently versioned per key,
+    /// disseminated to peers; `ttl_ms` (if `Some`) lets every receiver expire
+    /// the entry that long after last adopting it — the author refreshes by
+    /// re-setting.
+    SetLocalEntry {
+        /// State key. Keys starting with `~` are reserved for groupnet.
+        key: String,
+        /// The value.
+        value: Vec<u8>,
+        /// Optional time-to-live in ms.
+        ttl_ms: Option<u64>,
+    },
+    /// Delete one key of this node's state: a versioned tombstone is
+    /// disseminated so every peer drops the key, then reaped.
+    DeleteLocalEntry {
+        /// State key.
+        key: String,
+    },
     /// This node voluntarily leaves the group.
     Leave,
     /// Introduce a peer learned out-of-band (e.g. from an external roster / service
@@ -64,11 +83,13 @@ pub enum Effect {
     },
     /// The membership set or a member's status changed.
     MembershipChanged,
-    /// A node's app-defined per-node state changed (local write or merged
-    /// delta).
+    /// One key of a node's app-defined state changed (local write, merged
+    /// delta, delete, or a restart-recovery adoption of our own echoed entry).
     NodeStateChanged {
         /// The node whose state changed.
         node: NodeId,
+        /// The key that changed.
+        key: String,
     },
     /// A metadata key took a new value (from a local write or a merged delta).
     MetadataChanged {
@@ -133,6 +154,16 @@ pub struct GroupEngine {
     /// As an indirect prober: target -> the origins waiting for us to relay an
     /// ack about it.
     relaying: BTreeMap<NodeId, BTreeSet<NodeId>>,
+    /// The most recent logical time observed via `start`/`on_message`/`on_tick`.
+    /// Used only where a `Command` (which carries no clock) needs a timestamp —
+    /// entry TTLs and tombstone ages; command-path precision is one event-loop
+    /// turn, which is far finer than any TTL.
+    now_hint: Time,
+    /// State keys this process has authored since boot. Echoes of our own
+    /// entries are ADOPTED only for keys not in this set (restart recovery);
+    /// for authored keys we keep our value and out-version the echo (the
+    /// sole-author rule — a peer can never replace what we wrote this boot).
+    authored: BTreeSet<String>,
 }
 
 impl GroupEngine {
@@ -167,6 +198,8 @@ impl GroupEngine {
             probe_cursor: 0,
             pending: None,
             relaying: BTreeMap::new(),
+            now_hint: Time::ZERO,
+            authored: BTreeSet::new(),
         };
         engine.coordinator = engine.compute_coordinator();
         engine
@@ -219,26 +252,46 @@ impl GroupEngine {
         self.members.iter().map(|(node, m)| (node, m.status))
     }
 
-    /// The app-defined per-node state a node last advertised, if known.
+    /// The reserved key backing the single-blob state shim.
+    pub const BLOB_KEY: &str = "~blob";
+
+    /// One key of a node's state, if known and live (not tombstoned).
+    #[must_use]
+    pub fn node_entry(&self, node: &NodeId, key: &str) -> Option<&[u8]> {
+        self.members
+            .get(node)
+            .and_then(|m| m.entries.get(key))
+            .filter(|e| !e.tombstone)
+            .map(|e| e.value.as_slice())
+    }
+
+    /// Iterates a node's live state entries in key order.
+    pub fn node_entries(&self, node: &NodeId) -> impl Iterator<Item = (&str, &[u8])> {
+        self.members
+            .get(node)
+            .into_iter()
+            .flat_map(|m| m.entries.iter())
+            .filter(|(_, e)| !e.tombstone)
+            .map(|(k, e)| (k.as_str(), e.value.as_slice()))
+    }
+
+    /// The single-blob state a node last advertised (the `~blob` shim key).
     #[must_use]
     pub fn node_state(&self, node: &NodeId) -> Option<&[u8]> {
-        self.members.get(node).map(|m| m.state.as_slice())
+        self.node_entry(node, Self::BLOB_KEY)
     }
 
-    /// This node's own current app-defined state.
+    /// This node's own single-blob state (the `~blob` shim key).
     #[must_use]
     pub fn local_state(&self) -> &[u8] {
-        self.members
-            .get(&self.local)
-            .map_or(&[], |m| m.state.as_slice())
+        self.node_entry(&self.local, Self::BLOB_KEY).unwrap_or(&[])
     }
 
-    /// Iterates every node that has advertised non-empty app state, in id order.
+    /// Iterates every node advertising a non-empty `~blob` state, in id order.
     pub fn node_states_iter(&self) -> impl Iterator<Item = (&NodeId, &[u8])> {
-        self.members
-            .iter()
-            .filter(|(_, m)| !m.state.is_empty())
-            .map(|(node, m)| (node, m.state.as_slice()))
+        self.members.keys().filter_map(|node| {
+            self.node_state(node).filter(|s| !s.is_empty()).map(|s| (node, s))
+        })
     }
 
     /// Reads a shard-local metadata value.
@@ -257,6 +310,7 @@ impl GroupEngine {
     /// Primes the engine: announces this node and arms the first timers. A
     /// driver calls this once, right after construction, passing current time.
     pub fn start(&mut self, now: Time) -> Vec<Effect> {
+        self.now_hint = self.now_hint.max(now);
         self.next_gossip = now.saturating_add(self.config.gossip_interval_ms);
         self.next_probe = now.saturating_add(self.config.probe_interval_ms);
         let mut effects = self.gossip(now);
@@ -282,16 +336,31 @@ impl GroupEngine {
                 );
                 vec![Effect::MetadataChanged { key, value }]
             }
-            Command::SetLocalState(state) => {
-                // A node is the sole author of its own state; bump the version so
-                // the update supersedes prior copies at every peer.
-                if let Some(m) = self.members.get_mut(&self.local) {
-                    m.state_version += 1;
-                    m.state = state;
-                }
-                vec![Effect::NodeStateChanged {
-                    node: self.local.clone(),
-                }]
+            Command::SetLocalState(state) => self.set_local_entry(Self::BLOB_KEY, state, None),
+            Command::SetLocalEntry { key, value, ttl_ms } => {
+                self.set_local_entry(&key, value, ttl_ms)
+            }
+            Command::DeleteLocalEntry { key } => {
+                let Some(m) = self.members.get_mut(&self.local) else {
+                    return Vec::new();
+                };
+                // A tombstone at version+1 supersedes the live entry everywhere;
+                // deleting an unknown key still plants a tombstone (idempotent,
+                // and it wins over any in-flight older write).
+                let version = m.entries.get(&key).map_or(1, |e| e.version + 1);
+                m.entries.insert(
+                    key.clone(),
+                    StateEntry {
+                        version,
+                        value: Vec::new(),
+                        ttl_ms: 0,
+                        expires_at: Time::MAX,
+                        tombstone: true,
+                        tombstone_since: self.now_hint,
+                    },
+                );
+                self.authored.insert(key.clone());
+                vec![Effect::NodeStateChanged { node: self.local.clone(), key }]
             }
             Command::Leave => {
                 // Declare ourselves Dead at our current incarnation and stop
@@ -323,6 +392,7 @@ impl GroupEngine {
 
     /// Handles an inbound wire frame from node `from`, observed at `now`.
     pub fn on_message(&mut self, from: NodeId, wire: &[u8], now: Time) -> Vec<Effect> {
+        self.now_hint = self.now_hint.max(now);
         let Some(frame) = wire::decode(wire) else {
             return Vec::new(); // undecodable == dropped; transport is best-effort
         };
@@ -378,6 +448,7 @@ impl GroupEngine {
     /// Advances logical time: escalates or expires probes, ages out suspicions
     /// and tombstones, and emits probe / gossip rounds when due.
     pub fn on_tick(&mut self, now: Time) -> Vec<Effect> {
+        self.now_hint = self.now_hint.max(now);
         let mut effects = Vec::new();
 
         // 1. A probe whose window elapsed: escalate a direct miss to indirect,
@@ -403,6 +474,9 @@ impl GroupEngine {
         // 3. Dead tombstones past their reap window -> removed entirely.
         self.reap_dead(now);
 
+        // 3b. Expired state entries and stale entry tombstones.
+        self.reap_entries(now);
+
         // 4. Send the next liveness probe.
         if now >= self.next_probe {
             self.next_probe = now.saturating_add(self.config.probe_interval_ms);
@@ -417,6 +491,30 @@ impl GroupEngine {
 
         effects.push(self.arm_timer());
         effects
+    }
+
+    /// Author one key of our own state: bump above whatever version we hold
+    /// (ours or an adopted echo) so the write supersedes every prior copy.
+    fn set_local_entry(&mut self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>) -> Vec<Effect> {
+        let now = self.now_hint;
+        let Some(m) = self.members.get_mut(&self.local) else {
+            return Vec::new();
+        };
+        let version = m.entries.get(key).map_or(1, |e| e.version + 1);
+        self.authored.insert(key.to_owned());
+        let ttl = ttl_ms.unwrap_or(0);
+        m.entries.insert(
+            key.to_owned(),
+            StateEntry {
+                version,
+                value,
+                ttl_ms: ttl,
+                expires_at: if ttl == 0 { Time::MAX } else { now.saturating_add(ttl) },
+                tombstone: false,
+                tombstone_since: Time::ZERO,
+            },
+        );
+        vec![Effect::NodeStateChanged { node: self.local.clone(), key: key.to_owned() }]
     }
 
     fn probe(&mut self, now: Time) -> Vec<Effect> {
@@ -538,7 +636,7 @@ impl GroupEngine {
     /// versa. Also refutes any suspicion about ourselves.
     fn merge_members(&mut self, deltas: Vec<wire::MemberDelta>, now: Time) -> Vec<Effect> {
         let mut membership_changed = false;
-        let mut state_changed: Vec<NodeId> = Vec::new();
+        let mut state_changed: Vec<(NodeId, String)> = Vec::new();
         let mut refute_to: Option<u64> = None;
 
         for delta in deltas {
@@ -560,15 +658,53 @@ impl GroupEngine {
                         refute_to = Some(refute_to.map_or(target, |t| t.max(target)));
                     }
                 }
-                // We are the sole author of our own state *value* — never adopt
-                // a peer's. But if a peer remembers a higher version than ours
-                // (e.g. we restarted and reset to 0), bump *above* it and keep
-                // re-advertising our own value so it supersedes. In steady state
-                // no peer is ever ahead of us here.
-                if delta.state_version > self.members[&self.local].state_version {
+                // Restart recovery (the wipe fix): our own entries echoed back
+                // at versions above what we hold are OUR data from before a
+                // restart — ADOPT them verbatim instead of out-versioning them
+                // with fresh emptiness (which is exactly how the old blob model
+                // briefly wiped a restarted node's state cluster-wide). The app
+                // sees a NodeStateChanged for each adopted key and re-authors
+                // whatever should be fresher; a later local write bumps above
+                // the adopted version and supersedes everywhere.
+                for entry in delta.entries {
+                    let ours = self.members[&self.local].entries.get(&entry.key);
+                    if ours.is_some_and(|e| entry.version <= e.version) {
+                        continue; // echo of something we already hold — ignore
+                    }
                     let m = self.members.get_mut(&self.local).expect("self present");
-                    m.state_version = delta.state_version.saturating_add(1);
-                    state_changed.push(self.local.clone());
+                    if self.authored.contains(&entry.key) {
+                        // Sole-author rule: never let an echo (or a forgery)
+                        // replace a value we wrote this boot. Jump our version
+                        // above it and keep re-advertising OUR value, which
+                        // then supersedes everywhere.
+                        if let Some(e) = m.entries.get_mut(&entry.key) {
+                            e.version = entry.version.saturating_add(1);
+                            state_changed.push((self.local.clone(), entry.key));
+                        }
+                    } else {
+                        // Restart recovery (the wipe fix): a key we have NOT
+                        // authored this boot, echoed at a higher version, is
+                        // our own pre-restart data — adopt it verbatim instead
+                        // of out-versioning it with fresh emptiness. The app
+                        // sees NodeStateChanged and re-authors what should be
+                        // fresher.
+                        m.entries.insert(
+                            entry.key.clone(),
+                            StateEntry {
+                                version: entry.version,
+                                value: entry.value,
+                                ttl_ms: entry.ttl_ms,
+                                expires_at: if entry.ttl_ms == 0 {
+                                    Time::MAX
+                                } else {
+                                    now.saturating_add(entry.ttl_ms)
+                                },
+                                tombstone: entry.tombstone,
+                                tombstone_since: if entry.tombstone { now } else { Time::ZERO },
+                            },
+                        );
+                        state_changed.push((self.local.clone(), entry.key));
+                    }
                 }
                 continue;
             }
@@ -576,27 +712,35 @@ impl GroupEngine {
             match self.members.get(&delta.node) {
                 None => {
                     // Unknown node: adopt its liveness and state wholesale.
-                    let carries_state = delta.state_version > 0;
                     let mut member = Member::new(delta.incarnation, status);
                     match status {
                         Status::Suspect => member.suspect_since = now,
                         Status::Dead => member.dead_since = now,
                         Status::Alive => {}
                     }
-                    member.state_version = delta.state_version;
-                    member.state = delta.state;
+                    for entry in delta.entries {
+                        state_changed.push((delta.node.clone(), entry.key.clone()));
+                        member.entries.insert(
+                            entry.key,
+                            StateEntry {
+                                version: entry.version,
+                                value: entry.value,
+                                ttl_ms: entry.ttl_ms,
+                                expires_at: if entry.ttl_ms == 0 {
+                                    Time::MAX
+                                } else {
+                                    now.saturating_add(entry.ttl_ms)
+                                },
+                                tombstone: entry.tombstone,
+                                tombstone_since: if entry.tombstone { now } else { Time::ZERO },
+                            },
+                        );
+                    }
                     self.members.insert(delta.node.clone(), member);
                     membership_changed = true;
-                    if carries_state {
-                        state_changed.push(delta.node);
-                    }
                 }
                 Some(cur) => {
                     let status_wins = cur.superseded_by(delta.incarnation, status);
-                    let state_wins = delta.state_version > cur.state_version;
-                    if !status_wins && !state_wins {
-                        continue;
-                    }
                     let member = self.members.get_mut(&delta.node).expect("present");
                     if status_wins {
                         member.incarnation = delta.incarnation;
@@ -608,10 +752,33 @@ impl GroupEngine {
                         }
                         membership_changed = true;
                     }
-                    if state_wins {
-                        member.state_version = delta.state_version;
-                        member.state = delta.state;
-                        state_changed.push(delta.node);
+                    // Per-key LWW, independent of liveness: each entry is
+                    // single-writer (its owning node), so version order alone
+                    // decides; a fresher version also re-arms the local TTL.
+                    for entry in delta.entries {
+                        let wins = member
+                            .entries
+                            .get(&entry.key)
+                            .is_none_or(|e| entry.version > e.version);
+                        if !wins {
+                            continue;
+                        }
+                        member.entries.insert(
+                            entry.key.clone(),
+                            StateEntry {
+                                version: entry.version,
+                                value: entry.value,
+                                ttl_ms: entry.ttl_ms,
+                                expires_at: if entry.ttl_ms == 0 {
+                                    Time::MAX
+                                } else {
+                                    now.saturating_add(entry.ttl_ms)
+                                },
+                                tombstone: entry.tombstone,
+                                tombstone_since: if entry.tombstone { now } else { Time::ZERO },
+                            },
+                        );
+                        state_changed.push((delta.node.clone(), entry.key));
                     }
                 }
             }
@@ -631,8 +798,8 @@ impl GroupEngine {
             effects.push(Effect::MembershipChanged);
             effects.extend(self.recompute_coordinator());
         }
-        for node in state_changed {
-            effects.push(Effect::NodeStateChanged { node });
+        for (node, key) in state_changed {
+            effects.push(Effect::NodeStateChanged { node, key });
         }
         effects
     }
@@ -719,8 +886,18 @@ impl GroupEngine {
                     node: node.clone(),
                     incarnation: m.incarnation,
                     status: m.status.to_wire(),
-                    state_version: m.state_version,
-                    state: m.state.clone(),
+                    entries: m
+                        .entries
+                        .iter()
+                        .filter(|(_, e)| self.should_gossip_entry(e, now))
+                        .map(|(key, e)| wire::EntryDelta {
+                            key: key.clone(),
+                            version: e.version,
+                            ttl_ms: e.ttl_ms,
+                            tombstone: e.tombstone,
+                            value: e.value.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
             metadata: self
@@ -741,6 +918,33 @@ impl GroupEngine {
     /// reap the tombstone without re-teaching each other.
     fn should_gossip(&self, m: &Member, now: Time) -> bool {
         m.status != Status::Dead || now < m.dead_since.saturating_add(self.config.dead_timeout_ms)
+    }
+
+    /// An entry is advertised while live and unexpired; a tombstone only until
+    /// `dead_timeout` (after that peers are assumed to know — same shape as a
+    /// Dead member tombstone).
+    fn should_gossip_entry(&self, e: &StateEntry, now: Time) -> bool {
+        if e.tombstone {
+            return now < e.tombstone_since.saturating_add(self.config.dead_timeout_ms);
+        }
+        !e.expired(now)
+    }
+
+    /// Drop expired TTL entries (they converge to absent everywhere once the
+    /// author stops refreshing — no tombstone needed) and reap entry
+    /// tombstones past `2×dead_timeout` (no longer gossiped after 1×, so no
+    /// peer re-teaches them).
+    fn reap_entries(&mut self, now: Time) {
+        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
+        for member in self.members.values_mut() {
+            member.entries.retain(|_, e| {
+                if e.tombstone {
+                    now < e.tombstone_since.saturating_add(reap_after)
+                } else {
+                    !e.expired(now)
+                }
+            });
+        }
     }
 
     fn compute_coordinator(&self) -> Option<NodeId> {
@@ -805,8 +1009,7 @@ mod tests {
             node: NodeId::new(node),
             incarnation: inc,
             status: status.to_wire(),
-            state_version: 0,
-            state: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
@@ -1011,14 +1214,20 @@ mod tests {
         assert_eq!(a.metadata("k"), Some("local")); // stale ignored
     }
 
-    /// A member delta carrying only app state (alive, no liveness change).
+    /// A member delta carrying only app state (alive, no liveness change) on
+    /// the single-blob shim key.
     fn state_delta(node: &str, version: u64, state: &[u8]) -> wire::MemberDelta {
         wire::MemberDelta {
             node: NodeId::new(node),
             incarnation: 0,
             status: Status::Alive.to_wire(),
-            state_version: version,
-            state: state.to_vec(),
+            entries: vec![wire::EntryDelta {
+                key: GroupEngine::BLOB_KEY.to_owned(),
+                version,
+                ttl_ms: 0,
+                tombstone: false,
+                value: state.to_vec(),
+            }],
         }
     }
 
@@ -1085,5 +1294,129 @@ mod tests {
             Some(&b"s1"[..]),
             "state survived a status change"
         );
+    }
+
+    // ---- keyed per-node state (G1) + restart recovery (G2) ----
+
+    fn entry(key: &str, version: u64, ttl_ms: u64, tombstone: bool, value: &[u8]) -> wire::EntryDelta {
+        wire::EntryDelta {
+            key: key.to_owned(),
+            version,
+            ttl_ms,
+            tombstone,
+            value: value.to_vec(),
+        }
+    }
+
+    fn entries_delta(node: &str, entries: Vec<wire::EntryDelta>) -> wire::MemberDelta {
+        wire::MemberDelta {
+            node: NodeId::new(node),
+            incarnation: 0,
+            status: Status::Alive.to_wire(),
+            entries,
+        }
+    }
+
+    #[test]
+    fn keys_version_independently() {
+        let mut a = engine("a", &["b"]);
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(
+                vec![entries_delta("b", vec![entry("x", 5, 0, false, b"x5"), entry("y", 1, 0, false, b"y1")])],
+                vec![],
+            ),
+            Time(1),
+        );
+        // A fresher y does not disturb x; a stale x is ignored.
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(
+                vec![entries_delta("b", vec![entry("x", 4, 0, false, b"stale"), entry("y", 2, 0, false, b"y2")])],
+                vec![],
+            ),
+            Time(2),
+        );
+        assert_eq!(a.node_entry(&NodeId::new("b"), "x"), Some(&b"x5"[..]));
+        assert_eq!(a.node_entry(&NodeId::new("b"), "y"), Some(&b"y2"[..]));
+        let keys: Vec<&str> = a.node_entries(&NodeId::new("b")).map(|(k, _)| k).collect();
+        assert_eq!(keys, ["x", "y"]);
+    }
+
+    #[test]
+    fn ttl_entries_expire_and_a_refresh_rearms() {
+        let mut a = engine("a", &["b"]);
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![entries_delta("b", vec![entry("hot", 1, 100, false, b"v1")])], vec![]),
+            Time(0),
+        );
+        assert!(a.node_entry(&NodeId::new("b"), "hot").is_some());
+        // A fresher version at t=60 re-arms the expiry to t=160.
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![entries_delta("b", vec![entry("hot", 2, 100, false, b"v2")])], vec![]),
+            Time(60),
+        );
+        a.on_tick(Time(120)); // old deadline passed, refreshed one hasn't
+        assert_eq!(a.node_entry(&NodeId::new("b"), "hot"), Some(&b"v2"[..]));
+        a.on_tick(Time(161));
+        assert_eq!(a.node_entry(&NodeId::new("b"), "hot"), None, "expired after ttl");
+    }
+
+    #[test]
+    fn delete_disseminates_a_tombstone_then_reaps_it() {
+        let mut a = engine("a", &["b"]);
+        a.apply(Command::SetLocalEntry { key: "k".into(), value: b"v".to_vec(), ttl_ms: None });
+        a.apply(Command::DeleteLocalEntry { key: "k".into() });
+        assert_eq!(a.node_entry(&NodeId::new("a"), "k"), None, "deleted locally");
+
+        // The tombstone is still gossiped (so peers drop the key)...
+        let frame = wire::decode(&a.on_tick(Time(1_000)).iter().find_map(|e| match e {
+            Effect::Send { wire, .. } => Some(wire.clone()),
+            _ => None,
+        }).expect("a gossip send")).expect("decodes");
+        let m = frame.members.iter().find(|m| m.node.as_str() == "a").expect("self delta");
+        assert!(m.entries.iter().any(|e| e.key == "k" && e.tombstone), "tombstone advertised");
+
+        // ...and is reaped (and no longer advertised) after 2× dead_timeout.
+        let far = Time(1_000 + Config::default().dead_timeout_ms * 2 + 1);
+        a.on_tick(far);
+        let frame = wire::decode(&a.on_tick(far.saturating_add(10_000)).iter().find_map(|e| match e {
+            Effect::Send { wire, .. } => Some(wire.clone()),
+            _ => None,
+        }).expect("a gossip send")).expect("decodes");
+        let m = frame.members.iter().find(|m| m.node.as_str() == "a").expect("self delta");
+        assert!(!m.entries.iter().any(|e| e.key == "k"), "tombstone reaped");
+    }
+
+    #[test]
+    fn restart_adopts_echoed_entries_for_unauthored_keys() {
+        // Fresh engine (a restart): a peer echoes entries we authored last boot.
+        let mut a = engine("a", &["b"]);
+        let effects = a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![entries_delta("a", vec![entry("addr", 7, 0, false, b"10.0.0.1")])], vec![]),
+            Time(1),
+        );
+        // Adopted verbatim (NOT wiped by out-versioning with emptiness)...
+        assert_eq!(a.node_entry(&NodeId::new("a"), "addr"), Some(&b"10.0.0.1"[..]));
+        // ...with a change event so the app can re-author.
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::NodeStateChanged { node, key } if node.as_str() == "a" && key == "addr"
+        )));
+        // A post-restart local write supersedes the adopted version everywhere.
+        a.apply(Command::SetLocalEntry { key: "addr".into(), value: b"10.0.0.2".to_vec(), ttl_ms: None });
+        assert_eq!(a.node_entry(&NodeId::new("a"), "addr"), Some(&b"10.0.0.2"[..]));
+
+        // And once authored this boot, echoes can never replace it (sole-author
+        // rule): the forged/echoed 999 only bumps our version past it.
+        a.on_message(
+            NodeId::new("b"),
+            &gossip_frame(vec![entries_delta("a", vec![entry("addr", 999, 0, false, b"forged")])], vec![]),
+            Time(2),
+        );
+        assert_eq!(a.node_entry(&NodeId::new("a"), "addr"), Some(&b"10.0.0.2"[..]));
     }
 }

@@ -17,6 +17,9 @@ impl Time {
     /// The zero instant.
     pub const ZERO: Time = Time(0);
 
+    /// The far future ("never" for expiry stamps).
+    pub const MAX: Time = Time(u64::MAX);
+
     /// Returns `self + ms`, saturating at `u64::MAX`.
     #[must_use]
     pub fn saturating_add(self, ms: u64) -> Time {
