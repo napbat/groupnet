@@ -86,8 +86,14 @@ pub struct Simulation {
     seq: u64,
     /// Deterministic per-message loss probability, 0..=100 percent.
     loss_percent: u8,
+    /// Deterministic per-message extra latency, 0..=`jitter_ms`, so messages on a
+    /// link can arrive out of send order (models reorder). 0 disables it.
+    jitter_ms: u64,
     /// Directed links that drop every message (a one-way partition).
     blocked: BTreeSet<(NodeId, NodeId)>,
+    /// Largest encoded frame (`Effect::Send` payload) the sim has carried — lets a
+    /// test assert every emitted frame stayed within the configured cap.
+    max_frame_bytes: usize,
     /// Observed coordinator transitions, in the order the sim saw them.
     pub coordinator_log: Vec<(NodeId, Option<NodeId>)>,
 }
@@ -110,7 +116,9 @@ impl Simulation {
             queue: BinaryHeap::new(),
             seq: 0,
             loss_percent: 0,
+            jitter_ms: 0,
             blocked: BTreeSet::new(),
+            max_frame_bytes: 0,
             coordinator_log: Vec::new(),
         }
     }
@@ -134,6 +142,20 @@ impl Simulation {
     /// Changes the per-message loss probability mid-run (0..=100).
     pub fn set_loss(&mut self, percent: u8) {
         self.loss_percent = percent.min(100);
+    }
+
+    /// Sets the maximum deterministic per-message extra latency. With a non-zero
+    /// jitter, messages on the same link can arrive out of send order, exercising
+    /// the protocol's tolerance of reordering. Reproducible run-to-run.
+    pub fn set_jitter(&mut self, ms: u64) {
+        self.jitter_ms = ms;
+    }
+
+    /// The largest encoded frame the sim has carried so far. A test asserts this
+    /// stays within the engine's `max_delta_frame_bytes` cap across a whole run.
+    #[must_use]
+    pub fn max_frame_bytes(&self) -> usize {
+        self.max_frame_bytes
     }
 
     /// Sets deterministic per-message packet loss (`percent` of 0..=100).
@@ -291,6 +313,30 @@ impl Simulation {
         })
     }
 
+    /// `observer`'s full per-node **keyed-entry** view (live entries only —
+    /// tombstoned/expired keys are absent), so a test can assert every node
+    /// converges on every node's whole keyed map, not just the `~blob` shim.
+    #[must_use]
+    pub fn entries_snapshot(
+        &self,
+        observer: &NodeId,
+    ) -> BTreeMap<NodeId, BTreeMap<String, Vec<u8>>> {
+        self.engines.get(observer).map_or_else(BTreeMap::new, |e| {
+            let nodes: Vec<NodeId> = e.member_statuses().map(|(n, _)| n.clone()).collect();
+            let mut out = BTreeMap::new();
+            for node in nodes {
+                let entries: BTreeMap<String, Vec<u8>> = e
+                    .node_entries(&node)
+                    .map(|(k, v)| (k.to_owned(), v.to_vec()))
+                    .collect();
+                if !entries.is_empty() {
+                    out.insert(node, entries);
+                }
+            }
+            out
+        })
+    }
+
     /// Whether every node has converged on the same (non-`None`) coordinator.
     #[must_use]
     pub fn all_agree_on_coordinator(&self) -> bool {
@@ -305,7 +351,18 @@ impl Simulation {
         for effect in effects {
             match effect {
                 Effect::Send { to, wire } => {
-                    let at = self.now.saturating_add(self.latency_ms);
+                    self.max_frame_bytes = self.max_frame_bytes.max(wire.len());
+                    // Deterministic per-message jitter keyed on the sequence number
+                    // this delivery is about to take, so links can reorder.
+                    let extra = if self.jitter_ms == 0 {
+                        0
+                    } else {
+                        SplitMix64::hash(self.seq.wrapping_add(1)) % (self.jitter_ms + 1)
+                    };
+                    let at = self
+                        .now
+                        .saturating_add(self.latency_ms)
+                        .saturating_add(extra);
                     self.schedule(
                         at,
                         Kind::Deliver {

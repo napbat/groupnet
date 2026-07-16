@@ -21,12 +21,18 @@ async fn poll<F: Fn() -> bool>(what: &str, f: F) {
 #[tokio::test]
 async fn keyed_entries_disseminate_expire_and_delete() {
     let net = Network::new();
-    let ids: Vec<NodeId> = ["node-a", "node-b"].iter().map(|s| NodeId::new(*s)).collect();
+    let ids: Vec<NodeId> = ["node-a", "node-b"]
+        .iter()
+        .map(|s| NodeId::new(*s))
+        .collect();
     let mut nodes = Vec::new();
     for id in &ids {
         let mut b = Node::builder(id.clone(), net.endpoint(id.clone()))
             .gossip_interval_ms(20)
-            .advertise_addr(format!("10.0.0.{}", if id.as_str() == "node-a" { 1 } else { 2 }));
+            .advertise_addr(format!(
+                "10.0.0.{}",
+                if id.as_str() == "node-a" { 1 } else { 2 }
+            ));
         for other in &ids {
             if other != id {
                 b = b.seed(other.clone());
@@ -52,7 +58,10 @@ async fn keyed_entries_disseminate_expire_and_delete() {
 
     // Delete: tombstone disseminates, key drops everywhere.
     a.delete_entry("ready").unwrap();
-    poll("delete reaches b", || b.node_entry(&ids[0], "ready").is_none()).await;
+    poll("delete reaches b", || {
+        b.node_entry(&ids[0], "ready").is_none()
+    })
+    .await;
     assert!(
         b.node_entry(&ids[0], "hot/0").is_some(),
         "other keys untouched by the delete"
@@ -60,8 +69,14 @@ async fn keyed_entries_disseminate_expire_and_delete() {
 
     // TTL: once node-a stops refreshing hot/0, it expires on BOTH nodes
     // (locally too — the author's own copy ages out the same way).
-    poll("ttl expiry on b", || b.node_entry(&ids[0], "hot/0").is_none()).await;
-    poll("ttl expiry on a", || a.node_entry(&ids[0], "hot/0").is_none()).await;
+    poll("ttl expiry on b", || {
+        b.node_entry(&ids[0], "hot/0").is_none()
+    })
+    .await;
+    poll("ttl expiry on a", || {
+        a.node_entry(&ids[0], "hot/0").is_none()
+    })
+    .await;
 
     // ~addr dissemination: each node resolves the other from gossip.
     poll("addr resolution", || {
@@ -74,7 +89,10 @@ async fn keyed_entries_disseminate_expire_and_delete() {
 #[tokio::test]
 async fn events_stream_fires_on_entry_changes() {
     let net = Network::new();
-    let ids: Vec<NodeId> = ["node-a", "node-b"].iter().map(|s| NodeId::new(*s)).collect();
+    let ids: Vec<NodeId> = ["node-a", "node-b"]
+        .iter()
+        .map(|s| NodeId::new(*s))
+        .collect();
     let mut nodes = Vec::new();
     for id in &ids {
         let mut b = Node::builder(id.clone(), net.endpoint(id.clone())).gossip_interval_ms(20);
@@ -105,5 +123,8 @@ async fn events_stream_fires_on_entry_changes() {
             break;
         }
     }
-    assert_eq!(b.node_entry(&ids[0], "progress").as_deref(), Some(&b"42"[..]));
+    assert_eq!(
+        b.node_entry(&ids[0], "progress").as_deref(),
+        Some(&b"42"[..])
+    );
 }

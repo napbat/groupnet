@@ -57,11 +57,13 @@ impl Status {
 /// Per-node state is a **keyed map** of independently-versioned entries, so an
 /// application can update one fact (an address, a readiness flag, one page of
 /// a progress map) without re-shipping or re-versioning the rest. Each entry
-/// is single-writer (its owning node), so a bare per-key version totally
-/// orders it — no writer tiebreak needed.
+/// is single-writer (its owning node) and stamped from that node's one
+/// monotonic version clock, so a bare version totally orders it — no writer
+/// tiebreak needed — and a scalar per-node maximum summarizes the whole map.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StateEntry {
-    /// Monotonic per-key version, authored by the owning member.
+    /// The owning node's version clock at authoring time. Monotonic across all of
+    /// that node's keys.
     pub(crate) version: u64,
     /// The value. Meaningless when `tombstone` is set.
     pub(crate) value: Vec<u8>,
@@ -108,6 +110,16 @@ pub(crate) struct Member {
     /// Keyed app-defined per-node state; each entry merged by its own version,
     /// independently of liveness.
     pub(crate) entries: std::collections::BTreeMap<String, StateEntry>,
+    /// **High-water mark** over every entry version this node has *ever* held for
+    /// the member — the scalar digest summary the anti-entropy round advertises.
+    ///
+    /// It only ever rises: reaping a tombstone or expiring a TTL entry drops the
+    /// `entries` map but never lowers this, so a digest can never claim to be
+    /// behind on a version it has already reaped, and therefore can never
+    /// resurrect it. Combined with the single-writer per-node version clock, the
+    /// scalar is an exact summary: two observers reporting the same high-water for
+    /// a member hold the identical set of that member's live entries.
+    pub(crate) max_state_version: u64,
 }
 
 impl Member {
@@ -119,7 +131,14 @@ impl Member {
             suspect_since: Time::ZERO,
             dead_since: Time::ZERO,
             entries: std::collections::BTreeMap::new(),
+            max_state_version: 0,
         }
+    }
+
+    /// Records that an entry at `version` was seen for this member, advancing the
+    /// high-water mark (never regressing it).
+    pub(crate) fn observe_version(&mut self, version: u64) {
+        self.max_state_version = self.max_state_version.max(version);
     }
 
     /// SWIM merge precedence: would an incoming `(incarnation, status)` override

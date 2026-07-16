@@ -194,9 +194,7 @@ fn emit_events(events: &broadcast::Sender<GroupEvent>, effects: &[Effect]) {
                 node: node.clone(),
                 key: key.clone(),
             },
-            Effect::MetadataChanged { key, .. } => {
-                GroupEvent::MetadataChanged { key: key.clone() }
-            }
+            Effect::MetadataChanged { key, .. } => GroupEvent::MetadataChanged { key: key.clone() },
             Effect::Send { .. } | Effect::ArmTimer { .. } => continue,
         };
         let _ = events.send(event); // no subscribers / lagged is fine

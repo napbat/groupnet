@@ -7,9 +7,9 @@ use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
 use crate::driver::{EVENTS_CAPACITY, Event, GroupViews, INBOX_CAPACITY, Publishers, group_task};
-use tokio::sync::broadcast;
 use crate::group::Group;
 use crate::routing::Routing;
+use tokio::sync::broadcast;
 
 /// The reserved group every node joins to disseminate the inter-group routing
 /// table. Its metadata holds `owner:<resource>` and `coord:<group>` entries.
@@ -219,16 +219,46 @@ impl<T: Transport> NodeBuilder<T> {
     }
 
     /// Overrides the gossip interval (milliseconds). Lower is faster to
-    /// converge but chattier.
+    /// converge but chattier. Since G3 the round runs digest/delta anti-entropy,
+    /// so this also sets the anti-entropy cadence in step (override it separately
+    /// afterwards with [`anti_entropy_interval_ms`](Self::anti_entropy_interval_ms)).
     #[must_use]
     pub fn gossip_interval_ms(mut self, ms: u64) -> Self {
-        self.config.gossip_interval_ms = ms.max(1);
+        let ms = ms.max(1);
+        self.config.gossip_interval_ms = ms;
+        self.config.anti_entropy_interval_ms = ms;
+        self
+    }
+
+    /// Overrides just the anti-entropy digest cadence (milliseconds), leaving the
+    /// gossip interval as set. Call after [`gossip_interval_ms`](Self::gossip_interval_ms),
+    /// which sets both.
+    #[must_use]
+    pub fn anti_entropy_interval_ms(mut self, ms: u64) -> Self {
+        self.config.anti_entropy_interval_ms = ms.max(1);
+        self
+    }
+
+    /// Overrides how many peers each anti-entropy round sends a digest to
+    /// (default 2). Fanout rotates round-robin so every peer is covered over
+    /// successive rounds.
+    #[must_use]
+    pub fn anti_entropy_fanout(mut self, peers: usize) -> Self {
+        self.config.anti_entropy_fanout = peers.max(1);
+        self
+    }
+
+    /// Overrides the soft per-frame byte cap for digests and deltas (default
+    /// 60_000). Larger deltas are split across successive anti-entropy rounds.
+    #[must_use]
+    pub fn max_delta_frame_bytes(mut self, bytes: usize) -> Self {
+        self.config.max_delta_frame_bytes = bytes.max(1);
         self
     }
 
     /// Replaces the full protocol [`Config`] (probe/suspect/dead timings,
-    /// fanout, indirect probes). The narrow per-knob setters remain for the
-    /// common cases.
+    /// fanout, indirect probes, anti-entropy cadence/fanout/frame cap). The
+    /// narrow per-knob setters remain for the common cases.
     #[must_use]
     pub fn config(mut self, config: Config) -> Self {
         self.config = config;

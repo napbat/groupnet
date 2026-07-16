@@ -4,6 +4,16 @@ use crate::config::Config;
 use crate::membership::{Member, StateEntry, Status};
 use crate::{GroupId, NodeId, Time, placement, wire};
 
+/// One step of an FNV-1a fold (dep-free), used to hash a member's held entries
+/// into the digest's content hash.
+fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// A metadata value tagged with a version and its writer, resolved by
 /// last-writer-wins with a deterministic `(version, writer)` tiebreak.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,7 +138,27 @@ struct Pending {
 /// Membership uses a SWIM-style protocol: direct liveness probes with indirect
 /// (`ping-req`) fallback, a `Suspect` state with a refutation window,
 /// last-writer-wins merge keyed by per-node incarnation numbers, and reaping of
-/// stale `Dead` tombstones.
+/// stale `Dead` tombstones. Probes carry no piggybacked view — they are tiny.
+///
+/// Dissemination is **digest/delta anti-entropy** (G3). Each node stamps every
+/// one of its own keys from a single monotonic per-node version clock, so a
+/// scalar high-water mark per member summarizes its whole keyed map. The
+/// periodic round emits compact [`wire::Kind::Digest`] frames (per-node
+/// `(incarnation, status, max_version)` plus the small metadata register set); a
+/// receiver compares them against its own high-water marks and either requests
+/// the gap ([`wire::Kind::DeltaRequest`]) or pushes it ([`wire::Kind::Delta`],
+/// bounded per frame — successive rounds converge the rest).
+///
+/// **Reap-horizon invariant.** A member's high-water mark only ever rises;
+/// reaping a tombstone or expiring a TTL entry drops the value but never lowers
+/// the mark. Because a delta only ever carries entries *strictly newer* than the
+/// peer's advertised mark, an entry reaped past the horizon — whose version is
+/// below every connected peer's mark, since its tombstone was gossiped for a
+/// full `dead_timeout` before anyone reaped it — can never be regenerated. A
+/// node partitioned longer than the reap window (`2×dead_timeout`) is outside
+/// the horizon and may retain a reaped entry, exactly as a `Dead`-member
+/// tombstone already requires; set `dead_timeout` above the longest survivable
+/// partition.
 #[derive(Debug)]
 pub struct GroupEngine {
     group: GroupId,
@@ -145,10 +175,14 @@ pub struct GroupEngine {
     metadata: BTreeMap<String, VersionedValue>,
     coordinator: Option<NodeId>,
     config: Config,
-    next_gossip: Time,
+    /// When the next periodic anti-entropy (digest) round is due.
+    next_anti_entropy: Time,
     next_probe: Time,
     /// Round-robin cursor over probe candidates.
     probe_cursor: usize,
+    /// Round-robin cursor over dissemination targets, so digest fanout rotates
+    /// across peers instead of forever favouring the lowest ids.
+    gossip_cursor: usize,
     /// The outstanding probe awaiting a response, if any.
     pending: Option<Pending>,
     /// As an indirect prober: target -> the origins waiting for us to relay an
@@ -193,9 +227,10 @@ impl GroupEngine {
             metadata: BTreeMap::new(),
             coordinator: None,
             config,
-            next_gossip: Time::ZERO,
+            next_anti_entropy: Time::ZERO,
             next_probe: Time::ZERO,
             probe_cursor: 0,
+            gossip_cursor: 0,
             pending: None,
             relaying: BTreeMap::new(),
             now_hint: Time::ZERO,
@@ -290,7 +325,9 @@ impl GroupEngine {
     /// Iterates every node advertising a non-empty `~blob` state, in id order.
     pub fn node_states_iter(&self) -> impl Iterator<Item = (&NodeId, &[u8])> {
         self.members.keys().filter_map(|node| {
-            self.node_state(node).filter(|s| !s.is_empty()).map(|s| (node, s))
+            self.node_state(node)
+                .filter(|s| !s.is_empty())
+                .map(|s| (node, s))
         })
     }
 
@@ -307,13 +344,14 @@ impl GroupEngine {
             .map(|(k, v)| (k.as_str(), v.value.as_str()))
     }
 
-    /// Primes the engine: announces this node and arms the first timers. A
-    /// driver calls this once, right after construction, passing current time.
+    /// Primes the engine: announces this node (a first digest) and arms the
+    /// first timers. A driver calls this once, right after construction, passing
+    /// current time.
     pub fn start(&mut self, now: Time) -> Vec<Effect> {
         self.now_hint = self.now_hint.max(now);
-        self.next_gossip = now.saturating_add(self.config.gossip_interval_ms);
+        self.next_anti_entropy = now.saturating_add(self.anti_entropy_interval());
         self.next_probe = now.saturating_add(self.config.probe_interval_ms);
-        let mut effects = self.gossip(now);
+        let mut effects = self.disseminate_digest(now);
         effects.push(self.arm_timer());
         effects
     }
@@ -334,6 +372,7 @@ impl GroupEngine {
                         writer: self.local.clone(),
                     },
                 );
+                self.nudge_anti_entropy();
                 vec![Effect::MetadataChanged { key, value }]
             }
             Command::SetLocalState(state) => self.set_local_entry(Self::BLOB_KEY, state, None),
@@ -341,13 +380,15 @@ impl GroupEngine {
                 self.set_local_entry(&key, value, ttl_ms)
             }
             Command::DeleteLocalEntry { key } => {
+                let now = self.now_hint;
                 let Some(m) = self.members.get_mut(&self.local) else {
                     return Vec::new();
                 };
-                // A tombstone at version+1 supersedes the live entry everywhere;
-                // deleting an unknown key still plants a tombstone (idempotent,
-                // and it wins over any in-flight older write).
-                let version = m.entries.get(&key).map_or(1, |e| e.version + 1);
+                // A tombstone at the next per-node version supersedes the live
+                // entry everywhere; deleting an unknown key still plants a
+                // tombstone (idempotent, and it wins over any in-flight write).
+                let version = m.max_state_version.saturating_add(1);
+                m.max_state_version = version;
                 m.entries.insert(
                     key.clone(),
                     StateEntry {
@@ -356,22 +397,27 @@ impl GroupEngine {
                         ttl_ms: 0,
                         expires_at: Time::MAX,
                         tombstone: true,
-                        tombstone_since: self.now_hint,
+                        tombstone_since: now,
                     },
                 );
                 self.authored.insert(key.clone());
-                vec![Effect::NodeStateChanged { node: self.local.clone(), key }]
+                self.nudge_anti_entropy();
+                vec![Effect::NodeStateChanged {
+                    node: self.local.clone(),
+                    key,
+                }]
             }
             Command::Leave => {
                 // Declare ourselves Dead at our current incarnation and stop
                 // refuting. Dead supersedes Alive at equal incarnation, so the
-                // leave sticks as it disseminates on the next gossip round.
+                // leave sticks as it disseminates on the next digest round.
                 self.leaving = true;
                 if let Some(m) = self.members.get_mut(&self.local) {
                     m.status = Status::Dead;
                 }
                 let mut effects = vec![Effect::MembershipChanged];
                 effects.extend(self.recompute_coordinator());
+                self.nudge_anti_entropy();
                 effects
             }
             Command::AddPeer(node) => {
@@ -385,6 +431,7 @@ impl GroupEngine {
                 self.members.insert(node, Member::new(0, Status::Alive));
                 let mut effects = vec![Effect::MembershipChanged];
                 effects.extend(self.recompute_coordinator());
+                self.nudge_anti_entropy();
                 effects
             }
         }
@@ -400,53 +447,57 @@ impl GroupEngine {
             return Vec::new(); // not ours
         }
 
-        let mut effects = self.merge_members(frame.members, now);
-        effects.extend(self.merge_metadata(frame.metadata));
-
         match frame.kind {
+            wire::Kind::Digest => self.on_digest(&from, &frame, now),
+            wire::Kind::DeltaRequest => self.on_delta_request(&from, &frame, now),
+            wire::Kind::Delta => self.merge_members(frame.members, now),
             wire::Kind::Ping => {
-                effects.push(self.frame_to(from, wire::Kind::Ack, None, now));
+                // Prove we're alive. The ack carries no view (anti-entropy owns
+                // dissemination); it is a bare liveness token.
+                vec![self.send_probe(from, wire::Kind::Ack, None)]
             }
             wire::Kind::Ack => {
+                let mut effects = Vec::new();
                 self.clear_pending_if(&from);
                 // As an indirect prober: relay this proof of life to any origins
                 // waiting on `from`.
                 if let Some(origins) = self.relaying.remove(&from) {
                     for origin in origins {
-                        effects.push(self.frame_to(
+                        effects.push(self.send_probe(
                             origin,
                             wire::Kind::IndirectAck,
                             Some(from.clone()),
-                            now,
                         ));
                     }
                 }
+                effects
             }
             wire::Kind::PingReq => {
                 // We were asked to probe `frame.target` on `from`'s behalf.
+                let mut effects = Vec::new();
                 if let Some(target) = frame.target {
                     if target != self.local {
                         self.relaying
                             .entry(target.clone())
                             .or_default()
                             .insert(from);
-                        effects.push(self.frame_to(target, wire::Kind::Ping, None, now));
+                        effects.push(self.send_probe(target, wire::Kind::Ping, None));
                     }
                 }
+                effects
             }
             wire::Kind::IndirectAck => {
                 // A prober reports our probe target is alive.
                 if let Some(target) = frame.target {
                     self.clear_pending_if(&target);
                 }
+                Vec::new()
             }
-            wire::Kind::Gossip => {}
         }
-        effects
     }
 
     /// Advances logical time: escalates or expires probes, ages out suspicions
-    /// and tombstones, and emits probe / gossip rounds when due.
+    /// and tombstones, and emits probe / anti-entropy rounds when due.
     pub fn on_tick(&mut self, now: Time) -> Vec<Effect> {
         self.now_hint = self.now_hint.max(now);
         let mut effects = Vec::new();
@@ -483,38 +534,60 @@ impl GroupEngine {
             effects.extend(self.probe(now));
         }
 
-        // 5. Disseminate the full view.
-        if now >= self.next_gossip {
-            self.next_gossip = now.saturating_add(self.config.gossip_interval_ms);
-            effects.extend(self.gossip(now));
+        // 5. Run the anti-entropy digest round.
+        if now >= self.next_anti_entropy {
+            self.next_anti_entropy = now.saturating_add(self.anti_entropy_interval());
+            effects.extend(self.disseminate_digest(now));
         }
 
         effects.push(self.arm_timer());
         effects
     }
 
-    /// Author one key of our own state: bump above whatever version we hold
-    /// (ours or an adopted echo) so the write supersedes every prior copy.
+    fn anti_entropy_interval(&self) -> u64 {
+        self.config.anti_entropy_interval_ms.max(1)
+    }
+
+    /// Brings the next anti-entropy round forward to now, so a fresh membership
+    /// change or local write disseminates on the next tick rather than waiting a
+    /// whole interval — restoring the "state change rides the next frame"
+    /// promptness the full-view piggyback used to give for free.
+    fn nudge_anti_entropy(&mut self) {
+        self.next_anti_entropy = self.next_anti_entropy.min(self.now_hint);
+    }
+
+    /// Author one key of our own state: bump above whatever version our per-node
+    /// clock has reached (covering every key, and any adopted echo) so the write
+    /// supersedes every prior copy and advances our digest high-water mark.
     fn set_local_entry(&mut self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>) -> Vec<Effect> {
         let now = self.now_hint;
+        let ttl = ttl_ms.unwrap_or(0);
         let Some(m) = self.members.get_mut(&self.local) else {
             return Vec::new();
         };
-        let version = m.entries.get(key).map_or(1, |e| e.version + 1);
-        self.authored.insert(key.to_owned());
-        let ttl = ttl_ms.unwrap_or(0);
+        let version = m.max_state_version.saturating_add(1);
+        m.max_state_version = version;
         m.entries.insert(
             key.to_owned(),
             StateEntry {
                 version,
                 value,
                 ttl_ms: ttl,
-                expires_at: if ttl == 0 { Time::MAX } else { now.saturating_add(ttl) },
+                expires_at: if ttl == 0 {
+                    Time::MAX
+                } else {
+                    now.saturating_add(ttl)
+                },
                 tombstone: false,
                 tombstone_since: Time::ZERO,
             },
         );
-        vec![Effect::NodeStateChanged { node: self.local.clone(), key: key.to_owned() }]
+        self.authored.insert(key.to_owned());
+        self.nudge_anti_entropy();
+        vec![Effect::NodeStateChanged {
+            node: self.local.clone(),
+            key: key.to_owned(),
+        }]
     }
 
     fn probe(&mut self, now: Time) -> Vec<Effect> {
@@ -532,7 +605,7 @@ impl GroupEngine {
             deadline: now.saturating_add(self.config.probe_timeout_ms),
             phase: ProbePhase::Direct,
         });
-        vec![self.frame_to(target, wire::Kind::Ping, None, now)]
+        vec![self.send_probe(target, wire::Kind::Ping, None)]
     }
 
     /// A direct probe missed: enlist indirect probers instead of suspecting
@@ -557,7 +630,7 @@ impl GroupEngine {
         });
         probers
             .into_iter()
-            .map(|p| self.frame_to(p, wire::Kind::PingReq, Some(target.clone()), now))
+            .map(|p| self.send_probe(p, wire::Kind::PingReq, Some(target.clone())))
             .collect()
     }
 
@@ -581,6 +654,7 @@ impl GroupEngine {
         }
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
+        self.nudge_anti_entropy();
         effects
     }
 
@@ -607,6 +681,7 @@ impl GroupEngine {
         }
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
+        self.nudge_anti_entropy();
         effects
     }
 
@@ -630,10 +705,396 @@ impl GroupEngine {
         }
     }
 
-    /// Merges incoming member deltas. Liveness (`incarnation`/`status`, by SWIM
-    /// precedence) and app state (`state_version`, by last-writer-wins) are
-    /// merged *independently* — a status update never clobbers state, and vice
-    /// versa. Also refutes any suspicion about ourselves.
+    // ---- anti-entropy: digest generation -------------------------------------
+
+    /// Runs one anti-entropy round: send a digest (chunked to the frame budget)
+    /// to a rotating fanout of peers.
+    fn disseminate_digest(&mut self, now: Time) -> Vec<Effect> {
+        let targets = self.select_fanout_targets();
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        let chunks = self.build_digest_chunks(now);
+        let mut effects = Vec::new();
+        for to in targets {
+            for chunk in &chunks {
+                effects.push(Effect::Send {
+                    to: to.clone(),
+                    wire: chunk.clone(),
+                });
+            }
+        }
+        effects
+    }
+
+    /// Picks `anti_entropy_fanout` distinct peers, rotating a cursor so every
+    /// peer is covered over successive rounds.
+    fn select_fanout_targets(&mut self) -> Vec<NodeId> {
+        let candidates = self.dissemination_targets();
+        let n = candidates.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let k = self.config.anti_entropy_fanout.max(1).min(n);
+        let mut out = Vec::with_capacity(k);
+        for i in 0..k {
+            out.push(candidates[(self.gossip_cursor + i) % n].clone());
+        }
+        self.gossip_cursor = self.gossip_cursor.wrapping_add(k);
+        out
+    }
+
+    /// Builds the digest as one or more encoded [`wire::Kind::Digest`] frames,
+    /// each within the frame budget. The metadata register set rides the first
+    /// chunk; per-node summaries fill the rest.
+    fn build_digest_chunks(&self, now: Time) -> Vec<Vec<u8>> {
+        let budget = self.config.max_delta_frame_bytes;
+        let summaries: Vec<wire::NodeDigest> = self
+            .members
+            .iter()
+            .filter(|(_, m)| self.should_gossip(m, now))
+            .map(|(node, m)| wire::NodeDigest {
+                node: node.clone(),
+                incarnation: m.incarnation,
+                status: m.status.to_wire(),
+                max_version: m.max_state_version,
+                content_hash: self.content_hash(m, now),
+            })
+            .collect();
+        let metadata: Vec<wire::MetaDelta> = self
+            .metadata
+            .iter()
+            .map(|(key, v)| wire::MetaDelta {
+                key: key.clone(),
+                version: v.version,
+                writer: v.writer.clone(),
+                value: v.value.clone(),
+            })
+            .collect();
+
+        let base = 1 + 1 + (4 + self.group.as_str().len()) + 1 + 4; // ..+ digest count
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0usize;
+        loop {
+            let first = chunks.is_empty();
+            let meta = if first { metadata.clone() } else { Vec::new() };
+            let meta_len = 4 + meta
+                .iter()
+                .map(|d| {
+                    (4 + d.key.len()) + 8 + (4 + d.writer.as_str().len()) + (4 + d.value.len())
+                })
+                .sum::<usize>();
+            let mut size = base + meta_len;
+            let mut slice: Vec<wire::NodeDigest> = Vec::new();
+            while i < summaries.len() {
+                let d = &summaries[i];
+                let dlen = (4 + d.node.as_str().len()) + 8 + 1 + 8 + 8;
+                if size + dlen > budget && !slice.is_empty() {
+                    break;
+                }
+                size += dlen;
+                slice.push(d.clone());
+                i += 1;
+            }
+            if slice.is_empty() && meta.is_empty() {
+                break; // nothing left to emit
+            }
+            chunks.push(wire::encode(&wire::Frame {
+                kind: wire::Kind::Digest,
+                group: self.group.clone(),
+                target: None,
+                digest: slice,
+                wants: Vec::new(),
+                members: Vec::new(),
+                metadata: meta,
+            }));
+            if i >= summaries.len() {
+                break;
+            }
+        }
+        chunks
+    }
+
+    // ---- anti-entropy: reconciliation ----------------------------------------
+
+    /// Merges a peer's digest: reconcile liveness and metadata directly, then
+    /// request whatever entries we're behind on and offer whatever we're ahead
+    /// on.
+    fn on_digest(&mut self, from: &NodeId, frame: &wire::Frame, now: Time) -> Vec<Effect> {
+        let mut effects = self.merge_digest_liveness(&frame.digest, now);
+        effects.extend(self.merge_metadata(frame.metadata.clone()));
+
+        let mut wants: Vec<wire::NodeWant> = Vec::new();
+        let mut offers: Vec<(NodeId, u64)> = Vec::new();
+        for d in &frame.digest {
+            let (ours_max, ours_hash) = match self.members.get(&d.node) {
+                Some(m) => (m.max_state_version, self.content_hash(m, now)),
+                None => (0, 0),
+            };
+            if d.max_version > ours_max {
+                wants.push(wire::NodeWant {
+                    node: d.node.clone(),
+                    have_version: ours_max,
+                });
+            } else if d.max_version < ours_max {
+                offers.push((d.node.clone(), d.max_version));
+            } else if d.content_hash != ours_hash {
+                // Equal high-water but divergent holdings — a restart reused a
+                // version clock, so the same number now names different entries on
+                // each side. Fall back to a full per-key exchange (request and
+                // offer everything), which last-writer-wins reconciles where the
+                // scalar comparison alone was blind.
+                wants.push(wire::NodeWant {
+                    node: d.node.clone(),
+                    have_version: 0,
+                });
+                offers.push((d.node.clone(), 0));
+            }
+        }
+        if !wants.is_empty() {
+            effects.push(self.send_delta_request(from.clone(), wants));
+        }
+        if let Some(delta) = self.build_delta_frame(&offers, now) {
+            effects.push(Effect::Send {
+                to: from.clone(),
+                wire: delta,
+            });
+        }
+        effects
+    }
+
+    /// Answers a peer's `DeltaRequest` with the entries it asked for, bounded to
+    /// the frame budget.
+    fn on_delta_request(&mut self, from: &NodeId, frame: &wire::Frame, now: Time) -> Vec<Effect> {
+        let offers: Vec<(NodeId, u64)> = frame
+            .wants
+            .iter()
+            .map(|w| (w.node.clone(), w.have_version))
+            .collect();
+        match self.build_delta_frame(&offers, now) {
+            Some(delta) => vec![Effect::Send {
+                to: from.clone(),
+                wire: delta,
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    fn send_delta_request(&self, to: NodeId, wants: Vec<wire::NodeWant>) -> Effect {
+        let budget = self.config.max_delta_frame_bytes;
+        let base = 1 + 1 + (4 + self.group.as_str().len()) + 1 + 4;
+        let mut size = base;
+        let mut kept: Vec<wire::NodeWant> = Vec::new();
+        for w in wants {
+            let wlen = (4 + w.node.as_str().len()) + 8;
+            if size + wlen > budget && !kept.is_empty() {
+                break; // remainder re-requested next round
+            }
+            size += wlen;
+            kept.push(w);
+        }
+        Effect::Send {
+            to,
+            wire: wire::encode(&wire::Frame {
+                kind: wire::Kind::DeltaRequest,
+                group: self.group.clone(),
+                target: None,
+                digest: Vec::new(),
+                wants: kept,
+                members: Vec::new(),
+                metadata: Vec::new(),
+            }),
+        }
+    }
+
+    /// Assembles the entries newer than each `(node, have_version)` into a single
+    /// bounded `Delta` frame. Entries go out in ascending version order and are
+    /// truncated at the budget (the recipient re-requests the tail next round);
+    /// a member with no qualifying entries but a higher-water mark than the
+    /// requester is still included so the recipient can advance past a reaped
+    /// tail. Returns `None` when there is nothing to send.
+    fn build_delta_frame(&self, wants: &[(NodeId, u64)], now: Time) -> Option<Vec<u8>> {
+        let budget = self.config.max_delta_frame_bytes;
+        let mut size = wire::delta_frame_overhead(&self.group);
+        let mut members: Vec<wire::MemberDelta> = Vec::new();
+
+        'wants: for (node, have) in wants {
+            let Some(m) = self.members.get(node) else {
+                continue;
+            };
+            let mut qualifying: Vec<(&String, &StateEntry)> = m
+                .entries
+                .iter()
+                .filter(|(_, e)| e.version > *have && self.should_gossip_entry(e, now))
+                .collect();
+            qualifying.sort_by_key(|(_, e)| e.version);
+
+            let header = wire::member_header_len(node);
+            if size + header > budget && !members.is_empty() {
+                break 'wants; // no room even for the header
+            }
+
+            let mut md = wire::MemberDelta {
+                node: node.clone(),
+                incarnation: m.incarnation,
+                status: m.status.to_wire(),
+                max_version: 0,
+                entries: Vec::new(),
+            };
+            let mut member_size = header;
+            let mut top = *have;
+            let mut truncated = false;
+
+            for (k, e) in qualifying {
+                let ed = wire::EntryDelta {
+                    key: k.clone(),
+                    version: e.version,
+                    ttl_ms: e.ttl_ms,
+                    tombstone: e.tombstone,
+                    value: e.value.clone(),
+                };
+                let elen = wire::entry_len(&ed);
+                // The one exception to the budget: never starve the very first
+                // entry, even if its value alone exceeds the cap.
+                let first_ever = members.is_empty() && md.entries.is_empty();
+                if size + member_size + elen > budget && !first_ever {
+                    truncated = true;
+                    break;
+                }
+                top = ed.version;
+                member_size += elen;
+                md.entries.push(ed);
+            }
+
+            // If we sent everything qualifying, the recipient can jump straight
+            // to our true high-water (which may sit above the last entry when
+            // the top was reaped); if we truncated, only to the last we included.
+            md.max_version = if truncated {
+                top
+            } else {
+                m.max_state_version.max(top)
+            };
+
+            if !md.entries.is_empty() || md.max_version > *have {
+                size += member_size;
+                members.push(md);
+            }
+            if truncated {
+                break 'wants;
+            }
+        }
+
+        if members.is_empty() {
+            return None;
+        }
+        Some(wire::encode(&wire::Frame {
+            kind: wire::Kind::Delta,
+            group: self.group.clone(),
+            target: None,
+            digest: Vec::new(),
+            wants: Vec::new(),
+            members,
+            metadata: Vec::new(),
+        }))
+    }
+
+    // ---- liveness merges -----------------------------------------------------
+
+    /// Would an incoming `(status, incarnation)` about *ourselves* require us to
+    /// refute (bump our incarnation and reassert Alive)? Returns the incarnation
+    /// to jump to, if so. A voluntary leave is never refuted.
+    fn self_refute_target(&self, status: Status, incarnation: u64) -> Option<u64> {
+        if self.leaving {
+            return None;
+        }
+        let false_suspicion = status != Status::Alive && incarnation >= self.incarnation;
+        let peer_ahead = incarnation > self.incarnation;
+        (false_suspicion || peer_ahead).then_some(incarnation + 1)
+    }
+
+    fn apply_refutation(&mut self, refute_to: Option<u64>) -> bool {
+        let Some(ni) = refute_to else {
+            return false;
+        };
+        self.incarnation = ni;
+        if let Some(m) = self.members.get_mut(&self.local) {
+            m.incarnation = ni;
+            m.status = Status::Alive;
+        }
+        true
+    }
+
+    /// Applies a peer's liveness claim about a *remote* node by SWIM precedence.
+    /// Adopts an unknown node (liveness only — no entries) or updates a known
+    /// one. Returns whether membership changed.
+    fn merge_remote_liveness(
+        &mut self,
+        node: &NodeId,
+        incarnation: u64,
+        status: Status,
+        now: Time,
+    ) -> bool {
+        match self.members.get(node) {
+            None => {
+                let mut member = Member::new(incarnation, status);
+                match status {
+                    Status::Suspect => member.suspect_since = now,
+                    Status::Dead => member.dead_since = now,
+                    Status::Alive => {}
+                }
+                self.members.insert(node.clone(), member);
+                true
+            }
+            Some(cur) => {
+                if !cur.superseded_by(incarnation, status) {
+                    return false;
+                }
+                let member = self.members.get_mut(node).expect("present");
+                member.incarnation = incarnation;
+                member.status = status;
+                match status {
+                    Status::Suspect => member.suspect_since = now,
+                    Status::Dead => member.dead_since = now,
+                    Status::Alive => {}
+                }
+                true
+            }
+        }
+    }
+
+    /// Merges the liveness half of a digest (incarnation/status per node) and
+    /// refutes any suspicion of ourselves it carries. State reconciliation is a
+    /// separate delta round-trip.
+    fn merge_digest_liveness(&mut self, digest: &[wire::NodeDigest], now: Time) -> Vec<Effect> {
+        let mut membership_changed = false;
+        let mut refute_to: Option<u64> = None;
+        for d in digest {
+            let Some(status) = Status::from_wire(d.status) else {
+                continue;
+            };
+            if d.node == self.local {
+                if let Some(t) = self.self_refute_target(status, d.incarnation) {
+                    refute_to = Some(refute_to.map_or(t, |x| x.max(t)));
+                }
+                continue;
+            }
+            membership_changed |= self.merge_remote_liveness(&d.node, d.incarnation, status, now);
+        }
+        membership_changed |= self.apply_refutation(refute_to);
+
+        let mut effects = Vec::new();
+        if membership_changed {
+            effects.push(Effect::MembershipChanged);
+            effects.extend(self.recompute_coordinator());
+            self.nudge_anti_entropy();
+        }
+        effects
+    }
+
+    /// Merges the member deltas of a `Delta` frame. Liveness (`incarnation` /
+    /// `status`, by SWIM precedence) and app state (per-key last-writer-wins) are
+    /// merged *independently*, high-water marks advance, and our own echoed
+    /// entries are adopted for restart recovery.
     fn merge_members(&mut self, deltas: Vec<wire::MemberDelta>, now: Time) -> Vec<Effect> {
         let mut membership_changed = false;
         let mut state_changed: Vec<(NodeId, String)> = Vec::new();
@@ -645,27 +1106,14 @@ impl GroupEngine {
             };
 
             if delta.node == self.local {
-                // Refute a false suspicion, AND handle restart: if a peer
-                // remembers us at a higher incarnation than our (possibly fresh)
-                // one, out-incarnate it so our announcements aren't ignored as
-                // stale.
-                if !self.leaving {
-                    let false_suspicion =
-                        status != Status::Alive && delta.incarnation >= self.incarnation;
-                    let peer_ahead = delta.incarnation > self.incarnation;
-                    if false_suspicion || peer_ahead {
-                        let target = delta.incarnation + 1;
-                        refute_to = Some(refute_to.map_or(target, |t| t.max(target)));
-                    }
+                // Refute a false suspicion / out-incarnate a peer ahead of us.
+                if let Some(t) = self.self_refute_target(status, delta.incarnation) {
+                    refute_to = Some(refute_to.map_or(t, |x| x.max(t)));
                 }
-                // Restart recovery (the wipe fix): our own entries echoed back
-                // at versions above what we hold are OUR data from before a
-                // restart — ADOPT them verbatim instead of out-versioning them
-                // with fresh emptiness (which is exactly how the old blob model
-                // briefly wiped a restarted node's state cluster-wide). The app
-                // sees a NodeStateChanged for each adopted key and re-authors
-                // whatever should be fresher; a later local write bumps above
-                // the adopted version and supersedes everywhere.
+                // Restart recovery (the wipe fix): our own entries echoed back at
+                // versions above what we hold are OUR data from before a restart.
+                // ADOPT them verbatim for keys we have NOT authored this boot; for
+                // authored keys keep our value and out-version the echo.
                 for entry in delta.entries {
                     let ours = self.members[&self.local].entries.get(&entry.key);
                     if ours.is_some_and(|e| entry.version <= e.version) {
@@ -673,21 +1121,21 @@ impl GroupEngine {
                     }
                     let m = self.members.get_mut(&self.local).expect("self present");
                     if self.authored.contains(&entry.key) {
-                        // Sole-author rule: never let an echo (or a forgery)
-                        // replace a value we wrote this boot. Jump our version
-                        // above it and keep re-advertising OUR value, which
-                        // then supersedes everywhere.
-                        if let Some(e) = m.entries.get_mut(&entry.key) {
+                        // Sole-author rule: never let an echo (or forgery) replace
+                        // a value we wrote this boot. Jump our version above it and
+                        // keep re-advertising OUR value, which supersedes everywhere.
+                        let bumped = m.entries.get_mut(&entry.key).map(|e| {
                             e.version = entry.version.saturating_add(1);
+                            e.version
+                        });
+                        if let Some(v) = bumped {
+                            m.observe_version(v);
                             state_changed.push((self.local.clone(), entry.key));
                         }
                     } else {
-                        // Restart recovery (the wipe fix): a key we have NOT
-                        // authored this boot, echoed at a higher version, is
-                        // our own pre-restart data — adopt it verbatim instead
-                        // of out-versioning it with fresh emptiness. The app
-                        // sees NodeStateChanged and re-authors what should be
-                        // fresher.
+                        // A key we have NOT authored this boot, echoed at a higher
+                        // version, is our own pre-restart data — adopt it verbatim.
+                        m.observe_version(entry.version);
                         m.entries.insert(
                             entry.key.clone(),
                             StateEntry {
@@ -719,6 +1167,7 @@ impl GroupEngine {
                         Status::Alive => {}
                     }
                     for entry in delta.entries {
+                        member.observe_version(entry.version);
                         state_changed.push((delta.node.clone(), entry.key.clone()));
                         member.entries.insert(
                             entry.key,
@@ -736,6 +1185,7 @@ impl GroupEngine {
                             },
                         );
                     }
+                    member.observe_version(delta.max_version);
                     self.members.insert(delta.node.clone(), member);
                     membership_changed = true;
                 }
@@ -753,13 +1203,19 @@ impl GroupEngine {
                         membership_changed = true;
                     }
                     // Per-key LWW, independent of liveness: each entry is
-                    // single-writer (its owning node), so version order alone
-                    // decides; a fresher version also re-arms the local TTL.
+                    // single-writer, so version order alone decides; a fresher
+                    // version also re-arms the local TTL. Every seen version
+                    // advances the high-water mark.
                     for entry in delta.entries {
-                        let wins = member
-                            .entries
-                            .get(&entry.key)
-                            .is_none_or(|e| entry.version > e.version);
+                        member.observe_version(entry.version);
+                        // Per-key LWW by version, with a deterministic tiebreak
+                        // (tombstone, then value) so a version reused across a
+                        // restart can never deadlock two divergent values at the
+                        // same number — one side always wins and both converge.
+                        let wins = member.entries.get(&entry.key).is_none_or(|e| {
+                            (entry.version, entry.tombstone, &entry.value)
+                                > (e.version, e.tombstone, &e.value)
+                        });
                         if !wins {
                             continue;
                         }
@@ -780,23 +1236,20 @@ impl GroupEngine {
                         );
                         state_changed.push((delta.node.clone(), entry.key));
                     }
+                    // The sender's high-water (>= every version it holds) lets us
+                    // advance our summary past a reaped tail without re-requesting.
+                    member.observe_version(delta.max_version);
                 }
             }
         }
 
-        if let Some(new_incarnation) = refute_to {
-            self.incarnation = new_incarnation;
-            if let Some(m) = self.members.get_mut(&self.local) {
-                m.incarnation = new_incarnation;
-                m.status = Status::Alive;
-            }
-            membership_changed = true;
-        }
+        membership_changed |= self.apply_refutation(refute_to);
 
         let mut effects = Vec::new();
         if membership_changed {
             effects.push(Effect::MembershipChanged);
             effects.extend(self.recompute_coordinator());
+            self.nudge_anti_entropy();
         }
         for (node, key) in state_changed {
             effects.push(Effect::NodeStateChanged { node, key });
@@ -835,107 +1288,14 @@ impl GroupEngine {
         effects
     }
 
-    /// Live members (excluding self) we may probe or gossip to.
-    fn probe_candidates(&self) -> impl Iterator<Item = &NodeId> {
-        self.members
-            .iter()
-            .filter(|(node, m)| **node != self.local && m.status != Status::Dead)
-            .map(|(node, _)| node)
-    }
-
-    fn dissemination_targets(&self) -> Vec<NodeId> {
-        let mut set: BTreeSet<NodeId> = self.probe_candidates().cloned().collect();
-        set.extend(self.seeds.iter().cloned());
-        set.into_iter().collect()
-    }
-
-    fn gossip(&self, now: Time) -> Vec<Effect> {
-        let targets = self.dissemination_targets();
-        if targets.is_empty() {
-            return Vec::new();
-        }
-        let frame = self.encode_frame(wire::Kind::Gossip, None, now);
-        targets
-            .into_iter()
-            .take(self.config.fanout.max(1))
-            .map(|to| Effect::Send {
-                to,
-                wire: frame.clone(),
-            })
-            .collect()
-    }
-
-    /// Builds a `Send` effect of `kind` addressed to `to`.
-    fn frame_to(&self, to: NodeId, kind: wire::Kind, target: Option<NodeId>, now: Time) -> Effect {
-        Effect::Send {
-            to,
-            wire: self.encode_frame(kind, target, now),
-        }
-    }
-
-    fn encode_frame(&self, kind: wire::Kind, target: Option<NodeId>, now: Time) -> Vec<u8> {
-        wire::encode(&wire::Frame {
-            kind,
-            group: self.group.clone(),
-            target,
-            members: self
-                .members
-                .iter()
-                .filter(|(_, m)| self.should_gossip(m, now))
-                .map(|(node, m)| wire::MemberDelta {
-                    node: node.clone(),
-                    incarnation: m.incarnation,
-                    status: m.status.to_wire(),
-                    entries: m
-                        .entries
-                        .iter()
-                        .filter(|(_, e)| self.should_gossip_entry(e, now))
-                        .map(|(key, e)| wire::EntryDelta {
-                            key: key.clone(),
-                            version: e.version,
-                            ttl_ms: e.ttl_ms,
-                            tombstone: e.tombstone,
-                            value: e.value.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            metadata: self
-                .metadata
-                .iter()
-                .map(|(key, v)| wire::MetaDelta {
-                    key: key.clone(),
-                    version: v.version,
-                    writer: v.writer.clone(),
-                    value: v.value.clone(),
-                })
-                .collect(),
-        })
-    }
-
-    /// A `Dead` member is advertised only until `dead_timeout` elapses; after
-    /// that peers are assumed to know, and dropping it from gossip lets everyone
-    /// reap the tombstone without re-teaching each other.
-    fn should_gossip(&self, m: &Member, now: Time) -> bool {
-        m.status != Status::Dead || now < m.dead_since.saturating_add(self.config.dead_timeout_ms)
-    }
-
-    /// An entry is advertised while live and unexpired; a tombstone only until
-    /// `dead_timeout` (after that peers are assumed to know — same shape as a
-    /// Dead member tombstone).
-    fn should_gossip_entry(&self, e: &StateEntry, now: Time) -> bool {
-        if e.tombstone {
-            return now < e.tombstone_since.saturating_add(self.config.dead_timeout_ms);
-        }
-        !e.expired(now)
-    }
-
     /// Drop expired TTL entries (they converge to absent everywhere once the
-    /// author stops refreshing — no tombstone needed) and reap entry
-    /// tombstones past `2×dead_timeout` (no longer gossiped after 1×, so no
-    /// peer re-teaches them). A TTL expiry is an observable state change and
-    /// emits [`Effect::NodeStateChanged`]; a tombstone reap is not (the key
-    /// already read as absent).
+    /// author stops refreshing — no tombstone needed) and reap entry tombstones
+    /// past `2×dead_timeout` (no longer gossiped after 1×, so no peer re-teaches
+    /// them). The member's high-water mark is left untouched by reaping, so a
+    /// digest can never claim to be behind on — and so resurrect — a reaped
+    /// version. A TTL expiry is an observable state change and emits
+    /// [`Effect::NodeStateChanged`]; a tombstone reap is not (the key already
+    /// read as absent).
     fn reap_entries(&mut self, now: Time) -> Vec<Effect> {
         let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
         let mut expired: Vec<(NodeId, String)> = Vec::new();
@@ -957,6 +1317,74 @@ impl GroupEngine {
             .collect()
     }
 
+    /// Live members (excluding self) we may probe or gossip to.
+    fn probe_candidates(&self) -> impl Iterator<Item = &NodeId> {
+        self.members
+            .iter()
+            .filter(|(node, m)| **node != self.local && m.status != Status::Dead)
+            .map(|(node, _)| node)
+    }
+
+    fn dissemination_targets(&self) -> Vec<NodeId> {
+        let mut set: BTreeSet<NodeId> = self.probe_candidates().cloned().collect();
+        set.extend(self.seeds.iter().cloned());
+        set.into_iter().collect()
+    }
+
+    /// Builds a `Send` effect carrying a bare probe frame (no piggybacked view).
+    fn send_probe(&self, to: NodeId, kind: wire::Kind, target: Option<NodeId>) -> Effect {
+        Effect::Send {
+            to,
+            wire: wire::encode(&wire::Frame {
+                kind,
+                group: self.group.clone(),
+                target,
+                digest: Vec::new(),
+                wants: Vec::new(),
+                members: Vec::new(),
+                metadata: Vec::new(),
+            }),
+        }
+    }
+
+    /// A `Dead` member is summarized in digests only until `dead_timeout`
+    /// elapses; after that peers are assumed to know, and dropping it lets
+    /// everyone reap the tombstone without re-teaching each other.
+    fn should_gossip(&self, m: &Member, now: Time) -> bool {
+        m.status != Status::Dead || now < m.dead_since.saturating_add(self.config.dead_timeout_ms)
+    }
+
+    /// An entry is offered in a delta while live and unexpired; a tombstone only
+    /// until `dead_timeout` (after that peers are assumed to know — the same
+    /// shape as a Dead member tombstone, and what upholds the reap horizon).
+    fn should_gossip_entry(&self, e: &StateEntry, now: Time) -> bool {
+        if e.tombstone {
+            return now
+                < e.tombstone_since
+                    .saturating_add(self.config.dead_timeout_ms);
+        }
+        !e.expired(now)
+    }
+
+    /// A hash of a member's currently-advertised entries (keys, versions,
+    /// tombstones, values, in key order), carried in the digest so a receiver can
+    /// tell two summaries apart when their high-water marks coincide but their
+    /// holdings do not (a version reused across a restart). Empty holdings hash to
+    /// zero. A tiny dependency-free FNV-1a fold — the core stays dep-free.
+    fn content_hash(&self, m: &Member, now: Time) -> u64 {
+        let mut h: u64 = 0;
+        for (key, e) in &m.entries {
+            if !self.should_gossip_entry(e, now) {
+                continue;
+            }
+            h = fnv1a(h, key.as_bytes());
+            h = fnv1a(h, &e.version.to_le_bytes());
+            h = fnv1a(h, &[u8::from(e.tombstone)]);
+            h = fnv1a(h, &e.value);
+        }
+        h
+    }
+
     fn compute_coordinator(&self) -> Option<NodeId> {
         // The coordinator is just the placement owner of the group id among live
         // members (Alive or Suspect); a Dead node is never a candidate. Same
@@ -975,7 +1403,7 @@ impl GroupEngine {
     }
 
     fn arm_timer(&self) -> Effect {
-        let mut at = self.next_gossip.min(self.next_probe);
+        let mut at = self.next_anti_entropy.min(self.next_probe);
         if let Some(p) = &self.pending {
             at = at.min(p.deadline);
         }
@@ -1004,34 +1432,112 @@ mod tests {
         )
     }
 
-    fn gossip_frame(members: Vec<wire::MemberDelta>, metadata: Vec<wire::MetaDelta>) -> Vec<u8> {
+    /// A digest frame (liveness summaries + metadata) — how liveness and
+    /// metadata now disseminate.
+    fn digest_frame(digest: Vec<wire::NodeDigest>, metadata: Vec<wire::MetaDelta>) -> Vec<u8> {
         wire::encode(&wire::Frame {
-            kind: wire::Kind::Gossip,
+            kind: wire::Kind::Digest,
             group: GroupId::new("g"),
             target: None,
-            members,
+            digest,
+            wants: Vec::new(),
+            members: Vec::new(),
             metadata,
         })
     }
 
-    fn member(node: &str, inc: u64, status: Status) -> wire::MemberDelta {
-        wire::MemberDelta {
+    /// A delta frame (member entries) — how per-node state now disseminates.
+    fn delta_frame(members: Vec<wire::MemberDelta>) -> Vec<u8> {
+        wire::encode(&wire::Frame {
+            kind: wire::Kind::Delta,
+            group: GroupId::new("g"),
+            target: None,
+            digest: Vec::new(),
+            wants: Vec::new(),
+            members,
+            metadata: Vec::new(),
+        })
+    }
+
+    fn probe_frame(kind: wire::Kind, target: Option<NodeId>) -> Vec<u8> {
+        wire::encode(&wire::Frame {
+            kind,
+            group: GroupId::new("g"),
+            target,
+            digest: Vec::new(),
+            wants: Vec::new(),
+            members: Vec::new(),
+            metadata: Vec::new(),
+        })
+    }
+
+    fn ndigest(node: &str, inc: u64, status: Status, max_version: u64) -> wire::NodeDigest {
+        wire::NodeDigest {
             node: NodeId::new(node),
             incarnation: inc,
             status: status.to_wire(),
-            entries: Vec::new(),
+            max_version,
+            // Empty holdings hash to zero; these liveness-only digests advertise
+            // no entries, so a zero here matches an empty receiver.
+            content_hash: 0,
         }
+    }
+
+    fn entry(
+        key: &str,
+        version: u64,
+        ttl_ms: u64,
+        tombstone: bool,
+        value: &[u8],
+    ) -> wire::EntryDelta {
+        wire::EntryDelta {
+            key: key.to_owned(),
+            version,
+            ttl_ms,
+            tombstone,
+            value: value.to_vec(),
+        }
+    }
+
+    /// A member delta carrying `entries` (a well-formed delta sets its
+    /// high-water to the max entry version).
+    fn member_delta(node: &str, entries: Vec<wire::EntryDelta>) -> wire::MemberDelta {
+        let max_version = entries.iter().map(|e| e.version).max().unwrap_or(0);
+        wire::MemberDelta {
+            node: NodeId::new(node),
+            incarnation: 0,
+            status: Status::Alive.to_wire(),
+            max_version,
+            entries,
+        }
+    }
+
+    /// Decodes the single digest frame a round emits (all chunks in one, at
+    /// these small sizes), returning the sender's own summaries and metadata.
+    fn decode_one_digest(effects: &[Effect]) -> wire::Frame {
+        let bytes = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { wire, .. } => {
+                    let f = wire::decode(wire)?;
+                    (f.kind == wire::Kind::Digest).then_some(wire.clone())
+                }
+                _ => None,
+            })
+            .expect("a digest send");
+        wire::decode(&bytes).expect("decodes")
     }
 
     #[test]
     fn start_announces_to_seeds() {
+        // Fanout defaults to 2, so a round reaches up to two seeds.
         let mut e = engine("a", &["b", "c"]);
         let sends = e
             .start(Time::ZERO)
             .iter()
             .filter(|e| matches!(e, Effect::Send { .. }))
             .count();
-        assert_eq!(sends, 2, "should announce to both seeds");
+        assert_eq!(sends, 2, "should announce to two seeds via digest");
     }
 
     #[test]
@@ -1039,7 +1545,7 @@ mod tests {
         let mut a = engine("a", &["b"]);
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![member("b", 0, Status::Alive)], vec![]),
+            &digest_frame(vec![ndigest("b", 0, Status::Alive, 0)], vec![]),
             Time(1),
         );
         assert_eq!(a.members().count(), 2);
@@ -1054,12 +1560,13 @@ mod tests {
             probe_timeout_ms: 50,
             suspect_timeout_ms: 200,
             gossip_interval_ms: 100,
+            anti_entropy_interval_ms: 100,
             ..Config::default()
         };
         let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [NodeId::new("b")], cfg);
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![member("b", 0, Status::Alive)], vec![]),
+            &digest_frame(vec![ndigest("b", 0, Status::Alive, 0)], vec![]),
             Time(1),
         );
         a.start(Time(1));
@@ -1086,8 +1593,11 @@ mod tests {
         // Learn b and c.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(
-                vec![member("b", 0, Status::Alive), member("c", 0, Status::Alive)],
+            &digest_frame(
+                vec![
+                    ndigest("b", 0, Status::Alive, 0),
+                    ndigest("c", 0, Status::Alive, 0),
+                ],
                 vec![],
             ),
             Time(1),
@@ -1107,13 +1617,7 @@ mod tests {
         // An indirect ack keeps b alive.
         a.on_message(
             NodeId::new("c"),
-            &wire::encode(&wire::Frame {
-                kind: wire::Kind::IndirectAck,
-                group: GroupId::new("g"),
-                target: Some(NodeId::new("b")),
-                members: vec![],
-                metadata: vec![],
-            }),
+            &probe_frame(wire::Kind::IndirectAck, Some(NodeId::new("b"))),
             Time(1120),
         );
         a.on_tick(Time(2000));
@@ -1126,13 +1630,7 @@ mod tests {
         // origin o asks p to probe t.
         let effects = p.on_message(
             NodeId::new("o"),
-            &wire::encode(&wire::Frame {
-                kind: wire::Kind::PingReq,
-                group: GroupId::new("g"),
-                target: Some(NodeId::new("t")),
-                members: vec![],
-                metadata: vec![],
-            }),
+            &probe_frame(wire::Kind::PingReq, Some(NodeId::new("t"))),
             Time(1),
         );
         assert!(
@@ -1144,13 +1642,7 @@ mod tests {
         // When t acks, we relay an IndirectAck back to the origin o.
         let ack = p.on_message(
             NodeId::new("t"),
-            &wire::encode(&wire::Frame {
-                kind: wire::Kind::Ack,
-                group: GroupId::new("g"),
-                target: None,
-                members: vec![],
-                metadata: vec![],
-            }),
+            &probe_frame(wire::Kind::Ack, None),
             Time(3),
         );
         assert!(
@@ -1161,24 +1653,43 @@ mod tests {
     }
 
     #[test]
+    fn ping_is_answered_with_a_bare_ack() {
+        let mut a = engine("a", &[]);
+        let effects = a.on_message(
+            NodeId::new("b"),
+            &probe_frame(wire::Kind::Ping, None),
+            Time(1),
+        );
+        let ack = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { to, wire } if *to == NodeId::new("b") => wire::decode(wire),
+                _ => None,
+            })
+            .expect("an ack send");
+        assert_eq!(ack.kind, wire::Kind::Ack);
+        assert!(ack.digest.is_empty() && ack.members.is_empty() && ack.metadata.is_empty());
+    }
+
+    #[test]
     fn refutes_false_suspicion_about_self() {
         let mut a = engine("a", &["b"]);
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![member("a", 0, Status::Suspect)], vec![]),
+            &digest_frame(vec![ndigest("a", 0, Status::Suspect, 0)], vec![]),
             Time(1),
         );
         assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Alive));
-        let frame =
-            wire::decode(&a.encode_frame(wire::Kind::Gossip, None, Time(2))).expect("frame");
-        let self_delta = frame
-            .members
+        // Our next digest advertises ourselves Alive at a bumped incarnation.
+        let frame = decode_one_digest(&a.on_tick(Time(2)));
+        let self_d = frame
+            .digest
             .iter()
-            .find(|m| m.node == NodeId::new("a"))
-            .expect("self in frame");
-        assert_eq!(self_delta.status, Status::Alive.to_wire());
+            .find(|d| d.node == NodeId::new("a"))
+            .expect("self in digest");
+        assert_eq!(self_d.status, Status::Alive.to_wire());
         assert!(
-            self_delta.incarnation >= 1,
+            self_d.incarnation >= 1,
             "refutation should bump incarnation"
         );
     }
@@ -1190,7 +1701,7 @@ mod tests {
         assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Dead));
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![member("a", 0, Status::Dead)], vec![]),
+            &digest_frame(vec![ndigest("a", 0, Status::Dead, 0)], vec![]),
             Time(1),
         );
         assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Dead));
@@ -1200,7 +1711,7 @@ mod tests {
     fn metadata_merges_by_last_writer_wins() {
         let mut a = engine("a", &["b"]);
         let meta = |ver, writer: &str, val: &str| {
-            gossip_frame(
+            digest_frame(
                 vec![],
                 vec![wire::MetaDelta {
                     key: "k".into(),
@@ -1224,31 +1735,17 @@ mod tests {
         assert_eq!(a.metadata("k"), Some("local")); // stale ignored
     }
 
-    /// A member delta carrying only app state (alive, no liveness change) on
-    /// the single-blob shim key.
-    fn state_delta(node: &str, version: u64, state: &[u8]) -> wire::MemberDelta {
-        wire::MemberDelta {
-            node: NodeId::new(node),
-            incarnation: 0,
-            status: Status::Alive.to_wire(),
-            entries: vec![wire::EntryDelta {
-                key: GroupEngine::BLOB_KEY.to_owned(),
-                version,
-                ttl_ms: 0,
-                tombstone: false,
-                value: state.to_vec(),
-            }],
-        }
-    }
-
     #[test]
     fn per_node_state_merges_by_last_writer_wins() {
         let mut a = engine("a", &["b"]);
 
-        // Learn b's state at version 2.
+        // Learn b's blob state at version 2.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![state_delta("b", 2, b"v2")], vec![]),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![entry(GroupEngine::BLOB_KEY, 2, 0, false, b"v2")],
+            )]),
             Time(1),
         );
         assert_eq!(a.node_state(&NodeId::new("b")), Some(&b"v2"[..]));
@@ -1256,13 +1753,19 @@ mod tests {
         // A newer version wins; a stale one is ignored.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![state_delta("b", 3, b"v3")], vec![]),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![entry(GroupEngine::BLOB_KEY, 3, 0, false, b"v3")],
+            )]),
             Time(2),
         );
         assert_eq!(a.node_state(&NodeId::new("b")), Some(&b"v3"[..]));
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![state_delta("b", 1, b"old")], vec![]),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![entry(GroupEngine::BLOB_KEY, 1, 0, false, b"old")],
+            )]),
             Time(3),
         );
         assert_eq!(a.node_state(&NodeId::new("b")), Some(&b"v3"[..]));
@@ -1274,10 +1777,14 @@ mod tests {
         a.apply(Command::SetLocalState(b"mine".to_vec()));
         assert_eq!(a.local_state(), b"mine");
 
-        // A peer's claim about *our* state is ignored — we're the sole author.
+        // A peer's delta claiming *our* state is out-versioned — we're the sole
+        // author.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![state_delta("a", 999, b"forged")], vec![]),
+            &delta_frame(vec![member_delta(
+                "a",
+                vec![entry(GroupEngine::BLOB_KEY, 999, 0, false, b"forged")],
+            )]),
             Time(1),
         );
         assert_eq!(a.local_state(), b"mine");
@@ -1286,16 +1793,19 @@ mod tests {
     #[test]
     fn state_and_liveness_merge_independently() {
         let mut a = engine("a", &["b"]);
-        // Learn b alive with state v1.
+        // Learn b alive with blob state at version 1.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![state_delta("b", 1, b"s1")], vec![]),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![entry(GroupEngine::BLOB_KEY, 1, 0, false, b"s1")],
+            )]),
             Time(1),
         );
-        // A pure liveness update (suspect, no newer state) must not wipe state.
+        // A pure liveness digest (suspect, same state version) must not wipe state.
         a.on_message(
             NodeId::new("c"),
-            &gossip_frame(vec![member("b", 0, Status::Suspect)], vec![]),
+            &digest_frame(vec![ndigest("b", 0, Status::Suspect, 1)], vec![]),
             Time(2),
         );
         assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Suspect));
@@ -1306,45 +1816,30 @@ mod tests {
         );
     }
 
-    // ---- keyed per-node state (G1) + restart recovery (G2) ----
-
-    fn entry(key: &str, version: u64, ttl_ms: u64, tombstone: bool, value: &[u8]) -> wire::EntryDelta {
-        wire::EntryDelta {
-            key: key.to_owned(),
-            version,
-            ttl_ms,
-            tombstone,
-            value: value.to_vec(),
-        }
-    }
-
-    fn entries_delta(node: &str, entries: Vec<wire::EntryDelta>) -> wire::MemberDelta {
-        wire::MemberDelta {
-            node: NodeId::new(node),
-            incarnation: 0,
-            status: Status::Alive.to_wire(),
-            entries,
-        }
-    }
-
     #[test]
     fn keys_version_independently() {
         let mut a = engine("a", &["b"]);
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(
-                vec![entries_delta("b", vec![entry("x", 5, 0, false, b"x5"), entry("y", 1, 0, false, b"y1")])],
-                vec![],
-            ),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![
+                    entry("x", 5, 0, false, b"x5"),
+                    entry("y", 1, 0, false, b"y1"),
+                ],
+            )]),
             Time(1),
         );
         // A fresher y does not disturb x; a stale x is ignored.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(
-                vec![entries_delta("b", vec![entry("x", 4, 0, false, b"stale"), entry("y", 2, 0, false, b"y2")])],
-                vec![],
-            ),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![
+                    entry("x", 4, 0, false, b"stale"),
+                    entry("y", 2, 0, false, b"y2"),
+                ],
+            )]),
             Time(2),
         );
         assert_eq!(a.node_entry(&NodeId::new("b"), "x"), Some(&b"x5"[..]));
@@ -1358,46 +1853,107 @@ mod tests {
         let mut a = engine("a", &["b"]);
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![entries_delta("b", vec![entry("hot", 1, 100, false, b"v1")])], vec![]),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![entry("hot", 1, 100, false, b"v1")],
+            )]),
             Time(0),
         );
         assert!(a.node_entry(&NodeId::new("b"), "hot").is_some());
         // A fresher version at t=60 re-arms the expiry to t=160.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![entries_delta("b", vec![entry("hot", 2, 100, false, b"v2")])], vec![]),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![entry("hot", 2, 100, false, b"v2")],
+            )]),
             Time(60),
         );
         a.on_tick(Time(120)); // old deadline passed, refreshed one hasn't
         assert_eq!(a.node_entry(&NodeId::new("b"), "hot"), Some(&b"v2"[..]));
         a.on_tick(Time(161));
-        assert_eq!(a.node_entry(&NodeId::new("b"), "hot"), None, "expired after ttl");
+        assert_eq!(
+            a.node_entry(&NodeId::new("b"), "hot"),
+            None,
+            "expired after ttl"
+        );
     }
 
     #[test]
-    fn delete_disseminates_a_tombstone_then_reaps_it() {
+    fn delete_offers_a_tombstone_in_a_delta_then_reaps_it_without_resurrection() {
         let mut a = engine("a", &["b"]);
-        a.apply(Command::SetLocalEntry { key: "k".into(), value: b"v".to_vec(), ttl_ms: None });
+        a.apply(Command::SetLocalEntry {
+            key: "k".into(),
+            value: b"v".to_vec(),
+            ttl_ms: None,
+        });
         a.apply(Command::DeleteLocalEntry { key: "k".into() });
-        assert_eq!(a.node_entry(&NodeId::new("a"), "k"), None, "deleted locally");
+        assert_eq!(
+            a.node_entry(&NodeId::new("a"), "k"),
+            None,
+            "deleted locally"
+        );
 
-        // The tombstone is still gossiped (so peers drop the key)...
-        let frame = wire::decode(&a.on_tick(Time(1_000)).iter().find_map(|e| match e {
-            Effect::Send { wire, .. } => Some(wire.clone()),
-            _ => None,
-        }).expect("a gossip send")).expect("decodes");
-        let m = frame.members.iter().find(|m| m.node.as_str() == "a").expect("self delta");
-        assert!(m.entries.iter().any(|e| e.key == "k" && e.tombstone), "tombstone advertised");
+        // A peer requesting our full state gets the tombstone in a delta (so it
+        // drops the key too).
+        let req = wire::encode(&wire::Frame {
+            kind: wire::Kind::DeltaRequest,
+            group: GroupId::new("g"),
+            target: None,
+            digest: vec![],
+            wants: vec![wire::NodeWant {
+                node: NodeId::new("a"),
+                have_version: 0,
+            }],
+            members: vec![],
+            metadata: vec![],
+        });
+        let delta = wire::decode(
+            &a.on_message(NodeId::new("b"), &req, Time(1_000))
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Send { wire, .. } => Some(wire.clone()),
+                    _ => None,
+                })
+                .expect("a delta response"),
+        )
+        .expect("decodes");
+        let m = delta
+            .members
+            .iter()
+            .find(|m| m.node.as_str() == "a")
+            .expect("self member");
+        assert!(
+            m.entries.iter().any(|e| e.key == "k" && e.tombstone),
+            "tombstone offered"
+        );
+        let hwm = m.max_version;
 
-        // ...and is reaped (and no longer advertised) after 2× dead_timeout.
+        // After 2× dead_timeout the tombstone is reaped and no longer offered,
+        // but the high-water mark is preserved — so a request can never resurrect
+        // it.
         let far = Time(1_000 + Config::default().dead_timeout_ms * 2 + 1);
         a.on_tick(far);
-        let frame = wire::decode(&a.on_tick(far.saturating_add(10_000)).iter().find_map(|e| match e {
-            Effect::Send { wire, .. } => Some(wire.clone()),
-            _ => None,
-        }).expect("a gossip send")).expect("decodes");
-        let m = frame.members.iter().find(|m| m.node.as_str() == "a").expect("self delta");
+        let delta = wire::decode(
+            &a.on_message(NodeId::new("b"), &req, far.saturating_add(1))
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Send { wire, .. } => Some(wire.clone()),
+                    _ => None,
+                })
+                .expect("a delta response"),
+        )
+        .expect("decodes");
+        let m = delta
+            .members
+            .iter()
+            .find(|m| m.node.as_str() == "a")
+            .expect("self member");
         assert!(!m.entries.iter().any(|e| e.key == "k"), "tombstone reaped");
+        assert!(
+            m.max_version >= hwm,
+            "high-water preserved across reap (no resurrection)"
+        );
     }
 
     #[test]
@@ -1406,27 +1962,46 @@ mod tests {
         let mut a = engine("a", &["b"]);
         let effects = a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![entries_delta("a", vec![entry("addr", 7, 0, false, b"10.0.0.1")])], vec![]),
+            &delta_frame(vec![member_delta(
+                "a",
+                vec![entry("addr", 7, 0, false, b"10.0.0.1")],
+            )]),
             Time(1),
         );
         // Adopted verbatim (NOT wiped by out-versioning with emptiness)...
-        assert_eq!(a.node_entry(&NodeId::new("a"), "addr"), Some(&b"10.0.0.1"[..]));
+        assert_eq!(
+            a.node_entry(&NodeId::new("a"), "addr"),
+            Some(&b"10.0.0.1"[..])
+        );
         // ...with a change event so the app can re-author.
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::NodeStateChanged { node, key } if node.as_str() == "a" && key == "addr"
         )));
         // A post-restart local write supersedes the adopted version everywhere.
-        a.apply(Command::SetLocalEntry { key: "addr".into(), value: b"10.0.0.2".to_vec(), ttl_ms: None });
-        assert_eq!(a.node_entry(&NodeId::new("a"), "addr"), Some(&b"10.0.0.2"[..]));
+        a.apply(Command::SetLocalEntry {
+            key: "addr".into(),
+            value: b"10.0.0.2".to_vec(),
+            ttl_ms: None,
+        });
+        assert_eq!(
+            a.node_entry(&NodeId::new("a"), "addr"),
+            Some(&b"10.0.0.2"[..])
+        );
 
         // And once authored this boot, echoes can never replace it (sole-author
         // rule): the forged/echoed 999 only bumps our version past it.
         a.on_message(
             NodeId::new("b"),
-            &gossip_frame(vec![entries_delta("a", vec![entry("addr", 999, 0, false, b"forged")])], vec![]),
+            &delta_frame(vec![member_delta(
+                "a",
+                vec![entry("addr", 999, 0, false, b"forged")],
+            )]),
             Time(2),
         );
-        assert_eq!(a.node_entry(&NodeId::new("a"), "addr"), Some(&b"10.0.0.2"[..]));
+        assert_eq!(
+            a.node_entry(&NodeId::new("a"), "addr"),
+            Some(&b"10.0.0.2"[..])
+        );
     }
 }
