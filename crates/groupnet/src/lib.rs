@@ -7,7 +7,7 @@
 //! | Module | Role |
 //! |--------|------|
 //! | [`core`] | sans-IO state machine, identity, weighted [`placement`](core::placement) (HA-hash), and the [`wire`](core::wire) protocol — pure, deterministic, dep-free |
-//! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) |
+//! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) (persistent control-plane connections *and* bulk streams) |
 //! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
 //! | [`sim`] | deterministic single-threaded [`Simulation`](sim::Simulation) *(feature `sim`)* |
 //!
@@ -63,8 +63,10 @@ pub mod transport {
     #[cfg(feature = "udp")]
     pub use groupnet_transport_udp as udp;
 
-    /// TCP data-plane binding *(feature `tcp`)*.
-    #[cfg(feature = "tcp")]
+    /// TCP bindings: the persistent-connection control plane
+    /// (`TcpMsgTransport`, feature `tcp-msg`) and the data-plane streams
+    /// (`TcpBulkTransport`, feature `tcp`).
+    #[cfg(any(feature = "tcp", feature = "tcp-msg"))]
     pub use groupnet_transport_tcp as tcp;
 }
 

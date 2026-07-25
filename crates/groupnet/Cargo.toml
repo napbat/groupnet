@@ -19,7 +19,12 @@ udp = ["dep:groupnet-transport-udp"]
 # Data plane: `bulk` is the stream trait + framing (in groupnet-transport);
 # `tcp` is the TCP binding.
 bulk = ["groupnet-transport/bulk"]
-tcp = ["bulk", "dep:groupnet-transport-tcp"]
+tcp = ["bulk", "dep:groupnet-transport-tcp", "groupnet-transport-tcp/bulk"]
+# Control plane over persistent TCP: a bounded pool of lazily dialed,
+# idle-closed connections — the constant-connection *option* for deployments
+# that want frames delivered at network latency over reliable links. Gossip
+# deployments keep `udp`; nothing forces a socket per member.
+tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]

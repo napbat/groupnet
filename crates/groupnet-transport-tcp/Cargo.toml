@@ -1,22 +1,31 @@
 [package]
 name = "groupnet-transport-tcp"
-description = "TCP data-plane binding for Groupnet — reliable byte streams over real sockets, implementing BulkTransport."
+description = "TCP bindings for Groupnet — a persistent-connection control-plane Transport and the reliable data-plane BulkTransport."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# A BulkTransport binding: depends on the data-plane trait crate plus tokio's
-# TCP + the futures-io compat shim. Never on the runtime.
+[features]
+default = ["msg", "bulk"]
+# Control plane: `TcpMsgTransport`, best-effort messages over a bounded pool
+# of persistent connections. Needs tokio's task/sync/time slices for the
+# accept loop and per-connection workers.
+msg = ["tokio/rt", "tokio/sync", "tokio/time", "tokio/macros"]
+# Data plane: `TcpBulkTransport`, reliable byte streams. Pulls the `bulk`
+# trait surface plus the futures-io compat shim.
+bulk = ["groupnet-transport/bulk", "dep:tokio-util"]
+
+# Never depends on the runtime — bindings stay below it.
 [dependencies]
 groupnet-core = { workspace = true }
-groupnet-transport = { workspace = true, features = ["bulk"] }
+groupnet-transport = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["net", "io-util"] }
-tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
 bytes = "1"
 
 [lints]
