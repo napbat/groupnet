@@ -152,12 +152,14 @@
 //! # }
 //! ```
 
+mod acks;
 mod feed;
 mod frontier;
 mod peers;
 mod token;
 mod wire;
 
+pub use acks::{AckLedger, applied_by, applied_cluster_wide};
 pub use feed::WriteFeed;
 pub use frontier::{Frontier, FrontierView};
 pub use peers::{PeerWrite, PeerWrites, advertised_head, advertised_head_named};
