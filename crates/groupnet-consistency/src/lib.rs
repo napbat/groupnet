@@ -14,6 +14,19 @@
 //! advances a [`Frontier`], so readers can barrier on *applied* state with
 //! [`FrontierView::reached`].
 //!
+//! # Two tiers, priced separately
+//!
+//! The **session tier** (always on, cost-free beyond the feed itself) is
+//! everything below: per-writer order, gap detection, frontiers, tokens.
+//! The **strong-coherence tier** (feature `acks`, off by default) adds
+//! write-side acknowledgement: `AckLedger` publishes each node's applied
+//! watermarks and `applied_cluster_wide` holds a writer until every alive
+//! member has applied its write. Its price is real — one
+//! ledger republish per applied event, and write latency bounded by the
+//! slowest alive member — right for small clusters that must be
+//! indistinguishable from a single node, wrong past the scaling envelope
+//! (large fabrics keep the session tier and shard into cells instead).
+//!
 //! # What you get — and what you deliberately don't
 //!
 //! Provided, and safe to rely on:
@@ -152,6 +165,7 @@
 //! # }
 //! ```
 
+#[cfg(feature = "acks")]
 mod acks;
 mod feed;
 mod frontier;
@@ -159,6 +173,7 @@ mod peers;
 mod token;
 mod wire;
 
+#[cfg(feature = "acks")]
 pub use acks::{AckLedger, applied_by, applied_cluster_wide};
 pub use feed::WriteFeed;
 pub use frontier::{Frontier, FrontierView};

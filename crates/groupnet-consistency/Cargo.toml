@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The strong-coherence tier (AckLedger / applied_cluster_wide): write-side
+# acknowledgement waiting. Opt-in because it has a real runtime cost — one
+# ledger republish per applied event, and writers waiting on every alive
+# member — which is right for small clusters and wrong for large ones (see
+# the README's scaling envelope). Off by default; the session tier is free.
+acks = ["tokio/time"]
+
 # Built on the runtime's Group handle; the protocol work stays in the engine.
 # tokio is only the sync toolbox (watch channels) — no executor requirement
 # beyond what the runtime already has.

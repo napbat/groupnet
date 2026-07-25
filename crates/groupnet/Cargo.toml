@@ -29,6 +29,10 @@ tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
 # detection, and applied-write frontiers for read-your-writes barriers.
 # Built on the runtime's Group handle.
 consistency = ["runtime", "dep:groupnet-consistency"]
+# The strong-coherence tier on top: applied-watermark acks (AckLedger /
+# applied_cluster_wide). Opt-in — writers wait on every alive member, and
+# one ledger republish flows per applied event; see the scaling envelope.
+consistency-acks = ["consistency", "groupnet-consistency/acks"]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]
