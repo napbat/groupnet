@@ -1,0 +1,25 @@
+[package]
+name = "groupnet-consistency"
+description = "Session-consistency primitives over Groupnet: per-writer sequenced write feeds with loss detection, and applied-write frontiers for read-your-writes barriers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Built on the runtime's Group handle; the protocol work stays in the engine.
+# tokio is only the sync toolbox (watch channels) — no executor requirement
+# beyond what the runtime already has.
+[dependencies]
+groupnet-core = { workspace = true }
+groupnet-runtime = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+# The integration tests and the doc example run real multi-node clusters over
+# the in-memory transport.
+[dev-dependencies]
+groupnet-transport-mem = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

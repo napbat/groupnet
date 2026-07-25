@@ -20,6 +20,10 @@ udp = ["dep:groupnet-transport-udp"]
 # `tcp` is the TCP binding.
 bulk = ["groupnet-transport/bulk"]
 tcp = ["bulk", "dep:groupnet-transport-tcp"]
+# Session-consistency layer: per-writer sequenced write feeds with loss
+# detection, and applied-write frontiers for read-your-writes barriers.
+# Built on the runtime's Group handle.
+consistency = ["runtime", "dep:groupnet-consistency"]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]
@@ -29,6 +33,7 @@ groupnet-transport-mem = { workspace = true, optional = true }
 groupnet-transport-udp = { workspace = true, optional = true }
 groupnet-transport-tcp = { workspace = true, optional = true }
 groupnet-runtime = { workspace = true, optional = true }
+groupnet-consistency = { workspace = true, optional = true }
 groupnet-sim = { workspace = true, optional = true }
 
 # The async examples drive the runtime, so they need a Tokio executor.

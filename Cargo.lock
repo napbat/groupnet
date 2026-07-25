@@ -88,6 +88,7 @@ dependencies = [
 name = "groupnet"
 version = "0.1.0"
 dependencies = [
+ "groupnet-consistency",
  "groupnet-core",
  "groupnet-runtime",
  "groupnet-sim",
@@ -95,6 +96,16 @@ dependencies = [
  "groupnet-transport-mem",
  "groupnet-transport-tcp",
  "groupnet-transport-udp",
+ "tokio",
+]
+
+[[package]]
+name = "groupnet-consistency"
+version = "0.1.0"
+dependencies = [
+ "groupnet-core",
+ "groupnet-runtime",
+ "groupnet-transport-mem",
  "tokio",
 ]
 

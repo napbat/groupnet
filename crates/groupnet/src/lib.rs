@@ -9,6 +9,7 @@
 //! | [`core`] | sans-IO state machine, identity, weighted [`placement`](core::placement) (HA-hash), and the [`wire`](core::wire) protocol — pure, deterministic, dep-free |
 //! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) |
 //! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
+//! | [`consistency`] | session-consistency layer: per-writer sequenced [`WriteFeed`](consistency::WriteFeed)s with loss detection, and [`Frontier`](consistency::Frontier) read-your-writes barriers *(feature `consistency`)* |
 //! | [`sim`] | deterministic single-threaded [`Simulation`](sim::Simulation) *(feature `sim`)* |
 //!
 //! Two planes: the **control plane** (small best-effort datagrams — gossip,
@@ -73,6 +74,15 @@ pub mod transport {
 /// table.
 #[cfg(feature = "runtime")]
 pub use groupnet_runtime as runtime;
+
+/// Session-consistency layer over groups: per-writer sequenced write feeds
+/// ([`WriteFeed`](consistency::WriteFeed) / [`PeerWrites`](consistency::PeerWrites),
+/// loss detected as explicit [`Gap`](consistency::PeerWrite::Gap)s) and
+/// applied-write frontiers for read-your-writes barriers
+/// ([`Frontier`](consistency::Frontier)). Honest scope: per-writer order and
+/// session guarantees — consensus and fencing are deliberately out.
+#[cfg(feature = "consistency")]
+pub use groupnet_consistency as consistency;
 
 /// Deterministic simulation driver ([`Simulation`](sim::Simulation)) and its
 /// seedable PRNG.
