@@ -8,8 +8,9 @@
 //! changes into typed events ([`PeerWrites`]): [`PeerWrite::Wrote`] for each
 //! new write, or [`PeerWrite::Gap`] when writes were provably missed (the
 //! peer's ring advanced past this subscriber's cursor, or the peer
-//! restarted). The application applies each event — a cache invalidates the
-//! key, an index refreshes the id, a replica schedules a refetch — and
+//! restarted). The application applies each event — a tiered cache calls
+//! `invalidate(&key)` per `Wrote` and flushes its tiers on a `Gap`, an
+//! index refreshes the id, a replica schedules a refetch — and
 //! advances a [`Frontier`], so readers can barrier on *applied* state with
 //! [`FrontierView::reached`].
 //!
