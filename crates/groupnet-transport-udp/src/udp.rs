@@ -1,0 +1,263 @@
+//! The [`UdpTransport`] binding: one frame per datagram over a shared
+//! socket, peers attributed by source address.
+
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+
+use groupnet_core::NodeId;
+use groupnet_transport::{Inbound, Transport};
+use tokio::net::{ToSocketAddrs, UdpSocket};
+
+/// Receive-buffer size: the largest possible UDP payload (the length field is
+/// 16 bits), so any single datagram is read in one `recv_from` with no
+/// truncation.
+const MAX_DATAGRAM: usize = 65_535;
+
+/// Shared endpoint state behind a single [`Arc`], so every clone of a
+/// [`UdpTransport`] observes and performs registrations against the SAME
+/// address book. This is what lets one handle be consumed by the node builder
+/// while another is kept for out-of-band re-registration (e.g. periodic DNS
+/// re-resolution of gossip seeds under pod-IP churn).
+#[derive(Debug)]
+struct Inner {
+    local: NodeId,
+    /// NodeId -> where to send. Interior mutability so peers can be registered
+    /// after binding (e.g. once ephemeral ports are known).
+    peers: RwLock<HashMap<NodeId, SocketAddr>>,
+    /// The reverse map, to attribute inbound datagrams to a sender.
+    by_addr: RwLock<HashMap<SocketAddr, NodeId>>,
+}
+
+/// A UDP-backed transport endpoint.
+///
+/// Cheap to [`Clone`]: clones share one socket and one address book, so a
+/// [`register_peer`](Self::register_peer) through any handle is visible to all.
+#[derive(Clone, Debug)]
+pub struct UdpTransport {
+    socket: Arc<UdpSocket>,
+    inner: Arc<Inner>,
+}
+
+impl UdpTransport {
+    /// Binds a UDP socket for `local`. Register peers with
+    /// [`register_peer`](Self::register_peer) before use.
+    ///
+    /// # Errors
+    /// Propagates any socket bind error.
+    pub async fn bind(local: NodeId, bind_addr: impl ToSocketAddrs) -> io::Result<Self> {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        Ok(Self {
+            socket: Arc::new(socket),
+            inner: Arc::new(Inner {
+                local,
+                peers: RwLock::new(HashMap::new()),
+                by_addr: RwLock::new(HashMap::new()),
+            }),
+        })
+    }
+
+    /// This endpoint's local node id.
+    #[must_use]
+    pub fn local_id(&self) -> &NodeId {
+        &self.inner.local
+    }
+
+    /// The address the socket is bound to (useful when binding to an ephemeral
+    /// port with `:0`).
+    ///
+    /// # Errors
+    /// Propagates any socket error.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Teaches this endpoint that `node` is reachable at `addr`, replacing any
+    /// previous binding for `node`.
+    ///
+    /// When `node` was previously registered at a *different* address, that
+    /// stale reverse (`by_addr`) entry is removed before the new one is
+    /// inserted. The reverse map must never retain a dead address: a lingering
+    /// entry grows the map without bound and can mis-attribute an inbound
+    /// datagram once that address is reused by another node. Callable through
+    /// any clone — all clones share one book.
+    pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
+        // Take both locks (peers before by_addr — the only site that holds
+        // both) so the forward and reverse maps update atomically.
+        let mut peers = self.inner.peers.write().expect("peers lock poisoned");
+        let mut by_addr = self.inner.by_addr.write().expect("by_addr lock poisoned");
+        let stale = peers
+            .insert(node.clone(), addr)
+            .filter(|prev| *prev != addr);
+        if let Some(prev) = stale {
+            by_addr.remove(&prev);
+        }
+        by_addr.insert(addr, node);
+    }
+}
+
+impl Transport for UdpTransport {
+    type Error = io::Error;
+
+    fn learn_peer(&self, node: &NodeId, addr: &str) {
+        // An advertisement is a hint: register what parses, ignore the rest.
+        if let Ok(addr) = addr.parse::<SocketAddr>() {
+            self.register_peer(node.clone(), addr);
+        }
+    }
+
+    async fn send(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
+        // Resolve the address without holding the lock across the await.
+        let addr = self
+            .inner
+            .peers
+            .read()
+            .expect("peers lock poisoned")
+            .get(to)
+            .copied();
+        if let Some(addr) = addr {
+            // Best-effort: a send error is a drop, which the protocol tolerates.
+            let _ = self.socket.send_to(msg, addr).await;
+        }
+        Ok(())
+    }
+
+    async fn recv(&self) -> io::Result<Inbound> {
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        loop {
+            let (n, addr) = self.socket.recv_from(&mut buf).await?;
+            let from = self
+                .inner
+                .by_addr
+                .read()
+                .expect("by_addr lock poisoned")
+                .get(&addr)
+                .cloned();
+            if let Some(from) = from {
+                buf.truncate(n);
+                return Ok(Inbound { from, msg: buf });
+            }
+            // Datagram from an unregistered address — ignore and keep receiving.
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use groupnet_core::NodeId;
+    use groupnet_transport::Transport;
+
+    use super::UdpTransport;
+
+    /// Bind a loopback endpoint on an ephemeral port under the given id.
+    async fn bind_as(id: &str) -> UdpTransport {
+        UdpTransport::bind(NodeId::new(id), "127.0.0.1:0")
+            .await
+            .expect("bind")
+    }
+
+    /// A clone shares the address book: a peer registered through the clone is
+    /// reachable when sending through the original handle.
+    #[tokio::test]
+    async fn clone_shares_address_book() {
+        let sender = bind_as("sender").await;
+        let receiver = bind_as("receiver").await;
+        let sender_id = NodeId::new("sender");
+        let receiver_id = NodeId::new("receiver");
+
+        // Register the receiver's address ONLY through a clone; the original
+        // must observe it (shared book) to reach the receiver.
+        sender
+            .clone()
+            .register_peer(receiver_id.clone(), receiver.local_addr().expect("addr"));
+        // So the receiver can attribute the inbound datagram back to us.
+        receiver.register_peer(sender_id.clone(), sender.local_addr().expect("addr"));
+
+        sender.send(&receiver_id, b"hello").await.expect("send");
+
+        let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
+        assert_eq!(inbound.from, sender_id);
+        assert_eq!(inbound.msg, b"hello".to_vec());
+    }
+
+    /// A gossiped advertisement teaches the book exactly like registration —
+    /// and garbage is ignored, never an error (an advertisement is a hint).
+    #[tokio::test]
+    async fn learn_peer_registers_parseable_advertisements() {
+        let sender = bind_as("adv-sender").await;
+        let receiver = bind_as("adv-receiver").await;
+        let sender_id = NodeId::new("adv-sender");
+        let receiver_id = NodeId::new("adv-receiver");
+
+        let receiver_addr = receiver.local_addr().expect("addr").to_string();
+        sender.learn_peer(&receiver_id, &receiver_addr);
+        let sender_addr = sender.local_addr().expect("addr").to_string();
+        receiver.learn_peer(&sender_id, &sender_addr);
+        sender.learn_peer(&NodeId::new("junk"), "not-an-address");
+
+        sender
+            .send(&receiver_id, b"via-gossip")
+            .await
+            .expect("send");
+        let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
+        assert_eq!(inbound.from, sender_id);
+        assert_eq!(inbound.msg, b"via-gossip".to_vec());
+    }
+
+    /// Re-registering a node at a new address updates BOTH maps and drops the
+    /// stale reverse entry.
+    #[tokio::test]
+    async fn reregister_updates_both_maps_and_drops_stale_reverse() {
+        let t = bind_as("local").await;
+        let peer = NodeId::new("peer");
+        let old: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
+        let new: SocketAddr = "127.0.0.1:9002".parse().expect("addr");
+
+        t.register_peer(peer.clone(), old);
+        t.register_peer(peer.clone(), new);
+
+        assert_eq!(t.inner.peers.read().expect("peers").get(&peer), Some(&new));
+        let by_addr = t.inner.by_addr.read().expect("by_addr");
+        assert_eq!(by_addr.get(&new), Some(&peer));
+        assert!(
+            !by_addr.contains_key(&old),
+            "stale reverse entry lingered after re-registration"
+        );
+    }
+
+    /// An inbound datagram from a RE-REGISTERED (new) address attributes to the
+    /// node — the fresh reverse entry resolves, the stale one no longer can.
+    #[tokio::test]
+    async fn inbound_from_new_address_attributes() {
+        let receiver = bind_as("receiver").await;
+        let sender = bind_as("sender").await;
+        let sender_id = NodeId::new("sender");
+        let receiver_id = NodeId::new("receiver");
+
+        // Register the sender at a stale address first, then re-resolve to its
+        // real one (as the seed re-resolver does on a pod-IP change).
+        let stale: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        receiver.register_peer(sender_id.clone(), stale);
+        receiver.register_peer(sender_id.clone(), sender.local_addr().expect("addr"));
+
+        sender.register_peer(receiver_id.clone(), receiver.local_addr().expect("addr"));
+        sender.send(&receiver_id, b"ping").await.expect("send");
+
+        let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
+        assert_eq!(inbound.from, sender_id);
+        assert_eq!(inbound.msg, b"ping".to_vec());
+    }
+}

@@ -83,6 +83,29 @@ pub(crate) struct StateEntry {
 }
 
 impl StateEntry {
+    /// An entry as written or adopted at `now`: `ttl_ms == 0` never expires,
+    /// and a tombstone's gossip age starts now.
+    pub(crate) fn adopted(
+        version: u64,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        tombstone: bool,
+        now: Time,
+    ) -> Self {
+        Self {
+            version,
+            value,
+            ttl_ms,
+            expires_at: if ttl_ms == 0 {
+                Time::MAX
+            } else {
+                now.saturating_add(ttl_ms)
+            },
+            tombstone,
+            tombstone_since: if tombstone { now } else { Time::ZERO },
+        }
+    }
+
     /// Whether the entry has expired at `now` (tombstones don't expire — they
     /// reap on their own schedule).
     pub(crate) fn expired(&self, now: Time) -> bool {

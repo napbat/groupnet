@@ -433,6 +433,22 @@ fn str_len(s: &str) -> usize {
 }
 
 /// Encoded byte length a single [`EntryDelta`] contributes to a `Delta` frame.
+/// Encoded byte length one member summary contributes to a `Digest` frame:
+/// node id, incarnation, status, high-water, content hash.
+pub(crate) fn digest_len(d: &NodeDigest) -> usize {
+    str_len(d.node.as_str()) + 8 /* inc */ + 1 /* status */ + 8 /* max_version */ + 8 /* hash */
+}
+
+/// Encoded byte length one want contributes to a `DeltaRequest` frame.
+pub(crate) fn want_len(w: &NodeWant) -> usize {
+    str_len(w.node.as_str()) + 8 /* have_version */
+}
+
+/// Encoded byte length one register contributes to a digest's metadata rider.
+pub(crate) fn meta_len(d: &MetaDelta) -> usize {
+    str_len(&d.key) + 8 /* version */ + str_len(d.writer.as_str()) + 4 + d.value.len()
+}
+
 pub(crate) fn entry_len(e: &EntryDelta) -> usize {
     str_len(&e.key) + 8 /* version */ + 8 /* ttl */ + 1 /* tombstone */ + 4 + e.value.len()
 }
