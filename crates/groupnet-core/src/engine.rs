@@ -402,10 +402,12 @@ impl GroupEngine {
                 );
                 self.authored.insert(key.clone());
                 self.nudge_anti_entropy();
-                vec![Effect::NodeStateChanged {
+                let mut effects = vec![Effect::NodeStateChanged {
                     node: self.local.clone(),
                     key,
-                }]
+                }];
+                effects.extend(self.eager_push());
+                effects
             }
             Command::Leave => {
                 // Declare ourselves Dead at our current incarnation and stop
@@ -450,7 +452,42 @@ impl GroupEngine {
         match frame.kind {
             wire::Kind::Digest => self.on_digest(&from, &frame, now),
             wire::Kind::DeltaRequest => self.on_delta_request(&from, &frame, now),
-            wire::Kind::Delta => self.merge_members(frame.members, now),
+            wire::Kind::Delta => {
+                // Remember what each member section *advertised* so a
+                // truncated backfill can be continued: if, after merging, our
+                // stored high-water for a member still exceeds the frame's
+                // advertised max, the sender (or a third party) has entries we
+                // did not receive — re-request from where this frame stopped.
+                // The entries guard keeps max-only advancement frames (used to
+                // jump past reaped tails) from triggering spurious requests,
+                // and a peer with nothing above `have` simply builds no frame,
+                // so continuation cannot loop.
+                let carried: Vec<(NodeId, u64, bool)> = frame
+                    .members
+                    .iter()
+                    .map(|md| (md.node.clone(), md.max_version, !md.entries.is_empty()))
+                    .collect();
+                let mut effects = self.merge_members(frame.members, now);
+                let wants: Vec<wire::NodeWant> = carried
+                    .into_iter()
+                    .filter(|(node, advertised, had_entries)| {
+                        *had_entries
+                            && *node != self.local
+                            && self
+                                .members
+                                .get(node)
+                                .is_some_and(|m| m.max_state_version > *advertised)
+                    })
+                    .map(|(node, advertised, _)| wire::NodeWant {
+                        node,
+                        have_version: advertised,
+                    })
+                    .collect();
+                if !wants.is_empty() {
+                    effects.push(self.send_delta_request(from.clone(), wants));
+                }
+                effects
+            }
             wire::Kind::Ping => {
                 // Prove we're alive. The ack carries no view (anti-entropy owns
                 // dissemination); it is a bare liveness token.
@@ -584,10 +621,40 @@ impl GroupEngine {
         );
         self.authored.insert(key.to_owned());
         self.nudge_anti_entropy();
-        vec![Effect::NodeStateChanged {
+        let mut effects = vec![Effect::NodeStateChanged {
             node: self.local.clone(),
             key: key.to_owned(),
-        }]
+        }];
+        effects.extend(self.eager_push());
+        effects
+    }
+
+    /// Pushes the just-authored entry straight to the current fanout targets
+    /// as an unsolicited `Delta` frame — one hop, no digest round-trip — so a
+    /// local write reaches live peers at network latency rather than tick
+    /// cadence. Receivers adopt it through the ordinary versioned merge, so
+    /// duplication with the following anti-entropy round is harmless; that
+    /// round remains the repair path for peers outside this fanout and for
+    /// any frame the transport drops.
+    fn eager_push(&mut self) -> Vec<Effect> {
+        if !self.config.eager_push {
+            return Vec::new();
+        }
+        let have = self
+            .members
+            .get(&self.local)
+            .map_or(0, |m| m.max_state_version.saturating_sub(1));
+        let now = self.now_hint;
+        let Some(delta) = self.build_delta_frame(&[(self.local.clone(), have)], now) else {
+            return Vec::new();
+        };
+        self.select_fanout_targets()
+            .into_iter()
+            .map(|to| Effect::Send {
+                to,
+                wire: delta.clone(),
+            })
+            .collect()
     }
 
     fn probe(&mut self, now: Time) -> Vec<Effect> {
@@ -1876,6 +1943,143 @@ mod tests {
             a.node_entry(&NodeId::new("b"), "hot"),
             None,
             "expired after ttl"
+        );
+    }
+
+    #[test]
+    fn a_truncated_delta_triggers_a_continuation_request() {
+        let mut a = engine("a", &["b"]);
+        // An eager frame teaches `a` that b's high-water is 3 while carrying
+        // only the newest entry — holes below it.
+        a.on_message(
+            NodeId::new("b"),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![entry("k3", 3, 0, false, b"v3")],
+            )]),
+            Time(0),
+        );
+        // A backfill arrives truncated: entries through v1, advertised max 1,
+        // below our stored high-water of 3 — the merge must ask for the rest.
+        let effects = a.on_message(
+            NodeId::new("b"),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![entry("k1", 1, 0, false, b"v1")],
+            )]),
+            Time(1),
+        );
+        let request = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { wire, .. } => wire::decode(wire),
+                _ => None,
+            })
+            .expect("a continuation frame");
+        assert!(matches!(request.kind, wire::Kind::DeltaRequest));
+        assert_eq!(request.wants.len(), 1);
+        assert_eq!(request.wants[0].node, NodeId::new("b"));
+        assert_eq!(request.wants[0].have_version, 1);
+
+        // A frame that matches our stored high-water requests nothing.
+        let effects = a.on_message(
+            NodeId::new("b"),
+            &delta_frame(vec![member_delta(
+                "b",
+                vec![
+                    entry("k2", 2, 0, false, b"v2"),
+                    entry("k3", 3, 0, false, b"v3"),
+                ],
+            )]),
+            Time(2),
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+            "no continuation once holdings match the advertised high-water"
+        );
+    }
+
+    #[test]
+    fn a_local_write_eagerly_pushes_a_delta_to_fanout_peers() {
+        let mut a = engine("a", &["b"]);
+        let effects = a.apply(Command::SetLocalEntry {
+            key: "k".into(),
+            value: b"v1".to_vec(),
+            ttl_ms: None,
+        });
+        let wires: Vec<Vec<u8>> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send { wire, .. } => Some(wire.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!wires.is_empty(), "the write must emit eager delta frames");
+        let frame = wire::decode(&wires[0]).expect("decodes");
+        assert!(matches!(frame.kind, wire::Kind::Delta));
+        let m = frame
+            .members
+            .iter()
+            .find(|m| m.node.as_str() == "a")
+            .expect("self delta");
+        assert!(m.entries.iter().any(|e| e.key == "k" && e.value == b"v1"));
+
+        // A peer adopts it with no tick and no digest exchange: the write
+        // travels at network latency, not gossip cadence.
+        let mut b = engine("b", &["a"]);
+        b.on_message(NodeId::new("a"), &wires[0], Time(1));
+        assert_eq!(b.node_entry(&NodeId::new("a"), "k"), Some(&b"v1"[..]));
+    }
+
+    #[test]
+    fn eager_push_carries_only_the_newest_change_including_tombstones() {
+        let mut a = engine("a", &["b"]);
+        a.apply(Command::SetLocalEntry {
+            key: "old".into(),
+            value: b"x".to_vec(),
+            ttl_ms: None,
+        });
+        let effects = a.apply(Command::DeleteLocalEntry { key: "old".into() });
+        let bytes = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { wire, .. } => Some(wire.clone()),
+                _ => None,
+            })
+            .expect("eager frame");
+        let frame = wire::decode(&bytes).expect("decodes");
+        let m = frame
+            .members
+            .iter()
+            .find(|m| m.node.as_str() == "a")
+            .expect("self delta");
+        assert_eq!(
+            m.entries.len(),
+            1,
+            "exactly the newest change rides the eager frame"
+        );
+        assert!(m.entries[0].tombstone && m.entries[0].key == "old");
+    }
+
+    #[test]
+    fn eager_push_can_be_disabled() {
+        let mut a = GroupEngine::new(
+            GroupId::new("g"),
+            NodeId::new("a"),
+            [NodeId::new("b")],
+            Config {
+                eager_push: false,
+                ..Config::default()
+            },
+        );
+        let effects = a.apply(Command::SetLocalEntry {
+            key: "k".into(),
+            value: b"v".to_vec(),
+            ttl_ms: None,
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+            "no unsolicited frames when disabled"
         );
     }
 

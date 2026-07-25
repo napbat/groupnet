@@ -53,6 +53,7 @@ fn cfg() -> Config {
         fanout: 4,
         anti_entropy_interval_ms: 60,
         anti_entropy_fanout: 2,
+        eager_push: true,
         max_delta_frame_bytes: FRAME_CAP,
     }
 }
