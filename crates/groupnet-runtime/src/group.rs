@@ -76,6 +76,11 @@ impl Group {
         }
     }
 
+    /// The entries watch, for the node-level peer-address sync task.
+    pub(crate) fn entries_watch(&self) -> watch::Receiver<NodeEntriesSnapshot> {
+        self.entries_rx.clone()
+    }
+
     /// Subscribe to this group's change events. Bounded: a slow subscriber
     /// observes `Lagged` and must resync from the snapshot reads (which are
     /// always current) — the stream is an edge trigger, not a reliable log.

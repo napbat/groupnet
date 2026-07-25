@@ -1,19 +1,21 @@
 //! Integration test over *real* TCP: stream a multi-megabyte payload from one
 //! node to another on loopback, through the full data-plane stack
-//! (TcpTransport → futures-io compat → DataStream framing → zerocopy header →
-//! zero-copy `Bytes`).
+//! (TcpBulkTransport → futures-io compat → DataStream framing → zerocopy
+//! header → zero-copy `Bytes`).
+
+#![cfg(feature = "bulk")]
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::bulk::DataPlane;
-use groupnet_transport_tcp::TcpTransport;
+use groupnet_transport_tcp::TcpBulkTransport;
 
 #[tokio::test]
 async fn streams_a_multi_megabyte_blob_over_loopback() {
-    let a = TcpTransport::bind(NodeId::new("node-a"), "127.0.0.1:0")
+    let a = TcpBulkTransport::bind(NodeId::new("node-a"), "127.0.0.1:0")
         .await
         .expect("bind a");
-    let b = TcpTransport::bind(NodeId::new("node-b"), "127.0.0.1:0")
+    let b = TcpBulkTransport::bind(NodeId::new("node-b"), "127.0.0.1:0")
         .await
         .expect("bind b");
 
