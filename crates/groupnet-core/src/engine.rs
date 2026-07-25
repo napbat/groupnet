@@ -198,6 +198,46 @@ pub struct GroupEngine {
     /// for authored keys we keep our value and out-version the echo (the
     /// sole-author rule — a peer can never replace what we wrote this boot).
     authored: BTreeSet<String>,
+    /// Monotonic change clock: bumped whenever any member's digest-visible
+    /// summary changes; the member is stamped with it (`Member::changed_at`)
+    /// so per-peer delta digests can list only "changed since I last
+    /// digested to you".
+    change_clock: u64,
+    /// Per peer: the change-clock value as of the last digest built for it.
+    digest_cursors: BTreeMap<NodeId, u64>,
+    /// Per peer: digests built for it so far (drives the full-digest cadence).
+    digest_visits: BTreeMap<NodeId, u64>,
+    /// Cumulative anti-entropy traffic counters.
+    stats: NetStats,
+}
+
+/// Cumulative anti-entropy traffic counters for one engine (one node's view
+/// of one group), read via [`GroupEngine::net_stats`] (the runtime exposes
+/// them per group). The ratio to watch at scale is
+/// `digest_summaries_listed / digests_built`: with per-peer delta digests it
+/// tracks recent churn, not membership size — if it tracks membership size,
+/// the group has outgrown its cadence or `full_digest_every` (see the
+/// README's scaling envelope).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NetStats {
+    /// Digests built (one per fanout target per round; delta + full).
+    pub digests_built: u64,
+    /// How many of those were full digests (every gossipable member listed).
+    pub full_digests_built: u64,
+    /// Member summaries listed across all digests.
+    pub digest_summaries_listed: u64,
+    /// Encoded digest frames handed to the transport (budget chunking means
+    /// one digest can span several frames).
+    pub digest_frames_sent: u64,
+    /// Delta frames handed to the transport (anti-entropy backfill, offers,
+    /// and eager push).
+    pub delta_frames_sent: u64,
+    /// Delta-request frames sent (including truncation continuations).
+    pub delta_requests_sent: u64,
+    /// Total encoded bytes of the frames counted above. Constant-size probe
+    /// frames (ping/ack) are excluded — this measures the traffic that
+    /// scales with state, not liveness.
+    pub anti_entropy_bytes_sent: u64,
 }
 
 impl GroupEngine {
@@ -212,7 +252,9 @@ impl GroupEngine {
         config: Config,
     ) -> Self {
         let mut members = BTreeMap::new();
-        members.insert(local.clone(), Member::new(0, Status::Alive));
+        let mut own = Member::new(0, Status::Alive);
+        own.changed_at = 1; // stamped at clock 1, so a first digest lists us
+        members.insert(local.clone(), own);
         let seeds = seeds
             .into_iter()
             .filter(|p| *p != local)
@@ -235,9 +277,39 @@ impl GroupEngine {
             relaying: BTreeMap::new(),
             now_hint: Time::ZERO,
             authored: BTreeSet::new(),
+            change_clock: 1,
+            digest_cursors: BTreeMap::new(),
+            digest_visits: BTreeMap::new(),
+            stats: NetStats::default(),
         };
         engine.coordinator = engine.compute_coordinator();
         engine
+    }
+
+    /// Cumulative anti-entropy traffic counters (see [`NetStats`]).
+    #[must_use]
+    pub const fn net_stats(&self) -> NetStats {
+        self.stats
+    }
+
+    /// Bumps the change clock and stamps `node`'s member record, so the next
+    /// delta digest to any peer re-advertises this member. Cheap enough to
+    /// call once per mutation site; over-stamping only costs a digest line.
+    fn stamp(&mut self, node: &NodeId) {
+        self.change_clock += 1;
+        let stamp = self.change_clock;
+        if let Some(m) = self.members.get_mut(node) {
+            m.changed_at = stamp;
+        }
+    }
+
+    /// [`stamp`](Self::stamp) for the local member, avoiding a borrow clash.
+    fn stamp_self(&mut self) {
+        self.change_clock += 1;
+        let stamp = self.change_clock;
+        if let Some(m) = self.members.get_mut(&self.local) {
+            m.changed_at = stamp;
+        }
     }
 
     /// The group this engine belongs to.
@@ -401,6 +473,7 @@ impl GroupEngine {
                     },
                 );
                 self.authored.insert(key.clone());
+                self.stamp_self();
                 self.nudge_anti_entropy();
                 let mut effects = vec![Effect::NodeStateChanged {
                     node: self.local.clone(),
@@ -417,6 +490,7 @@ impl GroupEngine {
                 if let Some(m) = self.members.get_mut(&self.local) {
                     m.status = Status::Dead;
                 }
+                self.stamp_self();
                 let mut effects = vec![Effect::MembershipChanged];
                 effects.extend(self.recompute_coordinator());
                 self.nudge_anti_entropy();
@@ -430,7 +504,9 @@ impl GroupEngine {
                 if node == self.local || self.members.contains_key(&node) {
                     return Vec::new();
                 }
-                self.members.insert(node, Member::new(0, Status::Alive));
+                self.members
+                    .insert(node.clone(), Member::new(0, Status::Alive));
+                self.stamp(&node);
                 let mut effects = vec![Effect::MembershipChanged];
                 effects.extend(self.recompute_coordinator());
                 self.nudge_anti_entropy();
@@ -620,6 +696,7 @@ impl GroupEngine {
             },
         );
         self.authored.insert(key.to_owned());
+        self.stamp_self();
         self.nudge_anti_entropy();
         let mut effects = vec![Effect::NodeStateChanged {
             node: self.local.clone(),
@@ -648,7 +725,10 @@ impl GroupEngine {
         let Some(delta) = self.build_delta_frame(&[(self.local.clone(), have)], now) else {
             return Vec::new();
         };
-        self.select_fanout_targets()
+        let targets = self.select_fanout_targets();
+        self.stats.delta_frames_sent += targets.len() as u64;
+        self.stats.anti_entropy_bytes_sent += (delta.len() * targets.len()) as u64;
+        targets
             .into_iter()
             .map(|to| Effect::Send {
                 to,
@@ -719,6 +799,7 @@ impl GroupEngine {
         if !became_suspect {
             return Vec::new();
         }
+        self.stamp(target);
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
         self.nudge_anti_entropy();
@@ -745,6 +826,7 @@ impl GroupEngine {
                 m.status = Status::Dead;
                 m.dead_since = now;
             }
+            self.stamp(node);
         }
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
@@ -769,6 +851,8 @@ impl GroupEngine {
             .collect();
         for node in stale {
             self.members.remove(&node);
+            self.digest_cursors.remove(&node);
+            self.digest_visits.remove(&node);
         }
     }
 
@@ -781,13 +865,35 @@ impl GroupEngine {
         if targets.is_empty() {
             return Vec::new();
         }
-        let chunks = self.build_digest_chunks(now);
         let mut effects = Vec::new();
         for to in targets {
-            for chunk in &chunks {
+            // A peer's first digest — and every Nth after — is full; the rest
+            // are per-peer delta digests listing only members whose summary
+            // changed since the last digest built for this peer. The cursor
+            // advances on build, not delivery: anything a dropped frame loses
+            // stays divergent only until this peer's next full digest.
+            let every = self.config.full_digest_every.max(1);
+            let visit = self.digest_visits.entry(to.clone()).or_insert(0);
+            let full = *visit % every == 0;
+            *visit += 1;
+            let since = if full {
+                None
+            } else {
+                Some(self.digest_cursors.get(&to).copied().unwrap_or(0))
+            };
+            let (chunks, listed) = self.build_digest_chunks(now, since);
+            self.digest_cursors.insert(to.clone(), self.change_clock);
+            self.stats.digests_built += 1;
+            if full {
+                self.stats.full_digests_built += 1;
+            }
+            self.stats.digest_summaries_listed += listed as u64;
+            for chunk in chunks {
+                self.stats.digest_frames_sent += 1;
+                self.stats.anti_entropy_bytes_sent += chunk.len() as u64;
                 effects.push(Effect::Send {
                     to: to.clone(),
-                    wire: chunk.clone(),
+                    wire: chunk,
                 });
             }
         }
@@ -811,15 +917,20 @@ impl GroupEngine {
         out
     }
 
-    /// Builds the digest as one or more encoded [`wire::Kind::Digest`] frames,
-    /// each within the frame budget. The metadata register set rides the first
-    /// chunk; per-node summaries fill the rest.
-    fn build_digest_chunks(&self, now: Time) -> Vec<Vec<u8>> {
+    /// Builds a digest for one peer as encoded [`wire::Kind::Digest`] frames
+    /// within the frame budget, returning the frames and how many member
+    /// summaries they list. `since` of `None` builds a full digest; `Some(c)`
+    /// lists only members stamped after change-clock `c` — a per-peer delta
+    /// digest, safe because a digest only ever triggers per-listed-member
+    /// reconciliation (absence is never interpreted). The metadata register
+    /// set rides the first chunk either way.
+    fn build_digest_chunks(&self, now: Time, since: Option<u64>) -> (Vec<Vec<u8>>, usize) {
         let budget = self.config.max_delta_frame_bytes;
         let summaries: Vec<wire::NodeDigest> = self
             .members
             .iter()
             .filter(|(_, m)| self.should_gossip(m, now))
+            .filter(|(_, m)| since.is_none_or(|cursor| m.changed_at > cursor))
             .map(|(node, m)| wire::NodeDigest {
                 node: node.clone(),
                 incarnation: m.incarnation,
@@ -879,7 +990,8 @@ impl GroupEngine {
                 break;
             }
         }
-        chunks
+        let listed = summaries.len();
+        (chunks, listed)
     }
 
     // ---- anti-entropy: reconciliation ----------------------------------------
@@ -922,6 +1034,8 @@ impl GroupEngine {
             effects.push(self.send_delta_request(from.clone(), wants));
         }
         if let Some(delta) = self.build_delta_frame(&offers, now) {
+            self.stats.delta_frames_sent += 1;
+            self.stats.anti_entropy_bytes_sent += delta.len() as u64;
             effects.push(Effect::Send {
                 to: from.clone(),
                 wire: delta,
@@ -939,15 +1053,19 @@ impl GroupEngine {
             .map(|w| (w.node.clone(), w.have_version))
             .collect();
         match self.build_delta_frame(&offers, now) {
-            Some(delta) => vec![Effect::Send {
-                to: from.clone(),
-                wire: delta,
-            }],
+            Some(delta) => {
+                self.stats.delta_frames_sent += 1;
+                self.stats.anti_entropy_bytes_sent += delta.len() as u64;
+                vec![Effect::Send {
+                    to: from.clone(),
+                    wire: delta,
+                }]
+            }
             None => Vec::new(),
         }
     }
 
-    fn send_delta_request(&self, to: NodeId, wants: Vec<wire::NodeWant>) -> Effect {
+    fn send_delta_request(&mut self, to: NodeId, wants: Vec<wire::NodeWant>) -> Effect {
         let budget = self.config.max_delta_frame_bytes;
         let base = 1 + 1 + (4 + self.group.as_str().len()) + 1 + 4;
         let mut size = base;
@@ -1084,6 +1202,7 @@ impl GroupEngine {
             return false;
         };
         self.incarnation = ni;
+        self.stamp_self();
         if let Some(m) = self.members.get_mut(&self.local) {
             m.incarnation = ni;
             m.status = Status::Alive;
@@ -1110,6 +1229,7 @@ impl GroupEngine {
                     Status::Alive => {}
                 }
                 self.members.insert(node.clone(), member);
+                self.stamp(node);
                 true
             }
             Some(cur) => {
@@ -1124,6 +1244,7 @@ impl GroupEngine {
                     Status::Dead => member.dead_since = now,
                     Status::Alive => {}
                 }
+                self.stamp(node);
                 true
             }
         }
@@ -1198,6 +1319,7 @@ impl GroupEngine {
                         if let Some(v) = bumped {
                             m.observe_version(v);
                             state_changed.push((self.local.clone(), entry.key));
+                            self.stamp_self();
                         }
                     } else {
                         // A key we have NOT authored this boot, echoed at a higher
@@ -1219,6 +1341,7 @@ impl GroupEngine {
                             },
                         );
                         state_changed.push((self.local.clone(), entry.key));
+                        self.stamp_self();
                     }
                 }
                 continue;
@@ -1254,11 +1377,14 @@ impl GroupEngine {
                     }
                     member.observe_version(delta.max_version);
                     self.members.insert(delta.node.clone(), member);
+                    self.stamp(&delta.node);
                     membership_changed = true;
                 }
                 Some(cur) => {
                     let status_wins = cur.superseded_by(delta.incarnation, status);
                     let member = self.members.get_mut(&delta.node).expect("present");
+                    let high_water_before = member.max_state_version;
+                    let mut adopted = false;
                     if status_wins {
                         member.incarnation = delta.incarnation;
                         member.status = status;
@@ -1301,11 +1427,17 @@ impl GroupEngine {
                                 tombstone_since: if entry.tombstone { now } else { Time::ZERO },
                             },
                         );
+                        adopted = true;
                         state_changed.push((delta.node.clone(), entry.key));
                     }
                     // The sender's high-water (>= every version it holds) lets us
                     // advance our summary past a reaped tail without re-requesting.
                     member.observe_version(delta.max_version);
+                    // Anything digest-visible moved (liveness, content, or
+                    // high-water): re-advertise via future delta digests.
+                    if status_wins || adopted || member.max_state_version > high_water_before {
+                        self.stamp(&delta.node);
+                    }
                 }
             }
         }
@@ -1497,6 +1629,79 @@ mod tests {
             seeds.iter().map(|s| NodeId::new(*s)),
             Config::default(),
         )
+    }
+
+    /// The member summaries listed across all digest frames in `effects`.
+    fn digest_summaries(effects: &[Effect]) -> Vec<NodeId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send { wire, .. } => wire::decode(wire),
+                _ => None,
+            })
+            .filter(|f| f.kind == wire::Kind::Digest)
+            .flat_map(|f| f.digest.into_iter().map(|d| d.node))
+            .collect()
+    }
+
+    /// Delta digests list only members changed since the last digest built
+    /// for the peer; a quiet round emits nothing at all; every Nth digest is
+    /// full again. The counters expose exactly that shape.
+    #[test]
+    fn delta_digests_list_only_changed_members_with_periodic_full() {
+        let config = Config {
+            anti_entropy_fanout: 1,
+            full_digest_every: 3,
+            // Keep probes out of the timeline: no suspicion stamps.
+            probe_interval_ms: 1_000_000,
+            ..Config::default()
+        };
+        let mut a = GroupEngine::new(
+            GroupId::new("g"),
+            NodeId::new("a"),
+            [NodeId::new("b")],
+            config,
+        );
+
+        // Visit 1 (full): only ourselves exist — one summary.
+        let effects = a.start(Time(0));
+        assert_eq!(digest_summaries(&effects), vec![NodeId::new("a")]);
+
+        // b joins (stamped): the next digest is a delta listing exactly b.
+        let _ = a.apply(Command::AddPeer(NodeId::new("b")));
+        let effects = a.on_tick(Time(200));
+        assert_eq!(digest_summaries(&effects), vec![NodeId::new("b")]);
+
+        // Nothing changed since: a quiet delta round sends no digest at all.
+        let effects = a.on_tick(Time(400));
+        assert_eq!(digest_summaries(&effects), Vec::<NodeId>::new());
+
+        // A local write stamps us; visit 4 is the periodic FULL digest, so it
+        // lists everyone — the repair bound for anything a dropped frame lost.
+        let _ = a.apply(Command::SetLocalEntry {
+            key: "k".into(),
+            value: b"v".to_vec(),
+            ttl_ms: None,
+        });
+        let effects = a.on_tick(Time(600));
+        assert_eq!(
+            digest_summaries(&effects),
+            vec![NodeId::new("a"), NodeId::new("b")],
+            "every full_digest_every-th digest lists all members"
+        );
+
+        // Quiet again: back to zero-cost rounds.
+        let effects = a.on_tick(Time(800));
+        assert_eq!(digest_summaries(&effects), Vec::<NodeId>::new());
+
+        let stats = a.net_stats();
+        assert_eq!(stats.digests_built, 5);
+        assert_eq!(stats.full_digests_built, 2, "visit 1 and visit 4");
+        assert_eq!(
+            stats.digest_summaries_listed, 4,
+            "1 (boot) + 1 (b joined) + 0 + 2 (full) + 0"
+        );
+        assert!(stats.anti_entropy_bytes_sent > 0);
     }
 
     /// A digest frame (liveness summaries + metadata) — how liveness and

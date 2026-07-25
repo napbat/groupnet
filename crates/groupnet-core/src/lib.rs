@@ -36,7 +36,7 @@ pub mod placement;
 pub mod wire;
 
 pub use config::Config;
-pub use engine::{Command, Effect, GroupEngine, VersionedValue};
+pub use engine::{Command, Effect, GroupEngine, NetStats, VersionedValue};
 pub use id::{GroupId, NodeId};
 pub use membership::Status;
 pub use time::Time;

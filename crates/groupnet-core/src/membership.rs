@@ -120,6 +120,10 @@ pub(crate) struct Member {
     /// scalar is an exact summary: two observers reporting the same high-water for
     /// a member hold the identical set of that member's live entries.
     pub(crate) max_state_version: u64,
+    /// The engine's change-clock value when this member's digest-visible
+    /// summary (incarnation, status, or version high-water) last changed —
+    /// what per-peer delta digests filter on.
+    pub(crate) changed_at: u64,
 }
 
 impl Member {
@@ -132,6 +136,7 @@ impl Member {
             dead_since: Time::ZERO,
             entries: std::collections::BTreeMap::new(),
             max_state_version: 0,
+            changed_at: 0,
         }
     }
 

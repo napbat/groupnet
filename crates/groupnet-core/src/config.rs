@@ -56,6 +56,16 @@ pub struct Config {
     /// single entry whose value alone is larger (it is sent whole rather than
     /// starved).
     pub max_delta_frame_bytes: usize,
+    /// Every Nth digest built for a given peer is a **full** digest (every
+    /// gossipable member listed); the digests in between are per-peer
+    /// **delta digests**, listing only members whose summary changed since
+    /// the last digest built for that peer. Delta digests make the
+    /// steady-state anti-entropy round scale with recent churn instead of
+    /// membership size; the periodic full digest bounds how long anything a
+    /// dropped frame (or TTL-expiry drift) left divergent can stay that way.
+    /// A peer's first digest is always full. `1` disables delta digests
+    /// (every digest full — the pre-delta behaviour). Default: 4.
+    pub full_digest_every: u64,
 }
 
 impl Default for Config {
@@ -72,6 +82,7 @@ impl Default for Config {
             anti_entropy_fanout: 2,
             eager_push: true,
             max_delta_frame_bytes: 60_000,
+            full_digest_every: 4,
         }
     }
 }

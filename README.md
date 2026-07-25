@@ -188,6 +188,43 @@ The coordinator is **non-authoritative** — no write-ahead log, no quorum, no
 commit. During a partition two nodes may briefly compute different coordinators;
 because a coordinator can't do anything binding, that's harmless.
 
+## Scaling envelope
+
+Groupnet is a **full-membership** fabric: every node knows every member, which
+is exactly what weighted placement and routing rely on. That contract sets the
+envelope — know where you are in it:
+
+| Members per fabric | Verdict |
+|---|---|
+| ≤ ~1,000 | Comfortable at default cadences. |
+| ~1,000 – ~10,000 | Works; per-peer **delta digests** (default) keep steady-state rounds proportional to churn, not membership. Tune `full_digest_every` up and cadences down as you grow. |
+| beyond ~10,000 | Don't grow the fabric — **shard it into cells** and put the cell directory in an external store with conditional writes (CAS). Partial-view membership would break the full-membership contract placement depends on, so it is deliberately not on the table. |
+
+The load-bearing facts:
+
+* **Digests are the O(N) term.** A *full* digest lists every member (~40
+  bytes each). Per-peer delta digests (`full_digest_every`, default 4) list
+  only members whose summary changed since the last digest built for that
+  peer, so a quiet cluster's rounds cost near zero and a busy one's cost
+  tracks churn. The periodic full digest is the repair bound for anything a
+  dropped frame or TTL drift left divergent.
+* **Watch it, don't guess.** `Group::net_stats()` exposes digests built,
+  full digests, summaries listed, delta/request frames, and anti-entropy
+  bytes. If `digest_summaries_listed / digests_built` tracks your membership
+  size instead of your churn, the fabric has outgrown its configuration.
+* **Metadata registers ride every digest.** Keep the register set (routing
+  table, coordinator keys) small; per-node keyed *entries* are the scalable
+  bulk channel, registers are not.
+* **Probing is O(1) per node** — failure detection is never the wall.
+* Groups within a fabric are cheap and independent: the intended shape for a
+  big system is many small shard groups (replica sets) plus one membership
+  fabric per cell, with an authoritative store owning cross-cell placement.
+  Gossip carries liveness and coherence signals; stores own truth.
+
+If a single fabric ever genuinely needs to go past this envelope, the known
+escalation is Merkle-style state comparison for the full-sync path — an open
+roadmap item, deliberately unbuilt until a real deployment demands it.
+
 ## Build & test
 
 ```bash

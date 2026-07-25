@@ -54,6 +54,7 @@ fn cfg() -> Config {
         anti_entropy_interval_ms: 60,
         anti_entropy_fanout: 2,
         eager_push: true,
+        full_digest_every: 4,
         max_delta_frame_bytes: FRAME_CAP,
     }
 }

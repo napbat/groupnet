@@ -141,6 +141,7 @@ impl<T: Transport> Node<T> {
             .collect();
         let (statuses_tx, statuses_rx) = watch::channel(Arc::new(initial_statuses));
         let (entries_tx, entries_rx) = watch::channel(Arc::new(BTreeMap::new()));
+        let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());
         let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
 
         // Tick often enough to service the tightest engine deadline (probe
@@ -165,6 +166,7 @@ impl<T: Transport> Node<T> {
                 members: members_tx,
                 statuses: statuses_tx,
                 entries: entries_tx,
+                net_stats: net_stats_tx,
                 events: events_tx.clone(),
             },
             routing,
@@ -182,6 +184,7 @@ impl<T: Transport> Node<T> {
                 members: members_rx,
                 statuses: statuses_rx,
                 entries: entries_rx,
+                net_stats: net_stats_rx,
                 events: events_tx,
             },
         );
@@ -263,6 +266,16 @@ impl<T: Transport> NodeBuilder<T> {
     #[must_use]
     pub fn max_delta_frame_bytes(mut self, bytes: usize) -> Self {
         self.config.max_delta_frame_bytes = bytes.max(1);
+        self
+    }
+
+    /// Overrides how often a given peer receives a full digest instead of a
+    /// per-peer delta digest (default 4; `1` makes every digest full). Delta
+    /// digests keep the steady-state round proportional to recent churn
+    /// instead of membership size — see [`Config::full_digest_every`].
+    #[must_use]
+    pub fn full_digest_every(mut self, n: u64) -> Self {
+        self.config.full_digest_every = n.max(1);
         self
     }
 

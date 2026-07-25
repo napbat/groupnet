@@ -1,4 +1,4 @@
-use groupnet_core::{Command, GroupId, NodeId, Status};
+use groupnet_core::{Command, GroupId, NetStats, NodeId, Status};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::driver::{
@@ -53,6 +53,7 @@ pub struct Group {
     members_rx: watch::Receiver<MembersSnapshot>,
     statuses_rx: watch::Receiver<StatusesSnapshot>,
     entries_rx: watch::Receiver<NodeEntriesSnapshot>,
+    net_stats_rx: watch::Receiver<NetStats>,
     events_tx: broadcast::Sender<GroupEvent>,
 }
 
@@ -72,6 +73,7 @@ impl Group {
             members_rx: views.members,
             statuses_rx: views.statuses,
             entries_rx: views.entries,
+            net_stats_rx: views.net_stats,
             events_tx: views.events,
         }
     }
@@ -205,6 +207,15 @@ impl Group {
     #[must_use]
     pub fn all_entries(&self) -> NodeEntriesSnapshot {
         self.entries_rx.borrow().clone()
+    }
+
+    /// Cumulative anti-entropy traffic counters for this group on this node.
+    /// The ratio worth watching at scale is
+    /// `digest_summaries_listed / digests_built` — with delta digests it
+    /// tracks recent churn, not membership size (see [`NetStats`]).
+    #[must_use]
+    pub fn net_stats(&self) -> NetStats {
+        *self.net_stats_rx.borrow()
     }
 
     /// Runs a batch of shard-local operations against the group.

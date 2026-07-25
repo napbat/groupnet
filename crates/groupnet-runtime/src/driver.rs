@@ -2,11 +2,11 @@
 //! [`GroupEngine`] and a [`Transport`], and executes the effects the engine
 //! returns.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Command, Effect, GroupEngine, GroupId, NodeId, Status, Time};
+use groupnet_core::{Command, Effect, GroupEngine, GroupId, NetStats, NodeId, Status, Time};
 use groupnet_transport::Transport;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::MissedTickBehavior;
@@ -62,8 +62,10 @@ pub(crate) type MembersSnapshot = Arc<Vec<NodeId>>;
 pub(crate) type StatusesSnapshot = Arc<BTreeMap<NodeId, Status>>;
 
 /// A published, read-only snapshot of every node's keyed app-defined state
-/// (live entries only — tombstoned/expired keys are absent).
-pub(crate) type NodeEntriesSnapshot = Arc<BTreeMap<NodeId, BTreeMap<String, Vec<u8>>>>;
+/// (live entries only — tombstoned/expired keys are absent). Two-level
+/// `Arc` sharing keeps updates incremental: a state change rebuilds only the
+/// changed node's inner map; the outer map is pointer-cloned per publish.
+pub(crate) type NodeEntriesSnapshot = Arc<BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>>>;
 
 /// An event delivered to a group actor: either a decoded network frame or a
 /// local command from the [`Group`](crate::Group) handle.
@@ -79,6 +81,7 @@ pub(crate) struct Publishers {
     pub members: watch::Sender<MembersSnapshot>,
     pub statuses: watch::Sender<StatusesSnapshot>,
     pub entries: watch::Sender<NodeEntriesSnapshot>,
+    pub net_stats: watch::Sender<NetStats>,
     pub events: broadcast::Sender<GroupEvent>,
 }
 
@@ -90,6 +93,7 @@ pub(crate) struct GroupViews {
     pub members: watch::Receiver<MembersSnapshot>,
     pub statuses: watch::Receiver<StatusesSnapshot>,
     pub entries: watch::Receiver<NodeEntriesSnapshot>,
+    pub net_stats: watch::Receiver<NetStats>,
     pub events: broadcast::Sender<GroupEvent>,
 }
 
@@ -124,6 +128,10 @@ pub(crate) async fn group_task<T: Transport>(
     let mut announced_coordinator: Option<NodeId> = None;
     announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
 
+    // The entries snapshot, maintained incrementally: only nodes named in a
+    // NodeStateChanged effect rebuild their (Arc-shared) inner map.
+    let mut entries_master: BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>> = BTreeMap::new();
+
     loop {
         let effects = tokio::select! {
             maybe = inbox.recv() => match maybe {
@@ -141,9 +149,13 @@ pub(crate) async fn group_task<T: Transport>(
         let members_dirty = effects
             .iter()
             .any(|e| matches!(e, Effect::MembershipChanged));
-        let state_dirty = effects
+        let touched: BTreeSet<NodeId> = effects
             .iter()
-            .any(|e| matches!(e, Effect::NodeStateChanged { .. }));
+            .filter_map(|e| match e {
+                Effect::NodeStateChanged { node, .. } => Some(node.clone()),
+                _ => None,
+            })
+            .collect();
         emit_events(&publishers.events, &effects);
         dispatch(&transport, &publishers.coordinator, effects).await;
         // Republish snapshots; readers borrow them lock-free.
@@ -164,20 +176,37 @@ pub(crate) async fn group_task<T: Transport>(
             let _ = publishers.statuses.send(Arc::new(statuses));
             announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
         }
-        if state_dirty {
-            let mut snapshot: BTreeMap<NodeId, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
-            let nodes: Vec<NodeId> = engine.member_statuses().map(|(n, _)| n.clone()).collect();
-            for node in nodes {
+        if !touched.is_empty() {
+            for node in touched {
                 let entries: BTreeMap<String, Vec<u8>> = engine
                     .node_entries(&node)
                     .map(|(k, v)| (k.to_owned(), v.to_vec()))
                     .collect();
-                if !entries.is_empty() {
-                    snapshot.insert(node, entries);
+                if entries.is_empty() {
+                    entries_master.remove(&node);
+                } else {
+                    entries_master.insert(node, Arc::new(entries));
                 }
             }
-            let _ = publishers.entries.send(Arc::new(snapshot));
+            let _ = publishers.entries.send(Arc::new(entries_master.clone()));
         }
+        if members_dirty {
+            // Drop reaped members' state from the snapshot.
+            let live: BTreeSet<NodeId> = engine.member_statuses().map(|(n, _)| n.clone()).collect();
+            let before = entries_master.len();
+            entries_master.retain(|node, _| live.contains(node));
+            if entries_master.len() != before {
+                let _ = publishers.entries.send(Arc::new(entries_master.clone()));
+            }
+        }
+        let stats = engine.net_stats();
+        publishers.net_stats.send_if_modified(|current| {
+            let changed = *current != stats;
+            if changed {
+                *current = stats;
+            }
+            changed
+        });
     }
 }
 
