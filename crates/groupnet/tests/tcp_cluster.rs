@@ -72,3 +72,68 @@ async fn nodes_gossip_and_sync_entries_over_persistent_tcp() {
     assert!(a_pool.outbound_connections() <= 1);
     assert!(b_pool.outbound_connections() <= 1);
 }
+
+/// The only static addressing in this cluster is "where is the seed": the
+/// seed learns joiners from the dial-back intro, joiners learn each other
+/// from gossiped advertisements, and state flows between two nodes that were
+/// never configured with each other's address. No full-mesh registration.
+#[tokio::test]
+async fn seed_only_bootstrap_resolves_every_address_dynamically() {
+    let a_id = NodeId::new("boot-a");
+    let b_id = NodeId::new("boot-b"); // the seed
+    let c_id = NodeId::new("boot-c");
+    let ta = TcpMsgTransport::bind(a_id.clone(), "127.0.0.1:0")
+        .await
+        .expect("bind a");
+    let tb = TcpMsgTransport::bind(b_id.clone(), "127.0.0.1:0")
+        .await
+        .expect("bind b");
+    let tc = TcpMsgTransport::bind(c_id.clone(), "127.0.0.1:0")
+        .await
+        .expect("bind c");
+    ta.register_peer(b_id.clone(), tb.local_addr());
+    tc.register_peer(b_id.clone(), tb.local_addr());
+
+    let a_book = ta.clone();
+    let c_book = tc.clone();
+    let a = Node::builder(a_id.clone(), ta)
+        .seed(b_id.clone())
+        .advertise_addr(a_book.local_addr().to_string())
+        .gossip_interval_ms(20)
+        .anti_entropy_interval_ms(50)
+        .spawn();
+    let b = Node::builder(b_id.clone(), tb.clone())
+        .advertise_addr(tb.local_addr().to_string())
+        .gossip_interval_ms(20)
+        .anti_entropy_interval_ms(50)
+        .spawn();
+    let c = Node::builder(c_id.clone(), tc)
+        .seed(b_id.clone())
+        .advertise_addr(c_book.local_addr().to_string())
+        .gossip_interval_ms(20)
+        .anti_entropy_interval_ms(50)
+        .spawn();
+
+    let ga = a.join_group("boot");
+    let gb = b.join_group("boot");
+    let gc = c.join_group("boot");
+    eventually(
+        || [&ga, &gb, &gc].iter().all(|g| g.members().len() == 3),
+        "three-way membership from one seed address",
+    )
+    .await;
+
+    // a and c resolved each other without any registration between them.
+    eventually(
+        || c_book.peer_addr(&a_id).is_some() && a_book.peer_addr(&c_id).is_some(),
+        "joiners resolve each other from gossiped advertisements",
+    )
+    .await;
+
+    gc.set_entry("who", b"c", None).expect("entry accepted");
+    eventually(
+        || ga.node_entry(&c_id, "who").as_deref() == Some(b"c"),
+        "state from c reaches a",
+    )
+    .await;
+}

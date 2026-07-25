@@ -69,4 +69,18 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Awaits the next inbound datagram. Returning `Err` ends the receive loop.
     fn recv(&self) -> impl Future<Output = Result<Inbound, Self::Error>> + Send;
+
+    /// Teaches the transport that `node` claims to be reachable at `addr` —
+    /// the exact string the peer advertised (the runtime feeds gossiped
+    /// `advertise_addr` values through here automatically, so only seeds need
+    /// out-of-band addressing).
+    ///
+    /// The default does nothing: bindings that resolve peers another way (an
+    /// in-memory fabric, fixed infrastructure) may ignore advertisements.
+    /// Address-book-backed bindings parse the string and register it,
+    /// silently ignoring what they cannot parse — an advertisement is a hint,
+    /// never an error.
+    fn learn_peer(&self, node: &NodeId, addr: &str) {
+        let _ = (node, addr);
+    }
 }

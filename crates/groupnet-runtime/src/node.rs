@@ -6,7 +6,9 @@ use groupnet_core::{Config, GroupEngine, GroupId, NodeId, Status};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
-use crate::driver::{EVENTS_CAPACITY, Event, GroupViews, INBOX_CAPACITY, Publishers, group_task};
+use crate::driver::{
+    EVENTS_CAPACITY, Event, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers, group_task,
+};
 use crate::group::Group;
 use crate::routing::Routing;
 use tokio::sync::broadcast;
@@ -269,6 +271,10 @@ impl<T: Transport> NodeBuilder<T> {
     /// as the reserved `~addr` state entry on the routing group — so only
     /// seeds need out-of-band addressing and everyone else resolves peers
     /// from gossip ([`Group::node_entry`] / [`Node::peer_addr`]).
+    ///
+    /// Every node also feeds the advertisements it *receives* into its own
+    /// transport ([`Transport::learn_peer`]) automatically, so address-book
+    /// transports (UDP, persistent TCP) fill themselves from gossip.
     #[must_use]
     pub fn advertise_addr(mut self, addr: impl Into<String>) -> Self {
         self.advertise_addr = Some(addr.into());
@@ -295,8 +301,49 @@ impl<T: Transport> NodeBuilder<T> {
         if let Some(addr) = advertise {
             let _ = routing_group.set_entry("~addr", addr.into_bytes(), None);
         }
+        // Feed gossiped `~addr` advertisements into the transport's address
+        // book, so only seeds need out-of-band registration. Transports that
+        // resolve peers another way ignore the calls (default `learn_peer`).
+        tokio::spawn(sync_peer_addrs(
+            node.inner.transport.clone(),
+            node.inner.id.clone(),
+            routing_group.entries_watch(),
+        ));
         let _ = node.inner.routing.set(routing_group);
         node
+    }
+}
+
+/// Keeps the transport's address book fed with gossiped `~addr`
+/// advertisements via [`Transport::learn_peer`]. Each distinct advertised
+/// value is taught once (including unparseable ones, so a bad value is never
+/// re-taught every wakeup). Ends when the routing group's actor does.
+async fn sync_peer_addrs<T: Transport>(
+    transport: Arc<T>,
+    local: NodeId,
+    mut entries: watch::Receiver<NodeEntriesSnapshot>,
+) {
+    let mut taught: HashMap<NodeId, Vec<u8>> = HashMap::new();
+    loop {
+        let snapshot = entries.borrow_and_update().clone();
+        for (node, kv) in snapshot.iter() {
+            if *node == local {
+                continue;
+            }
+            let Some(advertised) = kv.get("~addr") else {
+                continue;
+            };
+            if taught.get(node).is_some_and(|seen| seen == advertised) {
+                continue;
+            }
+            if let Ok(addr) = std::str::from_utf8(advertised) {
+                transport.learn_peer(node, addr);
+            }
+            taught.insert(node.clone(), advertised.clone());
+        }
+        if entries.changed().await.is_err() {
+            return;
+        }
     }
 }
 

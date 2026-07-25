@@ -8,10 +8,13 @@
 //!
 //! ## Scaffold simplifications
 //!
-//! * **Static address book.** The engine speaks only in [`NodeId`]s, so this
-//!   transport maps them to socket addresses via a table you register up front
-//!   (and inbound datagrams are attributed by matching their source address). A
-//!   production build would gossip addresses or resolve them dynamically.
+//! * **Seeded address book.** The engine speaks only in [`NodeId`]s, so this
+//!   transport maps them to socket addresses via a book: seeds are registered
+//!   up front ([`register_peer`](UdpTransport::register_peer)), and the rest
+//!   arrives from gossiped `advertise_addr` values via `Transport::learn_peer`
+//!   (the runtime feeds them automatically). Inbound datagrams are attributed
+//!   by matching their source address, so a peer must be in the book before
+//!   its frames are accepted.
 //! * **One frame per datagram.** A frame must fit in a single UDP packet; very
 //!   large clusters could exceed the MTU. Fragmentation / a stream fallback is
 //!   future work.
@@ -117,6 +120,13 @@ impl UdpTransport {
 impl Transport for UdpTransport {
     type Error = io::Error;
 
+    fn learn_peer(&self, node: &NodeId, addr: &str) {
+        // An advertisement is a hint: register what parses, ignore the rest.
+        if let Ok(addr) = addr.parse::<SocketAddr>() {
+            self.register_peer(node.clone(), addr);
+        }
+    }
+
     async fn send(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
         // Resolve the address without holding the lock across the await.
         let addr = self
@@ -195,6 +205,33 @@ mod tests {
             .expect("recv");
         assert_eq!(inbound.from, sender_id);
         assert_eq!(inbound.msg, b"hello".to_vec());
+    }
+
+    /// A gossiped advertisement teaches the book exactly like registration —
+    /// and garbage is ignored, never an error (an advertisement is a hint).
+    #[tokio::test]
+    async fn learn_peer_registers_parseable_advertisements() {
+        let sender = bind_as("adv-sender").await;
+        let receiver = bind_as("adv-receiver").await;
+        let sender_id = NodeId::new("adv-sender");
+        let receiver_id = NodeId::new("adv-receiver");
+
+        let receiver_addr = receiver.local_addr().expect("addr").to_string();
+        sender.learn_peer(&receiver_id, &receiver_addr);
+        let sender_addr = sender.local_addr().expect("addr").to_string();
+        receiver.learn_peer(&sender_id, &sender_addr);
+        sender.learn_peer(&NodeId::new("junk"), "not-an-address");
+
+        sender
+            .send(&receiver_id, b"via-gossip")
+            .await
+            .expect("send");
+        let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
+        assert_eq!(inbound.from, sender_id);
+        assert_eq!(inbound.msg, b"via-gossip".to_vec());
     }
 
     /// Re-registering a node at a new address updates BOTH maps and drops the

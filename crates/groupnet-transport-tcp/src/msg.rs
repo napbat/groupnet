@@ -22,14 +22,25 @@
 //!   failure drops whatever was queued behind it. The engine's anti-entropy
 //!   repairs all of it — do not add reliability on top.
 //!
+//! ## Address learning
+//!
+//! Only seed addresses need registering up front
+//! ([`register_peer`](TcpMsgTransport::register_peer)). The rest of the book
+//! fills itself in two ways: the dial handshake carries the dialer's own
+//! listener address, so the accepting side can dial back a peer nobody
+//! registered on it (a joiner reaching a seed); and gossiped `advertise_addr`
+//! values arrive through [`Transport::learn_peer`] (the runtime feeds them
+//! automatically), which resolves third parties. Between them, a cluster
+//! bootstraps from seed addresses alone.
+//!
 //! ## Scaffold simplifications
 //!
-//! Peer addresses come from a static book you register up front (inbound
-//! connections are attributed by handshake, not by source address). Inbound
-//! and outbound are separate sockets — two mutually chatty nodes hold two
-//! connections, not one full-duplex one. A failed dial drops the frames
-//! queued behind it and the next send re-dials, which self-limits to one
-//! connect attempt per burst of sends.
+//! A connection's claimed id and listener address are trusted as-is — the
+//! same trust model as UDP source-address attribution. Inbound and outbound
+//! are separate sockets — two mutually chatty nodes hold two connections,
+//! not one full-duplex one. A failed dial drops the frames queued behind it
+//! and the next send re-dials, which self-limits to one connect attempt per
+//! burst of sends.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -45,7 +56,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::handshake::{read_id, write_id};
+use crate::handshake::{read_id, read_str, write_id, write_str};
 
 /// Hard upper bound on a single frame. Engine frames are soft-capped far
 /// below this (`Config::max_delta_frame_bytes`); the guard only stops a
@@ -79,6 +90,12 @@ pub struct TcpMsgConfig {
     /// Frames buffered per outbound connection while it dials or drains; a
     /// full queue drops the frame (best-effort). Default: 256.
     pub outbound_queue: usize,
+    /// The listener address to introduce ourselves with when dialing, so the
+    /// accepting side can dial back without prior registration. `None`
+    /// introduces the bound address unless it is unspecified (`0.0.0.0`);
+    /// set it when peers must reach this node somewhere else (NAT, container
+    /// networking). Default: `None`.
+    pub advertise: Option<SocketAddr>,
 }
 
 impl Default for TcpMsgConfig {
@@ -87,6 +104,7 @@ impl Default for TcpMsgConfig {
             idle_timeout: Duration::from_secs(30),
             max_outbound: 64,
             outbound_queue: 256,
+            advertise: None,
         }
     }
 }
@@ -136,6 +154,9 @@ impl Pool {
 struct Inner {
     local: NodeId,
     local_addr: SocketAddr,
+    /// What we introduce ourselves with when dialing (empty: nothing
+    /// dialable — bound to an unspecified address with no `advertise`).
+    intro: String,
     config: TcpMsgConfig,
     /// NodeId -> where to dial. Interior mutability so peers can be
     /// registered after binding (e.g. once ephemeral ports are known).
@@ -181,17 +202,27 @@ impl TcpMsgTransport {
         let local_addr = listener.local_addr()?;
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
         let read_idle = config.idle_timeout.saturating_mul(2);
-        tokio::spawn(accept_loop(listener, inbound_tx, read_idle));
-        Ok(Self {
-            inner: Arc::new(Inner {
-                local,
-                local_addr,
-                config,
-                peers: RwLock::new(HashMap::new()),
-                pool: Mutex::new(Pool::default()),
-                inbox: AsyncMutex::new(inbound_rx),
-            }),
-        })
+        let intro = config
+            .advertise
+            .or_else(|| (!local_addr.ip().is_unspecified()).then_some(local_addr))
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let inner = Arc::new(Inner {
+            local,
+            local_addr,
+            intro,
+            config,
+            peers: RwLock::new(HashMap::new()),
+            pool: Mutex::new(Pool::default()),
+            inbox: AsyncMutex::new(inbound_rx),
+        });
+        tokio::spawn(accept_loop(
+            listener,
+            inbound_tx,
+            read_idle,
+            Arc::downgrade(&inner),
+        ));
+        Ok(Self { inner })
     }
 
     /// This endpoint's local node id.
@@ -217,6 +248,19 @@ impl TcpMsgTransport {
             .insert(node, addr);
     }
 
+    /// The address this endpoint would dial for `node`, however it was
+    /// learned — registration, a gossiped advertisement, or a dial-back
+    /// intro. `None` if unknown.
+    #[must_use]
+    pub fn peer_addr(&self, node: &NodeId) -> Option<SocketAddr> {
+        self.inner
+            .peers
+            .read()
+            .expect("peers lock poisoned")
+            .get(node)
+            .copied()
+    }
+
     /// Outbound connections currently pooled (established or still dialing).
     /// Observability for the bounded-pool promise: on a large cluster this
     /// tracks the active fanout, not the membership size.
@@ -233,6 +277,13 @@ impl TcpMsgTransport {
 
 impl Transport for TcpMsgTransport {
     type Error = io::Error;
+
+    fn learn_peer(&self, node: &NodeId, addr: &str) {
+        // An advertisement is a hint: register what parses, ignore the rest.
+        if let Ok(addr) = addr.parse::<SocketAddr>() {
+            self.register_peer(node.clone(), addr);
+        }
+    }
 
     async fn send(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
         if msg.len() > MAX_FRAME {
@@ -312,6 +363,7 @@ impl Transport for TcpMsgTransport {
             frames: rx,
             idle: self.inner.config.idle_timeout,
             local: self.inner.local.clone(),
+            intro: self.inner.intro.clone(),
         }));
         Ok(())
     }
@@ -338,6 +390,8 @@ struct Outbound {
     frames: mpsc::Receiver<Vec<u8>>,
     idle: Duration,
     local: NodeId,
+    /// Our own listener address, introduced so the peer can dial back.
+    intro: String,
 }
 
 impl Outbound {
@@ -359,7 +413,9 @@ impl Outbound {
 async fn write_loop(mut out: Outbound) {
     if let Ok(Ok(mut sock)) = timeout(CONNECT_TIMEOUT, TcpStream::connect(out.addr)).await {
         let _ = sock.set_nodelay(true); // latency is the point of eager frames
-        if write_id(&mut sock, &out.local).await.is_ok() {
+        if write_id(&mut sock, &out.local).await.is_ok()
+            && write_str(&mut sock, &out.intro).await.is_ok()
+        {
             loop {
                 match timeout(out.idle, out.frames.recv()).await {
                     // Idle: leave the pool first so a racing send re-dials,
@@ -392,7 +448,12 @@ async fn write_loop(mut out: Outbound) {
 
 /// Accepts inbound connections and spawns a reader per peer. Exits when the
 /// listener fails or every transport handle is dropped.
-async fn accept_loop(listener: TcpListener, inbound: mpsc::Sender<Inbound>, read_idle: Duration) {
+async fn accept_loop(
+    listener: TcpListener,
+    inbound: mpsc::Sender<Inbound>,
+    read_idle: Duration,
+    inner: Weak<Inner>,
+) {
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -400,19 +461,38 @@ async fn accept_loop(listener: TcpListener, inbound: mpsc::Sender<Inbound>, read
                     return; // listener failure ends intake; readers drain on their own
                 };
                 let _ = sock.set_nodelay(true);
-                tokio::spawn(read_loop(sock, inbound.clone(), read_idle));
+                tokio::spawn(read_loop(sock, inbound.clone(), read_idle, inner.clone()));
             }
             () = inbound.closed() => return, // transport dropped
         }
     }
 }
 
-/// Reads handshake + frames off one inbound connection, attributing each
-/// frame to the handshaken peer id.
-async fn read_loop(mut sock: TcpStream, inbound: mpsc::Sender<Inbound>, read_idle: Duration) {
-    let Ok(Ok(from)) = timeout(read_idle, read_id(&mut sock)).await else {
+/// Reads the intro + frames off one inbound connection, attributing each
+/// frame to the introduced peer id.
+async fn read_loop(
+    mut sock: TcpStream,
+    inbound: mpsc::Sender<Inbound>,
+    read_idle: Duration,
+    inner: Weak<Inner>,
+) {
+    let Ok(Ok((from, intro))) = timeout(read_idle, read_intro(&mut sock)).await else {
         return;
     };
+    // The dial-back path: a dialer that told us where it listens is in the
+    // book before its first frame surfaces, so replies can flow even to a
+    // peer nobody registered here (a joiner reaching a seed).
+    if !intro.is_empty() {
+        if let Ok(addr) = intro.parse::<SocketAddr>() {
+            if let Some(inner) = inner.upgrade() {
+                inner
+                    .peers
+                    .write()
+                    .expect("peers lock poisoned")
+                    .insert(from.clone(), addr);
+            }
+        }
+    }
     loop {
         let Ok(read) = timeout(read_idle, read_frame(&mut sock)).await else {
             return; // silent past the reaper deadline: presumed half-open
@@ -429,6 +509,14 @@ async fn read_loop(mut sock: TcpStream, inbound: mpsc::Sender<Inbound>, read_idl
             return;
         }
     }
+}
+
+/// Reads the dialer's intro: its node id and its (possibly empty) listener
+/// address.
+async fn read_intro(sock: &mut TcpStream) -> io::Result<(NodeId, String)> {
+    let from = read_id(sock).await?;
+    let intro = read_str(sock).await?;
+    Ok((from, intro))
 }
 
 /// Reads one length-prefixed frame. `Ok(None)` is a clean close between
@@ -568,6 +656,47 @@ mod tests {
         a.register_peer(peer.clone(), b.local_addr());
         a.send(&peer, b"back").await.expect("send");
         assert_eq!(recv_one(&b).await.msg, b"back".to_vec());
+    }
+
+    /// The dial intro teaches the accepting side a dial-back path: a seed
+    /// can answer a joiner nobody ever registered on it.
+    #[tokio::test]
+    async fn inbound_intro_teaches_the_reverse_path() {
+        let joiner = bind_as("intro-joiner").await;
+        let seed = bind_as("intro-seed").await;
+        joiner.register_peer(NodeId::new("intro-seed"), seed.local_addr());
+
+        joiner
+            .send(&NodeId::new("intro-seed"), b"hi")
+            .await
+            .expect("send");
+        assert_eq!(recv_one(&seed).await.msg, b"hi".to_vec());
+        assert_eq!(
+            seed.peer_addr(&NodeId::new("intro-joiner")),
+            Some(joiner.local_addr()),
+            "the intro registered the joiner's listener"
+        );
+
+        seed.send(&NodeId::new("intro-joiner"), b"welcome")
+            .await
+            .expect("send");
+        let back = recv_one(&joiner).await;
+        assert_eq!(back.from, NodeId::new("intro-seed"));
+        assert_eq!(back.msg, b"welcome".to_vec());
+    }
+
+    /// Gossiped advertisements teach the book like registration; garbage is
+    /// ignored (an advertisement is a hint, never an error).
+    #[tokio::test]
+    async fn learn_peer_parses_and_ignores_garbage() {
+        let t = bind_as("learn-a").await;
+        t.learn_peer(&NodeId::new("good"), "127.0.0.1:9999");
+        assert_eq!(
+            t.peer_addr(&NodeId::new("good")),
+            Some("127.0.0.1:9999".parse().expect("addr"))
+        );
+        t.learn_peer(&NodeId::new("bad"), "not-an-address");
+        assert_eq!(t.peer_addr(&NodeId::new("bad")), None);
     }
 
     /// The pool never exceeds its cap: dialing a new peer at the cap closes
