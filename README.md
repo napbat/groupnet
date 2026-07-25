@@ -51,6 +51,7 @@ requirements, so they're separate traits bound to separate physical connections.
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
 | [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | data | transport(bulk), core, tokio(net) | TCP stream binding |
 | [`groupnet-runtime`](crates/groupnet-runtime) | — | core, transport, tokio | **transport-agnostic** async `Node`/`Group` driver + routing table |
+| [`groupnet-consistency`](crates/groupnet-consistency) | — | core, runtime, tokio(sync) | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
 | [`groupnet`](crates/groupnet) | — | facade | umbrella re-export; `runtime`+`mem` default, `udp`/`tcp`/`sim` opt-in |
 

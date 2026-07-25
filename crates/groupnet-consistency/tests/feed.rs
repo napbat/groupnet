@@ -1,14 +1,16 @@
 //! Multi-node tests over the in-memory transport: writes published on one
 //! node arrive in order on another, ring overflow degrades to an explicit
-//! gap, a node never reacts to its own writes, and the frontier gives a true
-//! read-your-writes barrier.
+//! gap, a node never reacts to its own writes, the frontier gives a true
+//! read-your-writes barrier, a writer restart surfaces as an epoch-change
+//! gap with honest barriers on both sides of it, and named feeds stay
+//! isolated.
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed};
+use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken};
 use groupnet_core::NodeId;
 use groupnet_runtime::{Group, Node};
 use groupnet_transport_mem::{MemTransport, Network};
@@ -49,6 +51,10 @@ async fn next_event(peers: &mut PeerWrites<String>) -> PeerWrite<String> {
         .expect("event stream ended")
 }
 
+fn decode(bytes: &[u8]) -> Option<String> {
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
 #[tokio::test]
 async fn peer_writes_arrive_in_order_and_apply_locally() {
     let net = Network::new();
@@ -59,21 +65,33 @@ async fn peer_writes_arrive_in_order_and_apply_locally() {
     // Node B: local state holding a soon-stale copy, and a subscription.
     let fresh: Arc<Mutex<HashSet<String>>> = Arc::default();
     fresh.lock().expect("lock").insert("user:1".to_owned());
-    let mut peers = PeerWrites::new(b_group, b_id, |bytes| {
-        String::from_utf8(bytes.to_vec()).ok()
-    });
+    let mut peers = PeerWrites::new(b_group, b_id, decode);
 
-    // Node A publishes two writes; seqs are the read-your-writes tokens.
+    // Node A publishes two writes; the tokens are the RYW session tokens.
     let feed = WriteFeed::new(a_group, cap(128), |key: &String| key.clone().into_bytes());
-    assert_eq!(feed.publish(&"user:1".to_owned()).await, 1);
-    assert_eq!(feed.publish(&"user:2".to_owned()).await, 2);
+    let epoch = feed.epoch();
+    assert_eq!(
+        feed.publish(&"user:1".to_owned()).await,
+        WriteToken { epoch, seq: 1 }
+    );
+    assert_eq!(
+        feed.publish(&"user:2".to_owned()).await,
+        WriteToken { epoch, seq: 2 }
+    );
+    assert_eq!(feed.last_token(), Some(WriteToken { epoch, seq: 2 }));
 
     // B observes them in publication order and applies each.
     for (expected_seq, expected) in [(1, "user:1"), (2, "user:2")] {
         match next_event(&mut peers).await {
-            PeerWrite::Wrote { peer, seq, key } => {
+            PeerWrite::Wrote { peer, token, key } => {
                 assert_eq!(peer, a_id);
-                assert_eq!(seq, expected_seq);
+                assert_eq!(
+                    token,
+                    WriteToken {
+                        epoch,
+                        seq: expected_seq
+                    }
+                );
                 assert_eq!(key, expected);
                 fresh.lock().expect("lock").remove(&key);
             }
@@ -84,6 +102,8 @@ async fn peer_writes_arrive_in_order_and_apply_locally() {
         !fresh.lock().expect("lock").contains("user:1"),
         "the peer's write must drop the stale local copy"
     );
+    assert_eq!(peers.gaps_seen(), 0);
+    assert_eq!(peers.lag(&a_id), Some(0), "fully caught up");
 }
 
 #[tokio::test]
@@ -93,11 +113,10 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
     let (b_id, _b_node, b_group) = spawn_node(&net, "ov-b", &["ov-a"]);
     converged(&[&a_group, &b_group]).await;
 
-    let mut peers = PeerWrites::new(b_group, b_id, |bytes| {
-        String::from_utf8(bytes.to_vec()).ok()
-    });
+    let mut peers = PeerWrites::new(b_group, b_id, decode);
     // A tiny ring: two slots.
     let feed = WriteFeed::new(a_group, cap(2), |key: &String| key.clone().into_bytes());
+    let epoch = feed.epoch();
 
     // B tracks the feed normally first (cursor lands at w1's end)…
     feed.publish(&"w1".to_owned()).await;
@@ -117,7 +136,7 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
         next_event(&mut peers).await,
         PeerWrite::Gap {
             peer: a_id.clone(),
-            missed_through: 2
+            missed_through: WriteToken { epoch, seq: 2 }
         },
         "an overflowed ring must surface as a gap, never a silent skip"
     );
@@ -125,7 +144,7 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
         next_event(&mut peers).await,
         PeerWrite::Wrote {
             peer: a_id.clone(),
-            seq: 3,
+            token: WriteToken { epoch, seq: 3 },
             key: "w3".to_owned()
         }
     );
@@ -133,10 +152,11 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
         next_event(&mut peers).await,
         PeerWrite::Wrote {
             peer: a_id,
-            seq: 4,
+            token: WriteToken { epoch, seq: 4 },
             key: "w4".to_owned()
         }
     );
+    assert_eq!(peers.gaps_seen(), 1);
 }
 
 #[tokio::test]
@@ -149,9 +169,7 @@ async fn own_writes_are_ignored() {
     let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
         key.clone().into_bytes()
     });
-    let mut own = PeerWrites::new(a_group, a_id, |bytes| {
-        String::from_utf8(bytes.to_vec()).ok()
-    });
+    let mut own = PeerWrites::new(a_group, a_id, decode);
     feed.publish(&"local".to_owned()).await;
 
     // Nothing may arrive: a node does not notify itself.
@@ -170,17 +188,15 @@ async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
     let fresh: Arc<Mutex<HashSet<String>>> = Arc::default();
     fresh.lock().expect("lock").insert("user:1".to_owned());
 
-    let mut peers = PeerWrites::new(b_group, b_id, |bytes| {
-        String::from_utf8(bytes.to_vec()).ok()
-    });
+    let mut peers = PeerWrites::new(b_group, b_id, decode);
     let (frontier, view) = Frontier::new();
     let applied = Arc::clone(&fresh);
     tokio::spawn(async move {
         while let Some(event) = peers.next().await {
             match event {
-                PeerWrite::Wrote { peer, seq, key } => {
+                PeerWrite::Wrote { peer, token, key } => {
                     applied.lock().expect("lock").remove(&key);
-                    frontier.advance(&peer, seq);
+                    frontier.advance(&peer, token);
                 }
                 PeerWrite::Gap {
                     peer,
@@ -190,7 +206,7 @@ async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
         }
     });
 
-    // Node A writes; the returned seq is the client's token.
+    // Node A writes; the returned token is the client's session token.
     let feed = WriteFeed::new(a_group, cap(64), |key: &String| key.clone().into_bytes());
     let token = feed.publish(&"user:1".to_owned()).await;
 
@@ -207,4 +223,123 @@ async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
         !fresh.lock().expect("lock").contains("user:1"),
         "after the barrier, the stale copy is provably gone"
     );
+}
+
+/// The restart story end to end: a writer dies and comes back under the
+/// same id with a fresh ring. The subscriber gets an epoch-change gap that
+/// covers the whole previous life, new-life barriers stay unsatisfied until
+/// the gap is actually remediated, and old-life tokens remain satisfied
+/// afterwards (the remediation covered them).
+#[tokio::test]
+async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
+    let net = Network::new();
+    let (a_id, a_node, a_group) = spawn_node(&net, "rs-a", &["rs-b"]);
+    let (b_id, _b_node, b_group) = spawn_node(&net, "rs-b", &["rs-a"]);
+    converged(&[&a_group, &b_group]).await;
+
+    let mut peers = PeerWrites::new(b_group, b_id, decode);
+    let (frontier, view) = Frontier::new();
+
+    // First life: explicit epoch 1, three writes, all applied on B.
+    let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
+        key.clone().into_bytes()
+    })
+    .with_epoch(1);
+    let mut old_life_last = WriteToken { epoch: 0, seq: 0 };
+    for key in ["w1", "w2", "w3"] {
+        old_life_last = feed.publish(&key.to_owned()).await;
+    }
+    for _ in 0..3 {
+        match next_event(&mut peers).await {
+            PeerWrite::Wrote { peer, token, .. } => frontier.advance(&peer, token),
+            PeerWrite::Gap { .. } => panic!("no gap in the first life"),
+        }
+    }
+    assert!(view.reached(&a_id, old_life_last).await);
+
+    // Restart: tear the writer down completely, then boot a fresh node
+    // under the same id (fresh engine, fresh ring — the amnesia case).
+    drop(feed);
+    drop(a_group);
+    drop(a_node);
+    let (_a2_id, _a2_node, a2_group) = spawn_node(&net, "rs-a", &["rs-b"]);
+    let feed2 =
+        WriteFeed::new(a2_group, cap(8), |key: &String| key.clone().into_bytes()).with_epoch(2);
+    let new_token = feed2.publish(&"n1".to_owned()).await;
+    assert_eq!(new_token, WriteToken { epoch: 2, seq: 1 });
+
+    // B first sees the epoch change as a gap covering the whole old life…
+    match next_event(&mut peers).await {
+        PeerWrite::Gap {
+            peer,
+            missed_through,
+        } => {
+            assert_eq!(peer, a_id);
+            assert_eq!(missed_through, WriteToken { epoch: 2, seq: 0 });
+            assert!(
+                missed_through > old_life_last,
+                "epoch-major ordering: the gap covers every old-life token"
+            );
+            // …and until the gap is remediated, the new-life barrier must
+            // NOT pass (the old watermark may not satisfy a new epoch).
+            let premature =
+                tokio::time::timeout(Duration::from_millis(100), view.reached(&a_id, new_token))
+                    .await;
+            assert!(
+                premature.is_err(),
+                "a new-life token must not be satisfied by an old-life watermark"
+            );
+            frontier.advance(&peer, missed_through);
+        }
+        PeerWrite::Wrote { .. } => panic!("the epoch change must surface before new writes"),
+    }
+    // Old-life tokens stay satisfied: the remediation covered that life.
+    assert!(view.reached(&a_id, old_life_last).await);
+
+    // …then the new life's write arrives and barriers normally.
+    match next_event(&mut peers).await {
+        PeerWrite::Wrote { peer, token, key } => {
+            assert_eq!(token, new_token);
+            assert_eq!(key, "n1");
+            frontier.advance(&peer, token);
+        }
+        PeerWrite::Gap { .. } => panic!("only one gap expected"),
+    }
+    assert!(view.reached(&a_id, new_token).await);
+}
+
+/// Two subsystems sharing one group keep their feeds apart by name — no
+/// cross-talk in either direction.
+#[tokio::test]
+async fn named_feeds_do_not_cross_talk() {
+    let net = Network::new();
+    let (_a_id, _a_node, a_group) = spawn_node(&net, "nm-a", &["nm-b"]);
+    let (b_id, _b_node, b_group) = spawn_node(&net, "nm-b", &["nm-a"]);
+    converged(&[&a_group, &b_group]).await;
+
+    let docs_feed = WriteFeed::named("docs", a_group.clone(), cap(8), |key: &String| {
+        key.clone().into_bytes()
+    });
+    let index_feed = WriteFeed::named("index", a_group, cap(8), |key: &String| {
+        key.clone().into_bytes()
+    });
+    let mut docs = PeerWrites::named("docs", b_group.clone(), b_id.clone(), decode);
+    let mut index = PeerWrites::named("index", b_group, b_id, decode);
+
+    docs_feed.publish(&"d1".to_owned()).await;
+    index_feed.publish(&"i1".to_owned()).await;
+
+    match next_event(&mut docs).await {
+        PeerWrite::Wrote { key, .. } => assert_eq!(key, "d1"),
+        PeerWrite::Gap { .. } => panic!("no gap expected"),
+    }
+    match next_event(&mut index).await {
+        PeerWrite::Wrote { key, .. } => assert_eq!(key, "i1"),
+        PeerWrite::Gap { .. } => panic!("no gap expected"),
+    }
+    // And nothing further on either: one write each, no cross-talk.
+    let quiet = tokio::time::timeout(Duration::from_millis(200), docs.next()).await;
+    assert!(quiet.is_err(), "docs feed must not see index writes");
+    let quiet = tokio::time::timeout(Duration::from_millis(200), index.next()).await;
+    assert!(quiet.is_err(), "index feed must not see docs writes");
 }
