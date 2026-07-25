@@ -160,5 +160,5 @@ mod wire;
 
 pub use feed::WriteFeed;
 pub use frontier::{Frontier, FrontierView};
-pub use peers::{PeerWrite, PeerWrites};
+pub use peers::{PeerWrite, PeerWrites, advertised_head, advertised_head_named};
 pub use token::WriteToken;

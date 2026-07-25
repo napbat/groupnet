@@ -10,7 +10,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken};
+use groupnet_consistency::{
+    Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
+};
 use groupnet_core::NodeId;
 use groupnet_runtime::{Group, Node};
 use groupnet_transport_mem::{MemTransport, Network};
@@ -157,6 +159,39 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
         }
     );
     assert_eq!(peers.gaps_seen(), 1);
+}
+
+/// The advertised head tracks the writer's latest publish (as gossip shows
+/// it), and is absent before any publish or for unknown peers.
+#[tokio::test]
+async fn advertised_head_tracks_the_feed() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_node(&net, "hd-a", &["hd-b"]);
+    let (b_id, _b_node, b_group) = spawn_node(&net, "hd-b", &["hd-a"]);
+    converged(&[&a_group, &b_group]).await;
+
+    assert_eq!(advertised_head(&b_group, &a_id), None, "no feed yet");
+    assert_eq!(
+        advertised_head(&b_group, &b_id),
+        None,
+        "unknown/no self feed"
+    );
+
+    let feed =
+        WriteFeed::new(a_group, cap(8), |key: &String| key.clone().into_bytes()).with_epoch(9);
+    feed.publish(&"w1".to_owned()).await;
+    let last = feed.publish(&"w2".to_owned()).await;
+
+    for _ in 0..300 {
+        if advertised_head(&b_group, &a_id) == Some(last) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "head never reached B's view: {:?}",
+        advertised_head(&b_group, &a_id)
+    );
 }
 
 #[tokio::test]

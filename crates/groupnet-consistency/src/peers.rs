@@ -13,6 +13,32 @@ use crate::wire::{Frame, entry_key};
 
 type DecodeFn<K> = dyn Fn(&[u8]) -> Option<K> + Send + Sync;
 
+/// The head [`WriteToken`] `peer`'s default feed currently advertises in
+/// `group` — its most recently published write, as gossip shows it right
+/// now — or `None` when the peer has no decodable feed (or none yet).
+///
+/// This is what a freshness barrier compares a [`Frontier`](crate::Frontier)
+/// against: once `reached(peer, head)` holds for the head observed at some
+/// instant, every write the peer had advertised as of that instant has been
+/// applied locally. The head itself is only as fresh as propagation, so the
+/// barrier bounds staleness at roughly one push/gossip hop — a session
+/// guarantee, not a global order.
+#[must_use]
+pub fn advertised_head(group: &Group, peer: &NodeId) -> Option<WriteToken> {
+    advertised_head_named("", group, peer)
+}
+
+/// [`advertised_head`] for a named feed (see [`WriteFeed::named`](crate::WriteFeed::named)).
+#[must_use]
+pub fn advertised_head_named(name: &str, group: &Group, peer: &NodeId) -> Option<WriteToken> {
+    let frame = Frame::decode(&group.node_entry(peer, &entry_key(name))?)?;
+    let head = frame.end().checked_sub(1)?;
+    (head >= frame.first_seq).then_some(WriteToken {
+        epoch: frame.epoch,
+        seq: head,
+    })
+}
+
 /// One peer-write notification from [`PeerWrites::next`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerWrite<K> {
