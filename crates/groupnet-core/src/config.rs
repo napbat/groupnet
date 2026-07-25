@@ -42,6 +42,14 @@ pub struct Config {
     /// is 2. Fanout rotates round-robin so every peer is covered over successive
     /// rounds.
     pub anti_entropy_fanout: usize,
+    /// Push a just-authored entry (or tombstone) straight to the current
+    /// fanout targets as an unsolicited `Delta` frame, skipping both the tick
+    /// wait and the digest/request round-trip — a local write reaches live
+    /// peers at network latency. The nudged anti-entropy round remains the
+    /// repair path for everyone else and for dropped frames. Costs one small
+    /// frame per write per fanout target; disable for write-storms where
+    /// batching into the next digest round is preferable.
+    pub eager_push: bool,
     /// Soft cap on the encoded byte size of any single emitted frame (digest,
     /// delta, or request). Deltas that would exceed it are split across
     /// successive rounds; the only frame permitted to exceed it is one carrying a
@@ -62,6 +70,7 @@ impl Default for Config {
             fanout: 3,
             anti_entropy_interval_ms: 200,
             anti_entropy_fanout: 2,
+            eager_push: true,
             max_delta_frame_bytes: 60_000,
         }
     }

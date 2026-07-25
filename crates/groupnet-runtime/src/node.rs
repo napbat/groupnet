@@ -218,6 +218,14 @@ impl<T: Transport> NodeBuilder<T> {
         self
     }
 
+    /// Enables or disables eager delta push (default: enabled) — see
+    /// [`groupnet_core::Config::eager_push`].
+    #[must_use]
+    pub fn eager_push(mut self, enabled: bool) -> Self {
+        self.config.eager_push = enabled;
+        self
+    }
+
     /// Overrides the gossip interval (milliseconds). Lower is faster to
     /// converge but chattier. Since G3 the round runs digest/delta anti-entropy,
     /// so this also sets the anti-entropy cadence in step (override it separately
