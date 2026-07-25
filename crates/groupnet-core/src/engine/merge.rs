@@ -145,8 +145,20 @@ impl GroupEngine {
                 // authored keys keep our value and out-version the echo.
                 for entry in delta.entries {
                     let ours = self.members[&self.local].entries.get(&entry.key);
-                    if ours.is_some_and(|e| entry.version <= e.version) {
-                        continue; // echo of something we already hold — ignore
+                    // Ignore echoes we already dominate: any LOWER version, or
+                    // an equal version carrying our exact value. An equal
+                    // version with a DIFFERENT value is the restart hazard —
+                    // both lives wrote the key at the same clock (e.g. `~addr`
+                    // at v1 before and after a reboot), receivers tiebreak
+                    // arbitrarily, and without an out-version the cluster can
+                    // wedge on the dead value. Fall through and bump.
+                    if ours.is_some_and(|e| {
+                        entry.version < e.version
+                            || (entry.version == e.version
+                                && entry.value == e.value
+                                && entry.tombstone == e.tombstone)
+                    }) {
+                        continue;
                     }
                     let m = self.members.get_mut(&self.local).expect("self present");
                     if self.authored.contains(&entry.key) {

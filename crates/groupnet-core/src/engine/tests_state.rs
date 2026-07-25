@@ -453,6 +453,48 @@ fn delete_offers_a_tombstone_in_a_delta_then_reaps_it_without_resurrection() {
     );
 }
 
+/// The equal-version restart hazard: both lives author a key at version 1
+/// with different values (a reboot reusing its version clock, e.g. `~addr`).
+/// The new life must OUT-VERSION the echoed old value — never ignore it —
+/// or receivers tiebreak arbitrarily and can wedge on the dead value.
+#[test]
+fn restart_out_versions_an_equal_version_echo_with_a_different_value() {
+    let mut a = engine("a", &["b"]);
+    let _ = a.start(Time(0));
+    // This boot authors ~addr at version 1 (fresh clock).
+    let _ = a.apply(Command::SetLocalEntry {
+        key: "~addr".into(),
+        value: b"10.0.0.9:7946".to_vec(),
+        ttl_ms: None,
+    });
+
+    // A peer echoes the PREVIOUS life's ~addr — same version, dead value.
+    let echo = delta_frame(vec![member_delta(
+        "a",
+        vec![entry("~addr", 1, 0, false, b"10.0.0.4:7946")],
+    )]);
+    let _ = a.on_message(NodeId::new("b"), &echo, Time(10));
+
+    let value = a
+        .node_entry(&NodeId::new("a"), "~addr")
+        .expect("entry present");
+    assert_eq!(value, b"10.0.0.9:7946", "our value survives the echo");
+    // The real assertion: the digest-visible version must now EXCEED the
+    // echo, so every receiver's LWW converges on this life's value.
+    let effects = a.on_tick(Time(200));
+    let digest = decode_one_digest(&effects);
+    let summary = digest
+        .digest
+        .iter()
+        .find(|d| d.node == NodeId::new("a"))
+        .expect("self summary");
+    assert!(
+        summary.max_version >= 2,
+        "authored key must be out-versioned past the equal-version echo (got {})",
+        summary.max_version
+    );
+}
+
 #[test]
 fn restart_adopts_echoed_entries_for_unauthored_keys() {
     // Fresh engine (a restart): a peer echoes entries we authored last boot.
