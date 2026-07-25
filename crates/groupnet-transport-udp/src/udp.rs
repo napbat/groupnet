@@ -15,6 +15,37 @@ use tokio::net::{ToSocketAddrs, UdpSocket};
 /// truncation.
 const MAX_DATAGRAM: usize = 65_535;
 
+/// Longest accepted sender id in a datagram's self-attribution prefix.
+const MAX_ID_LEN: usize = 1024;
+
+/// Every datagram carries `[u32 sender-id length][sender id][frame]`, so a
+/// receiver can attribute — and learn the address of — a peer it has never
+/// been told about. Without it, UDP attribution is address-only: a restarted
+/// peer at a new address can dial out but nobody will accept its datagrams,
+/// and the cluster wedges into one-way visibility.
+///
+/// The claimed id is trusted exactly as much as a source address was: this
+/// is a cluster-internal fabric behind its own network boundary.
+fn frame(local: &NodeId, msg: &[u8]) -> Vec<u8> {
+    let id = local.as_str().as_bytes();
+    let mut out = Vec::with_capacity(4 + id.len() + msg.len());
+    out.extend_from_slice(&u32::try_from(id.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(id);
+    out.extend_from_slice(msg);
+    out
+}
+
+/// Splits a datagram into `(sender, frame)`, or `None` when the prefix is
+/// absent/garbled (a pre-prefix peer, or noise).
+fn unframe(datagram: &[u8]) -> Option<(NodeId, &[u8])> {
+    let len = usize::try_from(u32::from_le_bytes(datagram.get(0..4)?.try_into().ok()?)).ok()?;
+    if len > MAX_ID_LEN {
+        return None;
+    }
+    let id = std::str::from_utf8(datagram.get(4..4 + len)?).ok()?;
+    Some((NodeId::new(id), datagram.get(4 + len..)?))
+}
+
 /// Shared endpoint state behind a single [`Arc`], so every clone of a
 /// [`UdpTransport`] observes and performs registrations against the SAME
 /// address book. This is what lets one handle be consumed by the node builder
@@ -118,7 +149,10 @@ impl Transport for UdpTransport {
             .copied();
         if let Some(addr) = addr {
             // Best-effort: a send error is a drop, which the protocol tolerates.
-            let _ = self.socket.send_to(msg, addr).await;
+            let _ = self
+                .socket
+                .send_to(&frame(&self.inner.local, msg), addr)
+                .await;
         }
         Ok(())
     }
@@ -127,6 +161,26 @@ impl Transport for UdpTransport {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             let (n, addr) = self.socket.recv_from(&mut buf).await?;
+            if let Some((from, msg)) = unframe(&buf[..n]) {
+                // Self-attributed: learn where this peer speaks from, so the
+                // reverse path works even for a peer nothing told us about
+                // (a restart at a fresh address). Only touch the book when
+                // the binding actually changed.
+                let known = self
+                    .inner
+                    .peers
+                    .read()
+                    .expect("peers lock poisoned")
+                    .get(&from)
+                    .copied();
+                if known != Some(addr) {
+                    self.register_peer(from.clone(), addr);
+                }
+                let msg = msg.to_vec();
+                return Ok(Inbound { from, msg });
+            }
+            // No usable prefix: fall back to address attribution, so a peer
+            // still running a pre-prefix build is understood during a roll.
             let from = self
                 .inner
                 .by_addr
@@ -135,10 +189,10 @@ impl Transport for UdpTransport {
                 .get(&addr)
                 .cloned();
             if let Some(from) = from {
-                buf.truncate(n);
-                return Ok(Inbound { from, msg: buf });
+                let msg = buf[..n].to_vec();
+                return Ok(Inbound { from, msg });
             }
-            // Datagram from an unregistered address — ignore and keep receiving.
+            // Unattributable datagram — ignore and keep receiving.
         }
     }
 }
@@ -185,6 +239,68 @@ mod tests {
             .expect("recv");
         assert_eq!(inbound.from, sender_id);
         assert_eq!(inbound.msg, b"hello".to_vec());
+    }
+
+    /// The wedge this prefix exists to prevent: a receiver that has NEVER
+    /// been told about a sender still attributes its datagram, learns its
+    /// address, and can reply — no prior registration in that direction.
+    #[tokio::test]
+    async fn unknown_sender_is_attributed_and_learned() {
+        let sender = bind_as("attr-sender").await;
+        let receiver = bind_as("attr-receiver").await;
+        let sender_id = NodeId::new("attr-sender");
+        let receiver_id = NodeId::new("attr-receiver");
+
+        // ONLY the sender knows where to dial; the receiver's book is empty.
+        sender.register_peer(receiver_id.clone(), receiver.local_addr().expect("addr"));
+        sender.send(&receiver_id, b"hello").await.expect("send");
+
+        let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
+        assert_eq!(inbound.from, sender_id, "attributed by the datagram itself");
+        assert_eq!(
+            inbound.msg,
+            b"hello".to_vec(),
+            "payload excludes the prefix"
+        );
+
+        // The reverse path now works without anyone registering it.
+        receiver.send(&sender_id, b"reply").await.expect("send");
+        let back = tokio::time::timeout(Duration::from_secs(2), sender.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
+        assert_eq!(back.from, receiver_id);
+        assert_eq!(back.msg, b"reply".to_vec());
+    }
+
+    /// A moved peer (restart at a fresh address) re-teaches the book on its
+    /// first datagram, and the stale reverse entry does not linger.
+    #[tokio::test]
+    async fn a_moved_sender_rebinds_the_book() {
+        let receiver = bind_as("move-receiver").await;
+        let sender_id = NodeId::new("move-sender");
+        let receiver_id = NodeId::new("move-receiver");
+
+        // The receiver holds a STALE address for the sender.
+        receiver.register_peer(sender_id.clone(), "127.0.0.1:9".parse().expect("addr"));
+
+        let sender = bind_as("move-sender").await;
+        sender.register_peer(receiver_id.clone(), receiver.local_addr().expect("addr"));
+        sender.send(&receiver_id, b"i moved").await.expect("send");
+
+        let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
+        assert_eq!(inbound.from, sender_id);
+        assert_eq!(
+            receiver.inner.peers.read().expect("peers").get(&sender_id),
+            Some(&sender.local_addr().expect("addr")),
+            "the book rebound to the sender's live address"
+        );
     }
 
     /// A gossiped advertisement teaches the book exactly like registration —
