@@ -18,6 +18,21 @@ const MAX_DATAGRAM: usize = 65_535;
 /// Longest accepted sender id in a datagram's self-attribution prefix.
 const MAX_ID_LEN: usize = 1024;
 
+/// Whether a receive error is a transient ICMP response rather than a socket
+/// failure.
+///
+/// Windows reports an ICMP "port unreachable" from an earlier `send_to` as
+/// `WSAECONNRESET` on the next `recv_from` of the same unconnected UDP socket.
+/// Some other platforms surface the equivalent as `ConnectionRefused`. A seed
+/// that has not bound its port yet is normal during rolling or ordered startup,
+/// so neither error may permanently stop the transport's receive loop.
+fn retryable_recv_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+    )
+}
+
 /// Every datagram carries `[u32 sender-id length][sender id][frame]`, so a
 /// receiver can attribute — and learn the address of — a peer it has never
 /// been told about. Without it, UDP attribution is address-only: a restarted
@@ -160,7 +175,11 @@ impl Transport for UdpTransport {
     async fn recv(&self) -> io::Result<Inbound> {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
-            let (n, addr) = self.socket.recv_from(&mut buf).await?;
+            let (n, addr) = match self.socket.recv_from(&mut buf).await {
+                Ok(received) => received,
+                Err(error) if retryable_recv_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
             if let Some((from, msg)) = unframe(&buf[..n]) {
                 // Self-attributed: learn where this peer speaks from, so the
                 // reverse path works even for a peer nothing told us about
@@ -205,13 +224,74 @@ mod tests {
     use groupnet_core::NodeId;
     use groupnet_transport::Transport;
 
-    use super::UdpTransport;
+    use super::{UdpTransport, retryable_recv_error};
 
     /// Bind a loopback endpoint on an ephemeral port under the given id.
     async fn bind_as(id: &str) -> UdpTransport {
         UdpTransport::bind(NodeId::new(id), "127.0.0.1:0")
             .await
             .expect("bind")
+    }
+
+    #[test]
+    fn only_transient_icmp_receive_errors_are_retryable() {
+        assert!(retryable_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
+        assert!(retryable_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(!retryable_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!retryable_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::AddrNotAvailable
+        )));
+    }
+
+    /// An ordered-startup seed can be absent for the first probe. On Windows
+    /// that failed send produces `WSAECONNRESET` on `recv_from`; the receiver
+    /// must stay alive and accept the peer once it binds.
+    #[tokio::test]
+    async fn receiver_survives_a_peer_that_binds_after_the_first_probe() {
+        let receiver_id = NodeId::new("receiver");
+        let sender_id = NodeId::new("delayed-sender");
+        let receiver = bind_as(receiver_id.as_str()).await;
+
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve port");
+        let delayed_addr = reservation.local_addr().expect("reserved address");
+        drop(reservation);
+        receiver.register_peer(sender_id.clone(), delayed_addr);
+
+        let recv = tokio::spawn({
+            let receiver = receiver.clone();
+            async move { receiver.recv().await }
+        });
+        receiver
+            .send(&sender_id, b"probe before bind")
+            .await
+            .expect("initial probe");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let sender = UdpTransport::bind(sender_id.clone(), delayed_addr)
+            .await
+            .expect("bind delayed sender");
+        sender.register_peer(
+            receiver_id.clone(),
+            receiver.local_addr().expect("receiver address"),
+        );
+        sender
+            .send(&receiver_id, b"peer is now live")
+            .await
+            .expect("send after bind");
+
+        let inbound = tokio::time::timeout(Duration::from_secs(2), recv)
+            .await
+            .expect("receiver timed out")
+            .expect("receive task panicked")
+            .expect("receiver stopped after transient ICMP error");
+        assert_eq!(inbound.from, sender_id);
+        assert_eq!(inbound.msg, b"peer is now live");
     }
 
     /// A clone shares the address book: a peer registered through the clone is
