@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,7 +73,10 @@ async fn main() {
 
     // The apply loop is the application's, not the library's — which is exactly
     // why the frontier advances only once the local state really is coherent.
+    // The flag lets the closing narrative report what this run actually saw.
+    let gap_seen = Arc::new(AtomicBool::new(false));
     let applied = Arc::clone(&cache);
+    let saw = Arc::clone(&gap_seen);
     tokio::spawn(async move {
         while let Some(event) = peers.next().await {
             match event {
@@ -88,6 +92,7 @@ async fn main() {
                 } => {
                     // Coarse remediation: we cannot know *which* keys were
                     // missed, so nothing cached may be trusted.
+                    saw.store(true, Ordering::Relaxed);
                     tokio::time::sleep(APPLY_COST).await;
                     applied.lock().expect("lock").clear();
                     println!(
@@ -151,10 +156,17 @@ async fn main() {
         "  [read ] after reached(..) = {reached}: user:9 -> {}",
         read(&cache, "user:9")
     );
-    println!(
-        "  two of those writes fell off the ring — the reader was told, flushed, and its\n  \
-         barrier still means what it says. Silence was never an option."
-    );
+    if gap_seen.load(Ordering::Relaxed) {
+        println!(
+            "  writes fell off the ring — the reader was told, flushed, and its\n  \
+             barrier still means what it says. Silence was never an option."
+        );
+    } else {
+        println!(
+            "  the reader kept pace this run, so nothing fell off the ring — when it\n  \
+             cannot, the loss arrives as an explicit gap, never silence."
+        );
+    }
 }
 
 /// Brings up one node on `net` seeded with `seed`, joined to [`GROUP`]. The

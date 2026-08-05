@@ -59,8 +59,14 @@ pub async fn eventually_within(what: &str, timeout: Duration, mut cond: impl FnM
 /// Waits until every group in `groups` sees the whole cluster — i.e. each
 /// group's member count equals `groups.len()`. Panics on timeout.
 pub async fn converged(groups: &[&Group]) {
+    converged_within(groups, DEFAULT_TIMEOUT).await;
+}
+
+/// [`converged`] with an explicit budget, for sites that want a convergence
+/// regression reported faster than [`DEFAULT_TIMEOUT`].
+pub async fn converged_within(groups: &[&Group], timeout: Duration) {
     let size = groups.len();
-    eventually("membership convergence", || {
+    eventually_within("membership convergence", timeout, || {
         groups.iter().all(|g| g.members().len() == size)
     })
     .await;
@@ -136,15 +142,29 @@ pub fn spawn_mem_node(
     (me, node, group)
 }
 
-/// The one place a `Node` is actually built, so every fixture applies the same
-/// knobs in the same order (`anti_entropy_interval_ms` must land *after*
-/// `gossip_interval_ms`, which sets both cadences).
+/// Spawns the node and joins its group in one motion — the shape
+/// [`spawn_mem_node`] needs for a node added to (or restarted on) a cluster
+/// that is already running.
 fn spawn_one(
     net: &Network,
     id: NodeId,
     seeds: Vec<NodeId>,
     opts: &NodeOpts,
 ) -> (Node<MemTransport>, Group) {
+    let node = build_node(net, id, seeds, opts);
+    let group = node.join_group(opts.group.clone());
+    (node, group)
+}
+
+/// The one place a `Node` is actually built, so every fixture applies the same
+/// knobs in the same order (`anti_entropy_interval_ms` must land *after*
+/// `gossip_interval_ms`, which sets both cadences).
+fn build_node(
+    net: &Network,
+    id: NodeId,
+    seeds: Vec<NodeId>,
+    opts: &NodeOpts,
+) -> Node<MemTransport> {
     let mut builder = Node::builder(id.clone(), net.endpoint(id));
     for seed in seeds {
         builder = builder.seed(seed);
@@ -158,9 +178,7 @@ fn spawn_one(
     if let Some(addr) = &opts.advertise_addr {
         builder = builder.advertise_addr(addr.clone());
     }
-    let node = builder.spawn();
-    let group = node.join_group(opts.group.clone());
-    (node, group)
+    builder.spawn()
 }
 
 /// A running all-to-all cluster on one in-memory [`Network`]: every node is
@@ -257,16 +275,20 @@ impl MemClusterBuilder {
     #[must_use]
     pub fn spawn(self) -> MemCluster {
         let net = Network::new();
+        // Every node exists before any joins its group — the bring-up order
+        // of the tests this harness consolidated, so no engine starts
+        // gossiping toward a peer that has not bound its endpoint yet.
         let mut nodes = Vec::with_capacity(self.ids.len());
-        let mut groups = Vec::with_capacity(self.ids.len());
         for id in &self.ids {
             let seeds = self.ids.iter().filter(|o| *o != id).cloned().collect();
             let mut opts = self.opts.clone();
             opts.advertise_addr = self.advertise.as_ref().and_then(|f| f(id));
-            let (node, group) = spawn_one(&net, id.clone(), seeds, &opts);
-            nodes.push(node);
-            groups.push(group);
+            nodes.push(build_node(&net, id.clone(), seeds, &opts));
         }
+        let groups = nodes
+            .iter()
+            .map(|node| node.join_group(self.opts.group.clone()))
+            .collect();
         MemCluster {
             net,
             ids: self.ids,

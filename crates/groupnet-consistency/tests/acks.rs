@@ -9,8 +9,12 @@ use std::time::Duration;
 use groupnet_consistency::{
     AckLedger, PeerWrite, PeerWrites, WriteFeed, WriteToken, applied_by, applied_cluster_wide,
 };
-use groupnet_testkit::cluster::{NodeOpts, converged, spawn_mem_node};
+use groupnet_testkit::cluster::{NodeOpts, converged_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
+
+/// The convergence budget this test carried before the shared harness: a
+/// genuine regression reports in 3 s, not the harness default.
+const SETTLE: Duration = Duration::from_secs(3);
 
 const fn cap(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("nonzero")
@@ -36,7 +40,7 @@ async fn applied_acknowledgements_round_trip() {
     let net = Network::new();
     let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ack-a", &["ack-b"], &opts());
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ack-b", &["ack-a"], &opts());
-    converged(&[&a_group, &b_group]).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
 
     // B: apply loop that records into a ledger after each application.
     let mut peers = PeerWrites::new(b_group.clone(), b_id.clone(), decode);

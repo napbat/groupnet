@@ -13,10 +13,14 @@ use std::time::Duration;
 use groupnet_consistency::{
     Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
 };
-use groupnet_testkit::cluster::{NodeOpts, converged, spawn_mem_node};
+use groupnet_testkit::cluster::{NodeOpts, converged_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
 
 const GROUP: &str = "stores";
+
+/// The convergence budget these tests carried before the shared harness: a
+/// genuine regression reports in 3 s, not the harness default.
+const SETTLE: Duration = Duration::from_secs(3);
 
 const fn cap(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("nonzero")
@@ -46,7 +50,7 @@ async fn peer_writes_arrive_in_order_and_apply_locally() {
     let net = Network::new();
     let (a_id, _a_node, a_group) = spawn_mem_node(&net, "node-a", &["node-b"], &opts());
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "node-b", &["node-a"], &opts());
-    converged(&[&a_group, &b_group]).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
 
     // Node B: local state holding a soon-stale copy, and a subscription.
     let fresh: Arc<Mutex<HashSet<String>>> = Arc::default();
@@ -97,7 +101,7 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
     let net = Network::new();
     let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ov-a", &["ov-b"], &opts());
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ov-b", &["ov-a"], &opts());
-    converged(&[&a_group, &b_group]).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let mut peers = PeerWrites::new(b_group, b_id, decode);
     // A tiny ring: two slots.
@@ -152,7 +156,7 @@ async fn advertised_head_tracks_the_feed() {
     let net = Network::new();
     let (a_id, _a_node, a_group) = spawn_mem_node(&net, "hd-a", &["hd-b"], &opts());
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "hd-b", &["hd-a"], &opts());
-    converged(&[&a_group, &b_group]).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
 
     assert_eq!(advertised_head(&b_group, &a_id), None, "no feed yet");
     assert_eq!(
@@ -201,7 +205,7 @@ async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
     let net = Network::new();
     let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ryw-a", &["ryw-b"], &opts());
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ryw-b", &["ryw-a"], &opts());
-    converged(&[&a_group, &b_group]).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
 
     // Node B: stale local state, an apply loop, and a frontier.
     let fresh: Arc<Mutex<HashSet<String>>> = Arc::default();
@@ -254,7 +258,7 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
     let net = Network::new();
     let (a_id, a_node, a_group) = spawn_mem_node(&net, "rs-a", &["rs-b"], &opts());
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "rs-b", &["rs-a"], &opts());
-    converged(&[&a_group, &b_group]).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let mut peers = PeerWrites::new(b_group, b_id, decode);
     let (frontier, view) = Frontier::new();
@@ -334,7 +338,7 @@ async fn named_feeds_do_not_cross_talk() {
     let net = Network::new();
     let (_a_id, _a_node, a_group) = spawn_mem_node(&net, "nm-a", &["nm-b"], &opts());
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "nm-b", &["nm-a"], &opts());
-    converged(&[&a_group, &b_group]).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let docs_feed = WriteFeed::named("docs", a_group.clone(), cap(8), |key: &String| {
         key.clone().into_bytes()

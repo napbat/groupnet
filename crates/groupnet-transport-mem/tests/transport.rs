@@ -3,14 +3,9 @@
 //! delivery, best-effort sends that never error, and one routing table shared
 //! across every [`Network`] clone.
 
-use std::time::Duration;
-
 use groupnet_core::NodeId;
 use groupnet_transport::Transport;
 use groupnet_transport_mem::Network;
-
-/// How long a "nothing arrives" assertion waits before calling an inbox empty.
-const QUIET: Duration = Duration::from_millis(50);
 
 /// A frame reaches the addressed endpoint carrying the *sender's* id — the
 /// attribution every layer above (gossip, membership) is keyed on.
@@ -36,6 +31,10 @@ async fn round_trip_attributes_the_sender() {
 /// Sending to an id nobody registered is a **silent drop**: `Ok(())`, nothing
 /// misrouted, and the endpoint keeps working afterwards. That is the
 /// best-effort contract every binding owes the engine.
+///
+/// The negative is proven by ordering, not by waiting: delivery is FIFO per
+/// sender, so had the unroutable frame been misdelivered to `b`, it would have
+/// to arrive ahead of the probe sent after it.
 #[tokio::test]
 async fn unknown_peer_is_a_silent_drop() {
     let net = Network::new();
@@ -46,13 +45,14 @@ async fn unknown_peer_is_a_silent_drop() {
         .await
         .expect("an unroutable send reports success, not an error");
 
-    assert!(
-        tokio::time::timeout(QUIET, b.recv()).await.is_err(),
-        "the unroutable frame was not delivered to some other endpoint"
+    a.send(&NodeId::new("drop-b"), b"probe")
+        .await
+        .expect("send");
+    assert_eq!(
+        b.recv().await.expect("recv").msg,
+        b"probe".to_vec(),
+        "the unroutable frame was dropped, not delivered ahead of the probe"
     );
-
-    a.send(&NodeId::new("drop-b"), b"live").await.expect("send");
-    assert_eq!(b.recv().await.expect("recv").msg, b"live".to_vec());
 }
 
 /// A registered peer whose endpoint has been dropped is likewise a drop, not

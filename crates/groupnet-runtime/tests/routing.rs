@@ -1,8 +1,14 @@
 //! Integration test for the inter-group routing table: from any node, resolve a
 //! resource to the coordinator of the group that owns it.
 
+use std::time::Duration;
+
 use groupnet_core::GroupId;
-use groupnet_testkit::cluster::{MemCluster, eventually};
+use groupnet_testkit::cluster::{MemCluster, eventually_within};
+
+/// The poll budget these assertions carried before the shared harness: a
+/// genuine regression reports in 4 s, not the harness default.
+const SETTLE: Duration = Duration::from_secs(4);
 
 #[tokio::test]
 async fn resolves_resource_to_owning_groups_coordinator() {
@@ -16,7 +22,7 @@ async fn resolves_resource_to_owning_groups_coordinator() {
     let nodes = &cluster.nodes;
 
     // Wait for shard-1 to converge on a coordinator.
-    eventually("shard-1 to converge on a coordinator", || {
+    eventually_within("shard-1 to converge on a coordinator", SETTLE, || {
         let c = groups[0].coordinator();
         c.is_some() && groups.iter().all(|g| g.coordinator() == c)
     })
@@ -27,7 +33,7 @@ async fn resolves_resource_to_owning_groups_coordinator() {
     nodes[0].routing().claim("users", &shard1);
 
     // From *every* node, routing must resolve "users" to shard-1's coordinator.
-    eventually("routing to converge cluster-wide", || {
+    eventually_within("routing to converge cluster-wide", SETTLE, || {
         nodes.iter().all(|n| {
             let r = n.routing();
             r.owner("users") == Some(shard1.clone())

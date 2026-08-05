@@ -2,7 +2,14 @@
 //! actors — three nodes must converge on one coordinator over the in-memory
 //! transport.
 
-use groupnet_testkit::cluster::{MemCluster, eventually};
+use std::time::Duration;
+
+use groupnet_testkit::cluster::{MemCluster, eventually_within};
+
+/// The poll budget these assertions carried before the shared harness (2–3 s,
+/// rounded up to the wider): a genuine regression reports in 3 s, not the
+/// harness default.
+const SETTLE: Duration = Duration::from_secs(3);
 
 #[tokio::test]
 async fn three_nodes_converge_over_mem_transport() {
@@ -15,7 +22,7 @@ async fn three_nodes_converge_over_mem_transport() {
     let groups = &cluster.groups;
 
     // Poll for convergence with a bounded timeout — no fixed-sleep race.
-    eventually("nodes to converge on a coordinator", || {
+    eventually_within("nodes to converge on a coordinator", SETTLE, || {
         let coords: Vec<_> = groups.iter().map(|g| g.coordinator()).collect();
         coords.iter().all(Option::is_some) && coords.windows(2).all(|w| w[0] == w[1])
     })
@@ -28,7 +35,7 @@ async fn three_nodes_converge_over_mem_transport() {
     // Write metadata on one node; it must gossip to every node.
     groups[0].sync(|ctx| ctx.update_metadata("routing", "v3"));
 
-    eventually("metadata to propagate to all nodes", || {
+    eventually_within("metadata to propagate to all nodes", SETTLE, || {
         groups
             .iter()
             .all(|g| g.metadata("routing").as_deref() == Some("v3"))
@@ -39,7 +46,7 @@ async fn three_nodes_converge_over_mem_transport() {
     for (i, g) in groups.iter().enumerate() {
         g.set_state(format!("weight={i}"));
     }
-    eventually("per-node state to converge", || {
+    eventually_within("per-node state to converge", SETTLE, || {
         groups.iter().all(|g| {
             ids.iter().enumerate().all(|(i, id)| {
                 g.node_state(id).as_deref() == Some(format!("weight={i}").as_bytes())
@@ -54,7 +61,7 @@ async fn three_nodes_converge_over_mem_transport() {
     // node-c leaves gracefully; the other two must drop it from their view.
     let leaver = ids[2].clone();
     groups[2].leave();
-    eventually("the graceful leave to propagate", || {
+    eventually_within("the graceful leave to propagate", SETTLE, || {
         groups[..2].iter().all(|g| !g.members().contains(&leaver))
     })
     .await;

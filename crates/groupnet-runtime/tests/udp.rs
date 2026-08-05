@@ -2,10 +2,16 @@
 //! converge on a coordinator through the network stack — exercising the
 //! `groupnet-transport-udp` binding against the transport-agnostic runtime.
 
+use std::time::Duration;
+
 use groupnet_core::NodeId;
 use groupnet_runtime::Node;
-use groupnet_testkit::cluster::eventually;
+use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport_udp::UdpTransport;
+
+/// The poll budget this assertion carried before the shared harness: a
+/// genuine regression reports in 3 s, not the harness default.
+const SETTLE: Duration = Duration::from_secs(3);
 
 #[tokio::test]
 async fn three_nodes_converge_over_udp() {
@@ -49,7 +55,7 @@ async fn three_nodes_converge_over_udp() {
 
     let groups: Vec<_> = nodes.iter().map(|n| n.join_group("shard-42")).collect();
 
-    eventually("nodes to converge over UDP", || {
+    eventually_within("nodes to converge over UDP", SETTLE, || {
         let c = groups[0].coordinator();
         c.is_some()
             && groups
