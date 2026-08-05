@@ -1,14 +1,21 @@
-//! Shared fixtures for the engine test modules.
+//! Shared fixtures for the sans-IO engine tests: build an engine, hand-assemble
+//! wire frames, and read summaries back out of the effects it returns.
+//!
+//! Dependency-free by design — these helpers touch nothing but
+//! [`groupnet_core`], so any crate can use them without dragging an async
+//! runtime into its test graph.
 
-use crate::config::Config;
-use crate::membership::Status;
-use crate::{GroupId, NodeId, wire};
+use groupnet_core::{Config, Effect, GroupEngine, GroupId, NodeId, Status, wire};
 
-use super::{Effect, GroupEngine};
+/// The group every fixture frame and fixture engine belongs to. Tests are
+/// single-group, so one well-known id keeps senders and receivers agreeing.
+pub const TEST_GROUP: &str = "g";
 
-pub(super) fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
+/// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`] at the
+/// default [`Config`].
+pub fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
     GroupEngine::new(
-        GroupId::new("g"),
+        GroupId::new(TEST_GROUP),
         NodeId::new(id),
         seeds.iter().map(|s| NodeId::new(*s)),
         Config::default(),
@@ -16,7 +23,7 @@ pub(super) fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
 }
 
 /// The member summaries listed across all digest frames in `effects`.
-pub(super) fn digest_summaries(effects: &[Effect]) -> Vec<NodeId> {
+pub fn digest_summaries(effects: &[Effect]) -> Vec<NodeId> {
     effects
         .iter()
         .filter_map(|e| match e {
@@ -30,13 +37,10 @@ pub(super) fn digest_summaries(effects: &[Effect]) -> Vec<NodeId> {
 
 /// A digest frame (liveness summaries + metadata) — how liveness and
 /// metadata now disseminate.
-pub(super) fn digest_frame(
-    digest: Vec<wire::NodeDigest>,
-    metadata: Vec<wire::MetaDelta>,
-) -> Vec<u8> {
+pub fn digest_frame(digest: Vec<wire::NodeDigest>, metadata: Vec<wire::MetaDelta>) -> Vec<u8> {
     wire::encode(&wire::Frame {
         kind: wire::Kind::Digest,
-        group: GroupId::new("g"),
+        group: GroupId::new(TEST_GROUP),
         target: None,
         digest,
         wants: Vec::new(),
@@ -46,10 +50,10 @@ pub(super) fn digest_frame(
 }
 
 /// A delta frame (member entries) — how per-node state now disseminates.
-pub(super) fn delta_frame(members: Vec<wire::MemberDelta>) -> Vec<u8> {
+pub fn delta_frame(members: Vec<wire::MemberDelta>) -> Vec<u8> {
     wire::encode(&wire::Frame {
         kind: wire::Kind::Delta,
-        group: GroupId::new("g"),
+        group: GroupId::new(TEST_GROUP),
         target: None,
         digest: Vec::new(),
         wants: Vec::new(),
@@ -58,10 +62,12 @@ pub(super) fn delta_frame(members: Vec<wire::MemberDelta>) -> Vec<u8> {
     })
 }
 
-pub(super) fn probe_frame(kind: wire::Kind, target: Option<NodeId>) -> Vec<u8> {
+/// A bare probe frame of `kind` (`Ping`, `PingReq`, `Ack`, `IndirectAck`),
+/// optionally naming the probe's `target`.
+pub fn probe_frame(kind: wire::Kind, target: Option<NodeId>) -> Vec<u8> {
     wire::encode(&wire::Frame {
         kind,
-        group: GroupId::new("g"),
+        group: GroupId::new(TEST_GROUP),
         target,
         digest: Vec::new(),
         wants: Vec::new(),
@@ -70,7 +76,8 @@ pub(super) fn probe_frame(kind: wire::Kind, target: Option<NodeId>) -> Vec<u8> {
     })
 }
 
-pub(super) fn ndigest(node: &str, inc: u64, status: Status, max_version: u64) -> wire::NodeDigest {
+/// One liveness-only digest summary for `node`.
+pub fn ndigest(node: &str, inc: u64, status: Status, max_version: u64) -> wire::NodeDigest {
     wire::NodeDigest {
         node: NodeId::new(node),
         incarnation: inc,
@@ -82,7 +89,8 @@ pub(super) fn ndigest(node: &str, inc: u64, status: Status, max_version: u64) ->
     }
 }
 
-pub(super) fn entry(
+/// One keyed state entry, as it rides a delta frame.
+pub fn entry(
     key: &str,
     version: u64,
     ttl_ms: u64,
@@ -100,7 +108,7 @@ pub(super) fn entry(
 
 /// A member delta carrying `entries` (a well-formed delta sets its
 /// high-water to the max entry version).
-pub(super) fn member_delta(node: &str, entries: Vec<wire::EntryDelta>) -> wire::MemberDelta {
+pub fn member_delta(node: &str, entries: Vec<wire::EntryDelta>) -> wire::MemberDelta {
     let max_version = entries.iter().map(|e| e.version).max().unwrap_or(0);
     wire::MemberDelta {
         node: NodeId::new(node),
@@ -113,7 +121,7 @@ pub(super) fn member_delta(node: &str, entries: Vec<wire::EntryDelta>) -> wire::
 
 /// Decodes the single digest frame a round emits (all chunks in one, at
 /// these small sizes), returning the sender's own summaries and metadata.
-pub(super) fn decode_one_digest(effects: &[Effect]) -> wire::Frame {
+pub fn decode_one_digest(effects: &[Effect]) -> wire::Frame {
     let bytes = effects
         .iter()
         .find_map(|e| match e {

@@ -1,11 +1,7 @@
 //! State dissemination tests: digests, deltas, entries, eager push.
 
-use crate::config::Config;
-use crate::membership::Status;
-use crate::{GroupId, NodeId, Time, wire};
-
-use super::super::{Command, Effect, GroupEngine};
-use super::test_support::*;
+use groupnet_core::{Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, wire};
+use groupnet_testkit::frames::*;
 
 /// Delta digests list only members changed since the last digest built
 /// for the peer; a quiet round emits nothing at all; every Nth digest is

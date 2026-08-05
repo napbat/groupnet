@@ -2,10 +2,9 @@
 //! converge on a coordinator through the network stack — exercising the
 //! `groupnet-transport-udp` binding against the transport-agnostic runtime.
 
-use std::time::Duration;
-
 use groupnet_core::NodeId;
 use groupnet_runtime::Node;
+use groupnet_testkit::cluster::eventually;
 use groupnet_transport_udp::UdpTransport;
 
 #[tokio::test]
@@ -50,20 +49,14 @@ async fn three_nodes_converge_over_udp() {
 
     let groups: Vec<_> = nodes.iter().map(|n| n.join_group("shard-42")).collect();
 
-    let mut converged = false;
-    for _ in 0..150 {
+    eventually("nodes to converge over UDP", || {
         let c = groups[0].coordinator();
-        if c.is_some()
+        c.is_some()
             && groups
                 .iter()
                 .all(|g| g.coordinator() == c && g.members().len() == 3)
-        {
-            converged = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(converged, "nodes did not converge over UDP");
+    })
+    .await;
     assert_eq!(groups.iter().filter(|g| g.is_coordinator()).count(), 1);
 
     drop(nodes);

@@ -4,53 +4,33 @@
 
 use std::time::Duration;
 
-use groupnet_core::NodeId;
-use groupnet_runtime::{GroupEvent, Node};
-use groupnet_transport_mem::Network;
-
-async fn poll<F: Fn() -> bool>(what: &str, f: F) {
-    for _ in 0..250 {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
+use groupnet_runtime::GroupEvent;
+use groupnet_testkit::cluster::{MemCluster, eventually};
 
 #[tokio::test]
 async fn keyed_entries_disseminate_expire_and_delete() {
-    let net = Network::new();
-    let ids: Vec<NodeId> = ["node-a", "node-b"]
-        .iter()
-        .map(|s| NodeId::new(*s))
-        .collect();
-    let mut nodes = Vec::new();
-    for id in &ids {
-        let mut b = Node::builder(id.clone(), net.endpoint(id.clone()))
-            .gossip_interval_ms(20)
-            .advertise_addr(format!(
+    let cluster = MemCluster::builder(&["node-a", "node-b"])
+        .group("g")
+        .gossip_interval_ms(20)
+        .advertise_addr(|id| {
+            Some(format!(
                 "10.0.0.{}",
                 if id.as_str() == "node-a" { 1 } else { 2 }
-            ));
-        for other in &ids {
-            if other != id {
-                b = b.seed(other.clone());
-            }
-        }
-        nodes.push(b.spawn());
-    }
-    let a = nodes[0].join_group("g");
-    let b = nodes[1].join_group("g");
+            ))
+        })
+        .spawn();
+    let ids = &cluster.ids;
+    let a = &cluster.groups[0];
+    let b = &cluster.groups[1];
 
     // Idempotent join: a second join returns a handle to the SAME actor (a
     // write through one is visible through the other).
-    let a2 = nodes[0].join_group("g");
+    let a2 = cluster.nodes[0].join_group("g");
 
     // Cross-node dissemination of independent keys, one with a TTL.
     a.set_entry("ready", b"1", None).unwrap();
     a.set_entry("hot/0", b"page-0", Some(400)).unwrap();
-    poll("b sees a's entries", || {
+    eventually("b sees a's entries", || {
         b.node_entry(&ids[0], "ready").is_some() && b.node_entry(&ids[0], "hot/0").is_some()
     })
     .await;
@@ -58,7 +38,7 @@ async fn keyed_entries_disseminate_expire_and_delete() {
 
     // Delete: tombstone disseminates, key drops everywhere.
     a.delete_entry("ready").unwrap();
-    poll("delete reaches b", || {
+    eventually("delete reaches b", || {
         b.node_entry(&ids[0], "ready").is_none()
     })
     .await;
@@ -69,42 +49,32 @@ async fn keyed_entries_disseminate_expire_and_delete() {
 
     // TTL: once node-a stops refreshing hot/0, it expires on BOTH nodes
     // (locally too — the author's own copy ages out the same way).
-    poll("ttl expiry on b", || {
+    eventually("ttl expiry on b", || {
         b.node_entry(&ids[0], "hot/0").is_none()
     })
     .await;
-    poll("ttl expiry on a", || {
+    eventually("ttl expiry on a", || {
         a.node_entry(&ids[0], "hot/0").is_none()
     })
     .await;
 
     // ~addr dissemination: each node resolves the other from gossip.
-    poll("addr resolution", || {
-        nodes[0].peer_addr(&ids[1]).as_deref() == Some("10.0.0.2")
-            && nodes[1].peer_addr(&ids[0]).as_deref() == Some("10.0.0.1")
+    eventually("addr resolution", || {
+        cluster.nodes[0].peer_addr(&ids[1]).as_deref() == Some("10.0.0.2")
+            && cluster.nodes[1].peer_addr(&ids[0]).as_deref() == Some("10.0.0.1")
     })
     .await;
 }
 
 #[tokio::test]
 async fn events_stream_fires_on_entry_changes() {
-    let net = Network::new();
-    let ids: Vec<NodeId> = ["node-a", "node-b"]
-        .iter()
-        .map(|s| NodeId::new(*s))
-        .collect();
-    let mut nodes = Vec::new();
-    for id in &ids {
-        let mut b = Node::builder(id.clone(), net.endpoint(id.clone())).gossip_interval_ms(20);
-        for other in &ids {
-            if other != id {
-                b = b.seed(other.clone());
-            }
-        }
-        nodes.push(b.spawn());
-    }
-    let a = nodes[0].join_group("g");
-    let b = nodes[1].join_group("g");
+    let cluster = MemCluster::builder(&["node-a", "node-b"])
+        .group("g")
+        .gossip_interval_ms(20)
+        .spawn();
+    let ids = &cluster.ids;
+    let a = &cluster.groups[0];
+    let b = &cluster.groups[1];
 
     let mut events = b.events();
     a.set_entry("progress", b"42", None).unwrap();

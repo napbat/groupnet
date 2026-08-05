@@ -1,4 +1,4 @@
-//! # groupnet-udp
+//! # groupnet-transport-udp
 //!
 //! A real [`Transport`] over UDP datagrams — a concrete binding of Groupnet's
 //! transport-agnostic trait.

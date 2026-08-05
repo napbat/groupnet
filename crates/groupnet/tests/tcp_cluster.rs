@@ -13,17 +13,12 @@ use std::time::Duration;
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
 use groupnet::transport::tcp::TcpMsgTransport;
+use groupnet_testkit::cluster::eventually_within;
 
-/// Polls until `cond` holds or a deadline passes.
-async fn eventually(mut cond: impl FnMut() -> bool, what: &str) {
-    for _ in 0..1000 {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("timed out waiting for: {what}");
-}
+/// Real sockets and a dial-back handshake are slower to settle than the
+/// in-memory fabric, so these waits get a longer budget than the testkit
+/// default.
+const SETTLE: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn nodes_gossip_and_sync_entries_over_persistent_tcp() {
@@ -55,17 +50,15 @@ async fn nodes_gossip_and_sync_entries_over_persistent_tcp() {
 
     let ga = a.join_group("shard");
     let gb = b.join_group("shard");
-    eventually(
-        || ga.members().len() == 2 && gb.members().len() == 2,
-        "membership convergence over TCP",
-    )
+    eventually_within("membership convergence over TCP", SETTLE, || {
+        ga.members().len() == 2 && gb.members().len() == 2
+    })
     .await;
 
     ga.set_entry("route", b"v3", None).expect("entry accepted");
-    eventually(
-        || gb.node_entry(&a_id, "route").as_deref() == Some(b"v3"),
-        "entry replication over TCP",
-    )
+    eventually_within("entry replication over TCP", SETTLE, || {
+        gb.node_entry(&a_id, "route").as_deref() == Some(b"v3")
+    })
     .await;
 
     // One peer each: the persistent pool holds one warm socket, not a mesh.
@@ -117,23 +110,22 @@ async fn seed_only_bootstrap_resolves_every_address_dynamically() {
     let ga = a.join_group("boot");
     let gb = b.join_group("boot");
     let gc = c.join_group("boot");
-    eventually(
-        || [&ga, &gb, &gc].iter().all(|g| g.members().len() == 3),
-        "three-way membership from one seed address",
-    )
+    eventually_within("three-way membership from one seed address", SETTLE, || {
+        [&ga, &gb, &gc].iter().all(|g| g.members().len() == 3)
+    })
     .await;
 
     // a and c resolved each other without any registration between them.
-    eventually(
-        || c_book.peer_addr(&a_id).is_some() && a_book.peer_addr(&c_id).is_some(),
+    eventually_within(
         "joiners resolve each other from gossiped advertisements",
+        SETTLE,
+        || c_book.peer_addr(&a_id).is_some() && a_book.peer_addr(&c_id).is_some(),
     )
     .await;
 
     gc.set_entry("who", b"c", None).expect("entry accepted");
-    eventually(
-        || ga.node_entry(&c_id, "who").as_deref() == Some(b"c"),
-        "state from c reaches a",
-    )
+    eventually_within("state from c reaches a", SETTLE, || {
+        ga.node_entry(&c_id, "who").as_deref() == Some(b"c")
+    })
     .await;
 }

@@ -11,5 +11,24 @@ repository.workspace = true
 # so it can be simulated, fuzzed, and (later) compiled no_std.
 [dependencies]
 
+[dev-dependencies]
+# Path-only and publish = false: cargo strips path-only dev-deps at publish,
+# so this never enters the published dependency graph. Do NOT add `version`.
+# Default features only — never `cluster` — so the test graph stays tokio-free.
+groupnet-testkit = { path = "../groupnet-testkit" }
+# Benchmark harness. Dev-only, so the published dependency graph stays empty —
+# the core's `[dependencies]` is intentionally bare and must remain so.
+divan = "0.1.21"
+
+# `harness = false` hands the target to divan's own `#[divan::bench]` runner
+# instead of libtest.
+[[bench]]
+name = "wire"
+harness = false
+
+[[bench]]
+name = "placement"
+harness = false
+
 [lints]
 workspace = true

@@ -54,6 +54,7 @@ requirements, so they're separate traits bound to separate physical connections.
 | [`groupnet-consistency`](crates/groupnet-consistency) | — | core, runtime, tokio(sync) | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
 | [`groupnet`](crates/groupnet) | — | facade | umbrella re-export; `runtime`+`mem` default, `udp`/`tcp`/`sim` opt-in |
+| [`groupnet-testkit`](crates/groupnet-testkit) | — | core *(+cluster feature: runtime, transport-mem, tokio)* | shared test support: sans-IO frame fixtures + an async multi-node harness. Internal, `publish = false`, dev-dependency only |
 
 The runtime is generic over `T: Transport` and never depends on a concrete
 binding — you pick a transport crate (or write your own impl) and the driver is
@@ -78,6 +79,13 @@ Runnable examples live in [`crates/groupnet/examples`](crates/groupnet/examples)
 cargo run --example placement   # weighted HA-hash placement (sync, no I/O)
 cargo run --example cluster     # 3-node convergence, derived coordinator, metadata
 cargo run --example routing     # resolve a resource to its owner from any node
+```
+
+Two more live with the layers they exercise:
+
+```bash
+cargo run -p groupnet-sim --example partition              # partition -> detect -> heal -> rejoin, bit-for-bit reproducible
+cargo run -p groupnet-consistency --example read_your_writes   # write feed + applied-frontier barrier, and a gap surfacing
 ```
 
 ```rust
@@ -230,6 +238,7 @@ roadmap item, deliberately unbuilt until a real deployment demands it.
 ```bash
 cargo test --workspace        # unit + deterministic sim + async e2e + real UDP
 cargo clippy --workspace --all-targets -- -D warnings
+cargo bench -p groupnet-core  # wire codec + placement, at 5/50/500 members
 cargo build -p groupnet --no-default-features   # core + transport trait only, no tokio
 ```
 

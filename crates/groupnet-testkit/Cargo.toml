@@ -1,0 +1,25 @@
+[package]
+name = "groupnet-testkit"
+description = "Internal test support for the groupnet workspace. Never published."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Async multi-node harness (Node/Group over the in-memory transport + bounded
+# polling). Dev-only everywhere; keeps the default testkit dep-free so
+# groupnet-core's test graph stays free of tokio.
+cluster = ["dep:groupnet-runtime", "dep:groupnet-transport-mem", "dep:tokio"]
+
+[dependencies]
+groupnet-core = { workspace = true }
+groupnet-runtime = { workspace = true, optional = true }
+groupnet-transport-mem = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[lints]
+workspace = true

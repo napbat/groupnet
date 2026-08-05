@@ -14,5 +14,10 @@ groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 
+# The integration test drives the endpoints from an executor, so it needs the
+# workspace's wider tokio slice (rt + macros + time) on top of `sync`.
+[dev-dependencies]
+tokio = { workspace = true }
+
 [lints]
 workspace = true

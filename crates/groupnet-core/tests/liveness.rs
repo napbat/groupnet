@@ -1,13 +1,11 @@
 //! Probe, suspicion, refutation, and membership lifecycle tests.
 
-use crate::config::Config;
-use crate::membership::Status;
 use std::collections::BTreeSet;
 
-use crate::{GroupId, NodeId, Time, placement, wire};
-
-use super::super::{Command, Effect, GroupEngine};
-use super::test_support::*;
+use groupnet_core::{
+    Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, placement, wire,
+};
+use groupnet_testkit::frames::*;
 
 #[test]
 fn start_announces_to_seeds() {

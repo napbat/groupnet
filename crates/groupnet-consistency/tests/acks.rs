@@ -9,33 +9,19 @@ use std::time::Duration;
 use groupnet_consistency::{
     AckLedger, PeerWrite, PeerWrites, WriteFeed, WriteToken, applied_by, applied_cluster_wide,
 };
-use groupnet_core::NodeId;
-use groupnet_runtime::{Group, Node};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_testkit::cluster::{NodeOpts, converged, spawn_mem_node};
+use groupnet_transport_mem::Network;
 
 const fn cap(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("nonzero")
 }
 
-fn spawn_node(net: &Network, id: &str, peer: &str) -> (NodeId, Node<MemTransport>, Group) {
-    let me = NodeId::new(id);
-    let node = Node::builder(me.clone(), net.endpoint(me.clone()))
-        .seed(NodeId::new(peer))
+/// The timings every node in these tests runs at: fast gossip, brisk
+/// anti-entropy, one shared group.
+fn opts() -> NodeOpts {
+    NodeOpts::new("stores")
         .gossip_interval_ms(10)
         .anti_entropy_interval_ms(25)
-        .spawn();
-    let group = node.join_group("stores");
-    (me, node, group)
-}
-
-async fn converged(groups: &[&Group]) {
-    for _ in 0..300 {
-        if groups.iter().all(|g| g.members().len() == groups.len()) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("membership did not converge");
 }
 
 fn decode(bytes: &[u8]) -> Option<String> {
@@ -48,8 +34,8 @@ fn decode(bytes: &[u8]) -> Option<String> {
 #[tokio::test]
 async fn applied_acknowledgements_round_trip() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "ack-a", "ack-b");
-    let (b_id, _b_node, b_group) = spawn_node(&net, "ack-b", "ack-a");
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ack-a", &["ack-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ack-b", &["ack-a"], &opts());
     converged(&[&a_group, &b_group]).await;
 
     // B: apply loop that records into a ledger after each application.

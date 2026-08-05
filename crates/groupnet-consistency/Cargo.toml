@@ -28,6 +28,9 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 [dev-dependencies]
 groupnet-transport-mem = { workspace = true }
 tokio = { workspace = true }
+# Path-only and publish = false: cargo strips path-only dev-deps at publish,
+# so this never enters the published dependency graph. Do NOT add `version`.
+groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
 
 [lints]
 workspace = true

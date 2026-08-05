@@ -32,7 +32,14 @@ const STATUS_DEAD: u8 = 2;
 
 impl Status {
     /// Encodes this status as its one-byte wire code.
-    pub(crate) fn to_wire(self) -> u8 {
+    ///
+    /// Public because the mapping *is* public protocol: [`wire::NodeDigest`]
+    /// and [`wire::MemberDelta`] carry their `status` as a bare `u8`, so anyone
+    /// constructing or reading a frame needs this to interpret it.
+    ///
+    /// [`wire::NodeDigest`]: crate::wire::NodeDigest
+    /// [`wire::MemberDelta`]: crate::wire::MemberDelta
+    pub fn to_wire(self) -> u8 {
         match self {
             Status::Alive => STATUS_ALIVE,
             Status::Suspect => STATUS_SUSPECT,
@@ -42,7 +49,9 @@ impl Status {
 
     /// Decodes a one-byte wire code, or `None` for an unrecognised one — a
     /// forward-compatible peer may advertise codes this version doesn't know.
-    pub(crate) fn from_wire(code: u8) -> Option<Status> {
+    ///
+    /// The inverse of [`Status::to_wire`], and public for the same reason.
+    pub fn from_wire(code: u8) -> Option<Status> {
         match code {
             STATUS_ALIVE => Some(Status::Alive),
             STATUS_SUSPECT => Some(Status::Suspect),
@@ -187,5 +196,21 @@ impl Member {
             },
             Status::Dead => self.status != Status::Dead && incarnation >= self.incarnation,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every status survives a wire round-trip, and unknown codes decode to
+    /// `None` rather than silently aliasing a known status.
+    #[test]
+    fn status_round_trips_through_its_wire_code() {
+        for status in [Status::Alive, Status::Suspect, Status::Dead] {
+            assert_eq!(Status::from_wire(status.to_wire()), Some(status));
+        }
+        assert_eq!(Status::from_wire(3), None);
+        assert_eq!(Status::from_wire(u8::MAX), None);
     }
 }

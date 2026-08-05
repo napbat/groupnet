@@ -13,9 +13,8 @@ use std::time::Duration;
 use groupnet_consistency::{
     Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
 };
-use groupnet_core::NodeId;
-use groupnet_runtime::{Group, Node};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_testkit::cluster::{NodeOpts, converged, spawn_mem_node};
+use groupnet_transport_mem::Network;
 
 const GROUP: &str = "stores";
 
@@ -23,27 +22,12 @@ const fn cap(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("nonzero")
 }
 
-fn spawn_node(net: &Network, id: &str, peers: &[&str]) -> (NodeId, Node<MemTransport>, Group) {
-    let me = NodeId::new(id);
-    let mut builder = Node::builder(me.clone(), net.endpoint(me.clone()))
+/// The timings every node in these tests runs at: fast gossip, brisk
+/// anti-entropy, one shared group.
+fn opts() -> NodeOpts {
+    NodeOpts::new(GROUP)
         .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25);
-    for peer in peers {
-        builder = builder.seed(NodeId::new(*peer));
-    }
-    let node = builder.spawn();
-    let group = node.join_group(GROUP);
-    (me, node, group)
-}
-
-async fn converged(groups: &[&Group]) {
-    for _ in 0..300 {
-        if groups.iter().all(|g| g.members().len() == groups.len()) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("membership did not converge");
+        .anti_entropy_interval_ms(25)
 }
 
 async fn next_event(peers: &mut PeerWrites<String>) -> PeerWrite<String> {
@@ -60,8 +44,8 @@ fn decode(bytes: &[u8]) -> Option<String> {
 #[tokio::test]
 async fn peer_writes_arrive_in_order_and_apply_locally() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "node-a", &["node-b"]);
-    let (b_id, _b_node, b_group) = spawn_node(&net, "node-b", &["node-a"]);
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "node-a", &["node-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "node-b", &["node-a"], &opts());
     converged(&[&a_group, &b_group]).await;
 
     // Node B: local state holding a soon-stale copy, and a subscription.
@@ -111,8 +95,8 @@ async fn peer_writes_arrive_in_order_and_apply_locally() {
 #[tokio::test]
 async fn ring_overflow_degrades_to_an_explicit_gap() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "ov-a", &["ov-b"]);
-    let (b_id, _b_node, b_group) = spawn_node(&net, "ov-b", &["ov-a"]);
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ov-a", &["ov-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ov-b", &["ov-a"], &opts());
     converged(&[&a_group, &b_group]).await;
 
     let mut peers = PeerWrites::new(b_group, b_id, decode);
@@ -166,8 +150,8 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
 #[tokio::test]
 async fn advertised_head_tracks_the_feed() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "hd-a", &["hd-b"]);
-    let (b_id, _b_node, b_group) = spawn_node(&net, "hd-b", &["hd-a"]);
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "hd-a", &["hd-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "hd-b", &["hd-a"], &opts());
     converged(&[&a_group, &b_group]).await;
 
     assert_eq!(advertised_head(&b_group, &a_id), None, "no feed yet");
@@ -197,8 +181,8 @@ async fn advertised_head_tracks_the_feed() {
 #[tokio::test]
 async fn own_writes_are_ignored() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "self-a", &["self-b"]);
-    let (_b_id, _b_node, _b_group) = spawn_node(&net, "self-b", &["self-a"]);
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "self-a", &["self-b"], &opts());
+    let (_b_id, _b_node, _b_group) = spawn_mem_node(&net, "self-b", &["self-a"], &opts());
 
     // Feed and subscription on the SAME node.
     let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
@@ -215,8 +199,8 @@ async fn own_writes_are_ignored() {
 #[tokio::test]
 async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "ryw-a", &["ryw-b"]);
-    let (b_id, _b_node, b_group) = spawn_node(&net, "ryw-b", &["ryw-a"]);
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ryw-a", &["ryw-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ryw-b", &["ryw-a"], &opts());
     converged(&[&a_group, &b_group]).await;
 
     // Node B: stale local state, an apply loop, and a frontier.
@@ -268,8 +252,8 @@ async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
 #[tokio::test]
 async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
     let net = Network::new();
-    let (a_id, a_node, a_group) = spawn_node(&net, "rs-a", &["rs-b"]);
-    let (b_id, _b_node, b_group) = spawn_node(&net, "rs-b", &["rs-a"]);
+    let (a_id, a_node, a_group) = spawn_mem_node(&net, "rs-a", &["rs-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "rs-b", &["rs-a"], &opts());
     converged(&[&a_group, &b_group]).await;
 
     let mut peers = PeerWrites::new(b_group, b_id, decode);
@@ -297,7 +281,7 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
     drop(feed);
     drop(a_group);
     drop(a_node);
-    let (_a2_id, _a2_node, a2_group) = spawn_node(&net, "rs-a", &["rs-b"]);
+    let (_a2_id, _a2_node, a2_group) = spawn_mem_node(&net, "rs-a", &["rs-b"], &opts());
     let feed2 =
         WriteFeed::new(a2_group, cap(8), |key: &String| key.clone().into_bytes()).with_epoch(2);
     let new_token = feed2.publish(&"n1".to_owned()).await;
@@ -348,8 +332,8 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
 #[tokio::test]
 async fn named_feeds_do_not_cross_talk() {
     let net = Network::new();
-    let (_a_id, _a_node, a_group) = spawn_node(&net, "nm-a", &["nm-b"]);
-    let (b_id, _b_node, b_group) = spawn_node(&net, "nm-b", &["nm-a"]);
+    let (_a_id, _a_node, a_group) = spawn_mem_node(&net, "nm-a", &["nm-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "nm-b", &["nm-a"], &opts());
     converged(&[&a_group, &b_group]).await;
 
     let docs_feed = WriteFeed::named("docs", a_group.clone(), cap(8), |key: &String| {

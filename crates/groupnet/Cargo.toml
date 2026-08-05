@@ -48,6 +48,20 @@ groupnet-sim = { workspace = true, optional = true }
 # The async examples drive the runtime, so they need a Tokio executor.
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+# Path-only and publish = false: cargo strips path-only dev-deps at publish,
+# so this never enters the published dependency graph. Do NOT add `version`.
+groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
+
+# `placement` is sans-IO and builds from the core alone; the async examples
+# drive the runtime over the in-memory transport, so they are gated off under
+# `--no-default-features` builds.
+[[example]]
+name = "cluster"
+required-features = ["runtime", "mem"]
+
+[[example]]
+name = "routing"
+required-features = ["runtime", "mem"]
 
 [lints]
 workspace = true
