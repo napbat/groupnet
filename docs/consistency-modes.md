@@ -116,8 +116,52 @@ monotonic reads, per-writer order, detected-never-silent loss. Still AP/EL.
 Applied-watermark ledgers; `applied_cluster_wide` waits on every member the
 writer currently believes Alive. Bounded-time (not absolute) under asymmetric
 partition inside the probe window — the crate's honesty box stays verbatim.
-This tier **is** the s3cache invalidation-coherence story; no new mode needed
-there.
+This tier is what s3cache's strong mode is built on today; the owner judges
+that construction brittle, and T3 below is the proposed successor. T2 itself
+stays: it is the right tool when the writer only needs *responsive* peers
+coherent and degradation-on-timeout is acceptable.
+
+### T3 — Coherence-lease tier (proposed; motivated by s3cache's brittle strong mode)
+
+The owner's assessment — shared after reviewing s3cache — is that its current
+strong mode is brittle. The diagnosis: T2's `applied_cluster_wide` is
+**unanimity over a rumor-derived set**. Every write blocks on every peer the
+writer currently believes Alive (N-of-N, the most fragile quorum), one
+degraded-but-alive peer taxes every write cluster-wide, and an ack timeout
+ends in a *degradation* (writer proceeds; s3cache's stability clock suspends
+authoritative 404s everywhere) rather than a guarantee — correctness during
+the window depends on the stale peer *learning* it should stand down, which
+is exactly what an asymmetrically-partitioned peer cannot do. The root cause
+is structural: **the read side has no self-expiring right to serve**, so the
+write side has no choice but to chase acks from everyone, forever.
+
+The fix is read-side **freshness leases** (Gray–Cheriton): a node may serve
+locally-cached state (including authoritative negatives) only while holding
+an unexpired lease. A writer's invalidation blocks on responsive
+lease-holders (fast path — identical cost to T2 acks when healthy) or on the
+lapse of a silent peer's lease (slow path — bounded, and the exposure is
+ended by the *stale node's own clock*, a bounded-clock-**rate** assumption,
+not a connectivity assumption). Consequences:
+
+* Write-wait under failure becomes `min(acks, lease remainder)` with a real
+  guarantee at the end, instead of a timeout with a hope at the end.
+* "May I answer a 404 authoritatively?" becomes "do I hold a valid lease" —
+  a mechanism, replacing s3cache's hand-rolled view-stability heuristic
+  (`Stability`/`settled()` over `detection_window()`).
+* Mixed-mode deployments stop being a convention: lease participation is
+  advertised in membership (Section 7, item 2), so writers know exactly whom
+  to wait for.
+
+This tier is the **same lease machinery Hosted mode's Milestone 1 builds**
+(grant/renew/expire, DST-provable disjointness in virtual time), pointed the
+other way: instead of one host holding a lease to *write*, every reader
+holds a lease to *serve*. Lease duration is the knob trading
+write-stall-under-failure against renewal traffic; renewals piggyback on the
+existing gossip cadence.
+
+Status: proposed, decision **O5**. If adopted, it slots after the election
+skeleton (which proves the lease machinery under DST) and before or beside
+the hosted write path.
 
 ### M3 — Hosted mode (new)
 
@@ -366,3 +410,12 @@ Open — for the owner:
   (one README sentence drawing the line).
 * **O4 — naming.** `Hosted` / `host` / `GroupProfile` / `Activation` — happy
   with these names, or prefer e.g. `Leader`/`leader`?
+* **O5 — coherence-lease tier (T3).** Adopt the read-side freshness-lease
+  tier as the successor to s3cache's strong mode (owner's assessment: the
+  current unanimity-ack strong mode is brittle)? If adopted: where in the
+  milestone order — immediately after Milestone 1 (it reuses the same lease
+  machinery, freshly DST-proven), or after the hosted write path? Adopting
+  it also raises the priority of Section 7 items 1–2, which become part of
+  its contract rather than nice-to-haves. **Recommendation: adopt, sequence
+  as Milestone 2 (displacing Settle to Milestone 3) — it is the most
+  consumer-pulled piece of the whole design.**
