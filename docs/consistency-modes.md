@@ -97,6 +97,16 @@ which is the core of this design.
 
 ## 3. Mode taxonomy and honest guarantees
 
+The contract in three sentences (owner-confirmed 2026-08-05): a group can
+stay a pure metadata/membership group — `Eventual` is the default mode and
+its contract never changes. A group can opt into an elected, epoch-fenced
+leader (Hosted mode), with the activation policy setting the CAP posture. And
+a small-roster group can compose Quorum activation with a quorum-applied
+commit level (see *Commit levels* under M3) to get genuinely strong
+guarantees — every write pays a majority round-trip, which is exactly right
+for a game session or a small cache cluster and deliberately wrong at fleet
+scale.
+
 ### M0 — Eventual (base fabric; today; unchanged)
 
 SWIM membership, per-key LWW metadata registers, single-writer per-node keyed
@@ -239,6 +249,40 @@ CP path.
   migration as the epoch `Gap`. A later milestone can add snapshot handoff
   over the existing `BulkTransport` data plane.
 
+#### Commit levels — the second half of "strong"
+
+Activation answers *who may serve as host*; it does not answer *when a hosted
+write may be acknowledged*. Those are orthogonal knobs, and true strong
+consistency requires both. If the host acks from local state alone and dies
+before any follower applied the write, the write is lost even though the
+election was perfectly CP — so `HostedWrites` carries a commit level:
+
+* **`Commit::Local`** — acked once the host applied it. Followers trail via
+  the session tier; a migration may lose the acked tail, surfaced honestly as
+  the epoch `Gap`. The game-lobby default: cheap, and clients rebase.
+* **`Commit::QuorumApplied`** — acked once a majority of the voter roster has
+  *applied* it (the acks-tier machinery scoped to voters). Combined with
+  `Activation::Quorum`, the grant majority and the commit majority intersect,
+  so an activating candidate can — and **must** — recover the newest
+  committed state from the majority it heard before serving. That
+  **leader-completeness rule** is what upgrades "single serializer with
+  fencing" to a real guarantee: no write acked at this level is ever lost,
+  and no split-brain exists outside the lease window. This is the
+  small-roster strong profile.
+* **`Commit::AllApplied`** — unanimity via T2, for read-anywhere-after-ack.
+  Subject to the T3 brittleness diagnosis; prefer it leased, and only on
+  small fixed rosters.
+
+Reads, stated per level: host reads are linearizable only under a valid
+lease (or a per-read renewal); follower reads at a commit watermark are
+sequentially consistent, never linearizable. The strong profile's cost
+envelope — a majority round-trip per write, majority grants per election —
+is the deliberate, documented trade: right for single-digit rosters (a game
+session, a small cache cluster), wrong past that. It is view-stamped
+primary-backup in spirit and is **the ceiling**: the closest groupnet gets
+to consensus, constrained to fixed small rosters, with no general replicated
+log behind it (M4's boundary stands).
+
 #### Consumer mapping
 
 * **docres document ownership/locking** = Hosted mode per shard group with
@@ -248,8 +292,10 @@ CP path.
   ambition is that shardstore could eventually shed that bespoke code.
 * **s3cache** does not use Hosted mode at all; it is served by T2 plus the
   API gaps in Section 7.
-* **p2p-game-style consumers** use `Settle` — the lobby semantics the mode
-  was named for.
+* **p2p-game-style consumers** use `Settle` + `Commit::Local` — the lobby
+  semantics the mode was named for. A small session that must never lose
+  acked state (or a small cache cluster wanting real strong) steps up to
+  `Quorum` + `Commit::QuorumApplied`.
 
 ### M4 — Quorum-replicated log (Raft-shaped): out of scope
 
@@ -329,6 +375,10 @@ heal schedules) assert the safety and liveness properties:
   crash-restart seeds prove the grant blackout suffices.
 * **S4** — lease disjointness in virtual time: no instant with two unexpired
   leases for one group.
+* **S5** (with `Commit::QuorumApplied`) — no write acknowledged at the
+  quorum-applied level is ever lost, across every crash/partition/migration
+  schedule: after any activation, the new host's state contains every such
+  write (leader completeness).
 * **L1** — after heal + settle, exactly one host; all agree on
   `(host, epoch)`; it is the rendezvous top-ranked live member.
 
@@ -352,8 +402,10 @@ anything):
   DST seeds (heal ⇒ one surviving epoch, loser surfaced).
 * **Milestone 3 — hosted write path.** `HostedWrites` in
   `groupnet-consistency` behind `hosted`; fence surfacing; commit levels
-  (`Local` / `Applied` via T2); `NotHost`/`Deposed`; integration tests +
-  a runnable fenced-ownership example (the docres shape).
+  (`Local` / `QuorumApplied` / `AllApplied`) with the leader-completeness
+  recovery step gating activation when `QuorumApplied` is in force (DST
+  property S5); `NotHost`/`Deposed`; integration tests + a runnable
+  fenced-ownership example (the docres shape).
 * **Milestone 4 — external-CAS anchor.** `Activation::External` with an
   `Anchor` trait (driver-side, async — runtime layer, never core); the
   engine consumes anchor outcomes as commands; sim models the anchor as a
