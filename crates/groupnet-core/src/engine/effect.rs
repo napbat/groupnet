@@ -35,6 +35,23 @@ pub enum Effect {
         /// The key that changed.
         key: String,
     },
+    /// The group's epoch-fenced **host** changed — a new host activated, the
+    /// incumbent was deposed by a higher epoch, or the lease lapsed and left
+    /// the group hostless.
+    ///
+    /// Emitted only by a [`GroupMode::Hosted`](crate::GroupMode) group; an
+    /// `Eventual` group never emits one. Distinct from
+    /// [`Effect::CoordinatorChanged`]: the coordinator is *derived* and never
+    /// authoritative, while the host is elected and epoch-fenced. Both exist
+    /// side by side in a Hosted group.
+    LeadershipChanged {
+        /// The epoch this observation belongs to. Monotone per group: an
+        /// observer's epoch never regresses, so a reader can discard a
+        /// stale-arriving notification by comparing it.
+        epoch: u64,
+        /// The host of that epoch, or `None` if the group currently has none.
+        host: Option<NodeId>,
+    },
     /// A metadata key took a new value (from a local write or a merged delta).
     MetadataChanged {
         /// The key that changed.

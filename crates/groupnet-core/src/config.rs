@@ -1,5 +1,106 @@
 //! Per-group failure-detection and gossip tunables.
 
+/// The consistency posture of a single group: whether it is a pure
+/// metadata/membership group, or one that elects an epoch-fenced **host**.
+///
+/// The mode is per group, so one node mixes them freely — shard groups that
+/// serialize writes through a host alongside a fabric group that stays purely
+/// eventual.
+///
+/// # The `Eventual` guarantee
+///
+/// `Eventual` is the default and its contract never changes: SWIM membership,
+/// last-writer-wins metadata registers, single-writer per-node keyed state,
+/// and the *derived* coordinator — which is a deterministic function of the
+/// membership view, never an authority. **An `Eventual` group runs no
+/// election**: it never emits a [`LeadClaim`], [`LeadGrant`], or
+/// [`LeadState`] frame, never claims an epoch, and never emits an
+/// [`Effect::LeadershipChanged`]. Opting a *different* group into `Hosted`
+/// cannot change that — the mode is not a node-wide switch.
+///
+/// [`LeadClaim`]: crate::wire::Kind::LeadClaim
+/// [`LeadGrant`]: crate::wire::Kind::LeadGrant
+/// [`LeadState`]: crate::wire::Kind::LeadState
+/// [`Effect::LeadershipChanged`]: crate::Effect::LeadershipChanged
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GroupMode {
+    /// Metadata and membership only, converging eventually — the default, and
+    /// what every group was before Hosted mode existed. Costs nothing beyond
+    /// the gossip the fabric already pays for.
+    #[default]
+    Eventual,
+    /// The group elects one epoch-fenced host, per [`HostedConfig`]. Writes
+    /// that need a single serializer go through it; base-fabric gossip
+    /// continues underneath unchanged.
+    Hosted(HostedConfig),
+}
+
+/// Tunables for a [`GroupMode::Hosted`] group's election and lease.
+///
+/// # Sizing
+///
+/// Both durations here are in the engine's *logical* milliseconds, and both
+/// must be **much larger than the driver's tick period** — the engine only
+/// observes time when it is ticked, so a deadline finer than the tick is
+/// rounded up to it. The runtime driver ticks at half the tightest configured
+/// detector deadline; a lease or settle window near that period would expire
+/// a whole tick late (or, worse, be indistinguishable from zero). Prefer at
+/// least an order of magnitude above the tick period.
+///
+/// Size them against [`Config::detection_window_ms`], which is how long it
+/// takes this observer to call a silent host dead:
+///
+/// * **`lease_ms` bounds split-brain, so it must be the shorter one.** A host
+///   demotes itself `lease_ms` after its last successful renewal, and the
+///   cluster must not be able to elect a successor before that: the safety
+///   rule is `lease_ms` **<** `detection_window_ms(members)` + the activation's
+///   settle window — the deposed host has stepped down before anyone else can
+///   step up. Larger than that and two nodes can believe they hold the same
+///   group at the same instant.
+/// * **Too small costs availability, not safety.** A lease shorter than a
+///   couple of gossip rounds makes a host renew constantly and demote itself
+///   over ordinary jitter, so leadership churns.
+///
+/// In production this rests on bounded clock-*rate* error between nodes — the
+/// standard lease assumption, stated plainly rather than assumed away. The
+/// simulator checks lease disjointness exactly, in virtual time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostedConfig {
+    /// How an epoch is closed — which peers' agreement makes a claimant the
+    /// host. See [`Activation`].
+    pub activation: Activation,
+    /// How long a host's authority survives its last successful renewal
+    /// before it demotes itself. See the sizing guidance on
+    /// [`HostedConfig`] — this is the number that bounds split-brain.
+    pub lease_ms: u64,
+}
+
+/// How a [`GroupMode::Hosted`] group closes an epoch: what makes a claimant
+/// the host.
+///
+/// Activation answers *who may serve as host*; it says nothing about when a
+/// hosted write may be acknowledged (that is a separate, orthogonal knob).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Activation {
+    /// Lobby-style: a claimant that is still the top-ranked live candidate
+    /// after the settle window activates. Available on both sides of a
+    /// partition — each side elects its own host — so split-brain is possible
+    /// but **bounded and fenced**: at heal exactly one epoch survives, and the
+    /// loser is demoted rather than left writing.
+    Settle {
+        /// How long a claim must stand unchallenged before its claimant
+        /// activates. It must comfortably exceed one round-trip plus the
+        /// driver's tick period, or claims settle before their peers have had
+        /// a chance to answer; sizing it around a small multiple of
+        /// [`Config::gossip_interval_ms`] is the usual choice. It also
+        /// lengthens the safe [`lease_ms`](HostedConfig::lease_ms) — see the
+        /// sizing guidance on [`HostedConfig`].
+        claim_settle_ms: u64,
+    },
+}
+
 /// Tunables for a single group's gossip and failure detection.
 ///
 /// All durations are in milliseconds of *logical* time (see
@@ -66,6 +167,9 @@ pub struct Config {
     /// A peer's first digest is always full. `1` disables delta digests
     /// (every digest full — the pre-delta behaviour). Default: 4.
     pub full_digest_every: u64,
+    /// This group's consistency posture. Defaults to
+    /// [`GroupMode::Eventual`] — metadata and membership only, no election.
+    pub mode: GroupMode,
 }
 
 impl Config {
@@ -194,13 +298,45 @@ impl Default for Config {
             eager_push: true,
             max_delta_frame_bytes: 60_000,
             full_digest_every: 4,
+            mode: GroupMode::Eventual,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Activation, Config, GroupMode, HostedConfig};
+
+    /// A group is a plain metadata/membership group unless it is explicitly
+    /// opted in — the Eventual contract is the default, in both spellings.
+    #[test]
+    fn eventual_is_the_default_mode() {
+        assert_eq!(Config::default().mode, GroupMode::Eventual);
+        assert_eq!(GroupMode::default(), GroupMode::Eventual);
+    }
+
+    /// The mode rides `Config`'s struct-update syntax like every other knob,
+    /// and a Hosted config compares by value.
+    #[test]
+    fn hosted_mode_carries_its_activation_and_lease() {
+        let hosted = HostedConfig {
+            activation: Activation::Settle {
+                claim_settle_ms: 600,
+            },
+            lease_ms: 2_000,
+        };
+        let cfg = Config {
+            mode: GroupMode::Hosted(hosted),
+            ..Config::default()
+        };
+        assert_eq!(cfg.mode, GroupMode::Hosted(hosted));
+        assert_ne!(cfg.mode, GroupMode::Eventual);
+        // Everything else is untouched by opting in.
+        assert_eq!(
+            cfg.detection_window_ms(3),
+            Config::default().detection_window_ms(3)
+        );
+    }
 
     /// A bigger group means a longer round-robin pass before the detector
     /// reaches any one member, so the window may never shrink as members are

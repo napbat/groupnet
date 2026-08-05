@@ -3,11 +3,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::config::Config;
+use crate::config::{Config, GroupMode};
 use crate::membership::{Member, Status};
 use crate::{GroupId, NodeId, Time, placement, wire};
 
 use super::effect::Effect;
+use super::election::Election;
 use super::stats::NetStats;
 
 /// Which phase of failure detection an outstanding probe is in.
@@ -119,6 +120,12 @@ pub struct GroupEngine {
     pub(super) digest_cursors: BTreeMap<NodeId, u64>,
     /// Per peer: digests built for it so far (drives the full-digest cadence).
     pub(super) digest_visits: BTreeMap<NodeId, u64>,
+    /// The Hosted-mode election state — `Some` exactly when
+    /// [`Config::mode`](crate::Config::mode) is
+    /// [`Hosted`](crate::GroupMode::Hosted). An `Eventual` group does not
+    /// allocate it, and every election path checks it first, so the mode's
+    /// "runs no election" contract is structural rather than conventional.
+    pub(super) election: Option<Election>,
     /// Cumulative anti-entropy traffic counters.
     pub(super) stats: NetStats,
 }
@@ -144,6 +151,10 @@ impl GroupEngine {
             .into_iter()
             .filter(|p| *p != local)
             .collect::<BTreeSet<_>>();
+        let election = match config.mode {
+            GroupMode::Hosted(hosted) => Some(Election::new(hosted)),
+            GroupMode::Eventual => None,
+        };
         let mut engine = Self {
             group,
             local,
@@ -165,6 +176,7 @@ impl GroupEngine {
             change_clock: 1,
             digest_cursors: BTreeMap::new(),
             digest_visits: BTreeMap::new(),
+            election,
             stats: NetStats::default(),
         };
         engine.coordinator = engine.compute_coordinator();
@@ -336,6 +348,7 @@ impl GroupEngine {
         self.now_hint = self.now_hint.max(now);
         self.next_anti_entropy = now.saturating_add(self.anti_entropy_interval());
         self.next_probe = now.saturating_add(self.config.probe_interval_ms);
+        self.election_start(now);
         let mut effects = self.disseminate_digest(now);
         effects.push(self.arm_timer());
         effects
@@ -432,6 +445,12 @@ impl GroupEngine {
                 }
                 Vec::new()
             }
+            // The Hosted-mode election (see `election.rs`). In an `Eventual`
+            // group these decode and are dropped, exactly as they were before
+            // the election existed.
+            wire::Kind::LeadClaim | wire::Kind::LeadGrant | wire::Kind::LeadState => {
+                self.on_lead(&from, &frame, now)
+            }
         }
     }
 
@@ -474,10 +493,17 @@ impl GroupEngine {
         }
 
         // 5. Run the anti-entropy digest round.
-        if now >= self.next_anti_entropy {
+        let anti_entropy_due = now >= self.next_anti_entropy;
+        if anti_entropy_due {
             self.next_anti_entropy = now.saturating_add(self.anti_entropy_interval());
             effects.extend(self.disseminate_digest(now));
         }
+
+        // 6. The Hosted-mode election: claim, settle, renew, or step down. A
+        //    no-op in an `Eventual` group. Runs after the liveness steps above
+        //    so it reads this tick's membership, and rides the same round
+        //    cadence for its re-broadcasts.
+        effects.extend(self.election_tick(now, anti_entropy_due));
 
         effects.push(self.arm_timer());
         effects
@@ -495,6 +521,12 @@ impl GroupEngine {
                         .saturating_add(self.config.suspect_timeout_ms),
                 );
             }
+        }
+        // A standing claim's settle window and a host's lease are deadlines
+        // like any other: without them a driver whose timer is the gossip
+        // cadence would activate — or step down — a whole round late.
+        if let Some(deadline) = self.election.as_ref().and_then(Election::deadline) {
+            at = at.min(deadline);
         }
         Effect::ArmTimer { at }
     }

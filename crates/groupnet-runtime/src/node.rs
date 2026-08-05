@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Config, GroupEngine, GroupId, NodeId};
+use groupnet_core::{Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
@@ -10,13 +10,77 @@ use crate::driver::{
     EVENTS_CAPACITY, Event, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers,
     group_task, statuses_snapshot,
 };
-use crate::group::Group;
+use crate::group::{Group, Leadership};
 use crate::routing::Routing;
 use tokio::sync::broadcast;
 
 /// The reserved group every node joins to disseminate the inter-group routing
 /// table. Its metadata holds `owner:<resource>` and `coord:<group>` entries.
 pub(crate) const ROUTING_GROUP: &str = "__groupnet_routing__";
+
+/// The consistency posture one group is joined under — what
+/// [`Node::join_group_with`] takes.
+///
+/// The posture is **per group, not per node**: a node freely mixes hosted
+/// shard groups with eventual fabric groups, and opting one group in cannot
+/// make another run an election. Everything else about the group (gossip
+/// cadence, detector timings, fanout) still comes from the node's builder
+/// config — a profile only decides the mode.
+///
+/// ```no_run
+/// use groupnet_core::{Activation, HostedConfig};
+/// use groupnet_runtime::GroupProfile;
+///
+/// # fn demo<T: groupnet_transport::Transport>(node: &groupnet_runtime::Node<T>) {
+/// let shard = node.join_group_with(
+///     "shard-7",
+///     GroupProfile::hosted(HostedConfig {
+///         activation: Activation::Settle {
+///             claim_settle_ms: 600,
+///         },
+///         lease_ms: 2_000,
+///     }),
+/// );
+/// # let _ = shard;
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupProfile {
+    mode: GroupMode,
+}
+
+impl GroupProfile {
+    /// Metadata and membership only, converging eventually — no election, no
+    /// host, and no election frames on the wire. What every group was before
+    /// Hosted mode existed, and what [`Node::join_group`] uses unless the
+    /// node's [`Config::mode`] says otherwise.
+    #[must_use]
+    pub const fn eventual() -> Self {
+        Self {
+            mode: GroupMode::Eventual,
+        }
+    }
+
+    /// The group elects one epoch-fenced host per `config`, surfaced through
+    /// [`Group::leadership`](crate::Group::leadership) and
+    /// [`GroupEvent::LeadershipChanged`](crate::GroupEvent::LeadershipChanged).
+    ///
+    /// Size `config`'s durations against the node's detector timings — the
+    /// sizing rules (and the fact that both must be far larger than the
+    /// driver's tick period) are on [`HostedConfig`].
+    #[must_use]
+    pub const fn hosted(config: HostedConfig) -> Self {
+        Self {
+            mode: GroupMode::Hosted(config),
+        }
+    }
+
+    /// The profile a bare [`Node::join_group`] joins under: whatever the
+    /// node's own [`Config::mode`] says.
+    const fn from_mode(mode: GroupMode) -> Self {
+        Self { mode }
+    }
+}
 
 struct Inner<T: Transport> {
     id: NodeId,
@@ -77,22 +141,79 @@ impl<T: Transport> Node<T> {
     /// Idempotent: joining a group this node already participates in returns
     /// the existing handle.
     ///
+    /// The group is joined under the node's own [`Config::mode`] — normally
+    /// [`Eventual`](groupnet_core::GroupMode::Eventual). Opt a single group
+    /// into Hosted mode with [`join_group_with`](Self::join_group_with).
+    ///
     /// # Panics
     /// If the internal group table was poisoned by a panic in another thread.
     pub fn join_group(&self, group: impl Into<GroupId>) -> Group {
-        let group = group.into();
-        if let Some(existing) = self
-            .inner
-            .routes
-            .lock()
-            .expect("routes mutex poisoned")
-            .get(&group)
-        {
+        self.join_group_with(group, GroupProfile::from_mode(self.inner.config.mode))
+    }
+
+    /// Joins `group` under an explicit [`GroupProfile`] — the per-group
+    /// consistency posture — and returns a handle.
+    ///
+    /// # The first join wins, loudly
+    ///
+    /// This is idempotent in exactly the way [`join_group`](Self::join_group)
+    /// is: a repeat join of a group this node already participates in returns
+    /// the **existing handle**, spawning nothing. So on a repeat join
+    /// `profile` is *ignored* — the profile of the **first** join governs for
+    /// the life of the node's membership, whatever a later call passes. A
+    /// group's mode is baked into its engine at spawn (it decides whether an
+    /// election exists at all), and silently restarting a live actor to change
+    /// it would drop in-flight state and reset an epoch that peers still fence
+    /// against.
+    ///
+    /// So a caller that means to host a group must say so on the join that
+    /// creates it — including the implicit ones: [`join_group`](Self::join_group)
+    /// counts, and so does a `join_group` on any other code path in the same
+    /// process holding the same [`Node`]. If two call sites disagree about a
+    /// group's profile, whichever ran first is the one in effect; to leave the
+    /// group and rejoin under a different profile, build a new node.
+    ///
+    /// "First" is well defined even when the two calls are concurrent: the
+    /// get-or-spawn is atomic under the group table's lock, so of two threads
+    /// joining the same group at the same instant exactly one spawns the actor
+    /// and **both** are handed that one group.
+    ///
+    /// # Panics
+    /// If the internal group table was poisoned by a panic in another thread.
+    pub fn join_group_with(&self, group: impl Into<GroupId>, profile: GroupProfile) -> Group {
+        // Real groups announce their coordinator into the routing group. Read
+        // outside the lock: the routing group is joined once, during
+        // `NodeBuilder::spawn`, before any `Node` handle exists to race with.
+        let routing = self.inner.routing.get().map(Group::command_sender);
+        self.get_or_spawn(group.into(), routing, profile)
+    }
+
+    /// Returns the handle for `group`, spawning its actor if this node has not
+    /// joined it yet — the whole decision under **one** hold of the routes
+    /// lock, and the only place the table is written.
+    ///
+    /// The single hold is the contract, not an optimisation. Releasing the lock
+    /// between the lookup and the insert would make "the first join governs" a
+    /// lie under concurrency: two threads joining the same group at once would
+    /// each find it absent, each spawn an actor, and the *second* insert would
+    /// win — leaving two engines running the same group id (under two different
+    /// profiles, if the callers disagreed), one of them orphaned in the table
+    /// but still ticking, gossiping, and — in a Hosted group — electing.
+    /// [`spawn_group`](Self::spawn_group) has no `.await` and never touches
+    /// this lock, so nothing can yield or re-enter while it is held.
+    fn get_or_spawn(
+        &self,
+        group: GroupId,
+        routing: Option<mpsc::Sender<Event>>,
+        profile: GroupProfile,
+    ) -> Group {
+        let mut routes = self.inner.routes.lock().expect("routes mutex poisoned");
+        if let Some(existing) = routes.get(&group) {
             return existing.clone();
         }
-        // Real groups announce their coordinator into the routing group.
-        let routing = self.inner.routing.get().map(Group::command_sender);
-        self.spawn_group(group, routing)
+        let handle = self.spawn_group(group.clone(), routing, profile);
+        routes.insert(group, handle.clone());
+        handle
     }
 
     /// The address `node` advertised via
@@ -122,10 +243,20 @@ impl<T: Transport> Node<T> {
         Routing::new(group)
     }
 
-    /// Spawns a group actor. `routing` is the routing group's command channel
-    /// (so this group can publish its coordinator), or `None` for the routing
-    /// group itself.
-    fn spawn_group(&self, group: GroupId, routing: Option<mpsc::Sender<Event>>) -> Group {
+    /// Spawns a group actor and returns its handle, without touching the routes
+    /// table — [`get_or_spawn`](Self::get_or_spawn) owns that, and calls this
+    /// with the lock held, which is why nothing here may await.
+    ///
+    /// `routing` is the routing group's command channel (so this group can
+    /// publish its coordinator), or `None` for the routing group itself.
+    /// `profile` decides this group's mode; every other tunable comes from the
+    /// node's config.
+    fn spawn_group(
+        &self,
+        group: GroupId,
+        routing: Option<mpsc::Sender<Event>>,
+        profile: GroupProfile,
+    ) -> Group {
         // Tick often enough to service the tightest engine deadline (probe
         // timeouts are the shortest), so failure detection isn't lagged by a
         // coarse gossip-only cadence. Sampling at `TICKS_PER_DEADLINE`× the
@@ -135,11 +266,26 @@ impl<T: Transport> Node<T> {
 
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
 
+        // The group's *own* config: the node's, with only the mode replaced.
+        // Every group has had its own `Arc<Config>` since M0, so a per-group
+        // mode costs nothing new — and the routing group is force-pinned
+        // Eventual here, the one place every join funnels through. It is
+        // fabric plumbing carrying the cluster's routing table on every node;
+        // electing a host for it would put an epoch-fenced authority in front
+        // of the table every other group publishes into, for no gain. No
+        // profile (and no node-wide `Config::mode`) can opt it in.
+        let mut config = self.inner.config.clone();
+        config.mode = if group.as_str() == ROUTING_GROUP {
+            GroupMode::Eventual
+        } else {
+            profile.mode
+        };
+
         let engine = GroupEngine::new(
             group.clone(),
             self.inner.id.clone(),
             self.inner.seeds.iter().cloned(),
-            self.inner.config.clone(),
+            config.clone(),
         );
 
         // Seed the readable views from the engine's current truth. The engine
@@ -147,6 +293,9 @@ impl<T: Transport> Node<T> {
         // stays) its own coordinator would otherwise never publish an initial
         // value.
         let (coord_tx, coord_rx) = watch::channel(engine.coordinator().cloned());
+        let (epoch, host) = engine.leadership();
+        let (lead_tx, lead_rx) =
+            watch::channel(Leadership::observed(epoch, host.cloned(), &self.inner.id));
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let initial_members: Vec<NodeId> = engine.members().cloned().collect();
         let (members_tx, members_rx) = watch::channel(Arc::new(initial_members));
@@ -155,11 +304,10 @@ impl<T: Transport> Node<T> {
         let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());
         let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
 
-        let cfg = &self.inner.config;
-        let tightest_deadline_ms = cfg
+        let tightest_deadline_ms = config
             .gossip_interval_ms
-            .min(cfg.probe_interval_ms)
-            .min(cfg.probe_timeout_ms);
+            .min(config.probe_interval_ms)
+            .min(config.probe_timeout_ms);
         let tick_period = Duration::from_millis((tightest_deadline_ms / TICKS_PER_DEADLINE).max(1));
         tokio::spawn(group_task(
             engine,
@@ -167,6 +315,7 @@ impl<T: Transport> Node<T> {
             self.inner.transport.clone(),
             Publishers {
                 coordinator: coord_tx,
+                leadership: lead_tx,
                 metadata: meta_tx,
                 members: members_tx,
                 statuses: statuses_tx,
@@ -179,17 +328,18 @@ impl<T: Transport> Node<T> {
             tick_period,
         ));
 
-        let handle = Group::new(
-            group.clone(),
+        Group::new(
+            group,
             self.inner.id.clone(),
-            // The *effective* config this node was built with, shared with
-            // every handle to the group so a consumer sizes its timing
-            // windows off what is actually running.
-            Arc::new(self.inner.config.clone()),
+            // The *effective* config this group is running — the node's, with
+            // this group's mode — shared with every handle to it so a consumer
+            // sizes its timing windows off what is actually running.
+            Arc::new(config),
             self.inner.start,
             tx,
             GroupViews {
                 coordinator: coord_rx,
+                leadership: lead_rx,
                 metadata: meta_rx,
                 members: members_rx,
                 statuses: statuses_rx,
@@ -197,13 +347,7 @@ impl<T: Transport> Node<T> {
                 net_stats: net_stats_rx,
                 events: events_tx,
             },
-        );
-        self.inner
-            .routes
-            .lock()
-            .expect("routes mutex poisoned")
-            .insert(group, handle.clone());
-        handle
+        )
     }
 }
 
@@ -327,8 +471,13 @@ impl<T: Transport> NodeBuilder<T> {
         let advertise = self.advertise_addr;
         tokio::spawn(recv_loop(inner.clone()));
         let node = Node { inner };
-        // Join the reserved routing group (no coordinator publisher of its own).
-        let routing_group = node.spawn_group(GroupId::new(ROUTING_GROUP), None);
+        // Join the reserved routing group (no coordinator publisher of its
+        // own). `spawn_group` pins it Eventual whatever this asks for.
+        let routing_group = node.get_or_spawn(
+            GroupId::new(ROUTING_GROUP),
+            None,
+            GroupProfile::from_mode(node.inner.config.mode),
+        );
         if let Some(addr) = advertise {
             let _ = routing_group.set_entry("~addr", addr.into_bytes(), None);
         }

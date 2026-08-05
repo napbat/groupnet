@@ -254,10 +254,27 @@ CP path.
   churn. The derived coordinator itself is untouched.
 * **Epochs** are `u64`, monotone per group. A candidate claims
   `epoch = highest_seen + 1` via a new `LeadClaim` frame; peers answer
-  `LeadGrant` (Quorum: at most one grant per epoch per voter; Settle: grant
-  if claimant is the peer's top-ranked live candidate and the epoch is
-  higher). Current `(epoch, host)` rides a small `LeadState` frame on the
-  anti-entropy cadence for repair.
+  `LeadGrant` (Quorum: at most one grant per epoch per voter; Settle: grants
+  are defined on the wire but inert — activation is
+  settle-window-absence-of-a-beating-claim). Current `(epoch, host)` rides a
+  small `LeadState` frame on the anti-entropy cadence for repair.
+* **The fencing key is the pair `(epoch, host)`**, ordered epoch-major with
+  the deterministic rendezvous tiebreak at equal epochs (M1 finding, forced:
+  two symmetric partition sides with identical state can claim the same
+  integer, so a bare-`u64` global "no two hosts per epoch" is unachievable
+  in Settle mode — it returns as a strict guarantee under Quorum). Same-
+  epoch cross-partition activations heal deterministically: exactly one
+  pair survives, the loser is fenced and demoted.
+* **Self-naming state is learned, never adopted** (M1 finding, from DST
+  seed 45): a node that receives a `LeadState` naming **itself** at a
+  **strictly higher epoch** must not re-adopt its own hostship from an echo
+  — but it must still learn the epoch, step down to `(epoch, None)`, and
+  re-claim above it. Strictly-higher-*epoch*, not higher-*pair*: acting on
+  an equal-epoch echo of one's own hostship would either regress the
+  adopted pair or re-emit the step-down effect on every repair round — the
+  equal-epoch echo is deliberately inert (the fixed point the rule leaves
+  behind). Without this rule a restarted host wedges the cluster into
+  permanent disagreement on the fencing epoch while agreeing on the host.
 * **Leases and step-down.** The host's authority expires `lease_ms` after its
   last successful renewal; on expiry it demotes itself *before* the rest of
   the cluster can elect a successor (lease < election timeout). In the sim,
@@ -435,12 +452,25 @@ The deterministic simulator is the backbone. DST suites in the existing style
 (seeded `SplitMix64`, hundreds of seeds, scripted crash/restart/partition/
 heal schedules) assert the safety and liveness properties:
 
-* **S1** — no two nodes ever activate as host of the same epoch.
-* **S2** — a node's observed epoch never regresses.
+* **S1** — no two nodes ever activate as host of the same *fencing pair*
+  (true by construction — a pair names its activator; the DST-falsifiable
+  content is the interval fold: no node re-activates a pair it has left);
+  strict same-*epoch* uniqueness holds on partition-free runs (and returns
+  globally under Quorum activation, M3) — see the fencing-pair finding in
+  the election design above.
+* **S2** — a node's observed epoch never regresses, and its adopted pair
+  never regresses in the fencing order (modulo its own self-demotion step,
+  which is `(e, Some(self)) → (e, None)` by design).
 * **S3** (Quorum) — a side without a voter majority never activates; voter
   crash-restart seeds prove the grant blackout suffices.
-* **S4** — lease disjointness in virtual time: no instant with two unexpired
-  leases for one group.
+* **S4** — lease disjointness in virtual time, decomposed honestly for
+  Settle mode: **S4a** per fencing pair, only its named host ever holds a
+  lease, over at most one contiguous activation interval; **S4b** no node
+  is ever `Host` on an expired lease; **S4c** at most one unexpired lease
+  per group at any instant on partition-free runs (across a partition, two
+  unexpired leases may coexist only under *distinct* fencing pairs — the
+  documented Settle split-brain, fenced at heal). Quorum (M3) strengthens
+  S4c to global.
 * **S5** (with `Commit::QuorumApplied`) — no write acknowledged at the
   quorum-applied level is ever lost, across every crash/partition/migration
   schedule: after any activation, the new host's state contains every such

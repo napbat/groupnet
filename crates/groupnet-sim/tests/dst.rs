@@ -26,7 +26,7 @@
 use std::collections::BTreeSet;
 
 use groupnet_core::Time;
-use groupnet_core::{Command, Config, GroupEngine, GroupId, NodeId, Status, placement};
+use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Status, placement};
 use groupnet_sim::{Simulation, SplitMix64};
 
 /// The per-frame byte cap the DST holds the engines to. Small enough that the
@@ -56,6 +56,7 @@ fn cfg() -> Config {
         eager_push: true,
         full_digest_every: 4,
         max_delta_frame_bytes: FRAME_CAP,
+        mode: GroupMode::Eventual,
     }
 }
 
@@ -129,6 +130,19 @@ fn run_scenario(seed: u64) {
     sim.set_jitter(0);
     now += 20_000;
     sim.run_until(Time(now));
+
+    // Mode invariance: every group here is `GroupMode::Eventual`, and an
+    // Eventual group runs no election — not one election frame delivered, not
+    // one leadership transition, across the whole chaos schedule and settle.
+    assert_eq!(
+        sim.election_frames_seen(),
+        0,
+        "seed {seed}: an Eventual group carried an election frame"
+    );
+    assert!(
+        sim.leadership_log.is_empty(),
+        "seed {seed}: an Eventual group changed leadership"
+    );
 
     if alive.len() < 2 {
         return; // degenerate cluster, nothing to compare

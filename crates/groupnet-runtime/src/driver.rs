@@ -11,17 +11,37 @@ use groupnet_transport::Transport;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
+use crate::group::Leadership;
+
 /// A change notification a consumer can subscribe to via
 /// [`Group::events`](crate::Group::events). The stream is bounded: a slow
 /// subscriber observes `RecvError::Lagged` and must resync from the watch
 /// snapshots (which are always current) — events are edge triggers, not a
 /// reliable log.
+///
+/// An edge is published *after* the state it announces: a consumer woken by
+/// one and then reading the matching snapshot
+/// ([`Group::leadership`](crate::Group::leadership),
+/// [`coordinator`](crate::Group::coordinator),
+/// [`members`](crate::Group::members), …) sees at least the value that edge
+/// carried, never the one from before it.
 #[derive(Clone, Debug)]
 pub enum GroupEvent {
     /// The observed coordinator changed.
     CoordinatorChanged(Option<NodeId>),
     /// The membership set or some member's status changed.
     MembershipChanged,
+    /// The group's epoch-fenced host changed (a new host activated, the
+    /// incumbent was deposed, or the lease lapsed leaving none). Only a
+    /// [`GroupMode::Hosted`](groupnet_core::GroupMode) group emits this;
+    /// it is unrelated to [`CoordinatorChanged`](Self::CoordinatorChanged),
+    /// whose coordinator is derived and never authoritative.
+    LeadershipChanged {
+        /// The epoch this observation belongs to (monotone per group).
+        epoch: u64,
+        /// The host of that epoch, or `None` if the group has none.
+        host: Option<NodeId>,
+    },
     /// One key of a node's app-defined state changed.
     NodeStateChanged {
         /// The node whose entry changed.
@@ -93,6 +113,7 @@ pub(crate) enum Event {
 /// The `watch` senders a group actor publishes its readable state through.
 pub(crate) struct Publishers {
     pub coordinator: watch::Sender<Option<NodeId>>,
+    pub leadership: watch::Sender<Leadership>,
     pub metadata: watch::Sender<MetaSnapshot>,
     pub members: watch::Sender<MembersSnapshot>,
     pub statuses: watch::Sender<StatusesSnapshot>,
@@ -105,6 +126,7 @@ pub(crate) struct Publishers {
 /// through — the read-side mirror of [`Publishers`].
 pub(crate) struct GroupViews {
     pub coordinator: watch::Receiver<Option<NodeId>>,
+    pub leadership: watch::Receiver<Leadership>,
     pub metadata: watch::Receiver<MetaSnapshot>,
     pub members: watch::Receiver<MembersSnapshot>,
     pub statuses: watch::Receiver<StatusesSnapshot>,
@@ -136,8 +158,12 @@ pub(crate) async fn group_task<T: Transport>(
     start: Instant,
     tick_period: Duration,
 ) {
+    // The observer whose view every published `Leadership` is derived from.
+    // Cloned once so `dispatch` never has to borrow the engine.
+    let local = engine.local().clone();
+
     let boot = engine.start(now_since(start));
-    dispatch(&transport, &publishers.coordinator, boot).await;
+    dispatch(&transport, &publishers, &local, &boot).await;
 
     let mut ticker = tokio::time::interval(tick_period);
     // We approximate the engine's precise ArmTimer deadlines with a fixed
@@ -177,8 +203,11 @@ pub(crate) async fn group_task<T: Transport>(
                 _ => None,
             })
             .collect();
-        emit_events(&publishers.events, &effects);
-        dispatch(&transport, &publishers.coordinator, effects).await;
+        // Publish first, wake second. Every `watch` and snapshot this batch
+        // touches is republished *before* the matching `GroupEvent` goes out at
+        // the bottom of the loop, so a consumer woken by an edge always reads
+        // the state that edge announced — never the snapshot from before it.
+        dispatch(&transport, &publishers, &local, &effects).await;
         // Republish snapshots; readers borrow them lock-free.
         if meta_dirty {
             let snapshot: BTreeMap<String, String> = engine
@@ -224,11 +253,18 @@ pub(crate) async fn group_task<T: Transport>(
             }
             changed
         });
+        // Last: the edges. Everything they announce is already readable.
+        emit_events(&publishers.events, &effects);
     }
 }
 
 /// Forwards the engine's change effects onto the bounded event stream (a full
 /// stream lags slow subscribers instead of buffering unboundedly).
+///
+/// Called *after* every publish this batch produces (see the loop in
+/// [`group_task`]): an event is a wake-up whose whole purpose is to send the
+/// consumer to a snapshot read, so emitting it before that snapshot exists
+/// would hand it the pre-edge value.
 fn emit_events(events: &broadcast::Sender<GroupEvent>, effects: &[Effect]) {
     for effect in effects {
         let event = match effect {
@@ -236,6 +272,10 @@ fn emit_events(events: &broadcast::Sender<GroupEvent>, effects: &[Effect]) {
                 GroupEvent::CoordinatorChanged(coordinator.clone())
             }
             Effect::MembershipChanged => GroupEvent::MembershipChanged,
+            Effect::LeadershipChanged { epoch, host } => GroupEvent::LeadershipChanged {
+                epoch: *epoch,
+                host: host.clone(),
+            },
             Effect::NodeStateChanged { node, key } => GroupEvent::NodeStateChanged {
                 node: node.clone(),
                 key: key.clone(),
@@ -275,10 +315,17 @@ fn announce_coordinator(
     *announced = current;
 }
 
+/// Executes one batch of engine effects: sends frames, and republishes the
+/// `watch` views whose value an effect carries outright. `local` is the
+/// observer the [`Leadership`] role is derived against.
+///
+/// Runs before [`emit_events`] for the same batch, so the snapshots below are
+/// in place before any consumer is woken to read them.
 async fn dispatch<T: Transport>(
     transport: &Arc<T>,
-    coord_tx: &watch::Sender<Option<NodeId>>,
-    effects: Vec<Effect>,
+    publishers: &Publishers,
+    local: &NodeId,
+    effects: &[Effect],
 ) {
     for effect in effects {
         match effect {
@@ -286,11 +333,23 @@ async fn dispatch<T: Transport>(
                 // Best-effort: a send error is just a drop, which the protocol
                 // tolerates. Fanout is sequential here for clarity; a hot
                 // deployment can `join_all` these futures instead.
-                let _ = transport.send(&to, &wire).await;
+                let _ = transport.send(to, wire).await;
             }
             Effect::CoordinatorChanged { coordinator } => {
                 // Publish to readers; ignore error if no receivers remain.
-                let _ = coord_tx.send(coordinator);
+                let _ = publishers.coordinator.send(coordinator.clone());
+            }
+            Effect::LeadershipChanged { epoch, host } => {
+                // The role is observer-local: this node is the host exactly
+                // when the adopted pair names it. `Role::Claimant` cannot
+                // reach here — a standing claim emits no effect at all, so
+                // only an activation or a demotion ever republishes.
+                // The matching `GroupEvent` follows in `emit_events`, once
+                // this — the always-current snapshot behind it — is readable.
+                let _ =
+                    publishers
+                        .leadership
+                        .send(Leadership::observed(*epoch, host.clone(), local));
             }
             // ArmTimer is advisory — this driver uses a fixed-interval ticker.
             // Membership/metadata/state change signals are surfaced by

@@ -5,7 +5,7 @@ use crate::rng::SplitMix64;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use groupnet_core::{Command, Effect, GroupEngine, NodeId, Status, Time};
+use groupnet_core::{Command, Effect, GroupEngine, NodeId, Role, Status, Time};
 
 /// One scheduled future event in the simulation.
 struct Event {
@@ -67,6 +67,22 @@ pub struct Simulation {
     max_frame_bytes: usize,
     /// Observed coordinator transitions, in the order the sim saw them.
     pub coordinator_log: Vec<(NodeId, Option<NodeId>)>,
+    /// Observed leadership transitions — `(observer, epoch, host)` — in the
+    /// order the sim saw them. The Hosted-mode counterpart of
+    /// [`coordinator_log`](Self::coordinator_log); an `Eventual` run leaves it
+    /// empty, which is itself the assertion that mode invariance holds.
+    pub leadership_log: Vec<(NodeId, u64, Option<NodeId>)>,
+    /// How many delivered frames carried an election kind. See
+    /// [`election_frames_seen`](Self::election_frames_seen).
+    election_frames: u64,
+}
+
+/// Whether an encoded frame's kind tag names an election frame — wire kinds
+/// `8..=10` (`LeadClaim`, `LeadGrant`, `LeadState`). Read straight off the
+/// byte after the version, the same cheap peek `wire::peek_group` does, so
+/// counting costs nothing on the delivery path.
+fn is_election_frame(wire: &[u8]) -> bool {
+    matches!(wire.get(1).copied(), Some(8..=10))
 }
 
 impl std::fmt::Debug for Event {
@@ -96,6 +112,8 @@ impl Simulation {
             blocked: BTreeSet::new(),
             max_frame_bytes: 0,
             coordinator_log: Vec::new(),
+            leadership_log: Vec::new(),
+            election_frames: 0,
         }
     }
 
@@ -178,8 +196,15 @@ impl Simulation {
                     }
                     let effects = match self.engines.get_mut(&to) {
                         Some(engine) => engine.on_message(from, &wire, now),
-                        None => continue,
+                        None => continue, // a crashed node: nothing consumed it
                     };
+                    // Counted only once an engine has actually taken it — the
+                    // probe is "delivered to an engine", not "scheduled and not
+                    // dropped", so a frame still in flight to a node that has
+                    // since crashed is not election traffic anyone observed.
+                    if is_election_frame(&wire) {
+                        self.election_frames += 1;
+                    }
                     self.dispatch(&to, effects);
                 }
                 Kind::Tick { node } => {
@@ -194,12 +219,74 @@ impl Simulation {
         self.now = max;
     }
 
+    /// How many election frames (wire kinds `LeadClaim`, `LeadGrant`,
+    /// `LeadState`) the sim has actually delivered to an engine — frames lost
+    /// or blocked by a partition are not counted.
+    ///
+    /// This is the mode-invariance probe: a run of purely
+    /// [`GroupMode::Eventual`](groupnet_core::GroupMode) groups must end with
+    /// zero, proving the metadata-only contract really does cost no election
+    /// traffic.
+    #[must_use]
+    pub fn election_frames_seen(&self) -> u64 {
+        self.election_frames
+    }
+
     /// The coordinator a given node currently believes in.
     #[must_use]
     pub fn coordinator_of(&self, node: &NodeId) -> Option<NodeId> {
         self.engines
             .get(node)
             .and_then(|e| e.coordinator().cloned())
+    }
+
+    /// The `(epoch, host)` pair `node` has adopted, or `None` if it is not in
+    /// the simulation. `(0, None)` for a node whose group is
+    /// [`Eventual`](groupnet_core::GroupMode::Eventual) or which has not
+    /// adopted anything yet.
+    #[must_use]
+    pub fn leadership_of(&self, node: &NodeId) -> Option<(u64, Option<NodeId>)> {
+        self.engines.get(node).map(|e| {
+            let (epoch, host) = e.leadership();
+            (epoch, host.cloned())
+        })
+    }
+
+    /// The election role `node` currently plays, or `None` if it is not in the
+    /// simulation.
+    #[must_use]
+    pub fn role_of(&self, node: &NodeId) -> Option<Role> {
+        self.engines.get(node).map(GroupEngine::role)
+    }
+
+    /// Every node that currently believes *itself* to be the host, in id
+    /// order — the split-brain probe. More than one entry means two nodes hold
+    /// the group at once, which `Settle` permits only inside the lease window;
+    /// a test asserts on the count and on how long it lasts.
+    #[must_use]
+    pub fn hosts(&self) -> Vec<NodeId> {
+        self.engines
+            .iter()
+            .filter(|(_, e)| e.role() == Role::Host)
+            .map(|(node, _)| node.clone())
+            .collect()
+    }
+
+    /// The highest epoch `node` has observed from any source, or `None` if it
+    /// is not in the simulation.
+    #[must_use]
+    pub fn observed_epoch_of(&self, node: &NodeId) -> Option<u64> {
+        self.engines.get(node).map(GroupEngine::observed_epoch)
+    }
+
+    /// When `node`'s hostship expires if it stops renewing — `None` unless it
+    /// is in the simulation *and* currently a host. Read in exact virtual
+    /// time, which is what lets a test check lease disjointness precisely.
+    #[must_use]
+    pub fn lease_until_of(&self, node: &NodeId) -> Option<Time> {
+        self.engines
+            .get(node)
+            .and_then(GroupEngine::host_lease_until)
     }
 
     /// How many members `node` currently knows about.
@@ -372,6 +459,9 @@ impl Simulation {
                 }
                 Effect::CoordinatorChanged { coordinator } => {
                     self.coordinator_log.push((node.clone(), coordinator));
+                }
+                Effect::LeadershipChanged { epoch, host } => {
+                    self.leadership_log.push((node.clone(), epoch, host));
                 }
                 Effect::MembershipChanged
                 | Effect::NodeStateChanged { .. }

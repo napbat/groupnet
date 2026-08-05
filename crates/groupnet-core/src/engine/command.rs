@@ -100,6 +100,10 @@ impl GroupEngine {
                 effects
             }
             Command::Leave => {
+                // Give up hostship (or a standing claim) first, so this node
+                // never serves an epoch it has already announced it is gone
+                // from. A no-op in an `Eventual` group.
+                let mut effects = self.election_on_leave();
                 // Declare ourselves Dead at our current incarnation and stop
                 // refuting. Dead supersedes Alive at equal incarnation, so the
                 // leave sticks as it disseminates on the next digest round.
@@ -112,7 +116,7 @@ impl GroupEngine {
                     m.adopt_status(Status::Dead, now);
                 }
                 self.stamp_self();
-                let mut effects = vec![Effect::MembershipChanged];
+                effects.push(Effect::MembershipChanged);
                 effects.extend(self.recompute_coordinator());
                 self.nudge_anti_entropy();
                 effects

@@ -45,7 +45,7 @@ mod node;
 mod routing;
 
 pub use driver::GroupEvent;
-pub use group::{CommandRejected, Group, SyncCtx};
-pub use groupnet_core::Status;
-pub use node::{Node, NodeBuilder};
+pub use group::{CommandRejected, Group, Leadership, SyncCtx};
+pub use groupnet_core::{Role, Status};
+pub use node::{GroupProfile, Node, NodeBuilder};
 pub use routing::Routing;

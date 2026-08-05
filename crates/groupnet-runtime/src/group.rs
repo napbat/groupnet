@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Command, Config, GroupId, NetStats, NodeId, Status};
+use groupnet_core::{Command, Config, GroupId, NetStats, NodeId, Role, Status};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::driver::{
@@ -22,6 +22,65 @@ impl std::fmt::Display for CommandRejected {
 }
 
 impl std::error::Error for CommandRejected {}
+
+/// What this node believes its group's leadership to be: the adopted
+/// `(epoch, host)` pair, and the part this node plays in it.
+///
+/// Read it with [`Group::leadership`], which is a lock-free `watch` snapshot
+/// exactly like [`Group::coordinator`] — and republished by the driver every
+/// time the engine changes its belief. `Leadership { epoch: 0, host: None,
+/// role: Role::Follower }` before anything has been elected, and *forever* in
+/// an [`Eventual`](groupnet_core::GroupMode::Eventual) group, which runs no
+/// election at all.
+///
+/// **Observer-local, like every other read here.** During a partition two
+/// nodes legitimately report different pairs; the engine's epoch-major fencing
+/// order decides which one survives the heal. A `None` host at a non-zero
+/// epoch means the group is believed hostless *at that epoch* (a lease lapsed,
+/// or the incumbent stepped down) — the epoch is kept so a later pair still
+/// fences against it.
+///
+/// This is not the [`coordinator`](Group::coordinator). The coordinator is
+/// derived from the membership view and is never authoritative; the host is an
+/// epoch-fenced authority that only a [`Hosted`](groupnet_core::GroupMode::Hosted)
+/// group elects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Leadership {
+    /// The epoch of the adopted pair. Monotone per observer: it never
+    /// regresses, and a `None` host does not reset it.
+    pub epoch: u64,
+    /// The host of that epoch, or `None` if the group is believed hostless.
+    pub host: Option<NodeId>,
+    /// The part the local node plays — derived here, observer-locally, from
+    /// the pair itself: [`Role::Host`] exactly when [`host`](Self::host) names
+    /// this node, [`Role::Follower`] otherwise.
+    ///
+    /// **[`Role::Claimant`] never surfaces at the runtime layer in M1**, by
+    /// design: a claim is a bid, not authority. It changes nobody's belief —
+    /// not even the claimant's — until its settle window closes and it
+    /// activates, and a consumer that could observe `Claimant` here would be
+    /// tempted to read a standing claim as licence to serve, which is exactly
+    /// what the settle window exists to withhold. The engine still reports it
+    /// through [`GroupEngine::role`](groupnet_core::GroupEngine::role), where
+    /// the simulator asserts on it.
+    pub role: Role,
+}
+
+impl Leadership {
+    /// Derives `local`'s view of an adopted `(epoch, host)` pair.
+    ///
+    /// The single place the role is computed, so the boot seed in `node.rs`
+    /// and the driver's republish can never drift apart about what counts as
+    /// hosting.
+    pub(crate) fn observed(epoch: u64, host: Option<NodeId>, local: &NodeId) -> Self {
+        let role = if host.as_ref() == Some(local) {
+            Role::Host
+        } else {
+            Role::Follower
+        };
+        Self { epoch, host, role }
+    }
+}
 
 /// A transactional batch of shard-local operations, built inside
 /// [`Group::sync`]. Operations are collected and handed to the group actor to
@@ -44,8 +103,9 @@ impl SyncCtx {
 /// A handle to this node's participation in one group.
 ///
 /// Cheap to clone and hold; all state lives in the group's actor task. Reads
-/// ([`coordinator`](Self::coordinator), [`is_coordinator`](Self::is_coordinator))
-/// are lock-free snapshots via a `watch` channel.
+/// ([`coordinator`](Self::coordinator), [`is_coordinator`](Self::is_coordinator),
+/// [`leadership`](Self::leadership)) are lock-free snapshots via a `watch`
+/// channel.
 #[derive(Debug, Clone)]
 pub struct Group {
     id: GroupId,
@@ -60,6 +120,7 @@ pub struct Group {
     start: Instant,
     tx: mpsc::Sender<Event>,
     coord_rx: watch::Receiver<Option<NodeId>>,
+    leadership_rx: watch::Receiver<Leadership>,
     meta_rx: watch::Receiver<MetaSnapshot>,
     members_rx: watch::Receiver<MembersSnapshot>,
     statuses_rx: watch::Receiver<StatusesSnapshot>,
@@ -84,6 +145,7 @@ impl Group {
             start,
             tx,
             coord_rx: views.coordinator,
+            leadership_rx: views.leadership,
             meta_rx: views.metadata,
             members_rx: views.members,
             statuses_rx: views.statuses,
@@ -143,6 +205,33 @@ impl Group {
     #[must_use]
     pub fn is_coordinator(&self) -> bool {
         self.coord_rx.borrow().as_ref() == Some(&self.local)
+    }
+
+    /// What this node believes the group's epoch-fenced leadership to be — see
+    /// [`Leadership`] for the (deliberately narrow) guarantees.
+    ///
+    /// A lock-free snapshot of the same `watch` shape as
+    /// [`coordinator`](Self::coordinator), republished whenever the engine
+    /// changes its adopted pair. An
+    /// [`Eventual`](groupnet_core::GroupMode::Eventual) group never elects, so
+    /// this reads `Leadership { epoch: 0, host: None, role: Role::Follower }`
+    /// for its whole life — opt a group in with
+    /// [`Node::join_group_with`](crate::Node::join_group_with).
+    ///
+    /// ```no_run
+    /// # fn demo(group: &groupnet_runtime::Group) {
+    /// use groupnet_runtime::Role;
+    /// let lead = group.leadership();
+    /// if lead.role == Role::Host {
+    ///     // We hold the group for `lead.epoch` — until our lease lapses or a
+    ///     // higher pair fences us. Stamp writes with the epoch; never assume
+    ///     // it is still current by the time they land.
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn leadership(&self) -> Leadership {
+        self.leadership_rx.borrow().clone()
     }
 
     /// The current live members (anything not `Dead`), in id order. Failed and

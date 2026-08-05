@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use groupnet_core::{Command, Config, GroupEngine, GroupId, NodeId, Status, Time};
+use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Status, Time};
 use groupnet_sim::{Simulation, SplitMix64};
 
 /// Seeds the shared deterministic PRNG so each schedule is reproducible.
@@ -50,6 +50,7 @@ fn cfg() -> Config {
         eager_push: true,
         full_digest_every: 4,
         max_delta_frame_bytes: 4_096,
+        mode: GroupMode::Eventual,
     }
 }
 

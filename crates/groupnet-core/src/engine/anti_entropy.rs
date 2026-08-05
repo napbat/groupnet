@@ -179,6 +179,7 @@ impl GroupEngine {
                 wants: Vec::new(),
                 members: Vec::new(),
                 metadata: meta,
+                lead: None,
             }));
             if i >= summaries.len() {
                 break;
@@ -290,6 +291,7 @@ impl GroupEngine {
                 wants: kept,
                 members: Vec::new(),
                 metadata: Vec::new(),
+                lead: None,
             }),
         }
     }
@@ -382,6 +384,7 @@ impl GroupEngine {
             wants: Vec::new(),
             members,
             metadata: Vec::new(),
+            lead: None,
         }))
     }
 

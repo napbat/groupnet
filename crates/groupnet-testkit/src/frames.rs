@@ -5,7 +5,9 @@
 //! [`groupnet_core`], so any crate can use them without dragging an async
 //! runtime into its test graph.
 
-use groupnet_core::{Config, Effect, GroupEngine, GroupId, NodeId, Status, wire};
+use groupnet_core::{
+    Activation, Config, Effect, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Status, wire,
+};
 
 /// The group every fixture frame and fixture engine belongs to. Tests are
 /// single-group, so one well-known id keeps senders and receivers agreeing.
@@ -20,6 +22,28 @@ pub fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
         NodeId::new(id),
         seeds.iter().map(|s| NodeId::new(*s)),
         Config::default(),
+    )
+}
+
+/// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`], opted into
+/// [`GroupMode::Hosted`] with [`Activation::Settle`] — the election fixture.
+///
+/// Everything else is the default [`Config`], so a hosted engine and an
+/// [`engine`] differ by exactly the mode, which is what makes the "an
+/// `Eventual` group runs no election" assertions meaningful.
+#[must_use]
+pub fn hosted_engine(id: &str, seeds: &[&str], claim_settle_ms: u64, lease_ms: u64) -> GroupEngine {
+    GroupEngine::new(
+        GroupId::new(TEST_GROUP),
+        NodeId::new(id),
+        seeds.iter().map(|s| NodeId::new(*s)),
+        Config {
+            mode: GroupMode::Hosted(HostedConfig {
+                activation: Activation::Settle { claim_settle_ms },
+                lease_ms,
+            }),
+            ..Config::default()
+        },
     )
 }
 
@@ -49,6 +73,7 @@ pub fn digest_frame(digest: Vec<wire::NodeDigest>, metadata: Vec<wire::MetaDelta
         wants: Vec::new(),
         members: Vec::new(),
         metadata,
+        lead: None,
     })
 }
 
@@ -63,6 +88,7 @@ pub fn delta_frame(members: Vec<wire::MemberDelta>) -> Vec<u8> {
         wants: Vec::new(),
         members,
         metadata: Vec::new(),
+        lead: None,
     })
 }
 
@@ -78,7 +104,61 @@ pub fn probe_frame(kind: wire::Kind, target: Option<NodeId>) -> Vec<u8> {
         wants: Vec::new(),
         members: Vec::new(),
         metadata: Vec::new(),
+        lead: None,
     })
+}
+
+/// An election frame of `kind` carrying `body` — the one place the fixtures
+/// build a Hosted-mode frame, so the kind and the body can never disagree.
+fn lead_frame(kind: wire::Kind, body: wire::LeadBody) -> Vec<u8> {
+    wire::encode(&wire::Frame {
+        kind,
+        group: GroupId::new(TEST_GROUP),
+        target: None,
+        digest: Vec::new(),
+        wants: Vec::new(),
+        members: Vec::new(),
+        metadata: Vec::new(),
+        lead: Some(body),
+    })
+}
+
+/// A `LeadClaim` frame: `claimant` bidding for the host role at `epoch`.
+#[must_use]
+pub fn lead_claim_frame(epoch: u64, claimant: &str) -> Vec<u8> {
+    lead_frame(
+        wire::Kind::LeadClaim,
+        wire::LeadBody::Claim {
+            epoch,
+            claimant: NodeId::new(claimant),
+        },
+    )
+}
+
+/// A `LeadGrant` frame: `granter` endorsing `claimant` for `epoch`.
+#[must_use]
+pub fn lead_grant_frame(epoch: u64, claimant: &str, granter: &str) -> Vec<u8> {
+    lead_frame(
+        wire::Kind::LeadGrant,
+        wire::LeadBody::Grant {
+            epoch,
+            claimant: NodeId::new(claimant),
+            granter: NodeId::new(granter),
+        },
+    )
+}
+
+/// A `LeadState` repair frame: the sender's current `(epoch, host)` belief.
+/// `host` is `None` when the sender holds no host for that epoch.
+#[must_use]
+pub fn lead_state_frame(epoch: u64, host: Option<&str>) -> Vec<u8> {
+    lead_frame(
+        wire::Kind::LeadState,
+        wire::LeadBody::State {
+            epoch,
+            host: host.map(NodeId::new),
+        },
+    )
 }
 
 /// One liveness-only digest summary for `node`.

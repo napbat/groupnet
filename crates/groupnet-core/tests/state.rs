@@ -400,6 +400,7 @@ fn delete_offers_a_tombstone_in_a_delta_then_reaps_it_without_resurrection() {
         }],
         members: vec![],
         metadata: vec![],
+        lead: None,
     });
     let delta = wire::decode(
         &a.on_message(NodeId::new("b"), &req, Time(1_000))

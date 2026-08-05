@@ -19,6 +19,10 @@
 //! * [`Kind::Ping`] / [`Kind::Ack`] / [`Kind::PingReq`] / [`Kind::IndirectAck`] —
 //!   SWIM liveness probes. Since v3 these carry **no** piggybacked view; they are
 //!   tiny.
+//! * [`Kind::LeadClaim`] / [`Kind::LeadGrant`] / [`Kind::LeadState`] — the
+//!   Hosted-mode election, carried in a [`LeadBody`]. Added inside `v3` as new
+//!   kinds (an old node drops an unknown kind), so an `Eventual` group's bytes
+//!   are untouched and never sees one.
 //!
 //! The codec is a small hand-rolled length-prefixed format (little-endian),
 //! deliberately dependency-free.
@@ -59,6 +63,60 @@ pub enum Kind {
     /// "[`Frame::target`] answered my relayed probe" — an indirect prober's
     /// report back to the origin that the target is alive. Carries no view.
     IndirectAck,
+    /// A candidate bids to become the group's host for an epoch. Body:
+    /// [`LeadBody::Claim`].
+    LeadClaim,
+    /// A peer's answer to a [`Kind::LeadClaim`], endorsing the claimant for
+    /// that epoch. Body: [`LeadBody::Grant`].
+    LeadGrant,
+    /// The sender's current `(epoch, host)` belief, riding the anti-entropy
+    /// cadence so a node that missed the election converges on it. Body:
+    /// [`LeadBody::State`].
+    LeadState,
+}
+
+/// The body of an election frame — the payload of a [`Kind::LeadClaim`],
+/// [`Kind::LeadGrant`], or [`Kind::LeadState`].
+///
+/// One enum rather than three sets of optional [`Frame`] fields, because an
+/// election frame is exactly one of these shapes: the variant and the
+/// [`Kind`] must agree, and [`decode`] only ever produces a matching pair.
+///
+/// These frames exist only in a group whose [`GroupMode`] is
+/// `Hosted`; an `Eventual` group never emits one.
+///
+/// [`GroupMode`]: crate::GroupMode
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeadBody {
+    /// "I claim `epoch`" — a candidate bidding for the host role. The epoch is
+    /// one above the highest the claimant has seen, so a claim never
+    /// re-litigates a settled epoch.
+    Claim {
+        /// The epoch being claimed.
+        epoch: u64,
+        /// The node bidding for the host role.
+        claimant: NodeId,
+    },
+    /// "I endorse `claimant` for `epoch`" — a peer's answer to a claim.
+    Grant {
+        /// The epoch the grant is scoped to. A grant is only ever counted
+        /// against the claim it names.
+        epoch: u64,
+        /// The node being endorsed.
+        claimant: NodeId,
+        /// The node issuing the endorsement (the grant's author — a claimant
+        /// tallies at most one grant per granter per epoch).
+        granter: NodeId,
+    },
+    /// The sender's current `(epoch, host)` belief, for repair. `host` is
+    /// `None` when the sender knows of an epoch but holds no live host for it
+    /// (a lease lapsed, or the host was declared dead).
+    State {
+        /// The epoch this belief is about.
+        epoch: u64,
+        /// The host of that epoch, or `None` if the sender holds none.
+        host: Option<NodeId>,
+    },
 }
 
 /// One key of a member's app-defined state, as the sender holds it. Each key
@@ -175,6 +233,11 @@ pub struct Frame {
     pub members: Vec<MemberDelta>,
     /// Metadata register set — populated on a [`Kind::Digest`] (small, bounded).
     pub metadata: Vec<MetaDelta>,
+    /// The election body — `Some` exactly on a [`Kind::LeadClaim`],
+    /// [`Kind::LeadGrant`], or [`Kind::LeadState`], and `None` on every other
+    /// kind. [`decode`] guarantees the variant matches the kind; [`encode`]
+    /// debug-asserts it.
+    pub lead: Option<LeadBody>,
 }
 
 /// Protocol version, the first byte of every frame. Bumped to **3** for
@@ -193,6 +256,9 @@ const KIND_PING_REQ: u8 = 4;
 const KIND_INDIRECT_ACK: u8 = 5;
 const KIND_DELTA_REQUEST: u8 = 6;
 const KIND_DELTA: u8 = 7;
+const KIND_LEAD_CLAIM: u8 = 8;
+const KIND_LEAD_GRANT: u8 = 9;
+const KIND_LEAD_STATE: u8 = 10;
 
 /// Caps how much a decoder pre-allocates from a frame's self-declared element
 /// count. A corrupt or hostile frame can claim a huge count, so we reserve at
@@ -209,6 +275,19 @@ fn kind_to_u8(k: Kind) -> u8 {
         Kind::IndirectAck => KIND_INDIRECT_ACK,
         Kind::DeltaRequest => KIND_DELTA_REQUEST,
         Kind::Delta => KIND_DELTA,
+        Kind::LeadClaim => KIND_LEAD_CLAIM,
+        Kind::LeadGrant => KIND_LEAD_GRANT,
+        Kind::LeadState => KIND_LEAD_STATE,
+    }
+}
+
+/// The [`Kind`] a given election body belongs on — the pairing [`encode`]
+/// debug-asserts and [`decode`] upholds.
+fn lead_kind(body: &LeadBody) -> Kind {
+    match body {
+        LeadBody::Claim { .. } => Kind::LeadClaim,
+        LeadBody::Grant { .. } => Kind::LeadGrant,
+        LeadBody::State { .. } => Kind::LeadState,
     }
 }
 
@@ -221,6 +300,9 @@ fn kind_from_u8(b: u8) -> Option<Kind> {
         KIND_INDIRECT_ACK => Some(Kind::IndirectAck),
         KIND_DELTA_REQUEST => Some(Kind::DeltaRequest),
         KIND_DELTA => Some(Kind::Delta),
+        KIND_LEAD_CLAIM => Some(Kind::LeadClaim),
+        KIND_LEAD_GRANT => Some(Kind::LeadGrant),
+        KIND_LEAD_STATE => Some(Kind::LeadState),
         _ => None,
     }
 }
@@ -283,9 +365,51 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
                 }
             }
         }
+        Kind::LeadClaim | Kind::LeadGrant | Kind::LeadState => {
+            debug_assert!(
+                frame.lead.as_ref().map(lead_kind) == Some(frame.kind),
+                "an election frame must carry the body its kind names"
+            );
+            // A `None` here is the mismatch the assert above catches in tests;
+            // in release the bodiless frame simply fails to decode at the
+            // receiver, which drops it — the same fate as any corrupt frame.
+            if let Some(body) = &frame.lead {
+                put_lead(&mut out, body);
+            }
+        }
         Kind::Ping | Kind::Ack | Kind::PingReq | Kind::IndirectAck => {}
     }
     out
+}
+
+/// Writes an election body: `u64` epoch first in every variant, then the
+/// variant's node ids (`State`'s host behind a presence byte).
+fn put_lead(out: &mut Vec<u8>, body: &LeadBody) {
+    match body {
+        LeadBody::Claim { epoch, claimant } => {
+            put_u64(out, *epoch);
+            put_str(out, claimant.as_str());
+        }
+        LeadBody::Grant {
+            epoch,
+            claimant,
+            granter,
+        } => {
+            put_u64(out, *epoch);
+            put_str(out, claimant.as_str());
+            put_str(out, granter.as_str());
+        }
+        LeadBody::State { epoch, host } => {
+            put_u64(out, *epoch);
+            match host {
+                Some(h) => {
+                    out.push(1);
+                    put_str(out, h.as_str());
+                }
+                None => out.push(0),
+            }
+        }
+    }
 }
 
 #[expect(
@@ -329,6 +453,7 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
         wants: Vec::new(),
         members: Vec::new(),
         metadata: Vec::new(),
+        lead: None,
     };
 
     match kind {
@@ -397,10 +522,41 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
                 });
             }
         }
+        Kind::LeadClaim | Kind::LeadGrant | Kind::LeadState => {
+            frame.lead = Some(get_lead(kind, &mut cur)?);
+        }
         Kind::Ping | Kind::Ack | Kind::PingReq | Kind::IndirectAck => {}
     }
 
     Some(frame)
+}
+
+/// Reads the election body an election `kind` promises. A frame of kind 8–10
+/// is only well-formed with one, so a missing or truncated body is `None` —
+/// the whole frame is then dropped, like any other malformed input.
+fn get_lead(kind: Kind, cur: &mut &[u8]) -> Option<LeadBody> {
+    let epoch = get_u64(cur)?;
+    Some(match kind {
+        Kind::LeadClaim => LeadBody::Claim {
+            epoch,
+            claimant: NodeId::new(get_str(cur)?),
+        },
+        Kind::LeadGrant => LeadBody::Grant {
+            epoch,
+            claimant: NodeId::new(get_str(cur)?),
+            granter: NodeId::new(get_str(cur)?),
+        },
+        Kind::LeadState => LeadBody::State {
+            epoch,
+            host: match take_u8(cur)? {
+                0 => None,
+                1 => Some(NodeId::new(get_str(cur)?)),
+                _ => return None,
+            },
+        },
+        // Only the three election kinds reach here; `decode` matches on them.
+        _ => return None,
+    })
 }
 
 fn get_metadata(cur: &mut &[u8]) -> Option<Vec<MetaDelta>> {
@@ -577,6 +733,7 @@ mod tests {
                 writer: NodeId::new("node-a"),
                 value: "v3".into(),
             }],
+            lead: None,
         }
     }
 
@@ -617,6 +774,7 @@ mod tests {
                 ],
             }],
             metadata: vec![],
+            lead: None,
         }
     }
 
@@ -638,6 +796,7 @@ mod tests {
             ],
             members: vec![],
             metadata: vec![],
+            lead: None,
         }
     }
 
@@ -650,7 +809,46 @@ mod tests {
             wants: vec![],
             members: vec![],
             metadata: vec![],
+            lead: None,
         }
+    }
+
+    /// An election frame carrying `body`, on the kind that body belongs to.
+    fn lead_sample(body: LeadBody) -> Frame {
+        Frame {
+            kind: lead_kind(&body),
+            group: GroupId::new("shard-42"),
+            target: None,
+            digest: vec![],
+            wants: vec![],
+            members: vec![],
+            metadata: vec![],
+            lead: Some(body),
+        }
+    }
+
+    /// Every election body shape, including a `State` with and without a host —
+    /// the two branches of its optional-host byte.
+    fn lead_samples() -> Vec<Frame> {
+        vec![
+            lead_sample(LeadBody::Claim {
+                epoch: 7,
+                claimant: NodeId::new("node-a"),
+            }),
+            lead_sample(LeadBody::Grant {
+                epoch: 7,
+                claimant: NodeId::new("node-a"),
+                granter: NodeId::new("node-b"),
+            }),
+            lead_sample(LeadBody::State {
+                epoch: 7,
+                host: Some(NodeId::new("node-a")),
+            }),
+            lead_sample(LeadBody::State {
+                epoch: 0,
+                host: None,
+            }),
+        ]
     }
 
     #[test]
@@ -660,11 +858,50 @@ mod tests {
             delta_sample(),
             request_sample(),
             ping_req_sample(),
-        ] {
+        ]
+        .into_iter()
+        .chain(lead_samples())
+        {
             let bytes = encode(&frame);
             assert_eq!(decode(&bytes), Some(frame.clone()));
             assert_eq!(peek_group(&bytes), Some(GroupId::new("shard-42")));
         }
+    }
+
+    #[test]
+    fn an_election_frame_decodes_to_the_body_its_kind_names() {
+        // The kind tag and the `lead` variant are never allowed to disagree.
+        for frame in lead_samples() {
+            let decoded = decode(&encode(&frame)).expect("a well-formed election frame");
+            assert_eq!(
+                decoded.lead.as_ref().map(lead_kind),
+                Some(decoded.kind),
+                "kind {:?} decoded to a mismatched body",
+                frame.kind
+            );
+        }
+    }
+
+    #[test]
+    fn an_election_frame_missing_its_body_decodes_to_none() {
+        // A kind in 8..=10 requires a well-formed body: a bare header is not a
+        // frame with an empty body, it is undecodable.
+        for kind in [KIND_LEAD_CLAIM, KIND_LEAD_GRANT, KIND_LEAD_STATE] {
+            let mut bytes = encode(&ping_req_sample());
+            bytes[1] = kind;
+            assert_eq!(decode(&bytes), None, "kind {kind} accepted a probe body");
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_decodes_to_none() {
+        // 11 is the first unassigned tag: an old node must drop a future kind
+        // rather than misread it, which is what lets new kinds land inside v3.
+        let mut bytes = encode(&digest_sample());
+        bytes[1] = 11;
+        assert_eq!(decode(&bytes), None);
+        // ...but the group is still peekable, so a driver can demux it.
+        assert_eq!(peek_group(&bytes), Some(GroupId::new("shard-42")));
     }
 
     #[test]
@@ -679,6 +916,7 @@ mod tests {
             wants: vec![],
             members: vec![],
             metadata: vec![],
+            lead: None,
         };
         assert_eq!(encode(&ping).len(), 1 + 1 + (4 + 1) + 1);
     }
@@ -697,7 +935,10 @@ mod tests {
 
     #[test]
     fn truncated_input_decodes_to_none_not_panic() {
-        for frame in [digest_sample(), delta_sample(), request_sample()] {
+        for frame in [digest_sample(), delta_sample(), request_sample()]
+            .into_iter()
+            .chain(lead_samples())
+        {
             let bytes = encode(&frame);
             for cut in 0..bytes.len() {
                 let _ = decode(&bytes[..cut]); // must never panic

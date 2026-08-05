@@ -60,6 +60,7 @@ fn digest_frame(members: usize) -> Frame {
                 value: format!("shard-{i}"),
             })
             .collect(),
+        lead: None,
     }
 }
 
@@ -97,6 +98,7 @@ fn delta_frame(members: usize) -> Frame {
             })
             .collect(),
         metadata: Vec::new(),
+        lead: None,
     }
 }
 
@@ -115,6 +117,7 @@ fn request_frame(members: usize) -> Frame {
             .collect(),
         members: Vec::new(),
         metadata: Vec::new(),
+        lead: None,
     }
 }
 

@@ -192,6 +192,7 @@ impl GroupEngine {
                 wants: Vec::new(),
                 members: Vec::new(),
                 metadata: Vec::new(),
+                lead: None,
             }),
         }
     }

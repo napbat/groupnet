@@ -116,8 +116,16 @@ async fn a_restart_retires_the_previous_lifes_advertisement() {
     })
     .await;
 
-    // Tear the node down completely; B still holds (and will echo back) the
-    // first life's advertisement.
+    // Kill the node. Dropping the handles is *not* on its own enough: the
+    // node's receive loop owns an `Arc` of the same inner state that owns the
+    // transport, so its group actors keep ticking (and gossiping) with no
+    // handle left. What finishes the job here is the rebirth below —
+    // `spawn_mem_node` registers the id on the `Network` again, which replaces
+    // the sender, closes the old inbox, ends that receive loop and breaks the
+    // cycle. Between the two, a faithful process death.
+    //
+    // B, meanwhile, still holds (and will echo back) the first life's
+    // advertisement.
     drop(a_group);
     drop(a_node);
 

@@ -14,7 +14,7 @@ use std::fmt;
 use std::time::Duration;
 
 use groupnet_core::{GroupId, NodeId};
-use groupnet_runtime::{Group, Node};
+use groupnet_runtime::{Group, GroupProfile, Node};
 use groupnet_transport_mem::{MemTransport, Network};
 
 /// [`POLL_INTERVAL`] in milliseconds — the single literal both the interval and
@@ -88,6 +88,7 @@ pub struct NodeOpts {
     gossip_interval_ms: Option<u64>,
     anti_entropy_interval_ms: Option<u64>,
     advertise_addr: Option<String>,
+    group_profile: Option<GroupProfile>,
 }
 
 impl NodeOpts {
@@ -99,6 +100,7 @@ impl NodeOpts {
             gossip_interval_ms: None,
             anti_entropy_interval_ms: None,
             advertise_addr: None,
+            group_profile: None,
         }
     }
 
@@ -125,6 +127,21 @@ impl NodeOpts {
     #[must_use]
     pub fn advertise_addr(mut self, addr: impl Into<String>) -> Self {
         self.advertise_addr = Some(addr.into());
+        self
+    }
+
+    /// Joins the group under an explicit consistency posture — the fixture
+    /// then uses [`Node::join_group_with`](groupnet_runtime::Node::join_group_with)
+    /// instead of a bare `join_group`.
+    ///
+    /// Unset (the default) is a plain `join_group`, i.e. the node config's own
+    /// mode, i.e. `Eventual` — so every existing fixture keeps joining exactly
+    /// the group it always did. Set it to
+    /// [`GroupProfile::hosted`](groupnet_runtime::GroupProfile::hosted) for a
+    /// cluster that must elect a host.
+    #[must_use]
+    pub fn group_profile(mut self, profile: GroupProfile) -> Self {
+        self.group_profile = Some(profile);
         self
     }
 }
@@ -159,8 +176,18 @@ fn spawn_one(
     opts: &NodeOpts,
 ) -> (Node<MemTransport>, Group) {
     let node = build_node(net, id, seeds, opts);
-    let group = node.join_group(opts.group.clone());
+    let group = join(&node, opts);
     (node, group)
+}
+
+/// The one place a fixture joins its group, so the profile-carrying and the
+/// plain path can never drift: an unset [`NodeOpts::group_profile`] is a bare
+/// `join_group` (the node config's own mode), exactly as before.
+fn join(node: &Node<MemTransport>, opts: &NodeOpts) -> Group {
+    match opts.group_profile {
+        Some(profile) => node.join_group_with(opts.group.clone(), profile),
+        None => node.join_group(opts.group.clone()),
+    }
 }
 
 /// The one place a `Node` is actually built, so every fixture applies the same
@@ -266,6 +293,15 @@ impl MemClusterBuilder {
         self
     }
 
+    /// Joins every node's group under an explicit consistency posture — see
+    /// [`NodeOpts::group_profile`]. Unset, the cluster joins a plain
+    /// (`Eventual`) group.
+    #[must_use]
+    pub fn group_profile(mut self, profile: GroupProfile) -> Self {
+        self.opts = self.opts.group_profile(profile);
+        self
+    }
+
     /// Advertises a per-node address, derived from the node's id. Returning
     /// `None` leaves that node advertising nothing — see
     /// [`NodeOpts::advertise_addr`].
@@ -292,10 +328,7 @@ impl MemClusterBuilder {
             opts.advertise_addr = self.advertise.as_ref().and_then(|f| f(id));
             nodes.push(build_node(&net, id.clone(), seeds, &opts));
         }
-        let groups = nodes
-            .iter()
-            .map(|node| node.join_group(self.opts.group.clone()))
-            .collect();
+        let groups = nodes.iter().map(|node| join(node, &self.opts)).collect();
         MemCluster {
             net,
             ids: self.ids,
