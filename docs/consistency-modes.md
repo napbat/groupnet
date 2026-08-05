@@ -233,11 +233,17 @@ CP path.
   plainly.
 * **Voter durability (Quorum), stated honestly.** A voter that grants,
   crashes, and restarts within a claim window could double-grant (the classic
-  persistent-vote problem). The core stays storage-free; mitigation is a
-  **post-restart grant blackout** — a freshly booted voter refuses to grant
-  for ≥ `lease_ms`, converting durability into a timing rule DST can prove
-  sufficient in logical time. Drivers that do have durable storage may use an
-  optional recovered-state constructor instead.
+  persistent-vote problem). Raft solves it by *requiring* a persisted vote;
+  that is the one place this design deviates from the standard safety model,
+  and the deviation must not be the default posture. The rule: **a driver
+  with durable storage persists the grant** (a recovered-state constructor,
+  `GroupEngine::with_recovered(...)`, restores it on boot — docres-shaped
+  deployments always have a store); the **post-restart grant blackout** — a
+  freshly booted voter refuses to grant for ≥ `lease_ms` — is the documented
+  fallback for genuinely storage-free deployments, converting durability
+  into a timing rule DST can prove sufficient in logical time (but which,
+  in production, rests on "restart + boot exceeds the blackout" instead of
+  on nothing at all).
 * **Fencing surface.** A `Fence { epoch, host }` token exposed to the
   application, stamped onto data-plane operations and — critically —
   **external stores** (S3/R2 `If-Match`/`If-None-Match`). Gossip cannot
@@ -278,10 +284,11 @@ lease (or a per-read renewal); follower reads at a commit watermark are
 sequentially consistent, never linearizable. The strong profile's cost
 envelope — a majority round-trip per write, majority grants per election —
 is the deliberate, documented trade: right for single-digit rosters (a game
-session, a small cache cluster), wrong past that. It is view-stamped
-primary-backup in spirit and is **the ceiling**: the closest groupnet gets
-to consensus, constrained to fixed small rosters, with no general replicated
-log behind it (M4's boundary stands).
+session, a small cache cluster), wrong past that. Named plainly: this
+profile **is consensus** — view-stamped primary-backup over the existing
+feed — and it is **the ceiling**: constrained to fixed small rosters, with
+no general replicated log behind it (see M4 for the honest Raft
+comparison).
 
 #### Consumer mapping
 
@@ -297,16 +304,40 @@ log behind it (M4's boundary stands).
   acked state (or a small cache cluster wanting real strong) steps up to
   `Quorum` + `Commit::QuorumApplied`.
 
-### M4 — Quorum-replicated log (Raft-shaped): out of scope
+### M4 — the general replicated-log machine: out of scope
 
-Explicitly not on the roadmap. (a) It is a second product — log compaction,
-snapshot install, joint consensus, client sessions — inside a thin library
-whose identity is "without Raft, Paxos, or global consensus". (b) Neither
-consumer needs a replicated state machine: docres needs ownership/
-serialization (M3-External), s3cache needs coherence (T2). (c) The fence
-token deliberately makes an external CP store composable when a consumer
-truly needs one. One README sentence will draw this boundary. Revisit only
-against a concrete consumer.
+First, the honest concession (owner asked directly: "isn't our leader
+election just Raft?"): **the strong profile is consensus.** Epochs are
+terms; one-grant-per-epoch-per-voter with majority activation *is* Raft's
+vote rule; the safety of both rests on the same theorem (two majorities
+intersect). Once a group runs `Quorum` × `Commit::QuorumApplied`, groupnet
+contains in-fabric consensus, and no wording should pretend otherwise — the
+README's identity line softens to "leaderless **by default**", with
+consensus opt-in per group.
+
+What is *not* Raft, and why the distinction is substance rather than
+branding:
+
+| | Strong profile | Raft |
+|---|---|---|
+| Terms/epochs | epochs, monotone | terms — same role |
+| Candidate | deterministic (rendezvous top-ranked live) | any server, randomized timeouts |
+| Votes | ≤ 1 grant / epoch / voter, majority | same rule |
+| Vote durability | persisted grant when the driver has storage; restart-blackout fallback | persisted `votedFor`, mandatory |
+| Leader completeness | **recovery after winning**: fetch newest committed state from the heard majority (Viewstamped-Replication-style view change) | **election restriction**: stale candidates are refused votes |
+| Replication substrate | the existing session feed (bounded ring); a laggard gaps and state-resyncs | append-entries log, log matching, backtracking repair |
+| Compaction | none needed — state is the artifact, there is no unbounded log | snapshots + InstallSnapshot |
+| Membership change | none — static voter roster, changed by redeploy | joint consensus |
+| Scope | fixed single-digit rosters | general |
+
+So the accurate boundary is not "no Raft" but: **consensus comes in
+(opt-in, small static rosters, VR-style view change over the existing feed);
+the general replicated-log machine stays out** — log repair, compaction,
+snapshot install, dynamic reconfiguration, client sessions. Those are the
+second product this library refuses to become. Neither consumer needs it
+(docres: ownership/serialization via M3-External; s3cache: coherence via
+T2/T3), and the fence token keeps an external CP store composable for
+anyone who does. Revisit only against a concrete consumer.
 
 No other speculative modes: causal broadcast and multi-writer CRDT registers
 were considered and dropped for lack of consumer pull.
@@ -458,8 +489,13 @@ Open — for the owner:
 * **O2 — Section 7 scope.** Land the four consumer-pulled items as a
   pre-milestone (small, immediately useful to shipping consumers), fold them
   into Milestone 1, or defer?
-* **O3 — Raft boundary.** Confirm M4-Raft stays explicitly out of scope
-  (one README sentence drawing the line).
+* **O3 — the consensus boundary.** Reframed after the owner's challenge
+  ("isn't our leader election just Raft?"): the strong profile *is*
+  consensus (same vote rule, VR-style completeness), so the line to confirm
+  is not "no Raft" but "**consensus opt-in per group; the general
+  replicated-log machine never**" (no log repair/compaction/dynamic
+  reconfiguration/client sessions), plus softening the README identity line
+  to "leaderless by default". Confirm that boundary.
 * **O4 — naming.** `Hosted` / `host` / `GroupProfile` / `Activation` — happy
   with these names, or prefer e.g. `Leader`/`leader`?
 * **O5 — coherence-lease tier (T3).** Adopt the read-side freshness-lease
