@@ -23,6 +23,10 @@ Two words are load-bearing and must never blur:
   mode. In the common case the host lands on the same node the coordinator
   ranking picks, but it is a distinct concept with a distinct API.
 
+The two **coexist** in a Hosted group: the derived coordinator never goes
+away and never gains authority; the host is additive, opt-in, and the only
+bearer of authority.
+
 Likewise **modes** vs **tiers**:
 
 * A **mode** is per-group and changes the write path (Eventual, Hosted).
@@ -106,6 +110,34 @@ commit level (see *Commit levels* under M3) to get genuinely strong
 guarantees — every write pays a majority round-trip, which is exactly right
 for a game session or a small cache cluster and deliberately wrong at fleet
 scale.
+
+### The dial: what you want → what you pay
+
+The whole surface, as a practitioner chooses it (owner-confirmed
+2026-08-05). Configurations are per group and stack top-down; rows link to
+the sections that define them.
+
+| You want | You configure | The write path pays |
+|---|---|---|
+| Converges eventually, free | `Eventual` (default; derived coordinator only) — M0 | nothing — gossip amortizes it |
+| Read-your-writes, loss surfaced | + session tier — T1 | nothing extra |
+| One authoritative serializer, "good enough" | Hosted `Settle` × `Commit::Local` — M3 | nothing extra; a migration may lose the acked tail, surfaced as a loud `Gap` |
+| No node serves stale (cluster coherence) | acks tier — T2 (lease tier — T3 — proposed as its successor) | one cluster round per write |
+| **Guaranteed**: no acked write ever lost, no split-brain | Hosted `Quorum` × `Commit::QuorumApplied` — M3 | one voter-majority round per write |
+| **Guaranteed and fast** | Hosted `External` (CAS-anchored fencing) — M3 | ~nothing extra when writes already target a CAS-capable store |
+
+The organizing principle: **you pay for a guarantee where the guarantee
+lives.** In-fabric consensus costs a majority round-trip per write — right
+for small rosters with no external store (a game session). External CAS
+costs a store round-trip the consumer was usually already paying — docres's
+fencing rides on the durability writes themselves, which is why shardstore
+can honestly say "no election, no coordination round" while staying safe;
+that is the *guaranteed-and-fast* quadrant. Coherence tiers cost a cluster
+round because their guarantee is about **every reader**, not one writer —
+s3cache, which uses no leader of either kind. Eventual is free because it
+promises only convergence. And the knobs being per-group means one
+deployment mixes them: docres runs shard groups with External fencing while
+the fabric group underneath stays pure Eventual metadata.
 
 ### M0 — Eventual (base fabric; today; unchanged)
 
@@ -294,9 +326,11 @@ comparison).
 
 * **docres document ownership/locking** = Hosted mode per shard group with
   `Activation::External`: a "lock" is an ownership record written through the
-  host's serialized feed, carried with the fence token. This is a lift of the
-  pattern shardstore's `caslog/epoch.rs` already implements by hand — the
-  ambition is that shardstore could eventually shed that bespoke code.
+  host's serialized feed, carried with the fence token. This is the
+  *guaranteed-and-fast* quadrant of the dial — fencing amortizes onto
+  storage I/O docres already pays — and a lift of the pattern shardstore's
+  `caslog/epoch.rs` already implements by hand; the ambition is that
+  shardstore could eventually shed that bespoke code.
 * **s3cache** does not use Hosted mode at all; it is served by T2 plus the
   API gaps in Section 7.
 * **p2p-game-style consumers** use `Settle` + `Commit::Local` — the lobby
@@ -473,6 +507,12 @@ Taken (owner, 2026-08-05):
   `Activation::Quorum`, leases, blackout).
 * **D-place:** election implemented as an engine module in `groupnet-core`.
 * **D-process:** this document is reviewed and signed off before any code.
+* **D-dial:** the product shape is the dial in Section 3 — derived
+  coordinator always present and never authoritative; elected host opt-in
+  per group; guarantee level = activation × commit level; costs as tabled
+  ("you pay for a guarantee where the guarantee lives"), with docres in the
+  guaranteed-and-fast External quadrant and s3cache on the coherence tiers,
+  leaderless.
 
 Open — for the owner:
 
