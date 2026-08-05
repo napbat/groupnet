@@ -1,7 +1,8 @@
 # Consistency modes
 
-Status: **proposal — awaiting owner sign-off.** Nothing here is implemented.
-Decisions taken so far and decisions still open are listed at the end.
+Status: **accepted 2026-08-05 — all decisions resolved (Section 8);
+implementation begins with Milestone 0.** The milestone list in Section 6 is
+the build order of record.
 
 This document designs groupnet's consistency-mode surface: what each mode
 honestly guarantees, where each lives, and the order it gets built. It is
@@ -201,9 +202,9 @@ holds a lease to *serve*. Lease duration is the knob trading
 write-stall-under-failure against renewal traffic; renewals piggyback on the
 existing gossip cadence.
 
-Status: proposed, decision **O5**. If adopted, it slots after the election
-skeleton (which proves the lease machinery under DST) and before or beside
-the hosted write path.
+Status: **adopted** (decision D-lease) — sequenced as Milestone 2,
+immediately after the election skeleton proves the lease machinery under
+DST.
 
 ### M3 — Hosted mode (new)
 
@@ -453,35 +454,52 @@ and mixed-version compat tests (old node drops the new kinds).
 
 ## 6. Milestones
 
-Per the owner's decision, Quorum activation ships in the first slice — which
-pulls leases and the grant blackout forward (they are what makes Quorum mean
-anything):
+Build order of record (resolved 2026-08-05, decision D-order): prove each
+safety rung under DST before the next stands on it, and serve shipping
+consumers earliest. Settle is built first not because it is the priority but
+because it is the smallest activation that exercises the entire
+epoch/fencing/lease skeleton; Quorum and External land on the proven result.
 
-* **Milestone 1 — epoch-fenced election with Quorum activation.**
-  `election.rs` (epochs, claims/grants, `LeadState` repair), leases +
-  self-demotion, post-restart grant blackout, `Effect::LeadershipChanged`,
-  `Config.mode`, wire kinds + codec tests, sim dispatch + DST suite
-  (S1–S4, L1), runtime surfacing (`leadership()`, `join_group_with`,
-  `GroupEvent`). Excluded: write path, Settle, External, handoff.
-* **Milestone 2 — Settle activation** (the lobby policy) + fenced-split-brain
-  DST seeds (heal ⇒ one surviving epoch, loser surfaced).
-* **Milestone 3 — hosted write path.** `HostedWrites` in
-  `groupnet-consistency` behind `hosted`; fence surfacing; commit levels
-  (`Local` / `QuorumApplied` / `AllApplied`) with the leader-completeness
+* **Milestone 0 — consumer-pulled API (starts immediately).** The four
+  items of Section 7: detector-timing introspection, capability
+  advertisement, fencing-verdict roster, externally-typed sequence floors.
+  Small, independently valuable to shipping consumers, no election
+  dependency. Item 4 is the largest; if design shows it needs its own
+  slice, it splits out rather than delaying the other three.
+* **Milestone 1 — election skeleton with Settle activation.**
+  `election.rs`: epochs, `LeadClaim`/`LeadGrant`/`LeadState` frames + codec
+  round-trip tests, the epoch-major fencing merge rule, leases +
+  self-demotion, `Effect::LeadershipChanged`, `Config.mode`, `Settle`
+  activation; sim dispatch + DST (S1, S2, S4, L1, fenced-split-brain heal
+  seeds); runtime surfacing (`Group::leadership()`, `join_group_with`,
+  `GroupEvent::LeadershipChanged`). Excluded: voting, write path, anchors.
+* **Milestone 2 — coherence-lease tier (T3).** Reader serve-leases over the
+  freshly DST-proven lease machinery; writer invalidation blocks on
+  responsive lease-holders or lease lapse; the successor to s3cache's
+  unanimity-ack strong mode. Milestone 0's items 1–2 are part of its
+  contract.
+* **Milestone 3 — Quorum activation.** Static voter roster, one grant per
+  epoch per voter, persisted grants (restart-blackout fallback), minority
+  freeze (`NoLeader`); DST S3 including voter crash-restart seeds.
+* **Milestone 4 — hosted write path + commit levels.** `HostedWrites` in
+  `groupnet-consistency` behind feature `hosted`; fence surfacing;
+  `Local` / `QuorumApplied` / `AllApplied` with the leader-completeness
   recovery step gating activation when `QuorumApplied` is in force (DST
-  property S5); `NotHost`/`Deposed`; integration tests + a runnable
-  fenced-ownership example (the docres shape).
-* **Milestone 4 — external-CAS anchor.** `Activation::External` with an
-  `Anchor` trait (driver-side, async — runtime layer, never core); the
-  engine consumes anchor outcomes as commands; sim models the anchor as a
-  deterministic CAS register. This is the shardstore-pattern lift.
-* **Milestone 5 (optional) — handoff helper** over `BulkTransport`, plus
+  property S5); `NotHost`/`Deposed`; a runnable fenced-ownership example
+  (the docres shape). **The strong profile is complete at the end of this
+  milestone.**
+* **Milestone 5 — external-CAS anchor.** `Activation::External` with a
+  driver-side `Anchor` trait (runtime layer, never core); the engine
+  consumes anchor outcomes as commands; the sim models the anchor as a
+  deterministic CAS register. The shardstore-pattern lift — docres's
+  guaranteed-and-fast quadrant.
+* **Milestone 6 (optional) — handoff helper** over `BulkTransport`, plus
   host-scoped registers if fence tokens prove insufficient for docres locks.
 
 ## 7. Consumer-pulled adjacent work (independent of Hosted mode)
 
-Cheap, concrete, and directly "retains docres/s3cache support" — can land
-before or alongside Milestone 1:
+Cheap, concrete, and directly "retains docres/s3cache support". **This is
+Milestone 0** (decision D-api):
 
 1. **Detector-timing introspection** — expose the effective probe/suspect
    timings on the built `Node`/`Group` so s3cache stops reading
@@ -501,49 +519,35 @@ before or alongside Milestone 1:
 
 ## 8. Decisions
 
-Taken (owner, 2026-08-05):
+All resolved (owner, 2026-08-05). This ledger is final; reopen an entry only
+with a new owner decision.
 
-* **D-strong:** Quorum activation from day one (Milestone 1 includes
-  `Activation::Quorum`, leases, blackout).
 * **D-place:** election implemented as an engine module in `groupnet-core`.
-* **D-process:** this document is reviewed and signed off before any code.
+* **D-process:** this document was reviewed and accepted before code; it is
+  the contract of record for the work.
 * **D-dial:** the product shape is the dial in Section 3 — derived
   coordinator always present and never authoritative; elected host opt-in
   per group; guarantee level = activation × commit level; costs as tabled
   ("you pay for a guarantee where the guarantee lives"), with docres in the
   guaranteed-and-fast External quadrant and s3cache on the coherence tiers,
   leaderless.
-
-Open — for the owner:
-
-* **O1 — CP-anchor emphasis.** The consumer review found neither docres nor
-  s3cache needs in-fabric quorum: docres's strong path is external-CAS
-  fencing (shardstore's shipped design), s3cache needs the acks tier. Quorum
-  mode therefore serves the *generic base-library* ambition (and p2p-game
-  consumers wanting CP without an external store), not the current
-  consumers. Keep Quorum in Milestone 1 as decided, or resequence
-  (External first, Quorum second)? **Recommendation: keep the decided order
-  only if the generic-library goal outweighs time-to-value for docres;
-  otherwise swap Milestones — the skeleton is identical either way, so
-  nothing is thrown away.**
-* **O2 — Section 7 scope.** Land the four consumer-pulled items as a
-  pre-milestone (small, immediately useful to shipping consumers), fold them
-  into Milestone 1, or defer?
-* **O3 — the consensus boundary.** Reframed after the owner's challenge
-  ("isn't our leader election just Raft?"): the strong profile *is*
-  consensus (same vote rule, VR-style completeness), so the line to confirm
-  is not "no Raft" but "**consensus opt-in per group; the general
-  replicated-log machine never**" (no log repair/compaction/dynamic
-  reconfiguration/client sessions), plus softening the README identity line
-  to "leaderless by default". Confirm that boundary.
-* **O4 — naming.** `Hosted` / `host` / `GroupProfile` / `Activation` — happy
-  with these names, or prefer e.g. `Leader`/`leader`?
-* **O5 — coherence-lease tier (T3).** Adopt the read-side freshness-lease
-  tier as the successor to s3cache's strong mode (owner's assessment: the
-  current unanimity-ack strong mode is brittle)? If adopted: where in the
-  milestone order — immediately after Milestone 1 (it reuses the same lease
-  machinery, freshly DST-proven), or after the hosted write path? Adopting
-  it also raises the priority of Section 7 items 1–2, which become part of
-  its contract rather than nice-to-haves. **Recommendation: adopt, sequence
-  as Milestone 2 (displacing Settle to Milestone 3) — it is the most
-  consumer-pulled piece of the whole design.**
+* **D-name** (formerly O4): the elected role is **Hosted / host**
+  (`GroupMode::Hosted`, `Group::leadership()`, `HostedConfig`,
+  `Activation`). `Leader`/`Primary` rejected to keep distance from the
+  untouched derived coordinator.
+* **D-boundary** (formerly O3): consensus is **opt-in per group**; the
+  general replicated-log machine (log repair, compaction, dynamic
+  reconfiguration, client sessions) is **never** in scope; the README
+  identity line softens to "leaderless by default".
+* **D-order** (formerly O1; supersedes the sequencing half of the original
+  D-strong): the owner directed "the most proper and correct approach" —
+  **skeleton-first**. Epochs/fencing/leases are proven under DST with the
+  smallest activation (Settle, Milestone 1) before consensus stands on them
+  (Quorum, Milestone 3) and before the anchor (External, Milestone 5). The
+  commitment to Quorum itself is unchanged.
+* **D-lease** (formerly O5): the coherence-lease tier T3 is **adopted**,
+  sequenced as Milestone 2 — the most consumer-pulled piece of the design.
+* **D-api** (formerly O2): the four consumer-pulled items land first, as
+  **Milestone 0, starting immediately**.
+* **D-strong** (historical): Quorum activation is committed; its original
+  "day one" sequencing is superseded by D-order.
