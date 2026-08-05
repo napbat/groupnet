@@ -38,6 +38,7 @@
 //! [`groupnet-core`]: groupnet_core
 //! [`groupnet-sim`]: https://docs.rs/groupnet-sim
 
+mod capability;
 mod driver;
 mod group;
 mod node;

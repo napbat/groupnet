@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Config, GroupEngine, GroupId, NodeId, Status};
+use groupnet_core::{Config, GroupEngine, GroupId, NodeId};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
 use crate::driver::{
-    EVENTS_CAPACITY, Event, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers, group_task,
+    EVENTS_CAPACITY, Event, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers,
+    group_task, statuses_snapshot,
 };
 use crate::group::Group;
 use crate::routing::Routing;
@@ -149,11 +150,7 @@ impl<T: Transport> Node<T> {
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let initial_members: Vec<NodeId> = engine.members().cloned().collect();
         let (members_tx, members_rx) = watch::channel(Arc::new(initial_members));
-        let initial_statuses: BTreeMap<NodeId, Status> = engine
-            .member_statuses()
-            .map(|(n, s)| (n.clone(), s))
-            .collect();
-        let (statuses_tx, statuses_rx) = watch::channel(Arc::new(initial_statuses));
+        let (statuses_tx, statuses_rx) = watch::channel(statuses_snapshot(&engine));
         let (entries_tx, entries_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());
         let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
@@ -185,6 +182,11 @@ impl<T: Transport> Node<T> {
         let handle = Group::new(
             group.clone(),
             self.inner.id.clone(),
+            // The *effective* config this node was built with, shared with
+            // every handle to the group so a consumer sizes its timing
+            // windows off what is actually running.
+            Arc::new(self.inner.config.clone()),
+            self.inner.start,
             tx,
             GroupViews {
                 coordinator: coord_rx,

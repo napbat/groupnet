@@ -135,6 +135,16 @@ pub(crate) struct Member {
     pub(crate) incarnation: u64,
     /// The member's liveness as we last resolved it.
     pub(crate) status: Status,
+    /// When *this* observer last saw [`status`](Self::status) take a **new
+    /// value** — the instant the member has continuously held its current
+    /// status since. First adoption counts; re-merging the same status (at any
+    /// incarnation) does not move it, so it measures uninterrupted duration,
+    /// not last-touched.
+    ///
+    /// Distinct from [`suspect_since`](Self::suspect_since), which is the
+    /// suspicion *timer* and may legitimately re-arm on a higher-incarnation
+    /// suspicion while the status value stays `Suspect`.
+    pub(crate) status_since: Time,
     /// When *this* node first observed the member as `Suspect` (for the suspicion
     /// timeout). Only meaningful while `status == Suspect`.
     pub(crate) suspect_since: Time,
@@ -161,16 +171,37 @@ pub(crate) struct Member {
 }
 
 impl Member {
-    /// A fresh record at `incarnation`/`status`, with cleared timers and no state.
-    pub(crate) fn new(incarnation: u64, status: Status) -> Self {
+    /// A fresh record at `incarnation`/`status` adopted at `now`, with cleared
+    /// timers and no state. First adoption of a status counts as a change, so
+    /// `status_since` starts at `now`.
+    pub(crate) fn new(incarnation: u64, status: Status, now: Time) -> Self {
         Self {
             incarnation,
             status,
+            status_since: now,
             suspect_since: Time::ZERO,
             dead_since: Time::ZERO,
             entries: std::collections::BTreeMap::new(),
             max_state_version: 0,
             changed_at: 0,
+        }
+    }
+
+    /// Records a resolved liveness verdict, stamping
+    /// [`status_since`](Self::status_since) **only when the status value
+    /// actually changes**. A same-status re-merge — a repeated gossip claim, a
+    /// restatement at a higher incarnation — leaves the duration running,
+    /// which is what makes `status_since` a continuous-status stamp rather
+    /// than a last-touched one.
+    ///
+    /// The suspicion/death *timers* are the caller's: they re-arm on their own
+    /// rules (a higher-incarnation suspicion legitimately restarts
+    /// `suspect_since` while the status value stands still), so this never
+    /// touches them.
+    pub(crate) fn adopt_status(&mut self, status: Status, now: Time) {
+        if self.status != status {
+            self.status = status;
+            self.status_since = now;
         }
     }
 
@@ -214,5 +245,31 @@ mod tests {
         }
         assert_eq!(Status::from_wire(3), None);
         assert_eq!(Status::from_wire(u8::MAX), None);
+    }
+
+    /// `status_since` measures how long the *value* has stood: adoption starts
+    /// it, a real transition restarts it, and re-adopting the same status —
+    /// however many times — leaves it exactly where it was.
+    #[test]
+    fn status_since_tracks_value_changes_only() {
+        let mut m = Member::new(0, Status::Alive, Time(10));
+        assert_eq!(m.status_since, Time(10));
+
+        m.adopt_status(Status::Alive, Time(20));
+        assert_eq!(m.status_since, Time(10), "same status must not re-stamp");
+
+        m.adopt_status(Status::Suspect, Time(30));
+        assert_eq!(m.status_since, Time(30));
+        m.adopt_status(Status::Suspect, Time(40));
+        assert_eq!(m.status_since, Time(30), "same status must not re-stamp");
+
+        // The suspicion timer re-arms independently of the status stamp.
+        m.suspect_since = Time(40);
+        m.adopt_status(Status::Suspect, Time(50));
+        assert_eq!(m.status_since, Time(30));
+        assert_eq!(m.suspect_since, Time(40));
+
+        m.adopt_status(Status::Dead, Time(60));
+        assert_eq!(m.status_since, Time(60));
     }
 }

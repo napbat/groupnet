@@ -59,7 +59,23 @@ pub(crate) type MembersSnapshot = Arc<Vec<NodeId>>;
 /// A published, read-only snapshot of every known member's status (Alive/Suspect,
 /// plus not-yet-reaped Dead tombstones), so readers can route *around* a suspected
 /// peer that [`MembersSnapshot`] (the not-`Dead` set) still lists.
-pub(crate) type StatusesSnapshot = Arc<BTreeMap<NodeId, Status>>;
+///
+/// Each status carries the engine-logical [`Time`] this observer has held it
+/// continuously since, so a reader can turn a status into a *duration* —
+/// see [`Group::status_held_for`](crate::Group::status_held_for).
+pub(crate) type StatusesSnapshot = Arc<BTreeMap<NodeId, (Status, Time)>>;
+
+/// Collects the engine's whole status roster, stamps and all, into the shape
+/// [`StatusesSnapshot`] publishes. One place, so the boot snapshot in
+/// `node.rs` and the per-change republish below can never drift apart.
+pub(crate) fn statuses_snapshot(engine: &GroupEngine) -> StatusesSnapshot {
+    Arc::new(
+        engine
+            .member_statuses_since()
+            .map(|(n, s, since)| (n.clone(), (s, since)))
+            .collect(),
+    )
+}
 
 /// A published, read-only snapshot of every node's keyed app-defined state
 /// (live entries only — tombstoned/expired keys are absent). Two-level
@@ -174,11 +190,7 @@ pub(crate) async fn group_task<T: Transport>(
         if members_dirty {
             let snapshot: Vec<NodeId> = engine.members().cloned().collect();
             let _ = publishers.members.send(Arc::new(snapshot));
-            let statuses: BTreeMap<NodeId, Status> = engine
-                .member_statuses()
-                .map(|(n, s)| (n.clone(), s))
-                .collect();
-            let _ = publishers.statuses.send(Arc::new(statuses));
+            let _ = publishers.statuses.send(statuses_snapshot(&engine));
             announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
         }
         if !touched.is_empty() {

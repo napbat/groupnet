@@ -1,9 +1,12 @@
-use groupnet_core::{Command, GroupId, NetStats, NodeId, Status};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use groupnet_core::{Command, Config, GroupId, NetStats, NodeId, Status};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::driver::{
     Event, GroupEvent, GroupViews, MembersSnapshot, MetaSnapshot, NodeEntriesSnapshot,
-    StatusesSnapshot,
+    StatusesSnapshot, now_since,
 };
 
 /// A local command could not be enqueued: the group actor's bounded inbox is
@@ -47,6 +50,14 @@ impl SyncCtx {
 pub struct Group {
     id: GroupId,
     local: NodeId,
+    /// The effective protocol config the owning node was built with, shared
+    /// (never copied per handle) so [`config`](Self::config) can hand out a
+    /// borrow.
+    config: Arc<Config>,
+    /// The node's logical-time origin — the same instant the driver measures
+    /// the engine's [`Time`](groupnet_core::Time) from, so a published
+    /// `status_since` stamp and a read taken here share one clock.
+    start: Instant,
     tx: mpsc::Sender<Event>,
     coord_rx: watch::Receiver<Option<NodeId>>,
     meta_rx: watch::Receiver<MetaSnapshot>,
@@ -61,12 +72,16 @@ impl Group {
     pub(crate) fn new(
         id: GroupId,
         local: NodeId,
+        config: Arc<Config>,
+        start: Instant,
         tx: mpsc::Sender<Event>,
         views: GroupViews,
     ) -> Self {
         Self {
             id,
             local,
+            config,
+            start,
             tx,
             coord_rx: views.coordinator,
             meta_rx: views.metadata,
@@ -97,6 +112,26 @@ impl Group {
         &self.id
     }
 
+    /// The **effective** protocol config this node is running — the
+    /// builder-applied values, not [`Config::default`].
+    ///
+    /// Read failure-detector timings from here, never from the defaults: a
+    /// consumer that sizes a trust window off
+    /// [`Config::detection_window_ms`] against the defaults silently breaks
+    /// the moment a deployment retunes its probe/suspect timings, which is
+    /// exactly the drift this accessor exists to close.
+    ///
+    /// ```no_run
+    /// # fn demo(group: &groupnet_runtime::Group) {
+    /// let window = group.config().detection_window_ms(group.members().len());
+    /// # let _ = window;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// The coordinator this node currently believes in, or `None` before the
     /// first convergence.
     #[must_use]
@@ -123,7 +158,10 @@ impl Group {
     /// needs to route *around* a suspected peer before it is declared dead.
     #[must_use]
     pub fn member_status(&self, node: &NodeId) -> Option<Status> {
-        self.statuses_rx.borrow().get(node).copied()
+        self.statuses_rx
+            .borrow()
+            .get(node)
+            .map(|(status, _)| *status)
     }
 
     /// A snapshot of every known member and its status, in id order (includes
@@ -133,7 +171,93 @@ impl Group {
         self.statuses_rx
             .borrow()
             .iter()
-            .map(|(n, s)| (n.clone(), *s))
+            .map(|(n, (s, _))| (n.clone(), *s))
+            .collect()
+    }
+
+    /// The status this node perceives for `node`, **and how long it has held
+    /// that status uninterrupted** — the fencing-verdict primitive: "dead for
+    /// long enough ⇒ safe to fence", "healthy for long enough ⇒ safe to
+    /// unfence".
+    ///
+    /// The duration only restarts when the status *value* changes. Repeated
+    /// gossip re-asserting the same status leaves it running, so
+    /// `Some((Status::Dead, d))` with `d` past
+    /// [`Config::detection_window_ms`] is a real "this observer has been sure
+    /// for `d`" — not "the last message about it arrived `d` ago".
+    ///
+    /// **Observer-local, by construction.** This is *this* node's verdict from
+    /// *its* probes and the gossip it received. Two nodes can honestly report
+    /// different durations for the same peer, and a consumer that needs a
+    /// cluster-wide verdict must combine observers itself (or anchor the
+    /// durable act in a CAS-capable store, which is the pattern this feeds).
+    ///
+    /// **For the local node the duration is process lifetime, not group
+    /// tenure**: this node has been `Alive` since its own logical origin, so a
+    /// group joined an hour after boot still reports self as Alive for an
+    /// hour. Nothing observes the local node into a status, so there is no
+    /// observation to date it from. Fencing consumers read *peers*, where the
+    /// stamp is observation-based and means what it says.
+    ///
+    /// **Reap horizon — the one sharp edge.** A `Dead` tombstone is removed
+    /// `2 × dead_timeout_ms` after death, and from then on this returns
+    /// `None`: the duration is only readable *inside* that horizon, so a
+    /// long-departed node is indistinguishable from one never heard of. Two
+    /// remedies, both fine:
+    ///
+    /// * raise [`Config::dead_timeout_ms`] above the longest verdict window
+    ///   you need (it is already required to exceed the longest survivable
+    ///   partition), or
+    /// * treat `None` for a node you *know* was registered as "dead for at
+    ///   least `2 × dead_timeout_ms`" — which is what the reap actually
+    ///   proves, and is monotone in the safe direction for fencing.
+    ///
+    /// The duration is measured on the same logical clock the driver feeds the
+    /// engine, so it is directly comparable to
+    /// [`Config::detection_window_ms`]. Clamped at zero: a stamp cannot be in
+    /// the future.
+    #[must_use]
+    pub fn status_held_for(&self, node: &NodeId) -> Option<(Status, Duration)> {
+        let (status, since) = *self.statuses_rx.borrow().get(node)?;
+        let now = now_since(self.start);
+        Some((status, Duration::from_millis(now.0.saturating_sub(since.0))))
+    }
+
+    /// Every known member with its status **and how long this node has held
+    /// that status for it**, in id order — the roster-shaped
+    /// [`status_held_for`](Self::status_held_for), for a consumer that sweeps
+    /// the whole membership rather than asking about one peer.
+    ///
+    /// One borrow of the published snapshot and one clock read for the whole
+    /// roster, so every duration is measured against the same instant and the
+    /// membership cannot shift between entries — unlike `status_held_for` in a
+    /// loop, which takes a fresh borrow per node and can straddle a
+    /// republish, listing a member at one moment and a peer at another. That
+    /// consistency is the point for a fence maintainer (shardstore's, for
+    /// instance) deciding a whole shard map in one pass.
+    ///
+    /// Includes `Suspect` members and not-yet-reaped `Dead` tombstones, and
+    /// the local node — whose duration is process lifetime, with the same
+    /// caveats (and the same reap horizon) that
+    /// [`status_held_for`](Self::status_held_for) documents.
+    ///
+    /// **Policy stays with the caller.** This reports what is observed and for
+    /// how long; which threshold counts as "dead long enough to fence", and
+    /// what to do when it is met, is the consumer's decision and deliberately
+    /// not encoded here.
+    #[must_use]
+    pub fn statuses_held(&self) -> Vec<(NodeId, Status, Duration)> {
+        let now = now_since(self.start);
+        self.statuses_rx
+            .borrow()
+            .iter()
+            .map(|(node, (status, since))| {
+                (
+                    node.clone(),
+                    *status,
+                    Duration::from_millis(now.0.saturating_sub(since.0)),
+                )
+            })
             .collect()
     }
 

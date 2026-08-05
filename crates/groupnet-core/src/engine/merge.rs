@@ -36,9 +36,13 @@ impl GroupEngine {
         };
         self.incarnation = ni;
         self.stamp_self();
+        // A refutation carries no clock of its own — it is triggered by the
+        // frame being merged — so it stamps from the freshest time the engine
+        // has been told about, which is that frame's.
+        let now = self.now_hint;
         if let Some(m) = self.members.get_mut(&self.local) {
             m.incarnation = ni;
-            m.status = Status::Alive;
+            m.adopt_status(Status::Alive, now);
         }
         true
     }
@@ -55,7 +59,7 @@ impl GroupEngine {
     ) -> bool {
         match self.members.get(node) {
             None => {
-                let mut member = Member::new(incarnation, status);
+                let mut member = Member::new(incarnation, status, now);
                 match status {
                     Status::Suspect => member.suspect_since = now,
                     Status::Dead => member.dead_since = now,
@@ -71,7 +75,7 @@ impl GroupEngine {
                 }
                 let member = self.members.get_mut(node).expect("present");
                 member.incarnation = incarnation;
-                member.status = status;
+                member.adopt_status(status, now);
                 match status {
                     Status::Suspect => member.suspect_since = now,
                     Status::Dead => member.dead_since = now,
@@ -233,7 +237,7 @@ impl GroupEngine {
         match self.members.get(&delta.node) {
             None => {
                 // Unknown node: adopt its liveness and state wholesale.
-                let mut member = Member::new(delta.incarnation, status);
+                let mut member = Member::new(delta.incarnation, status, now);
                 match status {
                     Status::Suspect => member.suspect_since = now,
                     Status::Dead => member.dead_since = now,
@@ -265,7 +269,7 @@ impl GroupEngine {
                 let mut adopted = false;
                 if status_wins {
                     member.incarnation = delta.incarnation;
-                    member.status = status;
+                    member.adopt_status(status, now);
                     match status {
                         Status::Suspect => member.suspect_since = now,
                         Status::Dead => member.dead_since = now,

@@ -60,7 +60,7 @@ impl GroupEngine {
     pub(super) fn suspect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
         let became_suspect = match self.members.get_mut(target) {
             Some(m) if m.status == Status::Alive => {
-                m.status = Status::Suspect;
+                m.adopt_status(Status::Suspect, now);
                 m.suspect_since = now;
                 true
             }
@@ -93,7 +93,7 @@ impl GroupEngine {
         }
         for node in &dead {
             if let Some(m) = self.members.get_mut(node) {
-                m.status = Status::Dead;
+                m.adopt_status(Status::Dead, now);
                 m.dead_since = now;
             }
             self.stamp(node);
@@ -107,7 +107,13 @@ impl GroupEngine {
     /// Removes `Dead` tombstones that have aged past `2×dead_timeout`. By then
     /// they have stopped being gossiped (see `should_gossip`), so no peer
     /// re-teaches them and the removal converges.
-    pub(super) fn reap_dead(&mut self, now: Time) {
+    ///
+    /// A reap is an observable membership change — the member stops being
+    /// *known*, not merely stops being live — so it emits
+    /// [`Effect::MembershipChanged`]. Without it a driver's published roster
+    /// would keep listing a member the engine has forgotten, until some
+    /// unrelated change happened to refresh it.
+    pub(super) fn reap_dead(&mut self, now: Time) -> Vec<Effect> {
         let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
         let stale: Vec<NodeId> = self
             .members
@@ -119,11 +125,17 @@ impl GroupEngine {
             })
             .map(|(node, _)| node.clone())
             .collect();
+        if stale.is_empty() {
+            return Vec::new();
+        }
         for node in stale {
             self.members.remove(&node);
             self.digest_cursors.remove(&node);
             self.digest_visits.remove(&node);
         }
+        // The live set (which never counted a Dead member) is unchanged, so
+        // the coordinator cannot move — no recompute needed.
+        vec![Effect::MembershipChanged]
     }
 
     /// Drop expired TTL entries (they converge to absent everywhere once the

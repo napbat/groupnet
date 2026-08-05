@@ -104,8 +104,12 @@ impl GroupEngine {
                 // refuting. Dead supersedes Alive at equal incarnation, so the
                 // leave sticks as it disseminates on the next digest round.
                 self.leaving = true;
+                // A command carries no clock; `now_hint` is the freshest time
+                // the engine has been told about (one event-loop turn stale at
+                // worst — far finer than any status duration is read at).
+                let now = self.now_hint;
                 if let Some(m) = self.members.get_mut(&self.local) {
-                    m.status = Status::Dead;
+                    m.adopt_status(Status::Dead, now);
                 }
                 self.stamp_self();
                 let mut effects = vec![Effect::MembershipChanged];
@@ -122,7 +126,7 @@ impl GroupEngine {
                     return Vec::new();
                 }
                 self.members
-                    .insert(node.clone(), Member::new(0, Status::Alive));
+                    .insert(node.clone(), Member::new(0, Status::Alive, self.now_hint));
                 self.stamp(&node);
                 let mut effects = vec![Effect::MembershipChanged];
                 effects.extend(self.recompute_coordinator());

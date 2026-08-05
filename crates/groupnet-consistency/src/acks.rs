@@ -33,6 +33,32 @@ use crate::token::WriteToken;
 /// The group entry key under which a node's applied watermarks are gossiped.
 const ACK_KEY: &str = "~applied";
 
+/// The capability name a node advertises (via
+/// [`Group::advertise_capabilities`]) to declare that it runs an
+/// [`AckLedger`] — i.e. that waiting on it is not waiting on a timeout.
+///
+/// Pair it with [`applied_by_selected`] to scope a wait to the participating
+/// half of a mixed deployment:
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// # use groupnet_consistency::{CAP_ACKS, WriteToken, applied_by_selected};
+/// # use groupnet_core::NodeId;
+/// # use groupnet_runtime::Group;
+/// # async fn demo(group: &Group, me: &NodeId, token: WriteToken) -> bool {
+/// group.advertise_capabilities([CAP_ACKS]).ok();
+/// applied_by_selected(
+///     group,
+///     me,
+///     token,
+///     |peer| group.node_has_capability(peer, CAP_ACKS),
+///     Duration::from_secs(1),
+/// )
+/// .await
+/// # }
+/// ```
+pub const CAP_ACKS: &str = "acks";
+
 /// Attempts before giving up on republishing under inbox backpressure (the
 /// next `record` re-carries the full map; the ledger is state, not a log).
 const PUBLISH_RETRIES: usize = 8;
@@ -106,10 +132,50 @@ pub fn applied_by(group: &Group, member: &NodeId, writer: &NodeId) -> Option<Wri
 /// than `writer` itself advertises having applied `writer`'s feed through
 /// `token`. Members that die mid-wait drop out of the wait as SWIM marks
 /// them non-alive. Returns whether every such member acknowledged in time.
+///
+/// This is [`applied_by_selected`] with a selector that admits everyone; in a
+/// deployment where some peers do not run an [`AckLedger`] at all, prefer the
+/// selected form over eating a timeout per non-participant.
 pub async fn applied_cluster_wide(
     group: &Group,
     writer: &NodeId,
     token: WriteToken,
+    timeout: Duration,
+) -> bool {
+    applied_by_selected(group, writer, token, |_| true, timeout).await
+}
+
+/// [`applied_cluster_wide`], scoped: waits (bounded by `timeout`) only on
+/// members that are currently `Alive`, are not `writer` itself, **and** pass
+/// `include`. Returns whether every such member acknowledged in time.
+///
+/// The selection is re-evaluated on every poll, not snapshotted, so it tracks
+/// both liveness churn and late-arriving advertisements: a peer that dies
+/// mid-wait drops out, and a peer whose capability advertisement converges
+/// mid-wait is picked up. An empty selection resolves `true` immediately —
+/// there is nobody to wait on, and that is a real (if weak) answer, not a
+/// failure.
+///
+/// # The rolling-upgrade footgun
+///
+/// A capability selector such as `|peer| group.node_has_capability(peer,
+/// CAP_ACKS)` is only as good as the advertisements that have converged. A
+/// peer that *does* run an [`AckLedger`] but has not advertised
+/// [`CAP_ACKS`] yet — an older build, or a newer one whose advertisement is
+/// still in flight — is **invisible to the selector and silently skipped**,
+/// so the wait can resolve before that peer has applied the write. The
+/// guarantee quietly weakens instead of failing loudly.
+///
+/// So the safe rollout order is: advertise fleet-wide first, confirm the
+/// advertisements have landed (e.g. every member of interest appears in
+/// [`Group::members_with_capability`]), and only then narrow writers onto a
+/// capability selector. Selectors built from a source that cannot lag —
+/// a static roster, an explicit deny-list — do not have this hazard.
+pub async fn applied_by_selected(
+    group: &Group,
+    writer: &NodeId,
+    token: WriteToken,
+    include: impl Fn(&NodeId) -> bool,
     timeout: Duration,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -117,6 +183,7 @@ pub async fn applied_cluster_wide(
         let waiting_on = group.statuses().into_iter().any(|(member, status)| {
             member != *writer
                 && status == Status::Alive
+                && include(&member)
                 && applied_by(group, &member, writer).is_none_or(|t| t < token)
         });
         if !waiting_on {

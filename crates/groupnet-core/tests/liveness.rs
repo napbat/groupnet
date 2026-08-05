@@ -173,6 +173,170 @@ fn refutes_false_suspicion_about_self() {
     );
 }
 
+/// Timings for the status-since tests: one peer, so a direct probe miss falls
+/// straight through to suspicion and every transition lands on an instant the
+/// config alone dictates.
+fn since_cfg() -> Config {
+    Config {
+        probe_interval_ms: 100,
+        probe_timeout_ms: 50,
+        suspect_timeout_ms: 200,
+        gossip_interval_ms: 100,
+        anti_entropy_interval_ms: 100,
+        ..Config::default()
+    }
+}
+
+/// An engine for `a` that has just learned `b` (Alive, incarnation 0) at
+/// `Time(1)` and been started, with [`since_cfg`] timings.
+fn engine_knowing_b() -> GroupEngine {
+    let mut a = GroupEngine::new(
+        GroupId::new("g"),
+        NodeId::new("a"),
+        [NodeId::new("b")],
+        since_cfg(),
+    );
+    a.on_message(
+        NodeId::new("b"),
+        &digest_frame(vec![ndigest("b", 0, Status::Alive, 0)], vec![]),
+        Time(1),
+    );
+    a.start(Time(1));
+    a
+}
+
+/// A silent peer's status stamps land on exactly the instants the detector's
+/// timeouts dictate: adoption at first sight, `Suspect` when the probe window
+/// closes, `Dead` one suspicion window after that.
+#[test]
+fn status_since_lands_on_the_instants_the_timeouts_dictate() {
+    let b = NodeId::new("b");
+    let mut a = engine_knowing_b();
+    assert_eq!(
+        a.member_status_since(&b),
+        Some((Status::Alive, Time(1))),
+        "first adoption stamps the moment we learned the member"
+    );
+
+    a.on_tick(Time(101)); // probe slot: direct probe out, deadline 151
+    assert_eq!(
+        a.member_status_since(&b),
+        Some((Status::Alive, Time(1))),
+        "an outstanding probe is not a status change"
+    );
+
+    // 101 + probe_timeout: the window closes and, with no third node to relay,
+    // suspicion is immediate.
+    a.on_tick(Time(151));
+    assert_eq!(
+        a.member_status_since(&b),
+        Some((Status::Suspect, Time(151)))
+    );
+
+    // 151 + suspect_timeout: the refutation window closes.
+    a.on_tick(Time(350));
+    assert_eq!(
+        a.member_status_since(&b),
+        Some((Status::Suspect, Time(151))),
+        "one millisecond early is still Suspect"
+    );
+    a.on_tick(Time(351));
+    assert_eq!(a.member_status_since(&b), Some((Status::Dead, Time(351))));
+
+    // The roster iterator agrees with the point lookup, self included.
+    let roster: Vec<(NodeId, Status, Time)> = a
+        .member_statuses_since()
+        .map(|(n, s, t)| (n.clone(), s, t))
+        .collect();
+    assert_eq!(
+        roster,
+        vec![
+            (NodeId::new("a"), Status::Alive, Time::ZERO),
+            (NodeId::new("b"), Status::Dead, Time(351)),
+        ]
+    );
+}
+
+/// Re-merging the *same* status — even at a higher incarnation, which does
+/// supersede and does re-arm the suspicion timer — must not move
+/// `status_since`. The stamp measures how long the value has stood, and the
+/// value stood still.
+#[test]
+fn same_status_re_merge_at_a_higher_incarnation_holds_the_stamp() {
+    let b = NodeId::new("b");
+    let mut a = engine_knowing_b();
+
+    // A higher-incarnation *Alive* claim supersedes without changing the value.
+    a.on_message(
+        NodeId::new("b"),
+        &digest_frame(vec![ndigest("b", 5, Status::Alive, 0)], vec![]),
+        Time(60),
+    );
+    assert_eq!(a.member_status_since(&b), Some((Status::Alive, Time(1))));
+
+    // Detect it locally: Alive -> Suspect at 151.
+    a.on_tick(Time(101));
+    a.on_tick(Time(151));
+    assert_eq!(
+        a.member_status_since(&b),
+        Some((Status::Suspect, Time(151)))
+    );
+
+    // A peer re-asserts Suspect at a higher incarnation at t=200. The stamp
+    // holds; the suspicion *timer* re-arms, which death timing must reflect.
+    a.on_message(
+        NodeId::new("c"),
+        &digest_frame(vec![ndigest("b", 6, Status::Suspect, 0)], vec![]),
+        Time(200),
+    );
+    assert_eq!(
+        a.member_status_since(&b),
+        Some((Status::Suspect, Time(151))),
+        "a same-status re-merge must not restart the duration"
+    );
+
+    a.on_tick(Time(351)); // would have been death from the ORIGINAL stamp
+    assert_eq!(
+        a.member_status_since(&b),
+        Some((Status::Suspect, Time(151))),
+        "the re-armed suspicion timer, not status_since, decides death"
+    );
+    a.on_tick(Time(400)); // 200 + suspect_timeout
+    assert_eq!(a.member_status_since(&b), Some((Status::Dead, Time(400))));
+}
+
+/// A refutation observed from outside — the suspected node out-incarnating our
+/// suspicion — flips the record back to `Alive` with a *fresh* stamp: the
+/// member has been alive, as far as this observer is concerned, only since the
+/// refutation landed.
+#[test]
+fn a_refutation_flips_the_record_to_alive_with_a_fresh_stamp() {
+    let b = NodeId::new("b");
+    let mut a = engine_knowing_b();
+    a.on_tick(Time(101));
+    a.on_tick(Time(151));
+    assert_eq!(
+        a.member_status_since(&b),
+        Some((Status::Suspect, Time(151)))
+    );
+
+    // b refutes by out-incarnating the suspicion.
+    a.on_message(
+        NodeId::new("b"),
+        &digest_frame(vec![ndigest("b", 1, Status::Alive, 0)], vec![]),
+        Time(180),
+    );
+    assert_eq!(a.member_status_since(&b), Some((Status::Alive, Time(180))));
+
+    // And the fresh stamp holds while the refuted status keeps being gossiped.
+    a.on_message(
+        NodeId::new("c"),
+        &digest_frame(vec![ndigest("b", 2, Status::Alive, 0)], vec![]),
+        Time(240),
+    );
+    assert_eq!(a.member_status_since(&b), Some((Status::Alive, Time(180))));
+}
+
 #[test]
 fn voluntary_leave_is_not_refuted() {
     let mut a = engine("a", &["b"]);
@@ -184,4 +348,35 @@ fn voluntary_leave_is_not_refuted() {
         Time(1),
     );
     assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Dead));
+}
+
+/// The command path carries no clock, so its status writes stamp from the
+/// freshest time the engine has been *told* about — `now_hint`, one event-loop
+/// turn stale at worst. Both command-path status sites are pinned here; the
+/// simulator's stamp suite deliberately leaves them out for exactly this
+/// reason.
+#[test]
+fn command_path_status_writes_stamp_from_the_latest_observed_time() {
+    let mut a = engine("a", &["b"]);
+    assert_eq!(
+        a.member_status_since(&NodeId::new("a")),
+        Some((Status::Alive, Time::ZERO)),
+        "a fresh engine has been alive since the origin of its timeline"
+    );
+
+    // Advance the engine's notion of now, then introduce a peer out-of-band.
+    a.on_tick(Time(500));
+    a.apply(Command::AddPeer(NodeId::new("c")));
+    assert_eq!(
+        a.member_status_since(&NodeId::new("c")),
+        Some((Status::Alive, Time(500)))
+    );
+
+    // Leaving flips our own record to Dead, stamped the same way.
+    a.on_tick(Time(900));
+    a.apply(Command::Leave);
+    assert_eq!(
+        a.member_status_since(&NodeId::new("a")),
+        Some((Status::Dead, Time(900)))
+    );
 }

@@ -135,7 +135,9 @@ impl GroupEngine {
         config: Config,
     ) -> Self {
         let mut members = BTreeMap::new();
-        let mut own = Member::new(0, Status::Alive);
+        // Construction has no clock of its own; the local node has been Alive
+        // since the origin of this engine's logical timeline.
+        let mut own = Member::new(0, Status::Alive, Time::ZERO);
         own.changed_at = 1; // stamped at clock 1, so a first digest lists us
         members.insert(local.clone(), own);
         let seeds = seeds
@@ -237,6 +239,40 @@ impl GroupEngine {
     /// not-`Dead` set [`members`](Self::members) yields) reads this.
     pub fn member_statuses(&self) -> impl Iterator<Item = (&NodeId, Status)> {
         self.members.iter().map(|(node, m)| (node, m.status))
+    }
+
+    /// The status of a specific node **and the instant this observer has held
+    /// it continuously since** — the fencing-verdict primitive: "gossip-dead
+    /// for N ⇒ fence; gossip-healthy for N ⇒ unfence".
+    ///
+    /// The stamp moves only when the status *value* changes, so a member that
+    /// keeps being re-gossiped as `Alive` keeps its original stamp and the
+    /// duration `now - since` really is uninterrupted. Refutation back to
+    /// `Alive` is a change, and resets it.
+    ///
+    /// **Observer-local.** This is what *this* node concluded, from *its*
+    /// probes and the gossip it received; two observers legitimately hold
+    /// different stamps for the same member.
+    ///
+    /// **Reap horizon.** `Dead` tombstones are removed `2×dead_timeout_ms`
+    /// after death, and this returns `None` from then on — the duration is
+    /// readable only inside that horizon. A consumer that needs a longer
+    /// verdict either raises `dead_timeout_ms` past the longest window it
+    /// cares about, or treats "known member, now absent" as *dead for at least
+    /// the horizon*.
+    #[must_use]
+    pub fn member_status_since(&self, node: &NodeId) -> Option<(Status, Time)> {
+        self.members.get(node).map(|m| (m.status, m.status_since))
+    }
+
+    /// Iterates every known member with its status and the instant this
+    /// observer has held that status since, in id order — the whole
+    /// fencing-verdict roster in one pass. Same semantics and same
+    /// reap-horizon caveat as [`member_status_since`](Self::member_status_since).
+    pub fn member_statuses_since(&self) -> impl Iterator<Item = (&NodeId, Status, Time)> {
+        self.members
+            .iter()
+            .map(|(node, m)| (node, m.status, m.status_since))
     }
 
     /// One key of a node's state, if known and live (not tombstoned).
@@ -426,7 +462,7 @@ impl GroupEngine {
         effects.extend(self.reap_suspects(now));
 
         // 3. Dead tombstones past their reap window -> removed entirely.
-        self.reap_dead(now);
+        effects.extend(self.reap_dead(now));
 
         // 3b. Expired state entries and stale entry tombstones.
         effects.extend(self.reap_entries(now));

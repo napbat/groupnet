@@ -249,6 +249,19 @@ impl Simulation {
             .and_then(|e| e.member_status(node))
     }
 
+    /// The status `observer` holds for `node` **and the virtual instant it has
+    /// held it continuously since** — the fencing-verdict roster, readable in
+    /// exact virtual time.
+    ///
+    /// `None` once the observer has reaped the member's tombstone
+    /// (`2×dead_timeout` after death), or if it never knew the node.
+    #[must_use]
+    pub fn status_since_of(&self, observer: &NodeId, node: &NodeId) -> Option<(Status, Time)> {
+        self.engines
+            .get(observer)
+            .and_then(|e| e.member_status_since(node))
+    }
+
     /// The app-defined per-node state that `observer` currently holds for
     /// `node`.
     #[must_use]

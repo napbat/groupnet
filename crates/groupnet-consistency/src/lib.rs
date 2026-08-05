@@ -21,11 +21,23 @@
 //! The **strong-coherence tier** (feature `acks`, off by default) adds
 //! write-side acknowledgement: `AckLedger` publishes each node's applied
 //! watermarks and `applied_cluster_wide` holds a writer until every alive
-//! member has applied its write. Its price is real — one
+//! member has applied its write (`applied_by_selected` narrows that to the
+//! members a selector admits — e.g. those advertising `CAP_ACKS` — so a
+//! mixed deployment does not pay a timeout per non-participant). Its price
+//! is real — one
 //! ledger republish per applied event, and write latency bounded by the
 //! slowest alive member — right for small clusters that must be
 //! indistinguishable from a single node, wrong past the scaling envelope
 //! (large fabrics keep the session tier and shard into cells instead).
+//!
+//! Sitting beside both, priced at nothing and gated by nothing, are
+//! **typed watermarks**: [`SeqFloors`] publishes per-node, per-key floors in
+//! the consumer's *own* sequence space (a shard LSN, a WAL offset) as TTL'd
+//! gossiped entries. Where the tiers above answer "has my write landed?"
+//! with groupnet's tokens, floors answer "how far has that node applied?"
+//! with your number — the hot-set shape shardstore hand-rolls over
+//! `set_entry`/`node_entry`, with per-key TTL expiry as the idle signal and
+//! absence meaning route conservatively.
 //!
 //! # What you get — and what you deliberately don't
 //!
@@ -168,14 +180,16 @@
 #[cfg(feature = "acks")]
 mod acks;
 mod feed;
+mod floor;
 mod frontier;
 mod peers;
 mod token;
 mod wire;
 
 #[cfg(feature = "acks")]
-pub use acks::{AckLedger, applied_by, applied_cluster_wide};
+pub use acks::{AckLedger, CAP_ACKS, applied_by, applied_by_selected, applied_cluster_wide};
 pub use feed::WriteFeed;
+pub use floor::SeqFloors;
 pub use frontier::{Frontier, FrontierView};
 pub use peers::{PeerWrite, PeerWrites, advertised_head, advertised_head_named};
 pub use token::WriteToken;
