@@ -69,7 +69,7 @@ fn unframe(datagram: &[u8]) -> Option<(NodeId, &[u8])> {
 #[derive(Debug)]
 struct Inner {
     local: NodeId,
-    /// NodeId -> where to send. Interior mutability so peers can be registered
+    /// `NodeId` -> where to send. Interior mutability so peers can be registered
     /// after binding (e.g. once ephemeral ports are known).
     peers: RwLock<HashMap<NodeId, SocketAddr>>,
     /// The reverse map, to attribute inbound datagrams to a sender.
@@ -128,6 +128,10 @@ impl UdpTransport {
     /// entry grows the map without bound and can mis-attribute an inbound
     /// datagram once that address is reused by another node. Callable through
     /// any clone — all clones share one book.
+    ///
+    /// # Panics
+    /// If either half of the address book was poisoned by a panic in another
+    /// thread.
     pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
         // Take both locks (peers before by_addr — the only site that holds
         // both) so the forward and reverse maps update atomically.

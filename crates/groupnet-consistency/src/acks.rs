@@ -117,7 +117,7 @@ pub async fn applied_cluster_wide(
         let waiting_on = group.statuses().into_iter().any(|(member, status)| {
             member != *writer
                 && status == Status::Alive
-                && !applied_by(group, &member, writer).is_some_and(|t| t >= token)
+                && applied_by(group, &member, writer).is_none_or(|t| t < token)
         });
         if !waiting_on {
             return true;

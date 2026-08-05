@@ -48,7 +48,7 @@ fn run(seed: u64) {
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
 
     let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
-    sim.set_loss(rng.below(30) as u8);
+    sim.set_loss(u8::try_from(rng.below(30)).expect("below(30) is 0..30"));
     let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
     let cfg = Config {
         gossip_interval_ms: 60,

@@ -39,6 +39,7 @@ impl Status {
     ///
     /// [`wire::NodeDigest`]: crate::wire::NodeDigest
     /// [`wire::MemberDelta`]: crate::wire::MemberDelta
+    #[must_use]
     pub fn to_wire(self) -> u8 {
         match self {
             Status::Alive => STATUS_ALIVE,
@@ -51,6 +52,7 @@ impl Status {
     /// forward-compatible peer may advertise codes this version doesn't know.
     ///
     /// The inverse of [`Status::to_wire`], and public for the same reason.
+    #[must_use]
     pub fn from_wire(code: u8) -> Option<Status> {
         match code {
             STATUS_ALIVE => Some(Status::Alive),

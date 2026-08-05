@@ -41,7 +41,7 @@ fn main() {
     for key in keys {
         let before = owners(key, &members, 1)[0].clone();
         let after = owners(key, &reduced, 1)[0].clone();
-        let note = if before != after { "  (moved)" } else { "" };
+        let note = if before == after { "" } else { "  (moved)" };
         println!("  {key:>9}: {before} -> {after}{note}");
     }
 

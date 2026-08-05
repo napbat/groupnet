@@ -227,6 +227,12 @@ fn kind_from_u8(b: u8) -> Option<Kind> {
 
 /// Encodes a frame to bytes for a transport to ship.
 #[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "element counts are `u32` in the wire format itself; the engine packs a \
+              frame against `max_delta_frame_bytes` (60 kB by default), so no vector \
+              encoded here comes within many orders of magnitude of 2^32"
+)]
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(FRAME_VERSION);
@@ -282,6 +288,11 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
     out
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the register count is a `u32` on the wire, and the metadata rider is a \
+              small bounded set"
+)]
 fn put_metadata(out: &mut Vec<u8>, metadata: &[MetaDelta]) {
     put_u32(out, metadata.len() as u32);
     for d in metadata {
@@ -479,6 +490,11 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     put_bytes(out, s.as_bytes());
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a length prefix is a `u32` in the wire format; every string and value \
+              written here rides a frame packed against `max_delta_frame_bytes`"
+)]
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_u32(out, b.len() as u32);
     out.extend_from_slice(b);

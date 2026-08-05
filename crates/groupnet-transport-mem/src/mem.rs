@@ -27,6 +27,9 @@ impl Network {
     }
 
     /// Creates and registers a transport endpoint for `id`.
+    ///
+    /// # Panics
+    /// If the fabric's routing table was poisoned by a panic in another thread.
     #[must_use]
     pub fn endpoint(&self, id: NodeId) -> MemTransport {
         let (tx, rx) = mpsc::unbounded_channel();

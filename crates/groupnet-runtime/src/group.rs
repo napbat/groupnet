@@ -163,6 +163,10 @@ impl Group {
     /// Set one key of this node's app-defined state. Independently versioned
     /// per key and gossiped; `ttl_ms` (if `Some`) makes every receiver expire
     /// the entry that long after last adopting it — refresh by re-setting.
+    ///
+    /// # Errors
+    /// [`CommandRejected`] if the group actor's bounded inbox is full or the
+    /// actor has shut down; the write was not enqueued.
     pub fn set_entry(
         &self,
         key: impl Into<String>,
@@ -180,6 +184,10 @@ impl Group {
 
     /// Delete one key of this node's state (a versioned tombstone disseminates
     /// so every peer drops it).
+    ///
+    /// # Errors
+    /// [`CommandRejected`] if the group actor's bounded inbox is full or the
+    /// actor has shut down; the delete was not enqueued.
     pub fn delete_entry(&self, key: impl Into<String>) -> Result<(), CommandRejected> {
         self.tx
             .try_send(Event::Local(Command::DeleteLocalEntry { key: key.into() }))

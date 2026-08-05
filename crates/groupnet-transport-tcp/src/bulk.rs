@@ -62,6 +62,9 @@ impl TcpBulkTransport {
     }
 
     /// Teaches this endpoint that `node` listens at `addr`.
+    ///
+    /// # Panics
+    /// If the address book was poisoned by a panic in another thread.
     pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
         self.peers
             .write()

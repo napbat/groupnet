@@ -18,6 +18,11 @@ const MAX_ADDR_LEN: usize = 256;
 /// Sends a length-prefixed UTF-8 string (the msg-plane intro address; empty
 /// means "nothing dialable to advertise").
 #[cfg(feature = "msg")]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the length prefix is a u32 on the wire; the only value written is an \
+              intro address, which the reader caps at MAX_ADDR_LEN anyway"
+)]
 pub(crate) async fn write_str(sock: &mut TcpStream, s: &str) -> io::Result<()> {
     let bytes = s.as_bytes();
     sock.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
@@ -45,6 +50,11 @@ pub(crate) async fn read_str(sock: &mut TcpStream) -> io::Result<String> {
 
 /// Sends our node id as a length-prefixed handshake so the peer can attribute
 /// the connection.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the length prefix is a u32 on the wire; a node id is an in-memory \
+              string, and the reader caps it at MAX_ID_LEN regardless"
+)]
 pub(crate) async fn write_id(sock: &mut TcpStream, id: &NodeId) -> io::Result<()> {
     let bytes = id.as_str().as_bytes();
     sock.write_all(&(bytes.len() as u32).to_be_bytes()).await?;

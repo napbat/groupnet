@@ -99,6 +99,11 @@ pub(crate) struct GroupViews {
 
 /// Maps wall-clock elapsed time onto the engine's logical [`Time`]. This is the
 /// one place the runtime reads the real clock; the core never does.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a process would have to stay up ~584 million years for its elapsed \
+              milliseconds to overflow a u64"
+)]
 pub(crate) fn now_since(start: Instant) -> Time {
     Time(start.elapsed().as_millis() as u64)
 }

@@ -285,9 +285,11 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
     drop(feed);
     drop(a_group);
     drop(a_node);
-    let (_a2_id, _a2_node, a2_group) = spawn_mem_node(&net, "rs-a", &["rs-b"], &opts());
-    let feed2 =
-        WriteFeed::new(a2_group, cap(8), |key: &String| key.clone().into_bytes()).with_epoch(2);
+    let (_reborn_id, _reborn_node, reborn_group) = spawn_mem_node(&net, "rs-a", &["rs-b"], &opts());
+    let feed2 = WriteFeed::new(reborn_group, cap(8), |key: &String| {
+        key.clone().into_bytes()
+    })
+    .with_epoch(2);
     let new_token = feed2.publish(&"n1".to_owned()).await;
     assert_eq!(new_token, WriteToken { epoch: 2, seq: 1 });
 

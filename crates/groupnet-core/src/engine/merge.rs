@@ -139,145 +139,11 @@ impl GroupEngine {
                 if let Some(t) = self.self_refute_target(status, delta.incarnation) {
                     refute_to = Some(refute_to.map_or(t, |x| x.max(t)));
                 }
-                // Restart recovery (the wipe fix): our own entries echoed back at
-                // versions above what we hold are OUR data from before a restart.
-                // ADOPT them verbatim for keys we have NOT authored this boot; for
-                // authored keys keep our value and out-version the echo.
-                for entry in delta.entries {
-                    let ours = self.members[&self.local].entries.get(&entry.key);
-                    // Ignore echoes we already dominate: any LOWER version, or
-                    // an equal version carrying our exact value. An equal
-                    // version with a DIFFERENT value is the restart hazard —
-                    // both lives wrote the key at the same clock (e.g. `~addr`
-                    // at v1 before and after a reboot), receivers tiebreak
-                    // arbitrarily, and without an out-version the cluster can
-                    // wedge on the dead value. Fall through and bump.
-                    if ours.is_some_and(|e| {
-                        entry.version < e.version
-                            || (entry.version == e.version
-                                && entry.value == e.value
-                                && entry.tombstone == e.tombstone)
-                    }) {
-                        continue;
-                    }
-                    let m = self.members.get_mut(&self.local).expect("self present");
-                    if self.authored.contains(&entry.key) {
-                        // Sole-author rule: never let an echo (or forgery) replace
-                        // a value we wrote this boot. Jump our version above it and
-                        // keep re-advertising OUR value, which supersedes everywhere.
-                        let bumped = m.entries.get_mut(&entry.key).map(|e| {
-                            e.version = entry.version.saturating_add(1);
-                            e.version
-                        });
-                        if let Some(v) = bumped {
-                            m.observe_version(v);
-                            state_changed.push((self.local.clone(), entry.key));
-                            self.stamp_self();
-                        }
-                    } else {
-                        // A key we have NOT authored this boot, echoed at a higher
-                        // version, is our own pre-restart data — adopt it verbatim.
-                        m.observe_version(entry.version);
-                        m.entries.insert(
-                            entry.key.clone(),
-                            StateEntry::adopted(
-                                entry.version,
-                                entry.value,
-                                entry.ttl_ms,
-                                entry.tombstone,
-                                now,
-                            ),
-                        );
-                        state_changed.push((self.local.clone(), entry.key));
-                        self.stamp_self();
-                    }
-                }
+                self.merge_own_echo(delta.entries, now, &mut state_changed);
                 continue;
             }
 
-            match self.members.get(&delta.node) {
-                None => {
-                    // Unknown node: adopt its liveness and state wholesale.
-                    let mut member = Member::new(delta.incarnation, status);
-                    match status {
-                        Status::Suspect => member.suspect_since = now,
-                        Status::Dead => member.dead_since = now,
-                        Status::Alive => {}
-                    }
-                    for entry in delta.entries {
-                        member.observe_version(entry.version);
-                        state_changed.push((delta.node.clone(), entry.key.clone()));
-                        member.entries.insert(
-                            entry.key,
-                            StateEntry::adopted(
-                                entry.version,
-                                entry.value,
-                                entry.ttl_ms,
-                                entry.tombstone,
-                                now,
-                            ),
-                        );
-                    }
-                    member.observe_version(delta.max_version);
-                    self.members.insert(delta.node.clone(), member);
-                    self.stamp(&delta.node);
-                    membership_changed = true;
-                }
-                Some(cur) => {
-                    let status_wins = cur.superseded_by(delta.incarnation, status);
-                    let member = self.members.get_mut(&delta.node).expect("present");
-                    let high_water_before = member.max_state_version;
-                    let mut adopted = false;
-                    if status_wins {
-                        member.incarnation = delta.incarnation;
-                        member.status = status;
-                        match status {
-                            Status::Suspect => member.suspect_since = now,
-                            Status::Dead => member.dead_since = now,
-                            Status::Alive => {}
-                        }
-                        membership_changed = true;
-                    }
-                    // Per-key LWW, independent of liveness: each entry is
-                    // single-writer, so version order alone decides; a fresher
-                    // version also re-arms the local TTL. Every seen version
-                    // advances the high-water mark.
-                    for entry in delta.entries {
-                        member.observe_version(entry.version);
-                        // Per-key LWW by version, with a deterministic tiebreak
-                        // (tombstone, then value) so a version reused across a
-                        // restart can never deadlock two divergent values at the
-                        // same number — one side always wins and both converge.
-                        let wins = member.entries.get(&entry.key).is_none_or(|e| {
-                            (entry.version, entry.tombstone, &entry.value)
-                                > (e.version, e.tombstone, &e.value)
-                        });
-                        if !wins {
-                            continue;
-                        }
-                        member.entries.insert(
-                            entry.key.clone(),
-                            StateEntry::adopted(
-                                entry.version,
-                                entry.value,
-                                entry.ttl_ms,
-                                entry.tombstone,
-                                now,
-                            ),
-                        );
-                        adopted = true;
-                        state_changed.push((delta.node.clone(), entry.key));
-                    }
-                    // The sender's high-water (>= every version it holds) lets us
-                    // advance our summary past a reaped tail without re-requesting.
-                    member.observe_version(delta.max_version);
-                    // Anything digest-visible moved (liveness, content, or
-                    // high-water): re-advertise via future delta digests.
-                    if status_wins || adopted || member.max_state_version > high_water_before {
-                        self.stamp(&delta.node);
-                    }
-                }
-            }
+            membership_changed |= self.merge_peer_delta(delta, status, now, &mut state_changed);
         }
 
         membership_changed |= self.apply_refutation(refute_to);
@@ -292,6 +158,161 @@ impl GroupEngine {
             effects.push(Effect::NodeStateChanged { node, key });
         }
         effects
+    }
+
+    /// Restart recovery (the wipe fix): our own entries echoed back at versions
+    /// above what we hold are OUR data from before a restart. ADOPT them verbatim
+    /// for keys we have NOT authored this boot; for authored keys keep our value
+    /// and out-version the echo.
+    fn merge_own_echo(
+        &mut self,
+        entries: Vec<wire::EntryDelta>,
+        now: Time,
+        state_changed: &mut Vec<(NodeId, String)>,
+    ) {
+        for entry in entries {
+            let ours = self.members[&self.local].entries.get(&entry.key);
+            // Ignore echoes we already dominate: any LOWER version, or an equal
+            // version carrying our exact value. An equal version with a
+            // DIFFERENT value is the restart hazard — both lives wrote the key
+            // at the same clock (e.g. `~addr` at v1 before and after a reboot),
+            // receivers tiebreak arbitrarily, and without an out-version the
+            // cluster can wedge on the dead value. Fall through and bump.
+            if ours.is_some_and(|e| {
+                entry.version < e.version
+                    || (entry.version == e.version
+                        && entry.value == e.value
+                        && entry.tombstone == e.tombstone)
+            }) {
+                continue;
+            }
+            let m = self.members.get_mut(&self.local).expect("self present");
+            if self.authored.contains(&entry.key) {
+                // Sole-author rule: never let an echo (or forgery) replace a
+                // value we wrote this boot. Jump our version above it and keep
+                // re-advertising OUR value, which supersedes everywhere.
+                let bumped = m.entries.get_mut(&entry.key).map(|e| {
+                    e.version = entry.version.saturating_add(1);
+                    e.version
+                });
+                if let Some(v) = bumped {
+                    m.observe_version(v);
+                    state_changed.push((self.local.clone(), entry.key));
+                    self.stamp_self();
+                }
+            } else {
+                // A key we have NOT authored this boot, echoed at a higher
+                // version, is our own pre-restart data — adopt it verbatim.
+                m.observe_version(entry.version);
+                m.entries.insert(
+                    entry.key.clone(),
+                    StateEntry::adopted(
+                        entry.version,
+                        entry.value,
+                        entry.ttl_ms,
+                        entry.tombstone,
+                        now,
+                    ),
+                );
+                state_changed.push((self.local.clone(), entry.key));
+                self.stamp_self();
+            }
+        }
+    }
+
+    /// Merges one *remote* member's delta: SWIM precedence for its liveness,
+    /// per-key last-writer-wins for its entries, and the high-water mark it
+    /// advertises. Returns whether membership changed.
+    fn merge_peer_delta(
+        &mut self,
+        delta: wire::MemberDelta,
+        status: Status,
+        now: Time,
+        state_changed: &mut Vec<(NodeId, String)>,
+    ) -> bool {
+        match self.members.get(&delta.node) {
+            None => {
+                // Unknown node: adopt its liveness and state wholesale.
+                let mut member = Member::new(delta.incarnation, status);
+                match status {
+                    Status::Suspect => member.suspect_since = now,
+                    Status::Dead => member.dead_since = now,
+                    Status::Alive => {}
+                }
+                for entry in delta.entries {
+                    member.observe_version(entry.version);
+                    state_changed.push((delta.node.clone(), entry.key.clone()));
+                    member.entries.insert(
+                        entry.key,
+                        StateEntry::adopted(
+                            entry.version,
+                            entry.value,
+                            entry.ttl_ms,
+                            entry.tombstone,
+                            now,
+                        ),
+                    );
+                }
+                member.observe_version(delta.max_version);
+                self.members.insert(delta.node.clone(), member);
+                self.stamp(&delta.node);
+                true
+            }
+            Some(cur) => {
+                let status_wins = cur.superseded_by(delta.incarnation, status);
+                let member = self.members.get_mut(&delta.node).expect("present");
+                let high_water_before = member.max_state_version;
+                let mut adopted = false;
+                if status_wins {
+                    member.incarnation = delta.incarnation;
+                    member.status = status;
+                    match status {
+                        Status::Suspect => member.suspect_since = now,
+                        Status::Dead => member.dead_since = now,
+                        Status::Alive => {}
+                    }
+                }
+                // Per-key LWW, independent of liveness: each entry is
+                // single-writer, so version order alone decides; a fresher
+                // version also re-arms the local TTL. Every seen version
+                // advances the high-water mark.
+                for entry in delta.entries {
+                    member.observe_version(entry.version);
+                    // Per-key LWW by version, with a deterministic tiebreak
+                    // (tombstone, then value) so a version reused across a
+                    // restart can never deadlock two divergent values at the
+                    // same number — one side always wins and both converge.
+                    let wins = member.entries.get(&entry.key).is_none_or(|e| {
+                        (entry.version, entry.tombstone, &entry.value)
+                            > (e.version, e.tombstone, &e.value)
+                    });
+                    if !wins {
+                        continue;
+                    }
+                    member.entries.insert(
+                        entry.key.clone(),
+                        StateEntry::adopted(
+                            entry.version,
+                            entry.value,
+                            entry.ttl_ms,
+                            entry.tombstone,
+                            now,
+                        ),
+                    );
+                    adopted = true;
+                    state_changed.push((delta.node.clone(), entry.key));
+                }
+                // The sender's high-water (>= every version it holds) lets us
+                // advance our summary past a reaped tail without re-requesting.
+                member.observe_version(delta.max_version);
+                // Anything digest-visible moved (liveness, content, or
+                // high-water): re-advertise via future delta digests.
+                if status_wins || adopted || member.max_state_version > high_water_before {
+                    self.stamp(&delta.node);
+                }
+                status_wins
+            }
+        }
     }
 
     /// Merges incoming metadata deltas by last-writer-wins: an entry is adopted

@@ -66,7 +66,8 @@ fn engine(group: &GroupId, id: &NodeId, alive: &BTreeSet<NodeId>) -> GroupEngine
 
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
-    v[rng.below(v.len() as u32) as usize].clone()
+    let n = u32::try_from(v.len()).expect("these clusters are tens of nodes");
+    v[rng.below(n) as usize].clone()
 }
 
 #[test]
@@ -84,7 +85,8 @@ fn run_scenario(seed: u64) {
 
     let latency = u64::from(3 + rng.below(8));
     let mut sim = Simulation::new(latency);
-    sim.set_loss(rng.below(25) as u8); // up to 24% loss during chaos
+    // up to 24% loss during chaos
+    sim.set_loss(u8::try_from(rng.below(25)).expect("below(25) is 0..25"));
     sim.set_jitter(u64::from(rng.below(9))); // up to 8ms reorder
 
     let mut alive: BTreeSet<NodeId> = all.iter().cloned().collect();
@@ -111,75 +113,7 @@ fn run_scenario(seed: u64) {
             }
         }
 
-        // Inject one fault.
-        match rng.below(8) {
-            0 if alive.len() > 2 => {
-                let victim = pick(&alive, &mut rng);
-                sim.crash(&victim);
-                alive.remove(&victim);
-            }
-            1 if alive.len() < all.len() => {
-                // Restart a downed node with a fresh engine (incarnation 0).
-                let down: BTreeSet<NodeId> = all
-                    .iter()
-                    .filter(|x| !alive.contains(*x))
-                    .cloned()
-                    .collect();
-                let node = pick(&down, &mut rng);
-                alive.insert(node.clone());
-                sim.add(engine(&group, &node, &alive));
-            }
-            2 if alive.len() > 1 => {
-                let a = pick(&alive, &mut rng);
-                let b = pick(&alive, &mut rng);
-                if a != b {
-                    sim.block(&a, &b);
-                    sim.block(&b, &a);
-                }
-            }
-            3 => sim.heal_all(),
-            4 => {
-                let node = pick(&alive, &mut rng);
-                sim.command(
-                    &node,
-                    Command::SetLocalState(format!("s{now}").into_bytes()),
-                );
-            }
-            5 => {
-                // A permanent keyed entry authored by the node (no TTL, never
-                // deleted here — delete+reap has its own no-resurrection seed set).
-                let node = pick(&alive, &mut rng);
-                sim.command(
-                    &node,
-                    Command::SetLocalEntry {
-                        key: "kv".into(),
-                        value: format!("v{now}").into_bytes(),
-                        ttl_ms: None,
-                    },
-                );
-            }
-            6 => {
-                let node = pick(&alive, &mut rng);
-                sim.command(
-                    &node,
-                    Command::SetLocalEntry {
-                        key: "ready".into(),
-                        value: vec![1],
-                        ttl_ms: None,
-                    },
-                );
-            }
-            _ => {
-                let node = pick(&alive, &mut rng);
-                sim.command(
-                    &node,
-                    Command::UpdateMetadata {
-                        key: "k".into(),
-                        value: format!("v{now}"),
-                    },
-                );
-            }
-        }
+        inject_fault(&mut sim, &mut rng, &group, &all, &mut alive, now);
 
         // Bounded frames: no frame the engines emit ever exceeds the cap.
         assert!(
@@ -199,17 +133,111 @@ fn run_scenario(seed: u64) {
     if alive.len() < 2 {
         return; // degenerate cluster, nothing to compare
     }
+    assert_converged(&sim, &alive, seed);
 
-    let expected_coord = placement::owner("shard", &alive);
+    // Bounded frames held for the settle phase too.
+    assert!(
+        sim.max_frame_bytes() <= FRAME_CAP,
+        "seed {seed}: settle emitted a {}-byte frame over the {FRAME_CAP} cap",
+        sim.max_frame_bytes()
+    );
+}
+
+/// Applies one randomly-chosen fault from the schedule: a crash, a restart, a
+/// two-way partition, a heal, or one of the four write shapes. `alive` tracks
+/// which nodes the caller should still hold to the safety invariants.
+fn inject_fault(
+    sim: &mut Simulation,
+    rng: &mut SplitMix64,
+    group: &GroupId,
+    all: &[NodeId],
+    alive: &mut BTreeSet<NodeId>,
+    now: u64,
+) {
+    match rng.below(8) {
+        0 if alive.len() > 2 => {
+            let victim = pick(alive, rng);
+            sim.crash(&victim);
+            alive.remove(&victim);
+        }
+        1 if alive.len() < all.len() => {
+            // Restart a downed node with a fresh engine (incarnation 0).
+            let down: BTreeSet<NodeId> = all
+                .iter()
+                .filter(|x| !alive.contains(*x))
+                .cloned()
+                .collect();
+            let node = pick(&down, rng);
+            alive.insert(node.clone());
+            sim.add(engine(group, &node, alive));
+        }
+        2 if alive.len() > 1 => {
+            let a = pick(alive, rng);
+            let b = pick(alive, rng);
+            if a != b {
+                sim.block(&a, &b);
+                sim.block(&b, &a);
+            }
+        }
+        3 => sim.heal_all(),
+        4 => {
+            let node = pick(alive, rng);
+            sim.command(
+                &node,
+                Command::SetLocalState(format!("s{now}").into_bytes()),
+            );
+        }
+        5 => {
+            // A permanent keyed entry authored by the node (no TTL, never
+            // deleted here — delete+reap has its own no-resurrection seed set).
+            let node = pick(alive, rng);
+            sim.command(
+                &node,
+                Command::SetLocalEntry {
+                    key: "kv".into(),
+                    value: format!("v{now}").into_bytes(),
+                    ttl_ms: None,
+                },
+            );
+        }
+        6 => {
+            let node = pick(alive, rng);
+            sim.command(
+                &node,
+                Command::SetLocalEntry {
+                    key: "ready".into(),
+                    value: vec![1],
+                    ttl_ms: None,
+                },
+            );
+        }
+        _ => {
+            let node = pick(alive, rng);
+            sim.command(
+                &node,
+                Command::UpdateMetadata {
+                    key: "k".into(),
+                    value: format!("v{now}"),
+                },
+            );
+        }
+    }
+}
+
+/// The liveness half of the scenario, asserted after a fair settle: every live
+/// node agrees on the membership, the (correct) coordinator, everyone's
+/// aliveness, and every replicated map.
+fn assert_converged(sim: &Simulation, alive: &BTreeSet<NodeId>, seed: u64) {
+    let expected_coord = placement::owner("shard", alive);
     let first = alive.iter().next().cloned().unwrap();
     let meta = sim.metadata_snapshot(&first);
     let state = sim.state_snapshot(&first);
     let entries = sim.entries_snapshot(&first);
 
-    for node in &alive {
+    for node in alive {
         assert_eq!(
             sim.members_of(node),
-            alive,
+            *alive,
             "seed {seed}: {node} did not converge on the live set"
         );
         assert_eq!(
@@ -217,7 +245,7 @@ fn run_scenario(seed: u64) {
             expected_coord,
             "seed {seed}: {node} disagrees on the coordinator"
         );
-        for peer in &alive {
+        for peer in alive {
             assert_eq!(
                 sim.status_of(node, peer),
                 Some(Status::Alive),
@@ -240,13 +268,6 @@ fn run_scenario(seed: u64) {
             "seed {seed}: per-node keyed entries diverged at {node}"
         );
     }
-
-    // Bounded frames held for the settle phase too.
-    assert!(
-        sim.max_frame_bytes() <= FRAME_CAP,
-        "seed {seed}: settle emitted a {}-byte frame over the {FRAME_CAP} cap",
-        sim.max_frame_bytes()
-    );
 }
 
 /// The reap-horizon invariant, pinned across seeds: a keyed entry that is written,
@@ -304,8 +325,7 @@ fn dst_no_resurrection_after_reap() {
             assert!(
                 sim.entries_snapshot(obs)
                     .get(&author)
-                    .map(|m| !m.contains_key("doomed"))
-                    .unwrap_or(true),
+                    .is_none_or(|m| !m.contains_key("doomed")),
                 "seed {seed}: {obs} resurrected the reaped key"
             );
         }
@@ -317,8 +337,7 @@ fn dst_no_resurrection_after_reap() {
             assert!(
                 sim.entries_snapshot(obs)
                     .get(&author)
-                    .map(|m| !m.contains_key("doomed"))
-                    .unwrap_or(true),
+                    .is_none_or(|m| !m.contains_key("doomed")),
                 "seed {seed}: {obs} resurrected the reaped key after further gossip"
             );
             assert!(

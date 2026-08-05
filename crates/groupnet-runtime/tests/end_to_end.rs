@@ -23,7 +23,10 @@ async fn three_nodes_converge_over_mem_transport() {
 
     // Poll for convergence with a bounded timeout — no fixed-sleep race.
     eventually_within("nodes to converge on a coordinator", SETTLE, || {
-        let coords: Vec<_> = groups.iter().map(|g| g.coordinator()).collect();
+        let coords: Vec<_> = groups
+            .iter()
+            .map(groupnet_runtime::Group::coordinator)
+            .collect();
         coords.iter().all(Option::is_some) && coords.windows(2).all(|w| w[0] == w[1])
     })
     .await;

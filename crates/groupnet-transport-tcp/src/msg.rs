@@ -158,7 +158,7 @@ struct Inner {
     /// dialable — bound to an unspecified address with no `advertise`).
     intro: String,
     config: TcpMsgConfig,
-    /// NodeId -> where to dial. Interior mutability so peers can be
+    /// `NodeId` -> where to dial. Interior mutability so peers can be
     /// registered after binding (e.g. once ephemeral ports are known).
     peers: RwLock<HashMap<NodeId, SocketAddr>>,
     pool: Mutex<Pool>,
@@ -240,6 +240,9 @@ impl TcpMsgTransport {
     /// Teaches this endpoint that `node` listens at `addr`, replacing any
     /// previous binding. An existing connection to `node` is left alone; it
     /// dials the new address only after it next closes (idle or error).
+    ///
+    /// # Panics
+    /// If the address book was poisoned by a panic in another thread.
     pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
         self.inner
             .peers
@@ -251,6 +254,9 @@ impl TcpMsgTransport {
     /// The address this endpoint would dial for `node`, however it was
     /// learned — registration, a gossiped advertisement, or a dial-back
     /// intro. `None` if unknown.
+    ///
+    /// # Panics
+    /// If the address book was poisoned by a panic in another thread.
     #[must_use]
     pub fn peer_addr(&self, node: &NodeId) -> Option<SocketAddr> {
         self.inner
@@ -264,6 +270,9 @@ impl TcpMsgTransport {
     /// Outbound connections currently pooled (established or still dialing).
     /// Observability for the bounded-pool promise: on a large cluster this
     /// tracks the active fanout, not the membership size.
+    ///
+    /// # Panics
+    /// If the connection pool was poisoned by a panic in another thread.
     #[must_use]
     pub fn outbound_connections(&self) -> usize {
         self.inner
@@ -292,6 +301,11 @@ impl Transport for TcpMsgTransport {
         // Pre-frame (length prefix + payload) so the writer hands the socket
         // one buffer per frame.
         let mut framed = Vec::with_capacity(4 + msg.len());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the length prefix is a u32 on the wire, and the oversize guard \
+                      above already returned for anything past MAX_FRAME"
+        )]
         framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
         framed.extend_from_slice(msg);
 
@@ -300,9 +314,9 @@ impl Transport for TcpMsgTransport {
             let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
             if let Some(conn) = pool.conns.get(to) {
                 match conn.frames.try_send(framed) {
-                    Ok(()) => return Ok(()),
-                    // Full queue: best-effort drop; anti-entropy repairs.
-                    Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
+                    // Handed to the writer, or dropped because its queue is
+                    // full — best-effort either way; anti-entropy repairs.
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
                     // The writer is exiting (idle close or error): remove the
                     // husk and fall through to a fresh dial.
                     Err(mpsc::error::TrySendError::Closed(frame)) => {

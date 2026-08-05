@@ -111,7 +111,7 @@ pub fn owner(key: &str, members: &BTreeSet<NodeId>) -> Option<NodeId> {
 mod tests {
     use super::*;
 
-    /// SplitMix64 — a tiny deterministic PRNG so these property tests explore
+    /// `SplitMix64` — a tiny deterministic PRNG so these property tests explore
     /// thousands of configurations reproducibly (no external test deps, matching
     /// the house style). It's exactly the production [`mix64`] finalizer applied
     /// to a golden-ratio-strided counter, so the mixing constants live in one
@@ -126,7 +126,7 @@ mod tests {
             mix64(self.0)
         }
         fn below(&mut self, n: u32) -> u32 {
-            (self.next_u64() % u64::from(n)) as u32
+            u32::try_from(self.next_u64() % u64::from(n)).expect("`% n` bounds the draw by n")
         }
     }
 
@@ -168,7 +168,8 @@ mod tests {
             let mut shuffled = m.clone();
             // Fisher-Yates with the deterministic rng.
             for i in (1..shuffled.len()).rev() {
-                shuffled.swap(i, rng.below(i as u32 + 1) as usize);
+                let bound = u32::try_from(i).expect("member sets here are tiny") + 1;
+                shuffled.swap(i, rng.below(bound) as usize);
             }
             let r = 1 + rng.below(4) as usize;
             let k = key(rng.next_u64());
@@ -191,6 +192,11 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "key counts here are tens of thousands — exact in an f64 — and the \
+                  floats only express the tolerance band"
+    )]
     fn unit_weights_spread_load_uniformly() {
         let n = 10u32;
         let m: Vec<(NodeId, u32)> = (0..n).map(|i| (node(i), 1)).collect();
@@ -216,15 +222,16 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "key counts here are hundreds of thousands — exact in an f64 — and the \
+                  floats only express the tolerance band"
+    )]
     fn load_is_proportional_to_weight() {
         // Weights 1,1,2,4 → expected shares 1/8, 1/8, 2/8, 4/8.
         let weights = [1u32, 1, 2, 4];
         let total: u32 = weights.iter().sum();
-        let m: Vec<(NodeId, u32)> = weights
-            .iter()
-            .enumerate()
-            .map(|(i, w)| (node(i as u32), *w))
-            .collect();
+        let m: Vec<(NodeId, u32)> = (0u32..).zip(weights).map(|(i, w)| (node(i), w)).collect();
         let keys = 120_000u64;
         let mut counts = vec![0u64; weights.len()];
         for k in 0..keys {

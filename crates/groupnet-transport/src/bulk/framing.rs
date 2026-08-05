@@ -69,6 +69,12 @@ impl<S: AsyncWrite + Unpin> DataStream<S> {
     ///
     /// # Errors
     /// Propagates any write error.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the header's length field is a u32 by definition of the framing, and \
+                  a peer refuses anything past the 256 MiB `MAX_FRAME` cap — four \
+                  orders of magnitude below where a length could truncate"
+    )]
     pub async fn send(&mut self, payload: Bytes) -> io::Result<()> {
         let header = FrameHeader {
             len: U32::new(payload.len() as u32),

@@ -71,7 +71,12 @@ pub struct Simulation {
 
 impl std::fmt::Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Event").field("at", &self.at).finish()
+        // Hand-written because `Kind` carries whole encoded frames; the schedule
+        // key is what a trace needs to read.
+        f.debug_struct("Event")
+            .field("at", &self.at)
+            .field("seq", &self.seq)
+            .finish_non_exhaustive()
     }
 }
 
@@ -148,6 +153,10 @@ impl Simulation {
 
     /// Runs the event loop until logical time reaches `max` (or the queue
     /// empties, which won't happen while periodic gossip is armed).
+    ///
+    /// # Panics
+    /// Never in practice: the loop only pops an event it has just peeked, and
+    /// the simulation is single-threaded.
     pub fn run_until(&mut self, max: Time) {
         while let Some(event) = self.queue.peek() {
             if event.at > max {

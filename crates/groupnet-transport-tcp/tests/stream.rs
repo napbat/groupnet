@@ -1,6 +1,6 @@
 //! Integration test over *real* TCP: stream a multi-megabyte payload from one
 //! node to another on loopback, through the full data-plane stack
-//! (TcpBulkTransport → futures-io compat → DataStream framing → zerocopy
+//! (`TcpBulkTransport` → futures-io compat → `DataStream` framing → zerocopy
 //! header → zero-copy `Bytes`).
 
 #![cfg(feature = "bulk")]

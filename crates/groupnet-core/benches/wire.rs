@@ -45,7 +45,7 @@ fn digest_frame(members: usize) -> Frame {
             .map(|i| NodeDigest {
                 node: node(i),
                 incarnation: (i as u64) % 7,
-                status: (i % 3) as u8,
+                status: u8::try_from(i % 3).expect("0..3"),
                 max_version: (i as u64) * 13,
                 content_hash: (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
             })

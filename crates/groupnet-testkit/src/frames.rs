@@ -13,6 +13,7 @@ pub const TEST_GROUP: &str = "g";
 
 /// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`] at the
 /// default [`Config`].
+#[must_use]
 pub fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
     GroupEngine::new(
         GroupId::new(TEST_GROUP),
@@ -23,6 +24,7 @@ pub fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
 }
 
 /// The member summaries listed across all digest frames in `effects`.
+#[must_use]
 pub fn digest_summaries(effects: &[Effect]) -> Vec<NodeId> {
     effects
         .iter()
@@ -37,6 +39,7 @@ pub fn digest_summaries(effects: &[Effect]) -> Vec<NodeId> {
 
 /// A digest frame (liveness summaries + metadata) — how liveness and
 /// metadata now disseminate.
+#[must_use]
 pub fn digest_frame(digest: Vec<wire::NodeDigest>, metadata: Vec<wire::MetaDelta>) -> Vec<u8> {
     wire::encode(&wire::Frame {
         kind: wire::Kind::Digest,
@@ -50,6 +53,7 @@ pub fn digest_frame(digest: Vec<wire::NodeDigest>, metadata: Vec<wire::MetaDelta
 }
 
 /// A delta frame (member entries) — how per-node state now disseminates.
+#[must_use]
 pub fn delta_frame(members: Vec<wire::MemberDelta>) -> Vec<u8> {
     wire::encode(&wire::Frame {
         kind: wire::Kind::Delta,
@@ -64,6 +68,7 @@ pub fn delta_frame(members: Vec<wire::MemberDelta>) -> Vec<u8> {
 
 /// A bare probe frame of `kind` (`Ping`, `PingReq`, `Ack`, `IndirectAck`),
 /// optionally naming the probe's `target`.
+#[must_use]
 pub fn probe_frame(kind: wire::Kind, target: Option<NodeId>) -> Vec<u8> {
     wire::encode(&wire::Frame {
         kind,
@@ -77,6 +82,7 @@ pub fn probe_frame(kind: wire::Kind, target: Option<NodeId>) -> Vec<u8> {
 }
 
 /// One liveness-only digest summary for `node`.
+#[must_use]
 pub fn ndigest(node: &str, inc: u64, status: Status, max_version: u64) -> wire::NodeDigest {
     wire::NodeDigest {
         node: NodeId::new(node),
@@ -90,6 +96,7 @@ pub fn ndigest(node: &str, inc: u64, status: Status, max_version: u64) -> wire::
 }
 
 /// One keyed state entry, as it rides a delta frame.
+#[must_use]
 pub fn entry(
     key: &str,
     version: u64,
@@ -108,6 +115,7 @@ pub fn entry(
 
 /// A member delta carrying `entries` (a well-formed delta sets its
 /// high-water to the max entry version).
+#[must_use]
 pub fn member_delta(node: &str, entries: Vec<wire::EntryDelta>) -> wire::MemberDelta {
     let max_version = entries.iter().map(|e| e.version).max().unwrap_or(0);
     wire::MemberDelta {
@@ -121,6 +129,11 @@ pub fn member_delta(node: &str, entries: Vec<wire::EntryDelta>) -> wire::MemberD
 
 /// Decodes the single digest frame a round emits (all chunks in one, at
 /// these small sizes), returning the sender's own summaries and metadata.
+///
+/// # Panics
+/// If `effects` carries no digest [`Effect::Send`], or the one it carries does
+/// not decode — either way the round under test did not do what it claimed.
+#[must_use]
 pub fn decode_one_digest(effects: &[Effect]) -> wire::Frame {
     let bytes = effects
         .iter()

@@ -32,6 +32,11 @@ impl SplitMix64 {
     }
 
     /// A pseudo-random value in `0..n`; `n` is treated as at least `1`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`% n` bounds the draw below `n`, itself a u32, so the narrowing is \
+                  exact — and the whole point here is a branch-free fixed stream"
+    )]
     pub fn below(&mut self, n: u32) -> u32 {
         (self.next_u64() % u64::from(n.max(1))) as u32
     }

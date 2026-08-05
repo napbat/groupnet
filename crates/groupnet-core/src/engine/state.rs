@@ -476,7 +476,7 @@ impl GroupEngine {
         if next == self.coordinator {
             return Vec::new();
         }
-        self.coordinator = next.clone();
+        self.coordinator.clone_from(&next);
         vec![Effect::CoordinatorChanged { coordinator: next }]
     }
 }

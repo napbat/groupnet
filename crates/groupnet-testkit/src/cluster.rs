@@ -17,15 +17,18 @@ use groupnet_core::{GroupId, NodeId};
 use groupnet_runtime::{Group, Node};
 use groupnet_transport_mem::{MemTransport, Network};
 
+/// [`POLL_INTERVAL`] in milliseconds — the single literal both the interval and
+/// the default budget are built from, so neither can drift from the other.
+const POLL_INTERVAL_MS: u64 = 20;
+
 /// How long a bounded poll sleeps between two checks of its condition.
-pub const POLL_INTERVAL: Duration = Duration::from_millis(20);
+pub const POLL_INTERVAL: Duration = Duration::from_millis(POLL_INTERVAL_MS);
 
 /// How many [`POLL_INTERVAL`] sleeps a default [`eventually`] budget buys.
 pub const DEFAULT_POLLS: u64 = 250;
 
 /// The bound [`eventually`] polls for: [`DEFAULT_POLLS`] × [`POLL_INTERVAL`].
-pub const DEFAULT_TIMEOUT: Duration =
-    Duration::from_millis(DEFAULT_POLLS * POLL_INTERVAL.as_millis() as u64);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(DEFAULT_POLLS * POLL_INTERVAL_MS);
 
 /// Polls `cond` every [`POLL_INTERVAL`] until it holds, for up to
 /// [`DEFAULT_TIMEOUT`]. Panics naming `what` if it never does.
@@ -45,6 +48,10 @@ pub async fn eventually(what: &str, cond: impl FnMut() -> bool) {
 ///
 /// The budget is spent as a *count of polls*, so a slow machine cannot shorten
 /// the number of chances the condition gets.
+///
+/// # Panics
+/// If `cond` has not held once by the time the budget is spent — that is the
+/// failure signal the harness exists to produce.
 pub async fn eventually_within(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
     let polls = (timeout.as_millis() / POLL_INTERVAL.as_millis()).max(1);
     for _ in 0..polls {

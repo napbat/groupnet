@@ -9,7 +9,7 @@ fn node_ids(names: &[&str]) -> Vec<NodeId> {
 }
 
 fn build(group: &GroupId, ids: &[NodeId], latency: u64, loss_percent: u8) -> Simulation {
-    build_with(group, ids, latency, loss_percent, Config::default())
+    build_with(group, ids, latency, loss_percent, &Config::default())
 }
 
 fn build_with(
@@ -17,7 +17,7 @@ fn build_with(
     ids: &[NodeId],
     latency: u64,
     loss_percent: u8,
-    config: Config,
+    config: &Config,
 ) -> Simulation {
     let mut sim = Simulation::new(latency).with_loss(loss_percent);
     for id in ids {
@@ -60,7 +60,7 @@ fn converges_despite_deterministic_loss() {
         suspect_timeout_ms: 10_000_000,
         ..Config::default()
     };
-    let mut sim = build_with(&group, &ids, 10, 33, cfg);
+    let mut sim = build_with(&group, &ids, 10, 33, &cfg);
     sim.run_until(Time(10_000));
 
     assert!(sim.all_agree_on_coordinator());
@@ -215,7 +215,7 @@ fn dead_tombstones_are_reaped() {
         dead_timeout_ms: 1_000,
         ..Config::default()
     };
-    let mut sim = build_with(&group, &ids, 10, 0, cfg);
+    let mut sim = build_with(&group, &ids, 10, 0, &cfg);
     sim.run_until(Time(2_000));
 
     let dead = ids[3].clone();

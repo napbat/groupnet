@@ -75,6 +75,9 @@ impl<T: Transport> Node<T> {
     /// Joins `group`, spawning its actor task, and returns a handle.
     /// Idempotent: joining a group this node already participates in returns
     /// the existing handle.
+    ///
+    /// # Panics
+    /// If the internal group table was poisoned by a panic in another thread.
     pub fn join_group(&self, group: impl Into<GroupId>) -> Group {
         let group = group.into();
         if let Some(existing) = self
@@ -87,7 +90,7 @@ impl<T: Transport> Node<T> {
             return existing.clone();
         }
         // Real groups announce their coordinator into the routing group.
-        let routing = self.inner.routing.get().map(|g| g.command_sender());
+        let routing = self.inner.routing.get().map(Group::command_sender);
         self.spawn_group(group, routing)
     }
 
@@ -103,6 +106,10 @@ impl<T: Transport> Node<T> {
 
     /// The inter-group routing table: look up which group owns a resource and
     /// which node coordinates it, from any node in the cluster.
+    ///
+    /// # Panics
+    /// Never in practice: the reserved routing group is joined during
+    /// [`NodeBuilder::spawn`], before any `Node` handle exists.
     #[must_use]
     pub fn routing(&self) -> Routing {
         let group = self
@@ -118,6 +125,13 @@ impl<T: Transport> Node<T> {
     /// (so this group can publish its coordinator), or `None` for the routing
     /// group itself.
     fn spawn_group(&self, group: GroupId, routing: Option<mpsc::Sender<Event>>) -> Group {
+        // Tick often enough to service the tightest engine deadline (probe
+        // timeouts are the shortest), so failure detection isn't lagged by a
+        // coarse gossip-only cadence. Sampling at `TICKS_PER_DEADLINE`× the
+        // tightest deadline bounds how late a deadline can fire to one tick; the
+        // engine is idempotent under early/extra ticks, so oversampling is safe.
+        const TICKS_PER_DEADLINE: u64 = 2;
+
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
 
         let engine = GroupEngine::new(
@@ -144,12 +158,6 @@ impl<T: Transport> Node<T> {
         let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());
         let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
 
-        // Tick often enough to service the tightest engine deadline (probe
-        // timeouts are the shortest), so failure detection isn't lagged by a
-        // coarse gossip-only cadence. Sampling at `TICKS_PER_DEADLINE`× the
-        // tightest deadline bounds how late a deadline can fire to one tick; the
-        // engine is idempotent under early/extra ticks, so oversampling is safe.
-        const TICKS_PER_DEADLINE: u64 = 2;
         let cfg = &self.inner.config;
         let tightest_deadline_ms = cfg
             .gossip_interval_ms
@@ -262,7 +270,7 @@ impl<T: Transport> NodeBuilder<T> {
     }
 
     /// Overrides the soft per-frame byte cap for digests and deltas (default
-    /// 60_000). Larger deltas are split across successive anti-entropy rounds.
+    /// `60_000`). Larger deltas are split across successive anti-entropy rounds.
     #[must_use]
     pub fn max_delta_frame_bytes(mut self, bytes: usize) -> Self {
         self.config.max_delta_frame_bytes = bytes.max(1);
