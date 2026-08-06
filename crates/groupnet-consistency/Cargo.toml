@@ -72,12 +72,18 @@ groupnet-sim = { workspace = true }
 # so this never enters the published dependency graph. Do NOT add `version`.
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
 
-# The Hosted tier's example needs the tier: without this, `cargo build
-# --examples` on default features would try to compile it against an absent
+# The Hosted tier's examples need the tier: without this, `cargo build
+# --examples` on default features would try to compile them against an absent
 # `hosted` module. Declared here only — every other example stays
 # auto-discovered.
 [[example]]
 name = "fenced_ownership"
+required-features = ["hosted"]
+
+# The External activation's example — same docres shape, epoch closed at a CAS
+# object instead of by a voter majority.
+[[example]]
+name = "anchored_ownership"
 required-features = ["hosted"]
 
 [lints]

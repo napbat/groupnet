@@ -215,7 +215,10 @@ impl QuorumState {
     /// activation policy has to decide here rather than silently inherit.
     pub(super) fn for_activation(activation: &Activation) -> Option<Self> {
         match activation {
-            Activation::Settle { .. } => None,
+            // `External` allocates its epochs at the anchor, so there is
+            // nothing to grant and no ledger to keep — the anchor *is* the
+            // ledger. Structurally inert, exactly as `Settle` is.
+            Activation::Settle { .. } | Activation::External { .. } => None,
             Activation::Quorum { .. } => Some(Self {
                 granted: None,
                 // Unarmed until `start`; see the field doc.
@@ -287,7 +290,9 @@ impl Election {
     /// [`Activation::Quorum`].
     pub(super) fn voters(&self) -> Option<&VoterRoster> {
         match &self.cfg.activation {
-            Activation::Settle { .. } => None,
+            // No roster under `External` either: consensus is outsourced to
+            // the anchor, so there is nobody in the fabric to count.
+            Activation::Settle { .. } | Activation::External { .. } => None,
             Activation::Quorum { voters } => Some(voters),
         }
     }

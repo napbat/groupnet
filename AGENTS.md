@@ -38,17 +38,27 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 ## Engineering rules (owner-set, 2026-08-05)
 
 1. **No Rust source file over 1000 lines.** Split modules before they get
-   there. (Largest today, all within ~40 lines of the limit, so the next
-   addition to any of them splits it *first*: `groupnet-consistency`'s
-   `tests/hosted_dst.rs` ~975, `src/hosted/writes.rs` ~970 and
-   `tests/hosted_dst_migrate.rs` ~960; `groupnet-core`'s `src/wire.rs` ~960 and
-   `tests/election_quorum.rs` ~950; `groupnet-consistency/tests/lease_dst.rs`
-   ~950.) Two splits worth copying: a **shell** splits from its sans-IO core
-   (`hosted/reads.rs` drives, `hosted/lineage.rs` decides and is unit-tested
-   without a runtime), and a **DST harness** splits by *schedule family*, each
-   file carrying its own copy of the harness and asserting the floors its own
-   schedule earns — the house pattern `groupnet-sim`'s `election_quorum*` and
-   this crate's `hosted_dst*` suites both follow.
+   there. (Largest today, all within ~30 lines of the limit, so the next
+   addition to any of them splits it *first*:
+   `groupnet-sim/tests/election_external_failover.rs` ~990;
+   `groupnet-consistency`'s `tests/hosted_dst.rs` ~975, `src/hosted/writes.rs`
+   ~970 and `tests/hosted_dst_migrate.rs` ~960; `groupnet-core`'s `src/wire.rs`
+   ~960 and `tests/election_quorum.rs` ~950;
+   `groupnet-consistency/tests/lease_dst.rs` ~950. With room still:
+   `groupnet-sim/src/simulation.rs` ~885, `groupnet-core`'s
+   `engine/election/mod.rs` ~875 and `src/config.rs` ~860, the rest of the
+   `groupnet-sim` `election_external*` suites at ~785–890, and
+   `groupnet-runtime`'s `tests/external.rs` ~705 / `tests/external_faults.rs`
+   ~775. `simulation.rs` has now absorbed three subsystems' event kinds —
+   **the next addition to it splits the probe/liveness dispatch out** rather
+   than growing it again.) Two splits worth copying: a **shell** splits from
+   its sans-IO core (`hosted/reads.rs` drives, `hosted/lineage.rs` decides and
+   is unit-tested without a runtime), and a **DST harness** splits by *schedule
+   family*, each file carrying its own copy of the harness and asserting the
+   floors its own schedule earns — the house pattern `groupnet-sim`'s
+   `election_quorum*` and this crate's `hosted_dst*` suites both follow, and
+   `groupnet-runtime`'s `external.rs` / `external_faults.rs` (the tier, and the
+   same tier with its store broken) applies to an integration suite.
 2. **Clippy `all` + `pedantic`** are workspace lints; CI treats warnings as
    errors. Verify with
    `cargo clippy --workspace --all-targets -- -D warnings`. Any

@@ -10,6 +10,17 @@
 //! behaviour is reproducible bit-for-bit. No async runtime, no real sockets, no
 //! wall clock.
 //!
+//! It also models the one thing a Hosted group can depend on that is *not* in
+//! the cluster: [`Activation::External`]'s **CAS anchor**. One linearizable
+//! register per simulation, driven by rounds that are scheduled like any other
+//! event, with per-node wall-clock skew, store latency, reachability and
+//! ambiguous-write faults as knobs — see
+//! [`Simulation::enable_anchor`] and [`AnchorEvent`]. Every decision those
+//! rounds make is [`groupnet_core::anchor`]'s, so the simulator and a real
+//! object-store driver run one copy of the rules.
+//!
+//! [`Activation::External`]: groupnet_core::Activation::External
+//!
 //! ```
 //! use groupnet_core::{Config, GroupEngine, GroupId, NodeId, Time};
 //! use groupnet_sim::Simulation;
@@ -28,8 +39,10 @@
 //! [`groupnet-runtime`]: https://docs.rs/groupnet-runtime
 //! [`GroupEngine`]: groupnet_core::GroupEngine
 
+mod anchor;
 mod rng;
 mod simulation;
 
+pub use anchor::AnchorEvent;
 pub use rng::SplitMix64;
 pub use simulation::Simulation;

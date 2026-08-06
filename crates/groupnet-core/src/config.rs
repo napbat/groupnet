@@ -77,6 +77,17 @@ pub struct HostedConfig {
     /// How long a host's authority survives its last successful renewal
     /// before it demotes itself. See the sizing guidance on
     /// [`HostedConfig`] — this is the number that bounds split-brain.
+    ///
+    /// Under [`Activation::External`] this one number is **both** the anchor
+    /// record's TTL (the `ttl_ms` a driver passes to
+    /// [`plan_claim`](crate::anchor::plan_claim) and
+    /// [`renewal_record`](crate::anchor::renewal_record), which sets the
+    /// record's `expires_at_wall_ms`) **and** the engine lease that row 6
+    /// steps down on. Deliberately one knob: the two describe the same
+    /// authority seen from the two clocks, and letting them drift apart is how
+    /// a node keeps hosting past the record it holds — or abandons a record it
+    /// still owns. It doubles as the boot guard there too, exactly as it does
+    /// under [`Activation::Quorum`].
     pub lease_ms: u64,
 }
 
@@ -134,6 +145,83 @@ pub enum Activation {
         /// The nodes whose grants close an epoch. A majority of *these* — not
         /// of whoever gossip currently shows alive — makes a host.
         voters: VoterRoster,
+    },
+    /// Anchor-style: an epoch is closed by a **linearizable external CAS
+    /// register** — an S3/R2 object touched with `If-None-Match`/`If-Match`,
+    /// an etcd key, a CAS row — and by nothing in the fabric at all. Whoever
+    /// wins the conditional write is host; partition sides are irrelevant.
+    ///
+    /// The engine never touches the anchor. It *prompts* the driver with
+    /// [`Effect::AnchorClaimDue`](crate::Effect::AnchorClaimDue) on the
+    /// anti-entropy cadence while the ordinary claim guard is open, and
+    /// consumes the outcome as
+    /// [`Command::AnchorActivated`](crate::Command::AnchorActivated) or
+    /// [`Command::AnchorObserved`](crate::Command::AnchorObserved). No
+    /// `LeadClaim` or `LeadGrant` frame is ever built, and
+    /// [`Role::Claimant`](crate::Role::Claimant) is never entered: an
+    /// `External` group's only election frame is `LeadState`, which carries
+    /// the adopted pair for repair. See [`crate::anchor`] for the record and
+    /// the decision rules.
+    ///
+    /// # What it buys
+    ///
+    /// **Absolute epoch uniqueness, with no node-local storage.** The anchor
+    /// *allocates* the epoch, so no two nodes ever hold the same one — at any
+    /// instant, at disjoint times, across any partition. That is strictly
+    /// stronger than [`Quorum`](Activation::Quorum), whose equivalent
+    /// (`S1-strict`) is *storage-conditional*: an amnesiac voter can re-issue
+    /// an epoch. There is no `GrantStore` analogue here, no recovery
+    /// constructor and no boot blackout, because the anchor is the ledger.
+    ///
+    /// A host that keeps anchor access keeps hosting however the fabric is
+    /// cut; a node that loses anchor access cannot renew and demotes on lease
+    /// lapse however well-connected its peers are. Anchor connectivity is the
+    /// availability axis.
+    ///
+    /// # What it assumes, stated plainly
+    ///
+    /// One thing, and only on the **steal** path:
+    /// **claimant wall-clock skew ≤ `steal_margin_ms`**. That is an assumption
+    /// about *absolute* clock offset between nodes, which is a stronger class
+    /// than the coherence-lease tier's bounded clock-**rate** error — a node
+    /// whose clock ticks correctly but is set an hour fast violates it while
+    /// satisfying the rate bound. It is stated here rather than assumed away
+    /// because it is the only clock this tier consults.
+    ///
+    /// **Nothing about epoch uniqueness or fencing depends on it.** When the
+    /// assumption is violated, a deposed holder may keep believing itself live
+    /// for the excess; that overlap is bounded by the excess, is *always*
+    /// cross-epoch (a successor's epoch is strictly higher by construction),
+    /// and is *always* fenced at the store. The record is succession; the
+    /// fence is safety.
+    External {
+        /// How far past a record's `expires_at_wall_ms` a claimant must wait
+        /// before it may steal — the margin that absorbs wall-clock
+        /// disagreement between the holder that wrote the expiry and the
+        /// claimant reading it. See
+        /// [`AnchorRecord::stealable`](crate::anchor::AnchorRecord::stealable),
+        /// which is the whole rule.
+        ///
+        /// **The condition is *pairwise*, and that distinction is
+        /// load-bearing.** What enters the arithmetic is the disagreement
+        /// between *these two* clocks — the holder stamped
+        /// `expires_at_wall_ms` from its own, the claimant judges it against
+        /// its own — so what must hold is
+        /// `|skew(claimant) - skew(holder)| <= steal_margin_ms` (plus the
+        /// anchor round trip). "Every node within `steal_margin_ms` of true
+        /// time" is a strictly weaker premise and is **not** sufficient: two
+        /// nodes at opposite ends of that band disagree by *two* margins. Size
+        /// the margin against the worst **pair**, or equivalently hold each
+        /// node to half of it — which is exactly why the simulator's
+        /// within-margin family draws its per-node offsets inside
+        /// ±`margin / 2`.
+        ///
+        /// Size it above the worst clock offset the deployment tolerates
+        /// (NTP-disciplined hosts: a few hundred milliseconds; unsynchronized
+        /// ones: seconds). Too small risks an overlapping handover — bounded,
+        /// cross-epoch, and fenced, so it costs succession timing rather than
+        /// safety. Too large costs failover latency and nothing else.
+        steal_margin_ms: u64,
     },
 }
 
@@ -503,6 +591,82 @@ mod tests {
             }),
             "a different roster is a different mode"
         );
+    }
+
+    /// An External activation rides `GroupMode` exactly as the other two do,
+    /// and is never equal to either of them — the way an epoch is closed is
+    /// part of a group's identity, and a driver reading the mode must be able
+    /// to tell "go win an anchor round" from "wait out a window".
+    #[test]
+    fn external_mode_carries_its_steal_margin_and_lease() {
+        let hosted = HostedConfig {
+            activation: Activation::External {
+                steal_margin_ms: 500,
+            },
+            lease_ms: 2_000,
+        };
+        let cfg = Config {
+            mode: GroupMode::Hosted(hosted.clone()),
+            ..Config::default()
+        };
+        assert_eq!(cfg.mode, GroupMode::Hosted(hosted));
+        assert_ne!(cfg.mode, GroupMode::Eventual);
+        assert_ne!(
+            cfg.mode,
+            GroupMode::Hosted(HostedConfig {
+                activation: Activation::Settle {
+                    claim_settle_ms: 500
+                },
+                lease_ms: 2_000,
+            })
+        );
+        assert_ne!(
+            cfg.mode,
+            GroupMode::Hosted(HostedConfig {
+                activation: Activation::Quorum {
+                    voters: roster(&["a"]),
+                },
+                lease_ms: 2_000,
+            })
+        );
+        assert_ne!(
+            cfg.mode,
+            GroupMode::Hosted(HostedConfig {
+                activation: Activation::External {
+                    steal_margin_ms: 501
+                },
+                lease_ms: 2_000,
+            }),
+            "a different steal margin is a different mode"
+        );
+        // Opting in changes nothing about the base fabric's timings.
+        assert_eq!(
+            cfg.detection_window_ms(3),
+            Config::default().detection_window_ms(3)
+        );
+    }
+
+    /// A zero steal margin is a legal configuration — it says "these clocks
+    /// are perfectly agreed", which is unwise rather than invalid, and the
+    /// type must not quietly rewrite it into something else. The rule it feeds
+    /// is tabulated in [`crate::anchor`].
+    #[test]
+    fn a_zero_steal_margin_is_representable() {
+        let cfg = Config {
+            mode: GroupMode::Hosted(HostedConfig {
+                activation: Activation::External { steal_margin_ms: 0 },
+                lease_ms: 2_000,
+            }),
+            ..Config::default()
+        };
+        let GroupMode::Hosted(hosted) = &cfg.mode else {
+            panic!("hosted");
+        };
+        assert_eq!(
+            hosted.activation,
+            Activation::External { steal_margin_ms: 0 }
+        );
+        assert_eq!(hosted.lease_ms, 2_000);
     }
 
     /// The majority table, spelled out: a strict majority, so any two

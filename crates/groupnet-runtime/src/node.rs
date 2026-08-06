@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use groupnet_core::{
-    Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, RecoveredGrant,
+    Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, RecoveredGrant,
 };
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
+use crate::anchor::{Anchor, AnchorTask, anchor_task};
 use crate::driver::{
     EVENTS_CAPACITY, Event, GroupTask, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers,
     group_task, statuses_snapshot,
@@ -50,15 +51,32 @@ pub(crate) const ROUTING_GROUP: &str = "__groupnet_routing__";
 ///
 /// A `Quorum` group additionally carries the **voter storage** the driver
 /// honours [`Effect::PersistGrant`](groupnet_core::Effect::PersistGrant)
-/// through — see [`with_voter_storage`](Self::with_voter_storage). It is not
-/// part of a profile's identity (two profiles differing only in which file
-/// their store writes to describe the same group), which is why this type
-/// carries no `PartialEq`.
-#[derive(Clone, Debug)]
+/// through — see [`with_voter_storage`](Self::with_voter_storage) — and an
+/// `External` group the **anchor** it allocates epochs at, see
+/// [`with_anchor`](Self::with_anchor). Neither is part of a profile's identity
+/// (two profiles differing only in which file their store writes to, or which
+/// bucket their anchor lives in, describe the same group), which is why this
+/// type carries no `PartialEq`.
+#[derive(Clone)]
 pub struct GroupProfile {
     mode: GroupMode,
     /// Voter durability, `None` for the blackout posture.
     storage: Option<VoterStorage>,
+    /// The external CAS register, `None` for the never-claims posture.
+    anchor: Option<Arc<dyn Anchor>>,
+}
+
+impl std::fmt::Debug for GroupProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Neither the store nor the anchor carries a `Debug` bound —
+        // deliberately, so an implementation is free to hold a client handle
+        // and nothing else.
+        f.debug_struct("GroupProfile")
+            .field("mode", &self.mode)
+            .field("storage", &self.storage)
+            .field("anchor", &self.anchor.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl GroupProfile {
@@ -71,6 +89,7 @@ impl GroupProfile {
         Self {
             mode: GroupMode::Eventual,
             storage: None,
+            anchor: None,
         }
     }
 
@@ -86,6 +105,7 @@ impl GroupProfile {
         Self {
             mode: GroupMode::Hosted(config),
             storage: None,
+            anchor: None,
         }
     }
 
@@ -157,14 +177,98 @@ impl GroupProfile {
         self
     }
 
+    /// Gives this group the **external CAS anchor** its epochs are allocated
+    /// at: the linearizable register a claimant must win a conditional write on
+    /// to become host.
+    ///
+    /// Only an [`External`](groupnet_core::Activation::External) group has an
+    /// anchor. Setting this on any other profile is legal and inert — the
+    /// anchor is simply never called, not even once — which is what makes it
+    /// safe to configure **uniformly across a fleet** whose groups differ, in
+    /// exactly the way [`with_voter_storage`](Self::with_voter_storage) is.
+    /// (The reserved routing group is pinned `Eventual`, so an anchor set on it
+    /// is inert for the same reason.)
+    ///
+    /// # No anchor, no host
+    ///
+    /// An `External` group configured **without** one is a supported,
+    /// deliberately fail-safe posture, not a misconfiguration the runtime
+    /// rescues: the engine's [`AnchorClaimDue`] prompts are dropped, this node
+    /// never claims, and the group stays at `(0, None)` unless it *adopts* a
+    /// pair some other node's driver won and beaconed. So a read-only member of
+    /// an `External` group — one that must never host, but must follow whoever
+    /// does — is configured by leaving the anchor off, and it costs nothing on
+    /// the wire.
+    ///
+    /// # One anchor, one object, one group
+    ///
+    /// A process hosting several `External` groups gives each its own [`Anchor`]
+    /// over its own object: the trait names no group, because the profile a
+    /// group is joined under is what pairs them. Two groups sharing one object
+    /// would share one epoch sequence and fight, and no rule in the tier can
+    /// detect it.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use groupnet_core::{Activation, HostedConfig};
+    /// # use groupnet_runtime::{Anchor, GroupProfile};
+    /// # fn demo<T: groupnet_transport::Transport>(
+    /// #     node: &groupnet_runtime::Node<T>,
+    /// #     anchor: Arc<dyn Anchor>,
+    /// # ) {
+    /// let shard = node.join_group_with(
+    ///     "shard-7",
+    ///     GroupProfile::hosted(HostedConfig {
+    ///         activation: Activation::External {
+    ///             steal_margin_ms: 500,
+    ///         },
+    ///         lease_ms: 2_000,
+    ///     })
+    ///     .with_anchor(anchor),
+    /// );
+    /// # let _ = shard;
+    /// # }
+    /// ```
+    ///
+    /// [`AnchorClaimDue`]: groupnet_core::Effect::AnchorClaimDue
+    #[must_use]
+    pub fn with_anchor(mut self, anchor: Arc<dyn Anchor>) -> Self {
+        self.anchor = Some(anchor);
+        self
+    }
+
     /// The profile a bare [`Node::join_group`] joins under: whatever the
     /// node's own [`Config::mode`] says.
     const fn from_mode(mode: GroupMode) -> Self {
         Self {
             mode,
             storage: None,
+            anchor: None,
         }
     }
+}
+
+/// The anchor wiring a group actually runs, or `None` for every group that
+/// claims nothing.
+///
+/// Both halves must line up: an anchor configured on a group whose activation
+/// is not `External` is inert (the uniform-fleet posture
+/// [`GroupProfile::with_anchor`] documents), and an `External` group with no
+/// anchor never claims (the fail-safe posture). `config` is the group's
+/// **effective** config, so the routing group — force-pinned `Eventual` —
+/// lands here as `None` whatever profile it was joined under.
+fn external_anchor(
+    config: &Config,
+    anchor: Option<Arc<dyn Anchor>>,
+) -> Option<(Arc<dyn Anchor>, u64, u64)> {
+    let anchor = anchor?;
+    let GroupMode::Hosted(hosted) = &config.mode else {
+        return None;
+    };
+    let Activation::External { steal_margin_ms } = &hosted.activation else {
+        return None;
+    };
+    Some((anchor, hosted.lease_ms, *steal_margin_ms))
 }
 
 struct Inner<T: Transport> {
@@ -337,8 +441,13 @@ impl<T: Transport> Node<T> {
     ///
     /// `routing` is the routing group's command channel (so this group can
     /// publish its coordinator), or `None` for the routing group itself.
-    /// `profile` decides this group's mode **and its voter storage**; every
-    /// other tunable comes from the node's config.
+    /// `profile` decides this group's mode, **its voter storage and its
+    /// anchor**; every other tunable comes from the node's config.
+    ///
+    /// An `External` group carrying an anchor gets a **second** task beside the
+    /// group actor — see [`anchor_task`] — because an anchor round is a network
+    /// round trip to a store, and the actor pumping gossip must never be behind
+    /// one.
     ///
     /// The voter ledger is *recovered*, never *read*, here: the caller loaded
     /// it before joining (see
@@ -417,6 +526,31 @@ impl<T: Transport> Node<T> {
         let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());
         let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
 
+        // The External tier's driver half: one task per anchored group, owning
+        // the register, this group's command channel and its leadership watch.
+        //
+        // The prompt channel's capacity of **one** is the debounce
+        // `Effect::AnchorClaimDue` requires — the effect is a repeated level
+        // signal, and a `try_send` into a full slot is how a round trip longer
+        // than the anti-entropy interval is stopped from stacking claims. The
+        // task holds a *weak* command sender, so it can never keep a dead
+        // group's actor (and its gossip, and its anchor renewals) alive.
+        let anchor_prompts =
+            external_anchor(&config, profile.anchor).map(|(anchor, lease_ms, steal_margin_ms)| {
+                let (prompt_tx, prompt_rx) = mpsc::channel(1);
+                tokio::spawn(anchor_task(AnchorTask {
+                    anchor,
+                    local: self.inner.id.clone(),
+                    commands: tx.downgrade(),
+                    prompts: prompt_rx,
+                    leadership: lead_rx.clone(),
+                    lease_ms,
+                    steal_margin_ms,
+                    start: self.inner.start,
+                }));
+                prompt_tx
+            });
+
         let tightest_deadline_ms = config
             .gossip_interval_ms
             .min(config.probe_interval_ms)
@@ -438,6 +572,7 @@ impl<T: Transport> Node<T> {
             },
             routing,
             store,
+            anchor_prompts,
             start: self.inner.start,
             tick_period,
         }));

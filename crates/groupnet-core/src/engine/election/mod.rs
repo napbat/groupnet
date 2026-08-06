@@ -78,21 +78,59 @@
 //! rows here call into it at the points those rows name and are otherwise
 //! untouched.
 //!
+//! # `External` activation: the same skeleton, no in-fabric closing rule at all
+//!
+//! [`Activation::External`] shares every row above too, and replaces the
+//! closing rule with a conditional write to a **linearizable store outside the
+//! cluster**. That subtracts rather than adds: there is no claim to stand, so
+//! [`Role::Claimant`] is never entered and no `LeadClaim` frame is ever built;
+//! no endorsement to count, so no `LeadGrant` frame and no
+//! [`PersistGrant`](crate::Effect::PersistGrant) either. The only election
+//! frame an `External` group emits is `LeadState`.
+//!
+//! Row 1 becomes a **prompt** — the identical guard, emitting
+//! [`AnchorClaimDue`](crate::Effect::AnchorClaimDue) instead of opening a
+//! claim — and the outcome arrives as a command rather than a frame. The
+//! `X`-rows and the reasoning live in [`external`](self::external); the rows
+//! here call into it at the two points those rows name (X1 in
+//! [`tick_follower`](GroupEngine::tick_follower), X7 in
+//! [`tick_host`](GroupEngine::tick_host)) and are otherwise untouched.
+//!
+//! One hot-path line is shared with them: **row 5's renewal condition**, which
+//! reads [`is_settle`](GroupEngine::is_settle) rather than "not Quorum". The
+//! two are value-identical for `Settle` and `Quorum`; the difference is that an
+//! `External` host must *not* renew off its own rank, because its authority
+//! comes from the anchor and lapsing when it cannot reach the anchor is the
+//! whole fail-closed posture.
+//!
+//! Renewal is **rank-gated under every activation**, which is the symmetry the
+//! three rows are worth reading together for: row 5 renews only while
+//! `is_coordinator()`, row Q7 opens a renewal round only while
+//! `is_coordinator()`, and row X7 prompts the anchor only while
+//! `is_coordinator()`. What differs is the *evidence* that extends the lease —
+//! this node's own view, a fresh majority of the roster, a fresh anchor round —
+//! never who is entitled to look for it. So an incumbent that is outranked by a
+//! returning peer lets its authority lapse under all three, and the group lands
+//! back where the coordinator ranking points.
+//!
 //! # Layout
 //!
 //! This file is the [`GroupEngine`] rows and the frame dispatch that routes to
-//! them. The two pieces that are pure functions rather than state transitions
-//! live beside it: [`order`] holds [`Role`], the fencing order over
+//! them. The pieces that are pure functions rather than state transitions live
+//! beside it: [`order`] holds [`Role`], the fencing order over
 //! `(epoch, host)` pairs and row 1's claim guard (each tabulated exhaustively by
-//! its own tests), and [`quorum`] holds everything the `Q`-rows add.
+//! its own tests), [`quorum`] holds everything the `Q`-rows add, and
+//! [`external`] everything the `X`-rows do.
 //!
 //! [`Activation::Quorum`]: crate::Activation::Quorum
+//! [`Activation::External`]: crate::Activation::External
 //! [`Config::mode`]: crate::Config::mode
 //! [`GroupMode::Hosted`]: crate::GroupMode::Hosted
 //! [`Eventual`]: crate::GroupMode::Eventual
 //! [`coordinator`]: crate::GroupEngine::coordinator
 //! [`LeadershipChanged`]: crate::Effect::LeadershipChanged
 
+mod external;
 mod order;
 mod quorum;
 
@@ -197,10 +235,34 @@ impl Election {
     /// depends on this number: an epoch is closed by a majority of grants, not
     /// by the passage of time, so a window that is too short or too long costs
     /// election latency and nothing else.
+    ///
+    /// Under [`Activation::External`] it is one **lease** for the same reason
+    /// and with the same indifference: an `External` group has no claim window
+    /// at all (row X1 prompts the driver instead of standing a claim), so this
+    /// is *only* the boot guard — the span a freshly started node hears an
+    /// incumbent's [`wire::Kind::LeadState`] out before deciding the group is
+    /// vacant and prompting for an anchor round. Nothing about External's
+    /// safety depends on it either: the anchor closes the epoch, so a guard
+    /// that is too short or too long costs one wasted anchor round-trip.
     fn activation_window_ms(&self) -> u64 {
         match &self.cfg.activation {
             Activation::Settle { claim_settle_ms } => *claim_settle_ms,
-            Activation::Quorum { .. } => self.cfg.lease_ms,
+            Activation::Quorum { .. } | Activation::External { .. } => self.cfg.lease_ms,
+        }
+    }
+
+    /// Whether this activation closes an epoch on the **settle window alone**
+    /// — the property row 5's tick-re-rank renewal is the other half of.
+    ///
+    /// `Quorum` extends a lease only on a fresh majority of grants (row Q8);
+    /// `External` extends it only on a fresh anchor round (row X3). Neither
+    /// may renew off its own rank, and this is the predicate that says so.
+    /// A `match` rather than a negation, so a future activation policy has to
+    /// decide here instead of inheriting `Settle`'s renewal by default.
+    const fn closes_on_window(&self) -> bool {
+        match &self.cfg.activation {
+            Activation::Settle { .. } => true,
+            Activation::Quorum { .. } | Activation::External { .. } => false,
         }
     }
 
@@ -290,7 +352,7 @@ impl GroupEngine {
     /// re-broadcast and a host's state beacon ride.
     pub(super) fn election_tick(&mut self, now: Time, anti_entropy_due: bool) -> Vec<Effect> {
         match self.election.as_ref().map(|el| el.role) {
-            Some(Role::Follower) => self.tick_follower(now),
+            Some(Role::Follower) => self.tick_follower(now, anti_entropy_due),
             Some(Role::Claimant) => self.tick_claimant(now, anti_entropy_due),
             Some(Role::Host) => self.tick_host(now, anti_entropy_due),
             None => Vec::new(), // Eventual: no election at all
@@ -298,8 +360,9 @@ impl GroupEngine {
     }
 
     /// Row 1: open a claim when this node is the group's top-ranked live
-    /// candidate and nothing bars it.
-    fn tick_follower(&mut self, now: Time) -> Vec<Effect> {
+    /// candidate and nothing bars it — or, under `External`, prompt the driver
+    /// to go win one at the anchor instead (row X1).
+    fn tick_follower(&mut self, now: Time, anti_entropy_due: bool) -> Vec<Effect> {
         let top_ranked = self.is_coordinator();
         let leaving = self.leaving;
         let Some(el) = self.election.as_ref() else {
@@ -315,6 +378,14 @@ impl GroupEngine {
             return Vec::new();
         }
         let epoch = el.highest_seen.saturating_add(1);
+        // Row X1: under External there is no in-fabric bid to stand, so the
+        // same guard that would open a claim prompts the driver to run an
+        // anchor round on the same cadence a claim would be re-offered on.
+        // Nothing below this line runs: no epoch is spent, no role changes,
+        // and `Role::Claimant` is never entered.
+        if el.is_external() {
+            return self.external_claim_prompt(epoch, anti_entropy_due);
+        }
         let settle_at = now.saturating_add(el.activation_window_ms());
         if let Some(el) = self.election.as_mut() {
             el.highest_seen = epoch;
@@ -384,17 +455,36 @@ impl GroupEngine {
         effects
     }
 
+    /// Whether this group closes an epoch on the settle window alone — the one
+    /// activation whose host renews by re-reading its own rank, and therefore
+    /// the exact condition row 5 is gated on.
+    ///
+    /// `false` in an [`Eventual`](crate::GroupMode::Eventual) group, which has
+    /// no activation policy at all. See
+    /// [`Election::closes_on_window`] for why this is a `match` over the
+    /// policies rather than a negation of one of them.
+    fn is_settle(&self) -> bool {
+        self.election
+            .as_ref()
+            .is_some_and(Election::closes_on_window)
+    }
+
     /// Rows 5, 6 and 7: renew while still top-ranked, self-demote once the
-    /// lease lapses, and beacon the adopted pair on the gossip cadence.
+    /// lease lapses, and beacon the adopted pair on the gossip cadence — plus
+    /// row X7's anchor renewal prompt.
     fn tick_host(&mut self, now: Time, anti_entropy_due: bool) -> Vec<Effect> {
         let lease_ms = self.election.as_ref().map_or(0, |el| el.cfg.lease_ms);
         // Row 5: under Settle, renewal is a tick-re-rank — our own view is the
-        // evidence. Under Quorum it is not evidence of anything: the lease is
-        // extended only by a fresh majority of grants (row Q8), so a host cut
-        // off from its voters lapses however top-ranked it still looks to
-        // itself. That is the minority side being starved of a host, which is
-        // the whole point of the CP posture.
-        if self.is_coordinator() && !self.is_quorum() {
+        // evidence. Under every other activation it is not evidence of
+        // anything. Under Quorum the lease is extended only by a fresh majority
+        // of grants (row Q8), so a host cut off from its voters lapses however
+        // top-ranked it still looks to itself — the minority side being starved
+        // of a host, which is the whole point of the CP posture. Under External
+        // it is extended only by a fresh anchor round (row X3), so a host that
+        // has lost the anchor lapses however well-connected its peers are —
+        // which is what makes anchor connectivity, rather than reachability of
+        // peers, the availability axis.
+        if self.is_coordinator() && self.is_settle() {
             if let Some(el) = self.election.as_mut() {
                 el.lease_until = now.saturating_add(lease_ms);
             }
@@ -414,6 +504,12 @@ impl GroupEngine {
         // Row Q7: the Quorum renewal round — a no-op under Settle, whose
         // renewal was the re-rank above.
         let mut effects = self.renewal_round(now);
+        // Row X7: the External renewal prompt. Rank-gated like row Q7's round
+        // just above it — an outranked host should be letting its lease lapse,
+        // not asking the anchor to extend it — and reached only past row 6's
+        // lapse check, so a host that has already run out of lease steps down
+        // rather than asking for more. A no-op under Settle and Quorum.
+        effects.extend(self.external_renewal_prompt());
         // Row 7: repair beacon, so a node that missed the election converges.
         let targets = self.beacon_targets();
         if let Some(body) = self.state_body() {

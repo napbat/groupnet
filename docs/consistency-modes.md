@@ -288,8 +288,48 @@ already exists and is already tested.
 | Policy | Partition behavior | CAP posture | Split-brain |
 |---|---|---|---|
 | `Quorum { voters }` | only a side holding a majority of the **static voter roster** activates a host; the minority side fails hosted writes fast (`NoLeader`, once M4's write path exists) while base-fabric gossip continues | CP for the hosted domain | none outside the lease window (lease expiry + bounded clock-*rate* skew) |
-| `External` (CAS-anchored lease) | whoever wins the external conditional write is host; partition sides are irrelevant | CP; consensus outsourced to the anchor | none, absolutely (the anchor is linearizable) |
+| `External` (CAS-anchored lease) | whoever wins the external conditional write is host; partition sides are irrelevant | CP; consensus outsourced to the anchor | **none in epochs, absolutely** — and on the steal path a bounded, always-cross-epoch, always-fenced overlap in *instants* † |
 | `Settle { claim_settle_ms }` (lobby-style) | each side elects its own host after the settle window | AP + serialization per side | yes — bounded and **fenced**: at heal exactly one epoch survives; the loser surfaces as a `Gap` + demotion event for the app to reconcile |
+
+† **What "absolutely" covers, and what it does not.** The absolute statement is
+about **epochs**, and it is the strongest one in this table. The anchor is a
+linearizable CAS register and it *allocates* the epoch — an epoch number exists
+only because one conditional write created it — so no two nodes ever hold the
+same epoch, at any instant, at disjoint times, across any partition, and **with
+no node-local storage of any kind**. That is **S1-strict, unconditional**, and
+it is strictly stronger than Quorum's: there S1-strict is *storage-conditional*,
+holding only while voters remember what they granted (an amnesiac restart can
+re-issue an epoch — see the M3 property matrix). External needs no `GrantStore`,
+no boot blackout, and no persisted ledger, because the property that durability
+was standing in for is the anchor's job.
+
+What is *not* absolute is instantaneous non-overlap on the **steal** path.
+A claimant supersedes an expired record when `now_wall_ms ≥ expires_at_wall_ms +
+steal_margin_ms` — shardstore's `caslog/epoch.rs` TTL + skew-margin rule, lifted
+verbatim — so the deposed holder can still believe itself live for as long as
+the two nodes' **wall clocks disagree**, and the honest assumption is
+*claimant wall-clock skew ≤ the configured steal margin*. Read that as the
+**pairwise** condition it is — `|skew(claimant) − skew(holder)| ≤
+steal_margin_ms`, plus the anchor round trip — because "every node is within
+`steal_margin_ms` of true time" is a strictly weaker premise that does **not**
+imply it: two nodes at opposite ends of that band disagree by *two* margins.
+(The DST's within-margin family draws its per-node offsets inside ±`margin/2`
+for exactly this reason, and pins the boundary at the pairwise limit.) Three
+things bound
+what that costs, and they are why the residue is acceptable rather than papered
+over:
+
+* it is **bounded** by the margin, not open-ended;
+* it is **always cross-epoch** — the successor holds a strictly higher epoch by
+  construction, so the two overlapping beliefs are never a same-epoch duel and
+  every ordering question between them has an answer;
+* it is **always fenced** — the fence token stamped onto the external store
+  rejects the older epoch's writes at the store, whatever either node believes.
+
+Stated as the design rule the whole tier rests on: **the anchor record is
+*succession*; the fence at the store is *safety*.** A margin sized wrong costs a
+slower or a slightly overlapping handover; it cannot cost a lost write, because
+nothing about epoch uniqueness or fencing consults a clock.
 
 A gossip-derived majority is **not** an option: SWIM views can diverge across
 a partition, so "majority of who I think is alive" is unsafe. Quorum mode
@@ -874,6 +914,371 @@ that nobody reads "recovery" as "replay":
   strong-profile-versus-Raft table's "a laggard gaps and state-resyncs" row
   means in practice.
 
+#### External activation, as built (Milestone 5)
+
+Status: **Delivered (pending review).** What shipped, by layer:
+
+* **core** — `Activation::External { steal_margin_ms }`; the sans-IO anchor
+  vocabulary in `groupnet-core/src/anchor.rs` (`AnchorRecord`, `stealable`,
+  `ClaimPlan`, `plan_claim`, `renewal_record`, `ambiguous_applied`);
+  `Effect::AnchorClaimDue`, `Command::AnchorActivated` /
+  `Command::AnchorObserved`; the `X`-rows in `engine/election/external.rs`.
+* **runtime** — the `Anchor` trait (`load` + conditional `store`), `AnchorToken`
+  / `AnchorWriteIf` / `AnchorCas`, `GroupProfile::with_anchor`, and the per-group
+  `anchor_task` in `groupnet-runtime/src/anchor.rs`.
+* **sim** — a deterministic CAS register plus the driver state around it
+  (`groupnet-sim/src/anchor.rs`), with fault knobs for anchor reachability,
+  per-node wall-clock skew and ambiguous writes in **both** readings (applied
+  but unreported, and never applied and unreported), all orthogonal to fabric
+  partitions.
+* **tests** — `groupnet-core/tests/election_external.rs`, the three
+  `groupnet-sim/tests/election_external*.rs` suites,
+  `groupnet-runtime/tests/external.rs` and `external_faults.rs`, and a runnable
+  example (`cargo run -p groupnet-consistency --example anchored_ownership
+  --features hosted`).
+
+Everything below is the contract of record for what is built.
+
+##### The anchor is a raw CAS store, not a lock service
+
+The trait a deployment implements is deliberately the *smallest* shape a real
+object store already offers — a read that returns a version marker, and a write
+conditional on one:
+
+```text
+load()                  -> Option<(AnchorRecord, AnchorToken)>   // GET
+store(Absent,  record)  -> Stored | Mismatch | Unknown           // PUT If-None-Match: *
+store(Matches, record)  -> Stored | Mismatch | Unknown           // PUT If-Match: <etag>
+```
+
+As built there is **one method for both writes**, taking the precondition
+`plan_claim` already decided (`AnchorWriteIf::Absent` / `Matches(token)`), so a
+driver never infers which one to use. An implementation **closes over its object
+key** — nothing in the trait names the group, because the `GroupProfile` a group
+is joined under is what pairs them. An `Err` from `store` is read as `Unknown`,
+so an implementation that cannot distinguish "never left" from "may have
+applied" is still correct; an `Err` from `load` decides nothing at all.
+
+That is S3/R2/GCS reality: `GET` plus `PUT` with `If-None-Match: *` or
+`If-Match: <etag>`, and the third outcome is not optional — a timed-out or
+interrupted conditional `PUT` is genuinely *ambiguous*, and the only honest
+resolution is a read-back (shardstore's `renew` does exactly this, and
+`anchor::ambiguous_applied` is that read-back rule as a pure predicate).
+
+**The read-back compares the whole record, not the `(epoch, host)` pair.**
+Reviewed and changed during M5. For a *claim* the pair would do — an attempted
+claim bids strictly above everything standing, so finding it means our own write
+put it there. A **renewal** breaks that: it keeps the epoch and the host and
+only moves the expiry, so what it attempted and what is already standing are the
+same pair, and "my renewal applied" is indistinguishable from "my old record is
+still there". The reading that matters is not a rare timeout but a *standing*
+one — a store whose `PUT`s fail while its `GET`s work (write throttle,
+read-only window, expired write credentials) reports `Unknown` for **every**
+renewal — and a pair-only verdict would call each of them a win: the engine
+lease extends indefinitely off a record nobody is refreshing, until a rival
+steals at `expires + steal_margin` and two nodes host **with perfect clocks**.
+`expires_at_wall_ms` is exactly the discriminator, because the driver's pacing
+floor puts renewal rounds at least half a lease apart, so a renewal always
+stamps a strictly later expiry than the one it replaces. Both DST and the
+runtime suite carry the fault (`X-ambiguity-b`, and the write-throttled fixture
+in `groupnet-runtime/tests/external_faults.rs`).
+Anything richer — a lock service with sessions, a lease API, a compare-and-swap
+with a callback — would be a second protocol to write per backend. This one is
+written **once**, and a consumer with etcd or ZooKeeper adapts *down* to it
+rather than groupnet adapting up to each.
+
+##### The decision rules live in core, so the sim and the driver run one copy
+
+`groupnet-core/src/anchor.rs` is pure and clock-free: `AnchorRecord`,
+`AnchorRecord::stealable`, `ClaimPlan`, `plan_claim`, `renewal_record`,
+`ambiguous_applied`. It performs no I/O and reads no clock — `now_wall_ms`
+arrives as an argument, exactly as shardstore's epoch module takes it — so every
+branch (absent record, held by self, held by a live other, stealable at the exact
+boundary, an epoch hint that dominates) is a table, not a scenario. The driver
+supplies bytes and etags; the *verdicts* are this module's, which is what lets
+the deterministic simulator drive the identical code an S3-backed driver does.
+Same posture the lease tier's cores established, for the same reason.
+
+##### Two clocks, and which one each number answers to
+
+The tier touches two unrelated time bases, and conflating them is the mistake
+this table exists to prevent:
+
+| | Unit | Written by | Judged by | What it decides |
+|---|---|---|---|---|
+| `AnchorRecord::expires_at_wall_ms` | wall-clock ms, absolute | the holder, into the anchor record | **every claimant's own wall clock**, plus `steal_margin_ms` | when a *successor* may steal — the succession rule, subject to the skew assumption in the §3 footnote |
+| `Command::AnchorActivated { lease_until }` | the engine's logical `Time` | the driver, from the engine's own time base | the engine's `on_tick` | when *this* node stops believing itself host (row 6's step-down) |
+
+The engine never sees a wall-clock millisecond and the anchor record never sees
+a `Time`. `lease_until` is fed **in** by the driver precisely so the sans-IO
+rule holds; the engine does not derive it, because deriving it would mean
+knowing how long the CAS took.
+
+**`lease_until` is anchored at round *initiation*** — as built, both clocks are
+sampled in `Claimant::round` *before* the load is issued, not after the CAS
+returns, and an ambiguous write resolved by read-back takes its lease from the
+same `t0` (the round trip was longer, not the authority). This is Quorum's
+send-instant attribution argument in a different dress and it is conservative
+for the same reason: the record's `expires_at_wall_ms` was computed from a
+`now_wall_ms` sampled at or after that instant, so an engine lease anchored at
+initiation always expires no later than the record it was earned from. Anchoring
+after the round would hand the host an overhang past its own anchor record —
+exactly the window a successor's steal is entitled to use.
+
+**Where the anchor-latency term sits differs by layer, and both are
+conservative.** The simulator stamps the record when the round *fires* at the
+store (`started_at + latency`) while taking the engine lease from `started_at`,
+so a sim record outlives the lease it granted by exactly one anchor latency —
+the cushion is on the holder's side, and it is why the skew suite's arithmetic
+reads `skew(successor) − skew(holder) > margin + anchor_latency`. The runtime
+stamps both from the same pre-load instant, so its record and lease expire
+together and the cushion is the **successor's** own round trip instead: a rival
+cannot even observe the expiry until one `load` after it has passed. Same
+inequality, the latency term simply belongs to a different party in each layer;
+neither ever hands a holder time past its own record.
+
+**The skew assumption is pairwise.** What enters `stealable` is the
+disagreement between *these two* clocks — the holder stamped
+`expires_at_wall_ms` from its own, the claimant judges it against its own — so
+the condition is `|skew(claimant) − skew(holder)| ≤ steal_margin_ms` (plus the
+anchor round trip). "Every node within `steal_margin_ms` of true time" is
+strictly weaker and does **not** imply it: two nodes at opposite ends of that
+band disagree by two margins. The DST's within-margin family draws per-node
+offsets inside ±`margin/2` for exactly this reason, and its arithmetic note
+states the boundary an overlap needs to cross as
+`skew(successor) − skew(holder) > margin + anchor_latency`.
+
+##### The command/effect surface
+
+* **`Effect::AnchorClaimDue { epoch_hint }`** — the engine *prompting* the
+  driver, never performing. Emitted only under `External`, only on the
+  anti-entropy cadence, and only when **row 1's ordinary `ClaimGuard` opens**
+  (not leaving, past the boot guard, top-ranked, not already the adopted host).
+  It is a repeated prompt rather than a one-shot, because a lost prompt must
+  self-heal; the driver **debounces** it against its own in-flight round. With
+  no anchor configured a driver simply drops it, and the group never hosts —
+  fail-safe, and the same shape as an empty voter roster.
+* **`Command::AnchorActivated { epoch, lease_until }`** — the driver reporting a
+  CAS it *won*. Row **X2** activates on it (reusing row 4's `activate`
+  verbatim), row **X3** treats the same epoch while already `Host` as a lease
+  extension (`lease_until = max`).
+* **`Command::AnchorObserved { epoch, host }`** — the driver reporting a record
+  it *read* and did not win. Row **X4** adopts it when it outranks the adopted
+  pair in the existing `(epoch, host)` fencing order; row **X5** is row 12b
+  verbatim when it names *this* node at a strictly higher epoch.
+* **Row X6** is the gate on both: silently dropped outside `External`, and
+  dropped below the monotone bars (`AnchorActivated` under `highest_seen`,
+  `AnchorObserved` that does not outrank what is held). A command is driver
+  input, so it is exactly where a stale, duplicated or misrouted report has to
+  die. Two narrowings landed in M5's review, both on `AnchorActivated`:
+  * **Leaving drops it.** Row 15 demotes *before* the leave disseminates,
+    precisely so a node never serves an epoch it has announced it is gone from;
+    an anchor round already in flight when `Command::Leave` landed would
+    otherwise come back and re-activate it at the very epoch it just gave up.
+    Row X1's guard already refuses to *prompt* while leaving; this is the same
+    rule applied to a prompt issued earlier.
+  * **The `>=` bar admits equality only where the adopted host at that epoch is
+    hostless or ourselves** — the shapes row X5 (`(epoch, None)`) and row 6's
+    lapse leave behind, and row X3's renewal. An equal epoch adopted for
+    *another* node came through row X4, and activating over it would serve an
+    epoch the anchor awarded elsewhere. One anchor cannot produce that report;
+    a misrouted one can, which is what this row is for.
+* **Row X7** is the host's renewal prompt: the same `AnchorClaimDue` on the same
+  cadence, hinting the epoch it *already* holds rather than one above it,
+  reached only past row 6's lapse check — and **rank-gated**, see the next
+  subsection.
+
+**`Role::Claimant` is never entered.** Under `External` there is no in-fabric
+bid to stand: row **X1** replaces row 1's claim with a prompt, and no
+`LeadClaim` or `LeadGrant` frame is ever built. The only election frame an
+`External` group emits is `LeadState` — the activation broadcast and row 7's
+repair beacon. That is **X-purity**, and it is pinned by a test asserting zero
+claim/grant/persist effects across a whole run.
+
+##### Renewal is rank-gated under every activation (row X7)
+
+**Reviewed and changed during M5** (owner-approved): row X7's prompt is gated on
+`is_coordinator()`, exactly as row Q7's renewal round is, and row 5's re-rank
+renewal already was. The three rows are then one design — every activation's
+renewal is rank-gated, and they differ only in the *evidence* that extends the
+lease (this node's own view; a fresh majority of the roster; a fresh anchor
+round), never in who is entitled to go looking for it.
+
+What the ungated version did, and why it was wrong to ship: an incumbent that a
+returning higher-ranked peer had outranked kept renewing indefinitely, while the
+new rendezvous top prompted, read a live record, and yielded — **one store round
+trip per anti-entropy interval, per pinned candidate, for as long as the
+mismatch lasted**. Safe (the anchor allocates the epoch, and every yielded round
+is fenced by it), and permanently wasteful. With the gate, the outranked
+incumbent stops being prompted, its record ages out, its engine lease lapses on
+row 6, and the top-ranked node supersedes it at a strictly higher epoch — so the
+design's own sentence, *the host in the common case lands where the coordinator
+ranking points*, survives churn instead of holding only until the first restart.
+
+This is a **liveness and cost** rule, in the same class as row 6, and the DST
+says so: the hand-back is a `Steal` like any other, cross-epoch and store-fenced,
+and the sim measures it at a handful of yielded rounds rather than an unbounded
+stream (`X-handback`). It is also what lets **L1-external** assert the settled
+host is the rendezvous owner of the live set, and not merely whoever last held
+the record.
+
+**What it costs, stated plainly:** because renewal is rank-gated and candidacy
+is too, an incumbent that is anchor-connected and serving perfectly well lapses
+the moment a higher-ranked node returns — *even when that returning node has no
+anchor access at all*, so nobody replaces it and the group is left **hostless
+despite having a working, willing host**. That is the compound price of the two
+gates together (`X-rank` × row X7), it is the CP posture being honest rather
+than a bug, and it is pinned by `X-rank-compound` in
+`election_external_failover.rs`, which asserts both halves: the incumbent
+lapses, and the group stays hostless past the instant its record became
+stealable until the top-ranked node's anchor heals.
+
+There is still **no cooperative handoff** — `AnchorRecord` carries no successor
+hint, and a record is superseded on its expiry or not at all. The lapse costs one
+TTL plus the steal margin; shortening it is Milestone 6's business.
+
+##### The driver, as built: hold, leadership, and the third posture
+
+The runtime half is one task per group (`anchor_task`), and three of its rules
+are contract rather than implementation detail:
+
+* **What a prompted round may do is decided by the hold and the published
+  leadership *together*.** The **hold** (the epoch + etag this node's last
+  winning write returned) is what blocks the claim path: a round ends by feeding
+  `AnchorActivated` into a bounded inbox the group actor has not necessarily
+  drained, so the leadership watch is routinely one hop behind the task, and a
+  holder that fell through to `plan_claim` there would dutifully supersede its
+  *own* record and burn an epoch per round. **Leadership** is what licenses the
+  renewal: a node the engine has demoted must not renew, and above all must not
+  re-report an activation, which would hand back a group it has just given up.
+* **So there is a third posture, `Wait`.** A hold the engine is not currently
+  showing does nothing at all this round — the right answer for both readings of
+  it (the actor is one hop behind, and the next prompt resolves it; or a release
+  edge is on its way, and claiming would undo it). **The wait is bounded by the
+  record itself**: if the activation never reached the engine (a `try_send`
+  dropped under load), the hold lapses when its record does and this node
+  re-claims from scratch at a strictly higher epoch. One lease is the worst a
+  lost report costs, and it costs it without a special case.
+* **A renewal has a pacing floor of half a lease.** The engine's prompt is the
+  *ceiling* on how often a renewal may happen; `expires_at_wall_ms − now >
+  lease_ms / 2` is the floor on how late it may be left. That leaves a full half
+  lease spare for a slow round trip, a dropped report or a retry, and stops a
+  brisk gossip interval turning into a store write every few milliseconds.
+* **The command channel back into the actor is a `WeakSender`, on purpose.** The
+  group actor stops when its inbox closes — i.e. when every sender is dropped —
+  and the actor itself owns this task's prompt channel. A strong sender here
+  would make the pair mutually immortal: a killed node would keep gossiping *and
+  keep renewing its anchor record*, which is the one leak this tier cannot
+  afford. The task ends when the prompt sender drops, which happens when the
+  actor returns; `feed` upgrades the weak sender per report and gives up quietly
+  if the actor has already stopped.
+* **`AnchorClaimDue` must never block the group actor**, which is the sharp
+  inversion of `PersistGrant` (which blocks it *by contract* — a grant must not
+  outrun its own durability). Here there is nothing to be ahead of: until the
+  anchor answers, this node is not host, so making the actor wait would buy
+  nothing and stall gossip. The **capacity-one prompt channel plus `try_send`
+  *is* the debounce** the level-signal prompt requires of every driver.
+
+##### Fail-closed, and why partitions stop being the axis
+
+Anchor connectivity **is** the availability axis, and it replaces reachability
+of peers:
+
+* **Partition-irrelevance.** A host cut off from the entire fabric but still
+  able to reach the anchor keeps renewing and keeps hosting — correctly, because
+  the anchor is the only thing that can award the epoch, and nobody else can take
+  it. Under `Quorum` that same node would lapse. Under `External` a partition is
+  not a leadership event at all.
+* **Fail-closed on anchor loss.** A node that cannot reach the anchor cannot
+  renew, so its engine lease lapses on row 6 and it demotes. It does not keep
+  serving on rank, which is exactly why row 5's renewal is gated to `Settle`
+  (see the row-5 note below).
+* **The rank-pinned-hostless shape.** Candidacy is rank-gated — row X1's guard
+  is row 1's guard — so if the *top-ranked* node is the one that has lost the
+  anchor, the group stays hostless even though a second-ranked node could reach
+  it perfectly well. This is deliberate and it mirrors Quorum's stalled-candidate
+  behaviour: a rank-driven candidate set is what keeps the election free of
+  duelling timeouts, and the price is that a single node's connectivity can pin
+  the group. An operator's signal is the anchor error at the driver, not
+  anything in `NetStats`.
+
+  **Compounded with the rank-gated renewal (row X7), it can also *take the
+  group away* rather than merely fail to hand it over**: an outranked but
+  anchor-connected incumbent stops being prompted and lapses even when the
+  returning rendezvous top has no anchor access — so the group goes hostless
+  while a perfectly working, willing host sits in it. Both gates are defensible
+  alone and the composition is the actual price paid; `X-rank-compound` asserts
+  it, so a change that widens the candidate set to buy it back has to come and
+  edit that test.
+
+##### Restart is re-winning, never resuming
+
+There is no resume path and there will not be one. A restarted node comes back
+`Follower` at epoch 0 with no memory of hostship; if it is still entitled it
+prompts, and the driver **re-wins through the anchor** at a strictly higher
+epoch. The old epoch is never picked back up, even though the record may still
+name this node — the record naming us is *evidence of an epoch*, not a grant of
+hostship, and it is consumed by row X5 exactly as row 12b consumes a
+self-naming `LeadState`: the pair is taken with its hostship stripped off, as
+`(epoch, None)`, and the node re-earns the group above it. Epoch monotonicity
+across restarts is therefore free here — the anchor remembers, so the node
+does not have to.
+
+##### A leave releases; everything else lapses
+
+`Group::leave` demotes on row 15 *before* the leave disseminates, and the
+driver's leadership watch turns that host→not-host edge into a **release**: the
+record is re-stamped already-expired, at the **same epoch** (a release decides
+nothing, so it allocates nothing) and still conditional on this node's own etag,
+so a successor that already superseded it cannot be clobbered by a late release.
+A successor then claims after `steal_margin_ms` instead of waiting out a whole
+TTL — pinned in the runtime suite against a budget it could not possibly meet
+otherwise. The release is **best-effort and its failures are ignored on
+purpose**: a node that cannot reach the anchor to release (usually *why* it
+demoted) leaves the record to lapse, which is the same outcome one TTL later.
+The edge also discards a prompt issued while this node was still host, since
+replaying it would take the claim path and supersede the record the release just
+gave up.
+
+Everything else — a crash, an anchor outage, a lost rank, a deposing pair — is a
+**lapse**, not a release, and costs the full TTL plus the margin. The
+deterministic simulator deliberately models only the lapse path: it has no
+release, so every succession there is the slow one and no property in the DST is
+allowed to depend on a courtesy.
+
+##### The X properties, as they landed
+
+| Where | What it pins |
+|---|---|
+| `groupnet-core/src/anchor.rs` (unit) | the decision rules as tables: absent/held-by-self/live-other/stealable at the exact millisecond, the hint as a floor, saturating arithmetic, the ambiguous-write truth table — including the renewal that did **not** apply and must not be mistaken for the record it meant to replace |
+| `groupnet-core/tests/election_external.rs` | the `X`-rows against a real engine, including the rank-gated X7, the fail-closed step-down, and the leave that no in-flight anchor round may undo; **X-purity** asserted over each run's *whole* effect stream |
+| `groupnet-sim/tests/election_external.rs` | **X-S1** over 128 chaos seeds (crashes, amnesiac restarts, partitions, anchor outages, loss, reorder, arbitrary skew) — unconditional, with no storage anywhere; X-S2/S4b sampled after every round; **L1-external** (one host, it is the register's holder *and* the rendezvous owner of the live set) |
+| `groupnet-sim/tests/election_external_failover.rs` | the shaped scenarios: **X-part** (partition-irrelevance, with the `Quorum` inversion on the identical schedule), **X-closed** (no anchor, no host), **X-rank** (the rank-pinned-hostless cost), **X-rank-compound** (that cost composed with the rank-gated renewal: a working host lapses and nobody replaces it), **X-handback**, and **X-budget** — 32 seeds against an itemized virtual-time budget with no fudge term |
+| `groupnet-sim/tests/election_external_skew.rs` | **X-skew-a** (96 seeds, `hosts() ≤ 1` after *every scheduled event*), **X-skew-b** (64 seeds, each producing a real overlap: bounded by the excess, always cross-epoch, always resolved), **X-ambiguity-a** (64 seeds with a fifth to a half of writes applying and reporting `Unknown`), **X-ambiguity-b** (32 seeds of the store that swallows every write and still says `Unknown`: the lease lapses at exactly the instant the last landed round bought it, with perfect clocks and no overlap) |
+| `groupnet-runtime/tests/external.rs` | the driver half over the async runtime and a real `Anchor`: elect, steal, the two inert postures, release-on-leave |
+| `groupnet-runtime/tests/external_faults.rs` | the same fixture with the store broken: unreachable-anchor availability, the incumbent-only cut, ambiguous-write read-back, and the write-throttled store whose failed renewals must lapse the lease instead of extending it |
+
+Every seeded family prints its own floors on success (round tallies, steal
+counts, slack), so a schedule that has drifted *towards* its floor reports it
+before it drifts past it.
+
+##### Non-goals for this milestone
+
+* **No handoff.** `AnchorRecord` carries no `handoff_to` successor hint, unlike
+  shardstore's `WriterRecord`. Cooperative handoff is Milestone 6, and adding
+  the field early would put an unexercised branch in the steal rule.
+* **No `GrantStore` analogue, and none is coming.** The anchor *is* the ledger.
+  There is no `Effect::Persist*` under `External`, no recovery constructor, and
+  no boot blackout — those exist under `Quorum` to stand in for a durable
+  allocator, and here there is a real one.
+* **Two hot-path lines touched, both of them rank conditions.** Row 5's
+  condition moves from `is_coordinator() && !is_quorum()` to
+  `is_coordinator() && is_settle()` — value-identical for `Settle` and `Quorum`,
+  and what stops an `External` host renewing its engine lease off its own rank
+  instead of off the anchor. Row X7's prompt gained the same
+  `is_coordinator()` gate row Q7 already had (see above). The regression bar for
+  both is that every pre-existing suite passes byte-unmodified.
+
 #### Consumer mapping
 
 * **docres document ownership/locking** = Hosted mode per shard group with
@@ -1018,6 +1423,30 @@ heal schedules) assert the safety and liveness properties:
   write (leader completeness).
 * **L1** — after heal + settle, exactly one host; all agree on
   `(host, epoch)`; it is the rendezvous top-ranked live member.
+* **X** (External, M5) — the anchor tier's own properties. All four are DST
+  properties now; see the M5 as-built subsection for which suite pins each.
+  * **X-S1** — *absolute epoch uniqueness*: no two nodes ever hold the same
+    epoch, at any instant or at disjoint times, across any partition, and with
+    **no node-local storage**. Strictly stronger than S1-strict under Quorum,
+    which is storage-conditional — the anchor allocates the epoch, so there is
+    nothing for a restart to forget.
+  * **X-purity** — an `External` group builds **zero** `LeadClaim` and
+    `LeadGrant` frames and emits **zero** `PersistGrant` effects over any
+    schedule, and `Role::Claimant` is never entered. Its only election frame is
+    `LeadState`. Pinned at the core layer by asserting on the whole effect
+    stream of a run, not on a sampled tick.
+  * **X-part** — *partition-irrelevance*: a host that retains anchor access
+    keeps hosting however the fabric is cut, and a node that loses anchor access
+    demotes on lease lapse however well-connected its peers are. Anchor
+    connectivity replaces peer reachability as the availability axis.
+  * **X-skew**, the honesty pair. **X-skew-a**: while every *pair* of clocks
+    disagrees by at most `steal_margin_ms`, no two hosts' leases overlap at any
+    instant (S4c under this tier) — and this is the *only* External property
+    that consults a clock at all. **X-skew-b**: when that assumption is
+    violated, the overlap is
+    bounded by the excess, is **always cross-epoch** (a successor's epoch is
+    strictly higher by construction), and is **always fenced** at the store —
+    so a broken clock costs succession timing and never X-S1.
 
 Plus: codec round-trip tests for the new frames (testkit `frames` fixtures),
 mem-transport end-to-end (elect → kill host → observe migration as a `Gap`),
@@ -1072,11 +1501,21 @@ epoch/fencing/lease skeleton; Quorum and External land on the proven result.
   intersection argument, the deployment contract they impose (including the
   serving host's own lineage cut), the latched recovery verdict, and the two
   reviewed deviations that are now contract.
-* **Milestone 5 — external-CAS anchor.** `Activation::External` with a
-  driver-side `Anchor` trait (runtime layer, never core); the engine
-  consumes anchor outcomes as commands; the sim models the anchor as a
-  deterministic CAS register. The shardstore-pattern lift — docres's
-  guaranteed-and-fast quadrant.
+* **Milestone 5 — external-CAS anchor. Delivered (pending review).**
+  `Activation::External` with a driver-side `Anchor` trait (runtime layer, never
+  core); the engine consumes anchor outcomes as commands; the sim models the
+  anchor as a deterministic CAS register with orthogonal knobs for store
+  reachability, per-node wall-clock skew and ambiguous writes. The
+  shardstore-pattern lift — docres's guaranteed-and-fast quadrant. A runnable
+  anchored-ownership example (the docres shape with the election replaced:
+  `cargo run -p groupnet-consistency --example anchored_ownership --features
+  hosted`). As built, renewal is rank-gated under *every* activation (row X7
+  gained row Q7's `is_coordinator()` gate, reviewed and owner-approved during
+  the milestone), the driver decides claim-versus-renew from the hold and the
+  published leadership together with a bounded `Wait` for the third case, and a
+  voluntary leave *releases* the record while every other ending lapses — see
+  the M5 as-built subsection above for those and for the shape the `X`
+  properties landed in.
 * **Milestone 6 (optional) — handoff helper** over `BulkTransport`, plus
   host-scoped registers if fence tokens prove insufficient for docres locks.
 

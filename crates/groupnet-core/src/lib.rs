@@ -32,6 +32,7 @@ mod id;
 mod membership;
 mod time;
 
+pub mod anchor;
 pub mod placement;
 pub mod wire;
 

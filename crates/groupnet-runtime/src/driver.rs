@@ -171,6 +171,13 @@ pub(crate) struct GroupTask<T: Transport> {
     /// ignored and the engine's post-restart grant blackout stands in for
     /// durability.
     pub store: Option<Arc<dyn GrantStore>>,
+    /// Where [`Effect::AnchorClaimDue`]'s epoch hints go: the capacity-one
+    /// inbox of this group's [`anchor_task`](crate::anchor::anchor_task).
+    /// `None` for every group that is not both
+    /// [`External`](groupnet_core::Activation::External) and configured with an
+    /// [`Anchor`](crate::Anchor) — the **fail-safe posture**, where the prompt
+    /// is dropped and the group simply never activates a host.
+    pub anchor_prompts: Option<mpsc::Sender<u64>>,
     /// The node's logical-time origin.
     pub start: Instant,
     /// How often the engine is ticked.
@@ -186,6 +193,7 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
         publishers,
         routing,
         store,
+        anchor_prompts,
         start,
         tick_period,
     } = task;
@@ -209,6 +217,7 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
         &local,
         &boot,
         store.as_ref(),
+        anchor_prompts.as_ref(),
         &mut undurable,
     )
     .await;
@@ -261,6 +270,7 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
             &local,
             &effects,
             store.as_ref(),
+            anchor_prompts.as_ref(),
             &mut undurable,
         )
         .await;
@@ -360,7 +370,10 @@ fn emit_events(events: &broadcast::Sender<GroupEvent>, effects: &[Effect]) {
                 key: key.clone(),
             },
             Effect::MetadataChanged { key, .. } => GroupEvent::MetadataChanged { key: key.clone() },
-            Effect::Send { .. } | Effect::ArmTimer { .. } | Effect::PersistGrant { .. } => continue,
+            Effect::Send { .. }
+            | Effect::ArmTimer { .. }
+            | Effect::PersistGrant { .. }
+            | Effect::AnchorClaimDue { .. } => continue,
         };
         let _ = events.send(event); // no subscribers / lagged is fine
     }
@@ -407,6 +420,7 @@ async fn dispatch<T: Transport>(
     local: &NodeId,
     effects: &[Effect],
     store: Option<&Arc<dyn GrantStore>>,
+    anchor_prompts: Option<&mpsc::Sender<u64>>,
     undurable: &mut Undurable,
 ) {
     for effect in effects {
@@ -462,6 +476,24 @@ async fn dispatch<T: Transport>(
                     publishers
                         .leadership
                         .send(Leadership::observed(*epoch, host.clone(), local));
+            }
+            // The External tier's prompt, and the exact opposite of
+            // `PersistGrant` above: that one blocks the actor by contract,
+            // this one must **never** block it. A `try_send` into a
+            // capacity-one channel *is* the debounce the engine's repeated
+            // level signal requires — a prompt arriving while the anchor task
+            // is mid-round finds the slot full and is dropped, so a slow store
+            // cannot stack claims and burn an epoch per prompt. Nothing here
+            // waits on a network round trip a group's gossip has no business
+            // being behind.
+            //
+            // With no anchor prompts channel this is the documented fail-safe
+            // posture: the prompt is dropped and the group never activates a
+            // host, exactly as an empty voter roster behaves under Quorum.
+            Effect::AnchorClaimDue { epoch_hint } => {
+                if let Some(prompts) = anchor_prompts {
+                    let _ = prompts.try_send(*epoch_hint);
+                }
             }
             // ArmTimer is advisory — this driver uses a fixed-interval ticker.
             // Membership/metadata/state change signals are surfaced by

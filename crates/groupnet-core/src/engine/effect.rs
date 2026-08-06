@@ -110,6 +110,55 @@ pub enum Effect {
         /// The claimant this voter granted that epoch to.
         claimant: NodeId,
     },
+    /// **Prompt:** run an external-anchor claim round now, bidding at least
+    /// `epoch_hint`.
+    ///
+    /// Emitted only by a group whose activation is
+    /// [`Activation::External`](crate::Activation::External), only on the
+    /// anti-entropy cadence, and only while row 1's ordinary claim guard is
+    /// open — this node is not leaving, is past its boot guard, is the group's
+    /// top-ranked live candidate, and does not already believe itself the
+    /// adopted host. A host emits it too, as its renewal prompt (row X7).
+    ///
+    /// The engine is *asking*, not doing: it holds no connection, no etag and
+    /// no wall clock. The driver loads the anchor record, decides with
+    /// [`anchor::plan_claim`](crate::anchor::plan_claim) (or
+    /// [`anchor::renewal_record`](crate::anchor::renewal_record) if it is the
+    /// holder and still has its etag), performs the conditional write, and
+    /// reports back with
+    /// [`Command::AnchorActivated`](crate::Command::AnchorActivated) or
+    /// [`Command::AnchorObserved`](crate::Command::AnchorObserved).
+    ///
+    /// # It repeats, so the driver must debounce
+    ///
+    /// This is a **level** signal on a cadence, not a one-shot edge: a prompt
+    /// dropped by a busy driver, or lost with a crashed round, must self-heal,
+    /// and the only way to guarantee that without the engine tracking rounds
+    /// it cannot observe is to keep asking. **A driver must debounce it
+    /// against its own in-flight round** — a store round-trip that outlives
+    /// one anti-entropy interval would otherwise stack claims and burn epochs.
+    ///
+    /// # `epoch_hint` is a floor
+    ///
+    /// It is one above the highest epoch this node has observed (row X1), or
+    /// the epoch it is renewing (row X7) — never an instruction to write that
+    /// exact number. `plan_claim` takes it as a lower bound and still bids
+    /// strictly above whatever the anchor actually shows, so a hint made stale
+    /// in flight cannot re-litigate an epoch the anchor has already awarded.
+    ///
+    /// # No anchor, no host
+    ///
+    /// A driver with no anchor configured drops it, and the group simply never
+    /// activates a host — fail-safe, and the same posture an empty
+    /// [`VoterRoster`](crate::VoterRoster) produces under `Quorum`. A driver
+    /// that *has* an anchor but cannot reach it also does nothing, which is
+    /// why an unreachable anchor ends in a lease lapse and a step-down rather
+    /// than in a node hosting on its own say-so.
+    AnchorClaimDue {
+        /// The lowest epoch this node will accept as its own hostship — a
+        /// floor for the claim, never the literal number to write.
+        epoch_hint: u64,
+    },
     /// A metadata key took a new value (from a local write or a merged delta).
     MetadataChanged {
         /// The key that changed.

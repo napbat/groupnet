@@ -1,10 +1,12 @@
 //! The deterministic event loop: virtual clock, lossy/partitionable
 //! in-memory network, and the [`Simulation`] driver over real engines.
 
+use crate::anchor::{AnchorEvent, AnchorModel, RoundReport};
 use crate::rng::SplitMix64;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
+use groupnet_core::anchor::AnchorRecord;
 use groupnet_core::{Command, Effect, GroupEngine, NodeId, Role, Status, Time, wire};
 
 /// One scheduled future event in the simulation.
@@ -23,6 +25,26 @@ enum Kind {
     },
     /// Fire a timer tick on a node.
     Tick { node: NodeId },
+    /// A driver's external-anchor round, landing at the store one anchor
+    /// latency after the [`Effect::AnchorClaimDue`] that prompted it. The
+    /// whole round — load, plan, conditional write — happens at this one
+    /// instant, which is what makes the register linearizable by construction.
+    AnchorRound {
+        node: NodeId,
+        epoch_hint: u64,
+        /// When the round *began*: the instant `lease_until` is anchored at,
+        /// deliberately not the instant the write landed. See
+        /// [`Command::AnchorActivated`].
+        started_at: Time,
+    },
+    /// The read-back that resolves a conditional write the store reported
+    /// `Unknown` for — a separate instant, because that is the only way the
+    /// record can have moved on underneath it.
+    AnchorReadBack {
+        node: NodeId,
+        attempted: AnchorRecord,
+        started_at: Time,
+    },
 }
 
 // The heap is a max-heap; we invert the ordering so `pop` yields the *earliest*
@@ -75,6 +97,12 @@ pub struct Simulation {
     /// How many delivered frames carried an election kind. See
     /// [`election_frames_seen`](Self::election_frames_seen).
     election_frames: u64,
+    /// How many `LeadClaim` frames the sim has seen **issued**. See
+    /// [`claim_frames_seen`](Self::claim_frames_seen).
+    claim_frames: u64,
+    /// How many `LeadGrant` frames the sim has seen **issued**. See
+    /// [`grant_frames_seen`](Self::grant_frames_seen).
+    grant_frames: u64,
     /// The **durable** voter ledger this sim keeps on each node's behalf,
     /// written from [`Effect::PersistGrant`] — the store a driver with voter
     /// durability would provide. Keyed by granter, and deliberately *not* held
@@ -88,6 +116,25 @@ pub struct Simulation {
     /// makes it usable as the one-grant-per-epoch-per-voter probe: the property
     /// is about what a voter *said*, not about what anyone heard.
     pub grant_log: Vec<(Time, NodeId, u64, NodeId)>,
+    /// The external CAS anchor: the register, the per-node driver state around
+    /// it, and its fault knobs. Inert until
+    /// [`enable_anchor`](Self::enable_anchor) arms it.
+    anchor: AnchorModel,
+    /// Every anchor round that touched the register — `(when, node, what)`, in
+    /// schedule order. The register's whole history, and the probe the steal /
+    /// renewal / yield floors are read off.
+    ///
+    /// A round that never ran — a crashed node, or one that cannot reach the
+    /// anchor — leaves nothing here, which is itself the fail-closed signal:
+    /// the silence *is* the reason that node's lease is about to lapse.
+    ///
+    /// One caveat, and only under
+    /// [`set_anchor_unknown_lost_percent`](Self::set_anchor_unknown_lost_percent):
+    /// an entry records the round the driver *attempted*, which under that knob
+    /// is a write the store swallowed. [`anchor_record`](Self::anchor_record) is
+    /// the ground truth for what actually landed, and the two deliberately
+    /// disagree there.
+    pub anchor_log: Vec<(Time, NodeId, AnchorEvent)>,
 }
 
 /// Whether an encoded frame's kind tag names an election frame — wire kinds
@@ -127,8 +174,12 @@ impl Simulation {
             coordinator_log: Vec::new(),
             leadership_log: Vec::new(),
             election_frames: 0,
+            claim_frames: 0,
+            grant_frames: 0,
             persisted_grants: BTreeMap::new(),
             grant_log: Vec::new(),
+            anchor: AnchorModel::default(),
+            anchor_log: Vec::new(),
         }
     }
 
@@ -146,6 +197,131 @@ impl Simulation {
     /// Restores every partitioned link.
     pub fn heal_all(&mut self) {
         self.blocked.clear();
+    }
+
+    // -- The external CAS anchor -------------------------------------------
+    //
+    // Everything below drives `Activation::External`. A simulation that never
+    // calls `enable_anchor` has no anchor, so `Effect::AnchorClaimDue` is
+    // dropped and no group ever activates a host — the same fail-safe posture a
+    // driver with no anchor configured has, and the reason every `Settle` and
+    // `Quorum` suite in this crate is unaffected by any of it.
+
+    /// Arms the external anchor for this simulation.
+    ///
+    /// `ttl_ms` is the anchor record's TTL and `steal_margin_ms` the steal
+    /// margin — respectively
+    /// [`HostedConfig::lease_ms`](groupnet_core::HostedConfig::lease_ms) and
+    /// [`Activation::External`](groupnet_core::Activation::External)'s field,
+    /// which is the one configuration the tier has. Pass anything else and you
+    /// are simulating a deployment that cannot be configured.
+    pub fn enable_anchor(&mut self, ttl_ms: u64, steal_margin_ms: u64) {
+        self.anchor.enable(ttl_ms, steal_margin_ms);
+    }
+
+    /// How long a store round trip takes, in virtual milliseconds: prompt to
+    /// write, and (for an ambiguous write) write to read-back. A knob of its
+    /// own because it is not a fabric latency — the anchor is not on the
+    /// cluster's network, and a deployment where the store is far and the peers
+    /// are near is the normal one.
+    pub fn set_anchor_latency(&mut self, ms: u64) {
+        self.anchor.set_latency(ms);
+    }
+
+    /// This node's wall-clock offset from virtual time, in milliseconds, which
+    /// may be negative. Zero for every node unless set.
+    ///
+    /// This is the *only* clock the External tier consults, and it consults it
+    /// in exactly one place ([`AnchorRecord::stealable`]). An offset here is
+    /// therefore the complete model of the assumption `Activation::External`
+    /// states — and of violating it.
+    ///
+    /// [`AnchorRecord::stealable`]: groupnet_core::anchor::AnchorRecord::stealable
+    pub fn set_anchor_skew(&mut self, node: &NodeId, ms: i64) {
+        self.anchor.set_skew(node, ms);
+    }
+
+    /// Cuts `node` off from the anchor. **Orthogonal to
+    /// [`block`](Self::block)**: this is the availability axis under
+    /// `External`, and the CP inversion is only testable because the two are
+    /// separate. A node blocked here keeps gossiping, keeps its rank and keeps
+    /// its peers — and cannot renew, so its lease lapses and it demotes.
+    pub fn block_anchor(&mut self, node: &NodeId) {
+        self.anchor.block(node);
+    }
+
+    /// Restores `node`'s access to the anchor.
+    pub fn heal_anchor(&mut self, node: &NodeId) {
+        self.anchor.heal(node);
+    }
+
+    /// Restores every node's access to the anchor.
+    pub fn heal_anchor_all(&mut self) {
+        self.anchor.heal_all();
+    }
+
+    /// What share of conditional writes **apply and report `Unknown`**
+    /// (0..=100) — the timed-out `PUT` every object store can produce. The
+    /// driver resolves each one by reading the record back an anchor latency
+    /// later and judging it with
+    /// [`ambiguous_applied`](groupnet_core::anchor::ambiguous_applied).
+    ///
+    /// Deterministic: the schedule is keyed on the round counter through the
+    /// same [`SplitMix64`] the loss schedule uses, so a
+    /// failing seed replays exactly.
+    pub fn set_anchor_unknown_percent(&mut self, percent: u8) {
+        self.anchor.set_unknown_percent(percent);
+    }
+
+    /// What share of conditional writes report `Unknown` **without applying**
+    /// (0..=100) — the other half of the same timeout, and the shape a
+    /// write-throttled, read-only or expired-credential store produces
+    /// indefinitely rather than transiently.
+    ///
+    /// It is the half a **renewal** makes dangerous: an attempted renewal's
+    /// `(epoch, host)` is identical to the record it means to replace, so a
+    /// read-back that judged the pair alone would call every failed renewal a
+    /// win and extend a lease off a record that is quietly ageing out.
+    /// [`ambiguous_applied`](groupnet_core::anchor::ambiguous_applied) compares
+    /// the whole record, which is what makes this knob resolve as *lost*.
+    ///
+    /// Independent of [`set_anchor_unknown_percent`](Self::set_anchor_unknown_percent)
+    /// — a separate deterministic draw on the same round counter — and decided
+    /// first, so a write it takes never reaches the register.
+    pub fn set_anchor_unknown_lost_percent(&mut self, percent: u8) {
+        self.anchor.set_unknown_lost_percent(percent);
+    }
+
+    /// Writes a record into the anchor directly, as if some earlier incarnation
+    /// of the cluster — or a node that is not in this simulation at all — had
+    /// won it. The etag moves, so nobody holds one for it.
+    pub fn seed_anchor(&mut self, record: AnchorRecord) {
+        self.anchor.seed(record);
+    }
+
+    /// The record the anchor currently holds — the ground truth every observer
+    /// is converging on, readable without asking any node.
+    #[must_use]
+    pub fn anchor_record(&self) -> Option<AnchorRecord> {
+        self.anchor.record()
+    }
+
+    /// How many conditional writes reported `Unknown` and had to be resolved by
+    /// a read-back. The floor that keeps an ambiguity schedule from passing
+    /// vacuously.
+    #[must_use]
+    pub fn anchor_unknown_rounds(&self) -> u64 {
+        self.anchor.unknown_rounds()
+    }
+
+    /// How many of those never applied — the half of
+    /// [`anchor_unknown_rounds`](Self::anchor_unknown_rounds) a read-back has
+    /// to resolve as *lost*, and the floor that keeps a
+    /// [`set_anchor_unknown_lost_percent`](Self::set_anchor_unknown_lost_percent)
+    /// schedule from passing vacuously.
+    #[must_use]
+    pub fn anchor_unknown_lost_rounds(&self) -> u64 {
+        self.anchor.unknown_lost_rounds()
     }
 
     /// Changes the per-message loss probability mid-run (0..=100).
@@ -186,52 +362,80 @@ impl Simulation {
 
     /// Runs the event loop until logical time reaches `max` (or the queue
     /// empties, which won't happen while periodic gossip is armed).
+    pub fn run_until(&mut self, max: Time) {
+        while self.step_until(max).is_some() {}
+    }
+
+    /// Processes **exactly one** scheduled event, if the next one is at or
+    /// before `max`, and returns the instant it fired at. `None` — with the
+    /// clock advanced to `max`, exactly as [`run_until`](Self::run_until)
+    /// leaves it — once nothing is due.
+    ///
+    /// Every state change in the simulation happens inside one of these steps:
+    /// an engine only moves when it takes a frame, a tick, or an anchor
+    /// round's command. So a test that samples between steps samples
+    /// *everything* — no property can slip through the gap between two
+    /// coarser samples, which is what lets a safety claim be stated as
+    /// absolute rather than as "not observed at this cadence".
     ///
     /// # Panics
-    /// Never in practice: the loop only pops an event it has just peeked, and
-    /// the simulation is single-threaded.
-    pub fn run_until(&mut self, max: Time) {
-        while let Some(event) = self.queue.peek() {
-            if event.at > max {
-                break;
+    /// Never in practice: it only pops an event it has just peeked, and the
+    /// simulation is single-threaded.
+    pub fn step_until(&mut self, max: Time) -> Option<Time> {
+        match self.queue.peek() {
+            Some(event) if event.at <= max => {}
+            _ => {
+                self.now = max;
+                return None;
             }
-            let event = self.queue.pop().expect("peeked");
-            self.now = event.at;
-            let now = self.now;
-            let seq = event.seq;
-            match event.kind {
-                Kind::Deliver { to, from, wire } => {
-                    if self.loss_percent != 0
-                        && SplitMix64::hash(seq) % 100 < u64::from(self.loss_percent)
-                    {
-                        continue; // deterministic per-message drop
-                    }
-                    if self.blocked.contains(&(from.clone(), to.clone())) {
-                        continue; // partitioned link
-                    }
-                    let effects = match self.engines.get_mut(&to) {
-                        Some(engine) => engine.on_message(from, &wire, now),
-                        None => continue, // a crashed node: nothing consumed it
-                    };
-                    // Counted only once an engine has actually taken it — the
-                    // probe is "delivered to an engine", not "scheduled and not
-                    // dropped", so a frame still in flight to a node that has
-                    // since crashed is not election traffic anyone observed.
-                    if is_election_frame(&wire) {
-                        self.election_frames += 1;
-                    }
-                    self.dispatch(&to, effects);
-                }
-                Kind::Tick { node } => {
-                    let effects = match self.engines.get_mut(&node) {
-                        Some(engine) => engine.on_tick(self.now),
-                        None => continue,
-                    };
+        }
+        let event = self.queue.pop().expect("peeked");
+        self.now = event.at;
+        let seq = event.seq;
+        match event.kind {
+            Kind::Deliver { to, from, wire } => self.deliver(&to, from, &wire, seq),
+            Kind::Tick { node } => {
+                let now = self.now;
+                if let Some(engine) = self.engines.get_mut(&node) {
+                    let effects = engine.on_tick(now);
                     self.dispatch(&node, effects);
                 }
             }
+            Kind::AnchorRound {
+                node,
+                epoch_hint,
+                started_at,
+            } => self.anchor_round(&node, epoch_hint, started_at),
+            Kind::AnchorReadBack {
+                node,
+                attempted,
+                started_at,
+            } => self.anchor_read_back(&node, &attempted, started_at),
         }
-        self.now = max;
+        Some(self.now)
+    }
+
+    /// One frame arriving, subject to the loss schedule and the partition set.
+    fn deliver(&mut self, to: &NodeId, from: NodeId, wire: &[u8], seq: u64) {
+        if self.loss_percent != 0 && SplitMix64::hash(seq) % 100 < u64::from(self.loss_percent) {
+            return; // deterministic per-message drop
+        }
+        if self.blocked.contains(&(from.clone(), to.clone())) {
+            return; // partitioned link
+        }
+        let now = self.now;
+        let effects = match self.engines.get_mut(to) {
+            Some(engine) => engine.on_message(from, wire, now),
+            None => return, // a crashed node: nothing consumed it
+        };
+        // Counted only once an engine has actually taken it — the probe is
+        // "delivered to an engine", not "scheduled and not dropped", so a frame
+        // still in flight to a node that has since crashed is not election
+        // traffic anyone observed.
+        if is_election_frame(wire) {
+            self.election_frames += 1;
+        }
+        self.dispatch(to, effects);
     }
 
     /// How many election frames (wire kinds `LeadClaim`, `LeadGrant`,
@@ -245,6 +449,29 @@ impl Simulation {
     #[must_use]
     pub fn election_frames_seen(&self) -> u64 {
         self.election_frames
+    }
+
+    /// How many `LeadClaim` frames the run has **issued** — counted at
+    /// dispatch, off the decoded frame.
+    ///
+    /// Issuance rather than delivery, unlike
+    /// [`election_frames_seen`](Self::election_frames_seen), and deliberately:
+    /// this is the **X-purity** probe, and the claim it pins is that an
+    /// [`Activation::External`](groupnet_core::Activation::External) group
+    /// never *builds* a bid. A frame that was built and then lost, dropped by
+    /// the loss schedule or blocked by a partition would satisfy a delivery
+    /// counter while violating the property.
+    #[must_use]
+    pub fn claim_frames_seen(&self) -> u64 {
+        self.claim_frames
+    }
+
+    /// How many `LeadGrant` frames the run has **issued** — the other half of
+    /// the X-purity probe. See [`claim_frames_seen`](Self::claim_frames_seen)
+    /// for why both are counted at issuance.
+    #[must_use]
+    pub fn grant_frames_seen(&self) -> u64 {
+        self.grant_frames
     }
 
     /// The `(epoch, claimant)` pair `node` has durably granted as a voter, as
@@ -342,8 +569,16 @@ impl Simulation {
     /// Abruptly removes `node` from the simulation — it stops sending acks and
     /// gossip, modelling a crash. Survivors must detect it via failure
     /// detection.
+    ///
+    /// The node's **anchor driver dies with it**: the etag it was carrying is
+    /// forgotten, exactly as a real process's would be. That is what makes a
+    /// restart re-win the group through
+    /// [`plan_claim`](groupnet_core::anchor::plan_claim) at a strictly higher
+    /// epoch instead of resuming the epoch the record still names it at — the
+    /// tier keeps no node-local storage, and neither does this simulation.
     pub fn crash(&mut self, node: &NodeId) {
         self.engines.remove(node);
+        self.anchor.forget(node);
     }
 
     /// Whether `observer` currently considers `node` a live member (present and
@@ -477,7 +712,7 @@ impl Simulation {
             match effect {
                 Effect::Send { to, wire } => {
                     self.max_frame_bytes = self.max_frame_bytes.max(wire.len());
-                    self.log_if_grant(node, &wire);
+                    self.note_lead_frame(node, &wire);
                     // Deterministic per-message jitter keyed on the sequence number
                     // this delivery is about to take, so links can reorder.
                     let extra = if self.jitter_ms == 0 {
@@ -516,6 +751,25 @@ impl Simulation {
                     self.persisted_grants
                         .insert(node.clone(), (epoch, claimant));
                 }
+                // The External tier's prompt to a driver: run an anchor round
+                // now. It is a *level* signal on the anti-entropy cadence, so
+                // the model debounces it against this node's own in-flight
+                // round exactly as the effect's contract requires a driver to
+                // — without that, a store round trip longer than one
+                // anti-entropy interval would stack rounds and burn epochs.
+                Effect::AnchorClaimDue { epoch_hint } => {
+                    if self.anchor.accept_prompt(node) {
+                        let at = self.now.saturating_add(self.anchor.latency_ms());
+                        self.schedule(
+                            at,
+                            Kind::AnchorRound {
+                                node: node.clone(),
+                                epoch_hint,
+                                started_at: self.now,
+                            },
+                        );
+                    }
+                }
                 Effect::MembershipChanged
                 | Effect::NodeStateChanged { .. }
                 | Effect::MetadataChanged { .. } => {}
@@ -523,24 +777,109 @@ impl Simulation {
         }
     }
 
-    /// Appends to [`grant_log`](Self::grant_log) if `wire` is a grant frame,
-    /// reading the body off the encoded frame rather than the effect: issuance
-    /// is a wire fact.
+    /// One anchor round: what the driver would do between the prompt and the
+    /// command it reports back.
+    ///
+    /// Two ways a round simply does not happen, and both are load-bearing:
+    ///
+    /// * **The process crashed.** Nothing performs the round, and the record it
+    ///   holds ages out on its own.
+    /// * **The node cannot reach the anchor.** Also nothing — and *this* is the
+    ///   fail-closed posture the tier is chosen for: the engine is untouched,
+    ///   keeps its rank, keeps its peers, and demotes anyway when row 6 finds
+    ///   the lease lapsed. A node never hosts on its own say-so here.
+    fn anchor_round(&mut self, node: &NodeId, epoch_hint: u64, started_at: Time) {
+        if !self.engines.contains_key(node) || self.anchor.is_blocked(node) {
+            self.anchor.finish(node);
+            return;
+        }
+        // Renew or claim is the engine's answer, not the model's: the driver
+        // renews only while the node it is driving still believes it hosts the
+        // epoch its etag was won for.
+        let hosting = self
+            .engines
+            .get(node)
+            .filter(|e| e.role() == Role::Host)
+            .map(|e| e.leadership().0);
+        let (event, report) = self.anchor.round(node, epoch_hint, self.now, hosting);
+        self.anchor_log.push((self.now, node.clone(), event));
+        self.report_anchor(node, report, started_at);
+    }
+
+    /// The read-back an ambiguous write is resolved by. A node that crashed or
+    /// lost the anchor in the meantime never learns: its etag stays dropped and
+    /// its next round re-plans from whatever the record shows, which is the
+    /// conservative direction.
+    fn anchor_read_back(&mut self, node: &NodeId, attempted: &AnchorRecord, started_at: Time) {
+        if !self.engines.contains_key(node) || self.anchor.is_blocked(node) {
+            self.anchor.finish(node);
+            return;
+        }
+        let report = self.anchor.read_back(node, attempted);
+        self.report_anchor(node, report, started_at);
+    }
+
+    /// Hands a finished round's verdict to the engine as the command a real
+    /// driver would send, and releases the round's debounce.
+    ///
+    /// `lease_until` is `started_at + ttl`, anchored at the instant the round
+    /// **began** rather than the instant the write landed — the rule
+    /// [`Command::AnchorActivated`] states. The record's own
+    /// `expires_at_wall_ms` was stamped one anchor latency later, so the engine
+    /// lease always runs out first and a host never overhangs the record it is
+    /// hosting on.
+    fn report_anchor(&mut self, node: &NodeId, report: RoundReport, started_at: Time) {
+        match report {
+            RoundReport::Won { epoch } => {
+                self.anchor.finish(node);
+                let lease_until = started_at.saturating_add(self.anchor.ttl_ms());
+                self.command(node, Command::AnchorActivated { epoch, lease_until });
+            }
+            RoundReport::Observed { epoch, host } => {
+                self.anchor.finish(node);
+                self.command(node, Command::AnchorObserved { epoch, host });
+            }
+            RoundReport::Silent => self.anchor.finish(node),
+            // Still in flight: an ambiguous write is not over until the
+            // read-back, so the debounce deliberately stays held.
+            RoundReport::Ambiguous { attempted } => {
+                let at = self.now.saturating_add(self.anchor.latency_ms());
+                self.schedule(
+                    at,
+                    Kind::AnchorReadBack {
+                        node: node.clone(),
+                        attempted,
+                        started_at,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Counts and logs one dispatched election frame, reading its body off the
+    /// encoded bytes rather than off the effect: issuance is a wire fact.
     ///
     /// Every dispatched frame is decoded to find out — the codec is the only
     /// authority on what a frame is, and a byte-offset pre-filter would be a
     /// second, silently drifting copy of the wire format. The cost is test-only
-    /// and lands on a path that has already allocated the encoded frame.
-    fn log_if_grant(&mut self, granter: &NodeId, wire: &[u8]) {
+    /// and lands on a path that has already allocated the encoded frame. The
+    /// one decode feeds three probes: [`grant_log`](Self::grant_log),
+    /// [`claim_frames_seen`](Self::claim_frames_seen) and
+    /// [`grant_frames_seen`](Self::grant_frames_seen).
+    fn note_lead_frame(&mut self, from: &NodeId, wire: &[u8]) {
         let Some(frame) = wire::decode(wire) else {
             return;
         };
-        if let Some(wire::LeadBody::Grant {
-            epoch, claimant, ..
-        }) = frame.lead
-        {
-            self.grant_log
-                .push((self.now, granter.clone(), epoch, claimant));
+        match frame.lead {
+            Some(wire::LeadBody::Claim { .. }) => self.claim_frames += 1,
+            Some(wire::LeadBody::Grant {
+                epoch, claimant, ..
+            }) => {
+                self.grant_frames += 1;
+                self.grant_log
+                    .push((self.now, from.clone(), epoch, claimant));
+            }
+            Some(wire::LeadBody::State { .. }) | None => {}
         }
     }
 

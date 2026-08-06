@@ -38,6 +38,7 @@
 //! [`groupnet-core`]: groupnet_core
 //! [`groupnet-sim`]: https://docs.rs/groupnet-sim
 
+mod anchor;
 mod capability;
 mod driver;
 mod group;
@@ -45,6 +46,7 @@ mod node;
 mod routing;
 mod store;
 
+pub use anchor::{Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf};
 pub use driver::GroupEvent;
 pub use group::{CommandRejected, Group, Leadership, SyncCtx};
 pub use groupnet_core::{RecoveredGrant, Role, Status};

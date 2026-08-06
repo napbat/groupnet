@@ -90,12 +90,13 @@ cargo run --example cluster     # 3-node convergence, derived coordinator, metad
 cargo run --example routing     # resolve a resource to its owner from any node
 ```
 
-Three more live with the layers they exercise:
+Four more live with the layers they exercise:
 
 ```bash
 cargo run -p groupnet-sim --example partition              # partition -> detect -> heal -> rejoin, bit-for-bit reproducible
 cargo run -p groupnet-consistency --example read_your_writes   # write feed + applied-frontier barrier, and a gap surfacing
 cargo run -p groupnet-consistency --example fenced_ownership --features hosted   # elected host, majority-committed claims, and a store refusing a fenced-out writer
+cargo run -p groupnet-consistency --example anchored_ownership --features hosted   # the same claims, with the epoch won by one conditional PUT against a CAS object
 ```
 
 ```rust

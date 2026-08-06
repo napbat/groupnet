@@ -1,7 +1,7 @@
 //! Local commands and their application.
 
-use crate::NodeId;
 use crate::membership::{Member, StateEntry, Status};
+use crate::{NodeId, Time};
 
 use super::effect::Effect;
 use super::state::{GroupEngine, VersionedValue};
@@ -46,6 +46,70 @@ pub enum Command {
     ///
     /// [`seed`]: crate::GroupEngine
     AddPeer(NodeId),
+    /// **The driver won an external-anchor round:** this node now holds
+    /// `epoch` at the anchor, and its authority should lapse at `lease_until`.
+    ///
+    /// Row **X2** activates on it — the same
+    /// [`activate`](crate::GroupEngine) row 4 runs, so a `LeadState` broadcast
+    /// and one [`Effect::LeadershipChanged`](crate::Effect::LeadershipChanged)
+    /// follow — and row **X3** treats it as a lease extension when this node
+    /// is already `Host` at exactly `epoch`. Ignored (row **X6**) outside
+    /// [`Activation::External`](crate::Activation::External) and below the
+    /// monotone bar: an `epoch` under
+    /// [`observed_epoch`](crate::GroupEngine::observed_epoch) is a stale or
+    /// duplicated report and dies here, which is where driver input has to be
+    /// filtered.
+    ///
+    /// # `lease_until` is the engine's logical clock, and is anchored *early*
+    ///
+    /// It is a [`Time`], not a wall-clock millisecond — the anchor record's
+    /// `expires_at_wall_ms` never enters the engine, and this never leaves it.
+    /// The driver passes it in rather than the engine deriving it, because
+    /// deriving it would mean knowing how long the store round-trip took.
+    ///
+    /// **A driver must anchor it at the instant it *began* the round — the
+    /// time captured before the load, not after the CAS returned.** The
+    /// record's `expires_at_wall_ms` was computed from a `now_wall_ms` sampled
+    /// at or after that instant, so a lease anchored at initiation always
+    /// expires no later than the record it was earned from. Anchoring it after
+    /// the round hands the host an overhang past its own anchor record, which
+    /// is exactly the window a successor's steal is entitled to use. (Same
+    /// argument as `Quorum`'s send-instant attribution, in a different dress.)
+    AnchorActivated {
+        /// The epoch the anchor awarded this node.
+        epoch: u64,
+        /// When this node's hostship lapses, in the engine's logical time,
+        /// anchored at the instant the anchor round began.
+        lease_until: Time,
+    },
+    /// **The driver read an anchor record it did not win:** the anchor
+    /// currently names `host` at `epoch`.
+    ///
+    /// Row **X4** adopts it when the pair `(epoch, host)` outranks the adopted
+    /// one in the ordinary epoch-major fencing order — deposing this node if
+    /// it was hosting — and row **X5** is row 12b verbatim when it names *this*
+    /// node at a strictly higher epoch: the epoch is learned, the hostship is
+    /// not, and the node re-earns the group by winning above it. Hostship is
+    /// only ever entered by this node's own activation, and a record naming us
+    /// is evidence of an epoch rather than a grant of authority — which is why
+    /// a restart re-wins through the anchor instead of resuming.
+    ///
+    /// Ignored (row **X6**) outside
+    /// [`Activation::External`](crate::Activation::External) and whenever the
+    /// observed pair does not outrank the adopted one; an equal or lower pair
+    /// teaches nothing and announces nothing.
+    ///
+    /// This reports what the record *says*, not who is alive: an expired
+    /// record still names its holder until somebody supersedes it, and
+    /// adoption here is fence-ordered rather than liveness-ordered. The
+    /// successor's own activation is what moves the cluster on, and it
+    /// broadcasts `LeadState` to every live member when it does.
+    AnchorObserved {
+        /// The epoch the anchor record carries.
+        epoch: u64,
+        /// The node that record names as host.
+        host: NodeId,
+    },
 }
 
 impl GroupEngine {
@@ -137,6 +201,15 @@ impl GroupEngine {
                 self.nudge_anti_entropy();
                 effects
             }
+            // Rows X2/X3 and X4/X5 — the external anchor's whole inbound
+            // surface. Both are gated on `Activation::External` inside, so an
+            // `Eventual`, `Settle` or `Quorum` group drops them silently
+            // (row X6): a driver misconfiguration must not be able to make a
+            // group host on nobody's authority.
+            Command::AnchorActivated { epoch, lease_until } => {
+                self.on_anchor_activated(epoch, lease_until)
+            }
+            Command::AnchorObserved { epoch, host } => self.on_anchor_observed(epoch, &host),
         }
     }
 
