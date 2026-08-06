@@ -38,6 +38,12 @@ consistency-acks = ["consistency", "groupnet-consistency/acks"]
 # peer's lease lapse — bounded by the stale node's own clock instead of by a
 # timeout. Its fast path *is* an ack round, so it implies `consistency-acks`.
 consistency-leases = ["consistency-acks", "groupnet-consistency/leases"]
+# The Hosted write path: fenced, epoch-scoped writes through the group's elected
+# host, with a commit level pricing the guarantee (Local / QuorumApplied /
+# AllApplied). Layers straight onto `consistency` and deliberately *not* onto
+# `consistency-acks` — its commit ledger is a new, epoch-stamped entry rather
+# than a scoped reuse of the ack tier's watermarks.
+consistency-hosted = ["consistency", "groupnet-consistency/hosted"]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]

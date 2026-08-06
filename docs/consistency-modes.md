@@ -536,6 +536,344 @@ feed — and it is **the ceiling**: constrained to fixed small rosters, with
 no general replicated log behind it (see M4 for the honest Raft
 comparison).
 
+#### Hosted write path, as built (Milestone 4)
+
+Status: **delivered (pending review)** — both sans-IO cores, the `HostedWrites`
+/ `HostedReads` / `CommitLedger` shells, the DST, and the runnable
+fenced-ownership example
+(`crates/groupnet-consistency/examples/fenced_ownership.rs`) are built.
+Everything below is the contract of record for them: it amends, and in three
+places narrows, the sketch above.
+
+**Feature naming.** The write path ships as `hosted` in `groupnet-consistency`
+and as **`consistency-hosted`** on the `groupnet` facade — the same
+crate-feature / facade-feature pairing `leases` / `consistency-leases` uses.
+Where this document writes a bare `hosted` it means the crate-level feature;
+the facade name is always the prefixed one.
+
+##### What "gating activation" means — and what it does not
+
+Section 6's Milestone 4 line reads "the leader-completeness recovery step
+gating activation when `QuorumApplied` is in force". As built the word
+*activation* is narrowed to the **activation of hosted service**. The engine's
+leadership activation is **unchanged**.
+
+A candidate that collects a voter majority activates exactly when M3 says it
+does, publishes its `LeadState`, and `Group::leadership()` reports
+`(epoch, Some(self))` the instant it does. What waits is `HostedWrites`: until
+the recovery rule below is satisfied it refuses service — every write returns
+`HostedError::Recovering` — even though the node is by every other measure the
+host. Four reasons this is the right cut, each load-bearing:
+
+* **Layering.** Committed state lives in *entries the engine does not
+  interpret* — a feed ring, a watermark ledger, a consumer's own datum codec.
+  `groupnet-core` cannot evaluate a completeness predicate over payloads whose
+  framing belongs to the consistency crate and whose contents belong to the
+  application. Gating in the engine means teaching the engine the write path's
+  schema, which is the layering violation this design has refused everywhere
+  else.
+* **Liveness.** A group whose consumers never construct the write path must not
+  sit hostless. Gating in the engine would make hostship conditional on
+  machinery that may not exist: a consumer of a `Hosted` group that wants only
+  the fence token, or only `leadership()` for routing, would never see a host at
+  all. Activation stays a membership fact; service is a consumer-layer verdict.
+* **Authority.** Leadership was never permission to serve — that is M3's own
+  contract, stated there in the minority-freeze paragraph ("a consumer must not
+  read a non-`None` host as permission to serve" until M4 gives the write path
+  its own verdict). This milestone supplies the verdict; it does not retract the
+  rule. `Recovering` is what *elected but not yet serving* looks like through
+  the API.
+* **DST-provability, equal or better.** The recovery rule is a pure function of
+  gossiped readings (`CompletenessCore::step`), so the simulator drives the
+  identical code the tokio shell does, in virtual time, with no runtime and no
+  transport — the posture the lease tier's cores established. Nothing is lost by
+  keeping it out of the engine, and S5 becomes a predicate over snapshots rather
+  than an emergent behaviour of an actor.
+
+**The error surface, mapped to what was promised.**
+`HostedError::NotHost { host: None }` **is** the `NoLeader` the activation-policy
+table promised for a minority side: this node is not the host and believes the
+group has none. `NotHost { host: Some(peer) }` is the redirect.
+`Deposed { epoch }` is a fence hit mid-write. `Recovering` is the gate above.
+`Rejected` is the group actor's bounded inbox refusing the enqueue — a
+backpressure signal, never a consistency verdict.
+
+##### The commit ledger: epoch-stamped, and why literal ack reuse fails
+
+The commit-levels sketch reads "the acks-tier machinery scoped to voters". As
+built it is a **new, epoch-stamped ledger** — `~hosted:applied`
+(`~hosted:applied:<name>` for a named write path) — carrying one leadership
+epoch followed by the same watermark records the ack ledger uses:
+
+```text
+(lead_epoch: u64 LE) (records: u32 LE) (writer_len: u32, writer: utf-8, token_epoch: u64, token_seq: u64)*
+```
+
+`lead_epoch` is the leadership epoch the publisher had adopted when it
+published. Nothing else changes: watermarks are monotone per writer exactly as
+`AckLedger`'s are, and `CommitLedger::refresh` re-stamps without touching them.
+
+The `records` count is the one addition to the ack ledger's shape, and it is a
+safety field rather than a convenience. Without it a reading truncated on a
+record boundary still decodes — as a **subset** of the watermarks the publisher
+meant to send, which is a *lower* recovery target and a *smaller* set of writers
+for the recovery rule to demand coverage of. Silently under-recovering is
+exactly the failure this tier refuses everywhere else, so the count makes such a
+truncation undecodable instead: `decode_ledger` checks it three ways — the
+records must all be present, they must end exactly at the last byte, and they
+must name that many *distinct* writers — and any failure is `None`, "this member
+publishes nothing", which the rules already treat as a non-witness. A reading is
+all-or-nothing; twelve bytes (a stamp and a zero count) remain a legitimate one.
+
+The two tiers stay independent all the way out to their capabilities: `hosted`
+does **not** imply `acks`, `CAP_HOSTED` and `CAP_ACKS` advertise participation in
+separate ledgers under separate rules, and a node may run and advertise either,
+both, or neither.
+
+Two holes force the stamp. Neither is closable by scoping `applied_by_selected`
+to the roster:
+
+1. **Gossip staleness — recovery undershoots.** The recovery rule reads voters'
+   watermarks out of gossip, and an *unstamped* reading carries no evidence of
+   **when** it was written. A new host can therefore satisfy a majority out of
+   pre-migration views and set its recovery target below a write the old host
+   had already acked. The reading looks like a majority; it is not a *fresh*
+   one, and nothing in the payload can tell them apart.
+2. **The late-ack race — a committed write is lost.** `applied_by` keeps
+   advancing for the **old** host's feed after a new epoch activates: a voter
+   still draining the old host's ring publishes a higher watermark long
+   afterwards. An ack round opened before the migration can therefore resolve
+   *after* the new host finished recovering — so the old host answers its client
+   "committed" for a write the new host never saw, and the write is lost with an
+   acknowledgement behind it.
+
+The stamp is the **view-stamp fence**, and it is one sentence: *a voter that has
+adopted a higher epoch stops counting.* Its reading no longer satisfies the
+commit predicate's `lead_epoch == token.epoch`, so once a majority has adopted
+`e′` no round at `e < e′` can ever close again — and the same stamp read the
+other way (`lead_epoch ≥ e′`) is precisely what makes a recovery reading
+provably *later* than any reading a commit at `e` could have counted.
+
+##### The two rules, and the intersection argument
+
+Fix the static voter roster `R`, with `m = |R| / 2 + 1` (the same strict
+majority M3's grant rounds use).
+
+**Commit rule.** A write `W` authored by host `H` at epoch `e`, bearing token
+`t` (so `t.epoch = e`), is *committed at `QuorumApplied`* iff
+
+> there is a set `S_c ⊆ R` with `|S_c| ≥ m` such that every `v ∈ S_c` publishes
+> a reading `(lead_epoch_v, wm_v)` with `lead_epoch_v = e` **and**
+> `wm_v(H) ≥ t`.
+
+Liveness plays no part: a voter's reading counts whether or not membership
+believes it alive, which is exactly what makes a *static* roster the denominator
+rather than a rumour-derived set. (`Commit::AllApplied` applies the same
+per-member predicate to every selected, currently-`Alive` member instead of to a
+majority of `R`; `Commit::Local` commits on the host's own apply.)
+
+**Recovery rule.** A host `H′` activating at epoch `e′` may begin serving iff
+
+> there is a set `S_r ⊆ R` with `|S_r| ≥ m` such that every `v ∈ S_r` publishes
+> a reading `(lead_epoch_v, wm_v)` with `lead_epoch_v ≥ e′`; **and** for every
+> writer `w` named by any `v ∈ S_r`, `H′`'s own applied watermark satisfies
+> `own_wm(w) ≥ max_{v ∈ S_r} wm_v(w)`.
+
+Until both halves hold, the write path answers `Recovering`.
+
+**The argument.** Suppose `W` committed at epoch `e`, and `H′` completed
+recovery at some `e′ > e`. `S_c` and `S_r` are majorities of the **same** roster
+`R`, so they intersect: pick `v* ∈ S_c ∩ S_r`. Then:
+
+* `v*`'s counted commit reading was stamped `e`; its counted recovery reading is
+  stamped `≥ e′ > e`.
+* **Stamps are monotone per publisher.** A voter stamps the leadership epoch it
+  has currently adopted, and an adopted epoch never regresses (property S2), so
+  the recovery reading is a strictly **later publication by `v*`** than the
+  commit reading.
+* **Watermarks are monotone per publisher, per writer.** `record` never lowers
+  one and `refresh` never touches one. So `v*`'s recovery-reading watermark for
+  `H` is at or above its commit-reading watermark for `H`, which was `≥ t`.
+
+Therefore `max_{v ∈ S_r} wm_v(H) ≥ t`, and the recovery rule's second half
+forces `own_wm(H) ≥ t`: **`H′`'s state contains `W`**. `W` was an arbitrary
+write committed at any epoch below `e′`, so no write acknowledged at
+`QuorumApplied` is ever lost across a migration — property **S5**.
+
+**The grant set is not needed.** The intersection above is commit-majority ∩
+recovery-majority, both over the same static roster. M3's grant majority carries
+a *different* property (at most one unexpired lease per group) and does not
+enter this argument at all: a deployment reasoning about S5 needs the roster and
+the ledger, not the election's vote records.
+
+##### The deployment contract: every voter runs the follower loop
+
+Both rules are predicates over what voters *publish*. A voter that votes but
+never publishes is invisible to both, so the contract is explicit:
+
+> **Every voter must run the follower loop.** Subscribe to the host's feed
+> (`HostedReads`), apply each event, and call `CommitLedger::record(&host,
+> token)` **after** the apply — and on a `Migrated` event call
+> `CommitLedger::refresh()`, so the stamp tracks the epoch the voter has
+> adopted even while no new writes are arriving. **Bind the subscriber to the
+> node's own write path** (`HostedWrites::bind`, one line before the loop takes
+> the handle), so that a voter which becomes host cuts its predecessor's lineage
+> at the instant it starts serving — see deviation 2b.
+
+Voting-without-applying is not a safety hazard and is not silently tolerated
+either — the tier fails **closed** around it. Commits at `QuorumApplied` that
+need that voter's ack run out the caller's deadline
+(`CommitOutcome::TimedOut { waiting_on }`, naming it), and a new host that needs
+it in `S_r` stalls in `Recovering`. Both are loud, both are availability
+failures, and neither is a lost write. The symmetry with the lease tier's
+fail-slow reader is exact, and so is the remedy: the outcome names the node.
+
+##### Two deviations from the sketch, reviewed and recorded as contract
+
+Both were taken during implementation, both were reviewed, and both are now
+binding — a consumer may rely on them and an alternative implementation must
+reproduce them. The second carries a rider (**2b**) added in review: the cut a
+node must take on its predecessor's lineage the moment it *serves*, which the
+first-delivered-write rule can never take for it.
+
+**1. The host counts itself in a `QuorumApplied` majority.** A successful
+`HostedWrites::publish` records the write into *this node's own* `CommitLedger`
+before returning, so `S_c` may include `H` itself. That is honest rather than
+generous: `publish` is called **after** the caller's local durable write (the
+`WriteFeed` contract), so by the time the record lands the host genuinely has
+applied it, and its reading says nothing it cannot back. The cost model this
+buys is the one the tier advertises: on a roster of three, a write commits
+through **one follower plus self** — a single ack round to whichever follower is
+fastest — instead of unanimity among both.
+
+The alternative (a host that never counts itself) is also safe and strictly
+stricter, and the intersection argument is indifferent to the choice: any two
+majorities of `R` meet whether or not `H` is in one of them. What the choice
+does change is availability — never counting itself would turn a three-voter
+`QuorumApplied` into unanimity among the two followers, so one slow follower
+would tax every write. This design takes the majority; nothing about S5 moves.
+
+**2. The lineage cursor cuts at the first *delivered* write of the new lineage,
+not at watch adoption.** `HostedReads` keeps two positions — the adopted
+`(epoch, host)` pair and the cursor it has actually delivered from — and drops a
+write only once the *new* lineage has spoken, not the moment the watch adopts a
+higher epoch.
+
+The tempting simplification (drop anything below the adopted epoch) strands a
+recovering host, and strands it permanently. A host activating at `e′` whose
+apply loop was behind must still **drain the predecessor's tail** — that tail is
+precisely what the recovery rule is measuring it against — and a subscriber
+blinded to epoch-`e` writes the instant it adopts `e′` could never reach the
+target its peers report. The engine would say host; the write path would answer
+`Recovering`; nothing would ever move.
+
+Deferring the cut costs no *acked* write, because safety here is not the
+subscriber's job. A late epoch-`e` write delivered in that window cannot be
+counted toward a commit at `e`: this node has already stamped `≥ e′`, so its
+reading fails the commit predicate's `lead_epoch == t.epoch` — the view-stamp
+fence above, doing exactly the work it was introduced for. **Safety is carried
+by the stamp; ordering is carried by the subscriber** — and the ordering half is
+kept, because the instant the new lineage delivers its first write the old one is
+dead to this subscriber for good.
+
+*What the window does cost, stated so nobody infers less.* A follower still
+draining may **apply a write that is doomed** — never committed, and therefore no
+part of any successor's recovery. The divergence is real and it is not
+self-healing: a voter outside the recovery majority can be *ahead* of the
+successor, and nothing later re-delivers the difference. What reconciles it is
+the `Gap` that opens the next lineage: it is **authoritative**, not advisory, and
+the coarse remediation it asks for (flush, rebuild, refetch from the consumer's
+own store) is exactly what discards the doomed tail. A cache-shaped consumer —
+the shape this tier is written for — is therefore safe by construction. A
+consumer that treats the stream as an exact replay log and skips the rebuild
+keeps the divergence permanently, and that is its choice, not the tier's
+promise.
+
+**2b. A host cuts its predecessor's lineage when it begins to *serve*.** The
+deferral above has one hole, and it is on the node that can least afford it.
+`HostedReads` excludes this node's own feed, so a node that is itself the host
+never sees a write of its own lineage — the "first delivered write of the new
+lineage" never arrives, and the open lineage stays the **predecessor's** for as
+long as the process lives. Its predecessor's un-replicated tail is gossiped
+state that can land minutes later, when a partition heals; delivered then it
+would be applied *behind* the writes this node has authored at `e′`, which is a
+fenced epoch-`e` write reordered after the authority's own — silent stale state
+on the authority itself.
+
+The signal that closes it is **service**, not delivery: `HostedReads::cut_below`
+is the mechanism (drop everything below an epoch, emit nothing, move the cursor
+off the dead lineage), and `HostedWrites::bind` takes it automatically at the
+instant the admission table admits this node to serve. That instant is the
+earliest honest one in both directions — a host that is still `Recovering` needs
+the predecessor's tail, because the recovery rule is measuring it against exactly
+that, and a serving host must not have it. Leadership alone cannot tell those two
+apart; admission can.
+
+Binding is one builder step and it is part of the deployment contract: **a
+serving host that neither binds nor calls `cut_below` keeps the divergence window
+above open for as long as it hosts**, on the one node whose state everybody else
+is about to be recovered from.
+
+##### The recovery verdict is latched per epoch
+
+`HostedWrites` evaluates both rules **on demand and synchronously**, off the
+always-current gossip snapshots: no background task, nothing to spawn, no `Drop`.
+The recovery verdict is then **latched per epoch** — once `Completeness::Complete`
+answers for `e′`, this node serves `e′` for as long as it holds it, and a
+laggard's reading arriving afterwards, even one that would raise the target,
+never re-closes the gate.
+
+That is contract rather than an implementation detail, and it is correct for the
+same reason the intersection argument is: the argument needs **one** fresh
+majority, read **once**. A majority stamped `≥ e′` at any instant is proof that
+no commit round below `e′` can ever close again, and a watermark that arrives
+after that instant describes an *uncommitted* tail — not a write the successor
+owes anybody. Re-closing the gate on it would trade availability for nothing.
+`HostedWrites::recovery()` is deliberately **non-latching** and observability-only:
+reading a `Complete` there does not take it, so an operator's probe never changes
+what the node will serve. Decisions go through `fence()` / `publish()`.
+
+##### Durability, honestly
+
+`QuorumApplied` promises that no acked write is lost **while a majority of the
+applied copies survives**. It cannot outlive their simultaneous loss: the
+ledger's watermarks are gossiped state, and a majority of voters crashing
+amnesiac at once takes the evidence — and, for a memory-resident consumer, the
+applied state itself — with them. That is the standard majority-durability
+assumption; nothing here weakens it and nothing here strengthens it. An
+application with durable storage reseeds its ledger on boot from what its own
+store says it applied (`CommitLedger::with_recovered`), which keeps a restarted
+voter counting toward the majority it belongs to instead of dropping out of it
+for a full catch-up.
+
+S5 additionally presumes the **`GrantStore` posture** of M3's property matrix —
+epoch uniqueness across restarts. The commit predicate compares a stamp to
+`t.epoch` by **equality**, so an epoch that has stopped being a unique name for
+a hostship (the storage-free blackout posture's one gap) would let a reading
+stamped by a *different* hostship of the same integer count toward a commit.
+Storage-free Quorum keeps S4c; it does not keep S5. A deployment choosing
+`Commit::QuorumApplied` should run a `GrantStore`.
+
+##### The ring is the substrate, and it is bounded
+
+Recovery is expressed as watermarks, and a watermark past the end of a peer's
+visible ring is reached by machinery that already exists: the subscriber
+surfaces `PeerWrite::Gap`, the consumer remediates coarsely per its own contract
+(flush, rebuild, refetch), and the frontier advances into the target. Stated so
+that nobody reads "recovery" as "replay":
+
+* A recovering host whose target lies **beyond the ring** does not replay those
+  writes. It is `Gap`-remediated exactly as any lagging subscriber is, and
+  completeness is satisfied by the remediation — not by the individual writes.
+* A consumer needing **exact replay** rather than coarse remediation must size
+  the ring for the worst migration lag it accepts. That is a capacity decision
+  and it is the consumer's.
+* **State transfer is not in this milestone.** Snapshot handoff over the
+  `BulkTransport` data plane is Section 6's Milestone 6; until it exists, `Gap`
+  plus the consumer's remediation is the whole story — which is what the
+  strong-profile-versus-Raft table's "a laggard gaps and state-resyncs" row
+  means in practice.
+
 #### Consumer mapping
 
 * **docres document ownership/locking** = Hosted mode per shard group with
@@ -719,13 +1057,21 @@ epoch/fencing/lease skeleton; Quorum and External land on the proven result.
   here — a minority side simply never activates — but has no `NoLeader` error
   to report until M4 gives the hosted write path one; see the M3 as-built
   subsection for what it looks like through `leadership()` today.
-* **Milestone 4 — hosted write path + commit levels.** `HostedWrites` in
-  `groupnet-consistency` behind feature `hosted`; fence surfacing;
+* **Milestone 4 — hosted write path + commit levels. Delivered (pending
+  review).** `HostedWrites` in `groupnet-consistency` behind feature `hosted`
+  (`consistency-hosted` on the facade); fence surfacing;
   `Local` / `QuorumApplied` / `AllApplied` with the leader-completeness
   recovery step gating activation when `QuorumApplied` is in force (DST
   property S5); `NotHost`/`Deposed`; a runnable fenced-ownership example
-  (the docres shape). **The strong profile is complete at the end of this
-  milestone.**
+  (the docres shape:
+  `cargo run -p groupnet-consistency --example fenced_ownership --features
+  hosted`). **The strong profile is complete at the end of this
+  milestone.** As built, "gating activation" means gating *hosted service*
+  and the commit ledger is epoch-stamped rather than a literal reuse of the
+  ack tier — see the M4 as-built subsection above for the two rules, the
+  intersection argument, the deployment contract they impose (including the
+  serving host's own lineage cut), the latched recovery verdict, and the two
+  reviewed deviations that are now contract.
 * **Milestone 5 — external-CAS anchor.** `Activation::External` with a
   driver-side `Anchor` trait (runtime layer, never core); the engine
   consumes anchor outcomes as commands; the sim models the anchor as a

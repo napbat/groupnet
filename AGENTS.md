@@ -38,9 +38,17 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 ## Engineering rules (owner-set, 2026-08-05)
 
 1. **No Rust source file over 1000 lines.** Split modules before they get
-   there. (Largest today: `groupnet-core/src/wire.rs` ~960 and
-   `groupnet-consistency/tests/lease_dst.rs` ~950 — close enough that the next
-   addition to either splits it first, rather than after.)
+   there. (Largest today, all within ~40 lines of the limit, so the next
+   addition to any of them splits it *first*: `groupnet-consistency`'s
+   `tests/hosted_dst.rs` ~975, `src/hosted/writes.rs` ~970 and
+   `tests/hosted_dst_migrate.rs` ~960; `groupnet-core`'s `src/wire.rs` ~960 and
+   `tests/election_quorum.rs` ~950; `groupnet-consistency/tests/lease_dst.rs`
+   ~950.) Two splits worth copying: a **shell** splits from its sans-IO core
+   (`hosted/reads.rs` drives, `hosted/lineage.rs` decides and is unit-tested
+   without a runtime), and a **DST harness** splits by *schedule family*, each
+   file carrying its own copy of the harness and asserting the floors its own
+   schedule earns — the house pattern `groupnet-sim`'s `election_quorum*` and
+   this crate's `hosted_dst*` suites both follow.
 2. **Clippy `all` + `pedantic`** are workspace lints; CI treats warnings as
    errors. Verify with
    `cargo clippy --workspace --all-targets -- -D warnings`. Any
@@ -79,16 +87,19 @@ cargo check -p groupnet-transport --no-default-features
 cargo test -p groupnet --features tcp-msg
 cargo test -p groupnet-consistency --features acks
 cargo test -p groupnet-consistency --features leases
+cargo test -p groupnet-consistency --features hosted
 cargo test -p groupnet --features consistency-leases
+cargo test -p groupnet --features consistency-hosted
 cargo clippy -p groupnet-consistency --all-targets --features leases -- -D warnings
+cargo clippy -p groupnet-consistency --all-targets --features hosted -- -D warnings
 ```
 
-The last one is not redundant: no crate in the workspace turns `leases` on by
-default, so the workspace clippy above never sees the lease tier's code or its
-DST at all.
+The last two are not redundant: no crate in the workspace turns `leases` or
+`hosted` on by default, so the workspace clippy above never sees those tiers'
+code, their tests, or their DST at all.
 
 Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`) — the
-eleventh command, and the only one that is not a correctness gate.
+fourteenth command, and the only one that is not a correctness gate.
 
 ## Process
 

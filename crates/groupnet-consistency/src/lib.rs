@@ -35,6 +35,15 @@
 //! peer's lease lapse — bounded by the stale node's own clock instead of by a
 //! timeout with a hope at the end.
 //!
+//! Both of those make *readers* agree about what a writer said. Neither answers
+//! *who may write* — and the tier that does is the **Hosted write path**
+//! (feature `hosted`, off by default, module `hosted`): fenced, epoch-scoped
+//! writes through the group's elected host, with a `Commit` level pricing the
+//! guarantee (host-local, voter-majority-applied, or applied everywhere). Its
+//! strong profile — `Activation::Quorum` × `Commit::QuorumApplied` — is
+//! consensus, deliberately confined to fixed single-digit rosters, and it is the
+//! only thing in this crate that costs a majority round-trip per write.
+//!
 //! Sitting beside both, priced at nothing and gated by nothing, are
 //! **typed watermarks**: [`SeqFloors`] publishes per-node, per-key floors in
 //! the consumer's *own* sequence space (a shard LSN, a WAL offset) as TTL'd
@@ -64,10 +73,12 @@
 //! Not provided, by design:
 //!
 //! - **Cross-writer ordering, consensus, fencing.** Two nodes' feeds have no
-//!   mutual order, and groupnet's coordinator is derived, not fenced. For
-//!   "exactly one writer may proceed", fence at an external authority (a
-//!   store with conditional writes) or run a consensus log — this crate will
-//!   not pretend to do it with gossip.
+//!   mutual order, and groupnet's coordinator is derived, not fenced. "Exactly
+//!   one writer may proceed" is never a property of the tiers above — it is an
+//!   opt-in, per-group mode: the `hosted` feature's elected, epoch-fenced host,
+//!   or an external authority (a store with conditional writes) stamped with
+//!   the host's fence token. What this crate will never do is pretend to
+//!   arbitrate writers with gossip alone.
 //!
 //! # Writer restarts (why tokens carry an epoch)
 //!
@@ -187,6 +198,8 @@ mod acks;
 mod feed;
 mod floor;
 mod frontier;
+#[cfg(feature = "hosted")]
+pub mod hosted;
 #[cfg(feature = "leases")]
 pub mod lease;
 mod peers;
@@ -198,6 +211,12 @@ pub use acks::{AckLedger, CAP_ACKS, applied_by, applied_by_selected, applied_clu
 pub use feed::WriteFeed;
 pub use floor::SeqFloors;
 pub use frontier::{Frontier, FrontierView};
+#[cfg(feature = "hosted")]
+pub use hosted::{
+    CAP_HOSTED, Commit, CommitCore, CommitLedger, CommitOutcome, CommitReceipt, CommitVerdict,
+    Completeness, CompletenessCore, Fence, HostedError, HostedRead, HostedReads, HostedSetupError,
+    HostedWrites, LedgerView, Reading, Watermarks,
+};
 #[cfg(feature = "leases")]
 pub use lease::{
     CAP_LEASE, ClockMs, CoherenceCore, CoherenceOutcome, CoherenceStep, LeaseConfig,

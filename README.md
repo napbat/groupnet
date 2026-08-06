@@ -1,10 +1,19 @@
 # Groupnet
 
-A **deterministic, leaderless coordination fabric** for distributed systems that
-partition state into shard groups. Groupnet is an *engine*, not a database: it
-gives you group-local membership, an implicit (derived, non-elected)
-coordinator, inter-group routing awareness, and shard-scoped operations —
-without Raft, Paxos, or global consensus. You bring the storage and the wire.
+A **deterministic, leaderless-by-default coordination fabric** for distributed
+systems that partition state into shard groups. Groupnet is an *engine*, not a
+database: it gives you group-local membership, an implicit (derived,
+non-elected) coordinator, inter-group routing awareness, and shard-scoped
+operations. Consensus is **opt-in per group** — the Hosted mode's Quorum
+profile, epoch-fenced and majority-committed — while the general replicated-log
+machine (log repair, compaction, reconfiguration) is deliberately absent. You
+bring the storage and the wire.
+
+That opt-in is a dial, set per group: eventual metadata for free at one end, an
+elected epoch-fenced host paying a majority round-trip per write at the other,
+and the session and coherence tiers in between. Each rung, its price, and what
+it deliberately does *not* promise are in
+[`docs/consistency-modes.md`](docs/consistency-modes.md).
 
 > Status: early scaffold. The architecture and public API are in place with a
 > working gossip/coordinator core; several protocol pieces are stubbed and
@@ -81,11 +90,12 @@ cargo run --example cluster     # 3-node convergence, derived coordinator, metad
 cargo run --example routing     # resolve a resource to its owner from any node
 ```
 
-Two more live with the layers they exercise:
+Three more live with the layers they exercise:
 
 ```bash
 cargo run -p groupnet-sim --example partition              # partition -> detect -> heal -> rejoin, bit-for-bit reproducible
 cargo run -p groupnet-consistency --example read_your_writes   # write feed + applied-frontier barrier, and a gap surfacing
+cargo run -p groupnet-consistency --example fenced_ownership --features hosted   # elected host, majority-committed claims, and a store refusing a fenced-out writer
 ```
 
 ```rust
