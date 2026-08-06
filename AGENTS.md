@@ -38,32 +38,53 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 ## Engineering rules (owner-set, 2026-08-05)
 
 1. **No Rust source file over 1000 lines.** Split modules before they get
-   there. (Largest today, all within ~50 lines of the limit, so the next
-   addition to any of them splits it *first*:
-   `groupnet-sim/tests/election_external_failover.rs` ~990;
-   `groupnet-consistency`'s `tests/hosted_dst.rs` ~975, `src/hosted/writes.rs`
-   ~970 and `tests/hosted_dst_migrate.rs` ~960; `groupnet-core`'s `src/wire.rs`
-   ~960 and `tests/election_quorum.rs` ~950;
-   `groupnet-consistency/tests/lease_dst.rs` ~950. With room still:
-   `groupnet-sim`'s `tests/election_external_skew.rs` ~910 and
-   `src/simulation.rs` ~895, `groupnet-consistency/src/lease/shell.rs` ~890,
-   `groupnet-core`'s `engine/election/mod.rs` ~875 and `src/config.rs` ~860, the
-   rest of the `groupnet-sim` `election_external*` suites at ~785–790,
-   `groupnet-runtime`'s `tests/external.rs` ~705 / `tests/external_faults.rs`
-   ~780, and M6's handoff files — `groupnet-consistency`'s
-   `src/hosted/handoff/stream.rs` ~780, `tests/handoff_fence.rs` ~760,
-   `tests/handoff_migration.rs` ~755, `src/hosted/handoff/wire.rs` ~720 and
-   `tests/handoff_resync.rs` ~700.
+   there. (Largest today, and the only one still within ~50 lines of the limit,
+   so the next addition to it splits it *first*:
+   `groupnet-consistency/tests/lease_dst.rs` ~948. The band under it, with
+   ~90–150 lines of room: `groupnet-sim`'s `tests/election_external_skew.rs`
+   ~910, `tests/election_quorum.rs` ~896 and `src/simulation.rs` ~894;
+   `groupnet-core`'s `tests/election.rs` ~909, `src/engine/election/mod.rs`
+   ~873, `src/config.rs` ~861 and `src/engine/election/quorum.rs` ~859;
+   `groupnet-consistency`'s `src/lease/shell.rs` ~889,
+   `tests/hosted_dst_liveness.rs` ~875 and `tests/lease_dst_liveness.rs` ~853.
+   With room still: `groupnet-runtime`'s `src/node.rs` ~803,
+   `tests/external_faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
+   ~754 and `tests/external.rs` ~706; `groupnet-consistency`'s
+   `src/hosted/writes/mod.rs` ~794, `src/hosted/handoff/stream.rs` ~782,
+   `tests/handoff_fence.rs` ~761, `src/hosted/lineage.rs` ~759,
+   `tests/handoff_migration.rs` ~757, `tests/hosted_migration.rs` ~752,
+   `src/hosted/ledger.rs` ~725, `src/hosted/handoff/wire.rs` ~720 and
+   `tests/handoff_resync.rs` ~702; `groupnet-sim/tests/election_external.rs`
+   ~786; `groupnet-core`'s `tests/state.rs` ~774 and `src/wire/mod.rs` ~705.
    `simulation.rs` has now absorbed three subsystems' event kinds —
    **the next addition to it splits the probe/liveness dispatch out** rather
-   than growing it again.) Two splits worth copying: a **shell** splits from
-   its sans-IO core (`hosted/reads.rs` drives, `hosted/lineage.rs` decides and
-   is unit-tested without a runtime), and a **DST harness** splits by *schedule
-   family*, each file carrying its own copy of the harness and asserting the
-   floors its own schedule earns — the house pattern `groupnet-sim`'s
-   `election_quorum*` and this crate's `hosted_dst*` suites both follow, and
-   `groupnet-runtime`'s `external.rs` / `external_faults.rs` (the tier, and the
-   same tier with its store broken) applies to an integration suite.
+   than growing it again.) Four splits worth copying:
+   - a **shell** splits from its sans-IO core (`hosted/reads.rs` drives,
+     `hosted/lineage.rs` decides and is unit-tested without a runtime);
+   - a **DST harness** splits by *schedule family*, each file carrying its own
+     copy of the harness and asserting the floors its own schedule earns — the
+     house pattern `groupnet-sim`'s `election_quorum*` and this crate's
+     `hosted_dst*` suites both follow, and `groupnet-runtime`'s `external.rs` /
+     `external_faults.rs` (the tier, and the same tier with its store broken)
+     applies to an integration suite;
+   - a **shaped-scenario suite** splits by the *rule* each scenario prices, not
+     by size: `election_external_failover.rs` keeps the availability-axis
+     scenarios and the failover budget, `election_external_rank.rs` takes the
+     three the rank gate pays for; `election_quorum.rs` keeps the voter ledger
+     and the grant round, `election_quorum_renewal.rs` takes renewal, fencing
+     and the recovered-grant posture. Every test is self-contained, so the
+     move costs nothing;
+   - a **big inline `#[cfg(test)] mod tests`** moves to a sibling file —
+     `wire.rs` becomes `wire/mod.rs` + `wire/tests.rs` behind
+     `#[cfg(test)] mod tests;` (likewise `hosted/writes/`), which keeps every
+     `wire::tests::…` path byte-identical. And when a DST file is *already*
+     one schedule family (one `#[test]`, one seed loop) it cannot split by
+     family without moving seeds and floors, so it splits its harness into a
+     `#[path]`-included child instead: `tests/hosted_dst.rs` keeps the model
+     and the property suite, `tests/hosted_dst/harness.rs` holds the cluster
+     harness and the schedule. The child sees the parent's private items, so
+     only the scenario entry point needs `pub(crate)` and the binary's output
+     does not move a byte.
 2. **Clippy `all` + `pedantic`** are workspace lints; CI treats warnings as
    errors. Verify with
    `cargo clippy --workspace --all-targets -- -D warnings`. Any
