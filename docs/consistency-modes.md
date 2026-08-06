@@ -287,7 +287,7 @@ already exists and is already tested.
 
 | Policy | Partition behavior | CAP posture | Split-brain |
 |---|---|---|---|
-| `Quorum { voters }` | only a side holding a majority of the **static voter roster** activates a host; the minority side fails hosted writes fast (`NoLeader`) while base-fabric gossip continues | CP for the hosted domain | none outside the lease window (lease expiry + bounded clock-*rate* skew) |
+| `Quorum { voters }` | only a side holding a majority of the **static voter roster** activates a host; the minority side fails hosted writes fast (`NoLeader`, once M4's write path exists) while base-fabric gossip continues | CP for the hosted domain | none outside the lease window (lease expiry + bounded clock-*rate* skew) |
 | `External` (CAS-anchored lease) | whoever wins the external conditional write is host; partition sides are irrelevant | CP; consensus outsourced to the anchor | none, absolutely (the anchor is linearizable) |
 | `Settle { claim_settle_ms }` (lobby-style) | each side elects its own host after the settle window | AP + serialization per side | yes — bounded and **fenced**: at heal exactly one epoch survives; the loser surfaces as a `Gap` + demotion event for the app to reconcile |
 
@@ -343,7 +343,10 @@ CP path.
   fallback for genuinely storage-free deployments, converting durability
   into a timing rule DST can prove sufficient in logical time (but which,
   in production, rests on "restart + boot exceeds the blackout" instead of
-  on nothing at all).
+  on nothing at all). *As built this is sharper than the sketch: the two are
+  not alternatives — a recovered voter still serves the boot blackout, and
+  what persistence buys is epoch uniqueness across restarts plus immediate
+  re-grants to the incumbent. See the Quorum as-built subsection below.*
 * **Fencing surface.** A `Fence { epoch, host }` token exposed to the
   application, stamped onto data-plane operations and — critically —
   **external stores** (S3/R2 `If-Match`/`If-None-Match`). Gossip cannot
@@ -354,6 +357,149 @@ CP path.
   `LeadershipChanged { epoch, host, role }`; the write path surfaces
   migration as the epoch `Gap`. A later milestone can add snapshot handoff
   over the existing `BulkTransport` data plane.
+
+#### Quorum activation, as built (Milestone 3)
+
+Status: **delivered (pending review)** — `Activation::Quorum { voters }` +
+`VoterRoster`, the voter ledger and grant rounds in
+`engine/election/quorum.rs`, `Effect::PersistGrant`, `RecoveredGrant` +
+`GroupEngine::with_recovered` in `groupnet-core`; the `GrantStore` trait and
+`GroupProfile::with_voter_storage` in `groupnet-runtime`. The as-built rules
+refine the sketch above and are now contract:
+
+* **What carries global single-lease safety is the grant *promise*, not the
+  lease-vs-detection arithmetic.** A voter refuses every **new** claimant for
+  `lease_ms` after any grant it makes (a re-grant of the same pair slides the
+  promise; the claimant already granted is exempt, so a host may always
+  advance its own epoch). That promise, plus one-grant-per-epoch-per-voter and
+  the intersection of two majorities, is the whole argument. The Settle-era
+  sizing rule `lease_ms < detection_window_ms + settle window` is therefore
+  **demoted under Quorum to a liveness guideline**: it governs how fast a dead
+  host's group recovers, and no safety property rests on it. (It remains a
+  safety rule under `Settle`, where nothing else bounds split-brain.)
+* **A lease is attributed to the instant the claim was *sent*.** An activation
+  runs to `round_sent_at + lease_ms`, never `now + lease_ms` at the moment the
+  majority landed: every voter in that majority promised from an instant at or
+  after the send, so the host's authority expires no later than the earliest
+  promise that made it host. Anchoring on the last grant's *arrival* would
+  hand the host an overhang past the promises it was built from — exactly
+  where a second host fits. **The assumption:** a *renewal* round re-anchors
+  every anti-entropy tick, so a grant answering the previous round can be
+  counted into the current one and over-attribute the lease by at most one
+  anti-entropy interval. That is safe precisely while the **claim→grant round
+  trip — ≈2·(latency + jitter) — stays under `anti_entropy_interval_ms`**: the
+  grant being mis-attributed answered a claim sent one round earlier, so it is a
+  round trip, not a one-way hop, that has to fit inside the cadence. A deployment
+  that cannot
+  hold that sizing needs per-round identity on the wire; the escape hatch is a
+  nonce carried by a **new frame kind** (no existing body changes, so still
+  `FRAME_VERSION 3`). An election round has no such slack — its anchor is the
+  instant the claim was opened, and re-offers deliberately do not move it.
+* **Recovery restores the pair, not the time** — correcting the M1 sketch
+  above, which read as though persistence replaced the blackout. It does not:
+  a store records *what* was granted, never *when*, so **even a recovered
+  voter applies the boot-anchored window to every new claimant** (boot is at or
+  after the crash, which is at or after the grant, so a blackout measured from
+  boot always covers the promise the lost grant implied). What recovery buys is
+  the other two things: **epoch uniqueness across restarts** (the recovered
+  pair is a floor no restart can forget) and **immediate re-grants to the
+  incumbent** (the claimant named in the pair is exempt from the promise, so a
+  restarted voter stops starving the sitting host for a lease).
+  `RecoveredGrant::none()` — storage attesting this voter has *never* granted —
+  is the one statement that lifts the blackout outright, and only a driver that
+  really did persist every grant may make it.
+* **The honest property matrix.** Two different guarantees, and they are not
+  the same strength:
+
+  | Property | Storage-free (blackout) | `GrantStore` + recovery |
+  |---|---|---|
+  | **S4c-global** — at most one unexpired lease per group at any instant, partitions included | **holds** | **holds** |
+  | **S1-strict** — no two nodes ever host the same *epoch*, even at disjoint times | holds unless a voter restarts amnesiac | **holds**, assuming persists succeed |
+
+  The right-hand column's S1-strict is conditional on the store actually
+  accepting what it is asked to write: a persist *failure* leaves the two
+  self-grant shapes below (row Q4b's retry, and a roster of one) hosting on an
+  undurable grant, which risks S1-strict across an amnesiac restart — and only
+  that. **S4c is carried by the grant promise and the boot blackout and never
+  depends on the store**, so it stays in the "holds" column however the disk
+  behaves.
+
+  The gap is exactly one scenario: a voter grants epoch *e*, crashes with no
+  store, waits out its blackout, and grants *e* to a different claimant. The
+  first host's lease expired before the blackout ended, so no two leases ever
+  overlap — S4c is intact — but the epoch has stopped being a unique name for
+  a hostship. That matters to anything that treats an epoch as an identity
+  rather than as an ordering (a fence token stamped into an external store, for
+  instance), which is why a deployment with a disk should use one.
+* **The write-ahead driver contract, and fail-closed on persist error.**
+  `Effect::PersistGrant` is emitted immediately before the frames the grant it
+  records licenses, in two shapes: a peer's claim answered (the `LeadGrant`
+  itself) and this node's own claim opened (a self-grant is counted straight
+  into the round, so what follows is the `LeadClaim` broadcast). A driver with
+  a store **must complete the persist before those frames leave**, and if the
+  store errors it **must drop them** — and keep dropping re-offers of that pair
+  until a later persist succeeds, since the engine re-answers a recorded grant
+  without re-persisting it. The runtime driver does exactly this: the persist
+  runs on the blocking pool and the actor waits for it; a store error (or a
+  panicking store) arms a guard that swallows the matching grant/claim frames,
+  matched by decoding rather than by position. The drop is **silent by
+  design** — nothing in `NetStats` counts it (those counters are the sans-IO
+  engine's, and it cannot see a driver's disk), and a frame never sent is not
+  traffic; the `io::Error` the store returned is the operator's signal. Cost of
+  a failing store: that voter stops closing epochs and (with the caveat below)
+  cannot become host, so a roster that needs it stalls. A driver with **no**
+  store ignores `PersistGrant` entirely — the supported blackout posture, not a
+  bug.
+* **The caveat: a self-grant is not always a frame.** The two shapes above are
+  the frames a grant *licenses*; a claimant's own grant is counted straight into
+  its round instead of being sent, so a failed persist has nothing left to
+  withhold in two cases. Row **Q4b** re-attempts the self-grant on every tick the
+  round is open — long after the claim went out — and a roster of **one** closes
+  its round on the self-grant before the claim is broadcast at all. In both, a
+  refused persist still leaves the round closed and **the activation's
+  `LeadState` is not withheld**: the node hosts on a grant its disk refused. On a
+  roster of two or more that is bounded to one lease (the renewal round's claim
+  *is* withheld, so no voter re-grants and the host demotes on lapse); on a
+  roster of one it is unbounded, because a solo voter's renewal closes in-engine
+  and emits no frame to drop. What this costs is **S1-strict across an amnesiac
+  restart** and nothing else — S4c-global is carried by the promise and the
+  blackout, timing rules that never consult a store.
+* **Voters and members are different sets, and both directions are legal.** The
+  roster names who votes, not who is alive and not who is in the membership
+  view. A voter gossip has never shown alive is still sent every claim (claim
+  targets are the live peers **unioned** with the roster) — a roster member
+  nobody has heard from is precisely the grant an election cannot afford to
+  skip. A member outside the roster never grants (and cannot count itself),
+  but is otherwise a full participant and may still be elected host, since
+  candidacy is the rendezvous ranking and hosting and voting are independent.
+  An **empty roster** asks for one grant it can never collect, so the group
+  never activates a host at all — the fail-safe answer, chosen over a `0`
+  threshold that would turn a misconfiguration into a silent loss of the very
+  property Quorum is picked for.
+* **The minority freeze, as it is observable *today*.** There is no `NoLeader`
+  error yet: it belongs to M4's write path, and until that exists a minority
+  side has nothing to fail fast. What M3 surfaces is `leadership()`. If the
+  incumbent is on the minority side it cannot renew, so its lease lapses, it
+  demotes, and every observer there moves to `(epoch, None)` and stays hostless
+  — a minority candidate can claim but never collects a majority. If the
+  incumbent is on the *majority* side, the minority keeps reporting the stale
+  `(epoch, host)` pair it last adopted, with no local way to tell that it is
+  stale; base-fabric gossip continues underneath either way. Both are correct
+  and neither is an error return, so **a consumer must not read a non-`None`
+  host as permission to serve** until M4 gives the write path its own verdict.
+
+Proven at this layer by `groupnet-core/tests/election_quorum.rs` (the grant
+rules and round arithmetic), the Quorum DST seeds in `groupnet-sim`, and
+`groupnet-runtime/tests/quorum.rs` — which is where the *driver* half is
+falsifiable: a majority of real stores holding the winning pair, a voter whose
+store always fails putting no grant on the wire at all (counted on its own
+transport) while the other two still close the epoch, the *same* failing store
+on the **candidate** withholding the `LeadClaim` instead and stalling the group
+hostless (candidacy is rank-gated, so no second-ranked node steps in), and a
+voter restarting with its persisted ledger re-granting the incumbent an order of
+magnitude inside the lease a blackout would have cost. The guard's own truth
+table — including the `LeadState` it deliberately does **not** withhold — is
+unit-tested beside it in `groupnet-runtime/src/driver.rs`.
 
 #### Commit levels — the second half of "strong"
 
@@ -505,14 +651,20 @@ heal schedules) assert the safety and liveness properties:
 * **S1** — no two nodes ever activate as host of the same *fencing pair*
   (true by construction — a pair names its activator; the DST-falsifiable
   content is the interval fold: no node re-activates a pair it has left);
-  strict same-*epoch* uniqueness holds on partition-free runs (and returns
-  globally under Quorum activation, M3) — see the fencing-pair finding in
-  the election design above.
+  strict same-*epoch* uniqueness holds on partition-free runs, and returns
+  globally under Quorum activation (M3) **given voter durability** — a voter
+  that restarts amnesiac may grant one epoch twice at disjoint times, which
+  costs S1-strict and not S4c (see the M3 as-built property matrix) — see the
+  fencing-pair finding in the election design above.
 * **S2** — a node's observed epoch never regresses, and its adopted pair
   never regresses in the fencing order (modulo its own self-demotion step,
   which is `(e, Some(self)) → (e, None)` by design).
 * **S3** (Quorum) — a side without a voter majority never activates; voter
-  crash-restart seeds prove the grant blackout suffices.
+  crash-restart seeds prove the grant blackout suffices for S4c in the
+  storage-free posture, and the persisted-ledger seeds prove the durable one.
+  As built, what makes S4c *global* is the voter's grant promise (refuse new
+  claimants for `lease_ms` after any grant) together with send-instant lease
+  attribution, not the lease-vs-detection sizing — see M3 as-built.
 * **S4** — lease disjointness in virtual time, decomposed honestly for
   Settle mode: **S4a** per fencing pair, only its named host ever holds a
   lease, over at most one contiguous activation interval; **S4b** no node
@@ -520,7 +672,8 @@ heal schedules) assert the safety and liveness properties:
   per group at any instant on partition-free runs (across a partition, two
   unexpired leases may coexist only under *distinct* fencing pairs — the
   documented Settle split-brain, fenced at heal). Quorum (M3) strengthens
-  S4c to global.
+  S4c to global — including the storage-free posture, since an amnesiac
+  voter's boot blackout covers exactly the promise it forgot.
 * **S5** (with `Commit::QuorumApplied`) — no write acknowledged at the
   quorum-applied level is ever lost, across every crash/partition/migration
   schedule: after any activation, the new host's state contains every such
@@ -558,9 +711,14 @@ epoch/fencing/lease skeleton; Quorum and External land on the proven result.
   responsive lease-holders or lease lapse; the successor to s3cache's
   unanimity-ack strong mode. Milestone 0's items 1–2 are part of its
   contract.
-* **Milestone 3 — Quorum activation.** Static voter roster, one grant per
-  epoch per voter, persisted grants (restart-blackout fallback), minority
-  freeze (`NoLeader`); DST S3 including voter crash-restart seeds.
+* **Milestone 3 — Quorum activation. Delivered (pending review).** Static
+  voter roster, one grant per epoch per voter, the grant promise, send-instant
+  lease attribution, persisted grants over a runtime `GrantStore` (with the
+  restart-blackout fallback retained as the storage-free posture); DST S3
+  including voter crash-restart seeds. The minority freeze is *structural*
+  here — a minority side simply never activates — but has no `NoLeader` error
+  to report until M4 gives the hosted write path one; see the M3 as-built
+  subsection for what it looks like through `leadership()` today.
 * **Milestone 4 — hosted write path + commit levels.** `HostedWrites` in
   `groupnet-consistency` behind feature `hosted`; fence surfacing;
   `Local` / `QuorumApplied` / `AllApplied` with the leader-completeness

@@ -151,8 +151,8 @@ impl GroupEngine {
             .into_iter()
             .filter(|p| *p != local)
             .collect::<BTreeSet<_>>();
-        let election = match config.mode {
-            GroupMode::Hosted(hosted) => Some(Election::new(hosted)),
+        let election = match &config.mode {
+            GroupMode::Hosted(hosted) => Some(Election::new(hosted.clone())),
             GroupMode::Eventual => None,
         };
         let mut engine = Self {

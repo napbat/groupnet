@@ -843,3 +843,67 @@ fn an_eventual_group_runs_no_election() {
         assert!(leadership_changes(&effects).is_empty());
     }
 }
+
+/// The minority side, from the inside. A `Quorum` group whose voters never
+/// answer is deliberately hostless: the claim guard is unchanged, so a
+/// top-ranked node still opens and broadcasts claims, but only a
+/// majority-of-the-roster tally closes one of its epochs — so every claim
+/// expires silently when its window shuts.
+///
+/// Ticked across twenty windows against a three-voter roster it cannot reach,
+/// this node therefore never reaches [`Role::Host`], never announces
+/// leadership, never arms a lease, and never puts a grant on the wire (its own
+/// self-grant is counted, not sent). Unavailable, never unsafe — which is the
+/// whole point of the CP posture. The grant rows themselves live in
+/// `tests/election_quorum.rs`.
+#[test]
+fn a_quorum_group_without_a_voter_majority_never_activates() {
+    // Under Quorum the lease is also the claim window and the boot guard.
+    const LEASE_MS: u64 = 500;
+    const WINDOWS: u64 = 20;
+
+    let rank = ranked(&["a", "b", "c"]);
+    let voters: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
+    let mut e = hosted_quorum_engine(rank[0].as_str(), &[], &voters, LEASE_MS);
+    learn(&mut e, &rank[1..], Time::ZERO);
+    e.start(Time::ZERO);
+
+    let mut claims = 0usize;
+    for at in (100..=WINDOWS * LEASE_MS).step_by(100) {
+        let effects = e.on_tick(Time(at));
+        for (_, body) in lead_bodies(&effects) {
+            match body {
+                wire::LeadBody::Claim { .. } => claims += 1,
+                other => panic!("a Quorum group put {other:?} on the wire at {at}"),
+            }
+        }
+        assert!(
+            leadership_changes(&effects).is_empty(),
+            "a Quorum group announced leadership at {at}"
+        );
+        assert_ne!(e.role(), Role::Host, "a Quorum group activated at {at}");
+        assert_eq!(e.leadership(), (0, None), "still hostless at {at}");
+        assert_eq!(e.host_lease_until(), None, "no lease armed at {at}");
+    }
+    assert!(
+        claims > 0,
+        "the claim guard is untouched — claims are still bid, they just never close"
+    );
+
+    // And a grant that matches no round this node is running is dropped, and
+    // teaches it nothing — an epoch is learned from a claim or an adopted pair,
+    // never from somebody's endorsement of one.
+    let before = e.observed_epoch();
+    let effects = e.on_message(
+        rank[1].clone(),
+        &lead_grant_frame(before + 5, rank[0].as_str(), rank[1].as_str()),
+        Time(WINDOWS * LEASE_MS),
+    );
+    assert!(
+        effects.is_empty(),
+        "a grant for no standing round is dropped"
+    );
+    assert_eq!(e.observed_epoch(), before, "a grant teaches us no epoch");
+    assert_ne!(e.role(), Role::Host);
+    assert_eq!(e.leadership(), (0, None));
+}

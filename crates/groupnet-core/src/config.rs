@@ -1,5 +1,9 @@
 //! Per-group failure-detection and gossip tunables.
 
+use std::sync::Arc;
+
+use crate::NodeId;
+
 /// The consistency posture of a single group: whether it is a pure
 /// metadata/membership group, or one that elects an epoch-fenced **host**.
 ///
@@ -22,7 +26,7 @@
 /// [`LeadGrant`]: crate::wire::Kind::LeadGrant
 /// [`LeadState`]: crate::wire::Kind::LeadState
 /// [`Effect::LeadershipChanged`]: crate::Effect::LeadershipChanged
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GroupMode {
     /// Metadata and membership only, converging eventually — the default, and
@@ -65,7 +69,7 @@ pub enum GroupMode {
 /// In production this rests on bounded clock-*rate* error between nodes — the
 /// standard lease assumption, stated plainly rather than assumed away. The
 /// simulator checks lease disjointness exactly, in virtual time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostedConfig {
     /// How an epoch is closed — which peers' agreement makes a claimant the
     /// host. See [`Activation`].
@@ -81,7 +85,7 @@ pub struct HostedConfig {
 ///
 /// Activation answers *who may serve as host*; it says nothing about when a
 /// hosted write may be acknowledged (that is a separate, orthogonal knob).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Activation {
     /// Lobby-style: a claimant that is still the top-ranked live candidate
@@ -99,6 +103,127 @@ pub enum Activation {
         /// sizing guidance on [`HostedConfig`].
         claim_settle_ms: u64,
     },
+    /// Majority-style: only a claimant endorsed by a majority of the **static
+    /// voter roster** activates, so a partition side that cannot reach a
+    /// majority never gets a host at all. The CP posture — no split-brain
+    /// outside the lease window — bought at the price of availability on the
+    /// minority side.
+    ///
+    /// The roster is explicit and static on purpose: a gossip-*derived*
+    /// majority is unsafe, because two partition sides can each hold a
+    /// majority of what they can see. See [`VoterRoster`].
+    ///
+    /// # What it costs
+    ///
+    /// One grant round per election *and per renewal*: a Quorum host re-claims
+    /// its epoch from the roster on the anti-entropy cadence and extends its
+    /// lease only when a majority answers, where a `Settle` host renews by
+    /// re-reading its own membership view and asks nobody. That round trip is
+    /// the price of the CP posture — a host that cannot reach a majority stops
+    /// being one when its lease lapses, rather than serving a second copy of
+    /// the group.
+    ///
+    /// A voter grants at most one claimant per epoch and refuses a *new*
+    /// claimant for a lease after each grant. That promise is durable when the
+    /// driver honours
+    /// [`Effect::PersistGrant`](crate::Effect::PersistGrant) (see
+    /// [`GroupEngine::with_recovered`](crate::GroupEngine::with_recovered));
+    /// with no store it rests on the post-restart grant blackout, which is a
+    /// timing rule rather than a durability one.
+    Quorum {
+        /// The nodes whose grants close an epoch. A majority of *these* — not
+        /// of whoever gossip currently shows alive — makes a host.
+        voters: VoterRoster,
+    },
+}
+
+/// The static set of nodes whose endorsements close an epoch under
+/// [`Activation::Quorum`].
+///
+/// Canonicalized on construction — sorted and deduplicated — so two rosters
+/// built from the same nodes in different orders (or with a node named twice)
+/// are the *same* roster by [`PartialEq`]. That matters because the roster is
+/// part of a group's configuration: every member must agree on it, and
+/// agreement cannot depend on the order a caller happened to list ids in.
+///
+/// Cheap to clone (an `Arc<[NodeId]>` inside), and deliberately **not**
+/// `Copy` — which is what costs [`Activation`], [`HostedConfig`] and
+/// [`GroupMode`] their `Copy` too.
+///
+/// The roster is *not* the membership view: it names who votes, not who is
+/// alive. A voter that is down simply does not grant, which is exactly how a
+/// minority side is starved of a host rather than served a second one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoterRoster(Arc<[NodeId]>);
+
+impl VoterRoster {
+    /// Builds a roster from `voters`, canonicalizing it: sorted, with
+    /// duplicates collapsed. Any iterable of [`NodeId`] will do.
+    #[must_use]
+    pub fn new(voters: impl IntoIterator<Item = NodeId>) -> Self {
+        let mut voters: Vec<NodeId> = voters.into_iter().collect();
+        voters.sort_unstable();
+        voters.dedup();
+        Self(voters.into())
+    }
+
+    /// How many distinct nodes vote.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the roster names nobody — see [`majority`](Self::majority) for
+    /// what that means for the group.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `node` is one of the voters.
+    #[must_use]
+    pub fn contains(&self, node: &NodeId) -> bool {
+        self.0.contains(node)
+    }
+
+    /// The voters, in canonical (sorted) order.
+    pub fn iter(&self) -> std::slice::Iter<'_, NodeId> {
+        self.0.iter()
+    }
+
+    /// How many grants close an epoch: `len / 2 + 1`, a strict majority — so
+    /// two rosters' majorities always intersect in at least one voter, which
+    /// is what makes at most one host per epoch possible at all.
+    ///
+    /// | voters | majority |
+    /// |---|---|
+    /// | 1 | 1 |
+    /// | 2 | 2 |
+    /// | 3 | 2 |
+    /// | 4 | 3 |
+    /// | 5 | 3 |
+    ///
+    /// # The empty roster
+    ///
+    /// An empty roster yields `1`, which is unattainable from zero voters: the
+    /// group can never activate a host, and stays permanently hostless. That
+    /// is the fail-safe answer, and it is a deliberate `1` rather than a panic
+    /// or a `0` — a `0` would make the *first* claimant a host with nobody's
+    /// agreement, turning a misconfiguration into a silent loss of the very
+    /// property Quorum activation is chosen for.
+    #[must_use]
+    pub fn majority(&self) -> usize {
+        self.0.len() / 2 + 1
+    }
+}
+
+impl<'a> IntoIterator for &'a VoterRoster {
+    type Item = &'a NodeId;
+    type IntoIter = std::slice::Iter<'a, NodeId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 
 /// Tunables for a single group's gossip and failure detection.
@@ -305,7 +430,12 @@ impl Default for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Activation, Config, GroupMode, HostedConfig};
+    use super::{Activation, Config, GroupMode, HostedConfig, VoterRoster};
+    use crate::NodeId;
+
+    fn roster(ids: &[&str]) -> VoterRoster {
+        VoterRoster::new(ids.iter().map(|id| NodeId::new(*id)))
+    }
 
     /// A group is a plain metadata/membership group unless it is explicitly
     /// opted in — the Eventual contract is the default, in both spellings.
@@ -326,7 +456,7 @@ mod tests {
             lease_ms: 2_000,
         };
         let cfg = Config {
-            mode: GroupMode::Hosted(hosted),
+            mode: GroupMode::Hosted(hosted.clone()),
             ..Config::default()
         };
         assert_eq!(cfg.mode, GroupMode::Hosted(hosted));
@@ -336,6 +466,105 @@ mod tests {
             cfg.detection_window_ms(3),
             Config::default().detection_window_ms(3)
         );
+    }
+
+    /// A Quorum activation rides `GroupMode` exactly as a Settle one does, and
+    /// the two are never equal — the roster is part of the group's identity,
+    /// not a detail hanging off it.
+    #[test]
+    fn quorum_mode_carries_its_roster_and_lease() {
+        let hosted = HostedConfig {
+            activation: Activation::Quorum {
+                voters: roster(&["a", "b", "c"]),
+            },
+            lease_ms: 2_000,
+        };
+        let cfg = Config {
+            mode: GroupMode::Hosted(hosted.clone()),
+            ..Config::default()
+        };
+        assert_eq!(cfg.mode, GroupMode::Hosted(hosted));
+        assert_ne!(
+            cfg.mode,
+            GroupMode::Hosted(HostedConfig {
+                activation: Activation::Settle {
+                    claim_settle_ms: 600
+                },
+                lease_ms: 2_000,
+            })
+        );
+        assert_ne!(
+            cfg.mode,
+            GroupMode::Hosted(HostedConfig {
+                activation: Activation::Quorum {
+                    voters: roster(&["a", "b", "d"]),
+                },
+                lease_ms: 2_000,
+            }),
+            "a different roster is a different mode"
+        );
+    }
+
+    /// The majority table, spelled out: a strict majority, so any two
+    /// majorities of one roster share a voter.
+    #[test]
+    fn majority_is_a_strict_majority_of_the_roster() {
+        let ids = ["a", "b", "c", "d", "e"];
+        for (voters, want) in [(1, 1), (2, 2), (3, 2), (4, 3), (5, 3)] {
+            let roster = roster(&ids[..voters]);
+            assert_eq!(roster.len(), voters);
+            assert!(!roster.is_empty());
+            assert_eq!(roster.majority(), want, "{voters} voters");
+            // Strictly more than half, which is what makes two majorities of
+            // the same roster intersect.
+            assert!(2 * roster.majority() > roster.len());
+        }
+    }
+
+    /// An empty roster asks for one grant it can never collect, so the group
+    /// simply never activates a host. Fail-safe by arithmetic — no panic, and
+    /// emphatically not a zero threshold that would activate on nobody's say-so.
+    #[test]
+    fn an_empty_roster_is_unattainable_rather_than_unanimous() {
+        let empty = roster(&[]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.majority(), 1);
+        assert!(
+            empty.majority() > empty.len(),
+            "an empty roster's majority must be unattainable"
+        );
+        assert!(!empty.contains(&NodeId::new("a")));
+        assert_eq!(empty.iter().count(), 0);
+    }
+
+    /// The roster is canonical: order-insensitive and duplicate-insensitive,
+    /// so every member of a group derives the same roster (and the same
+    /// majority) from the same set of ids however it was written down.
+    #[test]
+    fn a_roster_is_canonical_in_order_and_multiplicity() {
+        let canonical = roster(&["a", "b", "c"]);
+        for spelling in [
+            &["a", "b", "c"][..],
+            &["c", "b", "a"][..],
+            &["b", "a", "c", "b"][..],
+            &["a", "a", "b", "c", "c", "c"][..],
+        ] {
+            let built = roster(spelling);
+            assert_eq!(built, canonical, "{spelling:?} is the same roster");
+            assert_eq!(built.len(), 3, "{spelling:?} names three distinct voters");
+            assert_eq!(built.majority(), 2);
+            assert_eq!(
+                built.iter().cloned().collect::<Vec<_>>(),
+                ["a", "b", "c"].map(NodeId::new).to_vec(),
+                "{spelling:?} iterates in canonical order"
+            );
+        }
+        for id in &canonical {
+            assert!(canonical.contains(id));
+        }
+        assert!(!canonical.contains(&NodeId::new("d")));
+        assert_ne!(canonical, roster(&["a", "b"]));
     }
 
     /// A bigger group means a longer round-robin pass before the detector

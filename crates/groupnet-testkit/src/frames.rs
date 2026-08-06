@@ -6,12 +6,119 @@
 //! runtime into its test graph.
 
 use groupnet_core::{
-    Activation, Config, Effect, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Status, wire,
+    Activation, Config, Effect, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId,
+    RecoveredGrant, Status, Time, VoterRoster, placement, wire,
 };
 
 /// The group every fixture frame and fixture engine belongs to. Tests are
 /// single-group, so one well-known id keeps senders and receivers agreeing.
 pub const TEST_GROUP: &str = "g";
+
+/// [`TEST_GROUP`]'s placement ranking of `ids`, best-ranked first — the same
+/// rendezvous order the derived coordinator, the claim guard, and the
+/// equal-epoch fencing tiebreak all read.
+#[must_use]
+pub fn rank_by_placement(ids: &[&str]) -> Vec<NodeId> {
+    let members: Vec<(NodeId, u32)> = ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
+    placement::owners(TEST_GROUP, &members, ids.len())
+}
+
+/// Teaches `engine` that `peers` exist and are alive, via one digest frame from
+/// the first of them.
+///
+/// # Panics
+/// If `peers` is empty — there would be no plausible sender for the digest.
+pub fn learn_peers(engine: &mut GroupEngine, peers: &[NodeId], now: Time) {
+    let digest = peers
+        .iter()
+        .map(|p| ndigest(p.as_str(), 0, Status::Alive, 0))
+        .collect();
+    let from = peers.first().cloned().expect("at least one peer");
+    engine.on_message(from, &digest_frame(digest, vec![]), now);
+}
+
+/// The election frames `effects` sends, as `(recipient, body)` pairs. Digest
+/// and probe traffic is filtered out — an election assertion reads the election
+/// wire only.
+#[must_use]
+pub fn election_frames(effects: &[Effect]) -> Vec<(NodeId, wire::LeadBody)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send { to, wire } => {
+                let frame = wire::decode(wire)?;
+                frame.lead.map(|body| (to.clone(), body))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The grants `effects` puts on the wire: `(recipient, epoch, claimant,
+/// granter)`.
+#[must_use]
+pub fn grant_frames(effects: &[Effect]) -> Vec<(NodeId, u64, NodeId, NodeId)> {
+    election_frames(effects)
+        .into_iter()
+        .filter_map(|(to, body)| match body {
+            wire::LeadBody::Grant {
+                epoch,
+                claimant,
+                granter,
+            } => Some((to, epoch, claimant, granter)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The claims `effects` puts on the wire: `(recipient, epoch, claimant)`.
+#[must_use]
+pub fn claim_frames(effects: &[Effect]) -> Vec<(NodeId, u64, NodeId)> {
+    election_frames(effects)
+        .into_iter()
+        .filter_map(|(to, body)| match body {
+            wire::LeadBody::Claim { epoch, claimant } => Some((to, epoch, claimant)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The adopted pairs `effects` puts on the wire: `(recipient, epoch, host)`.
+#[must_use]
+pub fn state_frames(effects: &[Effect]) -> Vec<(NodeId, u64, Option<NodeId>)> {
+    election_frames(effects)
+        .into_iter()
+        .filter_map(|(to, body)| match body {
+            wire::LeadBody::State { epoch, host } => Some((to, epoch, host)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The write-ahead grant persists `effects` asks for, in emission order — the
+/// order itself is the [`Effect::PersistGrant`] contract.
+#[must_use]
+pub fn persisted_grants(effects: &[Effect]) -> Vec<(u64, NodeId)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::PersistGrant { epoch, claimant } => Some((*epoch, claimant.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The leadership transitions `effects` announces, in order.
+#[must_use]
+pub fn leadership_changes(effects: &[Effect]) -> Vec<(u64, Option<NodeId>)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::LeadershipChanged { epoch, host } => Some((*epoch, host.clone())),
+            _ => None,
+        })
+        .collect()
+}
 
 /// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`] at the
 /// default [`Config`].
@@ -23,6 +130,36 @@ pub fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
         seeds.iter().map(|s| NodeId::new(*s)),
         Config::default(),
     )
+}
+
+/// The default [`Config`] opted into [`GroupMode::Hosted`] with
+/// [`Activation::Settle`] — what [`hosted_engine`] is built from, exposed so a
+/// test can vary the constructor without re-spelling the mode.
+#[must_use]
+pub fn settle_config(claim_settle_ms: u64, lease_ms: u64) -> Config {
+    Config {
+        mode: GroupMode::Hosted(HostedConfig {
+            activation: Activation::Settle { claim_settle_ms },
+            lease_ms,
+        }),
+        ..Config::default()
+    }
+}
+
+/// The default [`Config`] opted into [`GroupMode::Hosted`] with
+/// [`Activation::Quorum`] over `voters` — what [`hosted_quorum_engine`] is
+/// built from.
+#[must_use]
+pub fn quorum_config(voters: &[&str], lease_ms: u64) -> Config {
+    Config {
+        mode: GroupMode::Hosted(HostedConfig {
+            activation: Activation::Quorum {
+                voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
+            },
+            lease_ms,
+        }),
+        ..Config::default()
+    }
 }
 
 /// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`], opted into
@@ -37,14 +174,80 @@ pub fn hosted_engine(id: &str, seeds: &[&str], claim_settle_ms: u64, lease_ms: u
         GroupId::new(TEST_GROUP),
         NodeId::new(id),
         seeds.iter().map(|s| NodeId::new(*s)),
-        Config {
-            mode: GroupMode::Hosted(HostedConfig {
-                activation: Activation::Settle { claim_settle_ms },
-                lease_ms,
-            }),
-            ..Config::default()
-        },
+        settle_config(claim_settle_ms, lease_ms),
     )
+}
+
+/// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`], built with
+/// [`GroupEngine::with_recovered`] over `config` — the voter-durability
+/// fixture.
+///
+/// Pair it with [`quorum_config`] for the posture `recovered` actually means
+/// something in, and with [`settle_config`] or a plain [`Config::default`] to
+/// pin that it means nothing anywhere else.
+#[must_use]
+pub fn recovered_engine(
+    id: &str,
+    seeds: &[&str],
+    config: Config,
+    recovered: RecoveredGrant,
+) -> GroupEngine {
+    GroupEngine::with_recovered(
+        GroupId::new(TEST_GROUP),
+        NodeId::new(id),
+        seeds.iter().map(|s| NodeId::new(*s)),
+        config,
+        recovered,
+    )
+}
+
+/// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`], opted into
+/// [`GroupMode::Hosted`] with [`Activation::Quorum`] over `voters` — the
+/// CP-activation fixture.
+///
+/// Differs from [`hosted_engine`] by exactly the activation policy, so a test
+/// can hold everything else fixed and vary only the way an epoch is closed.
+/// `lease_ms` is both the lease and — under Quorum — the claim window, the boot
+/// guard, and the post-boot **grant blackout**, which is why there is no
+/// separate settle knob here. A test that wants a voter able to grant from the
+/// first instant builds it through [`recovered_engine`] with
+/// [`RecoveredGrant::none`] instead.
+#[must_use]
+pub fn hosted_quorum_engine(
+    id: &str,
+    seeds: &[&str],
+    voters: &[&str],
+    lease_ms: u64,
+) -> GroupEngine {
+    GroupEngine::new(
+        GroupId::new(TEST_GROUP),
+        NodeId::new(id),
+        seeds.iter().map(|s| NodeId::new(*s)),
+        quorum_config(voters, lease_ms),
+    )
+}
+
+/// A **started** [`hosted_quorum_engine`] for `id` over the roster `voters`,
+/// already knowing `peers` as live members — the fixture every Quorum suite
+/// opens with.
+///
+/// Started at [`Time::ZERO`], so the boot guard and the grant blackout both
+/// lapse at `lease_ms`: a test that wants either of them spent ticks at or
+/// past that instant, and one that wants them standing ticks before it.
+#[must_use]
+pub fn quorum_voter_engine(
+    id: &NodeId,
+    peers: &[NodeId],
+    voters: &[NodeId],
+    lease_ms: u64,
+) -> GroupEngine {
+    let ids: Vec<&str> = voters.iter().map(NodeId::as_str).collect();
+    let mut engine = hosted_quorum_engine(id.as_str(), &[], &ids, lease_ms);
+    if !peers.is_empty() {
+        learn_peers(&mut engine, peers, Time::ZERO);
+    }
+    engine.start(Time::ZERO);
+    engine
 }
 
 /// The member summaries listed across all digest frames in `effects`.

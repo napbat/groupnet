@@ -5,7 +5,7 @@ use crate::rng::SplitMix64;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use groupnet_core::{Command, Effect, GroupEngine, NodeId, Role, Status, Time};
+use groupnet_core::{Command, Effect, GroupEngine, NodeId, Role, Status, Time, wire};
 
 /// One scheduled future event in the simulation.
 struct Event {
@@ -75,6 +75,19 @@ pub struct Simulation {
     /// How many delivered frames carried an election kind. See
     /// [`election_frames_seen`](Self::election_frames_seen).
     election_frames: u64,
+    /// The **durable** voter ledger this sim keeps on each node's behalf,
+    /// written from [`Effect::PersistGrant`] — the store a driver with voter
+    /// durability would provide. Keyed by granter, and deliberately *not* held
+    /// inside the engine, so it survives [`crash`](Self::crash) and can be fed
+    /// back through
+    /// [`GroupEngine::with_recovered`](groupnet_core::GroupEngine::with_recovered).
+    persisted_grants: BTreeMap<NodeId, (u64, NodeId)>,
+    /// Every grant frame this sim has seen **issued** — `(when, granter,
+    /// epoch, claimant)`, appended at dispatch rather than at delivery, so a
+    /// grant that is lost or partitioned away still appears here. That is what
+    /// makes it usable as the one-grant-per-epoch-per-voter probe: the property
+    /// is about what a voter *said*, not about what anyone heard.
+    pub grant_log: Vec<(Time, NodeId, u64, NodeId)>,
 }
 
 /// Whether an encoded frame's kind tag names an election frame — wire kinds
@@ -114,6 +127,8 @@ impl Simulation {
             coordinator_log: Vec::new(),
             leadership_log: Vec::new(),
             election_frames: 0,
+            persisted_grants: BTreeMap::new(),
+            grant_log: Vec::new(),
         }
     }
 
@@ -230,6 +245,18 @@ impl Simulation {
     #[must_use]
     pub fn election_frames_seen(&self) -> u64 {
         self.election_frames
+    }
+
+    /// The `(epoch, claimant)` pair `node` has durably granted as a voter, as
+    /// the sim's stand-in store recorded it from
+    /// [`Effect::PersistGrant`](groupnet_core::Effect::PersistGrant).
+    ///
+    /// Survives [`crash`](Self::crash) — that is the whole point of it — so a
+    /// restart test reads it here and hands it back through
+    /// [`GroupEngine::with_recovered`](groupnet_core::GroupEngine::with_recovered).
+    #[must_use]
+    pub fn persisted_grant_of(&self, node: &NodeId) -> Option<(u64, NodeId)> {
+        self.persisted_grants.get(node).cloned()
     }
 
     /// The coordinator a given node currently believes in.
@@ -450,6 +477,7 @@ impl Simulation {
             match effect {
                 Effect::Send { to, wire } => {
                     self.max_frame_bytes = self.max_frame_bytes.max(wire.len());
+                    self.log_if_grant(node, &wire);
                     // Deterministic per-message jitter keyed on the sequence number
                     // this delivery is about to take, so links can reorder.
                     let extra = if self.jitter_ms == 0 {
@@ -481,10 +509,38 @@ impl Simulation {
                 Effect::LeadershipChanged { epoch, host } => {
                     self.leadership_log.push((node.clone(), epoch, host));
                 }
+                Effect::PersistGrant { epoch, claimant } => {
+                    // The store a durable voter would have. Written before the
+                    // grant frame is dispatched, because the effect precedes
+                    // the `Send` in the batch — which is the whole contract.
+                    self.persisted_grants
+                        .insert(node.clone(), (epoch, claimant));
+                }
                 Effect::MembershipChanged
                 | Effect::NodeStateChanged { .. }
                 | Effect::MetadataChanged { .. } => {}
             }
+        }
+    }
+
+    /// Appends to [`grant_log`](Self::grant_log) if `wire` is a grant frame,
+    /// reading the body off the encoded frame rather than the effect: issuance
+    /// is a wire fact.
+    ///
+    /// Every dispatched frame is decoded to find out — the codec is the only
+    /// authority on what a frame is, and a byte-offset pre-filter would be a
+    /// second, silently drifting copy of the wire format. The cost is test-only
+    /// and lands on a path that has already allocated the encoded frame.
+    fn log_if_grant(&mut self, granter: &NodeId, wire: &[u8]) {
+        let Some(frame) = wire::decode(wire) else {
+            return;
+        };
+        if let Some(wire::LeadBody::Grant {
+            epoch, claimant, ..
+        }) = frame.lead
+        {
+            self.grant_log
+                .push((self.now, granter.clone(), epoch, claimant));
         }
     }
 

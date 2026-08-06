@@ -2,16 +2,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId};
+use groupnet_core::{
+    Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, RecoveredGrant,
+};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
 use crate::driver::{
-    EVENTS_CAPACITY, Event, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers,
+    EVENTS_CAPACITY, Event, GroupTask, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers,
     group_task, statuses_snapshot,
 };
 use crate::group::{Group, Leadership};
 use crate::routing::Routing;
+use crate::store::{GrantStore, VoterStorage};
 use tokio::sync::broadcast;
 
 /// The reserved group every node joins to disseminate the inter-group routing
@@ -44,9 +47,18 @@ pub(crate) const ROUTING_GROUP: &str = "__groupnet_routing__";
 /// # let _ = shard;
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// A `Quorum` group additionally carries the **voter storage** the driver
+/// honours [`Effect::PersistGrant`](groupnet_core::Effect::PersistGrant)
+/// through — see [`with_voter_storage`](Self::with_voter_storage). It is not
+/// part of a profile's identity (two profiles differing only in which file
+/// their store writes to describe the same group), which is why this type
+/// carries no `PartialEq`.
+#[derive(Clone, Debug)]
 pub struct GroupProfile {
     mode: GroupMode,
+    /// Voter durability, `None` for the blackout posture.
+    storage: Option<VoterStorage>,
 }
 
 impl GroupProfile {
@@ -58,6 +70,7 @@ impl GroupProfile {
     pub const fn eventual() -> Self {
         Self {
             mode: GroupMode::Eventual,
+            storage: None,
         }
     }
 
@@ -72,13 +85,85 @@ impl GroupProfile {
     pub const fn hosted(config: HostedConfig) -> Self {
         Self {
             mode: GroupMode::Hosted(config),
+            storage: None,
         }
+    }
+
+    /// Gives this group's **voter ledger** durability: what storage says was
+    /// granted before this process started, and where to write what it grants
+    /// next.
+    ///
+    /// Only a [`Quorum`](groupnet_core::Activation::Quorum) group has a ledger,
+    /// and only a node named in its roster ever writes to one. Setting this on
+    /// any other profile is legal and inert — the store is simply never called,
+    /// and `recovered` is ignored rather than half-applied (which is what makes
+    /// it safe to configure uniformly across a fleet whose groups differ).
+    ///
+    /// # What it buys, and what it does not
+    ///
+    /// Without it, a Quorum voter falls back on the engine's **boot blackout**:
+    /// it refuses every new claimant for one `lease_ms` after start, on the
+    /// argument that any grant it made before the crash has expired by then.
+    /// That is a timing rule standing in for a durability one. With it, the
+    /// granted pair is a floor that survives the restart outright — this voter
+    /// can never grant that epoch to a second claimant however long it was
+    /// down — and the claimant named in it may be re-granted **immediately**,
+    /// so a restarted voter stops starving the sitting host for a lease.
+    ///
+    /// What it does not buy is a shorter blackout for anyone *else*: recovery
+    /// restores the pair, never the instant it was granted at, so a recovered
+    /// voter still applies the boot-anchored window to every new claimant. See
+    /// [`RecoveredGrant`] for that argument in full, and in particular for why
+    /// [`RecoveredGrant::none`] is the one statement that lifts the blackout —
+    /// and may only be made by a driver that really did persist every grant.
+    ///
+    /// # Load recovery *before* joining
+    ///
+    /// `recovered` is a value, not a callback, because the join path is
+    /// synchronous and spawns the group actor under the node's group-table
+    /// lock: it can await nothing and must touch no disk. Read the store, then
+    /// join.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use groupnet_core::{Activation, HostedConfig, RecoveredGrant, VoterRoster};
+    /// # use groupnet_runtime::{GrantStore, GroupProfile};
+    /// # fn demo<T: groupnet_transport::Transport>(
+    /// #     node: &groupnet_runtime::Node<T>,
+    /// #     store: Arc<dyn GrantStore>,
+    /// #     recovered: RecoveredGrant,
+    /// #     voters: VoterRoster,
+    /// # ) {
+    /// // `recovered` was read off `store` before this call — no I/O happens
+    /// // inside the join.
+    /// let shard = node.join_group_with(
+    ///     "shard-7",
+    ///     GroupProfile::hosted(HostedConfig {
+    ///         activation: Activation::Quorum { voters },
+    ///         lease_ms: 2_000,
+    ///     })
+    ///     .with_voter_storage(recovered, store),
+    /// );
+    /// # let _ = shard;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_voter_storage(
+        mut self,
+        recovered: RecoveredGrant,
+        store: Arc<dyn GrantStore>,
+    ) -> Self {
+        self.storage = Some(VoterStorage { recovered, store });
+        self
     }
 
     /// The profile a bare [`Node::join_group`] joins under: whatever the
     /// node's own [`Config::mode`] says.
     const fn from_mode(mode: GroupMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            storage: None,
+        }
     }
 }
 
@@ -148,7 +233,10 @@ impl<T: Transport> Node<T> {
     /// # Panics
     /// If the internal group table was poisoned by a panic in another thread.
     pub fn join_group(&self, group: impl Into<GroupId>) -> Group {
-        self.join_group_with(group, GroupProfile::from_mode(self.inner.config.mode))
+        self.join_group_with(
+            group,
+            GroupProfile::from_mode(self.inner.config.mode.clone()),
+        )
     }
 
     /// Joins `group` under an explicit [`GroupProfile`] — the per-group
@@ -249,8 +337,13 @@ impl<T: Transport> Node<T> {
     ///
     /// `routing` is the routing group's command channel (so this group can
     /// publish its coordinator), or `None` for the routing group itself.
-    /// `profile` decides this group's mode; every other tunable comes from the
-    /// node's config.
+    /// `profile` decides this group's mode **and its voter storage**; every
+    /// other tunable comes from the node's config.
+    ///
+    /// The voter ledger is *recovered*, never *read*, here: the caller loaded
+    /// it before joining (see
+    /// [`GroupProfile::with_voter_storage`]), so this stays a pure,
+    /// non-awaiting function that the routes lock may safely be held across.
     fn spawn_group(
         &self,
         group: GroupId,
@@ -281,12 +374,32 @@ impl<T: Transport> Node<T> {
             profile.mode
         };
 
-        let engine = GroupEngine::new(
-            group.clone(),
-            self.inner.id.clone(),
-            self.inner.seeds.iter().cloned(),
-            config.clone(),
-        );
+        // A profile carrying voter storage builds the engine through
+        // `with_recovered`, so the ledger is a floor from the first tick rather
+        // than something applied after the boot blackout has already been
+        // armed. Outside `Activation::Quorum` the two constructors are the same
+        // engine — a group with no voter ledger has nothing to restore.
+        let (engine, store) = match profile.storage {
+            Some(storage) => (
+                GroupEngine::with_recovered(
+                    group.clone(),
+                    self.inner.id.clone(),
+                    self.inner.seeds.iter().cloned(),
+                    config.clone(),
+                    storage.recovered,
+                ),
+                Some(storage.store),
+            ),
+            None => (
+                GroupEngine::new(
+                    group.clone(),
+                    self.inner.id.clone(),
+                    self.inner.seeds.iter().cloned(),
+                    config.clone(),
+                ),
+                None,
+            ),
+        };
 
         // Seed the readable views from the engine's current truth. The engine
         // only emits change effects on an actual change, so a node that is (and
@@ -309,11 +422,11 @@ impl<T: Transport> Node<T> {
             .min(config.probe_interval_ms)
             .min(config.probe_timeout_ms);
         let tick_period = Duration::from_millis((tightest_deadline_ms / TICKS_PER_DEADLINE).max(1));
-        tokio::spawn(group_task(
+        tokio::spawn(group_task(GroupTask {
             engine,
-            rx,
-            self.inner.transport.clone(),
-            Publishers {
+            inbox: rx,
+            transport: self.inner.transport.clone(),
+            publishers: Publishers {
                 coordinator: coord_tx,
                 leadership: lead_tx,
                 metadata: meta_tx,
@@ -324,9 +437,10 @@ impl<T: Transport> Node<T> {
                 events: events_tx.clone(),
             },
             routing,
-            self.inner.start,
+            store,
+            start: self.inner.start,
             tick_period,
-        ));
+        }));
 
         Group::new(
             group,
@@ -476,7 +590,7 @@ impl<T: Transport> NodeBuilder<T> {
         let routing_group = node.get_or_spawn(
             GroupId::new(ROUTING_GROUP),
             None,
-            GroupProfile::from_mode(node.inner.config.mode),
+            GroupProfile::from_mode(node.inner.config.mode.clone()),
         );
         if let Some(addr) = advertise {
             let _ = routing_group.set_entry("~addr", addr.into_bytes(), None);

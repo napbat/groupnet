@@ -20,10 +20,11 @@
 //!   each side counted only the members it could see, so each derived the same
 //!   `highest_seen + 1`. The unit that names a serializer is therefore the
 //!   pair `(epoch, host)`, and the fencing order is a total order over pairs:
-//!   epoch-major, and at equal epochs the [`placement::owner`] of the group id
-//!   among the two hosts wins. That tiebreak reads nothing but the group id
-//!   and the two host ids, so it is view-independent: every node, on either
-//!   side of a heal, picks the same survivor without exchanging anything.
+//!   epoch-major, and at equal epochs the [`owner`](crate::placement::owner) of
+//!   the group id among the two hosts wins. That tiebreak reads nothing but the
+//!   group id and the two host ids, so it is view-independent: every node, on
+//!   either side of a heal, picks the same survivor without exchanging
+//!   anything.
 //! * **Fencing, not prevention.** A deposed host stops being believed the
 //!   moment any peer holds a higher pair and teaches it back — but a client
 //!   talking to a not-yet-deposed host during the detection window can still
@@ -63,44 +64,60 @@
 //!   with — arrive with `Activation::Quorum` (M3), where persistence is a
 //!   safety requirement rather than a nicety.
 //!
+//! # `Quorum` activation: the same skeleton, a different closing rule
+//!
+//! [`Activation::Quorum`] shares every row above — the claim guard, the fencing
+//! order, adoption, row 12b, the repair beacon, the lease and its step-down —
+//! and replaces exactly one thing: what closes an epoch. A `Settle` claim
+//! activates because its window shut with the claim still standing; a `Quorum`
+//! claim activates because a majority of a **static voter roster** granted it,
+//! and expires silently if the window shuts first. The grant ledger, the round
+//! tally, the claimant's self-grant and its per-tick retry (row Q4b), the
+//! host's renewal round and the voter durability rules all live in
+//! [`quorum`](self::quorum), which is where the `Q`-rows are documented; the
+//! rows here call into it at the points those rows name and are otherwise
+//! untouched.
+//!
+//! # Layout
+//!
+//! This file is the [`GroupEngine`] rows and the frame dispatch that routes to
+//! them. The two pieces that are pure functions rather than state transitions
+//! live beside it: [`order`] holds [`Role`], the fencing order over
+//! `(epoch, host)` pairs and row 1's claim guard (each tabulated exhaustively by
+//! its own tests), and [`quorum`] holds everything the `Q`-rows add.
+//!
+//! [`Activation::Quorum`]: crate::Activation::Quorum
 //! [`Config::mode`]: crate::Config::mode
 //! [`GroupMode::Hosted`]: crate::GroupMode::Hosted
 //! [`Eventual`]: crate::GroupMode::Eventual
 //! [`coordinator`]: crate::GroupEngine::coordinator
 //! [`LeadershipChanged`]: crate::Effect::LeadershipChanged
 
+mod order;
+mod quorum;
+
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 
 use crate::config::{Activation, HostedConfig};
 use crate::membership::{Member, Status};
-use crate::{NodeId, Time, placement, wire};
+use crate::{NodeId, Time, wire};
 
 use super::effect::Effect;
 use super::state::GroupEngine;
+use order::{ClaimGuard, cmp_pair};
+use quorum::QuorumState;
 
-/// What part the local node is playing in its group's election right now.
-///
-/// Always [`Follower`](Role::Follower) in an
-/// [`Eventual`](crate::GroupMode::Eventual) group, which runs no election.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
-    /// Neither claiming nor hosting: following whatever pair this node has
-    /// adopted (which may be no host at all).
-    Follower,
-    /// A claim of this node's own is standing, waiting out its settle window.
-    Claimant,
-    /// This node activated its claim and holds the group for the adopted
-    /// epoch, until its lease lapses or a higher pair fences it.
-    Host,
-}
+pub use order::Role;
+pub use quorum::RecoveredGrant;
 
 /// A standing bid for an epoch: what row 1 opens and row 4 closes.
 #[derive(Clone, Copy, Debug)]
 struct Claim {
     /// The epoch being claimed (`highest_seen + 1` at the moment of the bid).
     epoch: u64,
-    /// When the claim activates if nothing has outranked it by then.
+    /// When the claim's window closes: under an activation that closes an
+    /// epoch on the window alone, when it activates if nothing has outranked
+    /// it by then — see [`Election::closes_on_window`].
     settle_at: Time,
 }
 
@@ -128,8 +145,9 @@ pub(super) struct Election {
     /// only while [`Role::Host`].
     lease_until: Time,
     /// The boot guard: no claim before this instant. Set in
-    /// [`GroupEngine::start`] to one settle window out, so a node that has
-    /// just joined hears the incumbent's state before deciding the group is
+    /// [`GroupEngine::start`] to one [activation
+    /// window](Election::activation_window_ms) out, so a node that has just
+    /// joined hears the incumbent's state before deciding the group is
     /// vacant.
     no_claim_before: Time,
     /// Row 7's rotation over the dissemination targets — the beacon's **own**
@@ -142,10 +160,15 @@ pub(super) struct Election {
     /// peers forever. The peers outside it never hear the adopted pair again
     /// — which is precisely the node that missed the election.
     beacon_cursor: usize,
+    /// The grant ledger and round tally — `Some` exactly under
+    /// [`Activation::Quorum`], so a `Settle` group cannot represent a grant at
+    /// all. See [`quorum`](self::quorum).
+    quorum: Option<QuorumState>,
 }
 
 impl Election {
     pub(super) fn new(cfg: HostedConfig) -> Self {
+        let quorum = QuorumState::for_activation(&cfg.activation);
         Self {
             cfg,
             role: Role::Follower,
@@ -156,15 +179,28 @@ impl Election {
             lease_until: Time::ZERO,
             no_claim_before: Time::ZERO,
             beacon_cursor: 0,
+            quorum,
         }
     }
 
-    /// The configured settle window. A `match` rather than a destructuring
-    /// `let` so a future activation policy fails to compile here instead of
-    /// silently inheriting Settle's timing.
-    const fn settle_ms(&self) -> u64 {
-        match self.cfg.activation {
-            Activation::Settle { claim_settle_ms } => claim_settle_ms,
+    /// How long this activation's claim window is — the boot guard, and the
+    /// span a claim must stand before its window closes. A `match` rather than
+    /// a destructuring `let` so a future activation policy fails to compile
+    /// here instead of silently inheriting another's timing.
+    ///
+    /// Under [`Activation::Quorum`] the claim window and the boot guard are
+    /// one **lease**, deliberately: the two only need to be long enough that a
+    /// claim gets a fair chance to be answered and that a joining node hears
+    /// an incumbent out first, and the lease is already sized for exactly that
+    /// (it is the number that bounds split-brain, so it comfortably exceeds a
+    /// round-trip and the driver's tick). Nothing about Quorum's safety
+    /// depends on this number: an epoch is closed by a majority of grants, not
+    /// by the passage of time, so a window that is too short or too long costs
+    /// election latency and nothing else.
+    fn activation_window_ms(&self) -> u64 {
+        match &self.cfg.activation {
+            Activation::Settle { claim_settle_ms } => *claim_settle_ms,
+            Activation::Quorum { .. } => self.cfg.lease_ms,
         }
     }
 
@@ -179,66 +215,6 @@ impl Election {
             Role::Host => Some(self.lease_until),
             Role::Follower => None,
         }
-    }
-}
-
-/// The fencing order over `(epoch, host)` pairs, as a total order.
-///
-/// Epoch-major; at equal epochs a `None` host sorts below any `Some` (a
-/// hostless belief never displaces a live one), and two named hosts are
-/// separated by the [`placement::owner`] of `group` among just those two.
-/// That tiebreak is a pure function of the group id and the two ids, so it is
-/// view-independent: every node agrees on it, whatever it believes about
-/// membership.
-fn cmp_pair(group: &str, a: (u64, Option<&NodeId>), b: (u64, Option<&NodeId>)) -> Ordering {
-    match a.0.cmp(&b.0) {
-        Ordering::Equal => {}
-        by_epoch => return by_epoch,
-    }
-    match (a.1, b.1) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(x), Some(y)) if x == y => Ordering::Equal,
-        (Some(x), Some(y)) => {
-            let pair: BTreeSet<NodeId> = [x.clone(), y.clone()].into_iter().collect();
-            if placement::owner(group, &pair).as_ref() == Some(x) {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-    }
-}
-
-/// Everything row 1's claim guard reads, gathered so the rule itself is one
-/// auditable expression rather than a condition smeared across a function.
-#[derive(Clone, Copy, Debug)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "this type IS the guard's truth table — four independent vetoes, each \
-              enumerated by the unit test. Two-variant enums would say the same thing \
-              at four times the length and make the table unreadable."
-)]
-struct ClaimGuard {
-    /// This node has voluntarily left.
-    leaving: bool,
-    /// The boot guard has elapsed.
-    past_boot_guard: bool,
-    /// This node is the group's top-ranked live candidate.
-    top_ranked: bool,
-    /// The adopted pair already names this node as host.
-    adopted_host_is_self: bool,
-}
-
-impl ClaimGuard {
-    /// Whether a claim may be opened: only by a top-ranked live candidate that
-    /// has not left, is past its boot guard, and does not already believe
-    /// *itself* to be the adopted host — that belief is entered only by
-    /// activating, and re-claiming on top of it would churn the epoch for
-    /// nothing.
-    const fn opens(self) -> bool {
-        !self.leaving && self.past_boot_guard && self.top_ranked && !self.adopted_host_is_self
     }
 }
 
@@ -298,9 +274,14 @@ impl GroupEngine {
     /// Arms the boot guard: a freshly started node may not claim for one
     /// settle window, so it hears an incumbent's [`wire::Kind::LeadState`]
     /// before concluding the group is vacant. No-op in `Eventual`.
+    ///
+    /// Under `Quorum` this also arms the **boot blackout** — a freshly started
+    /// voter refuses new claimants for one lease, which is what stands in for a
+    /// persisted grant when the driver has no store.
     pub(super) fn election_start(&mut self, now: Time) {
         if let Some(el) = self.election.as_mut() {
-            el.no_claim_before = now.saturating_add(el.settle_ms());
+            el.no_claim_before = now.saturating_add(el.activation_window_ms());
+            el.quorum_start(now);
         }
     }
 
@@ -334,15 +315,26 @@ impl GroupEngine {
             return Vec::new();
         }
         let epoch = el.highest_seen.saturating_add(1);
-        let settle_at = now.saturating_add(el.settle_ms());
+        let settle_at = now.saturating_add(el.activation_window_ms());
         if let Some(el) = self.election.as_mut() {
             el.highest_seen = epoch;
             el.claim = Some(Claim { epoch, settle_at });
             el.role = Role::Claimant;
         }
         // A claim changes nobody's belief — not even ours — so it emits no
-        // effect beyond the frames themselves.
-        self.broadcast_claim(epoch)
+        // effect beyond the frames themselves. Row Q4: under Quorum the claim
+        // also opens a grant round, and this node's own grant (if it votes) is
+        // written down *before* the claim reaches the wire.
+        let mut effects = self.quorum_open_round(epoch, now);
+        // A roster of one is closed by that self-grant alone, so the round can
+        // be over before the claim is sent — and a bid for an epoch this node
+        // has already activated is pure noise. Under `Settle` and under every
+        // larger roster the role here is still Claimant, so the broadcast is
+        // unchanged.
+        if self.role() == Role::Claimant {
+            effects.extend(self.broadcast_claim(epoch));
+        }
+        effects
     }
 
     /// Rows 2, 3 and 4: abandon on lost rank, activate when the window
@@ -358,23 +350,51 @@ impl GroupEngine {
             self.abandon_claim();
             return Vec::new();
         }
-        // Row 4: the window closed with the claim still standing.
         if now >= claim.settle_at {
-            return self.activate(claim.epoch, now);
+            // Row Q6: a Quorum window that shut without a majority of grants
+            // abandons silently — a claim that never activated changed nobody's
+            // belief, so there is nothing to announce. The guard re-fires on the
+            // next tick and bids one above the epoch just spent.
+            if self.is_quorum() {
+                self.abandon_claim();
+                return Vec::new();
+            }
+            // Row 4: under Settle the window closing with the claim still
+            // standing *is* the rule that closes the epoch.
+            let lease_ms = self.election.as_ref().map_or(0, |el| el.cfg.lease_ms);
+            return self.activate(claim.epoch, now.saturating_add(lease_ms));
+        }
+        // Row Q4b: this node's own grant is re-attempted every tick the round
+        // is still open, because the verdict on it flips with time — a
+        // successor claiming the instant it buried the dead host is normally
+        // still inside its own promise to that host, and Q3 refuses it. Row 3
+        // below re-asks the peers; without this nothing ever re-asks us, and a
+        // round needing our own vote burns the whole window. A no-op under
+        // `Settle` (which has no ledger) and once we are counted.
+        let mut effects = self.quorum_retry_self_grant(claim.epoch, now);
+        if self.role() != Role::Claimant {
+            // The retry closed the round: we are the host now, and the claim
+            // the re-offer below would carry no longer exists.
+            return effects;
         }
         // Row 3: a claim lost to a dropped frame is re-offered each round.
         if anti_entropy_due {
-            return self.broadcast_claim(claim.epoch);
+            effects.extend(self.broadcast_claim(claim.epoch));
         }
-        Vec::new()
+        effects
     }
 
     /// Rows 5, 6 and 7: renew while still top-ranked, self-demote once the
     /// lease lapses, and beacon the adopted pair on the gossip cadence.
     fn tick_host(&mut self, now: Time, anti_entropy_due: bool) -> Vec<Effect> {
         let lease_ms = self.election.as_ref().map_or(0, |el| el.cfg.lease_ms);
-        // Row 5: renewal is a tick-re-rank — our own view is the evidence.
-        if self.is_coordinator() {
+        // Row 5: under Settle, renewal is a tick-re-rank — our own view is the
+        // evidence. Under Quorum it is not evidence of anything: the lease is
+        // extended only by a fresh majority of grants (row Q8), so a host cut
+        // off from its voters lapses however top-ranked it still looks to
+        // itself. That is the minority side being starved of a host, which is
+        // the whole point of the CP posture.
+        if self.is_coordinator() && !self.is_quorum() {
             if let Some(el) = self.election.as_mut() {
                 el.lease_until = now.saturating_add(lease_ms);
             }
@@ -388,18 +408,22 @@ impl GroupEngine {
         {
             return self.demote_host();
         }
-        // Row 7: repair beacon, so a node that missed the election converges.
         if !anti_entropy_due {
             return Vec::new();
         }
+        // Row Q7: the Quorum renewal round — a no-op under Settle, whose
+        // renewal was the re-rank above.
+        let mut effects = self.renewal_round(now);
+        // Row 7: repair beacon, so a node that missed the election converges.
         let targets = self.beacon_targets();
-        let Some(body) = self.state_body() else {
-            return Vec::new();
-        };
-        targets
-            .into_iter()
-            .map(|to| self.send_lead(to, body.clone()))
-            .collect()
+        if let Some(body) = self.state_body() {
+            effects.extend(
+                targets
+                    .into_iter()
+                    .map(|to| self.send_lead(to, body.clone())),
+            );
+        }
+        effects
     }
 
     /// Row 7's targets: `anti_entropy_fanout` dissemination targets, rotated on
@@ -425,16 +449,20 @@ impl GroupEngine {
     }
 
     /// Row 4's activation: take the epoch, arm the lease, tell the world.
-    fn activate(&mut self, epoch: u64, now: Time) -> Vec<Effect> {
+    ///
+    /// `lease_until` is passed rather than derived, because the two activations
+    /// anchor it differently: Settle's row 4 from the instant the window shut,
+    /// Quorum's row Q4 from the instant the claim was *sent* (see
+    /// [`quorum`](self::quorum) for why that difference is load-bearing).
+    fn activate(&mut self, epoch: u64, lease_until: Time) -> Vec<Effect> {
         let local = self.local.clone();
-        let lease_ms = self.election.as_ref().map_or(0, |el| el.cfg.lease_ms);
         if let Some(el) = self.election.as_mut() {
             el.role = Role::Host;
             el.claim = None;
             el.epoch = epoch;
             el.host = Some(local.clone());
             el.highest_seen = el.highest_seen.max(epoch);
-            el.lease_until = now.saturating_add(lease_ms);
+            el.lease_until = lease_until;
         }
         let mut effects = vec![Effect::LeadershipChanged {
             epoch,
@@ -493,10 +521,16 @@ impl GroupEngine {
             Some(wire::LeadBody::State { epoch, host }) => {
                 self.on_lead_state(from, *epoch, host.as_ref())
             }
-            // Row 14: a grant is meaningless under Settle activation — an
-            // epoch is closed by the settle window, not by endorsements.
-            // Reserved for `Activation::Quorum` (M3), which tallies them.
-            Some(wire::LeadBody::Grant { .. }) | None => Vec::new(),
+            // Row 14 / rows Q4, Q5, Q8: a grant is meaningless under Settle
+            // activation — an epoch is closed there by the settle window, not
+            // by endorsements — and is dropped. `Activation::Quorum` is the
+            // policy that tallies them.
+            Some(wire::LeadBody::Grant {
+                epoch,
+                claimant,
+                granter,
+            }) => self.on_lead_grant(*epoch, claimant, granter),
+            None => Vec::new(),
         }
     }
 
@@ -527,15 +561,28 @@ impl GroupEngine {
         // hostless-recovery bid, and it is how a group with no host gets one
         // again. At equal epochs an adopted *host* is still taught back — the
         // claimant is bidding for an epoch already awarded.
+        //
+        // Row Q9a carves one case out of that, under Quorum only: a claim at
+        // exactly our adopted epoch whose claimant *is* our adopted host is
+        // that host renewing, not a stale bid, and teaching it the pair it is
+        // renewing would be both noise and a lie. Voters answer it with a
+        // re-grant (row Q2) instead.
         let stale = self
             .election
             .as_ref()
-            .is_some_and(|el| epoch < el.epoch || (epoch == el.epoch && el.host.is_some()));
+            .is_some_and(|el| epoch < el.epoch || (epoch == el.epoch && el.host.is_some()))
+            && !self.claim_is_renewal(epoch, claimant);
         if stale {
             if let Some(body) = self.state_body() {
                 effects.push(self.send_lead(from.clone(), body));
             }
         }
+
+        // Rows Q1–Q3: the voter's answer. Silent unless this node is in the
+        // roster of a Quorum group — and silent then too, whenever the ledger
+        // refuses. Ordered after row 9 so a repair and a grant can ride the
+        // same batch without either reordering the other.
+        effects.extend(self.on_claim_as_voter(epoch, claimant, now));
 
         // Row 10: a claim that outranks ours ends ours. Both sides apply the
         // same pair order, so exactly one of two duelling claimants yields.
@@ -676,13 +723,14 @@ impl GroupEngine {
     }
 
     /// A claim to every live member (a `Dead` tombstone is not told; it is not
-    /// going to answer, and rank does not count it).
+    /// going to answer, and rank does not count it) — plus, under Quorum, every
+    /// voter, live or not: see [`claim_targets`](Self::claim_targets).
     fn broadcast_claim(&self, epoch: u64) -> Vec<Effect> {
         let body = wire::LeadBody::Claim {
             epoch,
             claimant: self.local.clone(),
         };
-        self.live_peers()
+        self.claim_targets()
             .into_iter()
             .map(|to| self.send_lead(to, body.clone()))
             .collect()
@@ -725,144 +773,5 @@ impl GroupEngine {
                 lead: Some(body),
             }),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ClaimGuard, Ordering, cmp_pair};
-    use crate::{NodeId, placement};
-    use std::collections::BTreeSet;
-
-    const GROUP: &str = "g";
-
-    fn n(id: &str) -> NodeId {
-        NodeId::new(id)
-    }
-
-    /// The two ids of a pair, ranked: the one `placement::owner` picks for the
-    /// group first. This is exactly the tiebreak `cmp_pair` applies.
-    fn ranked_pair(a: &str, b: &str) -> (NodeId, NodeId) {
-        let (a, b) = (n(a), n(b));
-        let set: BTreeSet<NodeId> = [a.clone(), b.clone()].into_iter().collect();
-        let winner = placement::owner(GROUP, &set).expect("two candidates");
-        let loser = if winner == a { b } else { a };
-        (winner, loser)
-    }
-
-    /// Epoch dominates the host entirely: a higher epoch wins even when the
-    /// host it names would lose the equal-epoch tiebreak, and even when it
-    /// names no host at all.
-    #[test]
-    fn the_order_is_epoch_major() {
-        let (winner, loser) = ranked_pair("x", "y");
-        assert_eq!(
-            cmp_pair(GROUP, (8, Some(&loser)), (7, Some(&winner))),
-            Ordering::Greater
-        );
-        assert_eq!(
-            cmp_pair(GROUP, (8, None), (7, Some(&winner))),
-            Ordering::Greater
-        );
-        assert_eq!(
-            cmp_pair(GROUP, (7, Some(&winner)), (8, Some(&loser))),
-            Ordering::Less
-        );
-    }
-
-    /// At equal epochs the placement owner of the group among the two hosts
-    /// wins — the view-independent tiebreak that lets both sides of a heal
-    /// agree without exchanging anything.
-    #[test]
-    fn equal_epochs_break_by_placement_owner() {
-        let (winner, loser) = ranked_pair("x", "y");
-        assert_eq!(
-            cmp_pair(GROUP, (7, Some(&winner)), (7, Some(&loser))),
-            Ordering::Greater
-        );
-        assert_eq!(
-            cmp_pair(GROUP, (7, Some(&loser)), (7, Some(&winner))),
-            Ordering::Less
-        );
-        assert_eq!(
-            cmp_pair(GROUP, (7, Some(&winner)), (7, Some(&winner))),
-            Ordering::Equal
-        );
-    }
-
-    /// A hostless belief never displaces a live one at the same epoch, and two
-    /// hostless beliefs are indistinguishable.
-    #[test]
-    fn none_sorts_below_some_at_equal_epoch() {
-        let host = n("x");
-        assert_eq!(cmp_pair(GROUP, (7, None), (7, Some(&host))), Ordering::Less);
-        assert_eq!(
-            cmp_pair(GROUP, (7, Some(&host)), (7, None)),
-            Ordering::Greater
-        );
-        assert_eq!(cmp_pair(GROUP, (7, None), (7, None)), Ordering::Equal);
-    }
-
-    /// The order really is a total order over a spread of pairs: antisymmetric
-    /// and transitive. Anything less and two nodes could disagree about which
-    /// of two pairs survives a heal.
-    #[test]
-    fn the_order_is_total_and_transitive() {
-        let ids: Vec<Option<NodeId>> = [None, Some(n("x")), Some(n("y")), Some(n("z"))].into();
-        let pairs: Vec<(u64, Option<&NodeId>)> = (6u64..=8)
-            .flat_map(|e| ids.iter().map(move |h| (e, h.as_ref())))
-            .collect();
-        for a in &pairs {
-            for b in &pairs {
-                assert_eq!(
-                    cmp_pair(GROUP, *a, *b).reverse(),
-                    cmp_pair(GROUP, *b, *a),
-                    "asymmetry at {a:?} vs {b:?}"
-                );
-                for c in &pairs {
-                    let (ab, bc) = (cmp_pair(GROUP, *a, *b), cmp_pair(GROUP, *b, *c));
-                    if ab == bc && ab != Ordering::Equal {
-                        assert_eq!(
-                            cmp_pair(GROUP, *a, *c),
-                            ab,
-                            "intransitive at {a:?} {b:?} {c:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// The whole claim guard, tabulated: exactly one of the sixteen states
-    /// opens a claim, and each of the four inputs vetoes on its own.
-    #[test]
-    fn only_a_live_top_ranked_node_past_its_boot_guard_may_claim() {
-        for leaving in [false, true] {
-            for past_boot_guard in [false, true] {
-                for top_ranked in [false, true] {
-                    for adopted_host_is_self in [false, true] {
-                        let guard = ClaimGuard {
-                            leaving,
-                            past_boot_guard,
-                            top_ranked,
-                            adopted_host_is_self,
-                        };
-                        let want =
-                            !leaving && past_boot_guard && top_ranked && !adopted_host_is_self;
-                        assert_eq!(guard.opens(), want, "{guard:?}");
-                    }
-                }
-            }
-        }
-        // The one state that claims, spelled out rather than inferred.
-        assert!(
-            ClaimGuard {
-                leaving: false,
-                past_boot_guard: true,
-                top_ranked: true,
-                adopted_host_is_self: false,
-            }
-            .opens()
-        );
     }
 }

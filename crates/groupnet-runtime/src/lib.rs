@@ -43,9 +43,11 @@ mod driver;
 mod group;
 mod node;
 mod routing;
+mod store;
 
 pub use driver::GroupEvent;
 pub use group::{CommandRejected, Group, Leadership, SyncCtx};
-pub use groupnet_core::{Role, Status};
+pub use groupnet_core::{RecoveredGrant, Role, Status};
 pub use node::{GroupProfile, Node, NodeBuilder};
 pub use routing::Routing;
+pub use store::GrantStore;

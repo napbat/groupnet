@@ -184,8 +184,8 @@ fn spawn_one(
 /// plain path can never drift: an unset [`NodeOpts::group_profile`] is a bare
 /// `join_group` (the node config's own mode), exactly as before.
 fn join(node: &Node<MemTransport>, opts: &NodeOpts) -> Group {
-    match opts.group_profile {
-        Some(profile) => node.join_group_with(opts.group.clone(), profile),
+    match &opts.group_profile {
+        Some(profile) => node.join_group_with(opts.group.clone(), profile.clone()),
         None => node.join_group(opts.group.clone()),
     }
 }

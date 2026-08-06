@@ -13,6 +13,6 @@ mod stats;
 
 pub use command::Command;
 pub use effect::Effect;
-pub use election::Role;
+pub use election::{RecoveredGrant, Role};
 pub use state::{GroupEngine, VersionedValue};
 pub use stats::NetStats;
