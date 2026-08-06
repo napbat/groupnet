@@ -33,6 +33,11 @@ consistency = ["runtime", "dep:groupnet-consistency"]
 # applied_cluster_wide). Opt-in — writers wait on every alive member, and
 # one ledger republish flows per applied event; see the scaling envelope.
 consistency-acks = ["consistency", "groupnet-consistency/acks"]
+# The coherence-lease tier above that: readers hold self-expiring leases to
+# *serve*, so a writer's invalidation ends at an acknowledgement or at a silent
+# peer's lease lapse — bounded by the stale node's own clock instead of by a
+# timeout. Its fast path *is* an ack round, so it implies `consistency-acks`.
+consistency-leases = ["consistency-acks", "groupnet-consistency/leases"]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]

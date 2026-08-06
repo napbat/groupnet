@@ -28,7 +28,12 @@
 //! ledger republish per applied event, and write latency bounded by the
 //! slowest alive member — right for small clusters that must be
 //! indistinguishable from a single node, wrong past the scaling envelope
-//! (large fabrics keep the session tier and shard into cells instead).
+//! (large fabrics keep the session tier and shard into cells instead). Its
+//! successor, the **coherence-lease tier** (feature `leases`, off by default,
+//! module `lease`), inverts that bargain: readers hold self-expiring leases to
+//! *serve*, so a writer's wait ends at an acknowledgement **or** at a silent
+//! peer's lease lapse — bounded by the stale node's own clock instead of by a
+//! timeout with a hope at the end.
 //!
 //! Sitting beside both, priced at nothing and gated by nothing, are
 //! **typed watermarks**: [`SeqFloors`] publishes per-node, per-key floors in
@@ -182,6 +187,8 @@ mod acks;
 mod feed;
 mod floor;
 mod frontier;
+#[cfg(feature = "leases")]
+pub mod lease;
 mod peers;
 mod token;
 mod wire;
@@ -191,5 +198,10 @@ pub use acks::{AckLedger, CAP_ACKS, applied_by, applied_by_selected, applied_clu
 pub use feed::WriteFeed;
 pub use floor::SeqFloors;
 pub use frontier::{Frontier, FrontierView};
+#[cfg(feature = "leases")]
+pub use lease::{
+    CAP_LEASE, ClockMs, CoherenceCore, CoherenceOutcome, CoherenceStep, LeaseConfig,
+    LeaseConfigError, LeaseCore, LeaseState, LeaseView, Leases, RenewalId, WaitMember,
+};
 pub use peers::{PeerWrite, PeerWrites, advertised_head, advertised_head_named};
 pub use token::WriteToken;

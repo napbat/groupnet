@@ -15,6 +15,25 @@ repository.workspace = true
 # the README's scaling envelope). Off by default; the session tier is free.
 acks = ["tokio/time"]
 
+# The coherence-lease tier (T3): readers hold self-expiring leases to *serve*,
+# and a writer's invalidation ends at an acknowledgement or at a silent peer's
+# lease lapse. Built on the ack tier's applied watermarks — the fast path is a
+# T2 ack round — so it implies `acks`.
+#
+# Off by default, and priced honestly (the tier's honesty box has the full
+# accounting). The cheap half is one 16-byte renewal entry per reader per
+# renewal interval. The expensive half is the grant map: every member rewrites
+# its *whole* O(roster) `~lease:g` entry on every peer renewal it adopts — up to
+# N-1 rewrites of an O(N) value per member per interval — and the view task
+# re-folds every granter's map on every `NodeStateChanged` it sees, including
+# the ack tier's watermark churn, so that fold scales with write rate rather
+# than with lease rate. Small clusters, like the ack tier it sits on.
+#
+# `tokio/rt` is the one thing this tier adds beyond the ack tier's toolbox: the
+# lease shell owns three background tasks (renew, grant, ingest), so it spawns
+# where every other tier here only borrows the caller's task.
+leases = ["acks", "tokio/rt"]
+
 # Built on the runtime's Group handle; the protocol work stays in the engine.
 # tokio is only the sync toolbox (watch channels) — no executor requirement
 # beyond what the runtime already has.
@@ -28,6 +47,10 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 [dev-dependencies]
 groupnet-transport-mem = { workspace = true }
 tokio = { workspace = true }
+# The deterministic simulator, for the lease tier's DST (slice S3): the sans-IO
+# cores are driven in virtual time, with no runtime and no transport. Dev-only,
+# so it never enters the published dependency graph.
+groupnet-sim = { workspace = true }
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,
 # so this never enters the published dependency graph. Do NOT add `version`.
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }

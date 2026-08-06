@@ -38,7 +38,9 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 ## Engineering rules (owner-set, 2026-08-05)
 
 1. **No Rust source file over 1000 lines.** Split modules before they get
-   there. (Current largest file is ~670 lines; keep headroom.)
+   there. (Largest today: `groupnet-core/src/wire.rs` ~960 and
+   `groupnet-consistency/tests/lease_dst.rs` ~950 — close enough that the next
+   addition to either splits it first, rather than after.)
 2. **Clippy `all` + `pedantic`** are workspace lints; CI treats warnings as
    errors. Verify with
    `cargo clippy --workspace --all-targets -- -D warnings`. Any
@@ -76,9 +78,17 @@ cargo check -p groupnet --no-default-features --all-targets
 cargo check -p groupnet-transport --no-default-features
 cargo test -p groupnet --features tcp-msg
 cargo test -p groupnet-consistency --features acks
+cargo test -p groupnet-consistency --features leases
+cargo test -p groupnet --features consistency-leases
+cargo clippy -p groupnet-consistency --all-targets --features leases -- -D warnings
 ```
 
-Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`).
+The last one is not redundant: no crate in the workspace turns `leases` on by
+default, so the workspace clippy above never sees the lease tier's code or its
+DST at all.
+
+Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`) — the
+eleventh command, and the only one that is not a correctness gate.
 
 ## Process
 

@@ -358,6 +358,24 @@ impl Simulation {
             .and_then(|e| e.node_state(node).map(<[u8]>::to_vec))
     }
 
+    /// When `observer` will expire its copy of `node`'s `key` — the
+    /// lease-lapse instant, in exact virtual time, which is what lets a test
+    /// check the coherence-lease tier's bound precisely (a writer waits out
+    /// either an ack or this instant).
+    ///
+    /// `None` if `observer` is not in the simulation, or holds no lapsing copy
+    /// of the key: absent, tombstoned, reaped, or authored without a TTL. The
+    /// stamp is armed at **adoption** on `observer`'s own timeline, so two
+    /// observers of the same write legitimately report different instants —
+    /// see
+    /// [`GroupEngine::node_entry_expires_at`](groupnet_core::GroupEngine::node_entry_expires_at).
+    #[must_use]
+    pub fn entry_expires_at_of(&self, observer: &NodeId, node: &NodeId, key: &str) -> Option<Time> {
+        self.engines
+            .get(observer)
+            .and_then(|e| e.node_entry_expires_at(node, key))
+    }
+
     /// The ids of every engine currently in the simulation.
     #[must_use]
     pub fn nodes(&self) -> Vec<NodeId> {

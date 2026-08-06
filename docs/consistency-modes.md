@@ -202,9 +202,59 @@ holds a lease to *serve*. Lease duration is the knob trading
 write-stall-under-failure against renewal traffic; renewals piggyback on the
 existing gossip cadence.
 
-Status: **adopted** (decision D-lease) — sequenced as Milestone 2,
-immediately after the election skeleton proves the lease machinery under
-DST.
+Status: **delivered** (Milestone 2) — feature `leases` in
+`groupnet-consistency`, `consistency-leases` on the facade. The as-built
+protocol refines the sketch above in ways that are now contract:
+
+* **Renewal is confirmed, not asserted.** A reader's serving right derives
+  only from renewals that came back: every member folds the renewals it has
+  *adopted* into a wholesale grant-map entry (`~lease:g`), and the reader
+  serves until `D − rate_margin` after the publish instant of the newest
+  renewal confirmed by **every** not-reaped `CAP_LEASE` member. A reader
+  that merely re-publishes cannot extend its own lease — the unilateral-
+  extension hole a naive TTL-entry lease would have.
+* **The writer's countdown starts at adoption.** A silent reader's lapse
+  instant on the writer's side is the writer's *own engine's* TTL expiry of
+  that reader's `~lease` entry — armed at adoption, so propagation delay is
+  free safety margin in the safe direction. Zero wire changes: the whole
+  tier rides existing TTL'd entries, and non-upgraded nodes relay them.
+* **Lapse ⇒ NeedsResync ⇒ affirmation.** A lapsed (or booting) reader stays
+  invalid even with a fresh confirmed lease until it affirms catch-up
+  (`mark_caught_up`, accepted only while a lease is live) — a lapsed reader
+  missed exactly the invalidations whose writers proceeded at its lapse.
+* **Roster rule:** Suspect and Dead-but-unreaped granters stay in the
+  confirmation min-set (either may still be writing); only a reap removes
+  one. Boot guards narrow membership divergence, and both are **enforced in
+  the shell** rather than asked of the deployment: for its first
+  `detection_window_ms + 2 × anti_entropy_interval` of participation a reader
+  cannot reach `Serving` at all (`mark_caught_up` declines and no serve
+  deadline is published — without that gate the empty roster a booting node
+  holds confirms vacuously, and it can serve under a window no granter gave),
+  and a writer refuses the no-known-holders fast path over the same window.
+* **What the roster rule costs, stated as an outage:** one unreaped
+  `CAP_LEASE` member that stops granting freezes *every* reader's
+  confirmation cluster-wide. Each reader's window closes within one `D` of
+  the freeze and cannot reopen until membership reaps the silent member — at
+  the reap horizon, `2 × dead_timeout_ms` past the `Dead` verdict, itself up
+  to `detection_window_ms` past the silence. At the defaults (`D = 2s`,
+  `dead_timeout_ms = 10s`, three members) that is `0.9 + 20 − 2` ≈ **19s of
+  cluster-wide origin-serving** — correct reads throughout, none of them
+  cached. Sizing: a lease deployment wants a short `dead_timeout_ms`, on the
+  order of `D` (at `D = 2s`, `dead_timeout_ms = 2s` turns those 19s into
+  ≈ 3s), bounded below by the longest partition it must survive and still
+  reconcile — the reap horizon is also the window past which a returning
+  node's entries can no longer be recovered by a digest.
+* **Honesty:** production safety rests on bounded clock-*rate* error over
+  one lease duration (`rate_margin`, reader-side, default
+  `max(D/100, 5ms)`); every failure inside the assumptions degrades to
+  origin-serving or writer over-waiting, never a stale serve. The two ways it
+  costs availability instead — the fail-slow reader (renewing but not
+  applying: no ack, no lapse, so the writer waits to its own deadline) and
+  the unreaped-granter outage above — are named in the tier's honesty box.
+  Proven in virtual time by `tests/lease_dst.rs` (224 chaos seeds: the
+  Gray–Cheriton lapse contract, no-unconfirmed-extension, previous-life
+  ghosts never serve) and `tests/lease_dst_liveness.rs` (64 liveness seeds);
+  mutation-tested for falsifiability.
 
 ### M3 — Hosted mode (new)
 

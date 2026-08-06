@@ -307,6 +307,41 @@ impl GroupEngine {
             .map(|(k, e)| (k.as_str(), e.value.as_slice()))
     }
 
+    /// The logical instant **this engine** will expire its adopted copy of one
+    /// key of a node's state — the *lease-lapse instant* the coherence-lease
+    /// tier is built on: the moment after which this observer provably stops
+    /// serving the entry, whether or not anyone can reach it. A writer
+    /// invalidating a key waits for either an ack from a reachable holder or
+    /// this instant to pass on a silent one; the second branch is what turns a
+    /// timeout-with-a-hope into a bound, because the exposure is ended by the
+    /// *holder's own clock* (a bounded-clock-**rate** assumption) rather than
+    /// by the holder learning anything.
+    ///
+    /// `None` when there is no such instant: the key is absent, it is held as
+    /// a tombstone, or it was authored with no TTL (`ttl_ms == 0`, which arms
+    /// [`Time::MAX`] — never expires). Also `None` once an expired entry has
+    /// been reaped, since the copy it described is gone.
+    ///
+    /// **Observer-local, and armed at ADOPTION.** A TTL travels on the wire as
+    /// a *duration*, never as an absolute stamp: each receiver arms
+    /// `now + ttl_ms` against **its own** clock at the instant it adopts the
+    /// entry, so two observers of the same write legitimately hold different
+    /// expiries, and the author's own copy expires on the author's timeline.
+    /// Re-adopting a strictly newer version re-arms it; re-gossiping a version
+    /// already held does not, so a chatty peer can never extend a lapse
+    /// instant it did not advance. A writer reasoning about a peer's lapse
+    /// must therefore add the propagation delay and clock-rate skew it is
+    /// willing to assume to what *it* reads here.
+    #[must_use]
+    pub fn node_entry_expires_at(&self, node: &NodeId, key: &str) -> Option<Time> {
+        self.members
+            .get(node)
+            .and_then(|m| m.entries.get(key))
+            .filter(|e| !e.tombstone)
+            .map(|e| e.expires_at)
+            .filter(|at| *at != Time::MAX)
+    }
+
     /// The single-blob state a node last advertised (the `~blob` shim key).
     #[must_use]
     pub fn node_state(&self, node: &NodeId) -> Option<&[u8]> {

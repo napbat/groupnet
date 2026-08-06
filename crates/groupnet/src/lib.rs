@@ -83,6 +83,14 @@ pub use groupnet_runtime as runtime;
 /// applied-write frontiers for read-your-writes barriers
 /// ([`Frontier`](consistency::Frontier)). Honest scope: per-writer order and
 /// session guarantees — consensus and fencing are deliberately out.
+///
+/// Two stronger tiers sit on top, each priced separately and each off by
+/// default: `consistency-acks` adds applied-watermark acknowledgement
+/// (`AckLedger` / `applied_cluster_wide` — writers wait on every alive member),
+/// and `consistency-leases` adds the coherence-lease tier above it
+/// (`consistency::lease` — readers hold self-expiring leases to *serve*, so a
+/// writer's wait ends at an acknowledgement **or** at a silent peer's lease
+/// lapse). See the crate's own docs for the scaling envelope of each.
 #[cfg(feature = "consistency")]
 pub use groupnet_consistency as consistency;
 
