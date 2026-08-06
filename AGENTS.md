@@ -38,18 +38,23 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 ## Engineering rules (owner-set, 2026-08-05)
 
 1. **No Rust source file over 1000 lines.** Split modules before they get
-   there. (Largest today, all within ~30 lines of the limit, so the next
+   there. (Largest today, all within ~50 lines of the limit, so the next
    addition to any of them splits it *first*:
    `groupnet-sim/tests/election_external_failover.rs` ~990;
    `groupnet-consistency`'s `tests/hosted_dst.rs` ~975, `src/hosted/writes.rs`
    ~970 and `tests/hosted_dst_migrate.rs` ~960; `groupnet-core`'s `src/wire.rs`
    ~960 and `tests/election_quorum.rs` ~950;
    `groupnet-consistency/tests/lease_dst.rs` ~950. With room still:
-   `groupnet-sim/src/simulation.rs` ~885, `groupnet-core`'s
-   `engine/election/mod.rs` ~875 and `src/config.rs` ~860, the rest of the
-   `groupnet-sim` `election_external*` suites at ~785–890, and
+   `groupnet-sim`'s `tests/election_external_skew.rs` ~910 and
+   `src/simulation.rs` ~895, `groupnet-consistency/src/lease/shell.rs` ~890,
+   `groupnet-core`'s `engine/election/mod.rs` ~875 and `src/config.rs` ~860, the
+   rest of the `groupnet-sim` `election_external*` suites at ~785–790,
    `groupnet-runtime`'s `tests/external.rs` ~705 / `tests/external_faults.rs`
-   ~775. `simulation.rs` has now absorbed three subsystems' event kinds —
+   ~780, and M6's handoff files — `groupnet-consistency`'s
+   `src/hosted/handoff/stream.rs` ~780, `tests/handoff_fence.rs` ~760,
+   `tests/handoff_migration.rs` ~755, `src/hosted/handoff/wire.rs` ~720 and
+   `tests/handoff_resync.rs` ~700.
+   `simulation.rs` has now absorbed three subsystems' event kinds —
    **the next addition to it splits the probe/liveness dispatch out** rather
    than growing it again.) Two splits worth copying: a **shell** splits from
    its sans-IO core (`hosted/reads.rs` drives, `hosted/lineage.rs` decides and
@@ -98,18 +103,23 @@ cargo test -p groupnet --features tcp-msg
 cargo test -p groupnet-consistency --features acks
 cargo test -p groupnet-consistency --features leases
 cargo test -p groupnet-consistency --features hosted
+cargo test -p groupnet-consistency --features handoff
 cargo test -p groupnet --features consistency-leases
 cargo test -p groupnet --features consistency-hosted
+cargo test -p groupnet --features consistency-handoff
 cargo clippy -p groupnet-consistency --all-targets --features leases -- -D warnings
 cargo clippy -p groupnet-consistency --all-targets --features hosted -- -D warnings
+cargo clippy -p groupnet-consistency --all-targets --features handoff -- -D warnings
 ```
 
-The last two are not redundant: no crate in the workspace turns `leases` or
-`hosted` on by default, so the workspace clippy above never sees those tiers'
-code, their tests, or their DST at all.
+The last three are not redundant: no crate in the workspace turns `leases`,
+`hosted` or `handoff` on by default, so the workspace clippy above never sees
+those tiers' code, their tests, or their DST at all. `handoff` is not covered by
+the `hosted` runs either — it is the only consistency feature that pulls in the
+data plane, so it is the only one whose build graph differs from the rest.
 
 Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`) — the
-fourteenth command, and the only one that is not a correctness gate.
+seventeenth command, and the only one that is not a correctness gate.
 
 ## Process
 

@@ -395,8 +395,9 @@ CP path.
   carries liveness and coherence signals; stores own truth.
 * **Host migration / handoff.** Milestone 1 surfaces
   `LeadershipChanged { epoch, host, role }`; the write path surfaces
-  migration as the epoch `Gap`. A later milestone can add snapshot handoff
-  over the existing `BulkTransport` data plane.
+  migration as the epoch `Gap`. Milestone 6 added optional snapshot handoff
+  over the existing `BulkTransport` data plane — a `Gap` remediator, not a
+  replay (see the M6 as-built subsection).
 
 #### Quorum activation, as built (Milestone 3)
 
@@ -908,11 +909,15 @@ that nobody reads "recovery" as "replay":
 * A consumer needing **exact replay** rather than coarse remediation must size
   the ring for the worst migration lag it accepts. That is a capacity decision
   and it is the consumer's.
-* **State transfer is not in this milestone.** Snapshot handoff over the
-  `BulkTransport` data plane is Section 6's Milestone 6; until it exists, `Gap`
-  plus the consumer's remediation is the whole story — which is what the
+* **State transfer is not in this milestone**, and it is not in this tier: `Gap`
+  plus the consumer's remediation is the whole story here — which is what the
   strong-profile-versus-Raft table's "a laggard gaps and state-resyncs" row
-  means in practice.
+  means in practice. Milestone 6 has since delivered the *optional* way past the
+  bound for consumers whose state **is** the groupnet-carried state (feature
+  `handoff`, module `hosted::handoff`): a covering snapshot pulled from a donor
+  over the data plane, verified at three points, seeded into this ledger. It
+  changes nothing above — the rule still sees only watermarks that moved — and
+  `hosted` is complete without it. See the M6 as-built subsection below.
 
 #### External activation, as built (Milestone 5)
 
@@ -1135,7 +1140,10 @@ stealable until the top-ranked node's anchor heals.
 
 There is still **no cooperative handoff** — `AnchorRecord` carries no successor
 hint, and a record is superseded on its expiry or not at all. The lapse costs one
-TTL plus the steal margin; shortening it is Milestone 6's business.
+TTL plus the steal margin. Milestone 6 examined shortening it with a successor
+hint and **dropped** the idea; the rank gates make it inert and the voluntary
+path is already served by release-on-leave (see M6 as-built, "The two Milestone 6
+conditionals, discharged").
 
 ##### The driver, as built: hold, leadership, and the third posture
 
@@ -1265,8 +1273,11 @@ before it drifts past it.
 ##### Non-goals for this milestone
 
 * **No handoff.** `AnchorRecord` carries no `handoff_to` successor hint, unlike
-  shardstore's `WriterRecord`. Cooperative handoff is Milestone 6, and adding
-  the field early would put an unexercised branch in the steal rule.
+  shardstore's `WriterRecord`. Adding the field early would put an unexercised
+  branch in the steal rule. *(Resolved in Milestone 6: the hint is **dropped**,
+  not deferred — rank gates make a successor hint unable to change who claims,
+  release-on-leave already shortens the voluntary path, and crash paths cannot
+  cooperate. See "The two Milestone 6 conditionals, discharged" below.)*
 * **No `GrantStore` analogue, and none is coming.** The anchor *is* the ledger.
   There is no `Effect::Persist*` under `External`, no recovery constructor, and
   no boot blackout — those exist under `Quorum` to stand in for a durable
@@ -1278,6 +1289,300 @@ before it drifts past it.
   instead of off the anchor. Row X7's prompt gained the same
   `is_coordinator()` gate row Q7 already had (see above). The regression bar for
   both is that every pre-existing suite passes byte-unmodified.
+
+#### Handoff, as built (Milestone 6)
+
+Status: **Delivered (pending review).** What shipped, by layer:
+
+* **`groupnet-transport-mem`**, feature `bulk` — `MemBulkNet` /
+  `MemBulkTransport`: an in-process **data plane** of `tokio::io::duplex` pipes,
+  the sibling of the control plane's `Network` one plane down. Connection-
+  oriented, so connecting to an unknown id is an error rather than the silent
+  drop the datagram plane owes. Without it nothing could exercise both planes in
+  one process, and this milestone is the first thing that needs to.
+* **`groupnet-consistency`**, feature `handoff` (facade
+  **`consistency-handoff`**), module `hosted::handoff` — the sans-IO
+  `HandoffCore` (three verdicts) and `HandoffPhase` (the order they must be
+  taken in), the `GNHO/1` codec, and the `Handoff` shell: `offer`, `fetch` /
+  `fetch_on`, `donors`, `seed`. The consumer supplies both ends of the *data*
+  via `SnapshotSource` and `SnapshotSink`; this module never interprets a chunk.
+* **Tests** — `handoff.rs` (the ordered exchange over a plain group),
+  `handoff_fence.rs` (the two staleness re-verifications and `donors()` against
+  real epochs), `handoff_resync.rs` (a late joiner beyond the ring),
+  `handoff_migration.rs` (a recovering host completing through a transfer), the
+  facade smoke `groupnet/tests/consistency_handoff.rs`, and the runnable example
+  `crates/groupnet-consistency/examples/hosted_handoff.rs`.
+
+The tier is **optional and additive**: `hosted` is complete without it, the
+`handoff` feature is off in every build that does not ask for it, and it is the
+only consistency feature whose dependency graph reaches the data plane.
+
+##### It remediates a `Gap`, and it adds no cursor
+
+The one API question worth stating plainly: a handoff introduces **no new read
+position, no seek, no replay-from**. `HostedReads` already positioned the
+subscriber when it emitted the `Gap` — the cursor sits at the first write the
+ring still holds, and everything below it is what the `Gap` names. What the
+laggard is missing is *state*, not *position*, and the transfer supplies exactly
+that. Adding a cursor API would be adding a second way to be wrong about where a
+subscriber is.
+
+Two consequences fall straight out of that, and both are load-bearing:
+
+* **The live stream resumes contiguously.** After the transfer, the next write
+  the subscriber is handed is the one after its cursor. There is no second
+  `Gap`, because nothing was ever missed a second time. `handoff_resync.rs`
+  asserts the arriving tokens are contiguous *and* that the **total** gap count
+  over the whole run is still exactly one — the arrival gap — rather than
+  comparing against a snapshot taken after the transfer, which would say nothing
+  about the transfer window itself.
+* **Overlap is free.** A snapshot is a covering image, not a delta, so it
+  routinely re-delivers state the requester already applied — and on a retried
+  handoff that is the common case. It is safe because this crate's standing
+  contract already requires an apply to be **idempotent**; the handoff adds no
+  exception to it, and a sink that is not idempotent was broken for the session
+  tier already.
+
+The recovery rule is likewise untouched. `CompletenessCore::step` never learns a
+handoff happened; it sees watermarks that moved. `Handoff::seed` is the whole
+join: fold the receipt's `covers` into the `CommitLedger` and the `Frontier`,
+`refresh` the ledger's stamp, and re-ask. `Completeness::Recovering { needed }`
+is literally the `need` map a fetch is given — one names a debt, the other pays
+it, with no translation step between them.
+
+##### The stream protocol: `GNHO/1`, and why the terminator is in-band
+
+One request/response exchange on one bulk stream, five frame kinds:
+
+```text
+requester                                  donor
+  │── Request { group, name, need } ─────────▶│
+  │◀────────── Offer { fence, covers } ───────│   or Refuse { code, have }
+  │  (verify: staleness, then coverage)       │
+  │◀────────── Chunk × n ─────────────────────│
+  │◀────────── Done { chunks, bytes, fence } ─│
+  │  (verify: counts, then the re-read fence) │
+  │  sink.finish()                            │
+```
+
+Every frame opens `b"GNHO"`, version `1`, kind. The `(writer, token)` record map
+inside `Request`, `Offer` and a `NotCovered` refusal is the **commit ledger's
+map, byte for byte and by the same code** (`encode_records` / `decode_records`,
+factored out of `encode_ledger` for exactly this): a watermark map that parsed
+differently in two places would be a silent divergence between what a donor
+claims to cover and what a ledger says a voter applied, and the whole design
+turns on those being the same kind of number.
+
+**`Done` is in-band because a clean EOF at a frame boundary is
+indistinguishable from completion.** The framing layer reports a peer that died
+mid-snapshot as `Ok(None)` — the same answer it gives for a peer that finished.
+Nothing below the protocol can tell those apart, so the protocol carries its own
+terminator and **silence is never success**: a stream that ends without a `Done`
+is `HandoffError::Truncated`, and the sink is dropped. The counts in that frame
+are checked for **equality**, not for a floor: a short count is the truncation
+the name describes, and a long one is a re-framing or a duplicated chunk, which
+is the same mistake pointed the other way.
+
+Version and kind bytes are refused loudly rather than folded into a plausible
+neighbour. `RefusalCode::Version` is the one code this version never *sends* —
+answering an unreadable version in-band would mean encoding a reply in the
+version the peer has just demonstrated it cannot read — and it exists so a future
+version has a word for it and this one can decode it.
+
+##### Three verification points, and what they prove
+
+| Point | Check | Refusing means |
+|---|---|---|
+| the `Offer` arrives | `HandoffCore::staleness` on the donor's fence stamp, then `HandoffCore::coverage` of its `covers` against `need` | this donor's view is superseded, or it is behind what we need |
+| the `Done` arrives | `HandoffCore::done_consistent` on the counts | what landed is not what was sent |
+| immediately before `finish` | `staleness` again, on the **final** stamp in that `Done`, against a **freshly re-read** `leadership()` | the donor was deposed while it was still sending |
+
+The third point is the one the design turns on and the reason there are two
+fence checks rather than one. A snapshot takes real time to stream, and a donor
+that was the serving host when it opened the image can be deposed while it is
+still sending it. Both halves move — the donor stamps what *it* now believes into
+the terminator, and the requester compares against what *it* now believes — so a
+migration either side has learned about lands as `HandoffError::StaleDonor` with
+nothing installed. Verifying only at the offer would adopt exactly the state a
+surviving host has already ruled out.
+
+**What all three prove is staleness, never freshness.** A `Stale` verdict is a
+proof that this donor's state belongs to a superseded view. An `Ok` verdict is
+the *absence* of such a proof, which is strictly weaker: two nodes inside one
+stale partition agree perfectly and neither can tell. That is stated in the
+module's honesty box and it is contract, not a caveat.
+
+The residue is named, and it is **not new**. It is M4's drain-window divergence
+verbatim: state applied under a view no surviving host will hold. Nothing
+acknowledged is at risk — the commit ledger's view-stamp fence means such a write
+was never committed — and the reconciliation is the standing one: the
+authoritative `Gap` that opens the next lineage, and the consumer's own
+remediation behind it. A handoff can move that divergence faster than gossip
+would have; it cannot make it permanent. A consumer that treats the `Gap` as
+advisory keeps the divergence with or without this module.
+
+One failure this design **cannot** detect is the source over-claiming `covers`.
+A torn image with an honest-looking `covers` map is indistinguishable from a good
+one at this layer, because the chunks are opaque bytes. Take the `covers` reading
+at or before the instant the image is fixed — one lock across both, a
+copy-on-write handle, a store snapshot — and take it *after* nothing. That is the
+`SnapshotSource` contract and the whole weight of the trait sits on it.
+
+##### The hostless donor: the epoch is the fence, the name is weaker
+
+A fence stamp is `(epoch, Option<host>)`, and the `None` is real: a node can have
+adopted epoch `e` while still believing the group hostless at it — a follower
+that saw the epoch bump before the leadership entry naming its winner, which is
+one gossip round wide and entirely ordinary.
+
+**A hostless-stamped donor at our own epoch answers `Staleness::Ok`.** The epoch
+*is* the fence; the host name is strictly weaker information about the same
+hostship, and lagging on the name is not lagging on the fence. Under the posture
+S5 already presumes — an epoch is a unique name for one hostship — nothing the
+donor applied at `e` can belong to a *later* hostship, because a later hostship
+carries a higher epoch, which the epoch-major test catches on its own. The
+dangerous direction is accepting a donor that is genuinely behind, and that
+requires a *lower* epoch. Refusing the hostless donor would buy no safety and
+would cost exactly the availability this module exists to restore: it would
+refuse the most likely donor in the seconds after a migration, which is precisely
+when a handoff is wanted. The mirror case — a donor naming a host at an epoch we
+believe hostless — is the better-informed party, and is answered the same way.
+
+The one same-epoch refusal is **two different named hosts at one epoch**. That is
+not a lag, it is a contradiction — an epoch names one hostship — so one of the two
+beliefs is already dead, and nothing is adopted.
+
+The engine is **not** stuck on that case, and the handoff's refusal is stricter
+than it has to be, deliberately. The fencing order is total over `(epoch, host)`
+pairs: epoch-major, and at equal epochs the `placement::owner` of the group id
+among the two hosts wins — a tiebreak that reads nothing but the group id and the
+two host ids, so every node on either side of a heal picks the same survivor
+without exchanging anything (`groupnet-core`'s `engine/election/mod.rs`). A
+handoff could apply the same rule and accept a donor whose host is the one that
+will win. It does not, because it is fail-closed and its refusals are transient:
+the requester is about to adopt a whole image on the strength of this one verdict,
+and "our two stamps contradict each other" is as much a statement about the
+requester's view being unhealed as about the donor's. Waiting costs a retry — the
+engine's own merge closes the disagreement, after which the two stamps agree and
+the same donor is accepted — while adopting across it rests the check on a
+tiebreak the requester has not yet seen its own engine apply. Taking it here is an
+available *availability* win, not a correctness requirement, and it is not taken.
+
+The window is narrow and **`Settle`-only** in any case: two same-epoch hostships
+arise because each side of a partition counted the members it could see and
+derived the same `highest_seen + 1`. A `Quorum` epoch is granted by a majority of
+a static roster and an `External` one is a compare-and-swap on a real allocator;
+neither can mint the pair.
+
+##### The sink is taken by value, and `finish` consumes it
+
+`fetch` / `fetch_on` take the `SnapshotSink` **by value**, and
+`SnapshotSink::finish` takes `self`. That is not an ergonomics choice: the
+contract is that **a dropped, unfinished sink discards**, and no caller still
+holding a reference can be held to it. Every failure path — a refusal, either
+staleness verdict, short coverage, a count mismatch, an out-of-order frame, an
+I/O error, a sink error mid-stream — returns without finishing, and the driver
+owns the sink, so returning drops it. A failed handoff therefore leaves the node
+exactly as it was: still refusing service, still able to try another donor,
+nothing half-adopted. Consumers stage to a side location and make `finish` the
+swap; they do not stream into live state.
+
+##### `donors()`: host first, and the follower-donor honesty
+
+`Handoff::donors(need)` answers the members whose **published** commit ledgers
+already cover `need`, best first: the group's **serving host**, then everyone
+else in rendezvous order over the group id — the same deterministic ranking the
+engine's own candidate order uses, so every requester agrees on who to ask second
+without agreeing on anything. The coverage filter runs last, so a host that does
+not cover is merely *absent* rather than promoted-then-dropped, and **the caller
+is excluded by construction** — `Handoff::new` / `named` take this node's id
+alongside the group (the `HostedWrites` / `HostedReads` convention) and `donors()`
+drops it in the same `retain` as the short members.
+
+That exclusion is load-bearing, not tidy. A caller left on its own list would
+`connect` to its own endpoint, which no transport refuses: in-process the stream
+lands on that node's own accept queue, and over TCP it is an ordinary loopback
+connection. The failure is therefore not an error but a **silent hang** — the
+fetch waits for an offer only this node's own accept loop could write, which is at
+best a node streaming its state to itself and at worst (a serving loop that is
+busy, absent, or draining an endpoint that has since been replaced) a wait with
+nothing under it. "A node whose own reading covered `need` would not be asking" is
+true of the ordinary case and is not a mechanism; the filter is.
+
+It is a snapshot, stale the instant it is taken, which is why the answer is a list
+and why every refusal names the next thing to try.
+
+Host-first is the honesty box made operational. **A donor need not be the host** —
+the host is often the busiest node in the group and often the very node that is
+recovering — but a follower's applied state can include the previous host's
+un-replicated tail, which is precisely the state no surviving host will hold. The
+host's state is the one state definitionally survivable; a follower's is a
+best-effort second choice, taken when the host cannot serve, and it inherits the
+drain-window paragraph above rather than escaping it. `handoff_migration.rs` is
+the case where the host *is* the requester, so the caught-up voter is next — a
+follower donor, chosen knowingly.
+
+##### Sizing: the transfer must outrun the writers
+
+The requester's `need` is computed from a target that is itself moving: while a
+snapshot streams, the group keeps writing. If the writers advance past what the
+snapshot covers before it lands, the requester finishes, re-asks the recovery
+rule, and is short again — and if that is *durably* true the handoff repeats
+forever, transferring state and never catching up.
+
+There is no clever fix and this module does not pretend to one. The transfer must
+be able to outrun the write rate, which makes it a capacity decision — snapshot
+size, link bandwidth, ring depth — of exactly the same kind as the ring-sizing
+decision it replaces. **Size the ring for the worst migration lag you accept, or
+size the snapshot to land inside it.** A caller that wants the failure to be loud
+bounds its own retries and surfaces the stall.
+
+##### The two Milestone 6 conditionals, discharged
+
+Two conditionals pointed at this milestone, from two different places. Section 6's
+Milestone 6 line carried **one** "if" clause of its own — *plus host-scoped
+registers if fence tokens prove insufficient for docres locks*. The other was left
+here by **M5's as-built non-goals**, which deferred the anchor's `handoff_to`
+successor hint on the grounds that cooperative handoff was Milestone 6's business.
+Both are now answered, and neither is being built.
+
+* **Host-scoped registers: DEFERRED.** The clause was "*plus host-scoped
+  registers if fence tokens prove insufficient for docres locks*". They are
+  sufficient. The two runnable examples — `fenced_ownership` (Quorum) and
+  `anchored_ownership` (External) — **are** the docres lock shape end to end: an
+  ownership record committed through the host's serialized feed, then written to
+  the store under the fence that authorized it, with the store refusing the
+  deposed writer. Nothing in that path wants a register: the record lives where
+  truth already lives (the consumer's store), and a groupnet-side register would
+  be a second copy of it under weaker durability. No consumer has pulled for one
+  — docres/shardstore's stated needs (Section 2) are membership, TTL'd entries,
+  placement and the fence, and s3cache does not use Hosted mode at all. Deferred
+  rather than rejected: **revisit only against a concrete consumer** with a
+  requirement the fence token demonstrably cannot carry.
+* **The M5 anchor's `handoff_to` successor hint: DROPPED.** The External
+  as-built subsection flagged cooperative handoff as "Milestone 6's business"
+  and left `AnchorRecord` without a successor hint. It stays without one, for
+  three reasons that compound:
+  * **A hint cannot change who claims.** Renewal and claiming are *rank-gated*
+    under every activation (the M5 as-built row X7 / Q7 change): the top-ranked
+    live member is the one that bids. A departing host naming a successor could
+    only either agree with the rank order — in which case the hint is
+    decoration — or disagree with it, in which case the hint is ignored and the
+    field is an unexercised branch in the steal rule. That was the original
+    reason for leaving it out and it did not weaken.
+  * **The voluntary path is already short.** A voluntary leave **releases** the
+    anchor record rather than letting it lapse, so the cooperative case — the
+    one a hint would serve — already costs a claim round instead of a TTL plus
+    the steal margin. The remaining lapse cost is paid only by endings that are
+    *not* cooperative.
+  * **Crash paths cannot cooperate by construction.** A host that dies does not
+    write a hint, and those are exactly the endings where succession latency
+    hurts. A mechanism that helps only the case already handled, and cannot help
+    the case that is not, is not worth a wire field.
+
+  What Milestone 6 *did* deliver against the same underlying complaint is the
+  half that generalizes: state transfer, so a successor's slowness is a capacity
+  question rather than an unbounded wait on a ring.
 
 #### Consumer mapping
 
@@ -1452,6 +1757,24 @@ Plus: codec round-trip tests for the new frames (testkit `frames` fixtures),
 mem-transport end-to-end (elect → kill host → observe migration as a `Gap`),
 and mixed-version compat tests (old node drops the new kinds).
 
+**Handoff (M6)** carries no DST family of its own, and deliberately: its three
+verdicts and its phase table are pure functions unit-tested exhaustively beside
+the code (the 6×6 table is asserted cell by cell), and everything above them is
+I/O over two planes, which is an integration concern rather than a scheduling
+one. Four suites split by harness family, the house pattern:
+
+| Suite | What it earns |
+|---|---|
+| `groupnet-consistency/tests/handoff.rs` | the ordered exchange over a plain (hostless) group: a covering snapshot crossing whole and seeding the receiver, an early refusal that reads no byte of the donor's image, a mid-stream death installing nothing, and `is_request` demuxing a shared plane |
+| `groupnet-consistency/tests/handoff_fence.rs` | the fence-sensitive half, against real epochs: refusal at the **offer** for a donor behind us, refusal at the **terminator** for one deposed mid-stream, refusal at the terminator again for a donor whose *own* leadership moved while it streamed (the re-stamp, seen from the donor's side), and `donors()` over real gossiped ledgers — host first, short members out, and the caller out even when its own reading covers |
+| `groupnet-consistency/tests/handoff_resync.rs` | the laggard, over one steady hostship: a late joiner past the ring gets one `Gap`, fetches from the host `donors()` names, seeds, and **resumes contiguously with no second `Gap`** |
+| `groupnet-consistency/tests/handoff_migration.rs` | the ring-bound recovery, walked out of: an heir beyond the ring sits in `Recovering`, fetches from the caught-up voter (`donors()` excludes the requester itself), seeds, and the latch fires — then a `QuorumApplied` round resolves behind it |
+
+`groupnet/tests/consistency_handoff.rs` is the facade smoke: the tier's
+vocabulary reachable through `groupnet::consistency::hosted::handoff`, and one
+real transfer over `groupnet::transport::mem`'s **both** planes — which is what
+fails if the manifest's `groupnet-transport-mem?/bulk` edge is ever removed.
+
 ## 6. Milestones
 
 Build order of record (resolved 2026-08-05, decision D-order): prove each
@@ -1516,8 +1839,25 @@ epoch/fencing/lease skeleton; Quorum and External land on the proven result.
   voluntary leave *releases* the record while every other ending lapses — see
   the M5 as-built subsection above for those and for the shape the `X`
   properties landed in.
-* **Milestone 6 (optional) — handoff helper** over `BulkTransport`, plus
-  host-scoped registers if fence tokens prove insufficient for docres locks.
+* **Milestone 6 (optional) — snapshot handoff. Delivered (pending review).**
+  The handoff helper over `BulkTransport`: `hosted::handoff` behind feature
+  `handoff` (`consistency-handoff` on the facade) — three sans-IO verdicts and
+  the phase table that orders them, the `GNHO/1` stream protocol with its own
+  in-band terminator, `donors()` / `fetch()` / `offer()` / `seed()`, and the
+  `SnapshotSource` / `SnapshotSink` pair through which the consumer supplies
+  both ends of the data. Plus the in-process data plane it is exercised over
+  (`groupnet-transport-mem`'s `bulk` feature) and a runnable late-joiner example
+  (`cargo run -p groupnet-consistency --example hosted_handoff --features
+  handoff`). It is a **`Gap` remediator and adds no cursor API**: the `Gap`
+  already positioned the subscriber, the transfer supplies the state behind it,
+  and idempotent re-apply absorbs the overlap. Both conditionals aimed at this
+  milestone are discharged in the M6 as-built subsection — this line's own "if"
+  clause, **host-scoped registers DEFERRED** (fence tokens are sufficient; the two
+  ownership examples are the docres lock shape, and no consumer has pulled for a
+  register — revisit only against a concrete one), and the one M5's as-built
+  non-goals left here, **the anchor's `handoff_to` hint DROPPED** (rank
+  gates make a successor hint unable to change who claims, release-on-leave
+  already shortens the voluntary path, and crash paths cannot cooperate).
 
 ## 7. Consumer-pulled adjacent work (independent of Hosted mode)
 

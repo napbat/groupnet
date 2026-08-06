@@ -11,6 +11,7 @@
 //! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
 //! | [`consistency`] | session-consistency layer: per-writer sequenced [`WriteFeed`](consistency::WriteFeed)s with loss detection, and [`Frontier`](consistency::Frontier) read-your-writes barriers *(feature `consistency`)* |
 //! | `consistency::hosted` | the Hosted write path: fenced, epoch-scoped writes through the group's elected host, priced by a commit level (`Local` / `QuorumApplied` / `AllApplied`) *(feature `consistency-hosted`)* |
+//! | `consistency::hosted::handoff` | snapshot handoff: a recovering host pulls a covering snapshot from a donor over the data plane, verified at three points, instead of waiting on a ring it has overrun *(feature `consistency-handoff`)* |
 //! | [`sim`] | deterministic single-threaded [`Simulation`](sim::Simulation) *(feature `sim`)* |
 //!
 //! Two planes: the **control plane** (small best-effort datagrams — gossip,
@@ -97,7 +98,11 @@ pub use groupnet_runtime as runtime;
 /// (`consistency::hosted`): fenced, epoch-scoped writes through the group's
 /// elected host, with a commit level pricing the guarantee. Its strong profile
 /// (`Activation::Quorum` × `Commit::QuorumApplied`) is consensus, opt-in per
-/// group and deliberately confined to fixed single-digit rosters.
+/// group and deliberately confined to fixed single-digit rosters. Its recovery
+/// is ring-bound, and `consistency-handoff`
+/// (`consistency::hosted::handoff`) is the way past that bound: a covering
+/// snapshot pulled from a donor over the data plane. It is the one consistency
+/// feature that spans both planes, so it turns `bulk` on and expects a binding.
 #[cfg(feature = "consistency")]
 pub use groupnet_consistency as consistency;
 

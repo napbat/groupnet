@@ -47,6 +47,13 @@
 //! individual writes — a consumer that needs exact replay sizes the ring for the
 //! worst migration lag it accepts.
 //!
+//! A consumer with no store of its own to remediate *from* has a third option,
+//! and this core is unchanged by it: the optional `handoff` feature (module
+//! `hosted::handoff`) pulls a covering snapshot from a donor over the data
+//! plane, and the requester then seeds its ledger from the receipt and asks
+//! [`CompletenessCore::step`] again. The rule never learns that a handoff
+//! happened; it only ever sees watermarks that moved.
+//!
 //! [`PeerWrite::Gap`]: crate::PeerWrite::Gap
 //! [`Frontier`]: crate::Frontier
 

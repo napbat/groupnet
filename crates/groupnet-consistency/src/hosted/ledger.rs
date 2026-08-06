@@ -63,6 +63,16 @@
 //! peer that fabricates ledger bytes wholesale this tier's guarantee is void by
 //! construction anyway — but a truncation is the one hostile input that used to
 //! produce a *plausible* reading, and that is worth a `u32`.
+//!
+//! # The record map is a shared shape
+//!
+//! Everything after the stamp — the counted `(writer, token)` map — is factored
+//! into [`encode_records`] / [`decode_records`], because the handoff helper's
+//! wire protocol (feature `handoff`) embeds the *same* map inside its request,
+//! offer and refusal frames. One encoder, one decoder, one count check: a
+//! divergence between the two layouts would be a silent mis-parse of a recovery
+//! target, which is the one class of bug this codec exists to make impossible.
+//! [`encode_ledger`] and [`decode_ledger`] are the stamp plus a call.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -152,15 +162,33 @@ pub fn ledger_entry_key(name: &str) -> String {
 /// the grant map and the capability set use, plus the record count that makes a
 /// truncation undecodable rather than merely short.
 ///
-/// A writer id is assumed to fit a `u32` length, and the map to fit a `u32`
-/// count: debug assertions rather than release panics, because both cases are
-/// absurd (an id over 4 GiB, a roster over four billion writers) and both
-/// saturate into a prefix [`decode_ledger`] then refuses — `None`, "this member
-/// publishes nothing", never something wrong.
+/// Everything after the stamp is the crate-internal `encode_records`, shared
+/// verbatim with the handoff protocol's frames. The saturation posture is
+/// documented there: a
+/// prefix that cannot be counted becomes one [`decode_ledger`] refuses —
+/// `None`, "this member publishes nothing", never something wrong.
 #[must_use]
 pub fn encode_ledger(lead_epoch: u64, applied: &Watermarks) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + applied.len() * 32);
     out.extend_from_slice(&lead_epoch.to_le_bytes());
+    encode_records(applied, &mut out);
+    out
+}
+
+/// The counted record map alone — `(records: u32)(writer_len: u32, writer,
+/// token_epoch: u64, token_seq: u64)*`, little-endian — appended to `out`.
+///
+/// The shared half of this tier's two codecs: the ledger entry is a stamp
+/// followed by one of these, and the handoff protocol embeds one inside three of
+/// its five frames. Appending rather than returning is what lets a frame carry
+/// a map in the middle of a body.
+///
+/// A writer id is assumed to fit a `u32` length, and the map to fit a `u32`
+/// count: debug assertions rather than release panics, because both cases are
+/// absurd (an id over 4 GiB, a roster over four billion writers) and both
+/// saturate into a prefix [`decode_records`] then refuses — `None`, never
+/// something wrong.
+pub(crate) fn encode_records(applied: &Watermarks, out: &mut Vec<u8>) {
     debug_assert!(
         u32::try_from(applied.len()).is_ok(),
         "more watermarks than a u32 can count"
@@ -181,7 +209,49 @@ pub fn encode_ledger(lead_epoch: u64, applied: &Watermarks) -> Vec<u8> {
         out.extend_from_slice(&token.epoch.to_le_bytes());
         out.extend_from_slice(&token.seq.to_le_bytes());
     }
-    out
+}
+
+/// The record map beginning at `*offset`, advancing `*offset` past it — or
+/// `None` the moment anything does not parse, leaving `*offset` untouched.
+///
+/// Two of the count's three checks live here: every record must be present, and
+/// they must name that many **distinct** writers (a duplicated id yields a map
+/// shorter than its own header, which is not a map this tier will read). The
+/// third — nothing left over — belongs to the caller, because a map embedded in
+/// a frame body legitimately has bytes behind it and an entry value does not.
+///
+/// Never panics on hostile or truncated input.
+#[must_use]
+pub(crate) fn decode_records(bytes: &[u8], offset: &mut usize) -> Option<Watermarks> {
+    let start = *offset;
+    let records = usize::try_from(u32::from_le_bytes(
+        bytes.get(start..start.checked_add(4)?)?.try_into().ok()?,
+    ))
+    .ok()?;
+    let mut at = start + 4;
+    let mut applied = Watermarks::new();
+    for _ in 0..records {
+        let len = usize::try_from(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+        .ok()?;
+        at += 4;
+        let end = at.checked_add(len)?;
+        let writer = std::str::from_utf8(bytes.get(at..end)?).ok()?;
+        at = end;
+        let epoch = u64::from_le_bytes(bytes.get(at..at.checked_add(8)?)?.try_into().ok()?);
+        at += 8;
+        let seq = u64::from_le_bytes(bytes.get(at..at.checked_add(8)?)?.try_into().ok()?);
+        at += 8;
+        applied.insert(NodeId::new(writer), WriteToken { epoch, seq });
+    }
+    // Nothing collapsed: a map shorter than its own header is a duplicated
+    // writer id, and it under-reports whatever the reader is about to compute.
+    if applied.len() != records {
+        return None;
+    }
+    *offset = at;
+    Some(applied)
 }
 
 /// The whole reading in `bytes`, or `None` the moment anything does not parse.
@@ -192,33 +262,18 @@ pub fn encode_ledger(lead_epoch: u64, applied: &Watermarks) -> Vec<u8> {
 /// voter publishes and what a recovery majority is allowed to be made of.
 ///
 /// The count is checked three ways, and every failure is `None`: the records
-/// must all be present, they must end exactly at the last byte, and they must
-/// name that many *distinct* writers. Never panics on hostile or truncated
-/// input.
+/// must all be present, they must name that many *distinct* writers (both the
+/// shared `decode_records`'s), and they must end exactly at the last byte (this
+/// function's, because only an *entry* is allowed no tail). Never panics on
+/// hostile or truncated input.
 #[must_use]
 pub fn decode_ledger(bytes: &[u8]) -> Option<Reading> {
     let lead_epoch = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
-    let records = usize::try_from(u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?)).ok()?;
-    let mut applied = Watermarks::new();
-    let mut offset = 12usize;
-    for _ in 0..records {
-        let len = usize::try_from(u32::from_le_bytes(
-            bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
-        ))
-        .ok()?;
-        offset += 4;
-        let end = offset.checked_add(len)?;
-        let writer = std::str::from_utf8(bytes.get(offset..end)?).ok()?;
-        offset = end;
-        let epoch = u64::from_le_bytes(bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?);
-        offset += 8;
-        let seq = u64::from_le_bytes(bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?);
-        offset += 8;
-        applied.insert(NodeId::new(writer), WriteToken { epoch, seq });
-    }
-    // Nothing left over, and nothing collapsed: a tail is a re-framing attempt
-    // and a short map is a duplicated writer id. Neither is a reading.
-    (offset == bytes.len() && applied.len() == records).then_some(Reading {
+    let mut offset = 8usize;
+    let applied = decode_records(bytes, &mut offset)?;
+    // Nothing left over: a tail is a re-framing attempt, not a reading. (The
+    // other two checks are [`decode_records`]'s own.)
+    (offset == bytes.len()).then_some(Reading {
         lead_epoch,
         applied,
     })

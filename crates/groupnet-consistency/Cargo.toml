@@ -51,6 +51,28 @@ leases = ["acks", "tokio/rt"]
 # right for single-digit rosters and wrong past that.
 hosted = ["tokio/time"]
 
+# Snapshot handoff (M6): the covering state transfer the Hosted tier's recovery
+# deliberately left out. A recovering host whose target lies past the end of a
+# writer's gossiped ring has, without this, only `Gap` plus the consumer's own
+# remediation — which is the whole story when that remediation rebuilds from the
+# consumer's store, and nothing at all when the consumer's state *is* the
+# groupnet-carried state. This feature pulls a covering snapshot from a donor
+# over the existing data plane and verifies it at three points.
+#
+# It implies `hosted` (the watermarks it verifies against are the commit
+# ledger's) and turns on the data plane: `groupnet-transport/bulk` plus the two
+# deps that feature already carries — `bytes` for the copy-free chunk payloads
+# and `futures-util` for the runtime-agnostic AsyncRead/AsyncWrite the stream
+# driver is written over. Nothing novel enters the published graph: every one of
+# them is already there behind `bulk`.
+handoff = [
+    "hosted",
+    "dep:groupnet-transport",
+    "groupnet-transport/bulk",
+    "dep:bytes",
+    "dep:futures-util",
+]
+
 # Built on the runtime's Group handle; the protocol work stays in the engine.
 # tokio is only the sync toolbox (watch channels) — no executor requirement
 # beyond what the runtime already has.
@@ -58,11 +80,20 @@ hosted = ["tokio/time"]
 groupnet-core = { workspace = true }
 groupnet-runtime = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# The handoff tier's data plane — inert unless the `handoff` feature is enabled,
+# and the same versions `groupnet-transport/bulk` already pins.
+groupnet-transport = { workspace = true, optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["io"], optional = true }
 
 # The integration tests and the doc example run real multi-node clusters over
 # the in-memory transport.
 [dev-dependencies]
-groupnet-transport-mem = { workspace = true }
+# `bulk` unconditionally: the handoff suite drives the protocol over the
+# in-process *data* plane (`MemBulkNet`), and a feature list cannot be made
+# conditional on `handoff` for a dev-dependency. Dev-only, so neither the extra
+# tokio slice nor the compat shim reaches the published graph.
+groupnet-transport-mem = { workspace = true, features = ["bulk"] }
 tokio = { workspace = true }
 # The deterministic simulator, for the lease tier's DST (slice S3): the sans-IO
 # cores are driven in virtual time, with no runtime and no transport. Dev-only,
@@ -85,6 +116,12 @@ required-features = ["hosted"]
 [[example]]
 name = "anchored_ownership"
 required-features = ["hosted"]
+
+# The handoff tier's example — the only one that needs both planes, so it also
+# needs the `bulk` half of the dev-dependency above.
+[[example]]
+name = "hosted_handoff"
+required-features = ["handoff"]
 
 [lints]
 workspace = true

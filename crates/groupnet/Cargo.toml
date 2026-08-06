@@ -44,6 +44,25 @@ consistency-leases = ["consistency-acks", "groupnet-consistency/leases"]
 # `consistency-acks` — its commit ledger is a new, epoch-stamped entry rather
 # than a scoped reuse of the ack tier's watermarks.
 consistency-hosted = ["consistency", "groupnet-consistency/hosted"]
+# Snapshot handoff on top of the Hosted write path: a recovering host pulls a
+# covering snapshot from a donor over the data plane instead of waiting for a
+# ring it has already overrun. The only consistency feature that reaches across
+# the two planes, so it turns `bulk` on — bring your own binding (`tcp`, or the
+# `BulkTransport` trait over your own).
+#
+# `groupnet-transport-mem?/bulk` is the one non-obvious edge, and the `?` is the
+# whole of it: this feature needs no in-memory transport, but *if* `mem` is also
+# on (it is, by default) then the binding it selects must carry its data plane
+# too. Without it `transport::mem` would expose the control plane alone and the
+# tier's own in-process fabric — `MemBulkNet` — would be missing from the one
+# build that most obviously wants it. Weak, so `--no-default-features` plus this
+# tier still pulls in nothing.
+consistency-handoff = [
+    "consistency-hosted",
+    "bulk",
+    "groupnet-consistency/handoff",
+    "groupnet-transport-mem?/bulk",
+]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]
@@ -59,6 +78,11 @@ groupnet-sim = { workspace = true, optional = true }
 # The async examples drive the runtime, so they need a Tokio executor.
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+# The handoff facade test implements `SnapshotSource`/`SnapshotSink`, whose chunk
+# type is `bytes::Bytes`. The facade re-exports no `bytes`, so a consumer that
+# implements those two traits declares its own `bytes = "1"` exactly as this does
+# — same crate, same semver train. Dev-only: nothing enters the published graph.
+bytes = "1"
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,
 # so this never enters the published dependency graph. Do NOT add `version`.
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }

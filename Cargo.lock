@@ -173,6 +173,7 @@ dependencies = [
 name = "groupnet"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "groupnet-consistency",
  "groupnet-core",
  "groupnet-runtime",
@@ -189,10 +190,13 @@ dependencies = [
 name = "groupnet-consistency"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-util",
  "groupnet-core",
  "groupnet-runtime",
  "groupnet-sim",
  "groupnet-testkit",
+ "groupnet-transport",
  "groupnet-transport-mem",
  "tokio",
 ]
@@ -249,9 +253,11 @@ dependencies = [
 name = "groupnet-transport-mem"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "groupnet-core",
  "groupnet-transport",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

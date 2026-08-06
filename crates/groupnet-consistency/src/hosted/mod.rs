@@ -152,6 +152,20 @@
 //! and skips that rebuild keeps the divergence permanently; for it, the `Gap` is
 //! not advisory.
 //!
+//! **Recovery is ring-bound, and nothing here transfers state.** The recovery
+//! rule names a target; reaching one that lies past the end of a writer's
+//! visible ring is done the way any lagging subscriber does it — the
+//! [`Gap`](HostedRead::Gap), the consumer's own coarse remediation, and a
+//! frontier advanced into the target — and **never** by replaying the individual
+//! writes. That is the whole story for a consumer whose remediation rebuilds
+//! from its own store. For one whose state *is* the groupnet-carried state, a
+//! ring overrun leaves nothing to rebuild from, and the honest options are two:
+//! size the ring for the worst migration lag you accept, or transfer state out
+//! of band. The optional `handoff` feature (module `hosted::handoff`) is the
+//! second — a covering snapshot pulled from a donor over the data plane,
+//! verified at three points, priced and bounded in its own honesty box. It is
+//! opt-in, and this tier is complete without it.
+//!
 //! **Durability is majority-durability.** [`Commit::QuorumApplied`] cannot
 //! outlive the simultaneous loss of a majority of the applied copies — the
 //! watermarks are gossiped state, and a majority crashing amnesiac at once takes
@@ -171,6 +185,8 @@
 //! Loud, and never a lost write.
 
 mod commit;
+#[cfg(feature = "handoff")]
+pub mod handoff;
 mod ledger;
 mod lineage;
 mod reads;

@@ -44,6 +44,18 @@
 //! consensus, deliberately confined to fixed single-digit rosters, and it is the
 //! only thing in this crate that costs a majority round-trip per write.
 //!
+//! That tier's recovery is **ring-bound**: a new host whose target lies past the
+//! end of a writer's gossiped window reaches it through a `Gap` and the
+//! consumer's own coarse remediation, never by replay. For a consumer that
+//! rebuilds from its own store, that is the whole story. For one whose state
+//! *is* the groupnet-carried state, the optional **snapshot handoff** (feature
+//! `handoff`, module `hosted::handoff`) is the way out: pull a covering snapshot
+//! from a donor over the data plane's `BulkTransport` and verify it at three
+//! points — the donor's fence stamp, its coverage of what was needed, and the
+//! transfer's own counts. It is the only feature here that touches the data
+//! plane, and its honesty box is blunt about what verification can and cannot
+//! prove.
+//!
 //! Sitting beside both, priced at nothing and gated by nothing, are
 //! **typed watermarks**: [`SeqFloors`] publishes per-node, per-key floors in
 //! the consumer's *own* sequence space (a shard LSN, a WAL offset) as TTL'd
@@ -211,6 +223,12 @@ pub use acks::{AckLedger, CAP_ACKS, applied_by, applied_by_selected, applied_clu
 pub use feed::WriteFeed;
 pub use floor::SeqFloors;
 pub use frontier::{Frontier, FrontierView};
+#[cfg(feature = "handoff")]
+pub use hosted::handoff::{
+    Coverage, DoneCheck, DoneCounts, Handoff, HandoffCore, HandoffError, HandoffPhase,
+    HandoffReceipt, HandoffStep, Offered, RefusalCode, Snapshot, SnapshotChunks, SnapshotSink,
+    SnapshotSource, Staleness,
+};
 #[cfg(feature = "hosted")]
 pub use hosted::{
     CAP_HOSTED, Commit, CommitCore, CommitLedger, CommitOutcome, CommitReceipt, CommitVerdict,

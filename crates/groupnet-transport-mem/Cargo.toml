@@ -7,17 +7,29 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Data plane: `MemBulkNet` / `MemBulkTransport`, reliable in-process byte
+# streams over `tokio::io::duplex`. Pulls the `bulk` trait surface, tokio's
+# pipe (`io-util`), and the futures-io compat shim — all inert by default, so
+# the control-plane-only build stays on tokio's `sync` slice alone.
+bulk = ["groupnet-transport/bulk", "tokio/io-util", "dep:tokio-util"]
+
 # A concrete Transport binding depends only on the trait and the id type — never
 # on the runtime. It pulls just tokio's channel/sync slice.
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# Data plane only — inert unless the `bulk` feature is enabled. Declared here
+# rather than in `[workspace.dependencies]`, mirroring groupnet-transport-tcp:
+# the compat shim is a binding-local detail, not a workspace-wide one.
+tokio-util = { version = "0.7", default-features = false, features = ["compat"], optional = true }
 
-# The integration test drives the endpoints from an executor, so it needs the
+# The integration tests drive the endpoints from an executor, so they need the
 # workspace's wider tokio slice (rt + macros + time) on top of `sync`.
 [dev-dependencies]
 tokio = { workspace = true }
+bytes = "1"
 
 [lints]
 workspace = true
