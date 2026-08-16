@@ -25,15 +25,31 @@ struct Ring {
     first_seq: u64,
     keys: VecDeque<Vec<u8>>,
     capacity: usize,
+    max_frame_bytes: usize,
+    encoded_keys_bytes: usize,
 }
 
 impl Ring {
     fn push(&mut self, key: Vec<u8>) {
+        self.encoded_keys_bytes = self
+            .encoded_keys_bytes
+            .saturating_add(4_usize.saturating_add(key.len()));
         self.keys.push_back(key);
-        if self.keys.len() > self.capacity {
-            self.keys.pop_front();
+        while self.keys.len() > self.capacity
+            || (self.keys.len() > 1 && self.encoded_len() > self.max_frame_bytes)
+        {
+            let Some(removed) = self.keys.pop_front() else {
+                break;
+            };
+            self.encoded_keys_bytes = self
+                .encoded_keys_bytes
+                .saturating_sub(4_usize.saturating_add(removed.len()));
             self.first_seq += 1;
         }
+    }
+
+    fn encoded_len(&self) -> usize {
+        20_usize.saturating_add(self.encoded_keys_bytes)
     }
 
     fn frame(&self) -> Frame {
@@ -96,12 +112,20 @@ impl<K> WriteFeed<K> {
     /// Creates a named feed — independent subsystems sharing one group must
     /// name their feeds so they occupy distinct entries (and pair each with
     /// [`PeerWrites::named`](crate::PeerWrites::named) under the same name).
+    ///
+    /// `capacity` is an upper bound, not a promise that every slot remains
+    /// visible: the ring is also trimmed to the group's
+    /// [`Config::max_delta_frame_bytes`](groupnet_core::Config::max_delta_frame_bytes)
+    /// budget. Large encoded keys therefore shorten the replay window and make a
+    /// lagging subscriber receive an explicit [`PeerWrite::Gap`](crate::PeerWrite::Gap)
+    /// instead of growing this single gossiped entry past the transport envelope.
     pub fn named(
         name: &str,
         group: Group,
         capacity: NonZeroUsize,
         encode: impl Fn(&K) -> Vec<u8> + Send + Sync + 'static,
     ) -> Self {
+        let max_frame_bytes = group.config().max_delta_frame_bytes;
         Self {
             group,
             key: entry_key(name),
@@ -110,6 +134,8 @@ impl<K> WriteFeed<K> {
                 first_seq: 1,
                 keys: VecDeque::new(),
                 capacity: capacity.get(),
+                max_frame_bytes,
+                encoded_keys_bytes: 0,
             }),
             encode: Box::new(encode),
         }
@@ -223,6 +249,8 @@ mod tests {
             first_seq: 1,
             keys: VecDeque::new(),
             capacity: 2,
+            max_frame_bytes: usize::MAX,
+            encoded_keys_bytes: 0,
         };
         for key in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()] {
             ring.push(key);
@@ -230,5 +258,28 @@ mod tests {
         let frame = ring.frame();
         assert_eq!(frame.first_seq, 2);
         assert_eq!(frame.keys, vec![b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn ring_byte_budget_keeps_the_newest_write_and_advances_first_seq() {
+        let mut ring = Ring {
+            epoch: 1,
+            first_seq: 1,
+            keys: VecDeque::new(),
+            capacity: 32,
+            max_frame_bytes: 40,
+            encoded_keys_bytes: 0,
+        };
+        for key in [
+            b"aaaaaaaa".to_vec(),
+            b"bbbbbbbb".to_vec(),
+            b"cccccccc".to_vec(),
+        ] {
+            ring.push(key);
+        }
+        let frame = ring.frame();
+        assert_eq!(frame.first_seq, 3);
+        assert_eq!(frame.keys, vec![b"cccccccc".to_vec()]);
+        assert!(frame.encode().len() <= ring.max_frame_bytes);
     }
 }

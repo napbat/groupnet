@@ -13,7 +13,7 @@ use std::time::Duration;
 use groupnet_consistency::{
     Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
 };
-use groupnet_testkit::cluster::{NodeOpts, converged_within, spawn_mem_node};
+use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
 
 const GROUP: &str = "stores";
@@ -147,6 +147,67 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
         }
     );
     assert_eq!(peers.gaps_seen(), 1);
+}
+
+/// The count limit cannot let one feed entry outgrow the group's transport
+/// budget. Long keys shorten the visible ring and a subscriber behind that
+/// byte-bound window gets the same explicit gap as a count-bound overflow.
+#[tokio::test]
+async fn encoded_feed_budget_degrades_to_an_explicit_gap() {
+    let net = Network::new();
+    let opts = opts().max_delta_frame_bytes(1_024);
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bytes-a", &["bytes-b"], &opts);
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "bytes-b", &["bytes-a"], &opts);
+    converged_within(&[&a_group, &b_group], SETTLE).await;
+
+    let mut peers = PeerWrites::new(b_group.clone(), b_id, decode);
+    let feed =
+        WriteFeed::new(a_group, cap(4_096), |key: &String| key.clone().into_bytes()).with_epoch(11);
+    feed.publish(&"baseline".to_owned()).await;
+    assert!(matches!(
+        next_event(&mut peers).await,
+        PeerWrite::Wrote {
+            token: WriteToken { seq: 1, .. },
+            ..
+        }
+    ));
+
+    let mut last = WriteToken { epoch: 11, seq: 1 };
+    for seq in 2..=24 {
+        let key = format!("{seq:04}-{}", "x".repeat(256));
+        last = feed.publish(&key).await;
+    }
+    feed.republish().await;
+    eventually_within("byte-bounded feed head", SETTLE, || {
+        advertised_head(&b_group, &a_id) == Some(last)
+    })
+    .await;
+
+    match next_event(&mut peers).await {
+        PeerWrite::Gap {
+            peer,
+            missed_through,
+        } => {
+            assert_eq!(peer, a_id);
+            assert!(
+                missed_through.seq > 1,
+                "the byte budget must retire writes beyond the subscriber's cursor"
+            );
+        }
+        PeerWrite::Wrote { .. } => panic!("byte-window overflow must surface before survivors"),
+    }
+    let mut applied = None;
+    while applied != Some(last) {
+        match next_event(&mut peers).await {
+            PeerWrite::Wrote { peer, token, .. } => {
+                assert_eq!(peer, a_id);
+                applied = Some(token);
+            }
+            PeerWrite::Gap { .. } => panic!("one byte-window gap must cover the retired prefix"),
+        }
+    }
+    assert_eq!(peers.gaps_seen(), 1);
+    assert_eq!(peers.lag(&a_id), Some(0), "surviving tail must catch up");
 }
 
 /// The advertised head tracks the writer's latest publish (as gossip shows
