@@ -117,10 +117,14 @@
 //! # Semantics (read this once, rely on it forever)
 //!
 //! - **State-based, not a log.** The feed entry always carries the last N
-//!   writes; gossip loss, event lag, and duplication are all safe because
-//!   subscribers reconcile against the current entry, and applying a write
-//!   notification must be idempotent. Missing writes are *detected*, never
-//!   silently dropped.
+//!   writes that fit both the caller's item capacity and the group's encoded
+//!   frame budget. Crossing either bound retires the oldest writes and yields
+//!   the same explicit [`PeerWrite::Gap`] to a lagging subscriber; the whole
+//!   ring can therefore never silently arrest dissemination by outgrowing its
+//!   control-plane envelope. Gossip loss, event lag, and duplication are all
+//!   safe because subscribers reconcile against the current entry, and
+//!   applying a write notification must be idempotent. Missing writes are
+//!   *detected*, never silently dropped.
 //! - **Eventual, bounded by propagation latency.** A peer observes a write
 //!   after roughly one gossip round (or one round trip, when the engine's
 //!   eager delta push is enabled). The barrier for "has it landed?" is the

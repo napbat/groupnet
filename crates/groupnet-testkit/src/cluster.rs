@@ -87,6 +87,7 @@ pub struct NodeOpts {
     group: GroupId,
     gossip_interval_ms: Option<u64>,
     anti_entropy_interval_ms: Option<u64>,
+    max_delta_frame_bytes: Option<usize>,
     advertise_addr: Option<String>,
     group_profile: Option<GroupProfile>,
 }
@@ -99,6 +100,7 @@ impl NodeOpts {
             group: group.into(),
             gossip_interval_ms: None,
             anti_entropy_interval_ms: None,
+            max_delta_frame_bytes: None,
             advertise_addr: None,
             group_profile: None,
         }
@@ -119,6 +121,14 @@ impl NodeOpts {
     #[must_use]
     pub fn anti_entropy_interval_ms(mut self, ms: u64) -> Self {
         self.anti_entropy_interval_ms = Some(ms);
+        self
+    }
+
+    /// Overrides the maximum encoded gossip frame size — see
+    /// [`NodeBuilder::max_delta_frame_bytes`](groupnet_runtime::NodeBuilder::max_delta_frame_bytes).
+    #[must_use]
+    pub fn max_delta_frame_bytes(mut self, bytes: usize) -> Self {
+        self.max_delta_frame_bytes = Some(bytes);
         self
     }
 
@@ -208,6 +218,9 @@ fn build_node(
     }
     if let Some(ms) = opts.anti_entropy_interval_ms {
         builder = builder.anti_entropy_interval_ms(ms);
+    }
+    if let Some(bytes) = opts.max_delta_frame_bytes {
+        builder = builder.max_delta_frame_bytes(bytes);
     }
     if let Some(addr) = &opts.advertise_addr {
         builder = builder.advertise_addr(addr.clone());

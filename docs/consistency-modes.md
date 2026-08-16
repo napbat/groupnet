@@ -897,6 +897,15 @@ Storage-free Quorum keeps S4c; it does not keep S5. A deployment choosing
 
 ##### The ring is the substrate, and it is bounded
 
+The bound has two axes: the caller's item capacity and the group's encoded
+`max_delta_frame_bytes` budget. `WriteFeed` retires the oldest items as soon as
+either bound is crossed (while retaining at least the newest item), because the
+whole visible ring is one gossiped state entry. An item-count-only ring can fit
+the caller's capacity while producing a datagram-sized entry the transport can
+never disseminate; that is silent feed arrest, not a tolerable slow subscriber.
+The byte bound converts the same condition into the existing explicit `Gap`
+contract and keeps the control-plane frame inside its configured envelope.
+
 Recovery is expressed as watermarks, and a watermark past the end of a peer's
 visible ring is reached by machinery that already exists: the subscriber
 surfaces `PeerWrite::Gap`, the consumer remediates coarsely per its own contract
@@ -907,8 +916,8 @@ that nobody reads "recovery" as "replay":
   writes. It is `Gap`-remediated exactly as any lagging subscriber is, and
   completeness is satisfied by the remediation — not by the individual writes.
 * A consumer needing **exact replay** rather than coarse remediation must size
-  the ring for the worst migration lag it accepts. That is a capacity decision
-  and it is the consumer's.
+  both the ring's item capacity and the group's frame budget for the worst
+  migration lag it accepts. That is a capacity decision and it is the consumer's.
 * **State transfer is not in this milestone**, and it is not in this tier: `Gap`
   plus the consumer's remediation is the whole story here — which is what the
   strong-profile-versus-Raft table's "a laggard gaps and state-resyncs" row
