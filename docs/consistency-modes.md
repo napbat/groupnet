@@ -906,6 +906,14 @@ never disseminate; that is silent feed arrest, not a tolerable slow subscriber.
 The byte bound converts the same condition into the existing explicit `Gap`
 contract and keeps the control-plane frame inside its configured envelope.
 
+An application may explicitly shorten the window with
+`WriteFeed::retire_through` once every reader that may serve has applied
+through that token, or has lost serving authority. Retirement discards that
+matching-epoch prefix but always retains the newest current entry as a head
+anchor; a subscriber behind the new start receives the same explicit `Gap`.
+This is application-acknowledged compaction, not an inference Groupnet makes
+from delivery or gossip alone.
+
 Recovery is expressed as watermarks, and a watermark past the end of a peer's
 visible ring is reached by machinery that already exists: the subscriber
 surfaces `PeerWrite::Gap`, the consumer remediates coarsely per its own contract

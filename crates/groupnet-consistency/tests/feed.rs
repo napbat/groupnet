@@ -13,6 +13,8 @@ use std::time::Duration;
 use groupnet_consistency::{
     Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
 };
+use groupnet_core::NodeId;
+use groupnet_runtime::Group;
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
 
@@ -43,6 +45,14 @@ async fn next_event(peers: &mut PeerWrites<String>) -> PeerWrite<String> {
 
 fn decode(bytes: &[u8]) -> Option<String> {
     String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// Reads the window start from the fixed feed frame header. Public head
+/// observability alone cannot distinguish a compacted frame from an older,
+/// longer frame carrying the same head.
+fn advertised_first_seq(group: &Group, peer: &NodeId) -> Option<u64> {
+    let frame = group.node_entry(peer, "~writes")?;
+    Some(u64::from_le_bytes(frame.get(8..16)?.try_into().ok()?))
 }
 
 #[tokio::test]
@@ -144,6 +154,96 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
             peer: a_id,
             token: WriteToken { epoch, seq: 4 },
             key: "w4".to_owned()
+        }
+    );
+    assert_eq!(peers.gaps_seen(), 1);
+}
+
+/// Application-acknowledged retirement shortens the visible window without
+/// renumbering it. A laggard receives one gap, then the retained anchor and a
+/// subsequent write with their original monotonic tokens.
+#[tokio::test]
+async fn retired_prefix_gaps_then_delivers_the_anchor_and_tail() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "rt-a", &["rt-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "rt-b", &["rt-a"], &opts());
+    converged_within(&[&a_group, &b_group], SETTLE).await;
+
+    let mut peers = PeerWrites::new(b_group.clone(), b_id, decode);
+    let feed = WriteFeed::new(a_group.clone(), cap(128), |key: &String| {
+        key.clone().into_bytes()
+    })
+    .with_epoch(17);
+
+    let baseline = feed.publish(&"w1".to_owned()).await;
+    assert_eq!(baseline, WriteToken { epoch: 17, seq: 1 });
+    assert!(matches!(
+        next_event(&mut peers).await,
+        PeerWrite::Wrote { token, .. } if token == baseline
+    ));
+
+    let w2 = feed.publish(&"w2".to_owned()).await;
+    let retired = feed.publish(&"w3".to_owned()).await;
+    let anchor = feed.publish(&"w4".to_owned()).await;
+    assert_eq!(w2.seq, 2);
+    assert_eq!(retired.seq, 3);
+    assert_eq!(anchor.seq, 4);
+
+    // Poll the older acknowledgement last: it must advertise the already-more-
+    // compact current ring rather than restore the prefix it retired first.
+    let older_ack = feed.retire_through(w2);
+    let newer_ack = feed.retire_through(retired);
+    newer_ack.await;
+    eventually_within("newer retirement window", SETTLE, || {
+        advertised_head(&b_group, &a_id) == Some(anchor)
+            && advertised_first_seq(&b_group, &a_id) == Some(anchor.seq)
+    })
+    .await;
+
+    older_ack.await;
+    // This command is enqueued behind the older acknowledgement's feed
+    // advertisement. Observing it remotely proves that late advertisement was
+    // processed before we assert the window did not grow backward.
+    a_group
+        .set_entry("retirement-test-fence", vec![1], None)
+        .expect("enqueue propagation fence");
+    eventually_within("post-older-ack propagation fence", SETTLE, || {
+        b_group.node_entry(&a_id, "retirement-test-fence") == Some(vec![1])
+    })
+    .await;
+    assert_eq!(advertised_head(&b_group, &a_id), Some(anchor));
+    assert_eq!(advertised_first_seq(&b_group, &a_id), Some(anchor.seq));
+
+    let tail = feed.publish(&"w5".to_owned()).await;
+    assert_eq!(tail, WriteToken { epoch: 17, seq: 5 });
+    assert_eq!(feed.last_token(), Some(tail));
+    eventually_within("post-retirement feed head", SETTLE, || {
+        advertised_head(&b_group, &a_id) == Some(tail)
+            && advertised_first_seq(&b_group, &a_id) == Some(anchor.seq)
+    })
+    .await;
+
+    assert_eq!(
+        next_event(&mut peers).await,
+        PeerWrite::Gap {
+            peer: a_id.clone(),
+            missed_through: retired,
+        }
+    );
+    assert_eq!(
+        next_event(&mut peers).await,
+        PeerWrite::Wrote {
+            peer: a_id.clone(),
+            token: anchor,
+            key: "w4".to_owned(),
+        }
+    );
+    assert_eq!(
+        next_event(&mut peers).await,
+        PeerWrite::Wrote {
+            peer: a_id,
+            token: tail,
+            key: "w5".to_owned(),
         }
     );
     assert_eq!(peers.gaps_seen(), 1);

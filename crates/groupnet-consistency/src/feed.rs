@@ -52,6 +52,28 @@ impl Ring {
         20_usize.saturating_add(self.encoded_keys_bytes)
     }
 
+    /// Retires the acknowledged prefix while keeping the current head as a
+    /// sequence anchor for subscribers reconciling this state-based feed.
+    fn retire_through(&mut self, token: WriteToken) -> bool {
+        if token.epoch != self.epoch || self.keys.len() <= 1 || token.seq < self.first_seq {
+            return false;
+        }
+
+        let mut changed = false;
+        while self.keys.len() > 1 && self.first_seq <= token.seq {
+            let removed = self
+                .keys
+                .pop_front()
+                .expect("a non-anchor entry exists while retiring");
+            self.encoded_keys_bytes = self
+                .encoded_keys_bytes
+                .saturating_sub(4_usize.saturating_add(removed.len()));
+            self.first_seq += 1;
+            changed = true;
+        }
+        changed
+    }
+
     fn frame(&self) -> Frame {
         Frame {
             epoch: self.epoch,
@@ -189,7 +211,7 @@ impl<K> WriteFeed<K> {
     /// future is polled), so even a dropped future is re-carried by the
     /// next publish.
     pub fn publish(&self, key: &K) -> impl Future<Output = WriteToken> + Send + '_ {
-        let (token, frame) = {
+        let token = {
             let mut ring = self
                 .ring
                 .lock()
@@ -199,34 +221,69 @@ impl<K> WriteFeed<K> {
                 seq: ring.first_seq + ring.keys.len() as u64,
             };
             ring.push((self.encode)(key));
-            (token, ring.frame().encode())
+            token
         };
         async move {
-            self.advertise(frame).await;
+            self.advertise_current().await;
             token
+        }
+    }
+
+    /// Retires writes through `token` from the advertised history and
+    /// re-advertises the shortened feed best-effort.
+    ///
+    /// Call this only after every reader that may still serve has applied
+    /// through `token`, or after those readers have lost serving authority.
+    /// Retirement is irreversible: a lagging subscriber behind the shortened
+    /// window receives [`PeerWrite::Gap`](crate::PeerWrite::Gap). The newest
+    /// current-epoch write is always retained as the advertised-head anchor,
+    /// even when `token` is at or beyond that head.
+    ///
+    /// Tokens from another epoch, tokens older than the retained window, an
+    /// empty feed, and acknowledgements already reflected in the window are
+    /// no-ops. Concurrent acknowledgements compact monotonically: a late older
+    /// token cannot restore retired entries or move sequence identity backward.
+    ///
+    /// The ring is shortened synchronously before the returned future is
+    /// polled. If its advertisement meets sustained inbox backpressure, the
+    /// next [`publish`](Self::publish) re-carries the compacted window.
+    pub fn retire_through(&self, token: WriteToken) -> impl Future<Output = ()> + Send + '_ {
+        let changed = {
+            let mut ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ring.retire_through(token)
+        };
+        async move {
+            if changed {
+                self.advertise_current().await;
+            }
         }
     }
 
     /// Re-advertises the current feed without recording a new write —
     /// useful at quiescence points after a `publish` hit backpressure.
     pub fn republish(&self) -> impl Future<Output = ()> + Send + '_ {
-        let frame = {
-            let ring = self
-                .ring
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ring.frame().encode()
-        };
-        self.advertise(frame)
+        self.advertise_current()
     }
 
-    async fn advertise(&self, frame: Vec<u8>) {
+    async fn advertise_current(&self) {
         for _ in 0..PUBLISH_RETRIES {
-            if self
-                .group
-                .set_entry(self.key.clone(), frame.clone(), None)
-                .is_ok()
-            {
+            // Enqueue while holding the ring lock: a concurrent publish or
+            // retirement can only mutate after this frame is ordered into the
+            // actor inbox, so delayed/out-of-order futures cannot advertise an
+            // older window over a newer one.
+            let advertised = {
+                let ring = self
+                    .ring
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.group
+                    .set_entry(self.key.clone(), ring.frame().encode(), None)
+                    .is_ok()
+            };
+            if advertised {
                 return;
             }
             // Inbox backpressure: yield and retry; on sustained pressure the
@@ -281,5 +338,74 @@ mod tests {
         assert_eq!(frame.first_seq, 3);
         assert_eq!(frame.keys, vec![b"cccccccc".to_vec()]);
         assert!(frame.encode().len() <= ring.max_frame_bytes);
+    }
+
+    #[test]
+    fn retirement_keeps_the_head_anchor_and_exact_byte_accounting() {
+        let mut ring = Ring {
+            epoch: 7,
+            first_seq: 1,
+            keys: VecDeque::new(),
+            capacity: 8,
+            max_frame_bytes: usize::MAX,
+            encoded_keys_bytes: 0,
+        };
+        for key in [b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()] {
+            ring.push(key);
+        }
+
+        assert!(ring.retire_through(crate::WriteToken {
+            epoch: 7,
+            seq: u64::MAX,
+        }));
+        let frame = ring.frame();
+        assert_eq!(frame.first_seq, 3);
+        assert_eq!(frame.keys, vec![b"ccc".to_vec()]);
+        assert_eq!(ring.encoded_keys_bytes, 4 + b"ccc".len());
+        assert_eq!(ring.encoded_len(), frame.encode().len());
+    }
+
+    #[test]
+    fn retirement_ignores_wrong_and_out_of_order_tokens() {
+        let mut empty = Ring {
+            epoch: 11,
+            first_seq: 1,
+            keys: VecDeque::new(),
+            capacity: 8,
+            max_frame_bytes: usize::MAX,
+            encoded_keys_bytes: 0,
+        };
+        assert!(!empty.retire_through(crate::WriteToken { epoch: 11, seq: 1 }));
+
+        let mut ring = Ring {
+            epoch: 11,
+            first_seq: 1,
+            keys: VecDeque::new(),
+            capacity: 8,
+            max_frame_bytes: usize::MAX,
+            encoded_keys_bytes: 0,
+        };
+        for key in [
+            b"w1".to_vec(),
+            b"w2".to_vec(),
+            b"w3".to_vec(),
+            b"w4".to_vec(),
+        ] {
+            ring.push(key);
+        }
+
+        assert!(!ring.retire_through(crate::WriteToken { epoch: 10, seq: 4 }));
+        assert_eq!(ring.frame().first_seq, 1);
+
+        assert!(ring.retire_through(crate::WriteToken { epoch: 11, seq: 2 }));
+        assert_eq!(ring.frame().first_seq, 3);
+        assert!(!ring.retire_through(crate::WriteToken { epoch: 11, seq: 1 }));
+        assert!(!ring.retire_through(crate::WriteToken { epoch: 11, seq: 2 }));
+
+        assert!(ring.retire_through(crate::WriteToken { epoch: 11, seq: 3 }));
+        assert_eq!(ring.frame().first_seq, 4);
+        assert!(!ring.retire_through(crate::WriteToken { epoch: 11, seq: 2 }));
+        assert!(!ring.retire_through(crate::WriteToken { epoch: 11, seq: 4 }));
+        assert_eq!(ring.frame().keys, vec![b"w4".to_vec()]);
     }
 }
