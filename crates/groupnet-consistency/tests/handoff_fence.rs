@@ -145,15 +145,15 @@ impl TestSource {
 impl SnapshotSource for TestSource {
     type Chunks = TestChunks;
 
-    async fn open(&self) -> io::Result<Snapshot<TestChunks>> {
-        Ok(Snapshot {
+    fn open(&self) -> impl std::future::Future<Output = io::Result<Snapshot<TestChunks>>> + Send {
+        std::future::ready(Ok(Snapshot {
             covers: self.covers.clone(),
             chunks: TestChunks {
                 remaining: self.chunks.clone().into_iter(),
                 handed: 0,
                 gate: self.gate.clone(),
             },
-        })
+        }))
     }
 }
 
@@ -225,15 +225,15 @@ struct TestSink {
 }
 
 impl SnapshotSink for TestSink {
-    async fn apply(&mut self, chunk: Bytes) -> io::Result<()> {
+    fn apply(&mut self, chunk: Bytes) -> impl std::future::Future<Output = io::Result<()>> + Send {
         self.pending.extend_from_slice(&chunk);
         self.state.lock().expect("sink state").staged += 1;
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
-    async fn finish(self) -> io::Result<()> {
+    fn finish(self) -> impl std::future::Future<Output = io::Result<()>> + Send {
         self.state.lock().expect("sink state").installed = true;
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 

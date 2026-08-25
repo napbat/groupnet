@@ -195,12 +195,12 @@ struct ReplicaSource(Arc<Mutex<Replica>>);
 impl SnapshotSource for ReplicaSource {
     type Chunks = ImageChunks;
 
-    async fn open(&self) -> io::Result<Snapshot<ImageChunks>> {
+    fn open(&self) -> impl std::future::Future<Output = io::Result<Snapshot<ImageChunks>>> + Send {
         let (covers, chunks) = self.0.lock().expect("replica").image();
-        Ok(Snapshot {
+        std::future::ready(Ok(Snapshot {
             covers,
             chunks: ImageChunks(chunks.into_iter()),
-        })
+        }))
     }
 }
 
@@ -208,8 +208,8 @@ impl SnapshotSource for ReplicaSource {
 struct ImageChunks(std::vec::IntoIter<Bytes>);
 
 impl SnapshotChunks for ImageChunks {
-    async fn next(&mut self) -> io::Result<Option<Bytes>> {
-        Ok(self.0.next())
+    fn next(&mut self) -> impl std::future::Future<Output = io::Result<Option<Bytes>>> + Send {
+        std::future::ready(Ok(self.0.next()))
     }
 }
 
@@ -222,14 +222,14 @@ struct ReplicaSink {
 }
 
 impl SnapshotSink for ReplicaSink {
-    async fn apply(&mut self, chunk: Bytes) -> io::Result<()> {
+    fn apply(&mut self, chunk: Bytes) -> impl std::future::Future<Output = io::Result<()>> + Send {
         self.staged.extend_from_slice(&chunk);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
-    async fn finish(self) -> io::Result<()> {
+    fn finish(self) -> impl std::future::Future<Output = io::Result<()>> + Send {
         let ReplicaSink { replica, staged } = self;
-        replica.lock().expect("replica").install(&staged)
+        std::future::ready(replica.lock().expect("replica").install(&staged))
     }
 }
 

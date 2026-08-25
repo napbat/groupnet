@@ -116,22 +116,26 @@ impl BulkTransport for MemBulkTransport {
     type Error = io::Error;
     type Stream = Compat<DuplexStream>;
 
-    async fn connect(&self, to: &NodeId) -> io::Result<Self::Stream> {
-        // Resolve inside a scoped block so the std mutex guard is dropped
-        // before any await point.
-        let queue = {
-            let queues = self.queues.lock().expect("bulk network mutex poisoned");
-            queues.get(to).cloned()
-        }
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown peer"))?;
+    fn connect(
+        &self,
+        to: &NodeId,
+    ) -> impl std::future::Future<Output = io::Result<Self::Stream>> + Send {
+        let result = (|| {
+            let queue = {
+                let queues = self.queues.lock().expect("bulk network mutex poisoned");
+                queues.get(to).cloned()
+            }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown peer"))?;
 
-        let (near, far) = tokio::io::duplex(PIPE_BUFFER);
-        // A registered id whose endpoint has been dropped is a live address
-        // with nothing listening: refused, not "not found".
-        queue.send((self.id.clone(), far)).map_err(|_| {
-            io::Error::new(io::ErrorKind::ConnectionRefused, "peer endpoint dropped")
-        })?;
-        Ok(near.compat())
+            let (near, far) = tokio::io::duplex(PIPE_BUFFER);
+            // A registered id whose endpoint has been dropped is a live
+            // address with nothing listening: refused, not "not found".
+            queue.send((self.id.clone(), far)).map_err(|_| {
+                io::Error::new(io::ErrorKind::ConnectionRefused, "peer endpoint dropped")
+            })?;
+            Ok(near.compat())
+        })();
+        std::future::ready(result)
     }
 
     async fn accept(&self) -> io::Result<(NodeId, Self::Stream)> {

@@ -294,92 +294,99 @@ impl Transport for TcpMsgTransport {
         }
     }
 
-    async fn send(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
-        if msg.len() > MAX_FRAME {
-            return Ok(()); // oversized frame = drop, never poison the link
-        }
-        // Pre-frame (length prefix + payload) so the writer hands the socket
-        // one buffer per frame.
-        let mut framed = Vec::with_capacity(4 + msg.len());
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the length prefix is a u32 on the wire, and the oversize guard \
+    fn send(
+        &self,
+        to: &NodeId,
+        msg: &[u8],
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send {
+        let result: io::Result<()> = (|| {
+            if msg.len() > MAX_FRAME {
+                return Ok(()); // oversized frame = drop, never poison the link
+            }
+            // Pre-frame (length prefix + payload) so the writer hands the socket
+            // one buffer per frame.
+            let mut framed = Vec::with_capacity(4 + msg.len());
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the length prefix is a u32 on the wire, and the oversize guard \
                       above already returned for anything past MAX_FRAME"
-        )]
-        framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-        framed.extend_from_slice(msg);
+            )]
+            framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+            framed.extend_from_slice(msg);
 
-        // Fast path: an existing (possibly still dialing) connection.
-        {
-            let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
-            if let Some(conn) = pool.conns.get(to) {
-                match conn.frames.try_send(framed) {
-                    // Handed to the writer, or dropped because its queue is
-                    // full — best-effort either way; anti-entropy repairs.
-                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
-                    // The writer is exiting (idle close or error): remove the
-                    // husk and fall through to a fresh dial.
-                    Err(mpsc::error::TrySendError::Closed(frame)) => {
-                        framed = frame;
-                        pool.remove(to);
+            // Fast path: an existing (possibly still dialing) connection.
+            {
+                let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
+                if let Some(conn) = pool.conns.get(to) {
+                    match conn.frames.try_send(framed) {
+                        // Handed to the writer, or dropped because its queue is
+                        // full — best-effort either way; anti-entropy repairs.
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
+                        // The writer is exiting (idle close or error): remove the
+                        // husk and fall through to a fresh dial.
+                        Err(mpsc::error::TrySendError::Closed(frame)) => {
+                            framed = frame;
+                            pool.remove(to);
+                        }
                     }
                 }
             }
-        }
 
-        // Resolve the address without holding any lock across an await.
-        let addr = self
-            .inner
-            .peers
-            .read()
-            .expect("peers lock poisoned")
-            .get(to)
-            .copied();
-        let Some(addr) = addr else {
-            return Ok(()); // unknown peer = drop, per the trait contract
-        };
+            // Resolve the address after releasing the connection-pool lock.
+            let addr = self
+                .inner
+                .peers
+                .read()
+                .expect("peers lock poisoned")
+                .get(to)
+                .copied();
+            let Some(addr) = addr else {
+                return Ok(()); // unknown peer = drop, per the trait contract
+            };
 
-        let (tx, rx) = mpsc::channel(self.inner.config.outbound_queue);
-        tx.try_send(framed).expect("fresh queue has capacity");
-        let generation;
-        {
-            let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
-            // At the cap: close the oldest connection(s) first. Dropping the
-            // sender ends that writer task; if its peer is still active, the
-            // next frame to it simply re-dials.
-            while pool.conns.len() >= self.inner.config.max_outbound {
-                let Some((g, node)) = pool.order.pop_front() else {
-                    break;
-                };
-                if pool.conns.get(&node).is_some_and(|c| c.generation == g) {
-                    pool.conns.remove(&node);
+            let (tx, rx) = mpsc::channel(self.inner.config.outbound_queue);
+            tx.try_send(framed).expect("fresh queue has capacity");
+            let generation;
+            {
+                let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
+                // At the cap: close the oldest connection(s) first. Dropping the
+                // sender ends that writer task; if its peer is still active, the
+                // next frame to it simply re-dials.
+                while pool.conns.len() >= self.inner.config.max_outbound {
+                    let Some((g, node)) = pool.order.pop_front() else {
+                        break;
+                    };
+                    if pool.conns.get(&node).is_some_and(|c| c.generation == g) {
+                        pool.conns.remove(&node);
+                    }
                 }
+                generation = pool.next_generation;
+                pool.next_generation += 1;
+                pool.conns.insert(
+                    to.clone(),
+                    Conn {
+                        generation,
+                        frames: tx,
+                    },
+                );
+                pool.order.push_back((generation, to.clone()));
             }
-            generation = pool.next_generation;
-            pool.next_generation += 1;
-            pool.conns.insert(
-                to.clone(),
-                Conn {
-                    generation,
-                    frames: tx,
-                },
-            );
-            pool.order.push_back((generation, to.clone()));
-        }
-        // Concurrent sends to the same peer can race past the fast path; the
-        // loser's insert replaces the winner's entry and the winner's task
-        // exits once its now-unreferenced queue drains. Rare and harmless.
-        tokio::spawn(write_loop(Outbound {
-            inner: Arc::downgrade(&self.inner),
-            peer: to.clone(),
-            generation,
-            addr,
-            frames: rx,
-            idle: self.inner.config.idle_timeout,
-            local: self.inner.local.clone(),
-            intro: self.inner.intro.clone(),
-        }));
-        Ok(())
+            // Concurrent sends to the same peer can race past the fast path; the
+            // loser's insert replaces the winner's entry and the winner's task
+            // exits once its now-unreferenced queue drains. Rare and harmless.
+            tokio::spawn(write_loop(Outbound {
+                inner: Arc::downgrade(&self.inner),
+                peer: to.clone(),
+                generation,
+                addr,
+                frames: rx,
+                idle: self.inner.config.idle_timeout,
+                local: self.inner.local.clone(),
+                intro: self.inner.intro.clone(),
+            }));
+            Ok(())
+        })();
+        std::future::ready(result)
     }
 
     async fn recv(&self) -> io::Result<Inbound> {

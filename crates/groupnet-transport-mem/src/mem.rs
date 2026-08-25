@@ -68,11 +68,11 @@ impl std::error::Error for Closed {}
 impl Transport for MemTransport {
     type Error = Closed;
 
-    // `async fn` here still satisfies the trait's `impl Future + Send` bound —
-    // the compiler enforces `Send` on the returned future regardless.
-    async fn send(&self, to: &NodeId, msg: &[u8]) -> Result<(), Closed> {
-        // Resolve the target inside a scoped block so the std mutex guard is
-        // dropped before any await point.
+    fn send(
+        &self,
+        to: &NodeId,
+        msg: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), Closed>> + Send {
         let target = {
             let peers = self.peers.lock().expect("network mutex poisoned");
             peers.get(to).cloned()
@@ -84,7 +84,7 @@ impl Transport for MemTransport {
                 msg: msg.to_vec(),
             });
         }
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     async fn recv(&self) -> Result<Inbound, Closed> {
