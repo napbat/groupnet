@@ -9,7 +9,7 @@
 use std::fmt;
 use std::io;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -26,7 +26,7 @@ struct FrameHeader {
     /// needs (control frames, end-of-stream markers) can be added compatibly.
     kind: u8,
     /// Padding to a round 8 bytes.
-    _reserved: [u8; 3],
+    reserved: [u8; 3],
 }
 
 const HEADER_SIZE: usize = core::mem::size_of::<FrameHeader>();
@@ -41,7 +41,8 @@ const MAX_FRAME: usize = 256 << 20;
 ///
 /// Wraps any [`AsyncRead`] + [`AsyncWrite`] and moves whole [`Bytes`] payloads:
 /// the header is typed (zerocopy), and the payload is read into one buffer and
-/// handed out as `Bytes` with no extra copy.
+/// handed out as `Bytes` with no extra copy. Cancelling a send or receive after
+/// it starts may leave a partial frame; the caller must discard that stream.
 pub struct DataStream<S> {
     inner: S,
 }
@@ -69,22 +70,54 @@ impl<S: AsyncWrite + Unpin> DataStream<S> {
     ///
     /// # Errors
     /// Propagates any write error.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the header's length field is a u32 by definition of the framing, and \
-                  a peer refuses anything past the 256 MiB `MAX_FRAME` cap — four \
-                  orders of magnitude below where a length could truncate"
-    )]
     pub async fn send(&mut self, payload: Bytes) -> io::Result<()> {
+        self.send_bounded(payload, MAX_FRAME).await
+    }
+
+    /// Sends a frame only if it fits the caller's finite operation budget.
+    /// The limit is checked before any header or payload bytes are written.
+    ///
+    /// # Errors
+    /// Rejects invalid limits or oversized payloads and propagates write errors.
+    pub async fn send_bounded(&mut self, payload: Bytes, max_bytes: usize) -> io::Result<()> {
+        self.send_bounded_ref(&payload, max_bytes).await
+    }
+
+    /// Sends from borrowed admitted storage without making a second payload
+    /// allocation. The caller must retain that storage and its charge through
+    /// this entire write. A cancelled write leaves the stream unusable.
+    ///
+    /// # Errors
+    /// Rejects invalid limits or oversized payloads and propagates write errors.
+    pub async fn send_bounded_ref(&mut self, payload: &[u8], max_bytes: usize) -> io::Result<()> {
+        if max_bytes == 0 || max_bytes > MAX_FRAME || payload.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame exceeds caller's bounded send limit",
+            ));
+        }
+        let len = u32::try_from(payload.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame length exceeds u32"))?;
         let header = FrameHeader {
-            len: U32::new(payload.len() as u32),
+            len: U32::new(len),
             kind: FRAME_KIND_DATA,
-            _reserved: [0; 3],
+            reserved: [0; 3],
         };
         self.inner.write_all(header.as_bytes()).await?;
-        self.inner.write_all(&payload).await?;
+        self.inner.write_all(payload).await?;
         self.inner.flush().await?;
         Ok(())
+    }
+
+    /// Requests write-half shutdown after a complete protocol terminator.
+    /// Bindings used by the bootstrap exchange must preserve the read half
+    /// until the peer's reply; a cancelled or failed close requires
+    /// discarding this stream.
+    ///
+    /// # Errors
+    /// Propagates the underlying stream's close error.
+    pub async fn finish_write(&mut self) -> io::Result<()> {
+        self.inner.close().await
     }
 }
 
@@ -95,27 +128,58 @@ impl<S: AsyncRead + Unpin> DataStream<S> {
     /// Propagates read errors, and rejects a header whose length exceeds the
     /// 256 MiB cap.
     pub async fn recv(&mut self) -> io::Result<Option<Bytes>> {
-        let mut header_bytes = [0u8; HEADER_SIZE];
-        match self.inner.read_exact(&mut header_bytes).await {
-            Ok(()) => {}
-            // No more frames: treat an EOF at a frame boundary as clean.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+        self.recv_bounded(MAX_FRAME).await
+    }
+
+    /// Reads a frame only if its header fits the caller's operation budget.
+    /// The length is rejected before allocating payload storage. A partial
+    /// header is an error; only EOF at a frame boundary returns `None`.
+    ///
+    /// # Errors
+    /// Rejects zero/oversized limits, malformed or excessive frames, and
+    /// propagates read errors.
+    pub async fn recv_bounded(&mut self, max_bytes: usize) -> io::Result<Option<Bytes>> {
+        if max_bytes == 0 || max_bytes > MAX_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid bounded receive limit",
+            ));
         }
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        // A one-byte read separates a clean boundary EOF from truncation.
+        if self.inner.read(&mut header_bytes[..1]).await? == 0 {
+            return Ok(None);
+        }
+        self.inner.read_exact(&mut header_bytes[1..]).await?;
 
         let header = FrameHeader::read_from_bytes(&header_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed frame header"))?;
-        let len = header.len.get() as usize;
-        if len > MAX_FRAME {
+        if header.kind != FRAME_KIND_DATA || header.reserved != [0; 3] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "frame exceeds maximum size",
+                "unsupported frame header",
+            ));
+        }
+        let len = usize::try_from(header.len.get()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame length is unrepresentable",
+            )
+        })?;
+        if len > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame exceeds caller's bounded receive limit",
             ));
         }
 
-        let mut payload = BytesMut::zeroed(len);
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "frame allocation failed"))?;
+        payload.resize(len, 0);
         self.inner.read_exact(&mut payload).await?;
-        Ok(Some(payload.freeze()))
+        Ok(Some(Bytes::from(payload)))
     }
 }
 
@@ -146,5 +210,95 @@ mod tests {
     #[test]
     fn header_is_eight_bytes() {
         assert_eq!(HEADER_SIZE, 8);
+    }
+
+    #[test]
+    fn bounded_receive_rejects_header_before_payload_allocation() {
+        futures::executor::block_on(async {
+            let header = FrameHeader {
+                len: U32::new(10_000),
+                kind: FRAME_KIND_DATA,
+                reserved: [0; 3],
+            };
+            // There is deliberately no payload; a reader that tried to read
+            // it would report truncation instead of the declared cap.
+            let mut stream = DataStream::new(futures::io::Cursor::new(header.as_bytes()));
+            let error = stream.recv_bounded(16).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        });
+    }
+
+    #[test]
+    fn partial_header_is_not_a_clean_end_of_stream() {
+        futures::executor::block_on(async {
+            let mut partial = DataStream::new(futures::io::Cursor::new(&[1u8, 2, 3][..]));
+            assert_eq!(
+                partial.recv_bounded(16).await.unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            let mut clean = DataStream::new(futures::io::Cursor::new(&[][..]));
+            assert!(clean.recv_bounded(16).await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn unsupported_header_is_rejected_before_body() {
+        futures::executor::block_on(async {
+            for (kind, reserved) in [(7, [0; 3]), (FRAME_KIND_DATA, [1, 0, 0])] {
+                let header = FrameHeader {
+                    len: U32::new(1),
+                    kind,
+                    reserved,
+                };
+                let mut stream = DataStream::new(futures::io::Cursor::new(header.as_bytes()));
+                assert_eq!(
+                    stream.recv_bounded(16).await.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn declared_payload_truncation_is_an_error() {
+        futures::executor::block_on(async {
+            let header = FrameHeader {
+                len: U32::new(3),
+                kind: FRAME_KIND_DATA,
+                reserved: [0; 3],
+            };
+            let mut truncated = header.as_bytes().to_vec();
+            truncated.extend_from_slice(b"ab");
+            let mut stream = DataStream::new(futures::io::Cursor::new(truncated));
+            assert_eq!(
+                stream.recv_bounded(3).await.unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        });
+    }
+
+    #[test]
+    fn bounded_send_refuses_without_writing_and_round_trips_at_limit() {
+        futures::executor::block_on(async {
+            let mut bytes = Vec::new();
+            {
+                let mut stream = DataStream::new(futures::io::Cursor::new(&mut bytes));
+                assert_eq!(
+                    stream
+                        .send_bounded(Bytes::from_static(b"five!"), 4)
+                        .await
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput
+                );
+                stream.send_bounded_ref(b"five!", 5).await.unwrap();
+            }
+            assert_eq!(bytes.len(), HEADER_SIZE + 5);
+            let mut reader = DataStream::new(futures::io::Cursor::new(bytes));
+            assert_eq!(
+                reader.recv_bounded(5).await.unwrap().unwrap(),
+                &b"five!"[..]
+            );
+        });
     }
 }

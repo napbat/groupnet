@@ -166,10 +166,17 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                         && capture.is_active()
                     {
                         self.capture = Some(capture);
-                        if !self.accept(BootstrapEvent::Built { op, selected }) {
+                        if !self.accept(BootstrapEvent::Built {
+                            op,
+                            selected: selected.clone(),
+                        }) {
                             self.drop_capture();
                             return Some(BootstrapOutcome::Declined);
                         }
+                        // The same worker that owns the captured image
+                        // updates the listener's exact admitted claim. A
+                        // later capture retirement clears it synchronously.
+                        self.inbox.set_identity(Some(selected));
                         // A complete captured image exists before the Ready
                         // claim is advertised. Local recovery uses this scan.
                         self.drain_ready_publication(due).await;

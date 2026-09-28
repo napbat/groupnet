@@ -74,7 +74,7 @@ async fn one_worker_builds_origin_once_before_advertising_donor() {
     let admission = admission();
     let claims = Arc::new(Claims::default());
     let donor = Arc::new(OriginDonor::default());
-    let (driver, _sender) = BootstrapSession::new(
+    let (driver, sender) = BootstrapSession::new(
         BootstrapCapabilities {
             claims: Arc::clone(&claims),
             donor: Arc::clone(&donor),
@@ -120,7 +120,22 @@ async fn one_worker_builds_origin_once_before_advertising_donor() {
             |claim| claim.phase == groupnet_core::volatile_bootstrap::ClaimPhase::Ready
         )
     );
+    assert_eq!(
+        sender.current_identity(),
+        claims
+            .local
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|claim| claim.identity.clone())
+    );
     handle.cancel().unwrap();
+    eventually_within(
+        "retired capture clears donor listener identity",
+        SETTLE,
+        || sender.current_identity().is_none(),
+    )
+    .await;
 }
 
 #[tokio::test]

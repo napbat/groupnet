@@ -1,7 +1,8 @@
 # Bounded peer bootstrap data plane
 
-Status: **design contract; implementation pending**. This is an opt-in
-transport for the volatile donor protocol in
+Status: **opt-in framing, typed codec, bounded client/listener, and fault tests
+implemented; claim/transfer worker wiring and fleet consumer integration
+pending**. This is an opt-in transport for the volatile donor protocol in
 [`replication-volatile-transfer-runtime.md`](replication-volatile-transfer-runtime.md).
 It does not change the default S3 origin path or write metadata to origin.
 
@@ -54,8 +55,10 @@ byte admission **before** the read, actor dispatch, clone, or encode that can
 allocate a returned frame. The reservation follows the actual bytes through
 the queued request, decoded response, private stage, or outgoing send and is
 released only after those values are retired. A second simultaneously held
-copy takes a second reservation. There is a finite per-peer request count,
-queued-byte count, and original episode deadline; dropped caller futures do
+copy takes a second reservation. The current listener accepts one stream at
+a time under a finite server deadline, and its worker inbox has finite
+request and byte admission. This serial setting may limit donor throughput
+and has no measured fleet capacity claim. Dropped caller futures do
 not detach uncharged server work. A request deadline cannot be extended by
 stream reconnect, new donor selection, or claim renewal.
 Only the caller's monotonic local deadline controls its connect, send,
@@ -79,9 +82,10 @@ network request/retry state machine. The sans-IO claim and transfer engines
 remain the only protocol decision makers; the runtime maps one current effect
 to one correlated request and returns the exact result or failure.
 
-The listener is one worker-owned bounded inbox. It acquires an exact request
-count and worst-case frame-byte permit before reading an inbound payload or enqueueing donor
-work; it never spawns an unbounded task per stream. Pending requests and
+The listener serves one accepted stream at a time and shares the worker's
+bounded inbox. It reserves worst-case frame bytes before reading a payload,
+then reserves decoded bytes before trying the finite inbox; it never spawns
+an unbounded task per stream. Pending requests and
 outbound replies retain their permits through send or cancellation. It serves
 only the active `DonorCapture` identity and rejects incoming work after
 withdrawal, journal overflow, or capture expiry. Bounded batches yield to
@@ -89,25 +93,26 @@ claim renewal, local feed ingestion, and recovery timers. Closing the worker
 drains or rejects its inbox and drops each stream and permit; an old listener
 cannot route a late request into a replacement capture.
 
-The first public seam is `BootstrapBulkClient<B: BulkTransport>::new(
-DataPlane<B>, follower, ByteAdmission, BulkLimits)` plus a correlated
-`request(parent, child, donor, scope, DonorRequest, local_deadline)` method.
-It returns a typed `DonorReply` or refusal with its admitted response bytes;
-it does not choose a retry time. The donor side is
-`BootstrapBulkListener<B>::new(DataPlane<B>, local_identity, DonorSender,
-ByteAdmission, BulkLimits)` and a cancellation-safe `run()` bound to the
-existing recovery worker lifetime. The listener owns finite in-flight stream
-and queued-byte permits, and `DonorSender::try_submit` owns the decoded
-request charge until the worker responds. The worker still owns the only
-`DonorInbox`, active capture, and claim/transfer core engines. These names
-describe the intended API shape; the exact Rust signatures may adapt to the
-transport's associated stream type without moving policy into the listener.
+The public seam is `BootstrapBulkClient::<B>::new(DataPlane<B>, ByteAdmission,
+BulkLimits)` plus `request(Correlation, &DonorRequest, Instant)`, returning an
+`Admitted<WireReply>` or typed error. It does not choose a retry time. The
+donor side is `BootstrapBulkListener::<B>::new(DataPlane<B>, DonorSender,
+ByteAdmission, BulkLimits)` and `run(watch::Receiver<bool>)`. The listener
+reads `DonorSender::current_identity()` for each request; the owning worker
+updates that identity when a guarded capture becomes ready, and clears it
+when that capture retires. One transport binding can therefore survive a
+new donor attempt/session without admitting old requests. The listener owns
+one admitted stream at a time; `DonorSender::try_submit` keeps the decoded
+request charge through the bounded worker queue and callback. The worker
+still owns the only `DonorInbox`, active capture, and claim/transfer engines.
 
-Verification must include codec round trips and malformed/truncated/oversized
-frames; lost, duplicated, delayed, and reordered terminal responses; a
-cancelled stream after partial write; reservation expiry and exact cleanup;
-global-memory and per-peer backpressure; and multiworker donor exchange over
-`MemBulkNet`/`groupnet-testkit::MemCluster`. A follower stays origin-routed
+Codec and `MemBulkNet` tests now cover malformed/truncated/oversized frames,
+wrong correlation, duplicate/trailing/missing terminators, stalled EOF,
+lost reservation response, full/closed inbox, caller cancellation, and donor
+identity rotation. The subsequent worker/consumer slice must test reservation
+expiry and cleanup, delayed/reordered native replies, actual partial-write
+cancellation, and multiworker donor exchange with
+`groupnet-testkit::MemCluster`. A follower stays origin-routed
 until its separate native coverage, handoff, lease, and recovery gates admit
 local serving. Healthy connected schedules must complete donor transfer;
 faulted schedules may fall back to origin within the original deadline.

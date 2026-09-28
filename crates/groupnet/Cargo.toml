@@ -67,6 +67,12 @@ consistency-handoff = [
 # event-complete subscriptions are separate later capabilities.
 consistency-replication = ["consistency", "groupnet-consistency/replication"]
 consistency-volatile-recovery = ["consistency", "groupnet-consistency/volatile-recovery"]
+consistency-volatile-bootstrap-bulk = [
+    "consistency-volatile-recovery",
+    "bulk",
+    "groupnet-consistency/volatile-bootstrap-bulk",
+    "groupnet-transport-mem?/bulk",
+]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]

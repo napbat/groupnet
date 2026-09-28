@@ -1,6 +1,8 @@
 //! Bounded incoming donor work owned by the existing recovery worker.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use groupnet_core::volatile_bootstrap::ClaimIdentity;
 
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
@@ -27,9 +29,17 @@ pub type DonorResponse = oneshot::Receiver<Result<DonorReply, AdapterError>>;
 pub struct DonorSender {
     sender: mpsc::Sender<IncomingDonorRequest>,
     wake: Arc<Notify>,
+    identity: Arc<Mutex<Option<ClaimIdentity>>>,
 }
 
 impl DonorSender {
+    /// Current complete Ready claim identity published by the owning worker.
+    /// A poisoned identity lock fails closed instead of accepting stale work.
+    #[must_use]
+    pub fn current_identity(&self) -> Option<ClaimIdentity> {
+        self.identity.lock().ok()?.clone()
+    }
+
     /// Queues a request that already owns its exact metadata charge.
     ///
     /// # Errors
@@ -77,6 +87,13 @@ impl IncomingDonorRequest {
 pub struct DonorInbox {
     receiver: mpsc::Receiver<IncomingDonorRequest>,
     wake: Arc<Notify>,
+    identity: Arc<Mutex<Option<ClaimIdentity>>>,
+}
+
+impl Drop for DonorInbox {
+    fn drop(&mut self) {
+        self.set_identity(None);
+    }
 }
 
 impl DonorInbox {
@@ -90,13 +107,27 @@ impl DonorInbox {
         }
         let (sender, receiver) = mpsc::channel(capacity);
         let wake = Arc::new(Notify::new());
+        let identity = Arc::new(Mutex::new(None));
         Ok((
             DonorSender {
                 sender,
                 wake: Arc::clone(&wake),
+                identity: Arc::clone(&identity),
             },
-            Self { receiver, wake },
+            Self {
+                receiver,
+                wake,
+                identity,
+            },
         ))
+    }
+
+    /// Publishes or withdraws the exact donor identity along with the worker's
+    /// captured-image lifecycle. No network caller may mint this identity.
+    pub fn set_identity(&self, identity: Option<ClaimIdentity>) {
+        if let Ok(mut current) = self.identity.lock() {
+            *current = identity;
+        }
     }
 
     /// Receives one already-admitted request in the existing worker loop.

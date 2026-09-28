@@ -146,13 +146,20 @@ cargo clippy -p groupnet-consistency --all-targets --features volatile-recovery 
 cargo clippy -p groupnet --all-targets --features consistency-volatile-recovery -- -D warnings
 cargo check -p groupnet --no-default-features --features consistency-volatile-recovery --all-targets
 RUSTDOCFLAGS='-D warnings' cargo doc -p groupnet-consistency --features volatile-recovery --no-deps
+cargo test -p groupnet-transport --features bulk
+cargo test -p groupnet-transport-mem --features bulk
+cargo test -p groupnet-consistency --features volatile-bootstrap-bulk
+cargo test -p groupnet --features consistency-volatile-bootstrap-bulk
+cargo clippy -p groupnet-consistency -p groupnet-transport -p groupnet-transport-mem -p groupnet --all-targets --features groupnet-consistency/volatile-bootstrap-bulk,groupnet/consistency-volatile-bootstrap-bulk,groupnet-transport-mem/bulk -- -D warnings
+cargo check -p groupnet --no-default-features --features consistency-volatile-bootstrap-bulk --all-targets
+RUSTDOCFLAGS='-D warnings' cargo doc -p groupnet-consistency --features volatile-bootstrap-bulk --no-deps
 ```
 
 The feature-specific Clippy runs are not redundant: no crate in the workspace turns `leases`,
-`hosted`, `handoff`, `replication`, or `volatile-recovery` on by default, so the workspace clippy above never sees
+`hosted`, `handoff`, `replication`, `volatile-recovery`, or `volatile-bootstrap-bulk` on by default, so the workspace clippy above never sees
 those tiers' code, their tests, or their DST at all. `handoff` is not covered by
-the `hosted` runs either — it is the only consistency feature that pulls in the
-data plane, so it is the only one whose build graph differs from the rest.
+the `hosted` runs either. `Handoff` and `volatile-bootstrap-bulk` each pull in
+the data plane, so both have distinct feature graphs that need explicit gates.
 
 Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`) — the
 optional performance command; it is not a correctness gate.

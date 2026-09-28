@@ -20,6 +20,8 @@
 //! binding or implement the trait yourself.
 //!
 //! ```no_run
+//! # #[cfg(all(feature = "runtime", feature = "mem"))]
+//! # mod example {
 //! use groupnet::core::NodeId;
 //! use groupnet::runtime::Node;
 //! use groupnet::transport::mem::Network;
@@ -34,6 +36,7 @@
 //! if group.is_coordinator() {
 //!     group.sync(|ctx| ctx.update_metadata("routing", "v3"));
 //! }
+//! # }
 //! # }
 //! ```
 //!

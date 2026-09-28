@@ -220,6 +220,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
     }
 
     fn drop_capture(&mut self) {
+        self.inbox.set_identity(None);
         if let Some(capture) = self.capture.take() {
             self.donor.retire_local_capture(&capture);
             drop(capture);

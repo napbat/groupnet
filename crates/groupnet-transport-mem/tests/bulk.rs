@@ -112,6 +112,40 @@ async fn a_dropped_writer_is_a_clean_eof_at_the_frame_boundary() {
     );
 }
 
+/// The bootstrap request/reply exchange closes each write half to prove
+/// there are no trailing frames, yet must continue reading the peer's half.
+#[tokio::test]
+async fn write_half_shutdown_preserves_the_reply_half() {
+    let (a, b) = pair();
+    let mut outbound = a.connect(&NodeId::new("bulk-b")).await.expect("connect");
+    let (_, mut inbound) = b.accept().await.expect("accept");
+
+    outbound
+        .send_bounded(Bytes::from_static(b"request"), 7)
+        .await
+        .expect("request");
+    outbound
+        .finish_write()
+        .await
+        .expect("request write shutdown");
+    assert_eq!(
+        inbound.recv_bounded(7).await.unwrap().unwrap(),
+        &b"request"[..]
+    );
+    assert!(inbound.recv_bounded(7).await.unwrap().is_none());
+
+    inbound
+        .send_bounded(Bytes::from_static(b"reply"), 5)
+        .await
+        .expect("reply");
+    inbound.finish_write().await.expect("reply write shutdown");
+    assert_eq!(
+        outbound.recv_bounded(5).await.unwrap().unwrap(),
+        &b"reply"[..]
+    );
+    assert!(outbound.recv_bounded(5).await.unwrap().is_none());
+}
+
 /// Two streams between the *same* pair are independent pipes: frames written
 /// on one never surface on the other, and each keeps its own order. Bulk
 /// transfers run concurrently (a snapshot alongside a replication stream), so
