@@ -348,7 +348,18 @@ query-visible apply receipt. Existing `ReplicaFork::refresh_with_lower_bound`
 and `refresh`, backed by `caslog` fork/checkpoint recovery, provide
 authoritative replay and checkpoint
 recovery; Groupnet schedules and gates them instead of duplicating CAS slot
-ordering. The adapter retains Lean-to-Full fallback when provenance cannot
+ordering. Their current whole-refresh API does not enforce session byte or
+event budgets. Integration first adds a bounded native replay step that applies
+whole CAS slots to a private fork. It reports the native interval, encoded
+bytes, commit count, provenance, and whether it reached a requested floor,
+observed the next slot absent, exhausted a budget, or needs checkpoint recovery.
+A slot that exceeds a budget is an explicit limit result; it is never split.
+Checkpoint recovery has a separate transfer budget. An observed absent slot is
+a source-prefix observation, not proof that a damaged log contains no later
+slots. `Provenance::Recovered` cannot establish complete state. Shardstore's
+existing degraded-read policy remains a separate domain decision and cannot
+produce Groupnet's complete-state read permission.
+The adapter retains Lean-to-Full fallback when provenance cannot
 prove a Lean fold, and its floor-bearing segment search decides whether
 unflushed documents are actually servable. Groupnet replaces the existing
 detached and per-serve refresh scheduling with one coalesced session, waits
@@ -379,6 +390,33 @@ page merge, and absence rules. Mutations must pass through the coherent proxy
 fleet; out-of-band origin writes require a separately proven reconciliation
 source. A journal must not be added as a mandatory second log when the source
 already provides safe committed replay.
+
+Pre-mutation invalidation also needs a reader-admission rule. Sampling current
+lease holders leaves a race when a reader joins after the wait completes but
+before the origin mutation starts. The control source orders reader admissions
+with mutation intents. A reader starts a bounded local monotonic deadline
+before appending its admission, confirms that exact append, and replays through
+its admission before it can serve. Its gate requires both the ordinary serving
+lease and this source admission. A renewal is a new source admission; ordinary
+lease renewal cannot extend it. Earlier pending intents remain fenced.
+
+A writer waits for each earlier admission to acknowledge the specific intent
+and admission incarnation, or for its maximum permitted duration to elapse.
+The expiry wait starts when the writer confirms the intent and accounts for the
+documented clock-rate bound. Later admissions must replay the intent before
+serving. Admission versions and duration bounds are validated across the
+cluster; an unknown or unsupported bound fails closed. A restarted writer
+restarts the full expiry wait. A restarted reader must obtain a fresh admission.
+No persisted wall-clock timestamp is treated as a serving capability. This
+protocol needs deterministic race tests before it can grant authority.
+
+The initial s3cache control source uses a conditional-create slot chain per
+bucket. It verifies ambiguous appends by reading the exact slot and comparing
+the operation identity and payload. It never skips an uncertain slot. Intent,
+outcome, and admission records share this ordering. This choice adds control
+storage writes and contention to the coherent path; measurements must report
+that cost. The source is optional, but absence of a proven publication and
+admission mechanism cannot authorize a complete local multi-node index.
 
 ## 8. Build slices and verification
 
@@ -426,3 +464,31 @@ restarts, and large snapshots. Verify configured bounds and live-update
 progress during bulk transfer; publish measured results rather than invented
 targets. A single origin builder is expected when connected, takeover after
 failure, and duplicate builders are allowed under partition.
+
+## 9. Implementation status
+
+The first slice adds `groupnet_core::replication::SessionEngine`. It accepts
+scoped opaque cursors, exact-operand source comparisons, and replay batch
+metadata. Native payloads stay with the driver. Its effects request tail checks,
+bounded scans, application materialization, serving revocation, and logical
+timers. Read floors coalesce within one source history. Materialized and durable
+checkpoint positions remain separate.
+
+Each operation carries a caller-supplied session incarnation, a recovery
+generation, and a monotonically allocated token. The caller must use a fresh
+incarnation when recreating an engine that could receive old replies. Cancelled
+sessions and exhausted retries do not resume on hints or authority updates.
+Cancellation closes the gate before issuing a new-generation revocation that
+the application can acknowledge. Source and mode authority both gate reads.
+
+Core tests exercise floor waits, proof binding, bounded retries, cancellation,
+restart identity, and retention gaps. A standalone seeded simulator drives
+multiple scopes through missed hints, delayed and duplicate replies,
+partitions, and restart. The existing membership simulator and wire frames are
+unchanged.
+
+This slice is the sans-IO replay foundation. The async subscription manager,
+snapshot protocol, durable event-complete retention, named acknowledgements,
+and consumer migration remain in the build order above. Selecting the core's
+`EventComplete` gap policy does not itself establish a durable subscription or
+protect source history from retirement.

@@ -34,6 +34,7 @@ mod time;
 
 pub mod anchor;
 pub mod placement;
+pub mod replication;
 pub mod wire;
 
 pub use config::{Activation, Config, GroupMode, HostedConfig, VoterRoster};
