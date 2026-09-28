@@ -85,26 +85,35 @@ the application's existing conflict/tombstone rule. Native events cannot
 overwrite a newer private staged effect merely because they arrived later.
 Two same-key effects from incomparable writers without a source-certified
 ordering or authoritative origin reconciliation abort this image to origin
-routing. An unchanged native effect still advances coverage through a
-bounded no-op.
+routing. The same rule applies when a donor/native effect overlaps a
+follower's origin-validated local repair: local publication order alone
+cannot order effects observed on different nodes. An unchanged native
+effect still advances coverage through a bounded no-op.
 The donor stream stays attached until the follower proves its native feed
-coverage through one exact sampled `B` receipt and independently passes its
-current lease/frontier affirmation. An unknown writer, membership change,
+coverage through one exact sampled `B` receipt and atomically hands off to
+normal native delivery. The follower then independently passes its current
+head/frontier and lease/domain affirmation before local serving opens; a
+private candidate may be installed while that serving gate remains closed.
+An unknown writer, membership change,
 donor lapse/gap/rebuild, source hole, journal overflow, donor death, or
 uncertain overlap aborts to the existing guarded origin fallback.
 
 The final application install is a private-stage swap under a current
-recovery publication permit and lease/domain check. Every page, native
+recovery publication permit and exact continuous native handoff. Every page, native
 effect, and donor batch uses the same application generation fence; a stale
 private stage cannot overwrite a newer index or resurrect a delete. The
 core emits `InstallCandidate` only after complete image verification and
 barrier replay and an exact `NativeCoverageReceipt` binding the full B
 receipt, claim-selected parent, private stage position B, proven per-writer
 cuts, complete membership, and bounded buffered
-effects. The application executes the swap only inside the current
-`PublicationPermit::publish` closure and rechecks its own lease/frontier
-authority there; `Installed` is emitted only after that guarded closure
-commits. This means *eligible for an application check*, not
+effects. The next runtime slice must bind `Installed` to a typed handoff
+receipt certifying that under one guarded publication section, the private
+image through B received every bounded uncovered native/local effect and
+the normal feed applier took ownership without a gap. The application
+executes the swap only inside the current `PublicationPermit::publish`
+closure; the serving lease/domain check follows as a separate step.
+`Installed` is emitted only after that guarded closure commits. This means
+*eligible for an application check*, not
 `ReadPermitted`; origin fallback and replicated-miss policy continue until
 the application's own gate opens. The donor reservation may be released
 only after continuation coverage is proved or the transfer is discarded.
