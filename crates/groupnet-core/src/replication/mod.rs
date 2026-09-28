@@ -9,17 +9,21 @@ pub mod admission;
 mod identity;
 mod proof;
 mod session;
+mod snapshot;
 mod types;
 
 pub use identity::{Cursor, IdentityError, Scope, SourceHistory, Stream};
 pub use proof::{BoundComparison, Comparison, Coverage, ProofId, SourceProof};
 pub use session::SessionEngine;
+pub use snapshot::{ChunkReceipt, HoldReceipt, SnapshotConfig, SnapshotOffer};
 pub use types::{
     ApplyReceipt, Batch, Config, ConfigError, Effect, Event, Mode, Operation, ReadDecision,
-    Refusal, Reject, Stage, State, Step,
+    Refusal, Reject, SnapshotCleanupDisposition, Stage, State, Step,
 };
 
 #[cfg(test)]
 mod bootstrap_tests;
+#[cfg(test)]
+mod snapshot_tests;
 #[cfg(test)]
 mod tests;

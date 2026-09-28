@@ -54,8 +54,6 @@ names its proof kind and exact scope/history.
    allowed before the matching `SinkEpochBound` receipt. A crash between
    source registration and sink binding retries/readbacks the **same**
    source epoch and cannot invent a fresh cursor.
-   Registration uses a stable request ID; an unknown source response is read
-   back by that ID before delivery or a conflicting incarnation starts.
    A source may use its existing CAS checkpoint/retention machinery; Groupnet
    does not write a second copy of every event.
 2. The session checks the source tail independently of gossip and requests

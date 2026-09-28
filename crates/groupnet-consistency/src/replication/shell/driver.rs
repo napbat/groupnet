@@ -10,22 +10,25 @@ use groupnet_core::replication::{
     Batch, Coverage, Cursor, Effect, Event, Operation, ReadDecision, Reject, SessionEngine,
     SourceProof, Stage, Step,
 };
-use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, watch};
 
 use super::{Command, Manager, Published, SessionShared};
 use crate::replication::api::{
     ApplicationAdapter, Checkpoint, CheckpointLimit, FailureClass, ScanLimit, SourceAdapter,
     SourceBatch, TailLimit,
 };
+use crate::replication::snapshot_runtime::SnapshotMode;
 
 struct Payload<B> {
     native: B,
     _bytes: OwnedSemaphorePermit,
+    _snapshot_bytes: Option<OwnedSemaphorePermit>,
 }
 
 struct PrivateCheckpoint<P, R> {
     candidate: Checkpoint<P, R>,
     _bytes: OwnedSemaphorePermit,
+    _snapshot_bytes: Option<OwnedSemaphorePermit>,
 }
 
 fn discard_stale<P, B, R>(
@@ -45,12 +48,22 @@ fn discard_stale<P, B, R>(
     }
 }
 
-struct Driver<S, A>
+fn rejected_step(reason: Reject, ignorable: bool, effects: Vec<Effect>) -> (bool, Vec<Effect>) {
+    let stop = reason != Reject::StaleOperation
+        && !(ignorable && reason == Reject::Stage)
+        && !(ignorable && reason == Reject::History);
+    // Rejection does not imply the transition had no safety effects. The
+    // caller must dispatch these even when it also closes the local gate.
+    (stop, effects)
+}
+
+struct Driver<S, A, M>
 where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,
+    M: SnapshotMode<S, A>,
 {
-    manager: Arc<Manager<S, A>>,
+    manager: Arc<Manager<S, A, M>>,
     shared: Arc<SessionShared>,
     engine: SessionEngine,
     updates: watch::Sender<Published>,
@@ -67,12 +80,23 @@ where
     failure: Option<FailureClass>,
     cancel_reply: Option<tokio::sync::oneshot::Sender<Option<FailureClass>>>,
     cancel_processed: bool,
+    snapshot_hold: Option<M::Hold>,
+    snapshot_read: Option<M::ReadHandle>,
+    snapshot_attachment: Option<M::Attachment>,
+    snapshot_stage: Option<M::Stage>,
+    snapshot_candidate_permit: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+    snapshot_chunk: Option<(u64, Vec<u8>, OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+    snapshot_proof: Option<SourceProof>,
+    snapshot_payload_id: Option<u64>,
+    snapshot_candidate_id: Option<u64>,
+    snapshot_attempt: Option<Operation>,
 }
 
-impl<S, A> Driver<S, A>
+impl<S, A, M> Driver<S, A, M>
 where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,
+    M: SnapshotMode<S, A>,
 {
     fn timeout(&self) -> Duration {
         Duration::from_millis(self.manager.limits.core.attempt_timeout_ms)
@@ -106,7 +130,21 @@ where
 
     fn step(&mut self, event: Event) {
         let completed = match &event {
-            Event::CheckpointLoaded { op, .. }
+            Event::SnapshotHeld { op, .. }
+            | Event::SnapshotOffered { op, .. }
+            | Event::SnapshotOpened { op, .. }
+            | Event::SnapshotRead { op, .. }
+            | Event::SnapshotWritten { op, .. }
+            | Event::SnapshotVerified { op, .. }
+            | Event::SnapshotBarrier { op, .. }
+            | Event::SnapshotScanned { op, .. }
+            | Event::SnapshotApplied { op, .. }
+            | Event::SnapshotSealed { op, .. }
+            | Event::SnapshotInstalled { op, .. }
+            | Event::SnapshotAttached { op, .. }
+            | Event::SnapshotCleaned { op }
+            | Event::SnapshotDiscarded { op, .. }
+            | Event::CheckpointLoaded { op, .. }
             | Event::CheckpointInstalled { op, .. }
             | Event::Tail { op, .. }
             | Event::Scanned { op, .. }
@@ -128,12 +166,12 @@ where
             self.deadlines.remove(&op);
         }
         if let Some(reason) = rejection {
-            if reason != Reject::StaleOperation
-                && !(ignorable && reason == Reject::Stage)
-                && !(ignorable && reason == Reject::History)
-            {
+            let (stop, effects) = rejected_step(reason, ignorable, effects);
+            if stop {
                 self.stop(FailureClass::Terminal);
             }
+            self.enqueue(effects);
+            self.publish();
             return;
         }
         if let Some(proof) = tail {
@@ -155,9 +193,28 @@ where
                 }
             }
         }
+        self.enqueue(effects);
+        self.publish();
+    }
+
+    fn enqueue(&mut self, effects: Vec<Effect>) {
         for effect in &effects {
             let operation = match effect {
-                Effect::LoadCheckpoint { op, .. }
+                Effect::AcquireSnapshotHold { op, .. }
+                | Effect::OfferSnapshot { op, .. }
+                | Effect::OpenSnapshotStage { op, .. }
+                | Effect::ReadSnapshotChunk { op, .. }
+                | Effect::WriteSnapshotChunk { op, .. }
+                | Effect::VerifySnapshotImage { op, .. }
+                | Effect::SnapshotReplayBarrier { op, .. }
+                | Effect::SnapshotScan { op, .. }
+                | Effect::SnapshotApply { op, .. }
+                | Effect::SealSnapshotStage { op, .. }
+                | Effect::InstallSnapshot { op, .. }
+                | Effect::AttachSnapshot { op, .. }
+                | Effect::CleanupSnapshot { op, .. }
+                | Effect::DiscardSnapshotResources { op, .. }
+                | Effect::LoadCheckpoint { op, .. }
                 | Effect::InstallCheckpoint { op, .. }
                 | Effect::CheckTail { op, .. }
                 | Effect::Scan { op, .. }
@@ -166,7 +223,9 @@ where
                 _ => None,
             };
             if let Some(op) = operation {
-                let deadline = if self.engine.current_operation() == Some(op) {
+                let deadline = if let Effect::CleanupSnapshot { due, .. } = effect {
+                    self.started.checked_add(Duration::from_millis(due.0))
+                } else if self.engine.current_operation() == Some(op) {
                     self.engine
                         .next_deadline()
                         .and_then(|due| self.started.checked_add(Duration::from_millis(due.0)))
@@ -180,7 +239,6 @@ where
             }
         }
         self.effects.extend(effects);
-        self.publish();
     }
 
     fn stop(&mut self, class: FailureClass) {
@@ -192,16 +250,14 @@ where
         self.shared.fence.invalidate();
         self.payloads.clear();
         self.checkpoints.clear();
+        self.snapshot_chunk = None;
+        self.snapshot_stage = None;
+        self.snapshot_candidate_permit = None;
+        self.snapshot_read = None;
+        self.snapshot_attachment = None;
         self.deadlines.clear();
         let Step { effects, .. } = self.engine.step(Event::Cancel);
-        for effect in &effects {
-            if let Effect::RevokeServing { op } = effect {
-                if let Some(deadline) = Instant::now().checked_add(self.timeout()) {
-                    self.deadlines.insert(*op, deadline);
-                }
-            }
-        }
-        self.effects.extend(effects);
+        self.enqueue(effects);
         self.publish();
     }
 
@@ -216,7 +272,7 @@ where
     }
 
     async fn operation_permit(
-        manager: &Manager<S, A>,
+        manager: &Manager<S, A, M>,
         deadline: Instant,
     ) -> Option<OwnedSemaphorePermit> {
         tokio::time::timeout_at(
@@ -229,7 +285,7 @@ where
     }
 
     async fn byte_permit(
-        manager: &Manager<S, A>,
+        manager: &Manager<S, A, M>,
         deadline: Instant,
     ) -> Option<OwnedSemaphorePermit> {
         let count = u32::try_from(manager.limits.core.max_batch_bytes).ok()?;
@@ -243,7 +299,7 @@ where
     }
 
     async fn checkpoint_permit(
-        manager: &Manager<S, A>,
+        manager: &Manager<S, A, M>,
         deadline: Instant,
     ) -> Option<OwnedSemaphorePermit> {
         let count = u32::try_from(manager.limits.max_checkpoint_bytes).ok()?;
@@ -322,6 +378,7 @@ where
                     PrivateCheckpoint {
                         candidate: checkpoint,
                         _bytes: bytes,
+                        _snapshot_bytes: None,
                     },
                 );
                 self.step(Event::CheckpointLoaded {
@@ -350,7 +407,9 @@ where
         let Some(checkpoint) = self.checkpoints.remove(&payload_id) else {
             return self.stop(FailureClass::Terminal);
         };
-        let PrivateCheckpoint { candidate, _bytes } = checkpoint;
+        let PrivateCheckpoint {
+            candidate, _bytes, ..
+        } = checkpoint;
         let Some(_operation) = Self::operation_permit(&self.manager, deadline).await else {
             return self.step(Event::Failed { op });
         };
@@ -549,6 +608,7 @@ where
             Payload {
                 native,
                 _bytes: bytes,
+                _snapshot_bytes: None,
             },
         );
         self.tick();
@@ -663,8 +723,11 @@ where
 
     async fn effect(&mut self, effect: Effect) {
         let (batch_id, checkpoint_id) = match &effect {
-            Effect::Apply { batch, .. } => (Some(batch.payload_id), None),
-            Effect::InstallCheckpoint { payload_id, .. } => (None, Some(*payload_id)),
+            Effect::Apply { batch, .. } | Effect::SnapshotApply { batch, .. } => {
+                (Some(batch.payload_id), None)
+            }
+            Effect::InstallCheckpoint { payload_id, .. }
+            | Effect::InstallSnapshot { payload_id, .. } => (None, Some(*payload_id)),
             _ => (None, None),
         };
         let op = match &effect {
@@ -676,7 +739,10 @@ where
             | Effect::RevokeServing { op } => Some(*op),
             _ => None,
         };
-        if op.is_some_and(|operation| {
+        if !matches!(
+            &effect,
+            Effect::CleanupSnapshot { .. } | Effect::DiscardSnapshotResources { .. }
+        ) && op.is_some_and(|operation| {
             !self.deadlines.contains_key(&operation) || !self.engine.accepts_operation(operation)
         }) {
             if let Some(operation) = op {
@@ -692,6 +758,20 @@ where
             return;
         }
         match effect {
+            effect @ (Effect::AcquireSnapshotHold { .. }
+            | Effect::OfferSnapshot { .. }
+            | Effect::OpenSnapshotStage { .. }
+            | Effect::ReadSnapshotChunk { .. }
+            | Effect::WriteSnapshotChunk { .. }
+            | Effect::VerifySnapshotImage { .. }
+            | Effect::SnapshotReplayBarrier { .. }
+            | Effect::SnapshotScan { .. }
+            | Effect::SnapshotApply { .. }
+            | Effect::SealSnapshotStage { .. }
+            | Effect::InstallSnapshot { .. }
+            | Effect::AttachSnapshot { .. }
+            | Effect::CleanupSnapshot { .. }
+            | Effect::DiscardSnapshotResources { .. }) => self.run_snapshot_effect(effect).await,
             Effect::LoadCheckpoint { op, scope } => self.load_checkpoint(op, scope).await,
             Effect::InstallCheckpoint {
                 op,
@@ -760,6 +840,11 @@ where
                 self.shared.fence.invalidate();
                 self.payloads.clear();
                 self.checkpoints.clear();
+                self.snapshot_attachment = None;
+                self.snapshot_stage = None;
+                self.snapshot_chunk = None;
+                self.snapshot_candidate_permit = None;
+                self.snapshot_read = None;
                 if !self.cancel_processed {
                     self.effects.clear();
                     self.step(Event::Cancel);
@@ -783,168 +868,9 @@ where
     }
 }
 
-pub(super) async fn worker<S, A>(
-    manager: Arc<Manager<S, A>>,
-    shared: Arc<SessionShared>,
-    engine: SessionEngine,
-    mut receiver: mpsc::Receiver<Command>,
-    updates: watch::Sender<Published>,
-) where
-    S: SourceAdapter,
-    A: ApplicationAdapter<S::Position, S::Batch>,
-{
-    let mut driver = Driver {
-        manager,
-        shared,
-        engine,
-        updates,
-        effects: VecDeque::new(),
-        deadlines: HashMap::new(),
-        payloads: HashMap::new(),
-        checkpoints: HashMap::new(),
-        deferred_floors: VecDeque::new(),
-        started: Instant::now(),
-        proof: None,
-        tail_checked_at: None,
-        tail_request_started: None,
-        tail_authority_epoch: 0,
-        failure: None,
-        cancel_reply: None,
-        cancel_processed: false,
-    };
-    driver.step(Event::StartBootstrap);
-    loop {
-        if driver.shared.cancelled.load(Ordering::Acquire) && !driver.cancel_processed {
-            driver.shared.local_gate.store(false, Ordering::Release);
-            driver.shared.fence.invalidate();
-            driver.effects.clear();
-            driver.payloads.clear();
-            driver.checkpoints.clear();
-            driver.step(Event::Cancel);
-            driver.cancel_processed = true;
-        }
-        if driver
-            .engine
-            .next_deadline()
-            .is_some_and(|due| due <= driver.logical_now())
-        {
-            driver.tick();
-        }
-        if let Ok(command) = receiver.try_recv() {
-            driver.command(command);
-        }
-        if let Some(effect) = driver.effects.pop_front() {
-            driver.effect(effect).await;
-            continue;
-        }
-        if let Some(reply) = driver.cancel_reply.take() {
-            let _ = reply.send(driver.failure);
-        }
-        let next_timer = driver.next_timer();
-        let shared = Arc::clone(&driver.shared);
-        tokio::select! {
-            command = receiver.recv() => {
-                let Some(command) = command else { break; };
-                driver.command(command);
-            }
-            () = shared.hints.notified() => {
-                if shared.hinted.swap(false, Ordering::AcqRel) {
-                    driver.step(Event::Hint);
-                }
-            }
-            () = async {
-                if let Some(instant) = next_timer {
-                    tokio::time::sleep_until(instant).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => driver.tick(),
-        }
-    }
-    driver.shared.alive.store(false, Ordering::Release);
-    driver.shared.local_gate.store(false, Ordering::Release);
-    driver.shared.fence.invalidate();
-}
+mod worker;
+pub(super) use worker::worker;
+mod snapshot;
 
 #[cfg(test)]
-mod tests {
-    use super::{Checkpoint, Payload, PrivateCheckpoint, discard_stale};
-    use groupnet_core::replication::Operation;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
-    use tokio::sync::Semaphore;
-
-    struct DropCount(Arc<AtomicUsize>);
-
-    impl Drop for DropCount {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Release);
-        }
-    }
-
-    #[test]
-    fn stale_effect_releases_native_batch_reserve_and_private_checkpoint() {
-        let bytes = Arc::new(Semaphore::new(8));
-        let permit = Arc::clone(&bytes)
-            .try_acquire_many_owned(8)
-            .expect("reserve");
-        let checkpoint_bytes = Arc::new(Semaphore::new(8));
-        let checkpoint_permit = Arc::clone(&checkpoint_bytes)
-            .try_acquire_many_owned(8)
-            .expect("checkpoint reserve");
-        let released = Arc::new(AtomicUsize::new(0));
-        let mut payloads = HashMap::from([(
-            7,
-            Payload {
-                native: (),
-                _bytes: permit,
-            },
-        )]);
-        let mut checkpoints = HashMap::from([(
-            8,
-            PrivateCheckpoint {
-                candidate: Checkpoint {
-                    position: (),
-                    native: DropCount(Arc::clone(&released)),
-                    bytes: 8,
-                },
-                _bytes: checkpoint_permit,
-            },
-        )]);
-        let apply = Operation {
-            session: 1,
-            generation: 1,
-            token: 2,
-        };
-        let install = Operation {
-            session: 1,
-            generation: 1,
-            token: 3,
-        };
-        let mut deadlines = HashMap::from([(apply, Instant::now()), (install, Instant::now())]);
-        discard_stale(
-            apply,
-            Some(7),
-            None,
-            &mut deadlines,
-            &mut payloads,
-            &mut checkpoints,
-        );
-        assert_eq!(bytes.available_permits(), 8);
-        assert!(payloads.is_empty());
-        discard_stale(
-            install,
-            None,
-            Some(8),
-            &mut deadlines,
-            &mut payloads,
-            &mut checkpoints,
-        );
-        assert_eq!(released.load(Ordering::Acquire), 1);
-        assert_eq!(checkpoint_bytes.available_permits(), 8);
-        assert!(checkpoints.is_empty());
-        assert!(deadlines.is_empty());
-    }
-}
+mod tests;

@@ -21,51 +21,41 @@ selects the optional capabilities below. This uses ordinary explicit
 associated types; it needs no unstable associated-type defaults, external
 dependencies, or new wire frame.
 
+The public capabilities live in
+[`snapshot_api.rs`](../crates/groupnet-consistency/src/replication/snapshot_api.rs).
+`SnapshotSourceAdapter` supplies typed `Hold`, `ReadHandle`, and `Attachment`
+handles. Its `acquire_hold` receives the exact acquire `Operation`, the core's
+absolute logical deadline, the corresponding runtime `Instant`, and bounded
+`SnapshotConfig`. It returns a `SnapshotHold` containing both the handle and
+an operation-bound `HoldReceipt`. `offer` returns `SnapshotImage<ReadHandle>`;
+`attach` returns `SnapshotAttachment<Attachment>`. `barrier`, bounded
+`read_chunk`, and `release_hold` complete the source capability.
+
+`SnapshotApplicationAdapter` supplies a private `Stage`. `begin_stage` receives
+the validated offer and a `CheckpointLimit`, and returns `SnapshotStage`
+with its initial native-state charge. `write_chunk`, `verify_image`, and
+`apply_private` report the updated total charge. `seal_stage` returns the
+existing typed `Checkpoint`; its publication uses the normal application
+`install_checkpoint` method and `InstallPermit`.
+
 ```rust,ignore
-pub trait SnapshotSourceAdapter: SourceAdapter {
-    type Hold: Send + 'static;
-    type ReadHandle: Send + 'static;
-    type Attachment: Send + 'static;
-
-    fn acquire_hold(&self, scope: Scope, limit: SnapshotLimit)
-        -> impl Future<Output = Result<Self::Hold, AdapterFailure<Self::Error>>> + Send;
-    fn offer(&self, hold: &mut Self::Hold, limit: SnapshotLimit)
-        -> impl Future<Output = Result<SnapshotOffer<Self::Position, Self::ReadHandle>,
-                                      AdapterFailure<Self::Error>>> + Send;
-    fn read_chunk(&self, read: &mut Self::ReadHandle, offset: u64, max_bytes: usize)
-        -> impl Future<Output = Result<Vec<u8>, AdapterFailure<Self::Error>>> + Send;
-    fn barrier(&self, hold: &mut Self::Hold)
-        -> impl Future<Output = Result<SourceProof, AdapterFailure<Self::Error>>> + Send;
-    fn attach(&self, hold: &mut Self::Hold, after: Self::Position)
-        -> impl Future<Output = Result<Attached<Self::Attachment>,
-                                      AdapterFailure<Self::Error>>> + Send;
-    fn release_hold(&self, hold: Self::Hold)
-        -> impl Future<Output = Result<(), AdapterFailure<Self::Error>>> + Send;
-}
-
-pub trait SnapshotApplicationAdapter<P, B>: ApplicationAdapter<P, B> {
-    type Stage: Send + 'static;
-
-    fn begin_stage(&self, scope: Scope, metadata: SnapshotMetadata)
-        -> impl Future<Output = Result<Self::Stage, AdapterFailure<Self::Error>>> + Send;
-    fn write_chunk(&self, stage: &mut Self::Stage, offset: u64, bytes: Vec<u8>)
-        -> impl Future<Output = Result<(), AdapterFailure<Self::Error>>> + Send;
-    fn verify_image(&self, stage: &mut Self::Stage, digest: &[u8])
-        -> impl Future<Output = Result<(), AdapterFailure<Self::Error>>> + Send;
-    fn apply_private(&self, stage: &mut Self::Stage, from: P, through: P, batch: B)
-        -> impl Future<Output = Result<(), AdapterFailure<Self::Error>>> + Send;
-    fn seal_stage(&self, stage: Self::Stage, through: P)
-        -> impl Future<Output = Result<Checkpoint<P, Self::Recovery>,
-                                      AdapterFailure<Self::Error>>> + Send;
-}
+let replication = Replication::<_, _, NativeSnapshot>::new_native(
+    group, source, application, limits,
+)?;
 ```
+
 
 The snapshot `Hold`, `ReadHandle`, `Attachment`, and `Stage` are owned directly by one
 per-scope worker. The adapter does not hide an unbounded handle registry.
-`SnapshotOffer` owns the read handle and has a bounded metadata record:
+A read handle normally contains bounded streaming metadata. If the source
+retains a complete image or native fork, it must hold separate source-domain
+memory admission until that image and any background work are released. The
+manager's chunk and application-stage quotas do not account for source-owned
+image memory.
+`SnapshotImage` owns the read handle and a bounded `SnapshotOffer` metadata record:
 protocol/schema, scope and source history, source-proven cut `C0`, coverage
 certificate, total encoded bytes, chunk count, and digest.
-`Attached<T>` owns `T` plus the source-proven attach barrier/cursor and
+`SnapshotAttachment<T>` owns `T` plus the source-proven attach barrier/cursor and
 retention-continuity certificate. The shell reserves its global byte permits
 **before** each source read. The source must enforce
 `max_bytes` while producing a chunk; the shell checks the returned size again
@@ -74,7 +64,9 @@ sequentially and in exact offset order. It checks nonzero progress, each
 offset, count, size, total, checksum receipt, and final digest; an empty or
 truncated transfer cannot install. The application stage may spool to bounded
 private disk. `max_snapshot_bytes`, `max_chunks`, `max_chunk_bytes`,
-`max_metadata_bytes`, and `max_snapshot_time_ms` are finite config limits;
+`max_metadata_bytes`, and `max_total_ms` are finite config limits;
+the metadata bound covers combined variable-length fields, with fixed struct
+overhead bounded by one offered image per session;
 `max_chunk_bytes` fits the shared in-flight byte reserve. The adapter reports
 actual charged bytes and refuses a source object larger than the declared
 total. Merely trusting an advertised `Content-Length` is insufficient.
@@ -122,9 +114,12 @@ alone do not bound a decoded `ReplicaFork` or adapter heap allocation.
    the current session's bounded replay loop to cover the attach barrier.
    The snapshot transition stays in the **same** session generation; every
    effect receives a fresh token from the existing allocator. Read admission
-   remains closed until attach, tail recheck, materialization, source/mode
-   authority, and application `may_serve` all agree. Only then release the
-   hold. An absent source event hint cannot substitute for the tail check.
+   remains closed until attach, tail recheck, and materialization complete.
+   At that point `Stage::Ready` means replay readiness and the finite hold
+   can be released. Local read permission still separately intersects
+   source/mode authority and application `may_serve`; an unrelated authority
+   denial does not prolong retention. An absent source event hint cannot
+   substitute for the tail check.
 
 `SessionEngine` is the only transition scheduler. A snapshot module may add
 private handlers and stages, but must not create a second token allocator or
@@ -146,6 +141,13 @@ ticks the core before accepting a response. Cancellation, supersession,
 timeout, changed source history, corrupt bytes, missing chunk, failed install,
 or attach gap closes admission and drops private state. Normal abort explicitly
 releases the hold and discards the stage under bounded cleanup time.
+Successful cutover releases the temporary hold, read handle, and private
+stage while retaining the attached live continuation; abort, cancellation,
+and supersession discard the attachment too. Cleanup and final local
+disposal name the original acquire attempt, so an old operation cannot
+remove a newer attempt's resources. Failed or expired release triggers
+synchronous local disposal before another attempt may start; the finite
+source-side hold still expires if the process dies.
 `ReadHandle`, `Attachment`, and `Stage` must also clean local resources on drop; a remote
 hold needs finite source-side expiry if the process dies before explicit
 release. A late successful hold reply after cancellation is released rather

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -17,6 +18,10 @@ use tokio::task::JoinHandle;
 
 use super::api::{ApplicationAdapter, CatchUp, FailureClass, Limits, ReadVerdict, SourceAdapter};
 use super::fence::OperationFence;
+use super::snapshot_api::{
+    NativeSnapshot, ReplayOnly, SnapshotApplicationAdapter, SnapshotSourceAdapter,
+};
+use super::snapshot_runtime::SnapshotMode;
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
@@ -106,7 +111,7 @@ impl fmt::Debug for SessionShared {
     }
 }
 
-struct Manager<S, A>
+struct Manager<S, A, M>
 where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,
@@ -119,9 +124,13 @@ where
     operations: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     checkpoint_bytes: Arc<Semaphore>,
+    snapshot_ops: Arc<Semaphore>,
+    snapshot_bytes: Arc<Semaphore>,
+    snapshot_checkpoint_bytes: Arc<Semaphore>,
+    _mode: PhantomData<M>,
 }
 
-impl<S, A> fmt::Debug for Manager<S, A>
+impl<S, A, M> fmt::Debug for Manager<S, A, M>
 where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,
@@ -136,15 +145,15 @@ where
 }
 
 /// Registry of bounded source-backed state-sync sessions for one group.
-pub struct Replication<S, A>
+pub struct Replication<S, A, M = ReplayOnly>
 where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,
 {
-    inner: Arc<Manager<S, A>>,
+    inner: Arc<Manager<S, A, M>>,
 }
 
-impl<S, A> fmt::Debug for Replication<S, A>
+impl<S, A, M> fmt::Debug for Replication<S, A, M>
 where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,
@@ -154,7 +163,7 @@ where
     }
 }
 
-impl<S, A> Replication<S, A>
+impl<S, A> Replication<S, A, ReplayOnly>
 where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,
@@ -164,7 +173,39 @@ where
     /// # Errors
     /// Returns [`OpenError::InvalidConfig`] for zero or inconsistent limits.
     pub fn new(group: Group, source: S, app: A, limits: Limits) -> Result<Self, OpenError> {
+        Self::build(group, source, app, limits)
+    }
+}
+
+impl<S, A> Replication<S, A, NativeSnapshot>
+where
+    S: SnapshotSourceAdapter,
+    A: SnapshotApplicationAdapter<S::Position, S::Batch>,
+{
+    /// Builds a manager with source-native snapshot recovery enabled.
+    ///
+    /// # Errors
+    /// Returns [`OpenError::InvalidConfig`] unless finite snapshot limits are set.
+    pub fn new_native(group: Group, source: S, app: A, limits: Limits) -> Result<Self, OpenError> {
+        Self::build(group, source, app, limits)
+    }
+}
+
+#[expect(
+    private_bounds,
+    reason = "snapshot modes are sealed implementation choices; callers construct only ReplayOnly or NativeSnapshot"
+)]
+impl<S, A, M> Replication<S, A, M>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+    M: SnapshotMode<S, A>,
+{
+    fn build(group: Group, source: S, app: A, limits: Limits) -> Result<Self, OpenError> {
         let limits = limits.validate().map_err(|_| OpenError::InvalidConfig)?;
+        if M::ENABLED != limits.core.snapshot.is_some() {
+            return Err(OpenError::InvalidConfig);
+        }
         Ok(Self {
             inner: Arc::new(Manager {
                 group,
@@ -175,6 +216,26 @@ where
                 operations: Arc::new(Semaphore::new(limits.max_parallel_ops)),
                 bytes: Arc::new(Semaphore::new(limits.max_inflight_bytes)),
                 checkpoint_bytes: Arc::new(Semaphore::new(limits.max_checkpoint_inflight_bytes)),
+                snapshot_ops: Arc::new(Semaphore::new(
+                    limits.max_parallel_ops - usize::from(M::ENABLED),
+                )),
+                snapshot_bytes: Arc::new(Semaphore::new(
+                    limits.max_inflight_bytes
+                        - if M::ENABLED {
+                            limits.core.max_batch_bytes
+                        } else {
+                            0
+                        },
+                )),
+                snapshot_checkpoint_bytes: Arc::new(Semaphore::new(
+                    limits.max_checkpoint_inflight_bytes
+                        - if M::ENABLED {
+                            limits.max_checkpoint_bytes
+                        } else {
+                            0
+                        },
+                )),
+                _mode: PhantomData,
             }),
         })
     }
@@ -274,7 +335,7 @@ where
     }
 }
 
-impl<S, A> Drop for Replication<S, A>
+impl<S, A, M> Drop for Replication<S, A, M>
 where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,

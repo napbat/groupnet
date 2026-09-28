@@ -2,6 +2,8 @@
 
 use crate::replication::{BoundComparison, Comparison, Cursor, Scope, SourceHistory, SourceProof};
 
+use super::ExpiryTiming;
+
 /// Fleet-wide admission parameters, persisted by the source adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionPolicy {
@@ -41,10 +43,6 @@ impl AdmissionPolicy {
         if self.history.source.is_empty()
             || self.fingerprint.is_empty()
             || self.fingerprint.len() > 256
-            || self.max_duration_ms == 0
-            || self.rate_denominator == 0
-            || self.rate_numerator < self.rate_denominator
-            || self.clock_margin_ms == 0
             || self.max_waiters == 0
             || self.max_waiters > 4096
             || self.max_cursor_bytes == 0
@@ -53,34 +51,28 @@ impl AdmissionPolicy {
         {
             return Err(PolicyError::Invalid);
         }
-        self.expiry_wait_ms()?;
+        self.timing().validate()?;
         Ok(())
+    }
+
+    /// The reusable finite-window timing bound for this fleet policy.
+    #[must_use]
+    pub const fn timing(&self) -> ExpiryTiming {
+        ExpiryTiming {
+            max_duration_ms: self.max_duration_ms,
+            rate_numerator: self.rate_numerator,
+            rate_denominator: self.rate_denominator,
+            clock_margin_ms: self.clock_margin_ms,
+        }
     }
 
     /// Conservative writer-clock wait for every earlier admission to expire.
     ///
     /// # Errors
-    /// Returns [`PolicyError::Overflow`] if checked arithmetic fails.
+    /// Returns [`PolicyError::Invalid`] for invalid timing bounds or
+    /// [`PolicyError::Overflow`] if checked arithmetic fails.
     pub fn expiry_wait_ms(&self) -> Result<u64, PolicyError> {
-        if self.max_duration_ms == 0
-            || self.rate_denominator == 0
-            || self.rate_numerator < self.rate_denominator
-            || self.clock_margin_ms == 0
-        {
-            return Err(PolicyError::Invalid);
-        }
-        let product = u128::from(self.max_duration_ms)
-            .checked_mul(u128::from(self.rate_numerator))
-            .ok_or(PolicyError::Overflow)?;
-        let divisor = u128::from(self.rate_denominator);
-        let rounded = product
-            .checked_add(divisor - 1)
-            .ok_or(PolicyError::Overflow)?
-            / divisor;
-        u64::try_from(rounded)
-            .ok()
-            .and_then(|wait| wait.checked_add(self.clock_margin_ms))
-            .ok_or(PolicyError::Overflow)
+        self.timing().expiry_wait_ms()
     }
 }
 

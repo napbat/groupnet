@@ -66,6 +66,20 @@ impl Limits {
             || self.queue_depth == 0
             || self.queue_depth > tokio::sync::Semaphore::MAX_PERMITS
             || u32::try_from(self.core.max_batch_bytes).is_err()
+            || self.core.snapshot.is_some_and(|snapshot| {
+                self.max_parallel_ops < 2
+                    || self
+                        .core
+                        .max_batch_bytes
+                        .checked_add(snapshot.max_chunk_bytes.max(self.core.max_batch_bytes))
+                        .is_none_or(|sum| sum > self.max_inflight_bytes)
+                    || snapshot.max_candidate_bytes > self.max_checkpoint_bytes as u64
+                    || usize::try_from(snapshot.max_candidate_bytes)
+                        .ok()
+                        .and_then(|candidate| self.max_checkpoint_bytes.checked_add(candidate))
+                        .is_none_or(|sum| sum > self.max_checkpoint_inflight_bytes)
+                    || u32::try_from(snapshot.max_chunk_bytes).is_err()
+            })
         {
             return Err(LimitsError);
         }

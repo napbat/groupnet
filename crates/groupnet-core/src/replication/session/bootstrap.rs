@@ -5,7 +5,10 @@ use crate::replication::{ApplyReceipt, Cursor, Effect, Operation, Reject, Stage,
 
 impl SessionEngine {
     pub(super) fn start_bootstrap(&mut self) -> Step {
-        if self.state.stage != Stage::Unready || self.outstanding.is_some() {
+        if self.state.stage != Stage::Unready
+            || self.outstanding.is_some()
+            || self.snapshot_cleanup.is_some()
+        {
             return Step::reject(Reject::Stage);
         }
         self.retry_target = RetryTarget::Bootstrap;

@@ -2,7 +2,10 @@
 
 use crate::Time;
 
-use super::{BoundComparison, Coverage, Cursor, IdentityError, Scope, SourceProof};
+use super::{
+    BoundComparison, ChunkReceipt, Coverage, Cursor, HoldReceipt, IdentityError, Scope,
+    SnapshotConfig, SnapshotOffer, SourceProof,
+};
 
 /// Replay contract selected for this session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +19,8 @@ pub enum Mode {
 /// Limits enforced before effects and before accepting adapter responses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
+    /// Optional finite state-sync snapshot recovery; absent for replay-only sessions.
+    pub snapshot: Option<SnapshotConfig>,
     /// Maximum encoded native cursor or proof byte length.
     pub max_cursor_bytes: usize,
     /// Maximum records in one replay batch.
@@ -35,6 +40,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            snapshot: None,
             max_cursor_bytes: 4096,
             max_batch_events: 4096,
             max_batch_bytes: 8 * 1024 * 1024,
@@ -71,6 +77,9 @@ impl Config {
         {
             return Err(ConfigError::Zero);
         }
+        if self.snapshot.is_some_and(|snapshot| !snapshot.valid()) {
+            return Err(ConfigError::Zero);
+        }
         Ok(self)
     }
 }
@@ -86,6 +95,15 @@ pub struct Operation {
     pub token: u64,
 }
 
+/// Which worker-owned resources survive snapshot cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotCleanupDisposition {
+    /// Recovery completed: retain the live source attachment only.
+    Completed,
+    /// Recovery aborted: drop the attachment and all transient resources.
+    Aborted,
+}
+
 /// Current session stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -95,6 +113,30 @@ pub enum Stage {
     LoadingCheckpoint,
     /// Installing the loaded checkpoint through a guarded operation.
     InstallingCheckpoint,
+    /// Waiting for a bounded source retention hold.
+    SnapshotHolding,
+    /// Waiting for a consistent-cut offer under the hold.
+    SnapshotOffering,
+    /// Creating a private bounded application stage.
+    SnapshotOpening,
+    /// Reading one sequential image chunk.
+    SnapshotReading,
+    /// Writing one image chunk to the private stage.
+    SnapshotWriting,
+    /// Verifying the complete private image.
+    SnapshotVerifying,
+    /// Checking a source replay barrier under the hold.
+    SnapshotBarrier,
+    /// Scanning a bounded committed suffix into private state.
+    SnapshotScanning,
+    /// Applying a bounded suffix batch to private state.
+    SnapshotApplying,
+    /// Sealing the private stage at the replay barrier.
+    SnapshotSealing,
+    /// Installing the sealed durable state/cursor pair.
+    SnapshotInstalling,
+    /// Attaching ongoing source delivery before admission.
+    SnapshotAttaching,
     /// Waiting for an authoritative source tail.
     CheckingTail,
     /// Waiting for a retained source batch.
@@ -107,6 +149,8 @@ pub enum Stage {
     NeedsSnapshot,
     /// Event-complete history was irrecoverably lost.
     IrrecoverableGap,
+    /// Snapshot transfer or continuity was rejected; private resources must be cleaned.
+    SnapshotAborted,
     /// Explicitly cancelled until a new validated resume.
     Cancelled,
     /// Automatic retry budget was exhausted.
@@ -206,6 +250,118 @@ pub struct ApplyReceipt {
 /// Input supplied by a driver after its source/application adapter acts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Begin an opt-in state-sync snapshot with a deadline sampled now.
+    StartSnapshot,
+    /// Exact acquire response; a late response cannot renew an expired attempt.
+    SnapshotHeld {
+        /// Exact acquire operation.
+        op: Operation,
+        /// Request-bound finite hold certificate.
+        receipt: HoldReceipt,
+    },
+    /// Consistent-cut image metadata from the held source.
+    SnapshotOffered {
+        /// Exact offer operation.
+        op: Operation,
+        /// Bounded consistent-cut image metadata.
+        offer: Box<SnapshotOffer>,
+    },
+    /// Private stage opened with a reserved decoded-candidate budget.
+    SnapshotOpened {
+        /// Exact stage-open operation.
+        op: Operation,
+        /// Charged decoded/private candidate bytes.
+        charged_bytes: u64,
+    },
+    /// One bounded image chunk was read into a worker-held payload.
+    SnapshotRead {
+        /// Exact chunk-read operation.
+        op: Operation,
+        /// Bounded worker-held chunk metadata.
+        chunk: ChunkReceipt,
+    },
+    /// One exact image chunk was staged.
+    SnapshotWritten {
+        /// Exact stage-write operation.
+        op: Operation,
+        /// Index written in sequential order.
+        index: u32,
+        /// Exclusive encoded-image offset after this chunk.
+        through: u64,
+        /// Current decoded/private candidate byte charge.
+        charged_bytes: u64,
+    },
+    /// Trusted application verified the image schema and digest.
+    SnapshotVerified {
+        /// Exact image-verification operation.
+        op: Operation,
+        /// Current decoded/private candidate byte charge.
+        charged_bytes: u64,
+    },
+    /// Source barrier for bounded private replay.
+    SnapshotBarrier {
+        /// Exact barrier operation.
+        op: Operation,
+        /// Verified source-native replay barrier.
+        proof: SourceProof,
+        /// Exact comparisons of cut against head and retention boundary.
+        comparisons: Vec<BoundComparison>,
+    },
+    /// One bounded source batch for the private stage.
+    SnapshotScanned {
+        /// Exact private scan operation.
+        op: Operation,
+        /// Contiguous bounded committed batch.
+        batch: Box<Batch>,
+    },
+    /// Private application made a source batch visible within the stage.
+    SnapshotApplied {
+        /// Exact private apply operation.
+        op: Operation,
+        /// Exact source cursor visible within the private stage.
+        through: Cursor,
+        /// Current decoded/private candidate byte charge.
+        charged_bytes: u64,
+    },
+    /// Private state was sealed at the exact replay barrier.
+    SnapshotSealed {
+        /// Exact private seal operation.
+        op: Operation,
+        /// Cursor sealed atomically with private state.
+        through: Cursor,
+        /// Worker-held candidate, keyed by the seal token.
+        payload_id: u64,
+        /// Current decoded/private candidate byte charge.
+        charged_bytes: u64,
+    },
+    /// Exact durable snapshot candidate install completion.
+    SnapshotInstalled {
+        /// Exact guarded-install operation.
+        op: Operation,
+        /// Durable exact-cursor application receipt.
+        receipt: ApplyReceipt,
+    },
+    /// Source delivery attached with no gap after the installed barrier.
+    SnapshotAttached {
+        /// Exact source attach operation.
+        op: Operation,
+        /// Source-proven attach barrier and retained suffix.
+        proof: SourceProof,
+        /// Exact comparisons of installed cursor against attach proof.
+        comparisons: Vec<BoundComparison>,
+    },
+    /// Bounded best-effort cleanup completion; never grants authority.
+    SnapshotCleaned {
+        /// Exact best-effort cleanup operation.
+        op: Operation,
+    },
+    /// Local resource disposal after cleanup failure or expiry.
+    SnapshotDiscarded {
+        /// Exact cleanup operation that requested local disposal.
+        op: Operation,
+        /// Disposition echoed from the exact disposal effect.
+        disposition: SnapshotCleanupDisposition,
+    },
     /// Begin source-backed bootstrap through the shared operation allocator.
     StartBootstrap,
     /// Private checkpoint load completion; both fields are absent together.
@@ -285,6 +441,125 @@ pub enum Event {
 /// Driver work requested by the sans-IO session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// Acquire a finite source hold before choosing a snapshot cut.
+    AcquireSnapshotHold {
+        /// Core-issued acquire operation.
+        op: Operation,
+        /// Source scope to hold before choosing a cut.
+        scope: Scope,
+        /// Total recovery deadline measured before the acquire request.
+        total_due: Time,
+    },
+    /// Request a consistent source cut and bounded image offer.
+    OfferSnapshot {
+        /// Core-issued offer operation.
+        op: Operation,
+        /// Exact source scope under the held history.
+        scope: Scope,
+    },
+    /// Begin a private stage with explicit decoded-candidate reservation.
+    OpenSnapshotStage {
+        /// Core-issued stage-open operation.
+        op: Operation,
+        /// Validated bounded image metadata.
+        offer: Box<SnapshotOffer>,
+        /// Decoded/private candidate byte budget to reserve.
+        max_candidate_bytes: u64,
+    },
+    /// Read one bounded sequential image chunk.
+    ReadSnapshotChunk {
+        /// Core-issued chunk-read operation.
+        op: Operation,
+        /// Zero-based sequential chunk index.
+        index: u32,
+        /// Encoded image offset.
+        offset: u64,
+        /// Maximum encoded bytes to return.
+        max_bytes: usize,
+    },
+    /// Transfer one worker-held chunk to the private stage.
+    WriteSnapshotChunk {
+        /// Core-issued stage-write operation.
+        op: Operation,
+        /// Worker-held exact chunk to stage.
+        chunk: ChunkReceipt,
+    },
+    /// Verify complete image integrity in the private stage.
+    VerifySnapshotImage {
+        /// Core-issued verification operation.
+        op: Operation,
+        /// Source-verified expected complete-image digest.
+        digest: Vec<u8>,
+    },
+    /// Check a source barrier under the same finite hold.
+    SnapshotReplayBarrier {
+        /// Core-issued barrier operation.
+        op: Operation,
+        /// Consistent-cut cursor to retain and replay after.
+        from: Cursor,
+    },
+    /// Scan a bounded committed suffix for private replay.
+    SnapshotScan {
+        /// Core-issued private scan operation.
+        op: Operation,
+        /// Exclusive native cursor.
+        from: Cursor,
+        /// Committed-event budget.
+        max_events: usize,
+        /// Encoded batch byte budget.
+        max_bytes: usize,
+    },
+    /// Apply a bounded source batch to private state.
+    SnapshotApply {
+        /// Core-issued private apply operation.
+        op: Operation,
+        /// Source-proven batch to apply to private state.
+        batch: Box<Batch>,
+    },
+    /// Seal a private state/cursor pair at the exact replay barrier.
+    SealSnapshotStage {
+        /// Core-issued private seal operation.
+        op: Operation,
+        /// Exact replay barrier reached within the stage.
+        through: Cursor,
+    },
+    /// Install a sealed private candidate with a guarded exact-cursor permit.
+    InstallSnapshot {
+        /// Core-issued guarded-install operation.
+        op: Operation,
+        /// Exact sealed candidate cursor.
+        cursor: Cursor,
+        /// Worker-held candidate identifier.
+        payload_id: u64,
+    },
+    /// Attach ongoing source delivery after the installed barrier.
+    AttachSnapshot {
+        /// Core-issued source attach operation.
+        op: Operation,
+        /// Installed replay barrier to continue after.
+        after: Cursor,
+    },
+    /// Best-effort release of hold/attachment and private-stage resources.
+    CleanupSnapshot {
+        /// Core-issued best-effort cleanup operation.
+        op: Operation,
+        /// Original acquire operation tagging the worker's resource set.
+        attempt: Operation,
+        /// Whether the live continuation attachment survives cleanup.
+        disposition: SnapshotCleanupDisposition,
+        /// Absolute logical-time cleanup deadline; execution cannot reset it.
+        due: Time,
+    },
+    /// Synchronously drop only the resources of this exact attempt after
+    /// cleanup expiry or failure, then report `SnapshotDiscarded`.
+    DiscardSnapshotResources {
+        /// Cleanup operation; old source replies remain fenced.
+        op: Operation,
+        /// Original acquire operation tagging the worker's resource set.
+        attempt: Operation,
+        /// Whether to preserve the live continuation attachment.
+        disposition: SnapshotCleanupDisposition,
+    },
     /// Load and validate a private atomic state/cursor checkpoint.
     LoadCheckpoint {
         /// Core-issued load operation.

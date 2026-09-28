@@ -542,8 +542,28 @@ application's independent domain predicate.
 
 Runtime tests cover missed hints, floor waits, stale source checks, authority
 loss, cancellation, late detached installs, checkpoint restore, and bounded
-resource release. Snapshot recovery, durable event-complete retention, named
-acknowledgements, scalable idle scheduling, and consumer migration remain in
-the build order above. Selecting the core's `EventComplete` gap policy does not
-itself establish a durable subscription or protect source history from
-retirement.
+resource release.
+
+`NativeSnapshot` opts the same manager and core into the snapshot contract in
+[replication-snapshots.md](replication-snapshots.md). The source adapter supplies
+a finite retention hold, a certified bounded image, replay barriers, and a
+no-gap continuation. The application stages chunks privately, verifies the
+image, replays whole native batches, and installs state/cursor under the same
+generation fence. Final tail revalidation precedes replay readiness. Explicit
+cleanup releases the temporary hold; the live continuation survives successful
+cleanup and is disposed on cancellation, supersession, or a new recovery.
+Every cleanup identifies its original acquire attempt. Separate snapshot
+quotas leave ordinary replay operation and byte capacity available.
+
+Seeded snapshot simulations cover cutover races, concurrent mutations,
+corrupt/missing/duplicate chunks, cancellation, restart, and retention loss.
+Runtime tests exercise concurrent DELETE/PUT after a snapshot cut, guarded
+install cancellation, retained continuation lifetime, and source gaps. Native
+storage adapters still need to prove their actual retention/cleanup interlock
+before enabling this capability; the generic manager cannot provide it from
+gossip or a best-effort object-store listing.
+
+Durable event-complete retention, named acknowledgements, scalable idle
+scheduling, and consumer migration remain in the build order above. Selecting
+the core's `EventComplete` gap policy does not itself establish a durable
+subscription or protect source history from retirement.

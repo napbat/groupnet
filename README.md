@@ -15,10 +15,12 @@ and the session and coherence tiers in between. Each rung, its price, and what
 it deliberately does *not* promise are in
 [`docs/consistency-modes.md`](docs/consistency-modes.md).
 The opt-in `consistency-replication` feature adds source-backed replay, native
-cursor checkpoint resume, and read-your-writes floor waits. It works through
-typed source and application adapters and does not impose a second commit log.
-Snapshot recovery and durable subscriptions remain in development; their
-contracts and implementation status are in
+cursor checkpoint resume, read-your-writes floor waits, and opt-in native
+snapshot recovery. It works through typed source and application adapters and
+does not impose a second commit log. Snapshot recovery requires a source
+retention hold and a guarded application install; replay-only adapters keep
+their existing API. Durable subscriptions and consumer migrations remain in
+development. Contracts and implementation status are in
 [`docs/replication.md`](docs/replication.md).
 
 > Status: early scaffold. The architecture and public API are in place with a

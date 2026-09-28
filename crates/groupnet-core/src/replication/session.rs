@@ -1,6 +1,9 @@
-//! Replay-only, source-backed replica session decisions.
+//! Source-backed replica replay and snapshot session decisions.
 
 mod bootstrap;
+#[cfg(test)]
+mod exhaustion_tests;
+mod snapshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetryTarget {
@@ -36,6 +39,9 @@ pub struct SessionEngine {
     bootstrap_candidate: Option<(Cursor, u64)>,
     retry_target: RetryTarget,
     proof: Option<SourceProof>,
+    snapshot: Option<snapshot::Progress>,
+    snapshot_cleanup: Option<snapshot::CleanupState>,
+    live_attachment_attempt: Option<Operation>,
     mode_authority: bool,
     ready: bool,
 }
@@ -88,6 +94,9 @@ impl SessionEngine {
             bootstrap_candidate: None,
             retry_target: RetryTarget::Tail,
             proof: None,
+            snapshot: None,
+            snapshot_cleanup: None,
+            live_attachment_attempt: None,
             mode_authority: false,
             ready: false,
         })
@@ -111,6 +120,9 @@ impl SessionEngine {
     #[must_use]
     pub fn accepts_operation(&self, op: Operation) -> bool {
         self.revoke_op == Some(op)
+            || self.snapshot_cleanup.as_ref().is_some_and(|cleanup| {
+                cleanup.op == op && !cleanup.discarding && self.now < cleanup.due
+            })
             || (self.outstanding.is_some_and(|(current, _)| current == op)
                 && self.operation_due.is_some_and(|due| self.now < due))
     }
@@ -118,7 +130,7 @@ impl SessionEngine {
     /// Next live logical deadline, without retaining historical timer effects.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Time> {
-        if self.outstanding.is_some() {
+        let ordinary = if self.outstanding.is_some() {
             self.operation_due
         } else if self.state.stage == Stage::RetryWait {
             self.retry_due
@@ -128,12 +140,28 @@ impl SessionEngine {
                 Stage::Cancelled
                     | Stage::RetryExhausted
                     | Stage::NeedsSnapshot
+                    | Stage::SnapshotAborted
                     | Stage::IrrecoverableGap
             )
         {
             Some(self.tail_due)
         } else {
             None
+        };
+        let cleanup_due = self
+            .snapshot_cleanup
+            .as_ref()
+            .and_then(|cleanup| (!cleanup.discarding).then_some(cleanup.due));
+        let ordinary = match (ordinary, cleanup_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) | (None, a) => a,
+        };
+        match (
+            ordinary,
+            self.snapshot.as_ref().map(|snapshot| snapshot.total_due),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) | (None, a) => a,
         }
     }
 
@@ -142,7 +170,7 @@ impl SessionEngine {
     pub fn read_decision(&self) -> ReadDecision {
         if matches!(
             self.state.stage,
-            Stage::NeedsSnapshot | Stage::IrrecoverableGap
+            Stage::NeedsSnapshot | Stage::SnapshotAborted | Stage::IrrecoverableGap
         ) {
             return ReadDecision::Refuse(Refusal::Gap);
         }
@@ -240,7 +268,7 @@ impl SessionEngine {
             from: self.state.materialized.clone(),
         });
         effects.push(Effect::ArmTimer(
-            self.operation_due.expect("issued deadline"),
+            self.next_deadline().expect("issued deadline"),
         ));
         Step::ok(effects)
     }
@@ -277,7 +305,7 @@ impl SessionEngine {
                 max_events: self.config.max_batch_events,
                 max_bytes: self.config.max_batch_bytes,
             },
-            Effect::ArmTimer(self.operation_due.expect("issued deadline")),
+            Effect::ArmTimer(self.next_deadline().expect("issued deadline")),
         ])
     }
 
@@ -308,10 +336,30 @@ impl SessionEngine {
                 return Step::ok(Vec::new());
             }
         }
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.attached)
+        {
+            return Step::reject(Reject::Stage);
+        }
+        if let Some(target) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.attach_head.as_ref())
+        {
+            let reached = match Self::relation(comparisons, materialized, target, proof) {
+                Ok(order) => order,
+                Err(error) => return Step::reject(error),
+            };
+            if reached == Comparison::Before {
+                return self.start_scan();
+            }
+        }
         self.state.stage = Stage::Ready;
         self.ready = true;
         self.retries = 0;
-        Step::ok(Vec::new())
+        self.finish_snapshot()
     }
 
     /// Consumes one explicit input and returns the next bounded driver effects.
@@ -321,6 +369,47 @@ impl SessionEngine {
     )]
     pub fn step(&mut self, event: Event) -> Step {
         match event {
+            Event::StartSnapshot => self.start_snapshot(),
+            Event::SnapshotHeld { op, receipt } => self.snapshot_held(op, receipt),
+            Event::SnapshotOffered { op, offer } => self.snapshot_offered(op, *offer),
+            Event::SnapshotOpened { op, charged_bytes } => self.snapshot_opened(op, charged_bytes),
+            Event::SnapshotRead { op, chunk } => self.snapshot_read(op, chunk),
+            Event::SnapshotWritten {
+                op,
+                index,
+                through,
+                charged_bytes,
+            } => self.snapshot_written(op, index, through, charged_bytes),
+            Event::SnapshotVerified { op, charged_bytes } => {
+                self.snapshot_verified(op, charged_bytes)
+            }
+            Event::SnapshotBarrier {
+                op,
+                proof,
+                comparisons,
+            } => self.snapshot_barrier(op, proof, &comparisons),
+            Event::SnapshotScanned { op, batch } => self.snapshot_scanned(op, *batch),
+            Event::SnapshotApplied {
+                op,
+                through,
+                charged_bytes,
+            } => self.snapshot_applied(op, through, charged_bytes),
+            Event::SnapshotSealed {
+                op,
+                through,
+                payload_id,
+                charged_bytes,
+            } => self.snapshot_sealed(op, through, payload_id, charged_bytes),
+            Event::SnapshotInstalled { op, receipt } => self.snapshot_installed(op, receipt),
+            Event::SnapshotAttached {
+                op,
+                proof,
+                comparisons,
+            } => self.snapshot_attached(op, proof, &comparisons),
+            Event::SnapshotCleaned { op } => self.snapshot_cleaned(op),
+            Event::SnapshotDiscarded { op, disposition } => {
+                self.snapshot_discarded(op, disposition)
+            }
             Event::StartBootstrap => self.start_bootstrap(),
             Event::CheckpointLoaded {
                 op,
@@ -329,12 +418,16 @@ impl SessionEngine {
             } => self.checkpoint_loaded(op, cursor, payload_id),
             Event::CheckpointInstalled { op, receipt } => self.checkpoint_installed(op, receipt),
             Event::Resume { cursor } => {
+                if self.snapshot_cleanup.is_some() {
+                    return Step::reject(Reject::Stage);
+                }
                 if !matches!(
                     self.state.stage,
                     Stage::Unready
                         | Stage::Cancelled
                         | Stage::RetryExhausted
                         | Stage::NeedsSnapshot
+                        | Stage::SnapshotAborted
                 ) {
                     return Step::reject(Reject::Stage);
                 }
@@ -347,6 +440,7 @@ impl SessionEngine {
                         | Stage::RetryWait
                         | Stage::RetryExhausted
                         | Stage::NeedsSnapshot
+                        | Stage::SnapshotAborted
                         | Stage::IrrecoverableGap
                 ) {
                     Step::reject(Reject::Stage)
@@ -361,6 +455,7 @@ impl SessionEngine {
                         | Stage::RetryWait
                         | Stage::RetryExhausted
                         | Stage::NeedsSnapshot
+                        | Stage::SnapshotAborted
                         | Stage::IrrecoverableGap
                 ) {
                     return Step::reject(Reject::Stage);
@@ -402,11 +497,26 @@ impl SessionEngine {
                     return Step::reject(Reject::Discontinuity);
                 }
                 self.now = now;
+                if self
+                    .snapshot_cleanup
+                    .as_ref()
+                    .is_some_and(|cleanup| !cleanup.discarding && now >= cleanup.due)
+                {
+                    return self.expire_snapshot_cleanup();
+                }
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| now >= snapshot.total_due)
+                {
+                    return self.abort_snapshot();
+                }
                 if matches!(
                     self.state.stage,
                     Stage::Cancelled
                         | Stage::RetryExhausted
                         | Stage::NeedsSnapshot
+                        | Stage::SnapshotAborted
                         | Stage::IrrecoverableGap
                 ) {
                     return Step::ok(Vec::new());
@@ -458,11 +568,17 @@ impl SessionEngine {
                     };
                     self.outstanding = None;
                     self.operation_due = None;
+                    if self.mode == Mode::StateSync && self.config.snapshot.is_some() {
+                        return self.start_snapshot();
+                    }
                     return Step::ok(vec![match self.mode {
                         Mode::StateSync => Effect::NeedsSnapshot,
                         Mode::EventComplete => Effect::IrrecoverableGap,
                     }]);
                 };
+                if self.snapshot.is_some() && materialized.history != proof.head.history {
+                    return self.abort_snapshot();
+                }
                 let orders = (
                     Self::relation(&comparisons, materialized, &proof.head, &proof),
                     Self::relation(&comparisons, materialized, &proof.retained_from, &proof),
@@ -486,10 +602,20 @@ impl SessionEngine {
                 self.operation_due = None;
                 self.state.head = Some(proof.head.clone());
                 self.proof = Some(proof);
-                let mut effects = vec![Effect::ArmTimer(self.tail_due)];
+                let mut effects = vec![Effect::ArmTimer(
+                    self.next_deadline().unwrap_or(self.tail_due),
+                )];
                 let hinted_during_check = self.pending_tail;
                 self.pending_tail = false;
                 if to_low == Comparison::Before {
+                    if self.snapshot.is_some() {
+                        return self.abort_snapshot();
+                    }
+                    if self.live_attachment_attempt.is_some() {
+                        self.state.stage = Stage::NeedsSnapshot;
+                        effects.extend(self.cancel_snapshot_resources());
+                        return Step::ok(effects);
+                    }
                     self.state.stage = match self.mode {
                         Mode::StateSync => Stage::NeedsSnapshot,
                         Mode::EventComplete => Stage::IrrecoverableGap,
@@ -498,6 +624,15 @@ impl SessionEngine {
                         Mode::StateSync => Effect::NeedsSnapshot,
                         Mode::EventComplete => Effect::IrrecoverableGap,
                     });
+                    if self.mode == Mode::StateSync && self.config.snapshot.is_some() {
+                        effects.pop();
+                        let start = self.start_snapshot();
+                        effects.extend(start.effects);
+                        return Step {
+                            effects,
+                            rejection: start.rejection,
+                        };
+                    }
                     return Step::ok(effects);
                 }
                 let next = if to_head == Comparison::Before {
@@ -577,16 +712,12 @@ impl SessionEngine {
                     return Step::reject(Reject::Exhausted);
                 };
                 self.pending_batch = Some(*batch.clone());
-                let Some(deadline) = self.operation_due else {
-                    self.state.stage = Stage::Unready;
-                    return Step::reject(Reject::Stage);
-                };
                 Step::ok(vec![
                     Effect::Apply {
                         op: apply_op,
                         batch,
                     },
-                    Effect::ArmTimer(deadline),
+                    Effect::ArmTimer(self.next_deadline().unwrap_or(self.tail_due)),
                 ])
             }
             Event::Applied { op, receipt } => {
@@ -631,6 +762,7 @@ impl SessionEngine {
                             | Stage::RetryWait
                             | Stage::RetryExhausted
                             | Stage::NeedsSnapshot
+                            | Stage::SnapshotAborted
                             | Stage::IrrecoverableGap
                     )
                 {
@@ -642,8 +774,18 @@ impl SessionEngine {
                 }
             }
             Event::Failed { op } => {
+                if self
+                    .snapshot_cleanup
+                    .as_ref()
+                    .is_some_and(|cleanup| cleanup.op == op)
+                {
+                    return self.expire_snapshot_cleanup();
+                }
                 if self.outstanding.is_none_or(|(issued, _)| issued != op) {
                     return Step::reject(Reject::StaleOperation);
+                }
+                if self.snapshot.is_some() {
+                    return self.abort_snapshot();
                 }
                 let closed = self.close_gate();
                 if closed.rejection.is_some() {
@@ -681,17 +823,31 @@ impl SessionEngine {
                 Step::ok(effects)
             }
             Event::Cancel | Event::Supersede => {
+                let cleanup = self.cancel_snapshot_resources();
                 let cancelled = matches!(event, Event::Cancel);
                 let was_ready = self.ready;
                 let Some(next) = self.state.generation.checked_add(1) else {
                     self.ready = false;
                     self.state.stage = Stage::RetryExhausted;
+                    self.state.head = None;
+                    self.state.target = None;
+                    self.outstanding = None;
+                    self.operation_due = None;
+                    self.revoke_op = None;
+                    self.pending_tail = false;
+                    self.pending_batch = None;
+                    self.bootstrap_candidate = None;
+                    self.retry_target = RetryTarget::Tail;
+                    self.proof = None;
+                    self.retry_due = None;
+                    let mut effects = if was_ready {
+                        vec![Effect::RevokeServingUnconfirmed]
+                    } else {
+                        Vec::new()
+                    };
+                    effects.extend(cleanup);
                     return Step {
-                        effects: if was_ready {
-                            vec![Effect::RevokeServingUnconfirmed]
-                        } else {
-                            Vec::new()
-                        },
+                        effects,
                         rejection: Some(Reject::Exhausted),
                     };
                 };
@@ -712,7 +868,9 @@ impl SessionEngine {
                 self.retry_target = RetryTarget::Tail;
                 self.proof = None;
                 self.retry_due = None;
-                self.close_gate()
+                let mut closed = self.close_gate();
+                closed.effects.extend(cleanup);
+                closed
             }
         }
     }
