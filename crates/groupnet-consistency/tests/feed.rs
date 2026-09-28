@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_consistency::{
-    Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
+    Frontier, InvalidFeedHead, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
+    checked_advertised_head,
 };
 use groupnet_core::NodeId;
 use groupnet_runtime::Group;
@@ -320,6 +321,7 @@ async fn advertised_head_tracks_the_feed() {
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     assert_eq!(advertised_head(&b_group, &a_id), None, "no feed yet");
+    assert_eq!(checked_advertised_head(&b_group, &a_id), Ok(None));
     assert_eq!(
         advertised_head(&b_group, &b_id),
         None,
@@ -341,6 +343,27 @@ async fn advertised_head_tracks_the_feed() {
         "head never reached B's view: {:?}",
         advertised_head(&b_group, &a_id)
     );
+}
+
+#[tokio::test]
+async fn checked_head_rejects_present_malformed_feed() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bad-a", &["bad-b"], &opts());
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "bad-b", &["bad-a"], &opts());
+    converged_within(&[&a_group, &b_group], SETTLE).await;
+    assert_eq!(checked_advertised_head(&b_group, &a_id), Ok(None));
+    a_group
+        .set_entry("~writes", vec![0xff, 0x01], None)
+        .expect("queue malformed entry");
+    eventually_within("malformed feed to propagate", SETTLE, || {
+        b_group.node_entry(&a_id, "~writes").is_some()
+    })
+    .await;
+    assert_eq!(
+        checked_advertised_head(&b_group, &a_id),
+        Err(InvalidFeedHead)
+    );
+    assert_eq!(advertised_head(&b_group, &a_id), None);
 }
 
 #[tokio::test]

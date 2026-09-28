@@ -13,6 +13,10 @@ use crate::wire::{Frame, entry_key};
 
 type DecodeFn<K> = dyn Fn(&[u8]) -> Option<K> + Send + Sync;
 
+/// A present feed entry could not be decoded into a valid head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidFeedHead;
+
 /// The head [`WriteToken`] `peer`'s default feed currently advertises in
 /// `group` — its most recently published write, as gossip shows it right
 /// now — or `None` when the peer has no decodable feed (or none yet).
@@ -25,18 +29,54 @@ type DecodeFn<K> = dyn Fn(&[u8]) -> Option<K> + Send + Sync;
 /// guarantee, not a global order.
 #[must_use]
 pub fn advertised_head(group: &Group, peer: &NodeId) -> Option<WriteToken> {
-    advertised_head_named("", group, peer)
+    checked_advertised_head(group, peer).ok().flatten()
+}
+
+/// Reads the default feed head, distinguishing an absent entry from a
+/// malformed present entry. Recovery protocols should use this form so an
+/// unreadable source observation cannot be mistaken for a quiet writer.
+///
+/// # Errors
+/// Returns [`InvalidFeedHead`] when the peer has a present invalid frame.
+pub fn checked_advertised_head(
+    group: &Group,
+    peer: &NodeId,
+) -> Result<Option<WriteToken>, InvalidFeedHead> {
+    checked_advertised_head_named("", group, peer)
 }
 
 /// [`advertised_head`] for a named feed (see [`WriteFeed::named`](crate::WriteFeed::named)).
 #[must_use]
 pub fn advertised_head_named(name: &str, group: &Group, peer: &NodeId) -> Option<WriteToken> {
-    let frame = Frame::decode(&group.node_entry(peer, &entry_key(name))?)?;
-    let head = frame.end().checked_sub(1)?;
-    (head >= frame.first_seq).then_some(WriteToken {
+    checked_advertised_head_named(name, group, peer)
+        .ok()
+        .flatten()
+}
+
+/// Fallible [`advertised_head_named`] for source-backed recovery observers.
+///
+/// # Errors
+/// Returns [`InvalidFeedHead`] when the named entry is present but invalid.
+pub fn checked_advertised_head_named(
+    name: &str,
+    group: &Group,
+    peer: &NodeId,
+) -> Result<Option<WriteToken>, InvalidFeedHead> {
+    let Some(bytes) = group.node_entry(peer, &entry_key(name)) else {
+        return Ok(None);
+    };
+    let frame = Frame::decode(&bytes).ok_or(InvalidFeedHead)?;
+    let end = frame
+        .first_seq
+        .checked_add(u64::try_from(frame.keys.len()).map_err(|_| InvalidFeedHead)?)
+        .ok_or(InvalidFeedHead)?;
+    let Some(head) = end.checked_sub(1).filter(|head| *head >= frame.first_seq) else {
+        return Ok(None);
+    };
+    Ok(Some(WriteToken {
         epoch: frame.epoch,
         seq: head,
-    })
+    }))
 }
 
 /// One peer-write notification from [`PeerWrites::next`].

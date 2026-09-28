@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use groupnet_core::{Config, NodeId, Status};
-use groupnet_runtime::{Group, Node};
+use groupnet_runtime::{BoundedRosterError, Group, Node};
 use groupnet_testkit::cluster::{MemCluster, converged_within, eventually_within};
 use groupnet_transport::{Inbound, Transport};
 use groupnet_transport_mem::{MemTransport, Network};
@@ -163,6 +163,38 @@ async fn effective_config_and_alive_duration_are_readable_from_a_group() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn bounded_roster_refuses_overflow_without_truncating_a_coherent_view() {
+    let cluster = MemCluster::builder(&["node-a", "node-b", "node-c"])
+        .group("bounded-roster")
+        .gossip_interval_ms(OVERRIDDEN_GOSSIP_MS)
+        .spawn();
+    converged_within(&cluster.groups.iter().collect::<Vec<_>>(), SETTLE).await;
+    let observer = &cluster.groups[0];
+    let bounded = observer
+        .statuses_held_bounded(3, 64)
+        .expect("three members fit one bounded snapshot");
+    assert_eq!(bounded.len(), 3);
+    assert!(bounded.iter().any(|(id, _, _)| id == &cluster.ids[0]));
+    assert!(
+        bounded
+            .iter()
+            .all(|(id, status, _)| { observer.member_status(id) == Some(*status) })
+    );
+    assert_eq!(
+        observer.statuses_held_bounded(2, 64),
+        Err(BoundedRosterError::TooManyMembers)
+    );
+    assert_eq!(
+        observer.statuses_held_bounded(3, 5),
+        Err(BoundedRosterError::IdentityTooLong)
+    );
+    assert_eq!(
+        observer.statuses_held_bounded(0, 64),
+        Err(BoundedRosterError::InvalidLimit)
+    );
 }
 
 /// A crashed node — detected by the failure detector, not announced — is held

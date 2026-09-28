@@ -55,6 +55,15 @@ impl Frame {
             keys.push(bytes.get(offset..offset + len)?.to_vec());
             offset += len;
         }
+        if offset != bytes.len()
+            || first_seq == 0
+            || (keys.is_empty() && first_seq != 1)
+            || first_seq
+                .checked_add(u64::try_from(keys.len()).ok()?)
+                .is_none()
+        {
+            return None;
+        }
         Some(Self {
             epoch,
             first_seq,
@@ -96,6 +105,43 @@ mod tests {
         for cut in 0..bytes.len() {
             assert!(Frame::decode(&bytes[..cut]).is_none(), "cut at {cut}");
         }
+    }
+
+    #[test]
+    fn invalid_history_and_trailing_bytes_are_rejected() {
+        let frame = Frame {
+            epoch: 3,
+            first_seq: 1,
+            keys: vec![b"key".to_vec()],
+        };
+        let mut trailing = frame.encode();
+        trailing.push(7);
+        assert!(Frame::decode(&trailing).is_none());
+
+        let mut zero = frame.encode();
+        zero[8..16].copy_from_slice(&0_u64.to_le_bytes());
+        assert!(Frame::decode(&zero).is_none());
+
+        let mut overflow = frame.encode();
+        overflow[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Frame::decode(&overflow).is_none());
+
+        let empty = Frame {
+            epoch: 3,
+            first_seq: 4,
+            keys: Vec::new(),
+        };
+        assert!(Frame::decode(&empty.encode()).is_none());
+        assert!(
+            Frame::decode(
+                &Frame {
+                    first_seq: 1,
+                    ..empty
+                }
+                .encode()
+            )
+            .is_some()
+        );
     }
 
     #[test]

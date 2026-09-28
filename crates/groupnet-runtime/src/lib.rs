@@ -48,7 +48,7 @@ mod store;
 
 pub use anchor::{Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf};
 pub use driver::GroupEvent;
-pub use group::{CommandRejected, Group, Leadership, SyncCtx};
+pub use group::{BoundedRosterError, CommandRejected, Group, Leadership, SyncCtx};
 pub use groupnet_core::{RecoveredGrant, Role, Status};
 pub use node::{GroupProfile, Node, NodeBuilder};
 pub use routing::Routing;

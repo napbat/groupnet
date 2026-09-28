@@ -15,6 +15,17 @@ use crate::driver::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandRejected;
 
+/// A membership snapshot exceeded a caller's allocation bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundedRosterError {
+    /// A zero count or identity-byte limit cannot describe a roster.
+    InvalidLimit,
+    /// The observed roster has more identities than the caller can retain.
+    TooManyMembers,
+    /// At least one observed identity exceeds the caller's byte limit.
+    IdentityTooLong,
+}
+
 impl std::fmt::Display for CommandRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("group actor inbox full or closed")
@@ -348,6 +359,46 @@ impl Group {
                 )
             })
             .collect()
+    }
+
+    /// A single coherent status-and-held-age snapshot with allocation bounds.
+    ///
+    /// This checks the count and every identity against the borrowed published
+    /// view *before* cloning any identities. The local node counts toward
+    /// `max_members`; callers can remove it after receiving the snapshot.
+    ///
+    /// # Errors
+    /// Returns [`BoundedRosterError`] if a limit is zero or the observed view
+    /// exceeds either limit. An error is not a truncated roster.
+    pub fn statuses_held_bounded(
+        &self,
+        max_members: usize,
+        max_member_bytes: usize,
+    ) -> Result<Vec<(NodeId, Status, Duration)>, BoundedRosterError> {
+        if max_members == 0 || max_member_bytes == 0 {
+            return Err(BoundedRosterError::InvalidLimit);
+        }
+        let view = self.statuses_rx.borrow();
+        if view.len() > max_members {
+            return Err(BoundedRosterError::TooManyMembers);
+        }
+        if view
+            .keys()
+            .any(|node| node.as_str().len() > max_member_bytes)
+        {
+            return Err(BoundedRosterError::IdentityTooLong);
+        }
+        let now = now_since(self.start);
+        Ok(view
+            .iter()
+            .map(|(node, (status, since))| {
+                (
+                    node.clone(),
+                    *status,
+                    Duration::from_millis(now.0.saturating_sub(since.0)),
+                )
+            })
+            .collect())
     }
 
     /// Reads a metadata value as this node currently sees it. Values propagate

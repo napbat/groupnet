@@ -248,5 +248,8 @@ pub use lease::{
     CAP_LEASE, ClockMs, CoherenceCore, CoherenceOutcome, CoherenceStep, LeaseConfig,
     LeaseConfigError, LeaseCore, LeaseState, LeaseView, Leases, RenewalId, WaitMember,
 };
-pub use peers::{PeerWrite, PeerWrites, advertised_head, advertised_head_named};
+pub use peers::{
+    InvalidFeedHead, PeerWrite, PeerWrites, advertised_head, advertised_head_named,
+    checked_advertised_head, checked_advertised_head_named,
+};
 pub use token::WriteToken;
