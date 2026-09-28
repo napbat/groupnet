@@ -129,6 +129,23 @@ impl ClaimEngine {
         self.operation
     }
 
+    /// Deadline for one exact source, builder, selected-claim, or transfer
+    /// operation. Renewal and unrelated timers never shorten its I/O budget.
+    #[must_use]
+    pub fn operation_deadline(&self, op: BootstrapOperation) -> Option<Time> {
+        if self.operation == Some(op) {
+            return self.operation_due;
+        }
+        if self.claim_poll == Some(op) {
+            return self.claim_poll_due;
+        }
+        self.transfer.as_ref().and_then(|transfer| {
+            (transfer.current_operation() == Some(op))
+                .then(|| transfer.next_deadline())
+                .flatten()
+        })
+    }
+
     /// Exact selected donor or builder identity, if any.
     #[must_use]
     pub fn selected(&self) -> Option<&ClaimIdentity> {

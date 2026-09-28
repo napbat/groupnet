@@ -5,11 +5,12 @@
 //! synchronously revoked local publication gate.
 //! It never treats a gossip head as a durable source position.
 
+pub mod bootstrap;
 mod shell;
 
 pub use shell::{
-    AdapterError, BoxRecoveryFuture, PeerObservation, PublicationPermit, RecoveryAdapter,
-    RecoveryHandle, RecoveryOpenError, RecoveryStatus,
+    AdapterError, BoxRecoveryFuture, PeerHeadObservation, PeerObservation, PublicationPermit,
+    RecoveryAdapter, RecoveryHandle, RecoveryOpenError, RecoveryStatus,
 };
 
 pub use groupnet_core::volatile_recovery::{

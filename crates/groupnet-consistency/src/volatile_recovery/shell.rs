@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use groupnet_core::NodeId;
+use groupnet_core::volatile_bootstrap::ClaimIdentity;
 use groupnet_core::volatile_recovery::{
     Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryEngine, RecoveryError, RecoveryEvent,
     RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryState, RecoveryStep,
 };
-use groupnet_core::{NodeId, Time};
 use tokio::sync::Notify;
+
+use super::bootstrap::driver::BootstrapDriver;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -28,6 +31,9 @@ pub struct AdapterError;
 
 /// Bounded native membership, lease confirmation, and feed-head sample.
 pub type PeerObservation = Result<(Vec<Peer>, Option<Mark>), AdapterError>;
+
+/// Complete exact-incarnation peer observation after private peer handoff.
+pub type PeerHeadObservation = Result<(Vec<Peer>, Vec<ClaimIdentity>), AdapterError>;
 
 /// Consumer-owned facts and application effects for volatile coherence.
 ///
@@ -64,6 +70,17 @@ pub trait RecoveryAdapter: Send + Sync + 'static {
         op: RecoveryOperation,
         limits: RecoveryConfig,
     ) -> BoxRecoveryFuture<'_, PeerObservation>;
+
+    /// Observe bounded current peer identities and native feed heads after
+    /// a private peer handoff. Replay-only adapters can decline this optional
+    /// path; the core then falls back to its origin recovery policy.
+    fn observe_peer_heads(
+        &self,
+        _op: RecoveryOperation,
+        _limits: RecoveryConfig,
+    ) -> BoxRecoveryFuture<'_, PeerHeadObservation> {
+        Box::pin(async { Err(AdapterError) })
+    }
 
     /// Wait for every sampled native writer head to be applied locally.
     fn wait_frontiers(
@@ -276,6 +293,20 @@ impl Clone for PublicationPermit {
 }
 
 impl PublicationPermit {
+    /// Exact outer recovery operation this permit can publish for.
+    #[must_use]
+    pub const fn operation(&self) -> RecoveryOperation {
+        self.operation
+    }
+
+    /// Narrows this exact generation's publication deadline for a child
+    /// operation. It can never extend the parent recovery permission.
+    #[must_use]
+    pub fn restricted_to(&self, deadline: Instant) -> Self {
+        let mut restricted = self.clone();
+        restricted.deadline = restricted.deadline.min(deadline);
+        restricted
+    }
     /// Runs one bounded index mutation only if this exact permit still owns
     /// the publication generation. The closure runs under the short gate lock
     /// so a concurrent public signal cannot return before it has finished.
@@ -384,6 +415,23 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
         Self::open_configured(adapter, config, mode, me, session, Some(rearm))
     }
 
+    /// Opens one recovery worker with an optional source-backed peer bootstrap
+    /// child. The child only supplies a private baseline; independent lease
+    /// and application authority still decide whether reads may be served.
+    ///
+    /// # Errors
+    /// Rejects invalid recovery configuration, clock range, or no executor.
+    pub fn open_with_bootstrap(
+        adapter: Arc<A>,
+        config: RecoveryConfig,
+        mode: RecoveryMode,
+        me: NodeId,
+        session: u64,
+        bootstrap: Box<dyn BootstrapDriver>,
+    ) -> Result<Self, RecoveryOpenError> {
+        Self::open_inner(adapter, config, mode, me, session, None, Some(bootstrap))
+    }
+
     fn open_configured(
         adapter: Arc<A>,
         config: RecoveryConfig,
@@ -392,10 +440,25 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
         session: u64,
         rearm: Option<RecoveryRearm>,
     ) -> Result<Self, RecoveryOpenError> {
+        Self::open_inner(adapter, config, mode, me, session, rearm, None)
+    }
+
+    fn open_inner(
+        adapter: Arc<A>,
+        config: RecoveryConfig,
+        mode: RecoveryMode,
+        me: NodeId,
+        session: u64,
+        rearm: Option<RecoveryRearm>,
+        bootstrap: Option<Box<dyn BootstrapDriver>>,
+    ) -> Result<Self, RecoveryOpenError> {
         let mut engine =
             RecoveryEngine::new(config, mode, me, session).map_err(RecoveryOpenError::Core)?;
         if let Some(policy) = rearm {
             engine = engine.with_rearm(policy).map_err(RecoveryOpenError::Core)?;
+        }
+        if bootstrap.is_some() {
+            engine = engine.with_bootstrap().map_err(RecoveryOpenError::Core)?;
         }
         let now = Instant::now();
         if now
@@ -428,7 +491,7 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
             notify: Notify::new(),
         });
         shared.force_close(false);
-        runtime.spawn(run(Arc::clone(&shared), engine, config));
+        runtime.spawn(run(Arc::clone(&shared), engine, config, bootstrap));
         Ok(Self { shared })
     }
 
@@ -479,334 +542,10 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
     }
 }
 
-fn logical_now(start: Instant) -> Time {
-    Time(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
-}
-
-struct WorkerExitGuard<A: RecoveryAdapter>(Arc<Shared<A>>);
-
-impl<A: RecoveryAdapter> Drop for WorkerExitGuard<A> {
-    fn drop(&mut self) {
-        self.0.force_close(true);
-    }
-}
-
-fn absolute_deadline(started: Instant, due: Time) -> Option<Instant> {
-    started.checked_add(Duration::from_millis(due.0))
-}
-
-fn terminal_deadline<A: RecoveryAdapter>(
-    shared: &Shared<A>,
-    deadline: Option<Instant>,
-) -> Option<Instant> {
-    if deadline.is_none() {
-        shared.force_close(true);
-    }
-    deadline
-}
-
-fn affirm_effect<A: RecoveryAdapter>(
-    shared: &Shared<A>,
-    engine: &mut RecoveryEngine,
-    started: Instant,
-    active_version: u64,
-    op: RecoveryOperation,
-    now: impl Fn() -> Instant,
-) -> Vec<RecoveryEffect> {
-    if !engine.accepts_operation(op) {
-        return Vec::new();
-    }
-    let Some(due) = engine.next_deadline() else {
-        return Vec::new();
-    };
-    let Some(deadline) = terminal_deadline(shared, absolute_deadline(started, due)) else {
-        return Vec::new();
-    };
-    let mut control = lock(&shared.control);
-    if now() >= deadline {
-        drop(control);
-        return engine.step(RecoveryEvent::Tick(due)).effects;
-    }
-    let accepted =
-        !control.terminal && control.version == active_version && shared.adapter.affirm(op);
-    if accepted && now() >= deadline {
-        control.open = false;
-        shared.adapter.revoke_serving();
-        drop(control);
-        return engine.step(RecoveryEvent::Tick(due)).effects;
-    }
-    let result = engine.step(RecoveryEvent::Affirmed { op, accepted });
-    control.state = engine.state();
-    control.open = accepted && control.state.recovered;
-    result.effects
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "one auditable shell effect dispatch; all protocol decisions remain in the sans-IO engine"
-)]
-async fn run<A: RecoveryAdapter>(
-    shared: Arc<Shared<A>>,
-    mut engine: RecoveryEngine,
-    config: RecoveryConfig,
-) {
-    let _exit_guard = WorkerExitGuard(Arc::clone(&shared));
-    let started = Instant::now();
-    let mut effects = std::collections::VecDeque::new();
-    let mut active_version = 1;
-    loop {
-        let (pending, version) = {
-            let mut control = lock(&shared.control);
-            let pending = std::mem::take(&mut control.pending);
-            (pending, control.version)
-        };
-        if pending.start || pending.gap || pending.lapse > 0 || pending.cancel {
-            active_version = version;
-            // External signals can arrive after an arbitrarily long ready
-            // interval. Start their finite deadlines at this actual time.
-            let tick = engine.step(RecoveryEvent::Tick(logical_now(started)));
-            let transition = engine.step(pending_event(pending));
-            effects.clear();
-            effects.extend(signal_effects(tick, transition));
-            lock(&shared.control).state = engine.state();
-            if pending.cancel {
-                lock(&shared.control).pending.cancel = true;
-                return;
-            }
-        }
-
-        if let Some(effect) = effects.pop_front() {
-            let elapsed = engine.step(RecoveryEvent::Tick(logical_now(started)));
-            if !elapsed.effects.is_empty() {
-                effects.clear();
-                effects.extend(elapsed.effects);
-                lock(&shared.control).state = engine.state();
-                continue;
-            }
-            match effect {
-                RecoveryEffect::CloseGate { .. } => {
-                    let Some(version) = shared.close(active_version) else {
-                        continue;
-                    };
-                    active_version = version;
-                }
-                RecoveryEffect::ArmTimer(_) | RecoveryEffect::CancelBaseline { .. } => {}
-                RecoveryEffect::AcquireBaseline { op }
-                | RecoveryEffect::ObservePeerHeads { op } => {
-                    // This constructor has no peer source capability. If a
-                    // future caller supplies one without the opt-in driver,
-                    // decline the operation instead of leaving serving open
-                    // or waiting forever for an unimplemented callback.
-                    effects.extend(engine.step(RecoveryEvent::Failed { op }).effects);
-                }
-                RecoveryEffect::Invalidate {
-                    op,
-                    distrust_bodies,
-                } => {
-                    if !engine.accepts_operation(op) {
-                        continue;
-                    }
-                    let Some(due) = terminal_deadline(
-                        &shared,
-                        engine
-                            .next_deadline()
-                            .and_then(|due| absolute_deadline(started, due)),
-                    ) else {
-                        return;
-                    };
-                    let Some(permit) = shared.permit(op, active_version, due) else {
-                        continue;
-                    };
-                    let response = await_operation(
-                        &shared,
-                        &engine,
-                        started,
-                        active_version,
-                        shared.adapter.invalidate(op, distrust_bodies, permit),
-                    )
-                    .await;
-                    shared.disarm(op);
-                    if let Some(result) = response {
-                        effects.extend(
-                            engine
-                                .step(RecoveryEvent::Tick(logical_now(started)))
-                                .effects,
-                        );
-                        if engine.accepts_operation(op) {
-                            effects.extend(
-                                engine
-                                    .step(match result {
-                                        Ok(()) => RecoveryEvent::Invalidated { op },
-                                        Err(_) => RecoveryEvent::Failed { op },
-                                    })
-                                    .effects,
-                            );
-                        }
-                    }
-                }
-                RecoveryEffect::RebuildOrigin { op } => {
-                    if !engine.accepts_operation(op) {
-                        continue;
-                    }
-                    let Some(due) = terminal_deadline(
-                        &shared,
-                        engine
-                            .next_deadline()
-                            .and_then(|due| absolute_deadline(started, due)),
-                    ) else {
-                        return;
-                    };
-                    let Some(permit) = shared.permit(op, active_version, due) else {
-                        continue;
-                    };
-                    let response = await_operation(
-                        &shared,
-                        &engine,
-                        started,
-                        active_version,
-                        shared.adapter.rebuild_origin(op, permit),
-                    )
-                    .await;
-                    shared.disarm(op);
-                    if let Some(result) = response {
-                        effects.extend(
-                            engine
-                                .step(RecoveryEvent::Tick(logical_now(started)))
-                                .effects,
-                        );
-                        if engine.accepts_operation(op) {
-                            effects.extend(
-                                engine
-                                    .step(match result {
-                                        Ok(()) => RecoveryEvent::Materialized { op },
-                                        Err(_) => RecoveryEvent::Failed { op },
-                                    })
-                                    .effects,
-                            );
-                        }
-                    }
-                }
-                RecoveryEffect::ObservePeers { op } => {
-                    if !engine.accepts_operation(op) {
-                        continue;
-                    }
-                    let response = await_operation(
-                        &shared,
-                        &engine,
-                        started,
-                        active_version,
-                        shared.adapter.observe_peers(op, config),
-                    )
-                    .await;
-                    if let Some(result) = response {
-                        effects.extend(
-                            engine
-                                .step(RecoveryEvent::Tick(logical_now(started)))
-                                .effects,
-                        );
-                        if engine.accepts_operation(op) {
-                            effects.extend(
-                                engine
-                                    .step(match result {
-                                        Ok((peers, confirmed)) => RecoveryEvent::PeersObserved {
-                                            op,
-                                            peers,
-                                            confirmed,
-                                        },
-                                        Err(_) => RecoveryEvent::Failed { op },
-                                    })
-                                    .effects,
-                            );
-                        }
-                    }
-                }
-                RecoveryEffect::WaitFrontiers { op, heads } => {
-                    if !engine.accepts_operation(op) {
-                        continue;
-                    }
-                    let response = await_operation(
-                        &shared,
-                        &engine,
-                        started,
-                        active_version,
-                        shared.adapter.wait_frontiers(op, heads),
-                    )
-                    .await;
-                    if let Some(result) = response {
-                        effects.extend(
-                            engine
-                                .step(RecoveryEvent::Tick(logical_now(started)))
-                                .effects,
-                        );
-                        if engine.accepts_operation(op) {
-                            effects.extend(
-                                engine
-                                    .step(match result {
-                                        Ok(()) => RecoveryEvent::FrontiersReached { op },
-                                        Err(_) => RecoveryEvent::Failed { op },
-                                    })
-                                    .effects,
-                            );
-                        }
-                    }
-                }
-                RecoveryEffect::Affirm { op } => {
-                    effects.extend(affirm_effect(
-                        &shared,
-                        &mut engine,
-                        started,
-                        active_version,
-                        op,
-                        Instant::now,
-                    ));
-                }
-            }
-            lock(&shared.control).state = engine.state();
-            continue;
-        }
-
-        let Some(due) = engine.next_deadline() else {
-            shared.notify.notified().await;
-            continue;
-        };
-        let Some(deadline) = terminal_deadline(&shared, absolute_deadline(started, due)) else {
-            return;
-        };
-        tokio::select! {
-            () = shared.notify.notified() => {}
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                effects.extend(engine.step(RecoveryEvent::Tick(logical_now(started))).effects);
-                lock(&shared.control).state = engine.state();
-            }
-        }
-    }
-}
-
-async fn await_operation<A: RecoveryAdapter, T>(
-    shared: &Arc<Shared<A>>,
-    engine: &RecoveryEngine,
-    started: Instant,
-    active_version: u64,
-    future: BoxRecoveryFuture<'_, T>,
-) -> Option<T> {
-    let due = engine.next_deadline()?;
-    let deadline = terminal_deadline(shared, absolute_deadline(started, due))?;
-    tokio::pin!(future);
-    loop {
-        let delay = deadline.saturating_duration_since(Instant::now());
-        tokio::select! {
-            biased;
-            () = shared.notify.notified() => {
-                let control = lock(&shared.control);
-                if control.version != active_version || control.pending.cancel {
-                    return None;
-                }
-            }
-            () = tokio::time::sleep(delay) => return None,
-            value = &mut future => return Some(value),
-        }
-    }
-}
+mod worker;
+use worker::run;
+#[cfg(test)]
+use worker::{absolute_deadline, affirm_effect, terminal_deadline};
 
 #[cfg(test)]
 mod tests;

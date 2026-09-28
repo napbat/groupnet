@@ -148,6 +148,21 @@ fn converged_claims_select_exactly_one_provisional_builder() {
 }
 
 #[test]
+fn exact_operation_deadline_excludes_earlier_renewal_timer() {
+    let mut engine = node("me", 7);
+    engine.step(BootstrapEvent::Start);
+    let tick = engine.step(BootstrapEvent::Tick(crate::Time(3)));
+    let op = observed_op(&tick);
+    assert_eq!(engine.next_deadline(), Some(crate::Time(4)));
+    assert_eq!(engine.operation_deadline(op), Some(crate::Time(8)));
+    let stale = BootstrapOperation {
+        token: op.token + 1,
+        ..op
+    };
+    assert_eq!(engine.operation_deadline(stale), None);
+}
+
+#[test]
 fn failed_builder_withdraws_and_exact_followers_choose_one_takeover() {
     let names = ["a", "b", "c"];
     let mut engines: Vec<_> = names
