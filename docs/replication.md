@@ -7,6 +7,8 @@ must preserve the current feed, ack, lease, Hosted, and handoff APIs. The
 protocol may later reuse their internals, but their existing wire bodies do not
 change. This document is the contract of record for the replication work; the
 Hosted-mode build order in `consistency-modes.md` Section 6 remains unchanged.
+The bounded source-ordered admission decision core is specified in
+[`replication-admission.md`](replication-admission.md).
 
 ## 1. Boundary and promise
 
@@ -368,10 +370,22 @@ TTL LSN hint as proof. Docres may keep gRPC for forwarding/search and bind a
 replication data plane if it meets the framed and bounded contract; existing
 peer RPC alone does not provide a snapshot stream.
 
+**s3cache deployment constraint (owner-confirmed 2026-09-28): zero coordination
+or metadata writes to S3 by default.** Ordinary proxied user-object mutations
+are unchanged. No mode puts Groupnet journals, admissions, checkpoints, or
+snapshot objects in the origin bucket. A durable coordination store is an
+explicit opt-in; a separate control bucket is one possible adapter, not a
+startup requirement. Default recovery retains origin validation/reconciliation
+and fallback. Durable event-complete delivery is exposed only when a configured
+source supplies its history and retention obligations. Tests must prove that
+default startup, reads, recovery, and user mutations issue no extra metadata
+PUTs. The optional mode's storage traffic must be measured separately.
+
 For s3cache, origin commit precedes feed publication. A configurable durable
 shared intent/outcome journal in separate control storage, or a complete
 origin reconciliation contract, must close the crash window before peer
-snapshots can license an authoritative index. For strong mode, persist the
+snapshots can license an authoritative index. In the optional journal-backed
+coherence mode, persist the
 intent before forwarding the mutation and revoke local serving among current
 lease holders by acknowledgement or lease lapse before origin mutation. The
 intent and unresolved operation IDs must survive total fleet restart and be
@@ -391,7 +405,8 @@ fleet; out-of-band origin writes require a separately proven reconciliation
 source. A journal must not be added as a mandatory second log when the source
 already provides safe committed replay.
 
-Pre-mutation invalidation also needs a reader-admission rule. Sampling current
+The optional journal-backed pre-mutation protocol also needs a reader-admission
+rule. Sampling current
 lease holders leaves a race when a reader joins after the wait completes but
 before the origin mutation starts. The control source orders reader admissions
 with mutation intents. A reader starts a bounded local monotonic deadline
@@ -410,7 +425,7 @@ restarts the full expiry wait. A restarted reader must obtain a fresh admission.
 No persisted wall-clock timestamp is treated as a serving capability. This
 protocol needs deterministic race tests before it can grant authority.
 
-The initial s3cache control source uses a conditional-create slot chain per
+The optional s3cache control-source adapter uses a conditional-create slot chain per
 bucket. It verifies ambiguous appends by reading the exact slot and comparing
 the operation identity and payload. It never skips an uncertain slot. Intent,
 outcome, and admission records share this ordering. This choice adds control

@@ -5,6 +5,7 @@
 //! contiguous batches; an application adapter reports completed materialization.
 //! The driver executes effects and returns their generation and operation token.
 
+pub mod admission;
 mod identity;
 mod proof;
 mod session;
