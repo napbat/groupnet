@@ -238,6 +238,32 @@ impl RecoveryEngine {
         }
     }
 
+    fn retry_full(&mut self) -> RecoveryStep {
+        match self.state.stage {
+            RecoveryStage::Invalidating | RecoveryStage::Rebuilding | RecoveryStage::Affirming => {
+                self.wait_for(self.state.stage, self.config.poll_ms)
+            }
+            _ => self.origin_only(),
+        }
+    }
+
+    fn retry_invalidation(&mut self) -> RecoveryStep {
+        let Ok(op) = self.issue(RecoveryStage::Invalidating) else {
+            return self.origin_only();
+        };
+        self.with_timer(vec![RecoveryEffect::Invalidate {
+            op,
+            distrust_bodies: true,
+        }])
+    }
+
+    fn retry_rebuild(&mut self) -> RecoveryStep {
+        let Ok(op) = self.issue(RecoveryStage::Rebuilding) else {
+            return self.origin_only();
+        };
+        self.with_timer(vec![RecoveryEffect::RebuildOrigin { op }])
+    }
+
     fn wait_for(&mut self, stage: RecoveryStage, delay: u64) -> RecoveryStep {
         let Some(total_due) = self.total_due else {
             return self.origin_only();
@@ -536,7 +562,11 @@ impl RecoveryEngine {
                 if !self.accepts_operation(op) {
                     return Self::reject(RecoveryError::StaleOperation);
                 }
-                self.fallback_or_origin()
+                if self.plan == Plan::Full {
+                    self.retry_full()
+                } else {
+                    self.fallback()
+                }
             }
             RecoveryEvent::Tick(now) => {
                 if now < self.now {
@@ -547,7 +577,11 @@ impl RecoveryEngine {
                     return self.fallback_or_origin();
                 }
                 if self.operation_due.is_some_and(|due| now >= due) {
-                    return self.fallback_or_origin();
+                    return if self.plan == Plan::Full {
+                        self.retry_full()
+                    } else {
+                        self.fallback()
+                    };
                 }
                 if self.wait_due.is_some_and(|due| now >= due) {
                     self.wait_due = None;
@@ -557,6 +591,12 @@ impl RecoveryEngine {
                             self.observe_peers(RecoveryStage::WaitingRenewals)
                         }
                         RecoveryStage::Affirming => self.affirm(),
+                        RecoveryStage::Invalidating if self.plan == Plan::Full => {
+                            self.retry_invalidation()
+                        }
+                        RecoveryStage::Rebuilding if self.plan == Plan::Full => {
+                            self.retry_rebuild()
+                        }
                         _ => Self::reject(RecoveryError::Stage),
                     };
                 }

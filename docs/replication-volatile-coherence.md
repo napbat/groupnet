@@ -1,6 +1,6 @@
 # Volatile coherence recovery for origin-backed caches
 
-Status: **sans-IO core implemented; runtime and consumer integration pending**.
+Status: **sans-IO core and opt-in runtime implemented; consumer integration pending**.
 This complements [replication.md](replication.md); it is not a durable replay source.
 The first consumer is s3cache's default mode, which performs zero coordination
 or metadata writes to S3. Its origin bucket remains untouched by control data.
@@ -101,13 +101,37 @@ distinct completion receipts and every stage's correlation may not.
 
 ## Consumer cutover and evidence
 
-The current core slice ends a failed full origin rebuild in `OriginOnly`;
-an explicit `Start` can begin another full rebuild. Before consumer cutover,
-the runtime slice must add bounded full-plan retries to the core itself,
-preserving the original total deadline and issuing a fresh operation token.
-Every publication permit must fence that token as well as its generation, so
-a callback from a failed attempt cannot publish during its retry. The shell
-and consumer must not recreate a separate scan-retry state machine.
+The full-origin path retries a failed invalidation or rebuild with a fresh
+operation token and a bounded poll delay under its **original** total
+deadline. An operation timeout follows the same rule. At total expiry it
+ends in `OriginOnly`; an explicit `Start` can begin another full rebuild.
+The runtime's publication permit checks that exact token and generation,
+plus the operation's absolute deadline, on every page publication. A callback
+from a failed attempt cannot publish during its retry. The consumer must not
+recreate a separate scan-retry state machine.
+
+The opt-in runtime is `groupnet-consistency/volatile-recovery` (facade feature
+`groupnet/consistency-volatile-recovery`). `RecoveryHandle::open` starts closed
+and synchronously revokes the adapter's independent serve grant before
+returning. `feed_gap` and `lease_lapse` atomically close the read/publication
+gate and retain a bounded coalesced signal before returning; a gap dominates
+lapses and a newer lapse counter replaces an older one. A duplicate or
+unsupported lapse cannot revoke an already affirmed gate. The worker owns
+the core and bounded adapter calls. Every index page and final swap must use
+the operation-bound `PublicationPermit::publish`; the permit checks its
+generation, exact operation, and absolute deadline even if the worker has not
+polled a timeout yet. `RecoveryAdapter::revoke_serving` and `affirm` run under
+the same short control lock as public signal closure, so they must not call
+the handle's status/signal methods or a permit method and must not block on
+network or origin I/O. The last public handle drop fences serving and stops
+the worker; an unexpected worker exit also closes it.
+
+At `OriginOnly`, serving stays closed until an explicit `restart` starts a new
+full turn, or a new handle/session is opened. `Cancel` is terminal for that
+handle: subsequent automatic signals and `restart` reject, and reopening
+requires a new handle with a fresh session incarnation. The shell does not
+claim durable source completeness or change the application's independent
+lease, index-completion, body-validation, or origin-fallback decisions.
 
 
 The s3cache shell replaces `sync::recovery::ResyncGate`, `LapseWatch`, and

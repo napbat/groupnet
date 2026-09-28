@@ -222,6 +222,8 @@ mod peers;
 #[cfg(feature = "replication")]
 pub mod replication;
 mod token;
+#[cfg(feature = "volatile-recovery")]
+pub mod volatile_recovery;
 mod wire;
 
 #[cfg(feature = "acks")]

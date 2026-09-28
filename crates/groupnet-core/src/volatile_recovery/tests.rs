@@ -138,6 +138,8 @@ fn cold_and_origin_only_lapses_cannot_downgrade_full_rebuild() {
         op: operation(&newer),
     });
     assert!(failed.rejection.is_none());
+    assert_eq!(recovery.state().stage, RecoveryStage::Invalidating);
+    recovery.step(RecoveryEvent::Tick(Time(100)));
     assert_eq!(recovery.state().stage, RecoveryStage::OriginOnly);
     let restart = recovery.step(RecoveryEvent::LeaseLapse { count: 3 });
     assert!(restart.effects.iter().any(|effect| matches!(
@@ -508,5 +510,61 @@ fn newly_observed_nonlive_writer_cannot_vanish_during_barrier() {
             ..
         }
     )));
+    assert!(!recovery.state().recovered);
+}
+
+#[test]
+fn full_rebuild_failure_retries_with_new_operation_before_original_total_deadline() {
+    let mut recovery = engine();
+    let started = recovery.step(RecoveryEvent::Start);
+    let invalidated = recovery.step(RecoveryEvent::Invalidated {
+        op: operation(&started),
+    });
+    let first_rebuild = operation(&invalidated);
+    let failed = recovery.step(RecoveryEvent::Failed { op: first_rebuild });
+    assert_eq!(recovery.state().stage, RecoveryStage::Rebuilding);
+    assert!(
+        failed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RecoveryEffect::ArmTimer(Time(2))))
+    );
+    let retry = recovery.step(RecoveryEvent::Tick(Time(2)));
+    let second_rebuild = operation(&retry);
+    assert_ne!(first_rebuild, second_rebuild);
+    assert_eq!(
+        recovery
+            .step(RecoveryEvent::Materialized { op: first_rebuild })
+            .rejection,
+        Some(RecoveryError::StaleOperation)
+    );
+    let materialized = recovery.step(RecoveryEvent::Materialized { op: second_rebuild });
+    let affirmed = recovery.step(RecoveryEvent::Affirmed {
+        op: operation(&materialized),
+        accepted: true,
+    });
+    assert!(affirmed.rejection.is_none());
+    assert!(recovery.state().recovered);
+}
+
+#[test]
+fn full_operation_timeout_retries_but_total_deadline_still_ends_origin_only() {
+    let mut recovery = engine();
+    let started = recovery.step(RecoveryEvent::Start);
+    let first = operation(&started);
+    let timed_out = recovery.step(RecoveryEvent::Tick(Time(20)));
+    assert_eq!(recovery.state().stage, RecoveryStage::Invalidating);
+    assert!(!recovery.accepts_operation(first));
+    assert!(
+        timed_out
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RecoveryEffect::ArmTimer(Time(22))))
+    );
+    let retry = recovery.step(RecoveryEvent::Tick(Time(22)));
+    assert_ne!(operation(&retry), first);
+    let exhausted = recovery.step(RecoveryEvent::Tick(Time(100)));
+    assert!(exhausted.rejection.is_none());
+    assert_eq!(recovery.state().stage, RecoveryStage::OriginOnly);
     assert!(!recovery.state().recovered);
 }
