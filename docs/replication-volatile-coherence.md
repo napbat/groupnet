@@ -1,7 +1,9 @@
 # Volatile coherence recovery for origin-backed caches
 
-Status: **sans-IO core and opt-in runtime implemented; consumer integration pending**.
+Status: **sans-IO core, opt-in runtime, and first s3cache consumer implemented**.
 This complements [replication.md](replication.md); it is not a durable replay source.
+Optional OriginOnly retry is specified in
+[replication-volatile-rearm.md](replication-volatile-rearm.md).
 The first consumer is s3cache's default mode, which performs zero coordination
 or metadata writes to S3. Its origin bucket remains untouched by control data.
 
@@ -126,8 +128,8 @@ the handle's status/signal methods or a permit method and must not block on
 network or origin I/O. The last public handle drop fences serving and stops
 the worker; an unexpected worker exit also closes it.
 
-At `OriginOnly`, serving stays closed until an explicit `restart` starts a new
-full turn, or a new handle/session is opened. `Cancel` is terminal for that
+By default, at `OriginOnly` serving stays closed until an explicit `restart`
+starts a new full turn, or a new handle/session is opened. `Cancel` is terminal for that
 handle: subsequent automatic signals and `restart` reject, and reopening
 requires a new handle with a fresh session incarnation. The shell does not
 claim durable source completeness or change the application's independent
@@ -140,20 +142,20 @@ retains the existing Groupnet lease, volatile `WriteFeed`/`FrontierView`,
 origin rescan, index, body trust generation, and read fallbacks as adapters.
 The driver must never synthesize a native durable cursor or call the separate
 replication `SessionEngine` with gossip counters. A default startup with no
-control store performs no S3 metadata writes. Ordinary connected cold-cluster
-startup coordinates exactly one origin builder; takeover and safe duplicate
-builders under partition are scheduling concerns, not
-evidence of read authority. A joined peer still needs its own applicable
+control store performs no S3 metadata writes. The first consumer cutover uses
+one origin builder **per node**. Fleet-wide single-builder startup, takeover,
+and safe duplicate builders under partition remain a scheduling follow-up,
+not evidence of read authority. A joined peer still needs its own applicable
 index/recovery proof before local serving.
 
 Deterministic core simulations must cover overlapping gap and lapse,
 superseded rescan/affirmation, frozen individual granter while the minimum
 advances, vanished peer before and during the frontier barrier, moving heads,
 lost responses, retries, token/capacity exhaustion, and bounded fallback.
-S3cache's existing `sync::tests` cases for `lapse_barrier_retains`,
-`lapse_barrier_fallbacks`, `lease_lapse_resyncs`, and superseded resync remain
-black-box expectations. MinIO proxy tests must also assert origin fallback
-and body/index validation during recovery, no default control writes, and
-single-builder normal startup with takeover. Tests may show retained state
+S3cache's former lapse/retry state-machine cases are now Groupnet core/sim
+properties. MinIO proxy tests assert origin fallback and body/index
+validation during recovery, no default control writes, and guarded retry
+pages. Fleet single-builder startup with takeover remains a follow-up.
+Tests may show retained state
 and fewer origin LISTs when the lapse proof succeeds; they must not infer
 durable event completeness from the volatile feed.
