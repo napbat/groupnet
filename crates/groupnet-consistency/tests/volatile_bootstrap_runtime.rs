@@ -3,15 +3,15 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, ByteAdmission,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSnapshot, ClaimSource, DonorCapture,
-    DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureRequest, TransferContext,
-    TransferResources,
+    DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureRequest, TimedClaim,
+    TransferContext, TransferResources,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::session::{
     BootstrapRuntimeConfig, BootstrapSession,
@@ -108,7 +108,11 @@ impl ClaimSource for Claims {
                 });
                 claims.push(peer.clone());
             }
-            Ok(charge.hold(ClaimSnapshot { members, claims }))
+            Ok(charge.hold(ClaimSnapshot {
+                sampled_at: Instant::now(),
+                members,
+                claims,
+            }))
         })
     }
 
@@ -122,9 +126,7 @@ impl ClaimSource for Claims {
         'a,
         Result<
             Option<
-                groupnet_consistency::volatile_recovery::bootstrap::admission::Admitted<
-                    BootstrapClaim,
-                >,
+                groupnet_consistency::volatile_recovery::bootstrap::admission::Admitted<TimedClaim>,
             >,
             AdapterError,
         >,
@@ -136,7 +138,12 @@ impl ClaimSource for Claims {
                 .map(|peer| {
                     admission
                         .reserve(AdmissionClass::Inflight, 64)
-                        .map(|reservation| reservation.hold(peer.clone()))
+                        .map(|reservation| {
+                            reservation.hold(TimedClaim {
+                                sampled_at: Instant::now(),
+                                claim: peer.clone(),
+                            })
+                        })
                         .map_err(|_| AdapterError)
                 })
                 .transpose()

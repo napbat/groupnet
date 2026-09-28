@@ -99,6 +99,12 @@ struct Inner {
 pub struct ByteAdmission(Arc<Inner>);
 
 impl ByteAdmission {
+    /// Whether two handles charge the same shared global pool.
+    #[must_use]
+    pub fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Constructs a bounded shared budget.
     ///
     /// # Errors

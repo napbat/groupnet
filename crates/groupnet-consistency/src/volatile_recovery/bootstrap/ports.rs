@@ -4,6 +4,7 @@
 //! schedule claim retries or extend the parent recovery episode themselves.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::Notify;
 
@@ -24,10 +25,21 @@ use crate::volatile_recovery::{AdapterError, BoxRecoveryFuture, PublicationPermi
 /// Complete, source-observed roster and native TTL claims for one scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimSnapshot {
+    /// Observer-local monotonic sample time for every native TTL below.
+    pub sampled_at: Instant,
     /// All currently visible members, bounded before callback allocation.
     pub members: Vec<BootstrapMember>,
     /// All currently visible claims, bounded before callback allocation.
     pub claims: Vec<BootstrapClaim>,
+}
+
+/// One selected claim with its observer-local native TTL sample instant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimedClaim {
+    /// The actor cut's local monotonic sample time.
+    pub sampled_at: Instant,
+    /// Exact selected claim, with remaining TTL measured at `sampled_at`.
+    pub claim: BootstrapClaim,
 }
 
 /// Caller-provided pre-allocation bounds for a complete native observation.
@@ -75,7 +87,7 @@ pub trait ClaimSource: Send + Sync + 'static {
         selected: ClaimIdentity,
         limits: ClaimObservationLimits,
         admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<BootstrapClaim>>, AdapterError>>;
+    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TimedClaim>>, AdapterError>>;
 }
 
 /// Private stage owned by the recovery worker, with real memory charges.

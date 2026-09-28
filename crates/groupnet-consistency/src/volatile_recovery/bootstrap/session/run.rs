@@ -115,13 +115,24 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     return Some(BootstrapOutcome::Declined);
                 };
                 if self.engine.current_operation() == Some(op) {
-                    snapshot.consume(|snapshot| {
+                    let accepted = snapshot.consume(|mut snapshot| {
+                        let Some(age_ms) = observation_age_ms(snapshot.sampled_at, Instant::now())
+                        else {
+                            return false;
+                        };
+                        for claim in &mut snapshot.claims {
+                            claim.remaining_ms = claim.remaining_ms.saturating_sub(age_ms);
+                        }
+                        snapshot.claims.retain(|claim| claim.remaining_ms > 0);
                         self.accept(BootstrapEvent::ClaimsObserved {
                             op,
                             members: snapshot.members,
                             claims: snapshot.claims,
                         })
                     });
+                    if !accepted {
+                        return Some(BootstrapOutcome::Declined);
+                    }
                 }
             }
             BootstrapEffect::BuildOrigin { op, selected } => {
@@ -203,12 +214,22 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 self.engine.operation_deadline(op)?;
                 match observed {
                     Ok(Ok(Some(claim))) => {
-                        claim.consume(|claim| {
+                        let accepted = claim.consume(|mut observed| {
+                            let Some(age_ms) =
+                                observation_age_ms(observed.sampled_at, Instant::now())
+                            else {
+                                return false;
+                            };
+                            observed.claim.remaining_ms =
+                                observed.claim.remaining_ms.saturating_sub(age_ms);
                             self.accept(BootstrapEvent::SelectedClaimObserved {
                                 op,
-                                claim: Some(claim),
+                                claim: (observed.claim.remaining_ms > 0).then_some(observed.claim),
                             })
                         });
+                        if !accepted {
+                            return Some(BootstrapOutcome::Declined);
+                        }
                     }
                     Ok(Ok(None)) => {
                         let _ =
@@ -321,4 +342,35 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
     }
 }
 
+/// Rounds actor-to-worker transit upward and adds a tick of source-clock
+/// quantization margin. The two actors' logical origins are never compared.
+fn observation_age_ms(sampled_at: Instant, now: Instant) -> Option<u64> {
+    let elapsed = now.checked_duration_since(sampled_at)?;
+    let rounded = elapsed.as_nanos().checked_add(999_999)? / 1_000_000;
+    u64::try_from(rounded).ok()?.checked_add(1)
+}
+
 mod transfer;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actor_ttl_ages_upward_with_one_quantization_tick() {
+        let sampled_at = Instant::now();
+        assert_eq!(observation_age_ms(sampled_at, sampled_at), Some(1));
+        assert_eq!(
+            observation_age_ms(sampled_at, sampled_at + Duration::from_nanos(1)),
+            Some(2)
+        );
+        assert_eq!(
+            observation_age_ms(sampled_at, sampled_at + Duration::from_micros(1_001)),
+            Some(3)
+        );
+        assert_eq!(
+            observation_age_ms(sampled_at + Duration::from_millis(1), sampled_at),
+            None
+        );
+    }
+}

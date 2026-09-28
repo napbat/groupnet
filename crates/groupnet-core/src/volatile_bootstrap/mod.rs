@@ -7,9 +7,13 @@
 pub mod journal;
 pub mod transfer;
 
+mod claim_codec;
 mod engine;
 mod types;
 
+pub use claim_codec::{
+    ClaimCodecError, claim_entry_key, decode_claim_value, encode_claim_value, encoded_claim_len,
+};
 pub use engine::ClaimEngine;
 pub use types::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
