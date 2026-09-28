@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::volatile_bootstrap::transfer::{NativeHandoffReceipt, native_cuts_cover};
-use crate::{NodeId, volatile_bootstrap::ClaimIdentity};
+use crate::{NodeId, volatile_bootstrap::BootstrapMemberIdentity};
 
 use super::RecoveryEngine;
 use crate::volatile_recovery::{Peer, RecoveryOperation};
@@ -19,19 +19,22 @@ impl RecoveryEngine {
         let capture = &reservation.capture;
         handoff.recovery == op
             && coverage.members.len() <= self.config.max_members.saturating_add(1)
-            && coverage.members.iter().all(|identity| {
-                !identity.node.as_str().is_empty()
-                    && identity.node.as_str().len() <= self.config.max_member_bytes
-                    && identity.incarnation.0 != 0
-                    && identity.session != 0
-                    && identity.attempt != 0
-            })
+            && coverage
+                .members
+                .iter()
+                .all(|identity| identity.valid_bounded(self.config.max_member_bytes))
             && coverage
                 .members
                 .windows(2)
                 .all(|pair| pair[0].node < pair[1].node)
-            && coverage.members.contains(&reservation.follower)
-            && coverage.members.contains(&capture.donor)
+            && coverage
+                .members
+                .iter()
+                .any(|member| member.matches_claim(&reservation.follower))
+            && coverage
+                .members
+                .iter()
+                .any(|member| member.matches_claim(&capture.donor))
             && reservation.follower.node == self.me
             && reservation.follower.incarnation == coverage.parent.incarnation
             && reservation.follower.session == coverage.parent.session
@@ -60,16 +63,16 @@ impl RecoveryEngine {
             && native_cuts_cover(&handoff.continued_cuts, &coverage.proven_cuts)
     }
 
-    pub(super) fn valid_peer_roster(&self, peers: &[Peer], identities: &[ClaimIdentity]) -> bool {
+    pub(super) fn valid_peer_roster(
+        &self,
+        peers: &[Peer],
+        identities: &[BootstrapMemberIdentity],
+    ) -> bool {
         if identities.len() > self.config.max_members.saturating_add(1)
             || identities != self.peer_members
-            || identities.iter().any(|identity| {
-                identity.node.as_str().is_empty()
-                    || identity.node.as_str().len() > self.config.max_member_bytes
-                    || identity.incarnation.0 == 0
-                    || identity.session == 0
-                    || identity.attempt == 0
-            })
+            || identities
+                .iter()
+                .any(|identity| !identity.valid_bounded(self.config.max_member_bytes))
             || identities
                 .windows(2)
                 .any(|pair| pair[0].node >= pair[1].node)

@@ -18,7 +18,7 @@ use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit};
 /// One bounded acquisition outcome under the original outer operation.
 #[derive(Debug)]
 pub enum BootstrapOutcome {
-    /// Guarded local origin image and donor capture completed once.
+    /// Guarded local origin image completed once; donor capture is optional.
     LocalBuilt,
     /// Exact private peer candidate installed and native delivery attached.
     PeerInstalled(Admitted<Box<NativeHandoffReceipt>>),

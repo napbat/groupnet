@@ -35,6 +35,10 @@ pub struct BootstrapRuntimeConfig {
     pub max_claim_metadata_bytes: usize,
     /// Bounded incoming donor requests served by the same worker.
     pub donor_inbox_capacity: usize,
+    /// Require a complete native participation cut. Until the roster-bearing
+    /// bulk format is enabled, this mode uses local origin recovery and
+    /// declines peer transfer rather than downgrading to claims-only proof.
+    pub require_participation: bool,
 }
 
 /// Opening the optional child failed before it could publish a claim.
@@ -114,6 +118,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         engine
             .enable_transfer(config.transfer)
             .map_err(|_| BootstrapSessionError::Core)?;
+        if config.require_participation {
+            engine
+                .require_participation()
+                .map_err(|_| BootstrapSessionError::Core)?;
+        }
         if config.max_claim_metadata_bytes == 0 {
             return Err(BootstrapSessionError::Core);
         }
@@ -214,8 +223,15 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             .as_ref()
             .is_some_and(|capture| !capture.is_active())
         {
-            self.drop_capture();
-            let _ = self.accept(BootstrapEvent::Cancel);
+            self.retire_donor_capture();
+        }
+    }
+
+    fn retire_donor_capture(&mut self) {
+        let selected = self.engine.selected().cloned();
+        self.drop_capture();
+        if let Some(selected) = selected {
+            let _ = self.accept(BootstrapEvent::CaptureRetired { selected });
         }
     }
 
@@ -227,7 +243,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         }
     }
 
-    fn service_pending(&mut self) {
+    async fn service_pending(&mut self) {
         // Notify coalesces wakeups. Consume a finite batch and rearm once at
         // its end; continuous producers cannot starve recovery timers.
         let budget = self
@@ -239,6 +255,29 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             let Some(incoming) = self.inbox.try_recv() else {
                 break;
             };
+            let needs_roster = matches!(
+                incoming.request(),
+                super::ports::DonorRequest::Offer { .. }
+                    | super::ports::DonorRequest::Barrier { .. }
+                    | super::ports::DonorRequest::AdvanceBarrier { .. }
+            );
+            if self.config.require_participation && self.capture.is_some() && needs_roster {
+                let due = Instant::now()
+                    .checked_add(Duration::from_millis(self.config.claim.observe_ms))
+                    .and_then(|due| {
+                        self.capture
+                            .as_ref()
+                            .and_then(DonorCapture::next_deadline)
+                            .and_then(|deadline| self.absolute(deadline))
+                            .map_or(Some(due), |deadline| Some(due.min(deadline)))
+                    });
+                if !matches!(due, Some(due) if self.current_participation(due).await.is_some()) {
+                    incoming.respond(Err(crate::volatile_recovery::AdapterError));
+                    self.retire_donor_capture();
+                    served += 1;
+                    continue;
+                }
+            }
             // A preceding source callback may have held this worker past the
             // capture deadline. Revalidate at the request's linearization
             // point, not only at the start of the maintenance turn.
@@ -278,6 +317,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             return false;
         };
         if engine.enable_transfer(self.config.transfer).is_err() {
+            return false;
+        }
+        if self.config.require_participation && engine.require_participation().is_err() {
             return false;
         }
         self.session = session;
@@ -340,8 +382,20 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             }
             self.retire_capture_if_invalid();
             let _ = self.accept(BootstrapEvent::Tick(self.now()));
+            if self.engine.ready_recapture_pending() {
+                let deadline = Instant::now()
+                    .checked_add(Duration::from_millis(self.config.claim.donor_wait_ms));
+                if deadline.is_some_and(|deadline| {
+                    self.permit
+                        .as_ref()
+                        .and_then(|permit| permit.ready_capture(deadline))
+                        .is_some()
+                }) {
+                    let _ = self.accept(BootstrapEvent::StartReadyRecapture);
+                }
+            }
             self.drain_maintenance().await;
-            self.service_pending();
+            self.service_pending().await;
         })
     }
 }

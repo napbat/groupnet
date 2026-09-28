@@ -16,11 +16,10 @@ use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
 };
 use groupnet_consistency::volatile_recovery::bootstrap::inbox::DonorInbox;
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
-    DonorCapture, DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureRequest,
-    TransferContext, TransferResources,
+    DonorCapture, DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureOutcome,
+    LocalCaptureRequest, TransferContext, TransferResources,
 };
 use groupnet_consistency::volatile_recovery::{AdapterError, BoxRecoveryFuture, PublicationPermit};
-use groupnet_core::NodeId;
 use groupnet_core::Time;
 use groupnet_core::volatile_bootstrap::journal::{
     AttachToken, CaptureId, DeltaIdentity, DonorJournal, JournalBatch, JournalConfig,
@@ -30,14 +29,29 @@ use groupnet_core::volatile_bootstrap::transfer::{
     TransferConfig, TransferEffect, TransferEvent, TransferOffer,
 };
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapOperation, BootstrapScope, ClaimIdentity,
+    BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity,
+    PresenceIdentity,
 };
+use groupnet_core::{NodeId, Status};
 use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_mem::MemBulkNet;
 use tokio::sync::{Notify, watch};
 
 #[derive(Debug)]
 struct PrivateState;
+
+fn member(claim: ClaimIdentity) -> BootstrapMemberIdentity {
+    BootstrapMemberIdentity {
+        node: claim.node.clone(),
+        presence: Some(PresenceIdentity {
+            node: claim.node,
+            boot: claim.incarnation,
+            session: claim.session,
+        }),
+        member_incarnation: 1,
+        status: Status::Alive,
+    }
+}
 
 impl BootstrapStatePort for PrivateState {
     type Image = Vec<u8>;
@@ -48,7 +62,7 @@ impl BootstrapStatePort for PrivateState {
         &'a self,
         _request: LocalCaptureRequest,
         _admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
         Box::pin(async { Err(AdapterError) })
     }
 
@@ -78,7 +92,7 @@ impl BootstrapStatePort for PrivateState {
             decoded_bytes: 1,
             chunks: 1,
             commitment: [9; 32],
-            members: vec![context.donor, context.follower],
+            members: vec![member(context.donor), member(context.follower)],
             cuts: vec![],
         }))
     }
@@ -311,7 +325,10 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
         decoded_bytes: 1,
         chunks: 1,
         commitment: [9; 32],
-        members: vec![context.donor.clone(), context.follower.clone()],
+        members: vec![
+            member(context.donor.clone()),
+            member(context.follower.clone()),
+        ],
         cuts: vec![],
     };
     let (sender, mut inbox) = DonorInbox::new(5).unwrap();
@@ -497,7 +514,13 @@ fn capture_for_test(budget: &ByteAdmission) -> DonorCapture<Vec<u8>> {
     let storage = DonorJournal::storage_bound(config).unwrap();
     let mut journal = DonorJournal::new(config, id).unwrap();
     journal
-        .begin_capture(Time(1), 1, 1, vec![context.donor, context.follower], vec![])
+        .begin_capture(
+            Time(1),
+            1,
+            1,
+            vec![member(context.donor), member(context.follower)],
+            vec![],
+        )
         .unwrap();
     journal.finish_capture(Time(2), 1, 1).unwrap();
     let suffix = budget.reserve(AdmissionClass::Suffix, storage).unwrap();
@@ -518,7 +541,7 @@ fn capturing_ingress_records_live_effects_but_cannot_offer_until_finished() {
             Time(1),
             1,
             1,
-            vec![context.donor, context.follower.clone()],
+            vec![member(context.donor), member(context.follower.clone())],
             vec![],
         )
         .unwrap();

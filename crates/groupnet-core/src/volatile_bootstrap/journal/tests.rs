@@ -1,6 +1,8 @@
 use super::*;
-use crate::volatile_bootstrap::{BootstrapScope, ClaimIdentity};
-use crate::{NodeId, Time};
+use crate::volatile_bootstrap::{
+    BootstrapMemberIdentity, BootstrapScope, ClaimIdentity, PresenceIdentity,
+};
+use crate::{NodeId, Status, Time};
 use std::sync::{Arc, Barrier, Mutex};
 
 fn config() -> JournalConfig {
@@ -47,8 +49,21 @@ fn capture_id() -> CaptureId {
     }
 }
 
-fn members() -> Vec<ClaimIdentity> {
-    vec![identity("donor", 1), identity("peer", 2)]
+fn member(name: &str, session: u64) -> BootstrapMemberIdentity {
+    BootstrapMemberIdentity {
+        node: NodeId::from(name),
+        presence: Some(PresenceIdentity {
+            node: NodeId::from(name),
+            boot: super::super::BootId(3),
+            session,
+        }),
+        member_incarnation: 1,
+        status: Status::Alive,
+    }
+}
+
+fn members() -> Vec<BootstrapMemberIdentity> {
+    vec![member("donor", 1), member("peer", 2)]
 }
 
 fn cuts() -> Vec<NativeCut> {
@@ -150,7 +165,7 @@ fn encoding_phase_overflow_or_cancel_cannot_finish_or_advertise() {
         .begin_capture(Time(1), 64, 64, members(), cuts())
         .unwrap();
     assert_eq!(
-        changed_roster.observe_membership(Time(2), &[identity("donor", 1)]),
+        changed_roster.observe_membership(Time(2), &[member("donor", 1)]),
         Err(JournalError::Conflict)
     );
     assert_eq!(changed_roster.state(), JournalState::Invalidated);
@@ -518,7 +533,7 @@ fn unknown_writer_gap_and_membership_change_invalidate_without_authority() {
 
     let (mut changed, _) = captured();
     let mut altered = members();
-    altered[1].session = 3;
+    altered[1].presence.as_mut().unwrap().session = 3;
     assert_eq!(
         changed.observe_membership(Time(3), &altered),
         Err(JournalError::Conflict)

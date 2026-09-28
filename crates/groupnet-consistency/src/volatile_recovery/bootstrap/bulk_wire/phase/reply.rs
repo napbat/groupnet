@@ -7,7 +7,7 @@ use groupnet_core::volatile_bootstrap::journal::{
 use groupnet_core::volatile_bootstrap::transfer::TransferOffer;
 
 use super::{
-    PhaseLimits, Reader, Writer, read_barrier, read_blob, read_capture, read_cursor, read_identity,
+    PhaseLimits, Reader, Writer, read_barrier, read_blob, read_capture, read_cursor, read_member,
     read_reservation, read_size, valid_barrier,
 };
 use crate::volatile_recovery::bootstrap::bulk_wire::{
@@ -89,7 +89,7 @@ fn read_cuts(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<Vec<NativeC
 
 fn write_members(
     writer: &mut Writer,
-    members: &[groupnet_core::volatile_bootstrap::ClaimIdentity],
+    members: &[groupnet_core::volatile_bootstrap::BootstrapMemberIdentity],
     limits: PhaseLimits,
 ) -> Result<(), WireError> {
     if members.len() > limits.max_members
@@ -103,7 +103,7 @@ fn write_members(
             .to_be_bytes(),
     )?;
     for member in members {
-        writer.identity(member, limits)?;
+        writer.member(member, limits)?;
     }
     Ok(())
 }
@@ -111,7 +111,7 @@ fn write_members(
 fn read_members(
     reader: &mut Reader<'_>,
     limits: PhaseLimits,
-) -> Result<Vec<groupnet_core::volatile_bootstrap::ClaimIdentity>, WireError> {
+) -> Result<Vec<groupnet_core::volatile_bootstrap::BootstrapMemberIdentity>, WireError> {
     let count = usize::from(u16::from_be_bytes(reader.number()?));
     if count > limits.max_members {
         return Err(WireError::Capacity);
@@ -121,13 +121,12 @@ fn read_members(
         .try_reserve_exact(count)
         .map_err(|_| WireError::Capacity)?;
     for _ in 0..count {
-        let member = read_identity(reader, limits)?;
-        if members
-            .last()
-            .is_some_and(|last: &groupnet_core::volatile_bootstrap::ClaimIdentity| {
+        let member = read_member(reader, limits)?;
+        if members.last().is_some_and(
+            |last: &groupnet_core::volatile_bootstrap::BootstrapMemberIdentity| {
                 last.node >= member.node
-            })
-        {
+            },
+        ) {
             return Err(WireError::Invalid);
         }
         members.push(member);
@@ -446,11 +445,12 @@ mod tests {
     use crate::volatile_recovery::bootstrap::admission::{
         AdmissionClass, AdmissionLimits, Admitted, ByteAdmission,
     };
-    use groupnet_core::NodeId;
     use groupnet_core::volatile_bootstrap::journal::{CaptureId, JournalCursor};
     use groupnet_core::volatile_bootstrap::{
-        BootId, BootstrapOperation, BootstrapScope, ClaimIdentity,
+        BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity,
+        PresenceIdentity,
     };
+    use groupnet_core::{NodeId, Status};
 
     fn limits() -> PhaseLimits {
         PhaseLimits {
@@ -540,7 +540,24 @@ mod tests {
                 epoch: 1,
                 sequence: 0,
             }],
-            members: vec![follower],
+            members: vec![
+                BootstrapMemberIdentity {
+                    node: follower.node.clone(),
+                    presence: Some(PresenceIdentity {
+                        node: follower.node,
+                        boot: follower.incarnation,
+                        session: follower.session,
+                    }),
+                    member_incarnation: 1,
+                    status: Status::Alive,
+                },
+                BootstrapMemberIdentity {
+                    node: NodeId::from("quiet"),
+                    presence: None,
+                    member_incarnation: 4,
+                    status: Status::Suspect,
+                },
+            ],
         };
         (correlation, capture, reservation, barrier)
     }

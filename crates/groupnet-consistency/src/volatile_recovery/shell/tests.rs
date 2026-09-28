@@ -125,6 +125,36 @@ fn expired_publication_permit_refuses_page_before_worker_tick() {
 }
 
 #[test]
+fn ready_recapture_uses_a_fresh_finite_guard_and_generation_change_revokes_it() {
+    let shared = shared();
+    {
+        let mut control = lock(&shared.control);
+        control.state.stage = groupnet_core::volatile_recovery::RecoveryStage::Ready;
+        control.state.recovered = true;
+        control.state.generation = 1;
+    }
+    let old = PublicationPermit {
+        control: Arc::clone(&shared.control),
+        version: 1,
+        operation: RecoveryOperation {
+            session: 1,
+            generation: 1,
+            token: 1,
+        },
+        deadline: Instant::now(),
+    };
+    assert!(old.publish(|| ()).is_none());
+    let guard = old
+        .ready_capture(Instant::now() + Duration::from_secs(1))
+        .expect("same Ready generation may recapture a healthy index");
+    assert_eq!(guard.capture(|generation| generation), Some(1));
+    assert_eq!(guard.capture(|generation| generation + 1), Some(2));
+    assert!(old.ready_capture(Instant::now()).is_none());
+    shared.signal(Signal::Gap(1)).unwrap();
+    assert!(guard.capture(|_| 3).is_none());
+}
+
+#[test]
 fn cancel_stays_terminal_after_worker_drains_pending_slot() {
     let shared = shared();
     shared.signal(Signal::Cancel).unwrap();

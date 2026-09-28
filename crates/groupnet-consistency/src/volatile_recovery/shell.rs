@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use groupnet_core::NodeId;
-use groupnet_core::volatile_bootstrap::ClaimIdentity;
 use groupnet_core::volatile_recovery::{
     Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryEngine, RecoveryError, RecoveryEvent,
     RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryState, RecoveryStep,
@@ -33,7 +32,13 @@ pub struct AdapterError;
 pub type PeerObservation = Result<(Vec<Peer>, Option<Mark>), AdapterError>;
 
 /// Complete exact-incarnation peer observation after private peer handoff.
-pub type PeerHeadObservation = Result<(Vec<Peer>, Vec<ClaimIdentity>), AdapterError>;
+pub type PeerHeadObservation = Result<
+    (
+        Vec<Peer>,
+        Vec<groupnet_core::volatile_bootstrap::BootstrapMemberIdentity>,
+    ),
+    AdapterError,
+>;
 
 /// Consumer-owned facts and application effects for volatile coherence.
 ///
@@ -293,6 +298,28 @@ impl Clone for PublicationPermit {
 }
 
 impl PublicationPermit {
+    /// Derive a fresh, finite read-only capture guard after this exact
+    /// recovery generation reached Ready. The expired build deadline is not
+    /// extended: this permit can only clone an already-serving index under
+    /// the current control lock, never publish recovery state.
+    #[must_use]
+    pub fn ready_capture(&self, deadline: Instant) -> Option<ReadyCapturePermit> {
+        let control = lock(&self.control);
+        (Instant::now() < deadline
+            && !control.terminal
+            && control.version == self.version
+            && control.open
+            && control.state.recovered
+            && control.state.generation == self.operation.generation
+            && control.operation.is_none())
+        .then(|| ReadyCapturePermit {
+            control: Arc::clone(&self.control),
+            version: self.version,
+            generation: control.state.generation,
+            deadline,
+        })
+    }
+
     /// Exact outer recovery operation this permit can publish for.
     #[must_use]
     pub const fn operation(&self) -> RecoveryOperation {
@@ -327,6 +354,38 @@ impl PublicationPermit {
             && !control.terminal
             && control.version == self.version
             && control.operation == Some(self.operation)
+    }
+}
+
+/// One finite synchronous clone/ingress attachment against an already-Ready
+/// recovery generation. A gap, lapse, or restart revokes it before returning.
+#[derive(Clone, Debug)]
+pub struct ReadyCapturePermit {
+    control: Arc<Mutex<Control>>,
+    version: u64,
+    generation: u64,
+    deadline: Instant,
+}
+
+impl ReadyCapturePermit {
+    /// Runs one short application critical section only while the original
+    /// Ready generation remains current. No await may occur inside `capture`.
+    pub fn capture<T>(&self, capture: impl FnOnce(u64) -> T) -> Option<T> {
+        let control = lock(&self.control);
+        (Instant::now() < self.deadline
+            && !control.terminal
+            && control.version == self.version
+            && control.state.generation == self.generation
+            && control.open
+            && control.state.recovered
+            && control.operation.is_none())
+        .then(|| capture(control.state.generation))
+    }
+
+    /// Whether this exact guard remains current before an off-lock encode.
+    #[must_use]
+    pub fn valid(&self) -> bool {
+        self.capture(|_| ()).is_some()
     }
 }
 
@@ -430,6 +489,31 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
         bootstrap: Box<dyn BootstrapDriver>,
     ) -> Result<Self, RecoveryOpenError> {
         Self::open_inner(adapter, config, mode, me, session, None, Some(bootstrap))
+    }
+
+    /// Opens the same worker with both a peer bootstrap child and a bounded
+    /// rearm policy for later exhausted recovery episodes.
+    ///
+    /// # Errors
+    /// Rejects invalid recovery or rearm bounds, clock range, or no executor.
+    pub fn open_with_bootstrap_and_rearm(
+        adapter: Arc<A>,
+        config: RecoveryConfig,
+        mode: RecoveryMode,
+        me: NodeId,
+        session: u64,
+        rearm: RecoveryRearm,
+        bootstrap: Box<dyn BootstrapDriver>,
+    ) -> Result<Self, RecoveryOpenError> {
+        Self::open_inner(
+            adapter,
+            config,
+            mode,
+            me,
+            session,
+            Some(rearm),
+            Some(bootstrap),
+        )
     }
 
     fn open_configured(

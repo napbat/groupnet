@@ -9,16 +9,23 @@ use super::transfer::{TransferConfig, TransferSession};
 
 use super::types::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
-    BootstrapMember, BootstrapOperation, BootstrapScope, BootstrapStage, BootstrapStep,
-    ClaimIdentity, ClaimPhase,
+    BootstrapMember, BootstrapMemberIdentity, BootstrapOperation, BootstrapPresence,
+    BootstrapScope, BootstrapStage, BootstrapStep, ClaimIdentity, ClaimPhase, PresenceIdentity,
 };
 
+mod participation;
 mod transfer;
 
 #[derive(Clone, Copy, Debug)]
 struct ObservedRenewal {
     sequence: u64,
     phase: ClaimPhase,
+    expires: Time,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ObservedPresence {
+    sequence: u64,
     expires: Time,
 }
 
@@ -37,6 +44,11 @@ pub struct ClaimEngine {
     next_token: u64,
     local_phase: ClaimPhase,
     local_renewal: u64,
+    presence_renewal: u64,
+    presence_due: Option<Time>,
+    participation_required: bool,
+    participant_roster: Option<Vec<BootstrapMemberIdentity>>,
+    observed_presence: BTreeMap<PresenceIdentity, ObservedPresence>,
     settle_due: Option<Time>,
     renew_due: Option<Time>,
     operation_due: Option<Time>,
@@ -51,6 +63,8 @@ pub struct ClaimEngine {
     claim_refresh_due: Option<Time>,
     claim_poll: Option<BootstrapOperation>,
     claim_poll_due: Option<Time>,
+    roster_poll: Option<BootstrapOperation>,
+    roster_poll_due: Option<Time>,
 }
 
 impl ClaimEngine {
@@ -94,6 +108,11 @@ impl ClaimEngine {
             next_token: 1,
             local_phase: ClaimPhase::Willing,
             local_renewal: 0,
+            presence_renewal: 0,
+            presence_due: None,
+            participation_required: false,
+            participant_roster: None,
+            observed_presence: BTreeMap::new(),
             settle_due: None,
             renew_due: None,
             operation_due: None,
@@ -108,6 +127,8 @@ impl ClaimEngine {
             claim_refresh_due: None,
             claim_poll: None,
             claim_poll_due: None,
+            roster_poll: None,
+            roster_poll_due: None,
         })
     }
 
@@ -139,6 +160,9 @@ impl ClaimEngine {
         if self.claim_poll == Some(op) {
             return self.claim_poll_due;
         }
+        if self.roster_poll == Some(op) {
+            return self.roster_poll_due;
+        }
         self.transfer.as_ref().and_then(|transfer| {
             (transfer.current_operation() == Some(op))
                 .then(|| transfer.next_deadline())
@@ -152,12 +176,42 @@ impl ClaimEngine {
         self.selected.as_ref()
     }
 
+    /// Opt into source-certified participation before the first episode.
+    /// Existing claim-only sessions retain their previous behavior.
+    ///
+    /// # Errors
+    /// Rejects enabling after a selection has started.
+    pub fn require_participation(&mut self) -> Result<(), BootstrapError> {
+        if self.stage != BootstrapStage::Unready {
+            return Err(BootstrapError::Stage);
+        }
+        self.participation_required = true;
+        Ok(())
+    }
+
+    /// Exact sorted participant identities from the last accepted actor cut.
+    /// They are source evidence only, never read or donor authority.
+    #[must_use]
+    pub fn participant_roster(&self) -> Option<&[BootstrapMemberIdentity]> {
+        self.participant_roster.as_deref()
+    }
+
+    /// A completed local origin image needs one fresh Ready donor recapture.
+    #[must_use]
+    pub fn ready_recapture_pending(&self) -> bool {
+        self.participation_required
+            && self.stage == BootstrapStage::DonorAvailable
+            && self.local_phase == ClaimPhase::Building
+            && self.selected.as_ref() == Some(&self.identity())
+    }
+
     /// Earliest finite local deadline; the runtime must drive `Tick` at it.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Time> {
         [
             self.settle_due,
             self.renew_due,
+            self.presence_due,
             self.operation_due,
             self.follow_due,
             self.total_due,
@@ -187,6 +241,36 @@ impl ClaimEngine {
             session: self.session,
             attempt: self.generation,
         }
+    }
+
+    fn presence_identity(&self) -> PresenceIdentity {
+        PresenceIdentity {
+            node: self.me.clone(),
+            boot: self.boot_incarnation,
+            session: self.session,
+        }
+    }
+
+    fn presence(&self) -> BootstrapPresence {
+        BootstrapPresence {
+            identity: self.presence_identity(),
+            renewal: self.presence_renewal,
+            remaining_ms: self.config.claim_ttl_ms,
+        }
+    }
+
+    fn publish_presence(&mut self) -> Result<BootstrapEffect, BootstrapError> {
+        self.presence_renewal = self
+            .presence_renewal
+            .checked_add(1)
+            .ok_or(BootstrapError::Exhausted)?;
+        self.presence_due = Some(Time(
+            self.now
+                .0
+                .checked_add(self.config.renew_ms)
+                .ok_or(BootstrapError::Exhausted)?,
+        ));
+        Ok(BootstrapEffect::PublishPresence(self.presence()))
     }
 
     fn claim(&self) -> BootstrapClaim {
@@ -322,6 +406,8 @@ impl ClaimEngine {
         self.follow_due = None;
         self.selected = None;
         self.observed.clear();
+        self.observed_presence.clear();
+        self.participant_roster = None;
         self.excluded.clear();
         let mut effects = Vec::new();
         if let Some(op) = previous_operation {
@@ -331,8 +417,29 @@ impl ClaimEngine {
         if let Some(previous) = previous {
             effects.push(BootstrapEffect::WithdrawClaim(previous));
         }
+        if self.presence_due.is_none() {
+            match self.publish_presence() {
+                Ok(presence) => effects.push(presence),
+                Err(_) => return self.presence_failure(),
+            }
+        }
         effects.push(BootstrapEffect::PublishClaim(self.claim()));
         self.ok(effects)
+    }
+
+    fn presence_failure(&mut self) -> BootstrapStep {
+        self.presence_due = None;
+        let mut step = self.terminate();
+        let before_fallback = step
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, BootstrapEffect::FallbackOrigin))
+            .unwrap_or(step.effects.len());
+        step.effects.insert(
+            before_fallback,
+            BootstrapEffect::WithdrawPresence(self.presence_identity()),
+        );
+        step
     }
 
     fn validate_roster(
@@ -552,6 +659,26 @@ impl ClaimEngine {
             return Self::reject(BootstrapError::BackwardTime);
         }
         self.now = now;
+        let mut presence = Vec::new();
+        if self.presence_due.is_some_and(|due| now >= due) {
+            match self.publish_presence() {
+                Ok(effect) => presence.push(effect),
+                Err(_) => return self.presence_failure(),
+            }
+        }
+        let mut step = self.tick_claim(now);
+        if step.rejection.is_none() && !presence.is_empty() {
+            presence.extend(
+                step.effects
+                    .into_iter()
+                    .filter(|effect| !matches!(effect, BootstrapEffect::ArmTimer(_))),
+            );
+            step = self.ok(presence);
+        }
+        step
+    }
+
+    fn tick_claim(&mut self, now: Time) -> BootstrapStep {
         if self.stage == BootstrapStage::Transferring {
             return self.tick_transfer(now);
         }
@@ -604,6 +731,7 @@ impl ClaimEngine {
         self.stage = BootstrapStage::Cancelled;
         self.settle_due = None;
         self.renew_due = None;
+        self.presence_due = None;
         self.operation_due = None;
         self.follow_due = None;
         self.total_due = None;
@@ -617,10 +745,17 @@ impl ClaimEngine {
         if let Some(id) = identity {
             effects.push(BootstrapEffect::WithdrawClaim(id));
         }
+        if self.presence_renewal > 0 {
+            effects.push(BootstrapEffect::WithdrawPresence(self.presence_identity()));
+        }
         self.ok(effects)
     }
 
     /// Consume one event and emit only correlated, bounded decisions.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one finite sans-IO event dispatch keeps operation correlation visible"
+    )]
     pub fn step(&mut self, event: BootstrapEvent) -> BootstrapStep {
         match event {
             BootstrapEvent::Start => self.start(),
@@ -629,10 +764,28 @@ impl ClaimEngine {
                 members,
                 claims,
             } => {
-                if self.stage != BootstrapStage::Observing || self.operation != Some(op) {
+                if self.participation_required
+                    || self.stage != BootstrapStage::Observing
+                    || self.operation != Some(op)
+                {
                     return Self::reject(BootstrapError::StaleOperation);
                 }
                 self.choose(&members, claims)
+            }
+            BootstrapEvent::ParticipantsObserved {
+                op,
+                members,
+                roster,
+                participants,
+                claims,
+            } => {
+                if !self.participation_required
+                    || self.stage != BootstrapStage::Observing
+                    || self.operation != Some(op)
+                {
+                    return Self::reject(BootstrapError::StaleOperation);
+                }
+                self.choose_participants(&members, &roster, &participants, claims)
             }
             BootstrapEvent::Built { op, selected } => {
                 if self.stage != BootstrapStage::Building
@@ -650,6 +803,19 @@ impl ClaimEngine {
                     return self.terminate();
                 };
                 self.ok(vec![claim])
+            }
+            BootstrapEvent::LocalOnlyBuilt { op, selected } => self.local_only_built(op, selected),
+            BootstrapEvent::StartReadyRecapture => self.start_ready_recapture(),
+            BootstrapEvent::PeerTransferDeclined { op, selected } => {
+                if self.stage != BootstrapStage::DonorAvailable
+                    || self.operation != Some(op)
+                    || self.selected.as_ref() != Some(&selected)
+                    || selected.node == self.me
+                {
+                    Self::reject(BootstrapError::StaleOperation)
+                } else {
+                    self.terminate()
+                }
             }
             BootstrapEvent::BuildFailed { op, selected } => {
                 if self.stage != BootstrapStage::Building
@@ -708,88 +874,65 @@ impl ClaimEngine {
                 }
             }
             BootstrapEvent::Tick(now) => self.tick(now),
+            BootstrapEvent::PresenceFailed { identity, renewal } => {
+                if self.stage == BootstrapStage::Cancelled
+                    || self.presence_due.is_none()
+                    || identity != self.presence_identity()
+                    || renewal != self.presence_renewal
+                {
+                    Self::reject(BootstrapError::StaleOperation)
+                } else {
+                    self.presence_failure()
+                }
+            }
+            BootstrapEvent::CaptureRetired { selected } => {
+                if self.stage != BootstrapStage::DonorAvailable
+                    || self.selected.as_ref() != Some(&selected)
+                    || selected != self.identity()
+                {
+                    Self::reject(BootstrapError::StaleOperation)
+                } else if self.participation_required {
+                    let old = self.identity();
+                    let Some(generation) = self.generation.checked_add(1) else {
+                        return self.terminate();
+                    };
+                    self.generation = generation;
+                    self.local_renewal = 0;
+                    self.local_phase = ClaimPhase::Building;
+                    self.stage = BootstrapStage::Building;
+                    self.observed.retain(|identity, _| identity.node != self.me);
+                    self.participant_roster = None;
+                    let selected = self.identity();
+                    self.selected = Some(selected.clone());
+                    let Ok(claim) = self.publish_renewal() else {
+                        return self.terminate();
+                    };
+                    let Ok(op) = self.operation(self.config.donor_wait_ms) else {
+                        return self.terminate();
+                    };
+                    self.ok(vec![
+                        BootstrapEffect::WithdrawClaim(old),
+                        claim,
+                        BootstrapEffect::RecaptureCurrent { op, selected },
+                    ])
+                } else {
+                    self.terminate()
+                }
+            }
+            BootstrapEvent::DonorPublicationFailed { selected } => {
+                if self.stage != BootstrapStage::DonorAvailable
+                    || self.selected.as_ref() != Some(&selected)
+                    || selected != self.identity()
+                {
+                    Self::reject(BootstrapError::StaleOperation)
+                } else {
+                    self.terminate()
+                }
+            }
             BootstrapEvent::Cancel => self.cancel(),
         }
     }
 }
 
 #[cfg(test)]
-mod renewal_tests {
-    use super::*;
-
-    fn engine() -> ClaimEngine {
-        ClaimEngine::new(
-            BootstrapConfig {
-                max_members: 2,
-                max_member_bytes: 8,
-                max_scope_bytes: 16,
-                settle_ms: 2,
-                renew_ms: 3,
-                claim_ttl_ms: 10,
-                observe_ms: 3,
-                donor_wait_ms: 5,
-                total_ms: 20,
-            },
-            BootstrapScope {
-                domain: "o".to_owned(),
-                partition: "b".to_owned(),
-            },
-            NodeId::from("me"),
-            BootId(7),
-            1,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn repeated_stale_claim_never_refreshes_its_original_expiry() {
-        let mut engine = engine();
-        let mut claim = BootstrapClaim {
-            identity: ClaimIdentity {
-                node: NodeId::from("peer"),
-                incarnation: BootId(9),
-                session: 1,
-                attempt: 1,
-            },
-            renewal: 1,
-            phase: ClaimPhase::Building,
-            remaining_ms: 10,
-        };
-        assert!(engine.track_claim(&claim).unwrap());
-        assert_eq!(engine.observed[&claim.identity].expires, Time(10));
-        engine.now = Time(6);
-        assert!(engine.track_claim(&claim).unwrap());
-        assert_eq!(engine.observed[&claim.identity].expires, Time(10));
-        engine.now = Time(10);
-        assert!(!engine.track_claim(&claim).unwrap());
-        let local = BootstrapClaim {
-            identity: ClaimIdentity {
-                node: NodeId::from("me"),
-                incarnation: BootId(7),
-                session: 1,
-                attempt: 1,
-            },
-            renewal: 1,
-            phase: ClaimPhase::Willing,
-            remaining_ms: 10,
-        };
-        engine.generation = 1;
-        engine.local_renewal = 1;
-        let roster = vec![
-            BootstrapMember {
-                node: NodeId::from("me"),
-                eligible: true,
-            },
-            BootstrapMember {
-                node: NodeId::from("peer"),
-                eligible: true,
-            },
-        ];
-        let result = engine.choose(&roster, vec![local, claim.clone()]);
-        assert!(result.rejection.is_none());
-        assert_eq!(engine.observed[&claim.identity].expires, Time(10));
-        claim.renewal = 2;
-        assert!(engine.track_claim(&claim).unwrap());
-        assert_eq!(engine.observed[&claim.identity].expires, Time(20));
-    }
-}
+mod renewal_tests;

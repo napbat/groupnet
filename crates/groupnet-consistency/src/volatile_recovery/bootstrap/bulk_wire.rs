@@ -16,7 +16,9 @@ pub use phase::{
 pub use transport::{BootstrapBulkClient, BootstrapBulkListener, BulkError, BulkLimits};
 
 const MAGIC: [u8; 4] = *b"GBST";
-const VERSION: u8 = 1;
+// Version two binds complete presence identities instead of transient claims
+// in Offer and Barrier. Old peers refuse the exchange and use origin fallback.
+const VERSION: u8 = 2;
 // Magic/version/kinds, four string lengths, two claim IDs, two operations,
 // and the payload length. Variable strings and payload are charged separately.
 const FIXED_BYTES: usize = 8 + 4 * 2 + 2 * (16 + 8 + 8) + 2 * (16 + 8 + 8 + 8) + 4;

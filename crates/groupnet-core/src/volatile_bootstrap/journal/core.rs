@@ -8,7 +8,7 @@ use super::types::{
     ReservationStage,
 };
 use crate::Time;
-use crate::volatile_bootstrap::ClaimIdentity;
+use crate::volatile_bootstrap::BootstrapMemberIdentity;
 
 #[derive(Clone, Debug)]
 struct OutstandingBatch {
@@ -51,7 +51,7 @@ pub struct DonorJournal {
     reserved_encoded: usize,
     reserved_decoded: usize,
     charge: Option<CaptureCharge>,
-    members: Vec<ClaimIdentity>,
+    members: Vec<BootstrapMemberIdentity>,
     image_cuts: Vec<NativeCut>,
     cuts: Vec<NativeCut>,
     deltas: Vec<JournalDelta>,
@@ -142,7 +142,7 @@ impl DonorJournal {
         )?;
         total = add(
             total,
-            slots(config.max_members, size_of::<ClaimIdentity>())?,
+            slots(config.max_members, size_of::<BootstrapMemberIdentity>())?,
         )?;
         total = add(total, config.max_membership_bytes)?;
         total = add(total, slots(config.max_cuts, size_of::<NativeCut>())?)?;
@@ -174,7 +174,7 @@ impl DonorJournal {
             .checked_add(slots(1, size_of::<AbortedFollower>())?)
             .and_then(|n| n.checked_add(size_of::<BarrierReceipt>()))
             .and_then(|n| {
-                n.checked_add(slots(config.max_members, size_of::<ClaimIdentity>()).ok()?)
+                n.checked_add(slots(config.max_members, size_of::<BootstrapMemberIdentity>()).ok()?)
             })
             .and_then(|n| n.checked_add(config.max_membership_bytes))
             .and_then(|n| n.checked_add(slots(config.max_cuts, size_of::<NativeCut>()).ok()?))
@@ -333,6 +333,13 @@ impl DonorJournal {
         &self.image_cuts
     }
 
+    /// Immutable complete native member roster captured with image C.
+    /// Admission for a reply copy must precede cloning this slice.
+    #[must_use]
+    pub fn image_members(&self) -> &[BootstrapMemberIdentity] {
+        &self.members
+    }
+
     /// Current retained local suffix bytes, excluding private image memory.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
@@ -453,7 +460,7 @@ impl DonorJournal {
         self.invalidate_inner(reason);
     }
 
-    fn valid_members(&self, members: &[ClaimIdentity]) -> Result<(), JournalError> {
+    fn valid_members(&self, members: &[BootstrapMemberIdentity]) -> Result<(), JournalError> {
         if members.is_empty() || members.len() > self.config.max_members {
             return Err(JournalError::Capacity);
         }
@@ -462,18 +469,17 @@ impl DonorJournal {
             bytes = bytes
                 .checked_add(member.node.as_str().len())
                 .ok_or(JournalError::Capacity)?;
-            if member.node.as_str().is_empty()
-                || member.incarnation.0 == 0
-                || member.session == 0
-                || member.attempt == 0
-                || member.node.as_str().len() > self.config.max_follower_id_bytes
+            if !member.valid_bounded(self.config.max_follower_id_bytes)
                 || bytes > self.config.max_membership_bytes
                 || (index > 0 && members[index - 1].node >= member.node)
             {
                 return Err(JournalError::Capacity);
             }
         }
-        if !members.contains(&self.id.donor) {
+        if !members
+            .iter()
+            .any(|member| member.matches_claim(&self.id.donor))
+        {
             return Err(JournalError::Conflict);
         }
         Ok(())
@@ -512,7 +518,7 @@ impl DonorJournal {
         now: Time,
         planned_encoded: usize,
         planned_decoded: usize,
-        members: Vec<ClaimIdentity>,
+        members: Vec<BootstrapMemberIdentity>,
         cuts: Vec<NativeCut>,
     ) -> Result<CaptureCharge, JournalError> {
         self.advance(now)?;
@@ -632,7 +638,7 @@ impl DonorJournal {
     pub fn observe_membership(
         &mut self,
         now: Time,
-        members: &[ClaimIdentity],
+        members: &[BootstrapMemberIdentity],
     ) -> Result<(), JournalError> {
         self.advance(now)?;
         if !matches!(self.state, JournalState::Capturing | JournalState::Active) {

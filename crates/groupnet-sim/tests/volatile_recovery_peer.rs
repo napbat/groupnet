@@ -7,13 +7,14 @@ use groupnet_core::volatile_bootstrap::journal::{
 };
 use groupnet_core::volatile_bootstrap::transfer::{NativeCoverageReceipt, NativeHandoffReceipt};
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapOperation, BootstrapScope, ClaimIdentity,
+    BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity,
+    PresenceIdentity,
 };
 use groupnet_core::volatile_recovery::{
     Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryEngine, RecoveryEvent, RecoveryMode,
     RecoveryOperation, RecoveryStage,
 };
-use groupnet_core::{NodeId, Time};
+use groupnet_core::{NodeId, Status, Time};
 use groupnet_sim::SplitMix64;
 
 fn identity(node: &str, boot: u128, session: u64) -> ClaimIdentity {
@@ -25,8 +26,20 @@ fn identity(node: &str, boot: u128, session: u64) -> ClaimIdentity {
     }
 }
 
-fn members() -> Vec<ClaimIdentity> {
-    vec![identity("a", 8, 5), identity("me", 7, 9)]
+fn members() -> Vec<BootstrapMemberIdentity> {
+    [identity("a", 8, 5), identity("me", 7, 9)]
+        .into_iter()
+        .map(|claim| BootstrapMemberIdentity {
+            node: claim.node.clone(),
+            presence: Some(PresenceIdentity {
+                node: claim.node,
+                boot: claim.incarnation,
+                session: claim.session,
+            }),
+            member_incarnation: 1,
+            status: Status::Alive,
+        })
+        .collect()
 }
 
 fn handoff(recovery: RecoveryOperation) -> NativeHandoffReceipt {
@@ -156,7 +169,7 @@ fn peer_handoff_shaped_barrier_faults_keep_reads_closed_until_independent_affirm
                     sample_count += 1;
                     let mut identities = members();
                     if fault == 1 && sample_count == 2 {
-                        identities[0].incarnation = BootId(10);
+                        identities[0].presence.as_mut().unwrap().boot = BootId(10);
                         changed_boots += 1;
                     }
                     Some(RecoveryEvent::PeerHeadsObserved {
@@ -327,7 +340,7 @@ fn delayed_duplicate_and_lost_peer_callbacks_cannot_reopen_a_superseded_image() 
                         let mut identities = members();
                         if family == 4 && engine.state().stage == RecoveryStage::PeerRecheckingHeads
                         {
-                            identities[0].incarnation = BootId(11);
+                            identities[0].presence.as_mut().unwrap().boot = BootId(11);
                         }
                         Some(RecoveryEvent::PeerHeadsObserved {
                             op,

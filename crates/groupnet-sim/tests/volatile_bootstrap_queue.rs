@@ -184,8 +184,11 @@ fn enqueue_effects(
             }
             BootstrapEffect::FallbackOrigin => coverage.fallbacks += 1,
             BootstrapEffect::CancelWork { .. }
+            | BootstrapEffect::PublishPresence(_)
+            | BootstrapEffect::WithdrawPresence(_)
             | BootstrapEffect::FollowBuilder { .. }
             | BootstrapEffect::ObserveSelectedClaim { .. }
+            | BootstrapEffect::RecaptureCurrent { .. }
             | BootstrapEffect::Transfer(_) => {}
         }
     }

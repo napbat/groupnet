@@ -8,7 +8,7 @@ use super::transfer::{
 };
 use super::*;
 use crate::volatile_recovery::RecoveryOperation;
-use crate::{NodeId, Time, placement};
+use crate::{NodeId, Status, Time, placement};
 
 fn config() -> BootstrapConfig {
     BootstrapConfig {
@@ -324,7 +324,19 @@ fn installing() -> (
         follower: follower.clone(),
         serial: 1,
     };
-    let mut members = vec![donor.clone(), follower];
+    let mut members = vec![donor.clone(), follower]
+        .into_iter()
+        .map(|claim| BootstrapMemberIdentity {
+            node: claim.node.clone(),
+            presence: Some(PresenceIdentity {
+                node: claim.node,
+                boot: claim.incarnation,
+                session: claim.session,
+            }),
+            member_incarnation: 1,
+            status: Status::Alive,
+        })
+        .collect::<Vec<_>>();
     members.sort_by(|a, b| a.node.cmp(&b.node));
     let cuts = vec![NativeCut {
         writer: b"w".to_vec(),

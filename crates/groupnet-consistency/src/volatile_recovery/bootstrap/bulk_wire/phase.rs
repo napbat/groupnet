@@ -1,10 +1,12 @@
 //! Typed, bounded donor request bodies carried by the bulk envelope.
 
-use groupnet_core::NodeId;
 use groupnet_core::volatile_bootstrap::journal::{
     AttachToken, BarrierReceipt, CaptureId, JournalCursor, NativeCut, ReservationId,
 };
-use groupnet_core::volatile_bootstrap::{BootId, BootstrapScope, ClaimIdentity};
+use groupnet_core::volatile_bootstrap::{
+    BootId, BootstrapMemberIdentity, BootstrapScope, ClaimIdentity, PresenceIdentity,
+};
+use groupnet_core::{NodeId, Status};
 
 use super::{Correlation, Envelope, ExchangeKind, Message, Reader, WireError};
 use crate::volatile_recovery::bootstrap::ports::DonorRequest;
@@ -111,6 +113,27 @@ impl Writer {
         self.put(&id.attempt.to_be_bytes())
     }
 
+    fn member(
+        &mut self,
+        member: &BootstrapMemberIdentity,
+        limits: PhaseLimits,
+    ) -> Result<(), WireError> {
+        if !member.valid_bounded(limits.max_node_bytes) {
+            return Err(WireError::Invalid);
+        }
+        self.string(member.node.as_str(), limits.max_node_bytes)?;
+        self.put(&member.member_incarnation.to_be_bytes())?;
+        self.put(&[member.status.to_wire()])?;
+        match &member.presence {
+            Some(presence) => {
+                self.put(&[1])?;
+                self.put(&presence.boot.0.to_be_bytes())?;
+                self.put(&presence.session.to_be_bytes())
+            }
+            None => self.put(&[0]),
+        }
+    }
+
     fn scope(&mut self, scope: &BootstrapScope, limits: PhaseLimits) -> Result<(), WireError> {
         let total = scope
             .domain
@@ -173,7 +196,7 @@ impl Writer {
                 .to_be_bytes(),
         )?;
         for member in &receipt.members {
-            self.identity(member, limits)?;
+            self.member(member, limits)?;
         }
         Ok(())
     }
@@ -204,6 +227,34 @@ fn read_identity(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<ClaimId
         session: u64::from_be_bytes(reader.number()?),
         attempt: u64::from_be_bytes(reader.number()?),
     })
+}
+
+fn read_member(
+    reader: &mut Reader<'_>,
+    limits: PhaseLimits,
+) -> Result<BootstrapMemberIdentity, WireError> {
+    let node = NodeId::new(reader.string(limits.max_node_bytes)?);
+    let member_incarnation = u64::from_be_bytes(reader.number()?);
+    let status = Status::from_wire(reader.take(1)?[0]).ok_or(WireError::Invalid)?;
+    let presence = match reader.take(1)?[0] {
+        0 => None,
+        1 => Some(PresenceIdentity {
+            node: node.clone(),
+            boot: BootId(u128::from_be_bytes(reader.number()?)),
+            session: u64::from_be_bytes(reader.number()?),
+        }),
+        _ => return Err(WireError::Invalid),
+    };
+    let member = BootstrapMemberIdentity {
+        node,
+        presence,
+        member_incarnation,
+        status,
+    };
+    member
+        .valid_bounded(limits.max_node_bytes)
+        .then_some(member)
+        .ok_or(WireError::Invalid)
 }
 
 fn read_scope(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<BootstrapScope, WireError> {
@@ -283,7 +334,7 @@ fn read_barrier(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<BarrierR
         .try_reserve_exact(members_len)
         .map_err(|_| WireError::Capacity)?;
     for _ in 0..members_len {
-        members.push(read_identity(reader, limits)?);
+        members.push(read_member(reader, limits)?);
     }
     Ok(BarrierReceipt {
         reservation,
@@ -614,7 +665,24 @@ mod tests {
                 epoch: 1,
                 sequence: 0,
             }],
-            members: vec![follower],
+            members: vec![
+                BootstrapMemberIdentity {
+                    node: follower.node.clone(),
+                    presence: Some(PresenceIdentity {
+                        node: follower.node,
+                        boot: follower.incarnation,
+                        session: follower.session,
+                    }),
+                    member_incarnation: 1,
+                    status: Status::Alive,
+                },
+                BootstrapMemberIdentity {
+                    node: NodeId::from("quiet"),
+                    presence: None,
+                    member_incarnation: 4,
+                    status: Status::Suspect,
+                },
+            ],
         };
         (correlation, capture, reservation, barrier)
     }

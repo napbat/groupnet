@@ -3,15 +3,21 @@
 use groupnet_core::Status;
 use groupnet_core::volatile_bootstrap::{
     BootstrapClaim, BootstrapConfig, BootstrapMember, BootstrapOperation, BootstrapScope,
-    ClaimIdentity, claim_entry_key, decode_claim_value, encode_claim_value, encoded_claim_len,
+    ClaimIdentity, PresenceIdentity, claim_entry_key, decode_claim_value, encode_claim_value,
+    encoded_claim_len, presence_entry_key,
 };
 use groupnet_runtime::{EntryBudget, EntryInspectionLimits, Group, InspectedEntries};
 use std::mem::size_of;
 use tokio::sync::Mutex;
 
 use super::admission::{AdmissionClass, Admitted, ByteAdmission, Reservation};
-use super::ports::{ClaimObservationLimits, ClaimSnapshot, ClaimSource, TimedClaim};
+use super::ports::{
+    ClaimObservationLimits, ClaimSnapshot, ClaimSource, ParticipationSnapshot, TimedClaim,
+};
 use crate::volatile_recovery::{AdapterError, BoxRecoveryFuture};
+
+mod participation;
+mod presence;
 
 impl EntryBudget for Reservation {
     fn bytes(&self) -> usize {
@@ -34,9 +40,11 @@ pub struct NativeClaimSource {
     scope: BootstrapScope,
     policy: BootstrapConfig,
     key: String,
+    presence_key: String,
     max_value_bytes: usize,
     admission: ByteAdmission,
     published: Mutex<Option<(ClaimIdentity, Admitted<Vec<u8>>)>>,
+    presence_published: Mutex<Option<(PresenceIdentity, Admitted<Vec<u8>>)>>,
 }
 
 impl NativeClaimSource {
@@ -66,14 +74,17 @@ impl NativeClaimSource {
             return Err(AdapterError);
         }
         let key = claim_entry_key(&scope, max_key_bytes).map_err(|_| AdapterError)?;
+        let presence_key = presence_entry_key(&scope, max_key_bytes).map_err(|_| AdapterError)?;
         Ok(Self {
             group,
             scope,
             policy,
             key,
+            presence_key,
             max_value_bytes,
             admission,
             published: Mutex::new(None),
+            presence_published: Mutex::new(None),
         })
     }
 
@@ -212,6 +223,29 @@ impl NativeClaimSource {
 }
 
 impl ClaimSource for NativeClaimSource {
+    fn observe_participation<'a>(
+        &'a self,
+        _op: BootstrapOperation,
+        limits: ClaimObservationLimits,
+        admission: &'a ByteAdmission,
+    ) -> BoxRecoveryFuture<'a, Result<Admitted<ParticipationSnapshot>, AdapterError>> {
+        Box::pin(async move { self.inspect_participation(limits, admission).await })
+    }
+
+    fn publish_presence(
+        &self,
+        presence: groupnet_core::volatile_bootstrap::BootstrapPresence,
+    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
+        Box::pin(async move { self.publish_presence_inner(presence).await })
+    }
+
+    fn withdraw_presence(
+        &self,
+        identity: PresenceIdentity,
+    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
+        Box::pin(async move { self.withdraw_presence_inner(identity).await })
+    }
+
     fn publish_claim(
         &self,
         claim: BootstrapClaim,

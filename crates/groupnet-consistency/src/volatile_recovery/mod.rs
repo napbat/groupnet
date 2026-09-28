@@ -10,7 +10,7 @@ mod shell;
 
 pub use shell::{
     AdapterError, BoxRecoveryFuture, PeerHeadObservation, PeerObservation, PublicationPermit,
-    RecoveryAdapter, RecoveryHandle, RecoveryOpenError, RecoveryStatus,
+    ReadyCapturePermit, RecoveryAdapter, RecoveryHandle, RecoveryOpenError, RecoveryStatus,
 };
 
 pub use groupnet_core::volatile_recovery::{

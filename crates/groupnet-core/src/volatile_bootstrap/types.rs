@@ -1,7 +1,7 @@
 //! Bounded, non-authoritative claim decisions for peer index bootstrap.
 
 use super::transfer::{TransferEffect, TransferEvent};
-use crate::{NodeId, Time};
+use crate::{NodeId, Status, Time};
 
 /// Stable application scope for one index image and origin builder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +88,87 @@ pub struct ClaimIdentity {
     pub session: u64,
     /// Monotone local attempt within that boot.
     pub attempt: u64,
+}
+
+/// Long-lived opted-in participation identity, independent of one builder
+/// attempt. It remains visible after a follower completes its transfer.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PresenceIdentity {
+    /// Native Groupnet member name.
+    pub node: NodeId,
+    /// Caller-supplied process-fresh boot token.
+    pub boot: BootId,
+    /// Fresh worker session under that boot.
+    pub session: u64,
+}
+
+/// One native TTL-backed participation renewal, not donor or read authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootstrapPresence {
+    /// Exact long-lived participant.
+    pub identity: PresenceIdentity,
+    /// Strictly increasing on each publication of this identity.
+    pub renewal: u64,
+    /// Observer-local native TTL remaining at the source sample. It is never
+    /// encoded into the entry body or treated as a wall-clock timestamp.
+    pub remaining_ms: u64,
+}
+
+/// Exact native member from one complete actor cut retained by a donor image.
+/// A noneligible member may have no participation entry, but its status and
+/// native incarnation still belong to the roster. The participation boot
+/// separately fences processes reusing the same `NodeId`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootstrapMemberIdentity {
+    /// Native member node, including a nonparticipant or noneligible member.
+    pub node: NodeId,
+    /// Fresh native TTL participation identity, when source-present.
+    pub presence: Option<PresenceIdentity>,
+    /// Native Groupnet membership refutation incarnation.
+    pub member_incarnation: u64,
+    /// Exact native status at this complete actor cut.
+    pub status: Status,
+}
+
+impl BootstrapMemberIdentity {
+    /// Whether this member may currently donate or receive a peer image.
+    #[must_use]
+    pub fn eligible(&self) -> bool {
+        self.status == Status::Alive
+    }
+
+    /// Whether one exact eligible member still names this builder worker.
+    #[must_use]
+    pub fn matches_claim(&self, claim: &ClaimIdentity) -> bool {
+        self.eligible()
+            && self.node == claim.node
+            && self.presence.as_ref().is_some_and(|presence| {
+                presence.boot == claim.incarnation && presence.session == claim.session
+            })
+    }
+
+    /// Validate one bounded native roster element before retaining or wiring.
+    #[must_use]
+    pub fn valid_bounded(&self, max_node_bytes: usize) -> bool {
+        !self.node.as_str().is_empty()
+            && self.node.as_str().len() <= max_node_bytes
+            && (!self.eligible() || self.presence.is_some())
+            && self.presence.as_ref().is_none_or(|presence| {
+                presence.node == self.node && presence.boot.0 != 0 && presence.session != 0
+            })
+    }
+}
+
+/// One live, source-observed participation entry at a complete native cut.
+/// Its remaining TTL is measured at that cut, never encoded as a timestamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootstrapParticipant {
+    /// Exact process/worker identity and native member incarnation.
+    pub member: BootstrapMemberIdentity,
+    /// Strictly increasing renewal for this exact participation identity.
+    pub renewal: u64,
+    /// Source-observed native TTL remaining at the same roster cut.
+    pub remaining_ms: u64,
 }
 
 /// Claim state is a donor availability hint, never a read-authority proof.
@@ -192,11 +273,48 @@ pub enum BootstrapEvent {
         /// All source TTL claims in scope, bounded before adapter allocation.
         claims: Vec<BootstrapClaim>,
     },
+    /// Complete native member, participation, and transient claim cut.
+    /// Required for an opted-in peer path; a missing eligible presence is a
+    /// terminal invalid observation for this selection episode.
+    ParticipantsObserved {
+        /// Exact observation operation.
+        op: BootstrapOperation,
+        /// Complete native membership statuses.
+        members: Vec<BootstrapMember>,
+        /// Exact same-cut identity of every native member, including those
+        /// with no compatible participation entry.
+        roster: Vec<BootstrapMemberIdentity>,
+        /// Live scoped presence entries, including members without claims.
+        participants: Vec<BootstrapParticipant>,
+        /// Optional donor/builder claims at the same source cut.
+        claims: Vec<BootstrapClaim>,
+    },
     /// Local guarded origin build completed; image still needs transfer proof.
     Built {
         /// Exact build operation.
         op: BootstrapOperation,
         /// Exact selected local builder identity.
+        selected: ClaimIdentity,
+    },
+    /// A guarded local origin build completed, but this episode cannot
+    /// advertise a donor candidate. Withdraw only the transient claim;
+    /// ordinary local recovery may still affirm independently.
+    LocalOnlyBuilt {
+        /// Exact build operation.
+        op: BootstrapOperation,
+        /// Exact selected local builder identity.
+        selected: ClaimIdentity,
+    },
+    /// Local origin is serving, so attempt one fresh bounded donor recapture.
+    /// This is separate from the completed origin build and cannot rescan it.
+    StartReadyRecapture,
+    /// Peer transfer cannot represent the required roster format. Retire the
+    /// transient local claim while leaving participation renewal active and
+    /// allowing the outer recovery to use origin fallback.
+    PeerTransferDeclined {
+        /// Exact selected donor observation operation.
+        op: BootstrapOperation,
+        /// Exact selected peer that cannot be transferred in this mode.
         selected: ClaimIdentity,
     },
     /// Local guarded origin build failed or lost its recovery permit.
@@ -231,6 +349,26 @@ pub enum BootstrapEvent {
     Transfer(Box<TransferEvent>),
     /// Monotone caller-supplied logical time.
     Tick(Time),
+    /// Source could not confirm or renew this worker's exact participation.
+    /// Peer bootstrap ends; ordinary local recovery/serving gates are separate.
+    PresenceFailed {
+        /// Exact worker participation identity.
+        identity: PresenceIdentity,
+        /// Failed renewal sequence; older responses cannot end a newer one.
+        renewal: u64,
+    },
+    /// Exact local donor capture retired while ordinary local recovery may
+    /// remain healthy. Withdraw donor availability, retaining participation.
+    CaptureRetired {
+        /// Local builder claim that owned the retired capture.
+        selected: ClaimIdentity,
+    },
+    /// A Ready claim publication failed; stop donating without restarting a
+    /// healthy local recovery or withdrawing long-lived participation.
+    DonorPublicationFailed {
+        /// Exact local Ready claim whose publication failed.
+        selected: ClaimIdentity,
+    },
     /// Withdraw the local claim and end this session.
     Cancel,
 }
@@ -245,8 +383,13 @@ pub enum BootstrapEffect {
     },
     /// Publish/renew the exact claim with native TTL and new renewal sequence.
     PublishClaim(BootstrapClaim),
+    /// Publish/renew long-lived scoped participation, including after follower
+    /// transfer and after a local origin-builder episode reaches Ready.
+    PublishPresence(BootstrapPresence),
     /// Best-effort withdrawal; stale entries must still expire by native TTL.
     WithdrawClaim(ClaimIdentity),
+    /// Best-effort exact participation withdrawal; native TTL bounds loss.
+    WithdrawPresence(PresenceIdentity),
     /// Read a complete roster and claims through a pre-allocation bounded API.
     ObserveClaims {
         /// Exact observation operation.
@@ -261,6 +404,14 @@ pub enum BootstrapEffect {
         /// Exact build operation.
         op: BootstrapOperation,
         /// Exact provisional builder identity.
+        selected: ClaimIdentity,
+    },
+    /// Capture the already-Ready local index under a fresh finite operation;
+    /// this must never issue another origin scan.
+    RecaptureCurrent {
+        /// Fresh operation from the same token allocator.
+        op: BootstrapOperation,
+        /// New donor claim attempt after old Ready withdrawal.
         selected: ClaimIdentity,
     },
     /// Await a selected builder's candidate without opening local reads.

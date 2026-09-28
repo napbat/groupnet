@@ -5,8 +5,11 @@ use crate::volatile_bootstrap::journal::{
     AttachToken, BarrierReceipt, CaptureId, JournalCursor, NativeCut, ReservationId,
 };
 use crate::volatile_bootstrap::transfer::{NativeCoverageReceipt, NativeHandoffReceipt};
-use crate::volatile_bootstrap::{BootId, BootstrapOperation, BootstrapScope, ClaimIdentity};
-use crate::{NodeId, Time};
+use crate::volatile_bootstrap::{
+    BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity,
+    PresenceIdentity,
+};
+use crate::{NodeId, Status, Time};
 
 fn config() -> RecoveryConfig {
     RecoveryConfig {
@@ -29,8 +32,20 @@ fn identity(node: &str, boot: u128, session: u64) -> ClaimIdentity {
     }
 }
 
-fn members() -> Vec<ClaimIdentity> {
-    vec![identity("a", 8, 5), identity("me", 7, 9)]
+fn members() -> Vec<BootstrapMemberIdentity> {
+    [identity("a", 8, 5), identity("me", 7, 9)]
+        .into_iter()
+        .map(|claim| BootstrapMemberIdentity {
+            node: claim.node.clone(),
+            presence: Some(PresenceIdentity {
+                node: claim.node,
+                boot: claim.incarnation,
+                session: claim.session,
+            }),
+            member_incarnation: 1,
+            status: Status::Alive,
+        })
+        .collect()
 }
 
 fn handoff(recovery: RecoveryOperation) -> NativeHandoffReceipt {
@@ -249,7 +264,7 @@ fn changed_boot_identity_or_lost_peer_falls_back_with_original_deadline() {
         op: operation(&barrier),
     });
     let mut changed = members();
-    changed[0].incarnation = BootId(10);
+    changed[0].presence.as_mut().unwrap().boot = BootId(10);
     let fallback = engine.step(RecoveryEvent::PeerHeadsObserved {
         op: operation(&recheck),
         peers: vec![quiet_peer()],

@@ -230,17 +230,20 @@ impl TransferSession {
             bytes = bytes
                 .checked_add(member.node.as_str().len())
                 .ok_or(TransferError::Capacity)?;
-            if member.node.as_str().is_empty()
-                || member.incarnation.0 == 0
-                || member.session == 0
-                || member.attempt == 0
+            if !member.valid_bounded(self.config.max_metadata_bytes)
                 || (index > 0 && offer.members[index - 1].node >= member.node)
             {
                 return Err(TransferError::Continuity);
             }
         }
-        if !offer.members.contains(&self.binding.donor)
-            || !offer.members.contains(&self.binding.follower)
+        if !offer
+            .members
+            .iter()
+            .any(|member| member.matches_claim(&self.binding.donor))
+            || !offer
+                .members
+                .iter()
+                .any(|member| member.matches_claim(&self.binding.follower))
         {
             return Err(TransferError::Continuity);
         }
@@ -461,6 +464,8 @@ impl TransferSession {
                 }
                 let encoded_bytes = offer.encoded_bytes;
                 let decoded_bytes = offer.decoded_bytes;
+                let image_cut = offer.image_cut.clone();
+                let chunks = offer.chunks;
                 self.replay_cuts.clone_from(&offer.cuts);
                 self.offer = Some(offer);
                 let Ok(next) = self.allocate(allocator) else {
@@ -469,6 +474,8 @@ impl TransferSession {
                 self.stage = TransferStage::ReservingStage;
                 self.ok(vec![TransferEffect::ReserveStage {
                     op: next,
+                    image_cut,
+                    chunks,
                     encoded_bytes,
                     decoded_bytes,
                 }])

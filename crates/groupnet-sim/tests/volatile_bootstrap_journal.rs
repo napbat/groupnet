@@ -4,8 +4,10 @@ use groupnet_core::volatile_bootstrap::journal::{
     CaptureId, DeltaIdentity, DonorJournal, Invalidation, JournalConfig, JournalCursor,
     JournalError, JournalState, NativeCut,
 };
-use groupnet_core::volatile_bootstrap::{BootstrapScope, ClaimIdentity};
-use groupnet_core::{NodeId, Time};
+use groupnet_core::volatile_bootstrap::{
+    BootstrapMemberIdentity, BootstrapScope, ClaimIdentity, PresenceIdentity,
+};
+use groupnet_core::{NodeId, Status, Time};
 use groupnet_sim::SplitMix64;
 
 fn identity(name: &str, session: u64) -> ClaimIdentity {
@@ -14,6 +16,19 @@ fn identity(name: &str, session: u64) -> ClaimIdentity {
         incarnation: groupnet_core::volatile_bootstrap::BootId(7),
         session,
         attempt: 1,
+    }
+}
+
+fn member(claim: &ClaimIdentity) -> BootstrapMemberIdentity {
+    BootstrapMemberIdentity {
+        node: claim.node.clone(),
+        presence: Some(PresenceIdentity {
+            node: claim.node.clone(),
+            boot: claim.incarnation,
+            session: claim.session,
+        }),
+        member_incarnation: 1,
+        status: Status::Alive,
     }
 }
 
@@ -61,7 +76,7 @@ fn captured_with(seed: u64, limits: JournalConfig) -> (DonorJournal, JournalCurs
             Time(0),
             32,
             32,
-            vec![donor, identity("peer", seed + 100)],
+            vec![member(&donor), member(&identity("peer", seed + 100))],
             vec![NativeCut {
                 writer: b"w".to_vec(),
                 epoch: 1,
@@ -100,7 +115,7 @@ fn encoding_schedule_keeps_c_fixed_while_live_suffix_advances() {
                 Time(0),
                 32,
                 32,
-                vec![donor, follower.clone()],
+                vec![member(&donor), member(&follower)],
                 vec![NativeCut {
                     writer: b"w".to_vec(),
                     epoch: 1,

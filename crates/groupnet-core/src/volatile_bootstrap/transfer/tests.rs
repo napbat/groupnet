@@ -1,11 +1,15 @@
 use super::*;
 use crate::NodeId;
+use crate::Status;
 use crate::Time;
 use crate::volatile_bootstrap::journal::{
     AttachToken, BarrierReceipt, CaptureId, DeltaIdentity, JournalBatch, JournalCursor,
     JournalDelta, NativeCut, ReservationId,
 };
-use crate::volatile_bootstrap::{BootId, BootstrapOperation, BootstrapScope, ClaimIdentity};
+use crate::volatile_bootstrap::{
+    BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity,
+    PresenceIdentity,
+};
 use crate::volatile_recovery::RecoveryOperation;
 
 fn recovery() -> RecoveryOperation {
@@ -22,6 +26,19 @@ fn identity(name: &str, session: u64) -> ClaimIdentity {
         incarnation: BootId(7),
         session,
         attempt: 1,
+    }
+}
+
+fn member(name: &str, session: u64) -> BootstrapMemberIdentity {
+    BootstrapMemberIdentity {
+        node: NodeId::from(name),
+        presence: Some(PresenceIdentity {
+            node: NodeId::from(name),
+            boot: BootId(7),
+            session,
+        }),
+        member_incarnation: 1,
+        status: Status::Alive,
     }
 }
 
@@ -102,7 +119,7 @@ fn offer() -> TransferOffer {
         decoded_bytes: 2,
         chunks: 2,
         commitment: [8; 32],
-        members: vec![identity("donor", 1), identity("peer", 9)],
+        members: vec![member("donor", 1), member("peer", 9)],
         cuts: vec![cut(0)],
     }
 }
@@ -135,6 +152,27 @@ fn accept(
     step.effects.into_iter().next().unwrap()
 }
 
+fn reject_repeated_first_chunk(
+    engine: &mut TransferSession,
+    chunk0: BootstrapOperation,
+    allocator: &mut impl FnMut() -> Option<BootstrapOperation>,
+) {
+    assert_eq!(
+        engine
+            .step(
+                TransferEvent::ChunkStored {
+                    op: chunk0,
+                    sequence: 0,
+                    bytes: 1,
+                    decoded_charge: 1,
+                },
+                allocator,
+            )
+            .rejection,
+        Some(TransferError::Stale)
+    );
+}
+
 fn through_image(engine: &mut TransferSession, next: &mut u64) -> BootstrapOperation {
     let mut allocate = || {
         *next += 1;
@@ -145,16 +183,27 @@ fn through_image(engine: &mut TransferSession, next: &mut u64) -> BootstrapOpera
     else {
         panic!("fetch offer")
     };
-    let TransferEffect::ReserveStage { op: second, .. } = accept(
+    let offered = offer();
+    let expected_cut = offered.image_cut.clone();
+    let expected_chunks = offered.chunks;
+    let TransferEffect::ReserveStage {
+        op: second,
+        image_cut,
+        chunks,
+        ..
+    } = accept(
         engine,
         TransferEvent::Offered {
             op: first,
-            offer: offer(),
+            offer: offered,
         },
         &mut allocate,
-    ) else {
+    )
+    else {
         panic!("reserve stage")
     };
+    assert_eq!(image_cut, expected_cut);
+    assert_eq!(chunks, expected_chunks);
     let TransferEffect::ReserveDonor { op: third, .. } = accept(
         engine,
         TransferEvent::StageReserved { op: second },
@@ -194,20 +243,7 @@ fn through_image(engine: &mut TransferSession, next: &mut u64) -> BootstrapOpera
     else {
         panic!("second chunk")
     };
-    assert_eq!(
-        engine
-            .step(
-                TransferEvent::ChunkStored {
-                    op: chunk0,
-                    sequence: 0,
-                    bytes: 1,
-                    decoded_charge: 1,
-                },
-                &mut allocate,
-            )
-            .rejection,
-        Some(TransferError::Stale)
-    );
+    reject_repeated_first_chunk(engine, chunk0, &mut allocate);
     let TransferEffect::VerifyImage { op: verify, .. } = accept(
         engine,
         TransferEvent::ChunkStored {

@@ -15,8 +15,8 @@ use groupnet_transport::bulk::{BulkTransport, DataPlane};
 use super::admission::{AdmissionClass, Admitted, ByteAdmission, Reservation};
 use super::bulk_wire::{BootstrapBulkClient, BulkLimits, Correlation};
 use super::ports::{
-    DonorCapture, DonorPort, DonorReply, DonorRequest, LocalCaptureRequest, TransferContext,
-    TransferResources,
+    DonorCapture, DonorPort, DonorReply, DonorRequest, LocalCaptureOutcome, LocalCaptureRequest,
+    ReadyCaptureRequest, TransferContext, TransferResources,
 };
 use crate::volatile_recovery::{AdapterError, BoxRecoveryFuture, PublicationPermit};
 
@@ -30,12 +30,22 @@ pub trait BootstrapStatePort: Send + Sync + 'static {
     /// Bounded native effects awaiting the atomic handoff.
     type NativeBuffer: Send + 'static;
 
-    /// Build one guarded complete donor capture at the image cut.
+    /// Complete one origin scan, optionally retaining a guarded donor capture.
     fn build_local_capture<'a>(
         &'a self,
         request: LocalCaptureRequest,
         admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>>;
+    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>>;
+
+    /// Recapture an already-Ready complete application index through the
+    /// fresh recovery-generation guard, without another origin scan.
+    fn recapture_current_index<'a>(
+        &'a self,
+        _request: ReadyCaptureRequest,
+        _admission: &'a ByteAdmission,
+    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+        Box::pin(async { Err(AdapterError) })
+    }
 
     /// Unlink this exact capture before its charged image is retired.
     fn retire_local_capture(&self, capture: &DonorCapture<Self::Image>);
@@ -207,8 +217,16 @@ impl<A: BootstrapStatePort, B: BulkTransport> DonorPort for BulkDonorPort<A, B> 
         &'a self,
         request: LocalCaptureRequest,
         admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
         self.state.build_local_capture(request, admission)
+    }
+
+    fn recapture_current_index<'a>(
+        &'a self,
+        request: ReadyCaptureRequest,
+        admission: &'a ByteAdmission,
+    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+        self.state.recapture_current_index(request, admission)
     }
 
     fn retire_local_capture(&self, capture: &DonorCapture<Self::Image>) {

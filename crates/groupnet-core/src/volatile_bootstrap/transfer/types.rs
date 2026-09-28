@@ -6,7 +6,7 @@ use crate::volatile_recovery::RecoveryOperation;
 use super::super::journal::{
     AttachToken, BarrierReceipt, CaptureId, JournalBatch, JournalCursor, NativeCut, ReservationId,
 };
-use super::super::{BootstrapOperation, BootstrapScope, ClaimIdentity};
+use super::super::{BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity};
 
 /// Exact, sorted per-writer coverage; zero sequence denotes a quiet feed.
 pub(crate) fn native_cuts_cover(actual: &[NativeCut], expected: &[NativeCut]) -> bool {
@@ -105,7 +105,7 @@ pub struct TransferOffer {
     /// Opaque full-image commitment verified by the adapter.
     pub commitment: [u8; 32],
     /// Exact complete member identities observed at C, sorted by node.
-    pub members: Vec<ClaimIdentity>,
+    pub members: Vec<BootstrapMemberIdentity>,
     /// Exact native per-writer cuts at C, sorted by writer.
     pub cuts: Vec<NativeCut>,
 }
@@ -124,7 +124,7 @@ pub struct NativeCoverageReceipt {
     /// Actual contiguous native positions after buffered overlap handling.
     pub proven_cuts: Vec<NativeCut>,
     /// Complete currently observed member identities.
-    pub members: Vec<ClaimIdentity>,
+    pub members: Vec<BootstrapMemberIdentity>,
     /// Current bounded native-effect buffer memory charge.
     pub buffered_bytes: usize,
 }
@@ -305,6 +305,10 @@ pub enum TransferEffect {
     ReserveStage {
         /// Exact stage reservation operation.
         op: BootstrapOperation,
+        /// Exact accepted image cut, binding the private stage to C.
+        image_cut: JournalCursor,
+        /// Accepted finite image chunk count.
+        chunks: usize,
         /// Encoded image memory to admit.
         encoded_bytes: usize,
         /// Decoded stage memory to admit.

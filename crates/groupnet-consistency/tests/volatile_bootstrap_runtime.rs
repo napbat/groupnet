@@ -10,15 +10,15 @@ use groupnet_consistency::volatile_recovery::bootstrap::admission::{
 };
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSnapshot, ClaimSource, DonorCapture,
-    DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureRequest, TimedClaim,
-    TransferContext, TransferResources,
+    DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureOutcome, LocalCaptureRequest,
+    ParticipationSnapshot, TimedClaim, TimedParticipant, TransferContext, TransferResources,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::session::{
     BootstrapRuntimeConfig, BootstrapSession,
 };
 use groupnet_consistency::volatile_recovery::{
     AdapterError, BoxRecoveryFuture, Mark, PeerObservation, PublicationPermit, RecoveryAdapter,
-    RecoveryConfig, RecoveryHandle, RecoveryMode, RecoveryOperation,
+    RecoveryConfig, RecoveryHandle, RecoveryMode, RecoveryOperation, RecoveryRearm,
 };
 use groupnet_core::volatile_bootstrap::journal::{CaptureId, DonorJournal, JournalConfig};
 use groupnet_core::volatile_bootstrap::transfer::{
@@ -26,18 +26,32 @@ use groupnet_core::volatile_bootstrap::transfer::{
     TransferOffer,
 };
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapClaim, BootstrapConfig, BootstrapMember, BootstrapOperation, BootstrapScope,
-    ClaimIdentity,
+    BootId, BootstrapClaim, BootstrapConfig, BootstrapMember, BootstrapMemberIdentity,
+    BootstrapOperation, BootstrapPresence, BootstrapScope, ClaimIdentity, PresenceIdentity,
 };
-use groupnet_core::{NodeId, Time};
+use groupnet_core::{NodeId, Status, Time};
 use groupnet_testkit::cluster::eventually_within;
 use tokio::sync::Notify;
 
 const SETTLE: Duration = Duration::from_secs(2);
 
+fn member_from_claim(claim: &ClaimIdentity) -> BootstrapMemberIdentity {
+    BootstrapMemberIdentity {
+        node: claim.node.clone(),
+        presence: Some(PresenceIdentity {
+            node: claim.node.clone(),
+            boot: claim.incarnation,
+            session: claim.session,
+        }),
+        member_incarnation: 1,
+        status: Status::Alive,
+    }
+}
+
 #[derive(Debug, Default)]
 struct Claims {
     local: Mutex<Option<BootstrapClaim>>,
+    presence: Mutex<Option<BootstrapPresence>>,
     peer: Option<BootstrapClaim>,
     pause_ready_renewal: std::sync::atomic::AtomicBool,
     ready_publishes: AtomicUsize,
@@ -46,6 +60,103 @@ struct Claims {
 }
 
 impl ClaimSource for Claims {
+    fn observe_participation<'a>(
+        &'a self,
+        _op: BootstrapOperation,
+        limits: ClaimObservationLimits,
+        admission: &'a ByteAdmission,
+    ) -> BoxRecoveryFuture<
+        'a,
+        Result<
+            groupnet_consistency::volatile_recovery::bootstrap::admission::Admitted<
+                ParticipationSnapshot,
+            >,
+            AdapterError,
+        >,
+    > {
+        Box::pin(async move {
+            let charge = admission
+                .reserve(AdmissionClass::Inflight, limits.max_metadata_bytes)
+                .map_err(|_| AdapterError)?;
+            let presence = self.presence.lock().unwrap().clone().ok_or(AdapterError)?;
+            let claim = self.local.lock().unwrap().clone().ok_or(AdapterError)?;
+            let mut members = vec![BootstrapMember {
+                node: presence.identity.node.clone(),
+                eligible: true,
+            }];
+            let mut participants = vec![TimedParticipant {
+                member: BootstrapMemberIdentity {
+                    node: presence.identity.node.clone(),
+                    presence: Some(presence.identity),
+                    member_incarnation: 0,
+                    status: Status::Alive,
+                },
+                renewal: presence.renewal,
+                remaining_ms: presence.remaining_ms,
+            }];
+            let mut claims = vec![claim];
+            if let Some(peer) = &self.peer {
+                members.push(BootstrapMember {
+                    node: peer.identity.node.clone(),
+                    eligible: true,
+                });
+                participants.push(TimedParticipant {
+                    member: BootstrapMemberIdentity {
+                        node: peer.identity.node.clone(),
+                        presence: Some(PresenceIdentity {
+                            node: peer.identity.node.clone(),
+                            boot: peer.identity.incarnation,
+                            session: peer.identity.session,
+                        }),
+                        member_incarnation: 0,
+                        status: Status::Alive,
+                    },
+                    renewal: 1,
+                    remaining_ms: peer.remaining_ms,
+                });
+                claims.push(peer.clone());
+            }
+            let mut roster = participants
+                .iter()
+                .map(|participant| participant.member.clone())
+                .collect::<Vec<_>>();
+            roster.sort_by(|a, b| a.node.cmp(&b.node));
+            Ok(charge.hold(ParticipationSnapshot {
+                sampled_at: Instant::now(),
+                roster,
+                members,
+                participants,
+                claims,
+            }))
+        })
+    }
+
+    fn publish_presence(
+        &self,
+        presence: BootstrapPresence,
+    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
+        Box::pin(async move {
+            *self.presence.lock().unwrap() = Some(presence);
+            Ok(())
+        })
+    }
+
+    fn withdraw_presence(
+        &self,
+        identity: PresenceIdentity,
+    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
+        Box::pin(async move {
+            let mut presence = self.presence.lock().unwrap();
+            if presence
+                .as_ref()
+                .is_some_and(|value| value.identity == identity)
+            {
+                *presence = None;
+            }
+            Ok(())
+        })
+    }
+
     fn publish_claim(
         &self,
         claim: BootstrapClaim,
@@ -154,6 +265,7 @@ impl ClaimSource for Claims {
 #[derive(Debug, Default)]
 struct OriginDonor {
     builds: AtomicUsize,
+    local_only: std::sync::atomic::AtomicBool,
     follower_prepares: AtomicUsize,
     pause: std::sync::atomic::AtomicBool,
     started: Notify,
@@ -206,7 +318,7 @@ impl DonorPort for OriginDonor {
         &'a self,
         request: LocalCaptureRequest,
         admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
         Box::pin(async move {
             let LocalCaptureRequest {
                 recovery,
@@ -246,7 +358,7 @@ impl DonorPort for OriginDonor {
             )
             .map_err(|_| AdapterError)?;
             journal
-                .begin_capture(now, 1, 1, vec![selected], Vec::new())
+                .begin_capture(now, 1, 1, vec![member_from_claim(&selected)], Vec::new())
                 .map_err(|_| AdapterError)?;
             if self.pause.load(Ordering::SeqCst) {
                 *self.latest_permit.lock().unwrap() = Some(permit.clone());
@@ -256,12 +368,15 @@ impl DonorPort for OriginDonor {
             permit
                 .publish(|| self.builds.fetch_add(1, Ordering::SeqCst))
                 .ok_or(AdapterError)?;
+            if self.local_only.load(Ordering::SeqCst) {
+                return Ok(LocalCaptureOutcome::LocalOnly);
+            }
             journal
                 .finish_capture(now, 1, 1)
                 .map_err(|_| AdapterError)?;
             let ingress = JournalIngress::new(journal, suffix, wake)?;
             *self.ingress.lock().unwrap() = Some(ingress.clone());
-            DonorCapture::new(vec![42], ingress, encoded, decoded)
+            DonorCapture::new(vec![42], ingress, encoded, decoded).map(LocalCaptureOutcome::Ready)
         })
     }
 
@@ -311,6 +426,7 @@ impl DonorPort for OriginDonor {
 struct ReadAdapter {
     old_origin_builds: AtomicUsize,
     peer: Option<ClaimIdentity>,
+    latest_origin_permit: Mutex<Option<PublicationPermit>>,
 }
 
 impl RecoveryAdapter for ReadAdapter {
@@ -328,9 +444,10 @@ impl RecoveryAdapter for ReadAdapter {
     fn rebuild_origin(
         &self,
         _op: RecoveryOperation,
-        _permit: PublicationPermit,
+        permit: PublicationPermit,
     ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
         Box::pin(async move {
+            *self.latest_origin_permit.lock().unwrap() = Some(permit);
             self.old_origin_builds.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
@@ -351,24 +468,38 @@ impl RecoveryAdapter for ReadAdapter {
     ) -> BoxRecoveryFuture<'_, groupnet_consistency::volatile_recovery::PeerHeadObservation> {
         Box::pin(async move {
             let peer = self.peer.clone().ok_or(AdapterError)?;
+            let peer_node = peer.node.clone();
+            let members = [
+                ClaimIdentity {
+                    node: NodeId::from("me"),
+                    incarnation: BootId(17),
+                    session: 7,
+                    attempt: 1,
+                },
+                peer,
+            ]
+            .into_iter()
+            .map(|claim| BootstrapMemberIdentity {
+                node: claim.node.clone(),
+                presence: Some(PresenceIdentity {
+                    node: claim.node,
+                    boot: claim.incarnation,
+                    session: claim.session,
+                }),
+                member_incarnation: 1,
+                status: Status::Alive,
+            })
+            .collect();
             Ok((
                 vec![groupnet_consistency::volatile_recovery::Peer {
-                    node: peer.node.clone(),
+                    node: peer_node,
                     alive: true,
                     grants_lease: false,
                     old_nonlive: false,
                     grant: None,
                     head: None,
                 }],
-                vec![
-                    ClaimIdentity {
-                        node: NodeId::from("me"),
-                        incarnation: BootId(17),
-                        session: 7,
-                        attempt: 1,
-                    },
-                    peer,
-                ],
+                members,
             ))
         })
     }
@@ -416,6 +547,7 @@ fn bootstrap_config() -> BootstrapRuntimeConfig {
         },
         max_claim_metadata_bytes: 128,
         donor_inbox_capacity: 2,
+        require_participation: false,
     }
 }
 
@@ -431,7 +563,7 @@ struct PeerDonor {
 }
 
 impl PeerDonor {
-    fn new(peer: ClaimIdentity, follower: ClaimIdentity) -> Self {
+    fn new(peer: &ClaimIdentity, follower: &ClaimIdentity) -> Self {
         let scope = BootstrapScope {
             domain: "o".into(),
             partition: "b".into(),
@@ -450,7 +582,7 @@ impl PeerDonor {
             },
         )
         .unwrap();
-        let members = vec![follower, peer];
+        let members = vec![member_from_claim(follower), member_from_claim(peer)];
         journal
             .begin_capture(Time(0), 1, 1, members.clone(), Vec::new())
             .unwrap();
@@ -503,7 +635,7 @@ impl DonorPort for PeerDonor {
         &'a self,
         _request: LocalCaptureRequest,
         _admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
         Box::pin(async { Err(AdapterError) })
     }
 
@@ -557,6 +689,7 @@ impl DonorPort for PeerDonor {
                     op,
                     encoded_bytes,
                     decoded_bytes,
+                    ..
                 } => {
                     let encoded = admission
                         .reserve(AdmissionClass::Encoded, encoded_bytes)
@@ -711,3 +844,7 @@ fn admission() -> ByteAdmission {
 
 #[path = "volatile_bootstrap_runtime/scenarios.rs"]
 mod scenarios;
+
+#[cfg(feature = "volatile-bootstrap-bulk")]
+#[path = "volatile_bootstrap_runtime/bulk_recapture.rs"]
+mod bulk_recapture;

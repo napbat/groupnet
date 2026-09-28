@@ -12,13 +12,16 @@ mod engine;
 mod types;
 
 pub use claim_codec::{
-    ClaimCodecError, claim_entry_key, decode_claim_value, encode_claim_value, encoded_claim_len,
+    ClaimCodecError, claim_entry_key, decode_claim_value, decode_presence_value,
+    encode_claim_value, encode_presence_value, encoded_claim_len, encoded_presence_len,
+    presence_entry_key,
 };
 pub use engine::ClaimEngine;
 pub use types::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
-    BootstrapMember, BootstrapOperation, BootstrapScope, BootstrapStage, BootstrapStep,
-    ClaimIdentity, ClaimPhase,
+    BootstrapMember, BootstrapMemberIdentity, BootstrapOperation, BootstrapParticipant,
+    BootstrapPresence, BootstrapScope, BootstrapStage, BootstrapStep, ClaimIdentity, ClaimPhase,
+    PresenceIdentity,
 };
 
 #[cfg(test)]

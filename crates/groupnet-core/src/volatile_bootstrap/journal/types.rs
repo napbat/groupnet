@@ -2,7 +2,7 @@
 
 use crate::Time;
 
-use super::super::{BootstrapScope, ClaimIdentity};
+use super::super::{BootstrapMemberIdentity, BootstrapScope, ClaimIdentity};
 
 /// A capture identity that cannot be reused by the same donor session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,7 +158,7 @@ pub struct BarrierReceipt {
     /// Native writer cuts sampled atomically with B.
     pub covered_cuts: Vec<NativeCut>,
     /// Exact complete membership identities at B.
-    pub members: Vec<ClaimIdentity>,
+    pub members: Vec<BootstrapMemberIdentity>,
 }
 
 /// One final index effect in donor publication order.

@@ -15,12 +15,14 @@ use groupnet_core::volatile_bootstrap::journal::{
 };
 use groupnet_core::volatile_bootstrap::transfer::{TransferEffect, TransferEvent, TransferOffer};
 use groupnet_core::volatile_bootstrap::{
-    BootstrapClaim, BootstrapMember, BootstrapOperation, ClaimIdentity,
+    BootstrapClaim, BootstrapMember, BootstrapMemberIdentity, BootstrapOperation, ClaimIdentity,
 };
 use groupnet_core::volatile_recovery::RecoveryOperation;
 
 use super::admission::{AdmissionClass, Admitted, ByteAdmission, Reservation};
-use crate::volatile_recovery::{AdapterError, BoxRecoveryFuture, PublicationPermit};
+use crate::volatile_recovery::{
+    AdapterError, BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit,
+};
 
 /// Complete, source-observed roster and native TTL claims for one scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +32,36 @@ pub struct ClaimSnapshot {
     /// All currently visible members, bounded before callback allocation.
     pub members: Vec<BootstrapMember>,
     /// All currently visible claims, bounded before callback allocation.
+    pub claims: Vec<BootstrapClaim>,
+}
+
+/// One source-certified participation identity with native TTL at a cut.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimedParticipant {
+    /// Native member incarnation and independently fresh worker identity.
+    pub member: BootstrapMemberIdentity,
+    /// Exact renewal sequence in the scoped presence entry.
+    pub renewal: u64,
+    /// Native remaining TTL measured at the enclosing snapshot's sample.
+    pub remaining_ms: u64,
+}
+
+/// Complete same-actor-cut participation and transient builder hints.
+///
+/// Each eligible native member must have one live compatible participant.
+/// Presence grants neither donor readiness nor local read authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParticipationSnapshot {
+    /// Observer-local monotonic sample time for both native TTL sets.
+    pub sampled_at: Instant,
+    /// Complete native membership statuses, including ineligible members.
+    pub members: Vec<BootstrapMember>,
+    /// Every native member's exact incarnation, status, and optional presence
+    /// from that same actor cut, in canonical node order.
+    pub roster: Vec<BootstrapMemberIdentity>,
+    /// One certified presence for every eligible member.
+    pub participants: Vec<TimedParticipant>,
+    /// Optional builder claims; already transferred members need no claim.
     pub claims: Vec<BootstrapClaim>,
 }
 
@@ -60,6 +92,31 @@ pub struct ClaimObservationLimits {
 /// record is an error, not absence. A TTL claim is never serving authority or
 /// an origin write log.
 pub trait ClaimSource: Send + Sync + 'static {
+    /// Publish or renew exact scoped participation through native TTL and
+    /// revision fencing. It conveys no donor or serving authority.
+    fn publish_presence(
+        &self,
+        presence: groupnet_core::volatile_bootstrap::BootstrapPresence,
+    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+
+    /// Best-effort conditional withdrawal of this exact worker presence.
+    fn withdraw_presence(
+        &self,
+        identity: groupnet_core::volatile_bootstrap::PresenceIdentity,
+    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+
+    /// Read complete native membership, long-lived participation, and
+    /// transient builder claims from one bounded actor cut.
+    fn observe_participation<'a>(
+        &'a self,
+        op: BootstrapOperation,
+        limits: ClaimObservationLimits,
+        admission: &'a ByteAdmission,
+    ) -> BoxRecoveryFuture<'a, Result<Admitted<ParticipationSnapshot>, AdapterError>> {
+        let _ = (op, limits, admission);
+        Box::pin(async { Err(AdapterError) })
+    }
+
     /// Publish or renew one exact local claim under native TTL semantics.
     fn publish_claim(
         &self,
@@ -251,6 +308,16 @@ pub struct DonorCapture<I> {
     decoded: Reservation,
 }
 
+/// Completed local origin scan with optional peer-donor capture.
+/// Local-only completion never grants a peer read.
+#[derive(Debug)]
+pub enum LocalCaptureOutcome<I> {
+    /// Complete guarded capture may be offered after a final roster check.
+    Ready(DonorCapture<I>),
+    /// Origin scan succeeded, but this cut cannot be offered to peers.
+    LocalOnly,
+}
+
 impl<I> DonorCapture<I> {
     /// Constructs only from a complete active private capture whose journal
     /// ingress is already attached to the live index publication coordinator.
@@ -373,11 +440,37 @@ pub struct LocalCaptureRequest {
     pub build: BootstrapOperation,
     /// Exact locally selected claim.
     pub selected: ClaimIdentity,
+    /// Complete source-observed participation roster checked before C.
+    pub members: Vec<BootstrapMemberIdentity>,
     /// Publication permission narrowed to the child operation deadline.
     pub permit: PublicationPermit,
     /// Current logical time supplied by the worker.
     pub now: Time,
     /// Shared worker wake for synchronous journal invalidation.
+    pub wake: Arc<Notify>,
+}
+
+/// A fresh bounded recapture of an already-Ready, complete local index.
+/// This never repeats the origin scan or extends its expired publication
+/// permit. The application checks its lease/feed/scope state inside `guard`'s
+/// short Control-then-index critical section before attaching journal C.
+#[derive(Clone, Debug)]
+pub struct ReadyCaptureRequest {
+    /// Fresh worker operation from the core session allocator.
+    pub operation: BootstrapOperation,
+    /// Exact newly selected donor claim after old Ready withdrawal.
+    pub selected: ClaimIdentity,
+    /// Recovery generation whose current index may be cloned.
+    pub recovery_generation: u64,
+    /// Complete, freshly observed native participation roster.
+    pub members: Vec<BootstrapMemberIdentity>,
+    /// Guard that synchronously fences capture against recovery invalidation.
+    pub guard: ReadyCapturePermit,
+    /// Original finite recapture deadline.
+    pub deadline: Instant,
+    /// Current core logical time.
+    pub now: Time,
+    /// Existing recovery worker wake for journal invalidation.
     pub wake: Arc<Notify>,
 }
 
@@ -512,13 +605,24 @@ pub trait DonorPort: Send + Sync + 'static {
     /// its reserved memory can be reused.
     ///
     /// # Errors
-    /// Returns an adapter error when a complete guarded capture cannot be
-    /// established within the supplied finite deadline.
+    /// Returns `LocalOnly` after a successful origin scan that cannot be
+    /// admitted for peer donation. An error means the local scan failed.
     fn build_local_capture<'a>(
         &'a self,
         request: LocalCaptureRequest,
         admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>>;
+    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>>;
+
+    /// Capture a fresh image from an already-Ready complete local index.
+    /// This is available only to the opt-in participation worker. Returning
+    /// an error leaves local reads intact and disables peer donor service.
+    fn recapture_current_index<'a>(
+        &'a self,
+        _request: ReadyCaptureRequest,
+        _admission: &'a ByteAdmission,
+    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+        Box::pin(async { Err(AdapterError) })
+    }
 
     /// Synchronously remove this exact capture's journal ingress from the
     /// application's publication coordinator before dropping its image and

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::volatile_bootstrap::ClaimIdentity;
+use crate::volatile_bootstrap::BootstrapMemberIdentity;
 use crate::{NodeId, Time};
 
 use super::types::{
@@ -55,7 +55,7 @@ pub struct RecoveryEngine {
     known_heads: BTreeMap<NodeId, Mark>,
     heads: BTreeMap<NodeId, Mark>,
     barrier_rounds: u32,
-    peer_members: Vec<ClaimIdentity>,
+    peer_members: Vec<BootstrapMemberIdentity>,
 }
 
 impl RecoveryEngine {

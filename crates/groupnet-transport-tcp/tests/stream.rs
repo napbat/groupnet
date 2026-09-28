@@ -9,6 +9,7 @@ use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_tcp::TcpBulkTransport;
+use std::time::Duration;
 
 #[tokio::test]
 async fn streams_a_multi_megabyte_blob_over_loopback() {
@@ -46,4 +47,33 @@ async fn streams_a_multi_megabyte_blob_over_loopback() {
     assert_eq!(from, NodeId::new("node-a"), "peer identified via handshake");
     assert_eq!(got.len(), 4_000_000);
     assert_eq!(got, expected, "payload survived the round trip intact");
+}
+
+#[tokio::test]
+async fn hostname_book_resolves_each_connect_under_caller_deadline() {
+    let a = TcpBulkTransport::bind(NodeId::new("host-a"), "127.0.0.1:0")
+        .await
+        .unwrap();
+    let b = TcpBulkTransport::bind(NodeId::new("host-b"), "127.0.0.1:0")
+        .await
+        .unwrap();
+    let port = b.local_addr().unwrap().port();
+    assert!(
+        a.register_peer_host(NodeId::new("invalid"), "localhost".into())
+            .is_err()
+    );
+    assert!(
+        a.register_peer_host(NodeId::new("invalid"), format!("localhost:{port}/../bad"))
+            .is_err()
+    );
+    a.register_peer_host(NodeId::new("host-b"), format!("localhost:{port}"))
+        .unwrap();
+    let a = DataPlane::new(a);
+    let b = DataPlane::new(b);
+    let receiver = tokio::spawn(async move { b.accept().await.unwrap().0 });
+    let _stream = tokio::time::timeout(Duration::from_secs(10), a.connect(&NodeId::new("host-b")))
+        .await
+        .expect("bounded connect")
+        .expect("resolved host");
+    assert_eq!(receiver.await.unwrap(), NodeId::new("host-a"));
 }

@@ -2,10 +2,14 @@
 
 use std::fmt::Write;
 
-use super::{BootId, BootstrapClaim, BootstrapConfig, BootstrapScope, ClaimIdentity, ClaimPhase};
+use super::{
+    BootId, BootstrapClaim, BootstrapConfig, BootstrapPresence, BootstrapScope, ClaimIdentity,
+    ClaimPhase, PresenceIdentity,
+};
 use crate::NodeId;
 
 const MAGIC: &[u8; 4] = b"VBC1";
+const PRESENCE_MAGIC: &[u8; 4] = b"VBP1";
 
 /// A bootstrap claim key or value is invalid or exceeds its declared bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +196,156 @@ pub fn decode_claim_value(
     })
 }
 
+/// Collision-free reserved native key for a long-lived participation entry.
+///
+/// # Errors
+/// Rejects empty or over-limit scope names.
+pub fn presence_entry_key(
+    scope: &BootstrapScope,
+    max_key_bytes: usize,
+) -> Result<String, ClaimCodecError> {
+    if scope.domain.is_empty() || scope.partition.is_empty() || max_key_bytes == 0 {
+        return Err(ClaimCodecError::Bound);
+    }
+    let prefix = "~volatile-presence/v1/";
+    let size = prefix
+        .len()
+        .checked_add(scope.domain.len().to_string().len())
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_add(scope.domain.len()))
+        .and_then(|n| n.checked_add(scope.partition.len()))
+        .ok_or(ClaimCodecError::Bound)?;
+    if size > max_key_bytes {
+        return Err(ClaimCodecError::Bound);
+    }
+    let mut key = String::new();
+    key.try_reserve_exact(size)
+        .map_err(|_| ClaimCodecError::Bound)?;
+    write!(
+        &mut key,
+        "{prefix}{}:{}{}",
+        scope.domain.len(),
+        scope.domain,
+        scope.partition
+    )
+    .map_err(|_| ClaimCodecError::Bound)?;
+    Ok(key)
+}
+
+/// Exact encoded length of one participation value, excluding native TTL.
+///
+/// # Errors
+/// Rejects invalid identity, policy representation, or capacity.
+pub fn encoded_presence_len(
+    scope: &BootstrapScope,
+    policy: BootstrapConfig,
+    presence: &BootstrapPresence,
+    max_bytes: usize,
+) -> Result<usize, ClaimCodecError> {
+    let domain = bounded_name(&scope.domain, policy.max_scope_bytes)?;
+    let partition = bounded_name(&scope.partition, policy.max_scope_bytes)?;
+    let node = bounded_name(presence.identity.node.as_str(), policy.max_member_bytes)?;
+    let scope_bytes = domain
+        .len()
+        .checked_add(partition.len())
+        .ok_or(ClaimCodecError::Bound)?;
+    if scope_bytes > policy.max_scope_bytes
+        || presence.identity.boot.0 == 0
+        || presence.identity.session == 0
+        || presence.renewal == 0
+    {
+        return Err(ClaimCodecError::Bound);
+    }
+    let _ = policy_fields(policy)?;
+    let size = 4usize
+        .checked_add(2 * 3)
+        .and_then(|n| n.checked_add(scope_bytes))
+        .and_then(|n| n.checked_add(node.len()))
+        .and_then(|n| n.checked_add(9 * 8 + 16 + 2 * 8))
+        .ok_or(ClaimCodecError::Bound)?;
+    if size > max_bytes {
+        return Err(ClaimCodecError::Bound);
+    }
+    Ok(size)
+}
+
+/// Encode one policy-bound participation renewal with no wall timestamp.
+///
+/// # Errors
+/// Rejects invalid or oversized fields before allocating the body.
+pub fn encode_presence_value(
+    scope: &BootstrapScope,
+    policy: BootstrapConfig,
+    presence: &BootstrapPresence,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ClaimCodecError> {
+    let size = encoded_presence_len(scope, policy, presence, max_bytes)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(size)
+        .map_err(|_| ClaimCodecError::Bound)?;
+    out.extend_from_slice(PRESENCE_MAGIC);
+    write_name(&mut out, scope.domain.as_bytes())?;
+    write_name(&mut out, scope.partition.as_bytes())?;
+    for field in policy_fields(policy)? {
+        out.extend_from_slice(&field.to_le_bytes());
+    }
+    write_name(&mut out, presence.identity.node.as_str().as_bytes())?;
+    out.extend_from_slice(&presence.identity.boot.0.to_le_bytes());
+    out.extend_from_slice(&presence.identity.session.to_le_bytes());
+    out.extend_from_slice(&presence.renewal.to_le_bytes());
+    Ok(out)
+}
+
+/// Decode one actor-observed participation value for an exact author/scope.
+/// The caller fills remaining TTL only from the native actor sample.
+///
+/// # Errors
+/// Rejects malformed, trailing, wrong-policy, or over-limit bytes without
+/// first allocating an identity.
+pub fn decode_presence_value(
+    scope: &BootstrapScope,
+    policy: BootstrapConfig,
+    observed_node: &NodeId,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<BootstrapPresence, ClaimCodecError> {
+    if bytes.len() > max_bytes {
+        return Err(ClaimCodecError::Bound);
+    }
+    let mut reader = Reader { bytes, offset: 0 };
+    if reader.take(4)? != PRESENCE_MAGIC {
+        return Err(ClaimCodecError::Mismatch);
+    }
+    if reader.name(policy.max_scope_bytes)? != scope.domain.as_bytes()
+        || reader.name(policy.max_scope_bytes)? != scope.partition.as_bytes()
+    {
+        return Err(ClaimCodecError::Mismatch);
+    }
+    for field in policy_fields(policy)? {
+        if reader.u64()? != field {
+            return Err(ClaimCodecError::Mismatch);
+        }
+    }
+    if reader.name(policy.max_member_bytes)? != observed_node.as_str().as_bytes() {
+        return Err(ClaimCodecError::Mismatch);
+    }
+    let boot = BootId(u128::from_le_bytes(reader.array()?));
+    let session = reader.u64()?;
+    let renewal = reader.u64()?;
+    if reader.offset != bytes.len() || boot.0 == 0 || session == 0 || renewal == 0 {
+        return Err(ClaimCodecError::Malformed);
+    }
+    Ok(BootstrapPresence {
+        identity: PresenceIdentity {
+            node: observed_node.clone(),
+            boot,
+            session,
+        },
+        renewal,
+        remaining_ms: 0,
+    })
+}
+
 fn bounded_name(name: &str, max_bytes: usize) -> Result<&[u8], ClaimCodecError> {
     if name.is_empty() || name.len() > max_bytes || name.len() > usize::from(u16::MAX) {
         return Err(ClaimCodecError::Bound);
@@ -368,6 +522,46 @@ mod tests {
                 &bad_version,
                 256
             ),
+            Err(ClaimCodecError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn presence_is_separate_policy_bound_entry_without_ttl_timestamp() {
+        let presence = BootstrapPresence {
+            identity: PresenceIdentity {
+                node: NodeId::new("node-a"),
+                boot: BootId(17),
+                session: 23,
+            },
+            renewal: 4,
+            remaining_ms: 99,
+        };
+        let bytes = encode_presence_value(&scope(), policy(), &presence, 256).unwrap();
+        assert_eq!(
+            encoded_presence_len(&scope(), policy(), &presence, 256).unwrap(),
+            bytes.len()
+        );
+        let decoded =
+            decode_presence_value(&scope(), policy(), &presence.identity.node, &bytes, 256)
+                .unwrap();
+        assert_eq!(decoded.identity, presence.identity);
+        assert_eq!(decoded.renewal, 4);
+        assert_eq!(decoded.remaining_ms, 0);
+        assert_ne!(
+            presence_entry_key(&scope(), 256).unwrap(),
+            claim_entry_key(&scope(), 256).unwrap()
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_presence_value(&scope(), policy(), &presence.identity.node, &trailing, 256),
+            Err(ClaimCodecError::Malformed)
+        );
+        let mut wrong_policy = policy();
+        wrong_policy.claim_ttl_ms += 1;
+        assert_eq!(
+            decode_presence_value(&scope(), wrong_policy, &presence.identity.node, &bytes, 256,),
             Err(ClaimCodecError::Mismatch)
         );
     }

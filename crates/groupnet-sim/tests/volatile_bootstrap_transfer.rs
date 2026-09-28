@@ -10,10 +10,11 @@ use groupnet_core::volatile_bootstrap::transfer::{
 };
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
-    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity, ClaimPhase,
+    BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine,
+    ClaimIdentity, ClaimPhase, PresenceIdentity,
 };
 use groupnet_core::volatile_recovery::RecoveryOperation;
-use groupnet_core::{NodeId, Time, placement};
+use groupnet_core::{NodeId, Status, Time, placement};
 use groupnet_sim::SplitMix64;
 
 #[derive(Clone)]
@@ -187,7 +188,19 @@ fn start() -> (ClaimEngine, Fixture, Vec<BootstrapEffect>) {
         capture: capture.clone(),
         position: 0,
     };
-    let mut members = vec![donor.clone(), follower.clone()];
+    let mut members = vec![donor.clone(), follower.clone()]
+        .into_iter()
+        .map(|claim| BootstrapMemberIdentity {
+            node: claim.node.clone(),
+            presence: Some(PresenceIdentity {
+                node: claim.node,
+                boot: claim.incarnation,
+                session: claim.session,
+            }),
+            member_incarnation: 1,
+            status: Status::Alive,
+        })
+        .collect::<Vec<_>>();
     members.sort_by(|a, b| a.node.cmp(&b.node));
     let cuts = vec![NativeCut {
         writer: b"w".to_vec(),
@@ -495,13 +508,16 @@ fn enqueue(
                 None
             }
             BootstrapEffect::CancelWork { .. }
+            | BootstrapEffect::PublishPresence(_)
+            | BootstrapEffect::WithdrawPresence(_)
             | BootstrapEffect::PublishClaim(_)
             | BootstrapEffect::WithdrawClaim(_)
             | BootstrapEffect::ObserveClaims { .. }
             | BootstrapEffect::BuildOrigin { .. }
             | BootstrapEffect::FollowBuilder { .. }
             | BootstrapEffect::DonorAvailable { .. }
-            | BootstrapEffect::ArmTimer(_) => None,
+            | BootstrapEffect::ArmTimer(_)
+            | BootstrapEffect::RecaptureCurrent { .. } => None,
         };
         let Some(event) = event else { continue };
         let is_ack = matches!(&event, BootstrapEvent::Transfer(inner)
@@ -595,7 +611,8 @@ fn run(seed: u64, healthy: bool, coverage: &mut Coverage) {
             coverage.completed += 1;
             coverage.complete_batches += fixture.batches;
             coverage.complete_barriers += fixture.barrier_advances;
-            assert_eq!(engine.next_deadline(), None);
+            // Completed transfer keeps the scoped participation heartbeat.
+            assert!(engine.next_deadline().is_some());
         }
     }
     if healthy {

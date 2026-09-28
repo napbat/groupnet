@@ -4,8 +4,10 @@ use groupnet_core::volatile_bootstrap::journal::{
     AttachToken, CaptureId, DeltaIdentity, DonorJournal, Invalidation, JournalBatch, JournalConfig,
     JournalCursor, JournalError, ReservationId,
 };
-use groupnet_core::volatile_bootstrap::{BootId, BootstrapScope, ClaimIdentity};
-use groupnet_core::{NodeId, Time};
+use groupnet_core::volatile_bootstrap::{
+    BootId, BootstrapMemberIdentity, BootstrapScope, ClaimIdentity, PresenceIdentity,
+};
+use groupnet_core::{NodeId, Status, Time};
 use groupnet_sim::SplitMix64;
 
 #[derive(Clone)]
@@ -22,6 +24,19 @@ fn identity(name: &str, session: u64) -> ClaimIdentity {
         incarnation: BootId(7),
         session,
         attempt: 1,
+    }
+}
+
+fn member(claim: &ClaimIdentity) -> BootstrapMemberIdentity {
+    BootstrapMemberIdentity {
+        node: claim.node.clone(),
+        presence: Some(PresenceIdentity {
+            node: claim.node.clone(),
+            boot: claim.incarnation,
+            session: claim.session,
+        }),
+        member_incarnation: 1,
+        status: Status::Alive,
     }
 }
 
@@ -59,7 +74,13 @@ fn captured(seed: u64) -> (DonorJournal, JournalCursor, ClaimIdentity) {
     };
     let mut journal = DonorJournal::new(config, id).unwrap();
     journal
-        .begin_capture(Time(0), 8, 8, vec![donor, follower.clone()], vec![])
+        .begin_capture(
+            Time(0),
+            8,
+            8,
+            vec![member(&donor), member(&follower)],
+            vec![],
+        )
         .unwrap();
     let cut = journal.finish_capture(Time(0), 8, 8).unwrap();
     (journal, cut, follower)

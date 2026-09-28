@@ -1,6 +1,6 @@
 //! Bounded facts and effects for recovery from a volatile coherence feed.
 
-use crate::volatile_bootstrap::ClaimIdentity;
+use crate::volatile_bootstrap::BootstrapMemberIdentity;
 use crate::volatile_bootstrap::transfer::NativeHandoffReceipt;
 use crate::{NodeId, Time};
 
@@ -248,7 +248,7 @@ pub enum RecoveryEvent {
         /// Bounded source-backed peer and head facts, excluding the local node.
         peers: Vec<Peer>,
         /// Complete current roster including incarnation and session identity.
-        identities: Vec<ClaimIdentity>,
+        identities: Vec<BootstrapMemberIdentity>,
     },
     /// All sampled per-writer heads were applied to the local index.
     FrontiersReached {

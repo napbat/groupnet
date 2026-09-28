@@ -10,8 +10,8 @@ use groupnet_consistency::volatile_recovery::bootstrap::ports::{
 };
 use groupnet_core::Status;
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapClaim, BootstrapConfig, BootstrapOperation, BootstrapScope, ClaimIdentity,
-    ClaimPhase, claim_entry_key,
+    BootId, BootstrapClaim, BootstrapConfig, BootstrapOperation, BootstrapPresence, BootstrapScope,
+    ClaimIdentity, ClaimPhase, PresenceIdentity, claim_entry_key, presence_entry_key,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually};
 
@@ -69,6 +69,188 @@ fn limits() -> ClaimObservationLimits {
         max_member_bytes: 16,
         max_metadata_bytes: 2_048,
     }
+}
+
+fn presence(node: groupnet_core::NodeId, boot: u128, session: u64) -> BootstrapPresence {
+    BootstrapPresence {
+        identity: PresenceIdentity {
+            node,
+            boot: BootId(boot),
+            session,
+        },
+        renewal: 1,
+        remaining_ms: policy().claim_ttl_ms,
+    }
+}
+
+#[tokio::test]
+async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_replacement() {
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let budget = admission();
+    let old = NativeClaimSource::new(
+        cluster.groups[0].clone(),
+        scope(),
+        policy(),
+        128,
+        256,
+        budget.clone(),
+    )
+    .unwrap();
+    let new = NativeClaimSource::new(
+        cluster.groups[0].clone(),
+        scope(),
+        policy(),
+        128,
+        256,
+        budget.clone(),
+    )
+    .unwrap();
+    let mut old_presence = presence(cluster.ids[0].clone(), 7, 8);
+    old.publish_presence(old_presence.clone()).await.unwrap();
+    for _ in 0..24 {
+        let queued = budget.reserve(AdmissionClass::Inflight, 32).unwrap();
+        cluster.groups[0]
+            .set_entry_confirmed("hot", b"x".to_vec(), None, 32, 32, queued)
+            .await
+            .unwrap();
+    }
+    old_presence.renewal = 2;
+    old.publish_presence(old_presence.clone()).await.unwrap();
+    old.withdraw_presence(old_presence.identity.clone())
+        .await
+        .unwrap();
+    let replacement = presence(cluster.ids[0].clone(), 9, 10);
+    new.publish_presence(replacement.clone()).await.unwrap();
+    old.withdraw_presence(old_presence.identity).await.unwrap();
+    let key = presence_entry_key(&scope(), 128).unwrap();
+    let bytes = cluster.groups[0]
+        .node_entry(&cluster.ids[0], &key)
+        .expect("new presence remains");
+    assert_eq!(
+        groupnet_core::volatile_bootstrap::decode_presence_value(
+            &scope(),
+            policy(),
+            &cluster.ids[0],
+            &bytes,
+            256,
+        )
+        .unwrap()
+        .identity,
+        replacement.identity,
+    );
+    drop(old);
+    drop(new);
+    assert_eq!(budget.usage().0, 0);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one connected source schedule checks the same actor cut before and after claim withdrawal and malformed presence"
+)]
+async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
+    let cluster = MemCluster::builder(&["node-a", "node-b"])
+        .group("g")
+        .gossip_interval_ms(20)
+        .spawn();
+    let budget = admission();
+    let first = NativeClaimSource::new(
+        cluster.groups[0].clone(),
+        scope(),
+        policy(),
+        128,
+        256,
+        budget.clone(),
+    )
+    .unwrap();
+    let second = NativeClaimSource::new(
+        cluster.groups[1].clone(),
+        scope(),
+        policy(),
+        128,
+        256,
+        budget.clone(),
+    )
+    .unwrap();
+    let first_presence = presence(cluster.ids[0].clone(), 7, 8);
+    let second_presence = presence(cluster.ids[1].clone(), 9, 10);
+    first.publish_presence(first_presence).await.unwrap();
+    second.publish_presence(second_presence).await.unwrap();
+    let first_claim = claim(cluster.ids[0].clone());
+    first.publish_claim(first_claim.clone()).await.unwrap();
+    let presence_key = presence_entry_key(&scope(), 128).unwrap();
+    let claim_key = claim_entry_key(&scope(), 128).unwrap();
+    eventually("paired source metadata reaches the second member", || {
+        cluster.groups[1]
+            .node_entry(&cluster.ids[0], &presence_key)
+            .is_some()
+            && cluster.groups[1]
+                .node_entry(&cluster.ids[0], &claim_key)
+                .is_some()
+    })
+    .await;
+    let op = BootstrapOperation {
+        session: 10,
+        incarnation: BootId(9),
+        generation: 1,
+        token: 1,
+    };
+    let cut = second
+        .observe_participation(op, limits(), &budget)
+        .await
+        .unwrap();
+    assert_eq!(cut.get().members.len(), 2);
+    assert_eq!(cut.get().roster.len(), 2);
+    assert!(
+        cut.get()
+            .roster
+            .iter()
+            .all(|member| member.presence.is_some())
+    );
+    assert_eq!(cut.get().participants.len(), 2);
+    assert_eq!(cut.get().claims.len(), 1);
+    drop(cut);
+    first.withdraw_claim(first_claim.identity).await.unwrap();
+    eventually("transferred member claim withdrawal arrives", || {
+        cluster.groups[1]
+            .node_entry(&cluster.ids[0], &claim_key)
+            .is_none()
+    })
+    .await;
+    let cut = second
+        .observe_participation(op, limits(), &budget)
+        .await
+        .unwrap();
+    assert_eq!(cut.get().participants.len(), 2);
+    assert!(cut.get().claims.is_empty());
+    drop(cut);
+    let queued = budget.reserve(AdmissionClass::Inflight, 128).unwrap();
+    cluster.groups[0]
+        .set_entry_confirmed(
+            &presence_key,
+            b"malformed",
+            Some(policy().claim_ttl_ms),
+            128,
+            256,
+            queued,
+        )
+        .await
+        .unwrap();
+    eventually("malformed scoped participation propagates", || {
+        cluster.groups[1]
+            .node_entry(&cluster.ids[0], &presence_key)
+            .is_some_and(|value| value == b"malformed")
+    })
+    .await;
+    assert!(
+        second
+            .observe_participation(op, limits(), &budget)
+            .await
+            .is_err()
+    );
+    drop(first);
+    drop(second);
+    assert_eq!(budget.usage().0, 0);
 }
 
 #[tokio::test]
@@ -214,13 +396,14 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
 #[tokio::test]
 async fn failed_converted_admission_retires_raw_actor_response_first() {
     let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let raw_charge = 2_048 + claim_entry_key(&scope(), 128).unwrap().len();
     let budget = ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: 2_048,
+        max_total_bytes: raw_charge + 1,
         max_encoded_bytes: 0,
         max_decoded_bytes: 0,
         max_suffix_bytes: 0,
         max_native_overlap_bytes: 0,
-        max_inflight_bytes: 2_048,
+        max_inflight_bytes: raw_charge + 1,
         max_reservations: 2,
     })
     .unwrap();

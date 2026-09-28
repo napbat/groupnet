@@ -5,12 +5,13 @@ use super::{
     BootstrapScope, BootstrapSession, ByteAdmission, CaptureId, ClaimIdentity, Claims,
     DonorCapture, DonorJournal, DonorPort, DonorRequest, Duration, JournalIngress, Mutex, NodeId,
     Notify, Ordering, OriginDonor, PeerDonor, ReadAdapter, RecoveryConfig, RecoveryHandle,
-    RecoveryMode, SETTLE, Time, admission, bootstrap_config, eventually_within, journal_config,
+    RecoveryMode, RecoveryRearm, SETTLE, Time, admission, bootstrap_config, eventually_within,
+    journal_config, member_from_claim,
 };
 
 fn captured_for_cleanup(
     serial: u64,
-    selected: ClaimIdentity,
+    selected: &ClaimIdentity,
     admission: &ByteAdmission,
 ) -> DonorCapture<Vec<u8>> {
     let mut journal = DonorJournal::new(
@@ -27,7 +28,7 @@ fn captured_for_cleanup(
     )
     .unwrap();
     journal
-        .begin_capture(Time(0), 1, 1, vec![selected], Vec::new())
+        .begin_capture(Time(0), 1, 1, vec![member_from_claim(selected)], Vec::new())
         .unwrap();
     journal.finish_capture(Time(0), 1, 1).unwrap();
     let storage = DonorJournal::storage_bound(journal_config()).unwrap();
@@ -61,7 +62,13 @@ fn ingress_rejects_an_undercharged_whole_journal() {
     )
     .unwrap();
     journal
-        .begin_capture(Time(0), 1, 1, vec![selected], Vec::new())
+        .begin_capture(
+            Time(0),
+            1,
+            1,
+            vec![member_from_claim(&selected)],
+            Vec::new(),
+        )
         .unwrap();
     journal.finish_capture(Time(0), 1, 1).unwrap();
     let storage = DonorJournal::storage_bound(journal_config()).unwrap();
@@ -82,8 +89,8 @@ fn delayed_old_capture_unlink_preserves_replacement_and_its_charge() {
         session: 14,
         attempt: 1,
     };
-    let old = captured_for_cleanup(1, selected.clone(), &admission);
-    let replacement = captured_for_cleanup(2, selected, &admission);
+    let old = captured_for_cleanup(1, &selected, &admission);
+    let replacement = captured_for_cleanup(2, &selected, &admission);
     *donor.ingress.lock().unwrap() = Some(replacement.ingress().clone());
     donor.retire_local_capture(&old);
     assert!(
@@ -129,7 +136,7 @@ async fn one_worker_builds_origin_once_before_advertising_donor() {
     )
     .unwrap();
     let reads = Arc::new(ReadAdapter::default());
-    let handle = RecoveryHandle::open_with_bootstrap(
+    let handle = RecoveryHandle::open_with_bootstrap_and_rearm(
         Arc::clone(&reads),
         RecoveryConfig {
             max_members: 2,
@@ -143,6 +150,10 @@ async fn one_worker_builds_origin_once_before_advertising_donor() {
         RecoveryMode::Unleased,
         NodeId::from("me"),
         9,
+        RecoveryRearm {
+            initial_ms: 50,
+            max_ms: 200,
+        },
         Box::new(driver),
     )
     .unwrap();
@@ -173,6 +184,124 @@ async fn one_worker_builds_origin_once_before_advertising_donor() {
         SETTLE,
         || sender.current_identity().is_none(),
     )
+    .await;
+}
+
+#[tokio::test]
+async fn completed_origin_without_donor_capture_serves_without_a_second_scan() {
+    let claims = Arc::new(Claims::default());
+    let donor = Arc::new(OriginDonor::default());
+    donor.local_only.store(true, Ordering::SeqCst);
+    let (driver, sender) = BootstrapSession::new(
+        BootstrapCapabilities {
+            claims: Arc::clone(&claims),
+            donor: Arc::clone(&donor),
+            admission: admission(),
+        },
+        BootstrapRuntimeConfig {
+            require_participation: true,
+            ..bootstrap_config()
+        },
+        BootstrapScope {
+            domain: "o".into(),
+            partition: "b".into(),
+        },
+        NodeId::from("me"),
+        BootId(7),
+        1,
+    )
+    .unwrap();
+    let reads = Arc::new(ReadAdapter::default());
+    let handle = RecoveryHandle::open_with_bootstrap(
+        Arc::clone(&reads),
+        RecoveryConfig {
+            max_members: 2,
+            max_member_bytes: 8,
+            max_barrier_rounds: 2,
+            total_ms: 1_000,
+            attempt_ms: 500,
+            settle_ms: 5,
+            poll_ms: 5,
+        },
+        RecoveryMode::Unleased,
+        NodeId::from("me"),
+        9,
+        Box::new(driver),
+    )
+    .unwrap();
+    eventually_within("local-only image is independently affirmed", SETTLE, || {
+        handle.status().may_serve && donor.builds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
+    assert!(sender.current_identity().is_none());
+    handle.cancel().unwrap();
+}
+
+#[tokio::test]
+async fn required_participation_keeps_local_origin_and_declines_claim_only_donor() {
+    let admission = admission();
+    let claims = Arc::new(Claims::default());
+    let donor = Arc::new(OriginDonor::default());
+    let mut config = bootstrap_config();
+    config.require_participation = true;
+    config.max_claim_metadata_bytes = 512;
+    let (driver, sender) = BootstrapSession::new(
+        BootstrapCapabilities {
+            claims: Arc::clone(&claims),
+            donor: Arc::clone(&donor),
+            admission,
+        },
+        config,
+        BootstrapScope {
+            domain: "o".into(),
+            partition: "b".into(),
+        },
+        NodeId::from("me"),
+        BootId(7),
+        1,
+    )
+    .unwrap();
+    let reads = Arc::new(ReadAdapter::default());
+    let handle = RecoveryHandle::open_with_bootstrap(
+        Arc::clone(&reads),
+        RecoveryConfig {
+            max_members: 2,
+            max_member_bytes: 8,
+            max_barrier_rounds: 2,
+            total_ms: 1_000,
+            attempt_ms: 500,
+            settle_ms: 5,
+            poll_ms: 5,
+        },
+        RecoveryMode::Unleased,
+        NodeId::from("me"),
+        9,
+        Box::new(driver),
+    )
+    .unwrap();
+    eventually_within(
+        "local scan can affirm without a donor advertisement",
+        SETTLE,
+        || handle.status().may_serve && donor.builds.load(Ordering::SeqCst) == 1,
+    )
+    .await;
+    eventually_within(
+        "claim-only donor retires but participation remains",
+        SETTLE,
+        || {
+            claims.local.lock().unwrap().is_none()
+                && claims.presence.lock().unwrap().is_some()
+                && sender.current_identity().is_none()
+                && donor.ingress.lock().unwrap().is_none()
+        },
+    )
+    .await;
+    assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
+    handle.cancel().unwrap();
+    eventually_within("cancel withdraws the exact participation", SETTLE, || {
+        claims.presence.lock().unwrap().is_none()
+    })
     .await;
 }
 
@@ -557,7 +686,7 @@ fn follower_setup_with_config(
         }),
         ..Claims::default()
     });
-    let donor = Arc::new(PeerDonor::new(peer.clone(), follower_identity()));
+    let donor = Arc::new(PeerDonor::new(&peer, &follower_identity()));
     donor.pause_install.store(paused, Ordering::SeqCst);
     let admission = admission();
     let (driver, _sender) = BootstrapSession::new(
@@ -598,6 +727,27 @@ fn follower_setup_with_config(
     )
     .unwrap();
     (donor, admission, handle, reads)
+}
+
+#[tokio::test]
+async fn complete_presence_enables_canonical_peer_transfer() {
+    let mut config = bootstrap_config();
+    config.require_participation = true;
+    config.max_claim_metadata_bytes = 512;
+    let (donor, admission, handle, reads) = follower_setup_with_config(false, config);
+    eventually_within(
+        "peer transfer and fresh head barrier use the same participant roster",
+        SETTLE,
+        || handle.status().may_serve && donor.installed.load(Ordering::SeqCst) == 1,
+    )
+    .await;
+    assert_eq!(*donor.live.lock().unwrap(), Some(vec![42]));
+    assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
+    handle.cancel().unwrap();
+    eventually_within("canonical transfer releases admission", SETTLE, || {
+        admission.usage().0 == 0
+    })
+    .await;
 }
 
 #[tokio::test]
