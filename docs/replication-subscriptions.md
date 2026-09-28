@@ -54,6 +54,23 @@ names its proof kind and exact scope/history.
    allowed before the matching `SinkEpochBound` receipt. A crash between
    source registration and sink binding retries/readbacks the **same**
    source epoch and cannot invent a fresh cursor.
+   Each accepted registration also carries a durable, source-certified
+   **per-subscriber fence ordinal**. The source strictly increments it across
+   incarnation replacement, terminal reset, and source-history replacement;
+   exhaustion is terminal and an old ordinal is never reused.
+   Loss, rollback, or recreation of that ordinal ledger is authority loss,
+   never permission to restart ordinals; a source cannot advertise
+   `EventComplete` unless this persistent fence history survives native-log
+   history replacement. The sink's
+   `BindSinkEpoch` transaction atomically stores that ordinal with its epoch
+   and recovered application cursor. An exact retry of the same
+   ordinal/epoch/request is a no-op or readback that cannot lower the sink
+   cursor. It accepts a greater ordinal only with the certified
+   registration and an explicit old-lineage reconciliation or reset, and
+   rejects every lower ordinal. A delayed old bind therefore cannot replace
+   a newer fence even if it began before the newer incarnation registered.
+   Binding a new history creates an explicit new sink lineage; it never
+   relabels effects from the old history as materialized in the new one.
    A source may use its existing CAS checkpoint/retention machinery; Groupnet
    does not write a second copy of every event.
 2. The session checks the source tail independently of gossip and requests
@@ -183,9 +200,10 @@ retains bounded cursor/proof/identity metadata only; native records and
 transactions stay with the worker. Separate source/application capability
 traits preserve the existing replay-only adapters:
 
-`RegisterReceipt` binds the key, new source epoch, protected native cursor,
-policy fingerprint, and exact register request. `FencedCheckpoint` binds that
-same epoch to the recovered application cursor. The core accepts
+`RegisterReceipt` binds the key, new source epoch, monotonic fence ordinal,
+protected native cursor, policy fingerprint, and exact register request.
+`FencedCheckpoint` binds that same epoch and ordinal to the recovered
+application cursor. The core accepts
 `SinkEpochBound` only for its outstanding `BindSinkEpoch` operation and that
 exact registration; all later apply receipts bind the same epoch and expected
 previous cursor.
@@ -256,6 +274,9 @@ Delay an old-incarnation sink transaction through takeover: after the new
 worker fences its registered epoch and applies a later record, the old
 transaction must fail the shared epoch/previous-cursor condition and cannot
 overwrite the newer effects.
+Delay an old incarnation's **bind** across the new bind and apply as well:
+its lower source-certified fence ordinal must be rejected without replacing
+the new epoch or its recovered cursor.
 Crash between source registration and `BindSinkEpoch`, then retry/read back
 the same registered epoch; no delivery occurs before sink binding. Recover a
 sink cursor ahead of the source ack after an unknown response and prove
