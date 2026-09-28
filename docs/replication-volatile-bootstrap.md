@@ -1,7 +1,7 @@
 # Peer bootstrap for a volatile application index
 
-Status: **claim/takeover sans-IO core implemented; runtime, donor capture,
-transfer, and consumer integration pending**. This extends the
+Status: **claim/takeover and bounded donor-journal sans-IO cores implemented;
+runtime image capture, transfer, and consumer integration pending**. This extends the
 [volatile recovery contract](replication-volatile-coherence.md). It is a
 state-sync optimization for an application whose initial state can be built
 from an origin and then updated by bounded peer feeds. It adds no durable
@@ -98,6 +98,16 @@ has a fresh correlated token and must be acknowledged before Groupnet may
 issue barrier `B`. Each returned batch has separately reserved in-flight
 bytes/events and one exact ack token; releasing a follower or acknowledging
 one batch never truncates the candidate's shared suffix in this first slice.
+The pure core's copyable charge is only logical accounting; the runtime must
+also hold and retire a real global memory permit until old image/batch buffers
+are dropped. Expiry alone cannot reclaim bytes still held by an asynchronous
+transfer. Replaying an unchanged native event records an explicit bounded
+no-op so the covered writer sequence still advances. The adapter decides
+same-ID idempotence under the index lock before changing live state; a second
+effect with the same ID and different bytes invalidates the candidate. An
+`append` invocation means an actual index publication occurred: a mismatched
+recovery generation invalidates that capture, while a stale callback blocked
+before publication never enters the journal.
 
 The donor must abort a candidate when its own feed gaps, lease lapses, index
 rebuilds, or observed membership continuity changes invalidate its existing
@@ -105,8 +115,8 @@ volatile index permission. A newly observed writer cannot be silently erased
 from the candidate. Gossip cannot prove that no writer joined unseen; the
 follower's independent current roster/lease and frontier affirmation remains
 mandatory, and this transfer makes no stronger freshness claim than the
-donor's existing volatile index contract. Until the local journal and
-transfer protocol exist, every node continues its guarded origin scan.
+donor's existing volatile index contract. Until runtime transfer and consumer
+integration exist, every node continues its guarded origin scan.
 
 The donor sends bounded metadata and sequential chunks over a peer data
 plane. Chunks carry sequence, length, an adapter-verified integrity check,

@@ -3,6 +3,8 @@
 //! Claims coordinate origin work but never authorize serving. Image capture,
 //! transfer, replay, and the final read gate belong to later slices.
 
+pub mod journal;
+
 mod engine;
 mod types;
 
