@@ -1,0 +1,608 @@
+//! Bounded Tokio driver around the sans-IO replication session.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use groupnet_core::replication::{
+    Comparison, Cursor, Mode, ReadDecision as CoreReadDecision, Refusal, Scope, SessionEngine,
+    SourceProof, Stage, State,
+};
+use groupnet_runtime::Group;
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+
+use super::api::{ApplicationAdapter, CatchUp, FailureClass, Limits, ReadVerdict, SourceAdapter};
+use super::fence::OperationFence;
+
+fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
+    value.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Failure to register a local state-sync scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenError {
+    /// Configuration is zero or exceeds the global reserve.
+    InvalidConfig,
+    /// Scope belongs to another Groupnet group.
+    WrongGroup,
+    /// A session for the scope already exists.
+    AlreadyOpen,
+    /// A session incarnation is already active in this manager.
+    DuplicateSession,
+    /// The configured local scope registry is full.
+    Backpressured,
+    /// No Tokio executor is running.
+    NoRuntime,
+}
+
+/// Typed progress visible to readers and observers.
+#[derive(Clone, Debug)]
+pub struct SessionStatus<P> {
+    /// Current recovery stage.
+    pub stage: Stage,
+    /// Latest application-visible native position.
+    pub materialized: Option<P>,
+    /// Latest durably recoverable native position.
+    pub checkpoint: Option<P>,
+    /// Last checked source head.
+    pub source_head: Option<P>,
+    /// Terminal source/application error, if any.
+    pub failure: Option<FailureClass>,
+}
+
+#[derive(Clone, Debug)]
+struct Published {
+    state: State,
+    decision: CoreReadDecision,
+    proof: Option<SourceProof>,
+    tail_checked_at: Option<Instant>,
+    failure: Option<FailureClass>,
+}
+
+enum Command {
+    Floor(Cursor, oneshot::Sender<bool>),
+    Authority(bool),
+    Cancel(oneshot::Sender<Option<FailureClass>>),
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Floor(cursor, _) => f.debug_tuple("Floor").field(cursor).finish(),
+            Self::Authority(allowed) => f.debug_tuple("Authority").field(allowed).finish(),
+            Self::Cancel(_) => f.write_str("Cancel(..)"),
+        }
+    }
+}
+
+struct SessionShared {
+    scope: Scope,
+    session_id: NonZeroU64,
+    commands: mpsc::Sender<Command>,
+    hints: Notify,
+    hinted: AtomicBool,
+    published: watch::Receiver<Published>,
+    signals: watch::Sender<()>,
+    local_gate: AtomicBool,
+    external_authority: AtomicBool,
+    authority_revalidation: AtomicBool,
+    authority_epoch: AtomicU64,
+    cancelled: AtomicBool,
+    alive: AtomicBool,
+    fence: OperationFence,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl fmt::Debug for SessionShared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionShared")
+            .field("scope", &self.scope)
+            .field("alive", &self.alive.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+struct Manager<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    group: Group,
+    source: Arc<S>,
+    app: Arc<A>,
+    limits: Limits,
+    sessions: Mutex<HashMap<Scope, Arc<SessionShared>>>,
+    operations: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+    checkpoint_bytes: Arc<Semaphore>,
+}
+
+impl<S, A> fmt::Debug for Manager<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Manager")
+            .field("group", &self.group.id())
+            .field("limits", &self.limits)
+            .field("sessions", &lock(&self.sessions).len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Registry of bounded source-backed state-sync sessions for one group.
+pub struct Replication<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    inner: Arc<Manager<S, A>>,
+}
+
+impl<S, A> fmt::Debug for Replication<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Replication").field(&self.inner).finish()
+    }
+}
+
+impl<S, A> Replication<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    /// Builds a bounded manager. It starts no source work until [`Self::open`].
+    ///
+    /// # Errors
+    /// Returns [`OpenError::InvalidConfig`] for zero or inconsistent limits.
+    pub fn new(group: Group, source: S, app: A, limits: Limits) -> Result<Self, OpenError> {
+        let limits = limits.validate().map_err(|_| OpenError::InvalidConfig)?;
+        Ok(Self {
+            inner: Arc::new(Manager {
+                group,
+                source: Arc::new(source),
+                app: Arc::new(app),
+                limits,
+                sessions: Mutex::new(HashMap::new()),
+                operations: Arc::new(Semaphore::new(limits.max_parallel_ops)),
+                bytes: Arc::new(Semaphore::new(limits.max_inflight_bytes)),
+                checkpoint_bytes: Arc::new(Semaphore::new(limits.max_checkpoint_inflight_bytes)),
+            }),
+        })
+    }
+
+    /// Registers one state-sync scope. `session_id` must be unique for this
+    /// scope across restarts while any old reply may arrive. The caller should
+    /// allocate it from a durable incarnation or another collision-proof
+    /// source; a process-local atomic counter alone is insufficient.
+    ///
+    /// # Errors
+    /// Returns an admission error for a wrong group, duplicate session/scope,
+    /// full registry, or missing Tokio executor.
+    pub fn open(
+        &self,
+        scope: Scope,
+        session_id: NonZeroU64,
+    ) -> Result<SessionHandle<S, A>, OpenError> {
+        if scope.stream.group != self.inner.group.id().as_str() {
+            return Err(OpenError::WrongGroup);
+        }
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| OpenError::NoRuntime)?;
+        let mut registry = lock(&self.inner.sessions);
+        if registry.contains_key(&scope) {
+            return Err(OpenError::AlreadyOpen);
+        }
+        if registry.len() >= self.inner.limits.max_scopes {
+            return Err(OpenError::Backpressured);
+        }
+        if registry
+            .values()
+            .any(|session| session.session_id == session_id)
+        {
+            return Err(OpenError::DuplicateSession);
+        }
+        let engine = SessionEngine::new(
+            scope.clone(),
+            Mode::StateSync,
+            self.inner.limits.core,
+            session_id.get(),
+        )
+        .map_err(|_| OpenError::InvalidConfig)?;
+        let (commands, receiver) = mpsc::channel(self.inner.limits.queue_depth);
+        let initial = Published {
+            state: engine.state().clone(),
+            decision: CoreReadDecision::Refuse(Refusal::Unready),
+            proof: None,
+            tail_checked_at: None,
+            failure: None,
+        };
+        let (updates, published) = watch::channel(initial);
+        let (signals, _) = watch::channel(());
+        let shared = Arc::new(SessionShared {
+            scope: scope.clone(),
+            session_id,
+            commands,
+            hints: Notify::new(),
+            hinted: AtomicBool::new(false),
+            published,
+            signals,
+            local_gate: AtomicBool::new(false),
+            external_authority: AtomicBool::new(false),
+            authority_revalidation: AtomicBool::new(true),
+            authority_epoch: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+            fence: OperationFence::default(),
+            task: Mutex::new(None),
+        });
+        let handle = SessionHandle {
+            source: Arc::clone(&self.inner.source),
+            app: Arc::clone(&self.inner.app),
+            shared: Arc::clone(&shared),
+            tail_interval: Duration::from_millis(self.inner.limits.core.tail_check_ms),
+        };
+        registry.insert(scope, Arc::clone(&shared));
+        let manager = Arc::clone(&self.inner);
+        let task_shared = Arc::clone(&shared);
+        let task = runtime.spawn(async move {
+            worker(manager, task_shared, engine, receiver, updates).await;
+        });
+        *lock(&shared.task) = Some(task);
+        Ok(handle)
+    }
+
+    /// Removes one scope and immediately closes its local read gate.
+    pub fn close(&self, scope: &Scope) {
+        if let Some(shared) = lock(&self.inner.sessions).remove(scope) {
+            shared.local_gate.store(false, Ordering::Release);
+            shared.cancelled.store(true, Ordering::Release);
+            shared.alive.store(false, Ordering::Release);
+            shared.fence.retire();
+            shared.signals.send_replace(());
+            if let Some(task) = lock(&shared.task).take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+impl<S, A> Drop for Replication<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    fn drop(&mut self) {
+        for (_, shared) in lock(&self.inner.sessions).drain() {
+            shared.local_gate.store(false, Ordering::Release);
+            shared.cancelled.store(true, Ordering::Release);
+            shared.alive.store(false, Ordering::Release);
+            shared.fence.retire();
+            shared.signals.send_replace(());
+            if let Some(task) = lock(&shared.task).take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+/// Handle for one native-position state-sync session.
+pub struct SessionHandle<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    source: Arc<S>,
+    app: Arc<A>,
+    shared: Arc<SessionShared>,
+    tail_interval: Duration,
+}
+
+impl<S, A> Clone for SessionHandle<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            source: Arc::clone(&self.source),
+            app: Arc::clone(&self.app),
+            shared: Arc::clone(&self.shared),
+            tail_interval: self.tail_interval,
+        }
+    }
+}
+
+impl<S, A> fmt::Debug for SessionHandle<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionHandle")
+            .field("scope", &self.shared.scope)
+            .field("alive", &self.shared.alive.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, A> SessionHandle<S, A>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    /// Coalesces a best-effort feed hint into one source-tail wakeup.
+    pub fn hint(&self) {
+        self.shared.hinted.store(true, Ordering::Release);
+        self.shared.hints.notify_one();
+    }
+
+    /// Updates mode/lease authority. Revocation closes the local gate before
+    /// the worker's next async operation or source response.
+    ///
+    /// # Errors
+    /// Returns cancellation, backpressure, or terminal epoch exhaustion.
+    pub fn set_authority(&self, allowed: bool) -> Result<(), CatchUp<S::Position>> {
+        if self.shared.cancelled.load(Ordering::Acquire) {
+            return Err(CatchUp::Cancelled);
+        }
+        self.shared
+            .external_authority
+            .store(allowed, Ordering::Release);
+        if !allowed {
+            self.shared
+                .authority_revalidation
+                .store(true, Ordering::Release);
+            self.shared.local_gate.store(false, Ordering::Release);
+            self.shared.fence.invalidate();
+            if self
+                .shared
+                .authority_epoch
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                    epoch.checked_add(1)
+                })
+                .is_err()
+            {
+                self.shared.cancelled.store(true, Ordering::Release);
+                self.shared.signals.send_replace(());
+                return Err(CatchUp::Failed(FailureClass::Terminal));
+            }
+        }
+        self.shared.signals.send_replace(());
+        self.shared
+            .commands
+            .try_send(Command::Authority(allowed))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Closed(_) => CatchUp::Cancelled,
+                mpsc::error::TrySendError::Full(_) => CatchUp::Backpressured,
+            })
+    }
+
+    /// Current typed positions and stage, independent of whether a local read
+    /// is presently permitted.
+    ///
+    /// # Errors
+    /// Returns an adapter failure if a published cursor cannot be decoded.
+    pub fn status(&self) -> Result<SessionStatus<S::Position>, CatchUp<S::Position>> {
+        let published = self.shared.published.borrow().clone();
+        let decode = |cursor: Option<Cursor>| -> Result<Option<S::Position>, CatchUp<S::Position>> {
+            cursor
+                .map(|c| {
+                    self.source
+                        .position(&c)
+                        .map_err(|error| CatchUp::Failed(error.class()))
+                })
+                .transpose()
+        };
+        Ok(SessionStatus {
+            stage: published.state.stage,
+            materialized: decode(published.state.materialized)?,
+            checkpoint: decode(published.state.checkpoint)?,
+            source_head: decode(published.state.head)?,
+            failure: published.failure,
+        })
+    }
+
+    /// Checks the immediate local gate, a native floor, current authority, and
+    /// the application's final domain read predicate. The wall-time expiry is
+    /// checked here even if the worker is blocked or has stopped.
+    #[must_use]
+    pub fn read_decision(
+        &self,
+        floor: Option<&S::Position>,
+        authority_now: bool,
+    ) -> ReadVerdict<S::Position> {
+        if !self.shared.alive.load(Ordering::Acquire)
+            || self.shared.cancelled.load(Ordering::Acquire)
+            || !self.shared.local_gate.load(Ordering::Acquire)
+            || !self.shared.external_authority.load(Ordering::Acquire)
+            || self.shared.authority_revalidation.load(Ordering::Acquire)
+            || !authority_now
+        {
+            return ReadVerdict::Fallback(Refusal::Authority);
+        }
+        let published = self.shared.published.borrow().clone();
+        let Some(checked_at) = published.tail_checked_at else {
+            return ReadVerdict::Fallback(Refusal::TailCheckDue);
+        };
+        if checked_at.elapsed() >= self.tail_interval {
+            return ReadVerdict::Fallback(Refusal::TailCheckDue);
+        }
+        let through = match published.decision {
+            CoreReadDecision::Serve(through) => through,
+            CoreReadDecision::Refuse(reason) => return ReadVerdict::Fallback(reason),
+        };
+        let Some(proof) = published.proof else {
+            return ReadVerdict::Fallback(Refusal::Authority);
+        };
+        if let Some(floor) = floor {
+            let Ok(target) = self.source.cursor(&self.shared.scope, floor) else {
+                return ReadVerdict::Fallback(Refusal::Floor);
+            };
+            let Ok(comparison) = self.source.compare(&through, &target, &proof) else {
+                return ReadVerdict::Fallback(Refusal::Floor);
+            };
+            if !matches!(
+                comparison.for_operands(&through, &target, &proof.id),
+                Some(Comparison::Equal | Comparison::After)
+            ) {
+                return ReadVerdict::Fallback(Refusal::Floor);
+            }
+        }
+        let Ok(position) = self.source.position(&through) else {
+            return ReadVerdict::Fallback(Refusal::Unready);
+        };
+        if !self.app.may_serve(&self.shared.scope, &position) {
+            return ReadVerdict::Fallback(Refusal::Unready);
+        }
+        ReadVerdict::Serve(position)
+    }
+
+    /// Waits for a native source floor with a caller deadline. Timeout reports
+    /// incomplete catch-up and never rolls back an external source commit.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the waiter checks the complete published evidence and all terminal outcomes in one loop"
+    )]
+    pub async fn catch_up(&self, floor: S::Position, deadline: Instant) -> CatchUp<S::Position> {
+        if Instant::now() >= deadline {
+            return CatchUp::TimedOut;
+        }
+        let cursor = match self.source.cursor(&self.shared.scope, &floor) {
+            Ok(cursor) => cursor,
+            Err(error) => return CatchUp::Failed(error.class()),
+        };
+        if self.shared.cancelled.load(Ordering::Acquire) {
+            return CatchUp::Cancelled;
+        }
+        let (admitted, reply) = oneshot::channel();
+        if self
+            .shared
+            .commands
+            .try_send(Command::Floor(cursor.clone(), admitted))
+            .is_err()
+        {
+            return if self.shared.alive.load(Ordering::Acquire) {
+                CatchUp::Backpressured
+            } else {
+                CatchUp::Cancelled
+            };
+        }
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), reply).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return CatchUp::Backpressured,
+            Ok(Err(_)) => return CatchUp::Cancelled,
+            Err(_) => return CatchUp::TimedOut,
+        }
+        let mut updates = self.shared.published.clone();
+        let mut signals = self.shared.signals.subscribe();
+        loop {
+            if !self.shared.alive.load(Ordering::Acquire) {
+                return CatchUp::Cancelled;
+            }
+            if self.shared.cancelled.load(Ordering::Acquire) {
+                return CatchUp::Cancelled;
+            }
+            if !self.shared.external_authority.load(Ordering::Acquire) {
+                return CatchUp::AuthorityLost;
+            }
+            let published = updates.borrow_and_update().clone();
+            if let Some(failure) = published.failure {
+                return match failure {
+                    FailureClass::AuthorityLost => CatchUp::AuthorityLost,
+                    other => CatchUp::Failed(other),
+                };
+            }
+            match published.state.stage {
+                Stage::NeedsSnapshot => return CatchUp::NeedsSnapshot,
+                Stage::Cancelled => return CatchUp::Cancelled,
+                Stage::RetryExhausted | Stage::IrrecoverableGap => {
+                    return CatchUp::Failed(FailureClass::Terminal);
+                }
+                _ => {}
+            }
+            if let (Some(materialized), Some(proof)) = (
+                published.state.materialized.as_ref(),
+                published.proof.as_ref(),
+            ) {
+                if materialized.scope != cursor.scope || materialized.history != cursor.history {
+                    return CatchUp::InvalidFloor;
+                }
+                if let Ok(comparison) = self.source.compare(materialized, &cursor, proof) {
+                    if matches!(
+                        comparison.for_operands(materialized, &cursor, &proof.id),
+                        Some(Comparison::After | Comparison::Equal)
+                    ) && matches!(published.decision, CoreReadDecision::Serve(_))
+                        && self.shared.local_gate.load(Ordering::Acquire)
+                        && self.shared.external_authority.load(Ordering::Acquire)
+                        && !self.shared.authority_revalidation.load(Ordering::Acquire)
+                        && published
+                            .tail_checked_at
+                            .is_some_and(|at| at.elapsed() < self.tail_interval)
+                        && !self.shared.cancelled.load(Ordering::Acquire)
+                    {
+                        return match self.source.position(materialized) {
+                            Ok(position) if self.app.may_serve(&self.shared.scope, &position) => {
+                                CatchUp::Ready(position)
+                            }
+                            Ok(_) => CatchUp::ReadPolicyBlocked,
+                            Err(error) => CatchUp::Failed(error.class()),
+                        };
+                    }
+                }
+            }
+            let until = tokio::time::Instant::from_std(deadline);
+            let changed = tokio::time::timeout_at(until, async {
+                tokio::select! {
+                    result = updates.changed() => result,
+                    result = signals.changed() => result,
+                }
+            })
+            .await;
+            if changed.is_err() {
+                return CatchUp::TimedOut;
+            }
+            if matches!(changed, Ok(Err(_))) {
+                return CatchUp::Cancelled;
+            }
+            signals.borrow_and_update();
+        }
+    }
+
+    /// Closes the shell gate and operation fence immediately, then asks the
+    /// worker to revoke application serving. A stalled worker cannot leave a
+    /// caller waiting past `deadline`.
+    pub async fn cancel(&self, deadline: Instant) -> CatchUp<S::Position> {
+        self.shared.local_gate.store(false, Ordering::Release);
+        self.shared.cancelled.store(true, Ordering::Release);
+        self.shared.fence.invalidate();
+        self.shared.signals.send_replace(());
+        let (reply, received) = oneshot::channel();
+        if self
+            .shared
+            .commands
+            .try_send(Command::Cancel(reply))
+            .is_err()
+        {
+            return CatchUp::Cancelled;
+        }
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), received).await {
+            Ok(Ok(None)) => CatchUp::Cancelled,
+            Ok(Ok(Some(FailureClass::AuthorityLost))) => CatchUp::AuthorityLost,
+            Ok(Ok(Some(class))) => CatchUp::Failed(class),
+            _ => CatchUp::TimedOut,
+        }
+    }
+}
+
+// The worker and effect driver follow in `driver.rs` to keep the public handle
+// and the event loop independently reviewable.
+mod driver;
+use driver::worker;

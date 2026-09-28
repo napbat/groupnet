@@ -63,6 +63,9 @@ consistency-handoff = [
     "groupnet-consistency/handoff",
     "groupnet-transport-mem?/bulk",
 ]
+# Resumable source-backed replay and native-position read floors. Snapshot and
+# event-complete subscriptions are separate later capabilities.
+consistency-replication = ["consistency", "groupnet-consistency/replication"]
 sim = ["dep:groupnet-sim"]
 
 [dependencies]

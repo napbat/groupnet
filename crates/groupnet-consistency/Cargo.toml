@@ -73,6 +73,10 @@ handoff = [
     "dep:futures-util",
 ]
 
+# Source-backed, replay-only state sync. The core decides recovery; this thin
+# shell supplies monotonic timers, bounded tasks, and source/application I/O.
+replication = ["tokio/rt", "tokio/time", "tokio/macros"]
+
 # Built on the runtime's Group handle; the protocol work stays in the engine.
 # tokio is only the sync toolbox (watch channels) — no executor requirement
 # beyond what the runtime already has.

@@ -45,12 +45,13 @@ impl BoundComparison {
     }
 }
 
-/// Verified source head and replay retention boundary.
+/// Verified committed source cut and replay retention boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceProof {
     /// Unique source-proof identity.
     pub id: ProofId,
-    /// Inclusive source head at the checked barrier.
+    /// Inclusive committed cut at the checked barrier. This may be a bounded
+    /// progressing cut; it is not proof that no later write exists.
     pub head: Cursor,
     /// Oldest cursor from which the source can replay a continuous suffix.
     pub retained_from: Cursor,

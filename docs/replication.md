@@ -155,6 +155,17 @@ The ordered recovery protocol is:
    barrier independently of feed gossip. If a continuous retained interval
    starts after the checkpoint, replay under byte/event/time bounds. Otherwise
    choose a verified source snapshot or an authoritative source rebuild.
+
+The initial replay core owns checkpoint bootstrap correlation as well: it
+issues distinct load and guarded-install operations from the same session
+token allocator used by tail, scan, and apply. A private state/cursor load is
+never published until a durable exact-cursor install receipt arrives for that
+install operation. A missing checkpoint still checks the source before
+entering snapshot recovery. Transient load/install failures retry within the
+session budget; cancellation and expiry reject late responses. Runtime workers
+must check the core's live operation and next logical deadline before acting
+on queued effects, rather than inventing a bootstrap token or retaining old
+timer entries. A revocation acknowledgement has separate correlation.
 2. Before snapshot cut `C0`, acquire retained replay or live capture with a
    lease/hold that guarantees every committed record after `C0` until attach.
    If the source cannot protect this interval, abort and retry from a newer
@@ -296,20 +307,26 @@ valid source reads may continue while local recovery is unready.
 
 ## 6. Scheduling and capacity
 
-Budgets are configured per stream and enforced in both the sans-IO scheduler
-and I/O shell. Initial defaults are: 8 MiB or 4096 events of retained replay
-per active scope; 1 GiB per snapshot offer; 256 KiB per chunk; 4 MiB in-flight
-per session; four in-flight batches per scope; 16 active scopes and four bulk
-snapshot transfers per node; 30 seconds per transfer attempt; a 5-second
-active-stream tail check with deterministic jitter, backed off to 60 seconds
-for an idle registered stream; and three retries with bounded exponential
-backoff before a `Retryable` stalled result. The per-node retained-history
-byte and age limits are separately configured by the source, since a source
-may already own that storage. Builders validate nonzero limits and require
-the source's hold duration to exceed the transfer attempt plus a renewal
-margin. These are starting operational limits, not promised throughput or
-recovery latency; consumer load results may change the defaults. There is no
-unbounded queue, transfer, retry loop, or required-ack wait.
+The replay implementation enforces 8 MiB or 4096 events per batch, one
+in-flight operation per scope, 1024 registered scopes, 16 concurrent adapter
+operations, and a 32 MiB global native-batch reserve. Checkpoint recovery has
+a separate 64 MiB per-candidate limit and 256 MiB global reserve held through
+installation. Adapters must account for retained native state, including fork
+heap allocations; encoded replay bytes alone do not bound a domain's full
+replica memory. Domain memory admission remains necessary. Queues hold at most
+32 commands per scope. An operation has a 30-second deadline including capacity
+waits; three retries use a one-second delay. Replay-only tail checks currently
+run every five seconds for each registered scope. These are configurable
+starting limits, not measured throughput or latency guarantees.
+
+Snapshot defaults planned for the next slice are a 1 GiB offer, 256 KiB chunks,
+and four concurrent bulk transfers, with separately reserved live catch-up
+capacity. Idle backoff to 60 seconds, deterministic jitter, and sparse active
+scope scheduling remain required scalability work; the current runtime does
+not implement them. Source-owned retained-history byte and age limits remain
+separate. Snapshot builders must validate nonzero limits and require the source
+hold to cover the complete attempt, including capacity waits and cutover.
+There is no unbounded queue, transfer, retry loop, or required-ack wait.
 History has byte, event, and age caps. Snapshot offers and chunks have encoded
 byte caps and an integrity algorithm/version. A session has maximum in-flight
 bytes, batches, elapsed time, and retry attempts before reporting a typed
@@ -502,8 +519,25 @@ multiple scopes through missed hints, delayed and duplicate replies,
 partitions, and restart. The existing membership simulator and wire frames are
 unchanged.
 
-This slice is the sans-IO replay foundation. The async subscription manager,
-snapshot protocol, durable event-complete retention, named acknowledgements,
-and consumer migration remain in the build order above. Selecting the core's
-`EventComplete` gap policy does not itself establish a durable subscription or
-protect source history from retirement.
+The `groupnet-consistency` `replication` feature now supplies the replay-only
+async manager; the facade exposes it with `consistency-replication`. Typed
+source and application adapters keep native positions and batches outside the
+core. Core-issued load and install operations restore an atomic checkpoint
+before replay. The manager bounds registration, commands, operation admission,
+replay bytes, and private checkpoint bytes. Coalesced hints and an independent
+source check discover commits without a notification or later write.
+
+Install and revocation permits fence synchronous publication against session
+closure, supersession, and operation deadlines. An external asynchronous store
+must enforce the same fence inside its state/cursor transaction; a callback
+receipt alone cannot make that transaction safe. Read verdicts additionally
+check current mode authority, source-check age, the requested floor, and the
+application's independent domain predicate.
+
+Runtime tests cover missed hints, floor waits, stale source checks, authority
+loss, cancellation, late detached installs, checkpoint restore, and bounded
+resource release. Snapshot recovery, durable event-complete retention, named
+acknowledgements, scalable idle scheduling, and consumer migration remain in
+the build order above. Selecting the core's `EventComplete` gap policy does not
+itself establish a durable subscription or protect source history from
+retirement.

@@ -20,6 +20,28 @@ pub struct Scope {
     pub partition: String,
 }
 
+impl Scope {
+    /// Checks every scope name before a session retains or emits it.
+    ///
+    /// # Errors
+    /// Returns an identity error for empty or oversized names.
+    pub fn validate(&self, max_bytes: usize) -> Result<(), IdentityError> {
+        let names = [
+            &self.stream.group,
+            &self.stream.topic,
+            &self.stream.kind,
+            &self.partition,
+        ];
+        if names.iter().any(|name| name.is_empty()) {
+            return Err(IdentityError::Empty);
+        }
+        if names.iter().any(|name| name.len() > max_bytes) {
+            return Err(IdentityError::TooLarge);
+        }
+        Ok(())
+    }
+}
+
 /// Authoritative source identity and durable history generation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SourceHistory {
@@ -62,17 +84,11 @@ impl Cursor {
         if self.scope != *scope {
             return Err(IdentityError::WrongScope);
         }
-        let names = [
-            &self.scope.stream.group,
-            &self.scope.stream.topic,
-            &self.scope.stream.kind,
-            &self.scope.partition,
-            &self.history.source,
-        ];
-        if names.iter().any(|name| name.is_empty()) || self.position.is_empty() {
+        self.scope.validate(max_bytes)?;
+        if self.history.source.is_empty() || self.position.is_empty() {
             return Err(IdentityError::Empty);
         }
-        if names.iter().any(|name| name.len() > max_bytes) || self.position.len() > max_bytes {
+        if self.history.source.len() > max_bytes || self.position.len() > max_bytes {
             return Err(IdentityError::TooLarge);
         }
         Ok(())

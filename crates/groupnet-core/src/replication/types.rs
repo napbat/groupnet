@@ -51,6 +51,8 @@ impl Default for Config {
 pub enum ConfigError {
     /// A budget or cadence is zero.
     Zero,
+    /// Scope identity is empty or exceeds the configured encoding bound.
+    Identity(IdentityError),
 }
 
 impl Config {
@@ -89,6 +91,10 @@ pub struct Operation {
 pub enum Stage {
     /// No validated checkpoint or source barrier.
     Unready,
+    /// Loading a private atomic state/cursor checkpoint.
+    LoadingCheckpoint,
+    /// Installing the loaded checkpoint through a guarded operation.
+    InstallingCheckpoint,
     /// Waiting for an authoritative source tail.
     CheckingTail,
     /// Waiting for a retained source batch.
@@ -200,6 +206,24 @@ pub struct ApplyReceipt {
 /// Input supplied by a driver after its source/application adapter acts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Begin source-backed bootstrap through the shared operation allocator.
+    StartBootstrap,
+    /// Private checkpoint load completion; both fields are absent together.
+    CheckpointLoaded {
+        /// Exact load operation.
+        op: Operation,
+        /// Validated native cursor of a recoverable atomic checkpoint.
+        cursor: Option<Cursor>,
+        /// Driver-held native candidate, keyed by the load token.
+        payload_id: Option<u64>,
+    },
+    /// Guarded checkpoint install completion.
+    CheckpointInstalled {
+        /// Exact install operation, distinct from load.
+        op: Operation,
+        /// Durable application-visible cursor receipt.
+        receipt: ApplyReceipt,
+    },
     /// Restore an adapter-validated atomic state/cursor checkpoint.
     Resume {
         /// Adapter-validated durable state/cursor checkpoint.
@@ -261,6 +285,22 @@ pub enum Event {
 /// Driver work requested by the sans-IO session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// Load and validate a private atomic state/cursor checkpoint.
+    LoadCheckpoint {
+        /// Core-issued load operation.
+        op: Operation,
+        /// Source scope.
+        scope: Scope,
+    },
+    /// Install a private checkpoint under this distinct guarded operation.
+    InstallCheckpoint {
+        /// Core-issued install operation.
+        op: Operation,
+        /// Expected exact checkpoint cursor.
+        cursor: Cursor,
+        /// Driver-held native candidate identifier.
+        payload_id: u64,
+    },
     /// Read the source independently of gossip.
     CheckTail {
         /// Tail operation.

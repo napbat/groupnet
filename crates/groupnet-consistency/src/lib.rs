@@ -219,6 +219,8 @@ pub mod hosted;
 #[cfg(feature = "leases")]
 pub mod lease;
 mod peers;
+#[cfg(feature = "replication")]
+pub mod replication;
 mod token;
 mod wire;
 

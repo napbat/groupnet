@@ -136,16 +136,20 @@ cargo test -p groupnet --features consistency-handoff
 cargo clippy -p groupnet-consistency --all-targets --features leases -- -D warnings
 cargo clippy -p groupnet-consistency --all-targets --features hosted -- -D warnings
 cargo clippy -p groupnet-consistency --all-targets --features handoff -- -D warnings
+cargo test -p groupnet-consistency --features replication
+cargo test -p groupnet --features consistency-replication
+cargo clippy -p groupnet-consistency --all-targets --features replication -- -D warnings
+cargo clippy -p groupnet --all-targets --features consistency-replication -- -D warnings
 ```
 
-The last three are not redundant: no crate in the workspace turns `leases`,
-`hosted` or `handoff` on by default, so the workspace clippy above never sees
+The feature-specific Clippy runs are not redundant: no crate in the workspace turns `leases`,
+`hosted`, `handoff`, or `replication` on by default, so the workspace clippy above never sees
 those tiers' code, their tests, or their DST at all. `handoff` is not covered by
 the `hosted` runs either — it is the only consistency feature that pulls in the
 data plane, so it is the only one whose build graph differs from the rest.
 
 Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`) — the
-seventeenth command, and the only one that is not a correctness gate.
+optional performance command; it is not a correctness gate.
 
 ## Process
 

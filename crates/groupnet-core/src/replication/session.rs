@@ -1,5 +1,13 @@
 //! Replay-only, source-backed replica session decisions.
 
+mod bootstrap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryTarget {
+    Tail,
+    Bootstrap,
+}
+
 use super::types::{
     Batch, Config, ConfigError, Effect, Event, Mode, Operation, ReadDecision, Refusal, Reject,
     Stage, State, Step,
@@ -25,6 +33,8 @@ pub struct SessionEngine {
     pending_tail: bool,
     retries: u32,
     pending_batch: Option<Batch>,
+    bootstrap_candidate: Option<(Cursor, u64)>,
+    retry_target: RetryTarget,
     proof: Option<SourceProof>,
     mode_authority: bool,
     ready: bool,
@@ -37,7 +47,8 @@ impl SessionEngine {
     /// responses from an earlier incarnation can still arrive.
     ///
     /// # Errors
-    /// Returns [`ConfigError::Zero`] for zero budgets or session incarnation.
+    /// Returns [`ConfigError::Zero`] for zero budgets/session incarnation or
+    /// [`ConfigError::Identity`] for an invalid scope.
     pub fn new(
         scope: Scope,
         mode: Mode,
@@ -48,6 +59,9 @@ impl SessionEngine {
         if session_id == 0 {
             return Err(ConfigError::Zero);
         }
+        scope
+            .validate(config.max_cursor_bytes)
+            .map_err(ConfigError::Identity)?;
         Ok(Self {
             session_id,
             scope,
@@ -71,6 +85,8 @@ impl SessionEngine {
             pending_tail: false,
             retries: 0,
             pending_batch: None,
+            bootstrap_candidate: None,
+            retry_target: RetryTarget::Tail,
             proof: None,
             mode_authority: false,
             ready: false,
@@ -81,6 +97,44 @@ impl SessionEngine {
     #[must_use]
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Current source/application operation, excluding a separate revocation.
+    #[must_use]
+    pub fn current_operation(&self) -> Option<Operation> {
+        self.outstanding.map(|(op, _)| op)
+    }
+
+    /// Whether a queued effect or response still names the live operation.
+    /// Revocation has independent correlation and remains valid alongside a
+    /// newer source operation until cancelled or acknowledged.
+    #[must_use]
+    pub fn accepts_operation(&self, op: Operation) -> bool {
+        self.revoke_op == Some(op)
+            || (self.outstanding.is_some_and(|(current, _)| current == op)
+                && self.operation_due.is_some_and(|due| self.now < due))
+    }
+
+    /// Next live logical deadline, without retaining historical timer effects.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Time> {
+        if self.outstanding.is_some() {
+            self.operation_due
+        } else if self.state.stage == Stage::RetryWait {
+            self.retry_due
+        } else if self.proof.is_some()
+            && !matches!(
+                self.state.stage,
+                Stage::Cancelled
+                    | Stage::RetryExhausted
+                    | Stage::NeedsSnapshot
+                    | Stage::IrrecoverableGap
+            )
+        {
+            Some(self.tail_due)
+        } else {
+            None
+        }
     }
 
     /// Current read verdict; the caller still supplies domain-specific checks.
@@ -137,6 +191,7 @@ impl SessionEngine {
         self.outstanding == Some((op, stage))
             && op.session == self.session_id
             && op.generation == self.state.generation
+            && self.operation_due.is_some_and(|due| self.now < due)
     }
 
     fn close_gate(&mut self) -> Step {
@@ -266,6 +321,13 @@ impl SessionEngine {
     )]
     pub fn step(&mut self, event: Event) -> Step {
         match event {
+            Event::StartBootstrap => self.start_bootstrap(),
+            Event::CheckpointLoaded {
+                op,
+                cursor,
+                payload_id,
+            } => self.checkpoint_loaded(op, cursor, payload_id),
+            Event::CheckpointInstalled { op, receipt } => self.checkpoint_installed(op, receipt),
             Event::Resume { cursor } => {
                 if !matches!(
                     self.state.stage,
@@ -276,40 +338,7 @@ impl SessionEngine {
                 ) {
                     return Step::reject(Reject::Stage);
                 }
-                if let Err(e) = cursor.validate(&self.scope, self.config.max_cursor_bytes) {
-                    return Step::reject(Reject::Identity(e));
-                }
-                let closed = self.close_gate();
-                if closed.rejection.is_some() {
-                    return closed;
-                }
-                let mut effects = closed.effects;
-                let Some(next) = self.state.generation.checked_add(1) else {
-                    self.state.stage = Stage::Unready;
-                    return Step {
-                        effects,
-                        rejection: Some(Reject::Exhausted),
-                    };
-                };
-                self.state.generation = next;
-                self.state.materialized = Some(cursor.clone());
-                self.state.checkpoint = Some(cursor);
-                self.state.head = None;
-                self.state.target = None;
-                self.outstanding = None;
-                self.operation_due = None;
-                self.pending_batch = None;
-                self.proof = None;
-                self.retries = 0;
-                self.retry_due = None;
-                self.revoke_op = None;
-                self.pending_tail = false;
-                let check = self.check_tail();
-                effects.extend(check.effects);
-                Step {
-                    effects,
-                    rejection: check.rejection,
-                }
+                self.resume_state(cursor, true)
             }
             Event::Hint => {
                 if matches!(
@@ -393,7 +422,11 @@ impl SessionEngine {
                 if let Some(due) = self.retry_due {
                     if now >= due {
                         self.retry_due = None;
-                        return self.check_tail();
+                        return if self.retry_target == RetryTarget::Bootstrap {
+                            self.load_checkpoint()
+                        } else {
+                            self.check_tail()
+                        };
                     }
                     return Step::ok(Vec::new());
                 }
@@ -620,6 +653,15 @@ impl SessionEngine {
                 self.outstanding = None;
                 self.operation_due = None;
                 self.pending_batch = None;
+                self.bootstrap_candidate = None;
+                self.retry_target = if matches!(
+                    self.state.stage,
+                    Stage::LoadingCheckpoint | Stage::InstallingCheckpoint
+                ) {
+                    RetryTarget::Bootstrap
+                } else {
+                    RetryTarget::Tail
+                };
                 self.retries = self.retries.saturating_add(1);
                 if self.retries >= self.config.max_retries {
                     self.state.stage = Stage::RetryExhausted;
@@ -666,6 +708,8 @@ impl SessionEngine {
                 self.revoke_op = None;
                 self.pending_tail = false;
                 self.pending_batch = None;
+                self.bootstrap_candidate = None;
+                self.retry_target = RetryTarget::Tail;
                 self.proof = None;
                 self.retry_due = None;
                 self.close_gate()

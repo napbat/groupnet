@@ -20,4 +20,6 @@ pub use types::{
 };
 
 #[cfg(test)]
+mod bootstrap_tests;
+#[cfg(test)]
 mod tests;
