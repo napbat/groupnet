@@ -88,8 +88,25 @@ At image capture, the adapter holds the same index publication lock used by
 every page and feed mutation. It reserves the encoded image, decoded image,
 and live suffix budgets **before** cloning; captures state, cursor `C`, the
 bounded current writer cuts, and the exact member identities under that lock;
-and aborts if the private
-image exceeds the admission. The capture binds the exact bounded sorted
+and attaches a pre-reserved journal in `Capturing` state before releasing the
+lock. The bounded immutable state clone is charged and measured while the
+publication lock is held; large encoding runs on a blocking worker with the
+image and its permits owned by that job. Feed publications after `C` append
+to the same suffix during encoding, including native no-ops. The image's
+immutable native cuts at C remain separate from the journal's advancing
+barrier cuts; an offer must never label the C image with later B coverage.
+This cannot make
+the initial clone itself nonblocking, so the configured clone cap and measured
+lock latency must keep that critical section finite. No follower may reserve,
+attach, read a batch, or treat a claim as `Ready` while the journal is
+`Capturing`. The encoding job's cancellation does not release its permits
+until its actual buffers are dropped. On completion the application rechecks
+the exact ingress identity, recovery generation, original episode deadline,
+and journal validity under the publication lock, then calls `finish_capture`
+with actual encoded/decoded charges; the image's cut remains `C = 0` even if
+later suffix positions were already appended. Failure, cancellation, expiry,
+or overflow invalidates the candidate and cannot publish a partial image.
+The capture binds the exact bounded sorted
 member identities, rather than trusting a short membership hash; any changed
 identity invalidates the candidate. Groupnet tracks the reservation and candidate
 budgets, while the application adapter owns the concrete index bytes and

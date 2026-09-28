@@ -70,6 +70,97 @@ fn captured() -> (DonorJournal, JournalCursor) {
 }
 
 #[test]
+fn encoding_phase_records_suffix_from_c_but_cannot_serve_a_follower() {
+    let mut journal = DonorJournal::new(config(), capture_id()).unwrap();
+    journal
+        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .unwrap();
+    assert_eq!(journal.state(), JournalState::Capturing);
+    assert_eq!(journal.current_cursor(), None);
+    assert_eq!(journal.image_cuts()[0].sequence, 0);
+    let c = JournalCursor {
+        capture: capture_id(),
+        position: 0,
+    };
+    assert_eq!(
+        journal.reserve(Time(2), identity("peer", 2), &c),
+        Err(JournalError::Stage)
+    );
+
+    assert_eq!(
+        journal
+            .append(Time(2), 2, native(1), b"put".to_vec())
+            .unwrap()
+            .position,
+        1
+    );
+    assert_eq!(journal.image_cuts()[0].sequence, 0);
+    assert_eq!(journal.covered_cuts()[0].sequence, 1);
+    journal.observe_membership(Time(2), &members()).unwrap();
+    assert_eq!(
+        journal
+            .append(Time(3), 2, local("repair"), b"fix".to_vec())
+            .unwrap()
+            .position,
+        2
+    );
+    let finished = journal.finish_capture(Time(4), 20, 24).unwrap();
+    assert_eq!(finished, c, "the encoded image still represents C");
+    assert_eq!(journal.image_cuts()[0].sequence, 0);
+    assert_eq!(journal.covered_cuts()[0].sequence, 1);
+    assert_eq!(journal.current_cursor().unwrap().position, 2);
+    assert!(journal.reserve(Time(5), identity("peer", 2), &c).is_ok());
+}
+
+#[test]
+fn encoding_phase_overflow_or_cancel_cannot_finish_or_advertise() {
+    let mut overflow = DonorJournal::new(config(), capture_id()).unwrap();
+    overflow
+        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .unwrap();
+    assert_eq!(
+        overflow.append(
+            Time(2),
+            2,
+            local("x"),
+            vec![1; config().max_event_bytes + 1]
+        ),
+        Err(JournalError::Capacity)
+    );
+    assert_eq!(overflow.state(), JournalState::Invalidated);
+    assert_eq!(
+        overflow.finish_capture(Time(3), 20, 24),
+        Err(JournalError::Stage)
+    );
+    assert_eq!(overflow.current_cursor(), None);
+
+    let mut cancelled = DonorJournal::new(config(), capture_id()).unwrap();
+    cancelled
+        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .unwrap();
+    cancelled.invalidate(Invalidation::DonorLost);
+    assert_eq!(
+        cancelled.finish_capture(Time(2), 20, 24),
+        Err(JournalError::Stage)
+    );
+    assert_eq!(cancelled.current_cursor(), None);
+
+    let mut changed_roster = DonorJournal::new(config(), capture_id()).unwrap();
+    changed_roster
+        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .unwrap();
+    assert_eq!(
+        changed_roster.observe_membership(Time(2), &[identity("donor", 1)]),
+        Err(JournalError::Conflict)
+    );
+    assert_eq!(changed_roster.state(), JournalState::Invalidated);
+    assert_eq!(
+        changed_roster.finish_capture(Time(3), 20, 24),
+        Err(JournalError::Stage)
+    );
+}
+
+#[test]
 fn whole_journal_charge_is_finite_and_rejects_oversized_retained_vectors() {
     let bound = DonorJournal::storage_bound(config()).unwrap();
     assert!(bound > config().max_suffix_bytes);

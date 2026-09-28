@@ -52,6 +52,7 @@ pub struct DonorJournal {
     reserved_decoded: usize,
     charge: Option<CaptureCharge>,
     members: Vec<ClaimIdentity>,
+    image_cuts: Vec<NativeCut>,
     cuts: Vec<NativeCut>,
     deltas: Vec<JournalDelta>,
     last_position: u64,
@@ -69,6 +70,35 @@ impl DonorJournal {
             .checked_mul(2)
             .map(|slots| slots.max(4))
             .ok_or(JournalError::InvalidConfig)
+    }
+
+    fn copy_image_cuts(
+        config: JournalConfig,
+        cuts: &[NativeCut],
+    ) -> Result<Vec<NativeCut>, JournalError> {
+        let mut image_cuts = Vec::new();
+        image_cuts
+            .try_reserve_exact(cuts.len())
+            .map_err(|_| JournalError::Capacity)?;
+        if image_cuts.capacity() > Self::storage_slots(config.max_cuts)? {
+            return Err(JournalError::Capacity);
+        }
+        for cut in cuts {
+            let mut writer = Vec::new();
+            writer
+                .try_reserve_exact(cut.writer.len())
+                .map_err(|_| JournalError::Capacity)?;
+            if writer.capacity() > config.max_cut_bytes {
+                return Err(JournalError::Capacity);
+            }
+            writer.extend_from_slice(&cut.writer);
+            image_cuts.push(NativeCut {
+                writer,
+                epoch: cut.epoch,
+                sequence: cut.sequence,
+            });
+        }
+        Ok(image_cuts)
     }
 
     /// Conservative retained-heap reservation for one journal, excluding the
@@ -117,6 +147,16 @@ impl DonorJournal {
         total = add(total, config.max_membership_bytes)?;
         total = add(total, slots(config.max_cuts, size_of::<NativeCut>())?)?;
         total = add(total, config.max_cut_bytes)?;
+        total = add(
+            total,
+            config
+                .max_cuts
+                .checked_mul(config.max_cut_bytes)
+                .ok_or(JournalError::InvalidConfig)?,
+        )?;
+        // C's immutable writer cuts coexist with the advancing B cuts while
+        // encoding and throughout donor service.
+        total = add(total, slots(config.max_cuts, size_of::<NativeCut>())?)?;
         total = add(
             total,
             config
@@ -234,6 +274,7 @@ impl DonorJournal {
             reserved_decoded: 0,
             charge: None,
             members: Vec::new(),
+            image_cuts: Vec::new(),
             cuts: Vec::new(),
             deltas,
             last_position: 0,
@@ -283,6 +324,13 @@ impl DonorJournal {
     #[must_use]
     pub fn covered_cuts(&self) -> &[NativeCut] {
         &self.cuts
+    }
+
+    /// Immutable native writer cuts belonging to the private image at C.
+    /// Later appended suffix events advance [`Self::covered_cuts`] only.
+    #[must_use]
+    pub fn image_cuts(&self) -> &[NativeCut] {
+        &self.image_cuts
     }
 
     /// Current retained local suffix bytes, excluding private image memory.
@@ -354,6 +402,7 @@ impl DonorJournal {
         self.reserved_decoded = 0;
         self.charge = None;
         self.members.clear();
+        self.image_cuts.clear();
         self.cuts.clear();
         self.deltas.clear();
         self.suffix_bytes = 0;
@@ -451,8 +500,10 @@ impl DonorJournal {
     }
 
     /// Reserve image and suffix budgets before the adapter clones the index.
-    /// The adapter holds the index publication lock through `finish_capture`
-    /// or `invalidate`, and performs a bounded private clone under that lock.
+    /// The adapter holds the publication lock through the bounded clone and
+    /// ingress attachment at C, then may encode off-lock while appends record
+    /// later effects. It rechecks the exact candidate and finishes under the
+    /// publication lock before advertising any follower availability.
     ///
     /// # Errors
     /// Fails closed on invalid roster/cuts, budget, or time; no image is ready.
@@ -498,6 +549,13 @@ impl DonorJournal {
             self.invalidate_inner(Invalidation::Capacity);
             return Err(JournalError::Capacity);
         }
+        let image_cuts = match Self::copy_image_cuts(self.config, &cuts) {
+            Ok(image_cuts) => image_cuts,
+            Err(error) => {
+                self.invalidate_inner(Invalidation::Capacity);
+                return Err(error);
+            }
+        };
         let Some(expires) = now.0.checked_add(self.config.max_total_ms).map(Time) else {
             self.invalidate_inner(Invalidation::Capacity);
             return Err(JournalError::Exhausted);
@@ -507,6 +565,7 @@ impl DonorJournal {
         self.reserved_encoded = planned_encoded;
         self.reserved_decoded = planned_decoded;
         self.members = members;
+        self.image_cuts = image_cuts;
         self.cuts = cuts;
         self.state = JournalState::Capturing;
         Ok(CaptureCharge {
@@ -563,8 +622,10 @@ impl DonorJournal {
         (self.state == JournalState::Active).then(|| self.cursor(self.last_position))
     }
 
-    /// Compare an exact bounded complete membership roster with the capture.
-    /// A changed or malformed roster invalidates all transfer candidates.
+    /// Compare an exact bounded complete membership roster with the capture,
+    /// including during off-lock image encoding. This does not make a
+    /// `Capturing` image available to followers. A changed or malformed
+    /// roster invalidates all transfer candidates.
     ///
     /// # Errors
     /// Fails closed on changed source membership or malformed metadata.
@@ -574,7 +635,7 @@ impl DonorJournal {
         members: &[ClaimIdentity],
     ) -> Result<(), JournalError> {
         self.advance(now)?;
-        if self.state != JournalState::Active {
+        if !matches!(self.state, JournalState::Capturing | JournalState::Active) {
             return Err(JournalError::Stage);
         }
         if self.valid_members(members).is_err() || members != self.members {
@@ -584,10 +645,11 @@ impl DonorJournal {
         Ok(())
     }
 
-    /// Record one final index publication after C. The application holds its
-    /// publication lock while applying the same mutation, including repairs
-    /// and tombstones. A conflicting duplicate or an unknown writer closes
-    /// this candidate; the live application index still proceeds normally.
+    /// Record one final index publication after C, including while the
+    /// bounded private image is still being encoded. The application holds
+    /// its publication lock while applying the same mutation, including
+    /// repairs and tombstones. A conflicting duplicate or unknown writer
+    /// closes this candidate; the live application index still proceeds.
     ///
     /// # Errors
     /// Rejects stale generation, noncontiguous native feed, or capacity.
@@ -599,7 +661,7 @@ impl DonorJournal {
         effect: Vec<u8>,
     ) -> Result<JournalCursor, JournalError> {
         self.advance(now)?;
-        if self.state != JournalState::Active {
+        if !matches!(self.state, JournalState::Capturing | JournalState::Active) {
             return Err(JournalError::Stage);
         }
         if recovery_generation != self.id.recovery_generation {

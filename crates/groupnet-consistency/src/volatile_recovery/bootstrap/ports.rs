@@ -167,18 +167,22 @@ impl JournalIngress {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// Attaches an already active capture and its pre-acquired whole-journal
-    /// storage budget, including bounded vector/header and barrier copies.
+    /// Attaches a pre-reserved capture at C, possibly still encoding its
+    /// private image. `Capturing` ingress records later index effects but
+    /// cannot serve follower requests or advertise donor readiness. The
+    /// storage budget includes bounded vector/header and barrier copies.
     ///
     /// # Errors
-    /// A partial capture cannot be exposed to live index publications.
+    /// An uncaptured or invalidated journal cannot enter live publication.
     pub fn new(
         journal: DonorJournal,
         suffix: Reservation,
         changed: Arc<Notify>,
     ) -> Result<Self, AdapterError> {
-        if journal.state() != JournalState::Active
-            || suffix.class() != AdmissionClass::Suffix
+        if !matches!(
+            journal.state(),
+            JournalState::Capturing | JournalState::Active
+        ) || suffix.class() != AdmissionClass::Suffix
             || DonorJournal::storage_bound(journal.config())
                 .ok()
                 .is_none_or(|needed| suffix.bytes() < needed)

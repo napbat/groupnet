@@ -73,6 +73,87 @@ fn captured_with(seed: u64, limits: JournalConfig) -> (DonorJournal, JournalCurs
     (journal, cut)
 }
 
+#[test]
+fn encoding_schedule_keeps_c_fixed_while_live_suffix_advances() {
+    let mut completed = 0;
+    let mut aborted = 0;
+    for seed in 0..48 {
+        let mut rng = SplitMix64::new(seed + 3_100);
+        let donor = identity("donor", seed + 1);
+        let follower = identity("peer", seed + 100);
+        let id = CaptureId {
+            scope: BootstrapScope {
+                domain: "o".to_owned(),
+                partition: "b".to_owned(),
+            },
+            donor: donor.clone(),
+            recovery_generation: 9,
+            serial: seed + 1,
+        };
+        let c = JournalCursor {
+            capture: id.clone(),
+            position: 0,
+        };
+        let mut journal = DonorJournal::new(config(), id).unwrap();
+        journal
+            .begin_capture(
+                Time(0),
+                32,
+                32,
+                vec![donor, follower.clone()],
+                vec![NativeCut {
+                    writer: b"w".to_vec(),
+                    epoch: 1,
+                    sequence: 0,
+                }],
+            )
+            .unwrap();
+        let encode_due = 3 + u64::from(rng.below(3));
+        let fail = seed % 3 == 0;
+        for at in 1..encode_due {
+            assert!(journal.current_cursor().is_none());
+            assert_eq!(
+                journal.reserve(Time(at), follower.clone(), &c),
+                Err(JournalError::Stage)
+            );
+            journal
+                .append(
+                    Time(at),
+                    9,
+                    DeltaIdentity::Native(NativeCut {
+                        writer: b"w".to_vec(),
+                        epoch: 1,
+                        sequence: at,
+                    }),
+                    vec![u8::try_from(at).unwrap()],
+                )
+                .unwrap();
+            assert_eq!(journal.image_cuts()[0].sequence, 0);
+            assert_eq!(journal.covered_cuts()[0].sequence, at);
+            if fail && at == 2 {
+                journal.invalidate(Invalidation::DonorLost);
+                break;
+            }
+        }
+        if fail {
+            aborted += 1;
+            assert_eq!(
+                journal.finish_capture(Time(encode_due), 8, 8),
+                Err(JournalError::Stage)
+            );
+            assert!(journal.current_cursor().is_none());
+        } else {
+            completed += 1;
+            assert_eq!(journal.finish_capture(Time(encode_due), 8, 8).unwrap(), c);
+            assert_eq!(journal.image_cuts()[0].sequence, 0);
+            assert_eq!(journal.covered_cuts()[0].sequence, encode_due - 1);
+            assert_eq!(journal.current_cursor().unwrap().position, encode_due - 1);
+            assert!(journal.reserve(Time(encode_due), follower, &c).is_ok());
+        }
+    }
+    assert_eq!((completed, aborted), (32, 16));
+}
+
 #[derive(Clone)]
 enum Delivery {
     Append(u8, Vec<u8>),

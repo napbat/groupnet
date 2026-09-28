@@ -468,9 +468,8 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
     assert_eq!(worker_budget.usage().0, 0);
 }
 
-fn capture_for_test(budget: &ByteAdmission) -> DonorCapture<Vec<u8>> {
-    let (_, context, id, _, _) = setup();
-    let config = JournalConfig {
+fn journal_config_for_test() -> JournalConfig {
+    JournalConfig {
         max_encoded_bytes: 8,
         max_decoded_bytes: 8,
         max_events: 4,
@@ -489,7 +488,12 @@ fn capture_for_test(budget: &ByteAdmission) -> DonorCapture<Vec<u8>> {
         max_inflight_bytes: 16,
         max_total_ms: 100,
         max_follower_ms: 50,
-    };
+    }
+}
+
+fn capture_for_test(budget: &ByteAdmission) -> DonorCapture<Vec<u8>> {
+    let (_, context, id, _, _) = setup();
+    let config = journal_config_for_test();
     let storage = DonorJournal::storage_bound(config).unwrap();
     let mut journal = DonorJournal::new(config, id).unwrap();
     journal
@@ -501,6 +505,61 @@ fn capture_for_test(budget: &ByteAdmission) -> DonorCapture<Vec<u8>> {
     let encoded = budget.reserve(AdmissionClass::Encoded, 1).unwrap();
     let decoded = budget.reserve(AdmissionClass::Decoded, 1).unwrap();
     DonorCapture::new(vec![9], ingress, encoded, decoded).unwrap()
+}
+
+#[test]
+fn capturing_ingress_records_live_effects_but_cannot_offer_until_finished() {
+    let budget = admission();
+    let (_, context, id, _, _) = setup();
+    let config = journal_config_for_test();
+    let mut journal = DonorJournal::new(config, id.clone()).unwrap();
+    journal
+        .begin_capture(
+            Time(1),
+            1,
+            1,
+            vec![context.donor, context.follower.clone()],
+            vec![],
+        )
+        .unwrap();
+    let suffix = budget
+        .reserve(
+            AdmissionClass::Suffix,
+            DonorJournal::storage_bound(config).unwrap(),
+        )
+        .unwrap();
+    let ingress = JournalIngress::new(journal, suffix, Arc::new(Notify::new())).unwrap();
+    let c = JournalCursor {
+        capture: id,
+        position: 0,
+    };
+    ingress.with_journal(|journal| {
+        assert!(journal.current_cursor().is_none());
+        assert_eq!(
+            journal.reserve(Time(2), context.follower.clone(), &c),
+            Err(groupnet_core::volatile_bootstrap::journal::JournalError::Stage)
+        );
+        journal
+            .append(
+                Time(2),
+                2,
+                DeltaIdentity::Local(b"x".to_vec()),
+                b"p".to_vec(),
+            )
+            .unwrap();
+        assert_eq!(journal.finish_capture(Time(3), 1, 1).unwrap(), c);
+    });
+    let encoded = budget.reserve(AdmissionClass::Encoded, 1).unwrap();
+    let decoded = budget.reserve(AdmissionClass::Decoded, 1).unwrap();
+    let capture = DonorCapture::new(vec![9], ingress, encoded, decoded).unwrap();
+    assert_eq!(
+        capture
+            .ingress()
+            .with_journal(|journal| journal.current_cursor().unwrap().position),
+        1
+    );
+    drop(capture);
+    assert_eq!(budget.usage().0, 0);
 }
 
 #[test]
