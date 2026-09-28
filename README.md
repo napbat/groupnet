@@ -14,8 +14,11 @@ elected epoch-fenced host paying a majority round-trip per write at the other,
 and the session and coherence tiers in between. Each rung, its price, and what
 it deliberately does *not* promise are in
 [`docs/consistency-modes.md`](docs/consistency-modes.md).
-The proposed source-backed replication tier, including native cursor resume,
-snapshot recovery, and durable subscription guarantees, is specified in
+The opt-in `consistency-replication` feature adds source-backed replay, native
+cursor checkpoint resume, and read-your-writes floor waits. It works through
+typed source and application adapters and does not impose a second commit log.
+Snapshot recovery and durable subscriptions remain in development; their
+contracts and implementation status are in
 [`docs/replication.md`](docs/replication.md).
 
 > Status: early scaffold. The architecture and public API are in place with a

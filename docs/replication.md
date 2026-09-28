@@ -136,6 +136,9 @@ amortize writes, but each acknowledged position has the declared proof.
 
 ## 4. Session state machine and race closure
 
+The first native snapshot slice is specified in
+[replication-snapshots.md](replication-snapshots.md).
+
 One active catch-up session exists per `(StreamId, ScopeId, local replica)`;
 multiple read floors and feed hints coalesce into its highest comparable
 target. An incomparable target starts a new generation. The sans-IO engine in
