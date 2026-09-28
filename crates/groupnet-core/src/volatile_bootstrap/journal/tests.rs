@@ -29,7 +29,7 @@ fn config() -> JournalConfig {
 fn identity(name: &str, session: u64) -> ClaimIdentity {
     ClaimIdentity {
         node: NodeId::from(name),
-        incarnation: 3,
+        incarnation: super::super::BootId(3),
         session,
         attempt: 1,
     }

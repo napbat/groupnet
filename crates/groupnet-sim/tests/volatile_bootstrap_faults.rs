@@ -77,7 +77,7 @@ fn initialized(
                 config(),
                 scope(),
                 node.clone(),
-                u64::try_from(index + 1).unwrap(),
+                groupnet_core::volatile_bootstrap::BootId(u128::try_from(index + 1).unwrap()),
                 seed + 1,
             )
             .unwrap()

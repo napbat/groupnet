@@ -24,7 +24,14 @@ fn scope() -> BootstrapScope {
 }
 
 fn node(name: &str, boot: u64) -> ClaimEngine {
-    ClaimEngine::new(config(), scope(), NodeId::from(name), boot, 1).unwrap()
+    ClaimEngine::new(
+        config(),
+        scope(),
+        NodeId::from(name),
+        BootId(u128::from(boot)),
+        1,
+    )
+    .unwrap()
 }
 
 fn published(step: &BootstrapStep) -> BootstrapClaim {
@@ -72,7 +79,7 @@ fn scope_encoding_and_constructor_bounds_are_unambiguous() {
         .placement_key()
     );
     assert_eq!(
-        ClaimEngine::new(config(), scope(), NodeId::from("me"), 0, 1).err(),
+        ClaimEngine::new(config(), scope(), NodeId::from("me"), BootId(0), 1).err(),
         Some(BootstrapError::InvalidConfig)
     );
     assert_eq!(
@@ -83,7 +90,7 @@ fn scope_encoding_and_constructor_bounds_are_unambiguous() {
             },
             scope(),
             NodeId::from("me"),
-            1,
+            BootId(1),
             1
         )
         .err(),
@@ -264,7 +271,7 @@ fn fresh_same_boot_session_rejects_old_claim_and_completion() {
     });
     let old_op = old.current_operation().unwrap();
 
-    let mut fresh = ClaimEngine::new(config(), scope(), NodeId::from("me"), 7, 2).unwrap();
+    let mut fresh = ClaimEngine::new(config(), scope(), NodeId::from("me"), BootId(7), 2).unwrap();
     let fresh_claim = published(&fresh.step(BootstrapEvent::Start));
     assert_ne!(old_claim.identity, fresh_claim.identity);
     let fresh_tick = fresh.step(BootstrapEvent::Tick(crate::Time(3)));
@@ -344,12 +351,13 @@ fn follower_observes_ready_donor_before_wait_budget_expires() {
     let winner =
         placement::owner(&scope().placement_key(), &names.iter().cloned().collect()).unwrap();
     let follower_name = names.iter().find(|name| **name != winner).unwrap();
-    let mut follower = ClaimEngine::new(config(), scope(), follower_name.clone(), 7, 1).unwrap();
+    let mut follower =
+        ClaimEngine::new(config(), scope(), follower_name.clone(), BootId(7), 1).unwrap();
     let self_claim = published(&follower.step(BootstrapEvent::Start));
     let donor_claim = BootstrapClaim {
         identity: ClaimIdentity {
             node: winner,
-            incarnation: 8,
+            incarnation: BootId(8),
             session: 1,
             attempt: 1,
         },

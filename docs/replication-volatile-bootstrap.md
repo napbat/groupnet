@@ -1,7 +1,7 @@
 # Peer bootstrap for a volatile application index
 
-Status: **claim/takeover and bounded donor-journal sans-IO cores implemented;
-runtime image capture, transfer, and consumer integration pending**. This extends the
+Status: **claim/takeover, bounded donor-journal, and transfer sans-IO cores implemented;
+runtime image capture, bulk transfer, and consumer integration pending**. This extends the
 [volatile recovery contract](replication-volatile-coherence.md). It is a
 state-sync optimization for an application whose initial state can be built
 from an origin and then updated by bounded peer feeds. It adds no durable

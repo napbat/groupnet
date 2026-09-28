@@ -183,7 +183,10 @@ fn enqueue_effects(
                 coverage.donor_nodes_this_seed.insert(from);
             }
             BootstrapEffect::FallbackOrigin => coverage.fallbacks += 1,
-            BootstrapEffect::CancelWork { .. } | BootstrapEffect::FollowBuilder { .. } => {}
+            BootstrapEffect::CancelWork { .. }
+            | BootstrapEffect::FollowBuilder { .. }
+            | BootstrapEffect::ObserveSelectedClaim { .. }
+            | BootstrapEffect::Transfer(_) => {}
         }
     }
 }
@@ -255,7 +258,7 @@ fn queued_native_ttl_claims_converge_and_survive_faults() {
                     config(),
                     scope(),
                     name.clone(),
-                    u64::try_from(index + 1).unwrap(),
+                    groupnet_core::volatile_bootstrap::BootId(u128::try_from(index + 1).unwrap()),
                     seed + 1,
                 )
                 .unwrap()

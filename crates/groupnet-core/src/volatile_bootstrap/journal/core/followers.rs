@@ -42,7 +42,7 @@ impl DonorJournal {
         }
         if follower.node.as_str().is_empty()
             || follower.node.as_str().len() > self.config.max_follower_id_bytes
-            || follower.incarnation == 0
+            || follower.incarnation.0 == 0
             || follower.session == 0
             || follower.attempt == 0
             || self.followers.len() >= self.config.max_followers.saturating_sub(self.aborted.len())

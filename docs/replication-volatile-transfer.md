@@ -1,6 +1,7 @@
 # Bounded transfer of a volatile index image
 
-Status: **API proposal; implementation pending**. This refines the peer
+Status: **claim/transfer sans-IO cores and deterministic tests implemented;
+runtime source, bulk transport, and consumer integration pending**. This refines the peer
 bootstrap contract in [replication-volatile-bootstrap.md](replication-volatile-bootstrap.md).
 It transfers an already guarded donor index. It does not certify origin
 freshness, durable writer history, or local read authority.
@@ -26,7 +27,9 @@ The first `DonorAvailable` operation's absolute `operation_due` and the
 original follower episode's `total_due` are retained when transfer starts.
 Its effective transfer deadline is their minimum. The ordinary claim poll
 timer pauses while transfer is active; `ClaimEngine::Tick` drives the child
-deadline and local claim renewals instead of replacing the parent operation
+deadline, local claim renewals, and a separately correlated native TTL
+refresh for the exact selected donor. An absent, expired, contradictory, or
+unrefreshed claim aborts transfer without replacing the parent operation
 with `ObserveClaims`. Transfer success completes the candidate handoff;
 failure excludes that exact donor and resumes bounded observation/takeover
 within the original total budget. Neither a delayed offer nor a later ready
@@ -107,9 +110,8 @@ the application's own gate opens. The donor reservation may be released
 only after continuation coverage is proved or the transfer is discarded.
 
 The runtime requires a fresh boot identity across restarts for each node
-identity. The current claim core's `u64` field is a prerequisite to change
-before fleet wiring: use a typed 128-bit boot token for claim, operation,
-capture, and wire correlation, while retaining the current nonzero per-open
+identity. The claim core now uses typed `BootId(u128)` for claim, operation,
+and capture correlation, while retaining the current nonzero per-open
 session and capture serial. For s3cache, the concrete default fleet-mode
 binding is one 128-bit nonce from the operating system's cryptographic
 random source at each process start, with a test injection hook; it writes

@@ -5,11 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::placement;
 use crate::{NodeId, Time};
 
+use super::transfer::{TransferConfig, TransferSession};
+
 use super::types::{
-    BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
+    BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
     BootstrapMember, BootstrapOperation, BootstrapScope, BootstrapStage, BootstrapStep,
     ClaimIdentity, ClaimPhase,
 };
+
+mod transfer;
 
 #[derive(Clone, Copy, Debug)]
 struct ObservedRenewal {
@@ -25,7 +29,7 @@ pub struct ClaimEngine {
     config: BootstrapConfig,
     scope: BootstrapScope,
     me: NodeId,
-    boot_incarnation: u64,
+    boot_incarnation: BootId,
     session: u64,
     stage: BootstrapStage,
     now: Time,
@@ -42,6 +46,11 @@ pub struct ClaimEngine {
     selected: Option<ClaimIdentity>,
     observed: BTreeMap<ClaimIdentity, ObservedRenewal>,
     excluded: BTreeSet<ClaimIdentity>,
+    transfer_config: Option<TransferConfig>,
+    transfer: Option<TransferSession>,
+    claim_refresh_due: Option<Time>,
+    claim_poll: Option<BootstrapOperation>,
+    claim_poll_due: Option<Time>,
 }
 
 impl ClaimEngine {
@@ -54,7 +63,7 @@ impl ClaimEngine {
         config: BootstrapConfig,
         scope: BootstrapScope,
         me: NodeId,
-        boot_incarnation: u64,
+        boot_incarnation: BootId,
         session: u64,
     ) -> Result<Self, BootstrapError> {
         let config = config.validate()?;
@@ -68,7 +77,7 @@ impl ClaimEngine {
             || names > config.max_scope_bytes
             || me.as_str().is_empty()
             || me.as_str().len() > config.max_member_bytes
-            || boot_incarnation == 0
+            || boot_incarnation.0 == 0
             || session == 0
         {
             return Err(BootstrapError::InvalidConfig);
@@ -94,6 +103,11 @@ impl ClaimEngine {
             selected: None,
             observed: BTreeMap::new(),
             excluded: BTreeSet::new(),
+            transfer_config: None,
+            transfer: None,
+            claim_refresh_due: None,
+            claim_poll: None,
+            claim_poll_due: None,
         })
     }
 
@@ -130,6 +144,19 @@ impl ClaimEngine {
             self.operation_due,
             self.follow_due,
             self.total_due,
+            self.transfer
+                .as_ref()
+                .and_then(TransferSession::next_deadline),
+            self.claim_refresh_due,
+            self.claim_poll_due,
+            (self.stage == BootstrapStage::Transferring)
+                .then(|| {
+                    self.selected
+                        .as_ref()
+                        .and_then(|id| self.observed.get(id))
+                        .map(|claim| claim.expires)
+                })
+                .flatten(),
         ]
         .into_iter()
         .flatten()
@@ -173,6 +200,11 @@ impl ClaimEngine {
 
     fn terminate(&mut self) -> BootstrapStep {
         let previous = self.operation.take();
+        let mut effects = Vec::new();
+        if let Some(op) = previous {
+            effects.push(BootstrapEffect::CancelWork { op });
+        }
+        effects.extend(self.cancel_transfer());
         self.stage = BootstrapStage::Fallback;
         self.settle_due = None;
         self.renew_due = None;
@@ -180,10 +212,6 @@ impl ClaimEngine {
         self.follow_due = None;
         self.total_due = None;
         self.selected = None;
-        let mut effects = Vec::new();
-        if let Some(op) = previous {
-            effects.push(BootstrapEffect::CancelWork { op });
-        }
         effects.push(BootstrapEffect::WithdrawClaim(self.identity()));
         effects.push(BootstrapEffect::FallbackOrigin);
         self.ok(effects)
@@ -196,17 +224,21 @@ impl ClaimEngine {
                 .checked_add(due_ms)
                 .ok_or(BootstrapError::Exhausted)?,
         );
+        let op = self.allocate_token().ok_or(BootstrapError::Exhausted)?;
+        self.operation = Some(op);
+        self.operation_due = Some(due.min(self.total_due.unwrap_or(due)));
+        Ok(op)
+    }
+
+    fn allocate_token(&mut self) -> Option<BootstrapOperation> {
         let token = self.next_token;
-        self.next_token = token.checked_add(1).ok_or(BootstrapError::Exhausted)?;
-        let op = BootstrapOperation {
+        self.next_token = token.checked_add(1)?;
+        Some(BootstrapOperation {
             session: self.session,
             incarnation: self.boot_incarnation,
             generation: self.generation,
             token,
-        };
-        self.operation = Some(op);
-        self.operation_due = Some(due.min(self.total_due.unwrap_or(due)));
-        Ok(op)
+        })
     }
 
     fn observe(&mut self) -> BootstrapStep {
@@ -259,6 +291,7 @@ impl ClaimEngine {
             return Self::reject(BootstrapError::Exhausted);
         };
         let previous = (self.generation > 0).then(|| self.identity());
+        let transfer_cleanup = self.cancel_transfer();
         let previous_operation = self.operation;
         self.generation = generation;
         self.stage = BootstrapStage::Settling;
@@ -277,6 +310,7 @@ impl ClaimEngine {
         if let Some(op) = previous_operation {
             effects.push(BootstrapEffect::CancelWork { op });
         }
+        effects.extend(transfer_cleanup);
         if let Some(previous) = previous {
             effects.push(BootstrapEffect::WithdrawClaim(previous));
         }
@@ -317,7 +351,7 @@ impl ClaimEngine {
             let id = &claim.identity;
             if id.node.as_str().is_empty()
                 || id.node.as_str().len() > self.config.max_member_bytes
-                || id.incarnation == 0
+                || id.incarnation.0 == 0
                 || id.session == 0
                 || id.attempt == 0
                 || claim.renewal == 0
@@ -501,6 +535,9 @@ impl ClaimEngine {
             return Self::reject(BootstrapError::BackwardTime);
         }
         self.now = now;
+        if self.stage == BootstrapStage::Transferring {
+            return self.tick_transfer(now);
+        }
         if self.total_due.is_some_and(|due| now >= due) {
             return self.terminate();
         }
@@ -545,6 +582,7 @@ impl ClaimEngine {
             return self.ok(Vec::new());
         }
         let identity = (self.generation > 0).then(|| self.identity());
+        let transfer_cleanup = self.cancel_transfer();
         let previous_operation = self.operation;
         self.stage = BootstrapStage::Cancelled;
         self.settle_due = None;
@@ -558,6 +596,7 @@ impl ClaimEngine {
         if let Some(op) = previous_operation {
             effects.push(BootstrapEffect::CancelWork { op });
         }
+        effects.extend(transfer_cleanup);
         if let Some(id) = identity {
             effects.push(BootstrapEffect::WithdrawClaim(id));
         }
@@ -605,6 +644,23 @@ impl ClaimEngine {
                 self.terminate()
             }
             BootstrapEvent::DonorUnavailable { op, selected } => {
+                if self.stage == BootstrapStage::Transferring
+                    && self.operation == Some(op)
+                    && self.selected.as_ref() == Some(&selected)
+                {
+                    let mut effects = vec![BootstrapEffect::CancelWork { op }];
+                    effects.extend(self.cancel_transfer());
+                    self.operation = None;
+                    self.operation_due = None;
+                    self.excluded.insert(selected);
+                    let next = self.observe();
+                    effects.extend(
+                        next.effects
+                            .into_iter()
+                            .filter(|effect| !matches!(effect, BootstrapEffect::ArmTimer(_))),
+                    );
+                    return self.ok(effects);
+                }
                 if !matches!(
                     self.stage,
                     BootstrapStage::Following | BootstrapStage::DonorAvailable
@@ -619,6 +675,20 @@ impl ClaimEngine {
                     return self.terminate();
                 }
                 self.observe()
+            }
+            BootstrapEvent::StartTransfer { op, selected } => self.start_transfer(op, selected),
+            BootstrapEvent::SelectedClaimObserved { op, claim } => {
+                self.selected_claim_observed(op, claim)
+            }
+            BootstrapEvent::Transfer(event) => {
+                if matches!(
+                    event.as_ref(),
+                    super::transfer::TransferEvent::Start | super::transfer::TransferEvent::Tick(_)
+                ) {
+                    Self::reject(BootstrapError::Stage)
+                } else {
+                    self.transfer_event(*event)
+                }
             }
             BootstrapEvent::Tick(now) => self.tick(now),
             BootstrapEvent::Cancel => self.cancel(),
@@ -648,7 +718,7 @@ mod renewal_tests {
                 partition: "b".to_owned(),
             },
             NodeId::from("me"),
-            7,
+            BootId(7),
             1,
         )
         .unwrap()
@@ -660,7 +730,7 @@ mod renewal_tests {
         let mut claim = BootstrapClaim {
             identity: ClaimIdentity {
                 node: NodeId::from("peer"),
-                incarnation: 9,
+                incarnation: BootId(9),
                 session: 1,
                 attempt: 1,
             },
@@ -678,7 +748,7 @@ mod renewal_tests {
         let local = BootstrapClaim {
             identity: ClaimIdentity {
                 node: NodeId::from("me"),
-                incarnation: 7,
+                incarnation: BootId(7),
                 session: 1,
                 attempt: 1,
             },

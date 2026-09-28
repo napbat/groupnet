@@ -80,7 +80,7 @@ impl DonorJournal {
             || scope_bytes > config.max_scope_bytes
             || id.donor.node.as_str().is_empty()
             || id.donor.node.as_str().len() > config.max_follower_id_bytes
-            || id.donor.incarnation == 0
+            || id.donor.incarnation.0 == 0
             || id.donor.session == 0
             || id.donor.attempt == 0
             || id.recovery_generation == 0
@@ -279,7 +279,7 @@ impl DonorJournal {
                 .checked_add(member.node.as_str().len())
                 .ok_or(JournalError::Capacity)?;
             if member.node.as_str().is_empty()
-                || member.incarnation == 0
+                || member.incarnation.0 == 0
                 || member.session == 0
                 || member.attempt == 0
                 || member.node.as_str().len() > self.config.max_follower_id_bytes

@@ -2,7 +2,7 @@
 
 use groupnet_core::placement;
 use groupnet_core::volatile_bootstrap::{
-    BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
+    BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
     BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine,
 };
 use groupnet_core::{NodeId, Time};
@@ -94,7 +94,7 @@ fn converged_claims_take_over_and_partitions_have_safe_duplicate_builders() {
                     config(),
                     scope(),
                     name.clone(),
-                    u64::try_from(index + 1).unwrap(),
+                    BootId(u128::try_from(index + 1).unwrap()),
                     seed + 1,
                 )
                 .unwrap()
@@ -162,7 +162,7 @@ fn converged_claims_take_over_and_partitions_have_safe_duplicate_builders() {
                         config(),
                         scope(),
                         name.clone(),
-                        u64::try_from(index + 101).unwrap(),
+                        BootId(u128::try_from(index + 101).unwrap()),
                         seed + 100,
                     )
                     .unwrap()

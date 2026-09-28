@@ -11,7 +11,7 @@ use groupnet_sim::SplitMix64;
 fn identity(name: &str, session: u64) -> ClaimIdentity {
     ClaimIdentity {
         node: NodeId::from(name),
-        incarnation: 7,
+        incarnation: groupnet_core::volatile_bootstrap::BootId(7),
         session,
         attempt: 1,
     }
