@@ -893,28 +893,13 @@ impl ClaimEngine {
                     Self::reject(BootstrapError::StaleOperation)
                 } else if self.participation_required {
                     let old = self.identity();
-                    let Some(generation) = self.generation.checked_add(1) else {
-                        return self.terminate();
-                    };
-                    self.generation = generation;
-                    self.local_renewal = 0;
                     self.local_phase = ClaimPhase::Building;
-                    self.stage = BootstrapStage::Building;
-                    self.observed.retain(|identity, _| identity.node != self.me);
+                    // Withdraw stale C immediately. Wait for a complete fresh
+                    // native cut before starting the one bounded recapture;
+                    // a newly Alive member may not have presence yet.
                     self.participant_roster = None;
-                    let selected = self.identity();
-                    self.selected = Some(selected.clone());
-                    let Ok(claim) = self.publish_renewal() else {
-                        return self.terminate();
-                    };
-                    let Ok(op) = self.operation(self.config.donor_wait_ms) else {
-                        return self.terminate();
-                    };
-                    self.ok(vec![
-                        BootstrapEffect::WithdrawClaim(old),
-                        claim,
-                        BootstrapEffect::RecaptureCurrent { op, selected },
-                    ])
+                    self.renew_due = None;
+                    self.ok(vec![BootstrapEffect::WithdrawClaim(old)])
                 } else {
                     self.terminate()
                 }

@@ -375,24 +375,45 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
         Arc::clone(&self.wake)
     }
 
-    fn maintain(&mut self, _now: Instant) -> BoxRecoveryFuture<'_, ()> {
+    fn maintain(&mut self, now: Instant) -> BoxRecoveryFuture<'_, ()> {
         Box::pin(async move {
+            let claim_timer_due = self
+                .engine
+                .next_deadline()
+                .and_then(|due| self.absolute(due))
+                .is_some_and(|due| due <= now);
             if let Some(capture) = &self.capture {
                 let _ = capture.tick(self.now());
             }
             self.retire_capture_if_invalid();
             let _ = self.accept(BootstrapEvent::Tick(self.now()));
-            if self.engine.ready_recapture_pending() {
-                let deadline = Instant::now()
-                    .checked_add(Duration::from_millis(self.config.claim.donor_wait_ms));
-                if deadline.is_some_and(|deadline| {
-                    self.permit
-                        .as_ref()
-                        .and_then(|permit| permit.ready_capture(deadline))
-                        .is_some()
-                }) {
-                    let _ = self.accept(BootstrapEvent::StartReadyRecapture);
+            // Publish the core's due renewal before sampling it back from the
+            // native source; otherwise an ordinary renewal tick appears to
+            // contradict this worker's own claim sequence.
+            self.drain_maintenance().await;
+            // Ready claims outlive the initial acquisition. Recheck their C
+            // roster on this existing maintenance turn, before any incoming
+            // follower can consume an obsolete offer. A changed or uncertain
+            // source cut withdraws donor availability; local serving stays up.
+            if claim_timer_due && self.config.require_participation && self.capture.is_some() {
+                let due =
+                    Instant::now().checked_add(Duration::from_millis(self.config.claim.observe_ms));
+                if !matches!(due, Some(due) if self.current_participation(due).await.is_some()) {
+                    self.retire_donor_capture();
                 }
+            }
+            self.drain_maintenance().await;
+            if self.engine.ready_recapture_pending()
+                && let Some(deadline) = Instant::now()
+                    .checked_add(Duration::from_millis(self.config.claim.donor_wait_ms))
+                && self
+                    .permit
+                    .as_ref()
+                    .and_then(|permit| permit.ready_capture(deadline))
+                    .is_some()
+                && self.current_participation(deadline).await.is_some()
+            {
+                let _ = self.accept(BootstrapEvent::StartReadyRecapture);
             }
             self.drain_maintenance().await;
             self.service_pending().await;

@@ -175,3 +175,136 @@ fn complete_source_cut_or_finite_origin_fallback_under_faults() {
     assert_eq!(lost, 12);
     assert!(duplicate_rejections > 0);
 }
+
+fn ready_then_retired() -> (ClaimEngine, BootstrapParticipant, ClaimIdentity) {
+    let mut engine = engine();
+    let _ = engine.step(BootstrapEvent::Start);
+    let settle = engine.step(BootstrapEvent::Tick(Time(2)));
+    let op = settle.effects.iter().find_map(|effect| match effect {
+        BootstrapEffect::ObserveClaims { op, .. } => Some(*op),
+        _ => None,
+    });
+    let me = participant("me", 7, 1);
+    let chosen = engine.step(BootstrapEvent::ParticipantsObserved {
+        op: op.unwrap(),
+        members: vec![BootstrapMember {
+            node: NodeId::from("me"),
+            eligible: true,
+        }],
+        roster: vec![me.member.clone()],
+        participants: vec![me.clone()],
+        claims: vec![claim("me", 7, 1, ClaimPhase::Willing)],
+    });
+    let origin = chosen.effects.iter().find_map(|effect| match effect {
+        BootstrapEffect::BuildOrigin { op, .. } => Some(*op),
+        _ => None,
+    });
+    let old = engine.selected().unwrap().clone();
+    assert!(
+        engine
+            .step(BootstrapEvent::Built {
+                op: origin.unwrap(),
+                selected: old.clone(),
+            })
+            .rejection
+            .is_none()
+    );
+    let retired = engine.step(BootstrapEvent::CaptureRetired {
+        selected: old.clone(),
+    });
+    assert!(engine.ready_recapture_pending());
+    assert_eq!(engine.participant_roster(), None);
+    assert!(retired.effects.iter().any(|effect| matches!(
+        effect,
+        BootstrapEffect::WithdrawClaim(identity) if *identity == old
+    )));
+    assert!(!retired.effects.iter().any(|effect| matches!(
+        effect,
+        BootstrapEffect::BuildOrigin { .. }
+            | BootstrapEffect::RecaptureCurrent { .. }
+            | BootstrapEffect::PublishClaim(_)
+    )));
+    (engine, me, old)
+}
+
+#[test]
+fn retired_ready_waits_for_complete_join_then_recaptures_once() {
+    let mut completed = 0;
+    let mut incomplete_cuts = 0;
+    let mut stale_rejections = 0;
+    for seed in 0..48 {
+        let mut rng = SplitMix64::new(seed);
+        let (mut engine, me, old) = ready_then_retired();
+
+        let peer = participant("peer", 9, 2);
+        let members = vec![
+            BootstrapMember {
+                node: NodeId::from("me"),
+                eligible: true,
+            },
+            BootstrapMember {
+                node: NodeId::from("peer"),
+                eligible: true,
+            },
+        ];
+        let roster = vec![me.member.clone(), peer.member.clone()];
+        for _ in 0..=rng.below(2) {
+            let op = engine.begin_roster_observation().unwrap();
+            assert!(
+                engine
+                    .verify_participant_roster(
+                        op,
+                        &members,
+                        &roster,
+                        std::slice::from_ref(&me),
+                        &[]
+                    )
+                    .is_err()
+            );
+            assert!(engine.ready_recapture_pending());
+            incomplete_cuts += 1;
+        }
+        let _ = engine.step(BootstrapEvent::Tick(Time(3 + u64::from(rng.below(2)))));
+        let op = engine.begin_roster_observation().unwrap();
+        assert_eq!(
+            engine.verify_participant_roster(op, &members, &roster, &[me, peer], &[]),
+            Ok(())
+        );
+        let recapture = engine.step(BootstrapEvent::StartReadyRecapture);
+        let op = recapture.effects.iter().find_map(|effect| match effect {
+            BootstrapEffect::RecaptureCurrent { op, .. } => Some(*op),
+            _ => None,
+        });
+        assert!(
+            recapture
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, BootstrapEffect::BuildOrigin { .. }))
+        );
+        let replacement = engine.selected().unwrap().clone();
+        assert_ne!(replacement, old);
+        assert!(
+            engine
+                .step(BootstrapEvent::Built {
+                    op: op.unwrap(),
+                    selected: replacement.clone(),
+                })
+                .rejection
+                .is_none()
+        );
+        assert_eq!(engine.stage(), BootstrapStage::DonorAvailable);
+        assert!(!engine.ready_recapture_pending());
+        completed += 1;
+        if engine
+            .step(BootstrapEvent::CaptureRetired { selected: old })
+            .rejection
+            .is_some()
+        {
+            stale_rejections += 1;
+        }
+        assert_eq!(engine.selected(), Some(&replacement));
+    }
+    assert_eq!(completed, 48);
+    assert!(incomplete_cuts >= 48);
+    assert_eq!(stale_rejections, 48);
+}

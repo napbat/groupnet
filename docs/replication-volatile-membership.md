@@ -91,12 +91,17 @@ affirmation; it must origin-route if those proofs cannot cover the join.
 If the origin LIST completed but donor capture is refused or the roster changed
 while C was encoded, the worker reports a local-only baseline. It does not
 repeat the LIST or advertise Ready. Once that baseline reaches the independent
-local serving gate, the existing worker may try one finite fresh Ready
-recapture; failure stops donation while participation renewal continues.
+local serving gate, the existing worker waits for a complete fresh source cut
+before starting one finite Ready recapture. A transient newly Alive member
+without presence leaves the old claim withdrawn and participation renewing;
+the existing maintenance timer rechecks without repeating the LIST. A failed
+admitted capture callback stops donation while presence renewal continues.
 
-A healthy donor whose exact roster changes withdraws its old Ready claim and
-unlinks the old journal before offering any replacement. The existing recovery
-worker may issue a fresh finite recapture operation against its already-Ready
+A healthy donor checks its exact roster on the existing worker maintenance
+turn, and also before serving an Offer or Barrier. A changed or unprovable cut
+withdraws its old Ready claim and unlinks the old journal before offering any
+replacement. Once a complete fresh cut is available, the existing recovery
+worker may issue a finite recapture operation against its already-Ready
 complete index; this does not repeat origin LIST. This is a distinct trusted
 `recapture_current_index` callback, not a reuse or extension of the expired
 origin-build `PublicationPermit`. It binds the new claim/capture identity,

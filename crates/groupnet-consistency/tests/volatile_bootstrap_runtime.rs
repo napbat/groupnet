@@ -53,6 +53,7 @@ struct Claims {
     local: Mutex<Option<BootstrapClaim>>,
     presence: Mutex<Option<BootstrapPresence>>,
     peer: Option<BootstrapClaim>,
+    joiner: Mutex<Option<(BootstrapMemberIdentity, bool)>>,
     pause_ready_renewal: std::sync::atomic::AtomicBool,
     ready_publishes: AtomicUsize,
     renewal_started: Notify,
@@ -79,7 +80,7 @@ impl ClaimSource for Claims {
                 .reserve(AdmissionClass::Inflight, limits.max_metadata_bytes)
                 .map_err(|_| AdapterError)?;
             let presence = self.presence.lock().unwrap().clone().ok_or(AdapterError)?;
-            let claim = self.local.lock().unwrap().clone().ok_or(AdapterError)?;
+            let claim = self.local.lock().unwrap().clone();
             let mut members = vec![BootstrapMember {
                 node: presence.identity.node.clone(),
                 eligible: true,
@@ -94,7 +95,7 @@ impl ClaimSource for Claims {
                 renewal: presence.renewal,
                 remaining_ms: presence.remaining_ms,
             }];
-            let mut claims = vec![claim];
+            let mut claims = claim.into_iter().collect::<Vec<_>>();
             if let Some(peer) = &self.peer {
                 members.push(BootstrapMember {
                     node: peer.identity.node.clone(),
@@ -115,6 +116,19 @@ impl ClaimSource for Claims {
                     remaining_ms: peer.remaining_ms,
                 });
                 claims.push(peer.clone());
+            }
+            if let Some((member, present)) = self.joiner.lock().unwrap().clone() {
+                members.push(BootstrapMember {
+                    node: member.node.clone(),
+                    eligible: true,
+                });
+                if present {
+                    participants.push(TimedParticipant {
+                        member,
+                        renewal: 1,
+                        remaining_ms: 500,
+                    });
+                }
             }
             let mut roster = participants
                 .iter()
@@ -265,6 +279,8 @@ impl ClaimSource for Claims {
 #[derive(Debug, Default)]
 struct OriginDonor {
     builds: AtomicUsize,
+    recaptures: AtomicUsize,
+    allow_recapture: std::sync::atomic::AtomicBool,
     local_only: std::sync::atomic::AtomicBool,
     follower_prepares: AtomicUsize,
     pause: std::sync::atomic::AtomicBool,
@@ -377,6 +393,67 @@ impl DonorPort for OriginDonor {
             let ingress = JournalIngress::new(journal, suffix, wake)?;
             *self.ingress.lock().unwrap() = Some(ingress.clone());
             DonorCapture::new(vec![42], ingress, encoded, decoded).map(LocalCaptureOutcome::Ready)
+        })
+    }
+
+    fn recapture_current_index<'a>(
+        &'a self,
+        request: groupnet_consistency::volatile_recovery::bootstrap::ports::ReadyCaptureRequest,
+        admission: &'a ByteAdmission,
+    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+        Box::pin(async move {
+            if !self.allow_recapture.load(Ordering::SeqCst) {
+                return Err(AdapterError);
+            }
+            let encoded = admission
+                .reserve(AdmissionClass::Encoded, 1)
+                .map_err(|_| AdapterError)?;
+            let decoded = admission
+                .reserve(AdmissionClass::Decoded, 1)
+                .map_err(|_| AdapterError)?;
+            let config = JournalConfig {
+                max_members: 2,
+                max_membership_bytes: 128,
+                ..journal_config()
+            };
+            let suffix = admission
+                .reserve(
+                    AdmissionClass::Suffix,
+                    DonorJournal::storage_bound(config).map_err(|_| AdapterError)?,
+                )
+                .map_err(|_| AdapterError)?;
+            let journal = request
+                .guard
+                .capture(|generation| {
+                    if generation != request.recovery_generation {
+                        return Err(AdapterError);
+                    }
+                    let mut journal = DonorJournal::new(
+                        config,
+                        CaptureId {
+                            scope: BootstrapScope {
+                                domain: "o".into(),
+                                partition: "b".into(),
+                            },
+                            donor: request.selected.clone(),
+                            recovery_generation: generation,
+                            serial: self.recaptures.fetch_add(1, Ordering::SeqCst) as u64 + 2,
+                        },
+                    )
+                    .map_err(|_| AdapterError)?;
+                    journal
+                        .begin_capture(request.now, 1, 1, request.members, Vec::new())
+                        .map_err(|_| AdapterError)?;
+                    Ok(journal)
+                })
+                .ok_or(AdapterError)??;
+            let mut journal = journal;
+            journal
+                .finish_capture(request.now, 1, 1)
+                .map_err(|_| AdapterError)?;
+            let ingress = JournalIngress::new(journal, suffix, request.wake)?;
+            *self.ingress.lock().unwrap() = Some(ingress.clone());
+            DonorCapture::new(vec![42], ingress, encoded, decoded)
         })
     }
 
@@ -848,3 +925,6 @@ mod scenarios;
 #[cfg(feature = "volatile-bootstrap-bulk")]
 #[path = "volatile_bootstrap_runtime/bulk_recapture.rs"]
 mod bulk_recapture;
+
+#[path = "volatile_bootstrap_runtime/roster_maintenance.rs"]
+mod roster_maintenance;

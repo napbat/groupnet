@@ -34,6 +34,9 @@ impl ClaimEngine {
         self.claim_refresh_due = None;
         self.roster_poll = None;
         self.roster_poll_due = None;
+        // The completed local image remains usable, but its pre-scan roster
+        // must not prevent a later Ready recapture from accepting a new cut.
+        self.participant_roster = None;
         self.stage = BootstrapStage::DonorAvailable;
         self.local_phase = ClaimPhase::Building;
         self.ok(vec![BootstrapEffect::WithdrawClaim(selected)])
@@ -438,6 +441,106 @@ mod tests {
                 .any(|effect| { matches!(effect, BootstrapEffect::RecaptureCurrent { .. }) })
         );
         assert!(!engine.ready_recapture_pending());
+    }
+
+    #[test]
+    fn retired_ready_waits_for_complete_new_roster_before_one_recapture() {
+        let mut engine = engine();
+        let observe = observe(&mut engine);
+        let (members, participants, claims) = facts();
+        let built = engine.step(BootstrapEvent::ParticipantsObserved {
+            op: observe,
+            members,
+            roster: roster(&participants),
+            participants: participants.clone(),
+            claims,
+        });
+        let op = built.effects.iter().find_map(|effect| match effect {
+            BootstrapEffect::BuildOrigin { op, .. } => Some(*op),
+            _ => None,
+        });
+        let old = engine.selected().unwrap().clone();
+        assert!(
+            engine
+                .step(BootstrapEvent::Built {
+                    op: op.unwrap(),
+                    selected: old.clone(),
+                })
+                .rejection
+                .is_none()
+        );
+        let retired = engine.step(BootstrapEvent::CaptureRetired {
+            selected: old.clone(),
+        });
+        assert_eq!(engine.stage(), BootstrapStage::DonorAvailable);
+        assert!(engine.ready_recapture_pending());
+        assert_eq!(engine.participant_roster(), None);
+        assert!(
+            retired
+                .effects
+                .contains(&BootstrapEffect::WithdrawClaim(old))
+        );
+        assert!(!retired.effects.iter().any(|effect| matches!(
+            effect,
+            BootstrapEffect::BuildOrigin { .. }
+                | BootstrapEffect::RecaptureCurrent { .. }
+                | BootstrapEffect::PublishClaim(_)
+        )));
+        assert!(engine.next_deadline().is_some()); // Presence renews while donation waits.
+
+        let peer = BootstrapParticipant {
+            member: BootstrapMemberIdentity {
+                node: NodeId::from("peer"),
+                presence: Some(PresenceIdentity {
+                    node: NodeId::from("peer"),
+                    boot: BootId(9),
+                    session: 2,
+                }),
+                member_incarnation: 1,
+                status: Status::Alive,
+            },
+            renewal: 1,
+            remaining_ms: 10,
+        };
+        let members = vec![
+            BootstrapMember {
+                node: NodeId::from("me"),
+                eligible: true,
+            },
+            BootstrapMember {
+                node: NodeId::from("peer"),
+                eligible: true,
+            },
+        ];
+        let mut exact = roster(&participants);
+        exact.push(peer.member.clone());
+        let incomplete = engine.begin_roster_observation().unwrap();
+        assert_eq!(
+            engine.verify_participant_roster(incomplete, &members, &exact, &participants, &[],),
+            Err(BootstrapError::InvalidObservation)
+        );
+        assert!(engine.ready_recapture_pending());
+        let complete = engine.begin_roster_observation().unwrap();
+        let mut present = participants;
+        present.push(peer);
+        assert_eq!(
+            engine.verify_participant_roster(complete, &members, &exact, &present, &[]),
+            Ok(())
+        );
+        let recapture = engine.step(BootstrapEvent::StartReadyRecapture);
+        assert!(!engine.ready_recapture_pending());
+        assert!(
+            recapture
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, BootstrapEffect::RecaptureCurrent { .. }))
+        );
+        assert!(
+            !recapture
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, BootstrapEffect::BuildOrigin { .. }))
+        );
     }
 
     #[test]
