@@ -15,12 +15,15 @@ and the session and coherence tiers in between. Each rung, its price, and what
 it deliberately does *not* promise are in
 [`docs/consistency-modes.md`](docs/consistency-modes.md).
 The opt-in `consistency-replication` feature adds source-backed replay, native
-cursor checkpoint resume, read-your-writes floor waits, and opt-in native
-snapshot recovery. It works through typed source and application adapters and
-does not impose a second commit log. Snapshot recovery requires a source
+cursor checkpoint resume, read-your-writes floor waits, source-certified named
+acknowledgement waits, and opt-in native snapshot recovery. Typed source and
+application adapters supply storage and state; Groupnet does not impose a
+second commit log. Snapshot recovery requires a source
 retention hold and a guarded application install; replay-only adapters keep
-their existing API. Durable subscriptions and consumer migrations remain in
-development. Contracts and implementation status are in
+their existing API. Named waits pin a bounded source-certified roster and
+return a target-bound invalidation or materialization outcome; they do not
+register durable subscribers. Durable subscriptions and consumer migrations
+remain in development. Contracts and implementation status are in
 [`docs/replication.md`](docs/replication.md).
 
 > Status: early scaffold. The architecture and public API are in place with a

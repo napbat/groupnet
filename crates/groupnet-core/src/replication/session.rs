@@ -1,9 +1,11 @@
 //! Source-backed replica replay and snapshot session decisions.
 
+mod ack_wait;
 mod bootstrap;
 #[cfg(test)]
 mod exhaustion_tests;
 mod snapshot;
+mod tick;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetryTarget {
@@ -42,6 +44,7 @@ pub struct SessionEngine {
     snapshot: Option<snapshot::Progress>,
     snapshot_cleanup: Option<snapshot::CleanupState>,
     live_attachment_attempt: Option<Operation>,
+    ack_wait: Option<ack_wait::AckWait>,
     mode_authority: bool,
     ready: bool,
 }
@@ -97,6 +100,7 @@ impl SessionEngine {
             snapshot: None,
             snapshot_cleanup: None,
             live_attachment_attempt: None,
+            ack_wait: None,
             mode_authority: false,
             ready: false,
         })
@@ -114,12 +118,41 @@ impl SessionEngine {
         self.outstanding.map(|(op, _)| op)
     }
 
+    /// Exact deadline of the current replay or snapshot operation. This is
+    /// separate from the earliest timer across independent facets.
+    #[must_use]
+    pub fn operation_deadline(&self, op: Operation) -> Option<Time> {
+        (self.outstanding.is_some_and(|(current, _)| current == op))
+            .then_some(self.operation_due?)
+            .map(|due| {
+                self.snapshot
+                    .as_ref()
+                    .map_or(due, |snapshot| due.min(snapshot.total_due))
+            })
+    }
+
+    /// Stable operation of the active named wait, distinct from each poll.
+    #[must_use]
+    pub fn ack_wait_operation(&self) -> Option<Operation> {
+        self.ack_wait.as_ref().map(ack_wait::AckWait::operation)
+    }
+
+    /// Current exact fixed-set acknowledgement progress, when a wait is live.
+    #[must_use]
+    pub fn ack_wait_status(&self) -> Option<super::AckWaitOutcome> {
+        self.ack_wait.as_ref().map(ack_wait::AckWait::status)
+    }
+
     /// Whether a queued effect or response still names the live operation.
     /// Revocation has independent correlation and remains valid alongside a
     /// newer source operation until cancelled or acknowledged.
     #[must_use]
     pub fn accepts_operation(&self, op: Operation) -> bool {
         self.revoke_op == Some(op)
+            || self.ack_wait.as_ref().is_some_and(|wait| {
+                self.now < wait.deadline()
+                    && (wait.operation() == op || wait.current_poll() == Some(op))
+            })
             || self.snapshot_cleanup.as_ref().is_some_and(|cleanup| {
                 cleanup.op == op && !cleanup.discarding && self.now < cleanup.due
             })
@@ -153,6 +186,13 @@ impl SessionEngine {
             .as_ref()
             .and_then(|cleanup| (!cleanup.discarding).then_some(cleanup.due));
         let ordinary = match (ordinary, cleanup_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) | (None, a) => a,
+        };
+        let ordinary = match (
+            ordinary,
+            self.ack_wait.as_ref().map(ack_wait::AckWait::next_deadline),
+        ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, None) | (None, a) => a,
         };
@@ -369,6 +409,11 @@ impl SessionEngine {
     )]
     pub fn step(&mut self, event: Event) -> Step {
         match event {
+            Event::StartAckWait { request, limits } => self.start_ack_wait(*request, limits),
+            Event::AckObserved { evidence } => self.observe_ack(&evidence),
+            Event::AckChecked { op } => self.ack_checked(op),
+            Event::AckAuthorityLost { op } => self.ack_authority_lost(op),
+            Event::CancelAckWait { op } => self.cancel_ack_wait(op),
             Event::StartSnapshot => self.start_snapshot(),
             Event::SnapshotHeld { op, receipt } => self.snapshot_held(op, receipt),
             Event::SnapshotOffered { op, offer } => self.snapshot_offered(op, *offer),
@@ -497,54 +542,18 @@ impl SessionEngine {
                     return Step::reject(Reject::Discontinuity);
                 }
                 self.now = now;
-                if self
-                    .snapshot_cleanup
-                    .as_ref()
-                    .is_some_and(|cleanup| !cleanup.discarding && now >= cleanup.due)
-                {
-                    return self.expire_snapshot_cleanup();
-                }
-                if self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| now >= snapshot.total_due)
-                {
-                    return self.abort_snapshot();
-                }
-                if matches!(
-                    self.state.stage,
-                    Stage::Cancelled
-                        | Stage::RetryExhausted
-                        | Stage::NeedsSnapshot
-                        | Stage::SnapshotAborted
-                        | Stage::IrrecoverableGap
-                ) {
-                    return Step::ok(Vec::new());
-                }
-                if self
-                    .outstanding
-                    .is_some_and(|_| self.operation_due.is_some_and(|due| now >= due))
-                {
-                    if let Some((op, _)) = self.outstanding {
-                        return self.step(Event::Failed { op });
+                let had_ack = self.ack_wait.is_some();
+                let ack_effects = self.tick_ack_wait();
+                let mut ordinary = self.tick_replay(now);
+                let should_rearm =
+                    had_ack && (!ack_effects.is_empty() || !ordinary.effects.is_empty());
+                ordinary.effects.extend(ack_effects);
+                if should_rearm {
+                    if let Some(due) = self.next_deadline() {
+                        ordinary.effects.push(Effect::ArmTimer(due));
                     }
                 }
-                if let Some(due) = self.retry_due {
-                    if now >= due {
-                        self.retry_due = None;
-                        return if self.retry_target == RetryTarget::Bootstrap {
-                            self.load_checkpoint()
-                        } else {
-                            self.check_tail()
-                        };
-                    }
-                    return Step::ok(Vec::new());
-                }
-                if now >= self.tail_due && self.state.stage != Stage::CheckingTail {
-                    self.request_tail()
-                } else {
-                    Step::ok(Vec::new())
-                }
+                ordinary
             }
             Event::Tail {
                 op,
@@ -824,6 +833,7 @@ impl SessionEngine {
             }
             Event::Cancel | Event::Supersede => {
                 let cleanup = self.cancel_snapshot_resources();
+                let ack = self.cancel_ack_wait_for_generation();
                 let cancelled = matches!(event, Event::Cancel);
                 let was_ready = self.ready;
                 let Some(next) = self.state.generation.checked_add(1) else {
@@ -846,6 +856,7 @@ impl SessionEngine {
                         Vec::new()
                     };
                     effects.extend(cleanup);
+                    effects.extend(ack);
                     return Step {
                         effects,
                         rejection: Some(Reject::Exhausted),
@@ -870,6 +881,7 @@ impl SessionEngine {
                 self.retry_due = None;
                 let mut closed = self.close_gate();
                 closed.effects.extend(cleanup);
+                closed.effects.extend(ack);
                 closed
             }
         }

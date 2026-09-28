@@ -49,10 +49,13 @@ pub(in crate::replication::shell) async fn worker<S, A, M>(
         snapshot_payload_id: None,
         snapshot_candidate_id: None,
         snapshot_attempt: None,
+        ack: None,
     };
     driver.step(Event::StartBootstrap);
     loop {
+        driver.cancel_ack_if_requested();
         if driver.shared.cancelled.load(Ordering::Acquire) && !driver.cancel_processed {
+            driver.cancel_ack_local();
             driver.shared.local_gate.store(false, Ordering::Release);
             driver.shared.fence.invalidate();
             driver.effects.clear();
@@ -74,7 +77,7 @@ pub(in crate::replication::shell) async fn worker<S, A, M>(
             driver.tick();
         }
         if let Ok(command) = receiver.try_recv() {
-            driver.command(command);
+            driver.dispatch_command(command).await;
         }
         if let Some(effect) = driver.effects.pop_front() {
             driver.effect(effect).await;
@@ -88,7 +91,7 @@ pub(in crate::replication::shell) async fn worker<S, A, M>(
         tokio::select! {
             command = receiver.recv() => {
                 let Some(command) = command else { break; };
-                driver.command(command);
+                driver.dispatch_command(command).await;
             }
             () = shared.hints.notified() => {
                 if shared.hinted.swap(false, Ordering::AcqRel) {

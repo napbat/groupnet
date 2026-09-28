@@ -3,7 +3,8 @@
 use crate::Time;
 
 use super::{
-    BoundComparison, ChunkReceipt, Coverage, Cursor, HoldReceipt, IdentityError, Scope,
+    AckEvidence, AckWaitError, AckWaitLimits, AckWaitOutcome, AckWaitRequest, BoundComparison,
+    ChunkReceipt, Coverage, Cursor, HoldReceipt, IdentityError, RequiredSubscriber, Scope,
     SnapshotConfig, SnapshotOffer, SourceProof,
 };
 
@@ -203,6 +204,8 @@ pub enum ReadDecision {
 /// Why an input was rejected without advancing progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
+    /// A named acknowledgement request or evidence failed exact validation.
+    AckWait(AckWaitError),
     /// Cursor/proof identity or bounds are invalid.
     Identity(IdentityError),
     /// Response belongs to a stale generation or replaced operation.
@@ -250,6 +253,33 @@ pub struct ApplyReceipt {
 /// Input supplied by a driver after its source/application adapter acts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Begin one bounded named acknowledgement wait on a certified fixed roster.
+    StartAckWait {
+        /// Stable external request, exact target, and certified required set.
+        request: Box<AckWaitRequest>,
+        /// Explicit per-wait bounds; the source adapter certified the roster.
+        limits: AckWaitLimits,
+    },
+    /// Source-confirmed evidence for one named subscriber.
+    AckObserved {
+        /// Exact wait and subscriber evidence.
+        evidence: Box<AckEvidence>,
+    },
+    /// A bounded source check found no new matching evidence.
+    AckChecked {
+        /// Exact live wait operation.
+        op: Operation,
+    },
+    /// The source can no longer certify the fixed roster or target history.
+    AckAuthorityLost {
+        /// Exact live wait operation.
+        op: Operation,
+    },
+    /// Cancel the wait without rolling back any external source commit.
+    CancelAckWait {
+        /// Exact live wait operation.
+        op: Operation,
+    },
     /// Begin an opt-in state-sync snapshot with a deadline sampled now.
     StartSnapshot,
     /// Exact acquire response; a late response cannot renew an expired attempt.
@@ -441,6 +471,25 @@ pub enum Event {
 /// Driver work requested by the sans-IO session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// Event-driven source observation for one exact named wait; return
+    /// `AckObserved` or a bounded empty `AckChecked` result.
+    ObserveNamedAcks {
+        /// Core-issued operation from the session allocator.
+        op: Operation,
+        /// Exact request and fixed certified roster.
+        request: Box<AckWaitRequest>,
+        /// Currently unmet members of that immutable certified roster.
+        waiting: Vec<RequiredSubscriber>,
+        /// Absolute deadline for this source observation, including capacity wait.
+        due: Time,
+    },
+    /// Terminal wait outcome, independent of externally committed write status.
+    AckWaitFinished {
+        /// Core-issued wait operation.
+        op: Operation,
+        /// Exact fixed-set result or degradation.
+        outcome: AckWaitOutcome,
+    },
     /// Acquire a finite source hold before choosing a snapshot cut.
     AcquireSnapshotHold {
         /// Core-issued acquire operation.

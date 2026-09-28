@@ -5,6 +5,7 @@
 //! contiguous batches; an application adapter reports completed materialization.
 //! The driver executes effects and returns their generation and operation token.
 
+mod ack_types;
 pub mod admission;
 mod identity;
 mod proof;
@@ -12,6 +13,10 @@ mod session;
 mod snapshot;
 mod types;
 
+pub use ack_types::{
+    AckEvidence, AckKind, AckTarget, AckWaitError, AckWaitLimits, AckWaitOutcome, AckWaitRequest,
+    CertifiedRoster, RequiredSubscriber,
+};
 pub use identity::{Cursor, IdentityError, Scope, SourceHistory, Stream};
 pub use proof::{BoundComparison, Comparison, Coverage, ProofId, SourceProof};
 pub use session::SessionEngine;

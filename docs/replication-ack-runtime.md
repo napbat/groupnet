@@ -1,6 +1,6 @@
 # Named acknowledgement wait runtime slice
 
-Status: **accepted runtime integration contract**. This implements only the
+Status: **implemented fixed-roster runtime slice**. This implements only the
 named, fixed-roster wait in [replication-subscriptions.md](replication-subscriptions.md).
 It does not register durable `EventComplete` subscribers or infer lease-holder
 eligibility from gossip. The existing replay and native snapshot adapters and
@@ -38,11 +38,11 @@ pub trait AckEvidenceSource: Send + Sync + 'static {
                    limits: AckWaitLimits)
         -> Pin<Box<dyn Future<Output = Result<(), AckSourceFailure>> + Send + 'a>>;
     fn observe<'a>(&'a self, request: &'a AckWaitRequest, poll: Operation,
-                   limits: AckWaitLimits)
+                   waiting: &'a [RequiredSubscriber], limits: AckWaitLimits)
         -> Pin<Box<dyn Future<Output = Result<AckObservation, AckSourceFailure>> + Send + 'a>>;
 }
 pub enum AckObservation {
-    Evidence(AckEvidence),
+    Evidence(Box<AckEvidence>),
     Pending,
     AuthorityLost,
 }
@@ -61,7 +61,11 @@ erased native records and uses no runtime downcasts. Invalid source evidence
 fails closed as authority loss or terminal adapter failure. Source uncertainty
 never counts as an acknowledgement.
 
-The bridge returns at most one bounded acknowledgement per observation.
+The bridge returns at most one bounded acknowledgement per observation. Each
+query includes the current unmet subset so a stateless source does not keep
+returning an already counted member. `NamedAckResult` binds the request ID,
+exact target, proof kind, and outcome. A timeout reports the last core-confirmed
+unmet identities, including when the caller deadline fires while I/O is blocked.
 Source operations share the existing global operation semaphore, absolute
 operation deadline, and FIFO worker turn with replay and snapshot work. A
 slow source call cannot hold the whole manager's capacity; its future must

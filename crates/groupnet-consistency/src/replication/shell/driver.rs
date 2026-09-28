@@ -13,6 +13,7 @@ use groupnet_core::replication::{
 use tokio::sync::{OwnedSemaphorePermit, watch};
 
 use super::{Command, Manager, Published, SessionShared};
+use crate::replication::ack_api::AckWaitStartError;
 use crate::replication::api::{
     ApplicationAdapter, Checkpoint, CheckpointLimit, FailureClass, ScanLimit, SourceAdapter,
     SourceBatch, TailLimit,
@@ -29,6 +30,15 @@ struct PrivateCheckpoint<P, R> {
     candidate: Checkpoint<P, R>,
     _bytes: OwnedSemaphorePermit,
     _snapshot_bytes: Option<OwnedSemaphorePermit>,
+}
+
+struct ActiveAck {
+    generation: u64,
+    request_id: Vec<u8>,
+    wait_op: Operation,
+    reply: tokio::sync::oneshot::Sender<
+        Result<groupnet_core::replication::AckWaitOutcome, AckWaitStartError>,
+    >,
 }
 
 fn discard_stale<P, B, R>(
@@ -90,6 +100,7 @@ where
     snapshot_payload_id: Option<u64>,
     snapshot_candidate_id: Option<u64>,
     snapshot_attempt: Option<Operation>,
+    ack: Option<ActiveAck>,
 }
 
 impl<S, A, M> Driver<S, A, M>
@@ -150,7 +161,9 @@ where
             | Event::Scanned { op, .. }
             | Event::Applied { op, .. }
             | Event::Invalidated { op }
+            | Event::AckChecked { op }
             | Event::Failed { op } => Some(*op),
+            Event::AckObserved { evidence } => Some(evidence.op),
             _ => None,
         };
         let tail = match &event {
@@ -199,6 +212,9 @@ where
 
     fn enqueue(&mut self, effects: Vec<Effect>) {
         for effect in &effects {
+            if let Effect::AckWaitFinished { op, outcome } = effect {
+                self.record_ack_terminal(*op, outcome.clone());
+            }
             let operation = match effect {
                 Effect::AcquireSnapshotHold { op, .. }
                 | Effect::OfferSnapshot { op, .. }
@@ -219,15 +235,18 @@ where
                 | Effect::CheckTail { op, .. }
                 | Effect::Scan { op, .. }
                 | Effect::Apply { op, .. }
-                | Effect::RevokeServing { op } => Some(*op),
+                | Effect::RevokeServing { op }
+                | Effect::ObserveNamedAcks { op, .. } => Some(*op),
                 _ => None,
             };
             if let Some(op) = operation {
                 let deadline = if let Effect::CleanupSnapshot { due, .. } = effect {
                     self.started.checked_add(Duration::from_millis(due.0))
+                } else if let Effect::ObserveNamedAcks { due, .. } = effect {
+                    self.started.checked_add(Duration::from_millis(due.0))
                 } else if self.engine.current_operation() == Some(op) {
                     self.engine
-                        .next_deadline()
+                        .operation_deadline(op)
                         .and_then(|due| self.started.checked_add(Duration::from_millis(due.0)))
                 } else {
                     Instant::now().checked_add(self.timeout())
@@ -732,6 +751,7 @@ where
         };
         let op = match &effect {
             Effect::LoadCheckpoint { op, .. }
+            | Effect::ObserveNamedAcks { op, .. }
             | Effect::InstallCheckpoint { op, .. }
             | Effect::CheckTail { op, .. }
             | Effect::Scan { op, .. }
@@ -758,6 +778,15 @@ where
             return;
         }
         match effect {
+            Effect::ObserveNamedAcks {
+                op,
+                request,
+                waiting,
+                due,
+            } => {
+                self.observe_ack(op, request, waiting, due).await;
+            }
+            Effect::AckWaitFinished { op, outcome } => self.finish_ack(op, outcome),
             effect @ (Effect::AcquireSnapshotHold { .. }
             | Effect::OfferSnapshot { .. }
             | Effect::OpenSnapshotStage { .. }
@@ -835,7 +864,15 @@ where
                 let _ = reply.send(accepted);
             }
             Command::Authority(allowed) => self.step(Event::Authority(allowed)),
+            Command::CancelAck {
+                generation,
+                request_id,
+            } => self.cancel_ack(generation, &request_id),
+            Command::StartAck { .. } => {
+                unreachable!("async acknowledgement admission is handled by the worker")
+            }
             Command::Cancel(reply) => {
+                self.cancel_ack_local();
                 self.shared.local_gate.store(false, Ordering::Release);
                 self.shared.fence.invalidate();
                 self.payloads.clear();
@@ -870,6 +907,7 @@ where
 
 mod worker;
 pub(super) use worker::worker;
+mod ack;
 mod snapshot;
 
 #[cfg(test)]

@@ -9,19 +9,23 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use groupnet_core::replication::{
-    Comparison, Cursor, Mode, ReadDecision as CoreReadDecision, Refusal, Scope, SessionEngine,
-    SourceProof, Stage, State,
+    AckWaitLimits, AckWaitOutcome, Comparison, Cursor, Mode, ReadDecision as CoreReadDecision,
+    Refusal, Scope, SessionEngine, SourceProof, Stage, State,
 };
 use groupnet_runtime::Group;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use super::ack_api::{AckEvidenceSource, AckWaitStartError, NamedAckRequest};
 use super::api::{ApplicationAdapter, CatchUp, FailureClass, Limits, ReadVerdict, SourceAdapter};
 use super::fence::OperationFence;
 use super::snapshot_api::{
     NativeSnapshot, ReplayOnly, SnapshotApplicationAdapter, SnapshotSourceAdapter,
 };
 use super::snapshot_runtime::SnapshotMode;
+
+mod ack;
+use ack::AckSlot;
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
@@ -72,6 +76,16 @@ enum Command {
     Floor(Cursor, oneshot::Sender<bool>),
     Authority(bool),
     Cancel(oneshot::Sender<Option<FailureClass>>),
+    StartAck {
+        generation: u64,
+        request: Box<NamedAckRequest>,
+        deadline: Instant,
+        reply: oneshot::Sender<Result<AckWaitOutcome, AckWaitStartError>>,
+    },
+    CancelAck {
+        generation: u64,
+        request_id: Vec<u8>,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -80,7 +94,39 @@ impl fmt::Debug for Command {
             Self::Floor(cursor, _) => f.debug_tuple("Floor").field(cursor).finish(),
             Self::Authority(allowed) => f.debug_tuple("Authority").field(allowed).finish(),
             Self::Cancel(_) => f.write_str("Cancel(..)"),
+            Self::StartAck {
+                generation,
+                request,
+                deadline,
+                ..
+            } => f
+                .debug_struct("StartAck")
+                .field("generation", generation)
+                .field("request", request)
+                .field("deadline", deadline)
+                .finish_non_exhaustive(),
+            Self::CancelAck {
+                generation,
+                request_id,
+            } => f
+                .debug_struct("CancelAck")
+                .field("generation", generation)
+                .field("request_id", request_id)
+                .finish(),
         }
+    }
+}
+
+struct AckCapability {
+    source: Arc<dyn AckEvidenceSource>,
+    limits: AckWaitLimits,
+}
+
+impl fmt::Debug for AckCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AckCapability")
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
     }
 }
 
@@ -100,6 +146,8 @@ struct SessionShared {
     alive: AtomicBool,
     fence: OperationFence,
     task: Mutex<Option<JoinHandle<()>>>,
+    ack_limits: Option<AckWaitLimits>,
+    ack_slot: Mutex<AckSlot>,
 }
 
 impl fmt::Debug for SessionShared {
@@ -127,6 +175,7 @@ where
     snapshot_ops: Arc<Semaphore>,
     snapshot_bytes: Arc<Semaphore>,
     snapshot_checkpoint_bytes: Arc<Semaphore>,
+    ack: Option<AckCapability>,
     _mode: PhantomData<M>,
 }
 
@@ -235,9 +284,45 @@ where
                             0
                         },
                 )),
+                ack: None,
                 _mode: PhantomData,
             }),
         })
+    }
+
+    /// Adds source-certified named acknowledgement waits before any session
+    /// opens. Existing source, application, and snapshot adapter types stay
+    /// unchanged; no lease-holder roster is inferred from gossip.
+    ///
+    /// # Errors
+    /// Returns an invalid-configuration error if the manager is already
+    /// shared/open, configured twice, or given zero/inconsistent bounds.
+    pub fn with_ack_evidence<E: AckEvidenceSource>(
+        mut self,
+        source: E,
+        limits: AckWaitLimits,
+    ) -> Result<Self, OpenError> {
+        if limits.max_required == 0
+            || limits.max_identity_bytes == 0
+            || limits.max_certificate_bytes == 0
+            || limits.max_metadata_bytes == 0
+            || limits.max_wait_ms == 0
+            || limits.poll_ms == 0
+            || limits.poll_ms > limits.max_wait_ms
+            || limits.max_identity_bytes > limits.max_metadata_bytes
+            || limits.max_certificate_bytes > limits.max_metadata_bytes
+        {
+            return Err(OpenError::InvalidConfig);
+        }
+        let manager = Arc::get_mut(&mut self.inner).ok_or(OpenError::InvalidConfig)?;
+        if manager.ack.is_some() {
+            return Err(OpenError::InvalidConfig);
+        }
+        manager.ack = Some(AckCapability {
+            source: Arc::new(source),
+            limits,
+        });
+        Ok(self)
     }
 
     /// Registers one state-sync scope. `session_id` must be unique for this
@@ -303,6 +388,8 @@ where
             alive: AtomicBool::new(true),
             fence: OperationFence::default(),
             task: Mutex::new(None),
+            ack_limits: self.inner.ack.as_ref().map(|ack| ack.limits),
+            ack_slot: Mutex::new(AckSlot::default()),
         });
         let handle = SessionHandle {
             source: Arc::clone(&self.inner.source),
