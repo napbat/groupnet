@@ -74,6 +74,31 @@ contiguous position, the candidate fails closed and the follower uses origin
 fallback. No all-publisher retention hold or new writer-admission protocol is
 required solely for this cache bootstrap optimization.
 
+The donor-local journal uses a fresh capture identity containing the donor's
+boot/session/attempt, recovery generation, and a capture serial that cannot
+repeat within that session. A follower reservation has its own increasing
+serial, so an ack, read, release, or attachment callback from an earlier
+reservation cannot advance a reopened follower. The source-native writer
+identity is optional on a journal entry: origin-validated repairs and other
+index changes still receive distinct stable local mutation identities and
+must be recorded. Bounded native per-writer covered cuts are carried as
+separate metadata; they are not inferred from the local journal sequence.
+
+At image capture, the adapter holds the same index publication lock used by
+every page and feed mutation. It reserves the encoded image, decoded image,
+and live suffix budgets **before** cloning; captures state, cursor `C`, the
+bounded current writer cuts, and the exact member identities under that lock;
+and aborts if the private
+image exceeds the admission. The capture binds the exact bounded sorted
+member identities, rather than trusting a short membership hash; any changed
+identity invalidates the candidate. Groupnet tracks the reservation and candidate
+budgets, while the application adapter owns the concrete index bytes and
+must enforce the bound during serialization. A follower's stream attachment
+has a fresh correlated token and must be acknowledged before Groupnet may
+issue barrier `B`. Each returned batch has separately reserved in-flight
+bytes/events and one exact ack token; releasing a follower or acknowledging
+one batch never truncates the candidate's shared suffix in this first slice.
+
 The donor must abort a candidate when its own feed gaps, lease lapses, index
 rebuilds, or observed membership continuity changes invalidate its existing
 volatile index permission. A newly observed writer cannot be silently erased
