@@ -1,6 +1,7 @@
 # Peer bootstrap for a volatile application index
 
-Status: **design contract; implementation pending**. This extends the
+Status: **claim/takeover sans-IO core implemented; runtime, donor capture,
+transfer, and consumer integration pending**. This extends the
 [volatile recovery contract](replication-volatile-coherence.md). It is a
 state-sync optimization for an application whose initial state can be built
 from an origin and then updated by bounded peer feeds. It adds no durable
@@ -36,7 +37,19 @@ until authoritative origin reconciliation.
 
 ## Builder selection and transfer
 
-Groupnet owns a sans-IO `VolatileBootstrapEngine` per scope. It consumes
+Groupnet owns a sans-IO `ClaimEngine` per scope. Its implemented first slice
+consumes complete bounded member/TTL-claim observations, logical ticks, and
+exact builder/follower callbacks. Each claim identity binds node, fresh boot
+incarnation, fresh session, and attempt. Monotone renewal high-water marks
+remain boundedly retained for the episode so an expired stale claim cannot be
+revived by repeated observation. `CancelWork` fences exact old work before a
+new build or origin fallback. A `Ready` claim advertises only a potential
+donor; it grants no serving authority. The eventual runtime must obtain a
+genuinely fresh boot identity across process restarts, not infer uniqueness
+from a process-local counter or wall-clock sample. Fleet-wide startup and
+request-volume improvements remain unmeasured until the consumer integration.
+
+The completed protocol will consume
 bounded, versioned member/claim observations, logical ticks, capture and
 transfer receipts, and loss signals. It emits claim, hold, request, transfer,
 install, release, and fallback effects. A deterministic rank among converged

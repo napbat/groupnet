@@ -35,6 +35,7 @@ mod time;
 pub mod anchor;
 pub mod placement;
 pub mod replication;
+pub mod volatile_bootstrap;
 pub mod volatile_recovery;
 pub mod wire;
 
