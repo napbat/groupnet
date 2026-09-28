@@ -98,6 +98,9 @@ restart until independently validated.
 
 ## 3. Subscription guarantees and retention
 
+The durable named subscription and acknowledgement protocol is specified in
+[replication-subscriptions.md](replication-subscriptions.md).
+
 `StateSync` means a correct, complete state for a scope at a proven cut and
 catch-up to an explicit source barrier, subject to source availability and
 processing capacity. It replays a retained suffix where available; otherwise
