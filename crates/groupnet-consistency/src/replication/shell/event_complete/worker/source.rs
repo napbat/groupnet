@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use groupnet_core::replication::{
     Batch, CommitSubscriberAck, Coverage, Cursor, Event, Operation, RegisterSubscriber, Scope,
-    SourceProof, SubscriberKey, SubscriptionError,
+    SourceProof, SubscriberKey, SubscriptionError, TerminalRequest,
 };
 
 use super::{Driver, NativePayload};
@@ -334,6 +334,54 @@ where
             Some(SubscriptionSourceResult::Accepted(receipt)) => self.reply(
                 op,
                 Event::SubscriberAckRead {
+                    op,
+                    receipt: receipt.map(Box::new),
+                },
+            ),
+            Some(SubscriptionSourceResult::Rejected(error)) => self.conclusive(op, error),
+            Some(SubscriptionSourceResult::Failed(error)) => self.source_failure(op, &error),
+            None => self.reply(op, Event::Failed { op }),
+        }
+    }
+
+    pub(super) async fn commit_terminal(
+        &mut self,
+        op: Operation,
+        request: TerminalRequest,
+        due: Instant,
+    ) {
+        let source = Arc::clone(&self.manager.source);
+        let result = self
+            .source_call(due, source.commit_subscriber_terminal(request))
+            .await;
+        match result {
+            Some(SubscriptionSourceResult::Accepted(receipt)) => self.reply(
+                op,
+                Event::SubscriberTerminalCommitted {
+                    op,
+                    receipt: Box::new(receipt),
+                },
+            ),
+            Some(SubscriptionSourceResult::Rejected(error)) => self.conclusive(op, error),
+            Some(SubscriptionSourceResult::Failed(error)) => self.source_failure(op, &error),
+            None => self.reply(op, Event::Failed { op }),
+        }
+    }
+
+    pub(super) async fn read_terminal(
+        &mut self,
+        op: Operation,
+        request: TerminalRequest,
+        due: Instant,
+    ) {
+        let source = Arc::clone(&self.manager.source);
+        let result = self
+            .source_call(due, source.read_subscriber_terminal(request))
+            .await;
+        match result {
+            Some(SubscriptionSourceResult::Accepted(receipt)) => self.reply(
+                op,
+                Event::SubscriberTerminalRead {
                     op,
                     receipt: receipt.map(Box::new),
                 },

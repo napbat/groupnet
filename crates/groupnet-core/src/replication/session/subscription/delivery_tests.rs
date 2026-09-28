@@ -253,12 +253,26 @@ fn sink_ahead_replays_without_rollback_and_retention_gap_is_terminal() {
     let mut gap = bound_engine(1);
     let result = tail(&mut gap, 2);
     assert_eq!(gap.state().stage, Stage::IrrecoverableGap);
+    assert!(gap.subscription_terminal().is_none());
     assert!(
         result
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::IrrecoverableGap))
     );
+    assert!(!result.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CommitSubscriberTerminal { .. } | Effect::ReadSubscriberTerminal { .. }
+    )));
+    assert!(
+        gap.step(Event::BeginSubscriberTerminal {
+            request_id: vec![44],
+            due: Time(1_000),
+        })
+        .rejection
+        .is_some()
+    );
+    assert!(gap.subscription_terminal().is_none());
 }
 
 #[test]

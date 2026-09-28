@@ -4,6 +4,17 @@ Groupnet is a **deterministic, leaderless coordination fabric** designed for dis
 
 Groupnet enables distributed databases, search engines, vector stores, and time‑series systems to implement shard‑level orchestration without embedding bespoke coordination logic or maintaining global consensus.
 
+Source-backed replay and native snapshots are opt-in through the
+`consistency-replication` feature. Its `with_event_complete` extension protects
+a stable named subscriber's native suffix at the source, applies sink effects
+durably before advancing the source acknowledgement, and uses a persistent
+per-name fence across process replacement. Local detach preserves source
+retention; explicit unsubscribe, finite source expiry, and `ResetAt` use a
+durable terminal tombstone. The source and sink supply their native durability
+and conditional transactions; Groupnet supplies the shared sans-IO session
+schedule. See [the subscription contract](replication-subscriptions.md) for
+the guarantees and implementation status.
+
 ---
 
 ## **1. System Model**

@@ -82,6 +82,9 @@ impl SessionEngine {
         self.proof = Some(proof);
         self.outstanding = None;
         self.operation_due = None;
+        if let Some(terminal) = self.maybe_commit_subscriber_terminal() {
+            return terminal;
+        }
         if ack_to_head == Comparison::Before {
             self.scan_subscriber()
         } else {
@@ -298,6 +301,9 @@ impl SessionEngine {
         self.operation_due = None;
         self.retries = 0;
         self.state.stage = Stage::Protected;
+        if let Some(terminal) = self.maybe_commit_subscriber_terminal() {
+            return terminal;
+        }
         self.poll_subscriber()
     }
 
@@ -380,6 +386,9 @@ impl SessionEngine {
         match self.retry_target {
             super::super::RetryTarget::SubscriptionTail => {
                 self.state.stage = Stage::Protected;
+                if let Some(terminal) = self.maybe_commit_subscriber_terminal() {
+                    return terminal;
+                }
                 self.poll_subscriber()
             }
             super::super::RetryTarget::SubscriptionAckRead => {

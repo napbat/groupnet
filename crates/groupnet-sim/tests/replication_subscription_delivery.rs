@@ -93,6 +93,7 @@ fn registered(session: u64, ordinal: u64, sink_at: u8) -> (SessionEngine, Regist
         },
         request_id: session.to_le_bytes().to_vec(),
         expected_prior_ordinal: None,
+        reset_from: None,
     };
     let start = engine.step(Event::StartSubscription {
         request: Box::new(request.clone()),

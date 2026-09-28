@@ -26,8 +26,9 @@ pub use api::{
 };
 pub use fence::{InstallPermit, OperationFence, RevocationPermit};
 pub use shell::{
-    EventSubscriptions, NamedSubscriptionHandle, NamedSubscriptionStatus, OpenError, Replication,
-    SessionHandle, SessionStatus, SubscriptionStart,
+    DetachedUnsubscribeError, EventSubscriptions, NamedSubscriptionHandle, NamedSubscriptionStatus,
+    OpenError, Replication, SessionHandle, SessionStatus, SubscriptionStart, TerminalInspectError,
+    UnsubscribeError,
 };
 pub use snapshot_api::{
     NativeSnapshot, ReplayOnly, SnapshotApplicationAdapter, SnapshotAttachment, SnapshotHold,

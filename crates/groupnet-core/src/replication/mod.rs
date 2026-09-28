@@ -28,7 +28,7 @@ pub use subscription::{
     CommitSubscriberAck, DurableDeliveryReceipt, FencedCheckpoint, RegisterReceipt,
     RegisterSubscriber, ResumeSubscriber, RetentionPolicy, SourceSubscriberState,
     SubscriberAckReceipt, SubscriberId, SubscriberKey, SubscriptionEpoch, SubscriptionError,
-    SubscriptionLimits,
+    SubscriptionLimits, TerminalReason, TerminalReceipt, TerminalRequest,
 };
 pub use types::{
     ApplyReceipt, Batch, Config, ConfigError, Effect, Event, Mode, Operation, ReadDecision,

@@ -21,6 +21,11 @@ impl SessionEngine {
     }
 
     fn tick_replay_progress(&mut self, now: Time) -> Step {
+        if self.subscriber_terminal_due().is_some_and(|due| now >= due)
+            && self.subscription_terminal().is_none()
+        {
+            return self.expire_subscriber_terminal();
+        }
         if self
             .snapshot_cleanup
             .as_ref()
@@ -42,6 +47,7 @@ impl SessionEngine {
                 | Stage::NeedsSnapshot
                 | Stage::SnapshotAborted
                 | Stage::IrrecoverableGap
+                | Stage::TerminatedSubscriber
         ) {
             return Step::ok(Vec::new());
         }
@@ -65,6 +71,7 @@ impl SessionEngine {
                     RetryTarget::SubscriptionTail | RetryTarget::SubscriptionAckRead => {
                         self.retry_subscription_delivery()
                     }
+                    RetryTarget::SubscriptionTerminalRead => self.retry_subscriber_terminal(),
                 };
             }
             return Step::ok(Vec::new());

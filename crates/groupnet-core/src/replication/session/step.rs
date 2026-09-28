@@ -12,6 +12,15 @@ impl SessionEngine {
     )]
     pub fn step(&mut self, event: Event) -> Step {
         match event {
+            Event::BeginSubscriberTerminal { request_id, due } => {
+                self.begin_subscriber_terminal(request_id, due)
+            }
+            Event::SubscriberTerminalCommitted { op, receipt } => {
+                self.subscriber_terminal_committed(op, *receipt)
+            }
+            Event::SubscriberTerminalRead { op, receipt } => {
+                self.subscriber_terminal_read(op, receipt.map(|r| *r))
+            }
             Event::PollSubscriber => self.poll_subscriber(),
             Event::SubscriberTail {
                 op,
@@ -34,6 +43,12 @@ impl SessionEngine {
             Event::ResumeSubscription { request, limits } => {
                 self.resume_subscription(*request, limits)
             }
+            Event::StartDetachedSubscriberTerminal {
+                key,
+                request_id,
+                due,
+                limits,
+            } => self.start_detached_subscriber_terminal(key, request_id, due, limits),
             Event::CurrentSubscriberRead { op, state } => {
                 self.current_subscriber_read(op, state.map(|s| *s))
             }
@@ -477,6 +492,9 @@ impl SessionEngine {
                 }
             }
             Event::Failed { op } => {
+                if let Some(result) = self.fail_subscriber_terminal(op) {
+                    return result;
+                }
                 if let Some(result) = self.fail_subscription_delivery(op) {
                     return result;
                 }

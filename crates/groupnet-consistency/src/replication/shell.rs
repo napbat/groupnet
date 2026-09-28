@@ -28,7 +28,8 @@ mod ack;
 mod event_complete;
 use ack::AckSlot;
 pub use event_complete::{
-    EventSubscriptions, NamedSubscriptionHandle, NamedSubscriptionStatus, SubscriptionStart,
+    DetachedUnsubscribeError, EventSubscriptions, NamedSubscriptionHandle, NamedSubscriptionStatus,
+    SubscriptionStart, TerminalInspectError, UnsubscribeError,
 };
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {

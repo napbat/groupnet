@@ -109,6 +109,7 @@ where
             state: self.engine.state().clone(),
             source_ack: self.engine.subscription_acknowledged().cloned(),
             failure: self.failure,
+            terminal: self.engine.subscription_terminal().cloned(),
         });
     }
 
@@ -134,6 +135,28 @@ where
 
     fn tick(&mut self) {
         let _ = self.step(Event::Tick(self.logical_now()));
+    }
+
+    fn command(&mut self, command: Option<NamedCommand>) -> bool {
+        match command {
+            None | Some(NamedCommand::Cancel) => {
+                self.shared.fence.retire();
+                self.step(Event::Cancel);
+                true
+            }
+            Some(NamedCommand::Unsubscribe { request_id, due }) => {
+                self.tick();
+                let logical_due = due
+                    .checked_duration_since(self.started)
+                    .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+                    .map_or(Time::ZERO, Time);
+                self.step(Event::BeginSubscriberTerminal {
+                    request_id,
+                    due: logical_due,
+                });
+                false
+            }
+        }
     }
 
     fn reply(&mut self, op: Operation, event: Event) {
@@ -215,29 +238,14 @@ where
     }
 
     fn source_failure(&mut self, op: Operation, error: &AdapterFailure<S::Error>) {
-        match error.class() {
-            FailureClass::Retryable => self.reply(op, Event::Failed { op }),
-            FailureClass::Terminal => {
-                self.failure = Some(FailureClass::Terminal);
-                self.reply(
-                    op,
-                    Event::SubscriberRejected {
-                        op,
-                        error: SubscriptionError::Unsupported,
-                    },
-                );
-            }
-            FailureClass::AuthorityLost => {
-                self.failure = Some(FailureClass::AuthorityLost);
-                self.reply(
-                    op,
-                    Event::SubscriberRejected {
-                        op,
-                        error: SubscriptionError::FenceLost,
-                    },
-                );
-            }
+        if error.class() != FailureClass::Retryable {
+            self.failure = Some(error.class());
         }
+        // A source failure never proves that a write was absent, including
+        // Terminal and AuthorityLost failures after a committed mutation.
+        // The core must reconcile the exact stable request before any
+        // conflicting terminal or registration decision.
+        self.reply(op, Event::Failed { op });
     }
 
     fn sink_failure(&mut self, op: Operation, error: &AdapterFailure<D::Error>) {
@@ -273,9 +281,11 @@ where
                 self.step(Event::Cancel);
                 break;
             }
-            if let Ok(NamedCommand::Cancel) = commands.try_recv() {
-                self.step(Event::Cancel);
-                break;
+            if let Ok(command) = commands.try_recv() {
+                if self.command(Some(command)) {
+                    break;
+                }
+                continue;
             }
             if let Some(effect) = self.effects.pop_front() {
                 self.execute(effect).await;
@@ -288,9 +298,7 @@ where
             if let Some(due) = due {
                 tokio::select! {
                     command = commands.recv() => {
-                        if command.is_none() || matches!(command, Some(NamedCommand::Cancel)) {
-                            self.shared.fence.retire();
-                            self.step(Event::Cancel);
+                        if self.command(command) {
                             break;
                         }
                     }
@@ -303,9 +311,7 @@ where
             } else {
                 tokio::select! {
                     command = commands.recv() => {
-                        if command.is_none() || matches!(command, Some(NamedCommand::Cancel)) {
-                            self.shared.fence.retire();
-                            self.step(Event::Cancel);
+                        if self.command(command) {
                             break;
                         }
                     }
@@ -331,7 +337,9 @@ where
             | Effect::ScanSubscriber { op, .. }
             | Effect::ApplySubscriberBatch { op, .. }
             | Effect::CommitSubscriberAck { op, .. }
-            | Effect::ReadSubscriberAck { op, .. } => *op,
+            | Effect::ReadSubscriberAck { op, .. }
+            | Effect::CommitSubscriberTerminal { op, .. }
+            | Effect::ReadSubscriberTerminal { op, .. } => *op,
             Effect::IrrecoverableGap | Effect::ArmTimer(_) => return,
             _ => {
                 self.failure = Some(FailureClass::Terminal);
@@ -386,6 +394,12 @@ where
             }
             Effect::ReadSubscriberAck { request, .. } => {
                 self.read_ack(op, *request, due).await;
+            }
+            Effect::CommitSubscriberTerminal { request, .. } => {
+                self.commit_terminal(op, *request, due).await;
+            }
+            Effect::ReadSubscriberTerminal { request, .. } => {
+                self.read_terminal(op, *request, due).await;
             }
             _ => {}
         }

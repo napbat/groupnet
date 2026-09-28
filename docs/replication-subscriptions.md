@@ -11,14 +11,24 @@ operation, and byte admission. A named session disables snapshot repair even
 when state-sync sessions in the same manager support snapshots.
 
 Local cancellation and `close_named_if` stop delivery and retain the durable
-source registration. Terminal unsubscribe, source expiry transitions, and
-explicit reset are the next slice; their contracts below remain required.
-Production retained-history adapters and consumer migration are unfinished.
-The initial seeded tests select crash, ambiguous-ack, and retention-gap
-scenarios. A queued fault simulation with independent durable ledgers follows
-with the lifecycle slice. This initial coverage is not a full delivery DST.
+source registration. A bounded `unsubscribe` conditionally writes and reads
+back an exact source tombstone; `unsubscribe_detached` does the same from a
+source-current durable ack without a healthy sink. Source expiry or a proven
+retention gap stops delivery immediately. A separate bounded terminal-ledger
+read exposes a source-certified tombstone, and `ResetAt` atomically compares it
+before claiming a new lineage with a higher persistent ordinal. Unknown
+terminal writes remain unconfirmed until exact readback. A queued 64-seed
+virtual-time test covers lost, delayed, duplicated and reordered delivery
+responses, crash after durable sink effects before source ack, higher-epoch
+resume, and healed progress without duplicate effects. Production
+retained-history adapters and consumer migration remain unfinished.
 
-Status: **accepted contract for the next implementation slice**. This refines
+A confirmed unsubscribe releases the named lineage's source retention. It
+does not roll back sink effects or prove that an already-issued remote sink
+transaction has quiesced; sink transactions must still enforce their durable
+epoch and previous-cursor conditions. Detached unsubscribe does no sink I/O.
+
+Status: **accepted contract with core and in-memory runtime implementation**. This refines
 [replication.md](replication.md#3-subscription-guarantees-and-retention). It
 adds an opt-in `EventComplete` capability above source-backed replay. It does
 not change the existing attach-at-head feed, make `StateSync` snapshots count

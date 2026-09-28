@@ -5,7 +5,8 @@ use std::future::Future;
 
 use groupnet_core::replication::{
     CommitSubscriberAck, FencedCheckpoint, RegisterReceipt, RegisterSubscriber, SourceProof,
-    SourceSubscriberState, SubscriberAckReceipt, SubscriberKey, SubscriptionError,
+    SourceSubscriberState, SubscriberAckReceipt, SubscriberKey, SubscriptionError, TerminalReceipt,
+    TerminalRequest,
 };
 
 use super::api::{AdapterFailure, ScanLimit, SourceAdapter, SourceBatch, TailLimit};
@@ -39,8 +40,10 @@ pub trait DurableSubscriptionSource: SourceAdapter {
         key: SubscriberKey,
     ) -> impl Future<Output = SubscriptionSourceResult<Option<SourceSubscriberState>, Self::Error>> + Send;
 
-    /// Atomically claims an absent name or compares both prior ordinal and
-    /// source ack before replacement, protecting the exact requested cursor.
+    /// Atomically claims an absent name, compares prior ordinal and ack for
+    /// resume, or compares an exact durable tombstone for explicit reset.
+    /// Reset must advance the persistent per-name ordinal even across native
+    /// source-history replacement; ledger loss is authority loss.
     fn register_subscriber(
         &self,
         request: RegisterSubscriber,
@@ -86,6 +89,28 @@ pub trait DurableSubscriptionSource: SourceAdapter {
         &self,
         request: CommitSubscriberAck,
     ) -> impl Future<Output = SubscriptionSourceResult<Option<SubscriberAckReceipt>, Self::Error>> + Send;
+
+    /// Atomically compares epoch and protected ack, then durably tombstones
+    /// this exact lineage before releasing source retention. A conditional
+    /// mismatch is a conclusive no-write result; ambiguity requires readback.
+    fn commit_subscriber_terminal(
+        &self,
+        request: TerminalRequest,
+    ) -> impl Future<Output = SubscriptionSourceResult<TerminalReceipt, Self::Error>> + Send;
+
+    /// Reads the exact original terminal request after an ambiguous result.
+    fn read_subscriber_terminal(
+        &self,
+        request: TerminalRequest,
+    ) -> impl Future<Output = SubscriptionSourceResult<Option<TerminalReceipt>, Self::Error>> + Send;
+
+    /// Reads the source-certified current terminal tombstone for a stable
+    /// name, if any. This metadata query grants no reset authority by itself;
+    /// the later conditional registration compares the exact durable receipt.
+    fn read_current_terminal(
+        &self,
+        key: SubscriberKey,
+    ) -> impl Future<Output = SubscriptionSourceResult<Option<TerminalReceipt>, Self::Error>> + Send;
 }
 
 /// Application transaction that fences an exact subscriber source epoch.

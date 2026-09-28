@@ -1,15 +1,16 @@
 //! Bounded named-subscription registry sharing `StateSync` operation admission.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use groupnet_core::replication::{
     Cursor, Event, Mode, RegisterSubscriber, ResumeSubscriber, RetentionPolicy, Scope,
-    SessionEngine, Stage, State, SubscriberId, SubscriberKey, SubscriptionLimits,
+    SessionEngine, Stage, State, SubscriberId, SubscriberKey, SubscriptionLimits, TerminalReceipt,
 };
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -20,7 +21,11 @@ use crate::replication::{
     ApplicationAdapter, DurableEventSink, DurableSubscriptionSource, FailureClass, OperationFence,
 };
 
+mod terminal_detached;
+mod terminal_inspect;
 mod worker;
+pub use terminal_detached::DetachedUnsubscribeError;
+pub use terminal_inspect::TerminalInspectError;
 
 /// Explicit durable subscriber start. Recovery never silently attaches at head.
 #[derive(Clone, Debug)]
@@ -41,6 +46,18 @@ pub enum SubscriptionStart<P> {
         /// Stable replacement request ID for ambiguous response readback.
         request_id: Vec<u8>,
     },
+    /// Reuse a terminated name only after presenting its exact durable
+    /// tombstone; the source must advance the persistent per-name fence.
+    ResetAt {
+        /// Explicit new native start, which may be in a new source history.
+        position: P,
+        /// Finite retention policy for the new lineage.
+        policy: RetentionPolicy,
+        /// Stable idempotency key for this conditional reset.
+        request_id: Vec<u8>,
+        /// Source-certified terminal predecessor of this exact name.
+        prior: Box<TerminalReceipt>,
+    },
 }
 
 /// Progress for one source-protected named subscriber.
@@ -54,6 +71,23 @@ pub struct NamedSubscriptionStatus<P> {
     pub sink_cursor: Option<P>,
     /// Terminal classified adapter failure, if any.
     pub failure: Option<FailureClass>,
+    /// Exact source-durable terminal tombstone, if unsubscribe completed.
+    pub terminal: Option<TerminalReceipt>,
+}
+
+/// Outcome of requesting a bounded source-durable unsubscribe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsubscribeError {
+    /// The request ID or deadline is invalid.
+    InvalidRequest,
+    /// Another command filled the bounded session queue.
+    Backpressured,
+    /// The local session was cancelled or closed before confirmation.
+    Cancelled,
+    /// The original deadline elapsed without exact source confirmation.
+    Unconfirmed,
+    /// Another terminal request completed for this name.
+    WrongRequest,
 }
 
 #[derive(Clone, Debug)]
@@ -61,16 +95,19 @@ struct NamedPublished {
     state: State,
     source_ack: Option<Cursor>,
     failure: Option<FailureClass>,
+    terminal: Option<TerminalReceipt>,
 }
 
 #[derive(Debug)]
 enum NamedCommand {
     Cancel,
+    Unsubscribe { request_id: Vec<u8>, due: Instant },
 }
 
 struct NamedShared {
     key: SubscriberKey,
     session_id: NonZeroU64,
+    max_request_bytes: usize,
     commands: mpsc::Sender<NamedCommand>,
     hints: Notify,
     published: watch::Receiver<NamedPublished>,
@@ -102,6 +139,7 @@ where
     sink: Arc<D>,
     limits: SubscriptionLimits,
     named: Mutex<HashMap<SubscriberKey, Arc<NamedShared>>>,
+    detached_terminal: Mutex<HashSet<SubscriberKey>>,
 }
 
 impl<S, A, D, M> fmt::Debug for EventSubscriptions<S, A, D, M>
@@ -146,6 +184,7 @@ where
             sink: Arc::new(sink),
             limits,
             named: Mutex::new(HashMap::new()),
+            detached_terminal: Mutex::new(HashSet::new()),
         })
     }
 }
@@ -195,7 +234,7 @@ where
             subscriber,
         };
         let mut registry = lock(&self.named);
-        if registry.contains_key(&key) {
+        if registry.contains_key(&key) || lock(&self.detached_terminal).contains(&key) {
             return Err(OpenError::AlreadyOpen);
         }
         // Event-complete recovery cannot replace missing events with a state
@@ -229,6 +268,7 @@ where
                         policy,
                         request_id,
                         expected_prior_ordinal: None,
+                        reset_from: None,
                     }),
                     limits: self.limits,
                 })
@@ -244,6 +284,31 @@ where
                     limits: self.limits,
                 })
             }
+            SubscriptionStart::ResetAt {
+                position,
+                policy,
+                request_id,
+                prior,
+            } => {
+                let cursor = self
+                    .replication
+                    .inner
+                    .source
+                    .cursor(scope, &position)
+                    .map_err(|_| OpenError::InvalidConfig)?;
+                engine.step(Event::StartSubscription {
+                    request: Box::new(RegisterSubscriber {
+                        key: key.clone(),
+                        incarnation: session_id,
+                        start: cursor,
+                        policy,
+                        request_id,
+                        expected_prior_ordinal: Some(prior.tombstone_ordinal),
+                        reset_from: Some(*prior),
+                    }),
+                    limits: self.limits,
+                })
+            }
         };
         if initial.rejection.is_some() {
             return Err(OpenError::InvalidConfig);
@@ -254,10 +319,12 @@ where
             state: engine.state().clone(),
             source_ack: None,
             failure: None,
+            terminal: None,
         });
         let shared = Arc::new(NamedShared {
             key: key.clone(),
             session_id,
+            max_request_bytes: self.limits.max_request_bytes,
             commands,
             hints: Notify::new(),
             published,
@@ -393,6 +460,67 @@ impl<S: DurableSubscriptionSource> NamedSubscriptionHandle<S> {
             source_ack: published.source_ack.as_ref().and_then(decode),
             sink_cursor: published.state.checkpoint.as_ref().and_then(decode),
             failure: published.failure,
+            terminal: published.terminal,
+        }
+    }
+
+    /// Durably relinquishes this exact source registration by a stable request.
+    /// A timeout is unconfirmed: source readback of the same ID may still prove
+    /// a committed tombstone, and no caller may assume rollback.
+    ///
+    /// # Errors
+    /// Returns invalid request, bounded queue backpressure, cancellation, or
+    /// an unconfirmed deadline instead of claiming source retention release.
+    pub async fn unsubscribe(
+        &self,
+        request_id: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<TerminalReceipt, UnsubscribeError> {
+        if request_id.is_empty()
+            || request_id.len() > self.shared.max_request_bytes
+            || deadline <= Instant::now()
+        {
+            return Err(UnsubscribeError::InvalidRequest);
+        }
+        if self.shared.cancelled.load(Ordering::Acquire) {
+            return Err(UnsubscribeError::Cancelled);
+        }
+        let mut updates = self.shared.published.clone();
+        self.shared
+            .commands
+            .try_send(NamedCommand::Unsubscribe {
+                request_id: request_id.clone(),
+                due: deadline,
+            })
+            .map_err(|_| UnsubscribeError::Backpressured)?;
+        loop {
+            let current = updates.borrow().clone();
+            if let Some(receipt) = current.terminal {
+                return if receipt.request.request_id == request_id {
+                    Ok(receipt)
+                } else {
+                    Err(UnsubscribeError::WrongRequest)
+                };
+            }
+            if self.shared.cancelled.load(Ordering::Acquire) {
+                return Err(UnsubscribeError::Cancelled);
+            }
+            if matches!(
+                current.state.stage,
+                Stage::RetryExhausted | Stage::IrrecoverableGap
+            ) {
+                return Err(UnsubscribeError::Unconfirmed);
+            }
+            if !matches!(
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    updates.changed()
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                return Err(UnsubscribeError::Unconfirmed);
+            }
         }
     }
 

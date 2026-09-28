@@ -246,6 +246,8 @@ where
                 | Effect::ApplySubscriberBatch { op, .. }
                 | Effect::CommitSubscriberAck { op, .. }
                 | Effect::ReadSubscriberAck { op, .. }
+                | Effect::CommitSubscriberTerminal { op, .. }
+                | Effect::ReadSubscriberTerminal { op, .. }
                 | Effect::ReadCurrentSubscriber { op, .. }
                 | Effect::RegisterSubscriber { op, .. }
                 | Effect::ReadSubscriberRegistration { op, .. }
@@ -817,6 +819,8 @@ where
             | Effect::ApplySubscriberBatch { .. }
             | Effect::CommitSubscriberAck { .. }
             | Effect::ReadSubscriberAck { .. }
+            | Effect::CommitSubscriberTerminal { .. }
+            | Effect::ReadSubscriberTerminal { .. }
             | Effect::ReadCurrentSubscriber { .. }
             | Effect::RegisterSubscriber { .. }
             | Effect::ReadSubscriberRegistration { .. }

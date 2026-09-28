@@ -11,17 +11,22 @@ use crate::replication::{
 mod delivery;
 #[cfg(test)]
 mod delivery_tests;
+mod terminal;
+#[cfg(test)]
+mod terminal_tests;
 
 /// Bounded metadata for one registered `EventComplete` source/sink lineage.
 #[derive(Clone, Debug)]
 pub(super) struct Progress {
     request: Option<RegisterSubscriber>,
     resume: Option<ResumeSubscriber>,
+    detached_key: Option<crate::replication::SubscriberKey>,
     limits: SubscriptionLimits,
     registration: Option<RegisterReceipt>,
     sink: Option<FencedCheckpoint>,
     source_ack: Option<Cursor>,
     pending_ack: Option<CommitSubscriberAck>,
+    terminal: Option<terminal::TerminalProgress>,
 }
 
 impl SessionEngine {
@@ -64,11 +69,13 @@ impl SessionEngine {
         self.subscription = Some(Progress {
             request: Some(request.clone()),
             resume: None,
+            detached_key: None,
             limits,
             registration: None,
             sink: None,
             source_ack: None,
             pending_ack: None,
+            terminal: None,
         });
         self.protocol = SessionProtocol::NamedSubscription;
         Step::ok(vec![
@@ -107,11 +114,13 @@ impl SessionEngine {
         self.subscription = Some(Progress {
             request: None,
             resume: Some(request),
+            detached_key: None,
             limits,
             registration: None,
             sink: None,
             source_ack: None,
             pending_ack: None,
+            terminal: None,
         });
         self.protocol = SessionProtocol::NamedSubscription;
         Step::ok(vec![
@@ -131,6 +140,9 @@ impl SessionEngine {
         let Some(progress) = self.subscription.as_ref() else {
             return Step::reject(Reject::Stage);
         };
+        if progress.detached_key.is_some() {
+            return self.detached_subscriber_current_read(op, state);
+        }
         let Some(resume) = progress.resume.as_ref() else {
             return Step::reject(Reject::Stage);
         };
@@ -143,6 +155,11 @@ impl SessionEngine {
         if let Err(error) =
             state.validate_against(resume, self.config.max_cursor_bytes, progress.limits)
         {
+            if error == SubscriptionError::HistoryUnavailable {
+                self.state.stage = Stage::IrrecoverableGap;
+                self.outstanding = None;
+                self.operation_due = None;
+            }
             return Step::reject(Reject::Subscription(error));
         }
         let request = RegisterSubscriber {
@@ -152,6 +169,7 @@ impl SessionEngine {
             policy: resume.policy.clone(),
             request_id: resume.request_id.clone(),
             expected_prior_ordinal: Some(state.epoch.ordinal),
+            reset_from: None,
         };
         if let Some(progress) = self.subscription.as_mut() {
             progress.request = Some(request.clone());
@@ -189,6 +207,8 @@ impl SessionEngine {
                     | Stage::ApplyingSubscriber
                     | Stage::AckingSubscriber
                     | Stage::ReadingSubscriberAck
+                    | Stage::TerminatingSubscriber
+                    | Stage::ReadingSubscriberTerminal
             )
             || self.subscription.is_none()
         {
@@ -340,6 +360,9 @@ impl SessionEngine {
         self.operation_due = None;
         self.retry_due = None;
         self.retries = 0;
+        if let Some(terminal) = self.maybe_commit_subscriber_terminal() {
+            return terminal;
+        }
         Step::ok(vec![Effect::ArmTimer(self.now)])
     }
 
@@ -389,18 +412,20 @@ impl SessionEngine {
     pub(super) fn retry_subscription(&mut self) -> Step {
         match self.retry_target {
             RetryTarget::SubscriptionCurrentRead => {
-                let Some(key) = self
-                    .subscription
-                    .as_ref()
-                    .and_then(|p| p.resume.as_ref())
-                    .map(|resume| resume.key.clone())
-                else {
+                let Some(key) = self.subscription.as_ref().and_then(|p| {
+                    p.detached_key
+                        .clone()
+                        .or_else(|| p.resume.as_ref().map(|resume| resume.key.clone()))
+                }) else {
                     return Step::reject(Reject::Stage);
                 };
                 let Ok(op) = self.issue(Stage::ReadingCurrentSubscriber) else {
                     self.state.stage = Stage::RetryExhausted;
                     return Step::reject(Reject::Exhausted);
                 };
+                if let Some(due) = self.subscriber_terminal_due() {
+                    self.operation_due = self.operation_due.map(|operation| operation.min(due));
+                }
                 Step::ok(vec![
                     Effect::ReadCurrentSubscriber { op, key },
                     Effect::ArmTimer(self.operation_due.expect("issued deadline")),
@@ -449,7 +474,8 @@ impl SessionEngine {
             RetryTarget::Tail
             | RetryTarget::Bootstrap
             | RetryTarget::SubscriptionTail
-            | RetryTarget::SubscriptionAckRead => Step::reject(Reject::Stage),
+            | RetryTarget::SubscriptionAckRead
+            | RetryTarget::SubscriptionTerminalRead => Step::reject(Reject::Stage),
         }
     }
 }
@@ -514,6 +540,7 @@ mod tests {
             },
             request_id: vec![4],
             expected_prior_ordinal: None,
+            reset_from: None,
         }
     }
 
@@ -540,7 +567,7 @@ mod tests {
         }
     }
 
-    fn source_state(request: &RegisterSubscriber) -> SourceSubscriberState {
+    pub(super) fn source_state(request: &RegisterSubscriber) -> SourceSubscriberState {
         SourceSubscriberState {
             key: request.key.clone(),
             epoch: SubscriptionEpoch {
@@ -795,5 +822,42 @@ mod tests {
         );
         assert_eq!(engine.state.stage, Stage::RetryExhausted);
         assert!(engine.next_deadline().is_none());
+    }
+
+    #[test]
+    fn resume_with_certified_retention_gap_stops_without_registering_or_reset_authority() {
+        let mut engine = engine();
+        let original = request();
+        let begin = engine.step(Event::ResumeSubscription {
+            request: Box::new(ResumeSubscriber {
+                key: original.key.clone(),
+                incarnation: NonZeroU64::new(4).expect("nonzero"),
+                policy: original.policy.clone(),
+                request_id: vec![5],
+            }),
+            limits: SubscriptionLimits::default(),
+        });
+        let read = begin
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ReadCurrentSubscriber { op, .. } => Some(*op),
+                _ => None,
+            })
+            .expect("source current read");
+        let mut current = source_state(&original);
+        current.proof.retained_from = cursor(2);
+        current.retained_to_ack = comparison(cursor(2), cursor(1), Comparison::After);
+        let stopped = engine.step(Event::CurrentSubscriberRead {
+            op: read,
+            state: Some(Box::new(current)),
+        });
+        assert_eq!(
+            stopped.rejection,
+            Some(Reject::Subscription(SubscriptionError::HistoryUnavailable))
+        );
+        assert_eq!(engine.state.stage, Stage::IrrecoverableGap);
+        assert!(stopped.effects.is_empty());
+        assert!(engine.subscription_terminal().is_none());
     }
 }

@@ -7,7 +7,9 @@ use super::{
 };
 
 mod delivery;
+mod terminal;
 pub use delivery::{CommitSubscriberAck, DurableDeliveryReceipt, SubscriberAckReceipt};
+pub use terminal::{TerminalReason, TerminalReceipt, TerminalRequest};
 
 /// Stable subscriber name within an exact native source scope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -163,6 +165,9 @@ pub struct RegisterSubscriber {
     /// compare its current durable ack to `start` atomically; `None` claims
     /// an absent key for `StartAt`.
     pub expected_prior_ordinal: Option<NonZeroU64>,
+    /// Explicit source-durable terminal predecessor for a reset. The source
+    /// must compare this tombstone atomically with its per-name fence ledger.
+    pub reset_from: Option<TerminalReceipt>,
 }
 
 /// Resume a stable name from its source-authoritative durable ack cursor.
@@ -217,7 +222,17 @@ impl RegisterSubscriber {
         )?;
         self.start
             .validate(&self.key.scope, max_cursor_bytes)
-            .map_err(SubscriptionError::Identity)
+            .map_err(SubscriptionError::Identity)?;
+        if let Some(prior) = &self.reset_from {
+            prior.request.validate(max_cursor_bytes, limits)?;
+            prior.validate_against(&prior.request)?;
+            if prior.request.key != self.key
+                || self.expected_prior_ordinal != Some(prior.tombstone_ordinal)
+            {
+                return Err(SubscriptionError::Binding);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -289,32 +304,88 @@ impl SourceSubscriberState {
         if self.key != request.key || self.policy_fingerprint != request.policy.fingerprint {
             return Err(SubscriptionError::Binding);
         }
+        self.validate_current(&request.key, max_cursor_bytes, limits)
+    }
+
+    /// Checks one source-current name and protected ack without needing a
+    /// sink or a policy chosen by a restarting process.
+    ///
+    /// # Errors
+    /// Returns a binding, history, identity, or bounds error on contradiction.
+    pub fn validate_current(
+        &self,
+        key: &SubscriberKey,
+        max_cursor_bytes: usize,
+        limits: SubscriptionLimits,
+    ) -> Result<(), SubscriptionError> {
+        self.validate_current_with_gap(key, max_cursor_bytes, limits, false)
+    }
+
+    /// Checks an exact source-current epoch and ack for conditional terminal
+    /// release. A retained-event gap does not prevent relinquishing this
+    /// lineage; it still forbids `EventComplete` replay or resume.
+    ///
+    /// # Errors
+    /// Returns invalid or unbound source-current metadata.
+    pub fn validate_terminal_target(
+        &self,
+        key: &SubscriberKey,
+        max_cursor_bytes: usize,
+        limits: SubscriptionLimits,
+    ) -> Result<(), SubscriptionError> {
+        self.validate_current_with_gap(key, max_cursor_bytes, limits, true)
+    }
+
+    fn validate_current_with_gap(
+        &self,
+        key: &SubscriberKey,
+        max_cursor_bytes: usize,
+        limits: SubscriptionLimits,
+        allow_gap: bool,
+    ) -> Result<(), SubscriptionError> {
+        key.scope
+            .validate(max_cursor_bytes)
+            .map_err(SubscriptionError::Identity)?;
+        if self.key != *key {
+            return Err(SubscriptionError::Binding);
+        }
+        if !limits.valid()
+            || key.subscriber.name.is_empty()
+            || key.subscriber.name.len() > limits.max_subscriber_bytes
+            || self.policy_fingerprint.is_empty()
+            || self.policy_fingerprint.len() > limits.max_policy_bytes
+        {
+            return Err(SubscriptionError::Bounds);
+        }
         if self.epoch.native.is_empty() || self.epoch.native.len() > limits.max_epoch_bytes {
             return Err(SubscriptionError::Bounds);
         }
         self.acknowledged
-            .validate(&request.key.scope, max_cursor_bytes)
+            .validate(&key.scope, max_cursor_bytes)
             .map_err(SubscriptionError::Identity)?;
         self.proof
-            .validate(&request.key.scope, max_cursor_bytes)
+            .validate(&key.scope, max_cursor_bytes)
             .map_err(SubscriptionError::Identity)?;
         if self.epoch.history != self.acknowledged.history
             || self.proof.head.history != self.acknowledged.history
         {
             return Err(SubscriptionError::History);
         }
-        if !matches!(
-            self.retained_to_ack.for_operands(
-                &self.proof.retained_from,
-                &self.acknowledged,
-                &self.proof.id,
-            ),
-            Some(Comparison::Before | Comparison::Equal)
-        ) || !matches!(
-            self.ack_to_head
-                .for_operands(&self.acknowledged, &self.proof.head, &self.proof.id,),
-            Some(Comparison::Before | Comparison::Equal)
-        ) {
+        let retained_to_ack = self.retained_to_ack.for_operands(
+            &self.proof.retained_from,
+            &self.acknowledged,
+            &self.proof.id,
+        );
+        if retained_to_ack == Some(Comparison::After) && !allow_gap {
+            return Err(SubscriptionError::HistoryUnavailable);
+        }
+        if retained_to_ack.is_none()
+            || !matches!(
+                self.ack_to_head
+                    .for_operands(&self.acknowledged, &self.proof.head, &self.proof.id,),
+                Some(Comparison::Before | Comparison::Equal)
+            )
+        {
             return Err(SubscriptionError::Binding);
         }
         Ok(())
@@ -470,6 +541,7 @@ mod tests {
             },
             request_id: vec![3],
             expected_prior_ordinal: None,
+            reset_from: None,
         }
     }
 

@@ -21,6 +21,7 @@ enum RetryTarget {
     SubscriptionBind,
     SubscriptionTail,
     SubscriptionAckRead,
+    SubscriptionTerminalRead,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +225,10 @@ impl SessionEngine {
             ordinary,
             self.snapshot.as_ref().map(|snapshot| snapshot.total_due),
         ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) | (None, a) => a,
+        };
+        let ordinary = match (ordinary, self.subscriber_terminal_due()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, None) | (None, a) => a,
         };

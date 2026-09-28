@@ -23,8 +23,17 @@ retention hold and a guarded application install; replay-only adapters keep
 their existing API. Named waits pin a bounded source-certified roster and
 return a target-bound invalidation or materialization outcome; they do not
 register durable subscribers. Optional idle backoff reduces source checks on
-quiet scopes while preserving the original proof-freshness gate. Durable
-subscriptions and consumer migrations remain in development. Contracts and implementation status are in
+quiet scopes while preserving the original proof-freshness gate. The optional
+`with_event_complete` capability registers source-protected named subscribers
+through `StartAt` or `ResumeExisting`; sink effects and cursors become durable
+before the source ack advances. Local `cancel` or `close_named_if` only detaches
+the worker. `unsubscribe` needs a durable source tombstone to release retention,
+and `ResetAt` requires that exact receipt and a strictly newer per-name fence.
+For example, an adapter-backed manager can call
+`replication.with_event_complete(sink, SubscriptionLimits::default())?`, then
+`open_named(&scope, subscriber, incarnation, SubscriptionStart::StartAt { position, policy, request_id })?`.
+Production source adapters and consumer migrations remain in development.
+Contracts and implementation status are in
 [`docs/replication.md`](docs/replication.md).
 
 > Status: early scaffold. The architecture and public API are in place with a
