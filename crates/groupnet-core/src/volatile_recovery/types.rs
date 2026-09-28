@@ -58,6 +58,29 @@ impl RecoveryConfig {
     }
 }
 
+/// Optional spacing between exhausted full recovery episodes.
+/// Individual operations inside an episode still retry on `RecoveryConfig::poll_ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryRearm {
+    /// Delay after the first exhausted episode.
+    pub initial_ms: u64,
+    /// Inclusive cap on later doubled delays.
+    pub max_ms: u64,
+}
+
+impl RecoveryRearm {
+    /// Rejects absent or inverted delay bounds before a recovery event starts.
+    ///
+    /// # Errors
+    /// Returns [`RecoveryError::InvalidConfig`] for an invalid policy.
+    pub fn validate(self) -> Result<Self, RecoveryError> {
+        if self.initial_ms == 0 || self.max_ms < self.initial_ms {
+            return Err(RecoveryError::InvalidConfig);
+        }
+        Ok(self)
+    }
+}
+
 /// Epoch-major renewal or write-feed position native to the existing fabric.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Mark {
@@ -149,8 +172,15 @@ pub struct RecoveryState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryEvent {
     /// Explicitly start or reopen a cold origin-index build with serving closed.
-    /// After `Cancel`, no gap or lapse can reopen without this event.
+    /// `Cancel` is terminal even for an explicit restart.
     Start,
+    /// Explicit restart coalesced with a newly observed lapse or feed gap.
+    /// The full rebuild covers at least this lapse counter and begins now,
+    /// even when an automatic rearm cooldown is pending.
+    StartWithLapses {
+        /// Latest local serve-lease lapse counter to cover.
+        lapses: u64,
+    },
     /// A volatile feed gap requires immediate invalidation and origin rebuild.
     FeedGap {
         /// Latest local serve-lease lapse counter covered by this invalidation.

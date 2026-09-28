@@ -87,8 +87,8 @@ watermark and generation advance together on gap fallback, so a lapse and
 its covering gap do not start duplicate origin rescans. Cancel, supersede,
 timeout, and token exhaustion fail closed. Effect admission and application
 callbacks have bounded deadlines and correlation; late completions cannot
-reopen serving. Cancel is terminal for automatic gap/lapse signals; only an
-explicit `Start` begins a new full rebuild. No whole-fleet barrier is imposed
+reopen serving. Cancel is terminal for that session, including an explicit
+`Start`; reopening requires a new session. No whole-fleet barrier is imposed
 on ordinary reads or writes.
 
 The API should expose a small core `RecoveryConfig`, `RecoveryEvent`,

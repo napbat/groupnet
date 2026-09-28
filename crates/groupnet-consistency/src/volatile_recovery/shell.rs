@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use groupnet_core::volatile_recovery::{
     Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryEngine, RecoveryError, RecoveryEvent,
-    RecoveryMode, RecoveryOperation, RecoveryState,
+    RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryState, RecoveryStep,
 };
 use groupnet_core::{NodeId, Time};
 use tokio::sync::Notify;
@@ -94,6 +94,33 @@ struct Pending {
     gap: bool,
     lapse: u64,
     cancel: bool,
+}
+
+fn pending_event(pending: Pending) -> RecoveryEvent {
+    if pending.cancel {
+        RecoveryEvent::Cancel
+    } else if pending.start {
+        RecoveryEvent::StartWithLapses {
+            lapses: pending.lapse,
+        }
+    } else if pending.gap {
+        RecoveryEvent::FeedGap {
+            lapses: pending.lapse,
+        }
+    } else {
+        RecoveryEvent::LeaseLapse {
+            count: pending.lapse,
+        }
+    }
+}
+
+fn signal_effects(tick: RecoveryStep, transition: RecoveryStep) -> Vec<RecoveryEffect> {
+    // A no-op signal must not erase a newly due timer's recovery work.
+    if transition.effects.is_empty() {
+        tick.effects
+    } else {
+        transition.effects
+    }
 }
 
 struct Shared<A> {
@@ -210,6 +237,10 @@ impl<A: RecoveryAdapter> Shared<A> {
         control.open = false;
         control.operation = None;
         control.terminal |= terminal;
+        if terminal {
+            control.pending.cancel = true;
+            self.notify.notify_one();
+        }
         self.adapter.revoke_serving();
     }
 }
@@ -333,11 +364,47 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
         me: NodeId,
         session: u64,
     ) -> Result<Self, RecoveryOpenError> {
-        let engine =
+        Self::open_configured(adapter, config, mode, me, session, None)
+    }
+
+    /// Opens a closed driver with capped automatic full recovery after an
+    /// exhausted episode. The policy does not change any individual attempt's
+    /// `RecoveryConfig::total_ms` or source authority.
+    ///
+    /// # Errors
+    /// Rejects invalid policy bounds, platform clock range, or no executor.
+    pub fn open_with_rearm(
+        adapter: Arc<A>,
+        config: RecoveryConfig,
+        mode: RecoveryMode,
+        me: NodeId,
+        session: u64,
+        rearm: RecoveryRearm,
+    ) -> Result<Self, RecoveryOpenError> {
+        Self::open_configured(adapter, config, mode, me, session, Some(rearm))
+    }
+
+    fn open_configured(
+        adapter: Arc<A>,
+        config: RecoveryConfig,
+        mode: RecoveryMode,
+        me: NodeId,
+        session: u64,
+        rearm: Option<RecoveryRearm>,
+    ) -> Result<Self, RecoveryOpenError> {
+        let mut engine =
             RecoveryEngine::new(config, mode, me, session).map_err(RecoveryOpenError::Core)?;
-        if Instant::now()
+        if let Some(policy) = rearm {
+            engine = engine.with_rearm(policy).map_err(RecoveryOpenError::Core)?;
+        }
+        let now = Instant::now();
+        if now
             .checked_add(Duration::from_millis(config.total_ms))
             .is_none()
+            || rearm.is_some_and(|policy| {
+                now.checked_add(Duration::from_millis(policy.max_ms))
+                    .is_none()
+            })
         {
             return Err(RecoveryOpenError::ClockRange);
         }
@@ -428,6 +495,16 @@ fn absolute_deadline(started: Instant, due: Time) -> Option<Instant> {
     started.checked_add(Duration::from_millis(due.0))
 }
 
+fn terminal_deadline<A: RecoveryAdapter>(
+    shared: &Shared<A>,
+    deadline: Option<Instant>,
+) -> Option<Instant> {
+    if deadline.is_none() {
+        shared.force_close(true);
+    }
+    deadline
+}
+
 fn affirm_effect<A: RecoveryAdapter>(
     shared: &Shared<A>,
     engine: &mut RecoveryEngine,
@@ -442,7 +519,7 @@ fn affirm_effect<A: RecoveryAdapter>(
     let Some(due) = engine.next_deadline() else {
         return Vec::new();
     };
-    let Some(deadline) = absolute_deadline(started, due) else {
+    let Some(deadline) = terminal_deadline(shared, absolute_deadline(started, due)) else {
         return Vec::new();
     };
     let mut control = lock(&shared.control);
@@ -487,22 +564,10 @@ async fn run<A: RecoveryAdapter>(
             active_version = version;
             // External signals can arrive after an arbitrarily long ready
             // interval. Start their finite deadlines at this actual time.
-            let _ = engine.step(RecoveryEvent::Tick(logical_now(started)));
-            let event = if pending.cancel {
-                RecoveryEvent::Cancel
-            } else if pending.gap || (pending.start && pending.lapse > 0) {
-                RecoveryEvent::FeedGap {
-                    lapses: pending.lapse,
-                }
-            } else if pending.start {
-                RecoveryEvent::Start
-            } else {
-                RecoveryEvent::LeaseLapse {
-                    count: pending.lapse,
-                }
-            };
+            let tick = engine.step(RecoveryEvent::Tick(logical_now(started)));
+            let transition = engine.step(pending_event(pending));
             effects.clear();
-            effects.extend(engine.step(event).effects);
+            effects.extend(signal_effects(tick, transition));
             lock(&shared.control).state = engine.state();
             if pending.cancel {
                 lock(&shared.control).pending.cancel = true;
@@ -533,11 +598,13 @@ async fn run<A: RecoveryAdapter>(
                     if !engine.accepts_operation(op) {
                         continue;
                     }
-                    let Some(due) = engine
-                        .next_deadline()
-                        .and_then(|due| absolute_deadline(started, due))
-                    else {
-                        continue;
+                    let Some(due) = terminal_deadline(
+                        &shared,
+                        engine
+                            .next_deadline()
+                            .and_then(|due| absolute_deadline(started, due)),
+                    ) else {
+                        return;
                     };
                     let Some(permit) = shared.permit(op, active_version, due) else {
                         continue;
@@ -573,11 +640,13 @@ async fn run<A: RecoveryAdapter>(
                     if !engine.accepts_operation(op) {
                         continue;
                     }
-                    let Some(due) = engine
-                        .next_deadline()
-                        .and_then(|due| absolute_deadline(started, due))
-                    else {
-                        continue;
+                    let Some(due) = terminal_deadline(
+                        &shared,
+                        engine
+                            .next_deadline()
+                            .and_then(|due| absolute_deadline(started, due)),
+                    ) else {
+                        return;
                     };
                     let Some(permit) = shared.permit(op, active_version, due) else {
                         continue;
@@ -692,10 +761,12 @@ async fn run<A: RecoveryAdapter>(
             shared.notify.notified().await;
             continue;
         };
-        let delay = due.0.saturating_sub(logical_now(started).0);
+        let Some(deadline) = terminal_deadline(&shared, absolute_deadline(started, due)) else {
+            return;
+        };
         tokio::select! {
             () = shared.notify.notified() => {}
-            () = tokio::time::sleep(Duration::from_millis(delay)) => {
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 effects.extend(engine.step(RecoveryEvent::Tick(logical_now(started))).effects);
                 lock(&shared.control).state = engine.state();
             }
@@ -711,7 +782,7 @@ async fn await_operation<A: RecoveryAdapter, T>(
     future: BoxRecoveryFuture<'_, T>,
 ) -> Option<T> {
     let due = engine.next_deadline()?;
-    let deadline = absolute_deadline(started, due)?;
+    let deadline = terminal_deadline(shared, absolute_deadline(started, due))?;
     tokio::pin!(future);
     loop {
         let delay = deadline.saturating_duration_since(Instant::now());
@@ -730,243 +801,4 @@ async fn await_operation<A: RecoveryAdapter, T>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[derive(Debug, Default)]
-    struct Adapter(AtomicUsize);
-
-    impl RecoveryAdapter for Adapter {
-        fn revoke_serving(&self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn invalidate(
-            &self,
-            _op: RecoveryOperation,
-            _distrust_bodies: bool,
-            _permit: PublicationPermit,
-        ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn rebuild_origin(
-            &self,
-            _op: RecoveryOperation,
-            _permit: PublicationPermit,
-        ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn observe_peers(
-            &self,
-            _op: RecoveryOperation,
-            _limits: RecoveryConfig,
-        ) -> BoxRecoveryFuture<'_, PeerObservation> {
-            Box::pin(async { Err(AdapterError) })
-        }
-
-        fn wait_frontiers(
-            &self,
-            _op: RecoveryOperation,
-            _heads: Vec<(NodeId, Mark)>,
-        ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-            Box::pin(async { Err(AdapterError) })
-        }
-
-        fn affirm(&self, _op: RecoveryOperation) -> bool {
-            true
-        }
-    }
-
-    fn shared() -> Arc<Shared<Adapter>> {
-        let config = RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
-            total_ms: 100,
-            attempt_ms: 20,
-            settle_ms: 1,
-            poll_ms: 1,
-        };
-        let state = RecoveryEngine::new(config, RecoveryMode::Unleased, NodeId::from("me"), 1)
-            .unwrap()
-            .state();
-        Arc::new(Shared {
-            adapter: Arc::new(Adapter::default()),
-            mode: RecoveryMode::Unleased,
-            control: Arc::new(Mutex::new(Control {
-                version: 1,
-                open: true,
-                state,
-                operation: None,
-                pending: Pending::default(),
-                terminal: false,
-            })),
-            handles: AtomicUsize::new(1),
-            notify: Notify::new(),
-        })
-    }
-
-    #[test]
-    fn later_signal_cannot_be_adopted_by_older_close_gate() {
-        let shared = shared();
-        let drained_version = lock(&shared.control).version;
-        shared.signal(Signal::Gap(3)).unwrap();
-        assert_eq!(shared.close(drained_version), None);
-        let control = lock(&shared.control);
-        assert_eq!(control.version, 2);
-        assert!(control.pending.gap);
-        assert_eq!(control.pending.lapse, 3);
-        assert!(!control.open);
-        assert_eq!(shared.adapter.0.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn expired_publication_permit_refuses_page_before_worker_tick() {
-        let shared = shared();
-        let op = RecoveryOperation {
-            session: 1,
-            generation: 1,
-            token: 1,
-        };
-        let expired = PublicationPermit {
-            control: Arc::clone(&shared.control),
-            version: 1,
-            operation: op,
-            deadline: Instant::now(),
-        };
-        lock(&shared.control).operation = Some(op);
-        assert!(!expired.valid());
-        assert_eq!(expired.publish(|| 7), None);
-    }
-
-    #[test]
-    fn cancel_stays_terminal_after_worker_drains_pending_slot() {
-        let shared = shared();
-        shared.signal(Signal::Cancel).unwrap();
-        let drained = std::mem::take(&mut lock(&shared.control).pending);
-        assert!(drained.cancel);
-        assert_eq!(shared.signal(Signal::Start), Err(RecoveryError::Stage));
-        assert_eq!(shared.signal(Signal::Gap(1)), Err(RecoveryError::Stage));
-        assert!(!lock(&shared.control).open);
-    }
-
-    #[test]
-    fn unexpected_worker_exit_refuses_new_signals() {
-        let shared = shared();
-        shared.force_close(true);
-        assert_eq!(shared.signal(Signal::Gap(1)), Err(RecoveryError::Stage));
-        assert!(!lock(&shared.control).open);
-    }
-
-    #[test]
-    fn close_gate_counter_exhaustion_terminally_rejects_old_work() {
-        let shared = shared();
-        lock(&shared.control).version = u64::MAX;
-        assert_eq!(shared.close(u64::MAX), None);
-        let op = RecoveryOperation {
-            session: 1,
-            generation: 1,
-            token: 1,
-        };
-        assert!(
-            shared
-                .permit(op, u64::MAX, Instant::now() + Duration::from_secs(1))
-                .is_none()
-        );
-        let control = lock(&shared.control);
-        assert!(control.terminal && control.pending.cancel);
-        assert!(!control.open);
-    }
-
-    #[test]
-    fn open_without_executor_returns_typed_error() {
-        let adapter = Arc::new(Adapter::default());
-        let config = RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
-            total_ms: 100,
-            attempt_ms: 20,
-            settle_ms: 1,
-            poll_ms: 1,
-        };
-        assert_eq!(
-            RecoveryHandle::open(
-                adapter,
-                config,
-                RecoveryMode::Unleased,
-                NodeId::from("me"),
-                1
-            )
-            .err(),
-            Some(RecoveryOpenError::NoRuntime)
-        );
-    }
-
-    #[test]
-    fn affirmation_expiring_during_callback_never_opens_gate() {
-        let shared = shared();
-        let config = RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
-            total_ms: 100,
-            attempt_ms: 20,
-            settle_ms: 1,
-            poll_ms: 1,
-        };
-        let mut engine =
-            RecoveryEngine::new(config, RecoveryMode::Unleased, NodeId::from("me"), 1).unwrap();
-        let start = engine.step(RecoveryEvent::Start);
-        let invalidation = start
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                RecoveryEffect::Invalidate { op, .. } => Some(*op),
-                _ => None,
-            })
-            .unwrap();
-        let rebuild = engine.step(RecoveryEvent::Invalidated { op: invalidation });
-        let rebuild_op = rebuild
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                RecoveryEffect::RebuildOrigin { op } => Some(*op),
-                _ => None,
-            })
-            .unwrap();
-        let affirm = engine.step(RecoveryEvent::Materialized { op: rebuild_op });
-        let affirm_op = affirm
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                RecoveryEffect::Affirm { op } => Some(*op),
-                _ => None,
-            })
-            .unwrap();
-        let started = Instant::now();
-        let deadline = absolute_deadline(started, engine.next_deadline().unwrap()).unwrap();
-        let calls = std::cell::Cell::new(0);
-        let effects = affirm_effect(&shared, &mut engine, started, 1, affirm_op, || {
-            let call = calls.get();
-            calls.set(call + 1);
-            if call == 0 {
-                deadline.checked_sub(Duration::from_millis(1)).unwrap()
-            } else {
-                deadline
-            }
-        });
-        assert!(calls.get() >= 2);
-        assert!(!lock(&shared.control).open);
-        assert!(!engine.state().recovered);
-        assert!(shared.adapter.0.load(Ordering::SeqCst) >= 1);
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, RecoveryEffect::ArmTimer(_)))
-        );
-    }
-}
+mod tests;

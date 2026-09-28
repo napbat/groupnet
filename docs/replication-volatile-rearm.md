@@ -1,6 +1,6 @@
 # Optional rearm for volatile origin recovery
 
-Status: **design contract; implementation pending**. This extends
+Status: **core and runtime implemented; s3cache opt-in pending**. This extends
 [volatile coherence recovery](replication-volatile-coherence.md) after a full
 turn has exhausted its finite budget. It does not add a durable source, origin
 metadata objects, or any authority to a gossip head. The default driver still
@@ -50,7 +50,9 @@ bucket free of control objects, and ordinary read fallbacks intact.
 ## API and execution boundary
 
 `RecoveryEngine::with_rearm(policy)` validates the policy before the first
-event. `RecoveryHandle::open_with_rearm` performs the matching platform
+event. A coalesced `StartWithLapses` event preserves an explicit restart and
+its highest observed lapse counter in one full recovery generation.
+`RecoveryHandle::open_with_rearm` performs the matching platform
 deadline check before spawning its worker. Existing constructors remain
 unchanged and opt out. The core owns the rearm deadline in `next_deadline`
 and emits `ArmTimer`; the runtime only maps that logical deadline to its

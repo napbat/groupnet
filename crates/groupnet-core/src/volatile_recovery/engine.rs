@@ -6,7 +6,7 @@ use crate::{NodeId, Time};
 
 use super::types::{
     Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryError, RecoveryEvent, RecoveryMode,
-    RecoveryOperation, RecoveryStage, RecoveryState, RecoveryStep,
+    RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState, RecoveryStep,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +31,11 @@ pub struct RecoveryEngine {
     operation_due: Option<Time>,
     wait_due: Option<Time>,
     total_due: Option<Time>,
+    rearm: Option<RecoveryRearm>,
+    rearm_due: Option<Time>,
+    next_rearm_ms: u64,
+    rearm_exhausted: bool,
+    stepped: bool,
     seen: BTreeSet<NodeId>,
     exempt: BTreeSet<NodeId>,
     grants: BTreeMap<NodeId, Option<Mark>>,
@@ -74,6 +79,11 @@ impl RecoveryEngine {
             operation_due: None,
             wait_due: None,
             total_due: None,
+            rearm: None,
+            rearm_due: None,
+            next_rearm_ms: 0,
+            rearm_exhausted: false,
+            stepped: false,
             seen: BTreeSet::new(),
             exempt: BTreeSet::new(),
             grants: BTreeMap::new(),
@@ -82,6 +92,21 @@ impl RecoveryEngine {
             heads: BTreeMap::new(),
             barrier_rounds: 0,
         })
+    }
+
+    /// Enables capped automatic full recovery after an exhausted episode.
+    /// This may be selected only before the first event.
+    ///
+    /// # Errors
+    /// Rejects an invalid policy or an engine already used for recovery.
+    pub fn with_rearm(mut self, policy: RecoveryRearm) -> Result<Self, RecoveryError> {
+        let policy = policy.validate()?;
+        if self.stepped {
+            return Err(RecoveryError::Stage);
+        }
+        self.rearm = Some(policy);
+        self.next_rearm_ms = policy.initial_ms;
+        Ok(self)
     }
 
     /// Current local recovery permission, which cannot override lease or app policy.
@@ -102,10 +127,15 @@ impl RecoveryEngine {
     /// Earliest finite timer across current I/O, settle/poll wait, and total budget.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Time> {
-        [self.operation_due, self.wait_due, self.total_due]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.operation_due,
+            self.wait_due,
+            self.total_due,
+            self.rearm_due,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn step_ok(effects: Vec<RecoveryEffect>) -> RecoveryStep {
@@ -127,6 +157,7 @@ impl RecoveryEngine {
         self.operation_due = None;
         self.wait_due = None;
         self.total_due = None;
+        self.rearm_due = None;
         self.seen.clear();
         self.exempt.clear();
         self.grants.clear();
@@ -140,7 +171,20 @@ impl RecoveryEngine {
         self.clear_work();
         self.state.stage = RecoveryStage::OriginOnly;
         self.state.recovered = false;
-        Self::step_ok(Vec::new())
+        let Some(policy) = self.rearm else {
+            return Self::step_ok(Vec::new());
+        };
+        if self.rearm_exhausted || self.next_token == 0 || self.state.generation == u64::MAX {
+            self.rearm_exhausted = true;
+            return Self::reject(RecoveryError::Exhausted);
+        }
+        let Some(due) = self.now.0.checked_add(self.next_rearm_ms).map(Time) else {
+            self.rearm_exhausted = true;
+            return Self::reject(RecoveryError::Exhausted);
+        };
+        self.rearm_due = Some(due);
+        self.next_rearm_ms = self.next_rearm_ms.saturating_mul(2).min(policy.max_ms);
+        self.with_timer(Vec::new())
     }
 
     fn issue(&mut self, stage: RecoveryStage) -> Result<RecoveryOperation, RecoveryError> {
@@ -176,11 +220,18 @@ impl RecoveryEngine {
     }
 
     fn begin(&mut self, plan: Plan, lapses: u64) -> RecoveryStep {
+        if self.state.stage == RecoveryStage::Cancelled {
+            return Self::reject(RecoveryError::Stage);
+        }
+        if self.rearm_exhausted {
+            return Self::reject(RecoveryError::Exhausted);
+        }
         self.clear_work();
         self.state.recovered = false;
         self.state.covered_lapses = self.state.covered_lapses.max(lapses);
         let Some(next) = self.state.generation.checked_add(1) else {
             self.state.stage = RecoveryStage::OriginOnly;
+            self.rearm_exhausted = true;
             return RecoveryStep {
                 effects: vec![RecoveryEffect::CloseGate {
                     generation: self.state.generation,
@@ -192,6 +243,7 @@ impl RecoveryEngine {
         self.plan = plan;
         let Some(due) = self.now.0.checked_add(self.config.total_ms).map(Time) else {
             self.state.stage = RecoveryStage::OriginOnly;
+            self.rearm_exhausted = true;
             return RecoveryStep {
                 effects: vec![RecoveryEffect::CloseGate { generation: next }],
                 rejection: Some(RecoveryError::Exhausted),
@@ -199,7 +251,9 @@ impl RecoveryEngine {
         };
         self.total_due = Some(due);
         let Ok(op) = self.issue(RecoveryStage::Invalidating) else {
-            self.origin_only();
+            self.clear_work();
+            self.state.stage = RecoveryStage::OriginOnly;
+            self.rearm_exhausted = true;
             return RecoveryStep {
                 effects: vec![RecoveryEffect::CloseGate { generation: next }],
                 rejection: Some(RecoveryError::Exhausted),
@@ -444,11 +498,17 @@ impl RecoveryEngine {
         reason = "one auditable sans-IO transition table; bounded proof handlers are split into helpers"
     )]
     pub fn step(&mut self, event: RecoveryEvent) -> RecoveryStep {
+        self.stepped = true;
         match event {
             RecoveryEvent::Start => self.begin(Plan::Full, self.state.covered_lapses),
+            RecoveryEvent::StartWithLapses { lapses } => self.begin(Plan::Full, lapses),
             RecoveryEvent::FeedGap { lapses } => {
                 if self.state.stage == RecoveryStage::Cancelled {
                     return Self::reject(RecoveryError::Stage);
+                }
+                if self.state.stage == RecoveryStage::OriginOnly && self.rearm_due.is_some() {
+                    self.state.covered_lapses = self.state.covered_lapses.max(lapses);
+                    return self.with_timer(Vec::new());
                 }
                 self.begin(Plan::Full, lapses)
             }
@@ -461,6 +521,10 @@ impl RecoveryEngine {
                 }
                 if count <= self.state.covered_lapses {
                     return Self::step_ok(Vec::new());
+                }
+                if self.state.stage == RecoveryStage::OriginOnly && self.rearm_due.is_some() {
+                    self.state.covered_lapses = count;
+                    return self.with_timer(Vec::new());
                 }
                 if self.plan == Plan::Full
                     && !matches!(
@@ -553,6 +617,10 @@ impl RecoveryEngine {
                     self.state.stage = RecoveryStage::Ready;
                     self.state.recovered = true;
                     self.total_due = None;
+                    self.rearm_due = None;
+                    if let Some(policy) = self.rearm {
+                        self.next_rearm_ms = policy.initial_ms;
+                    }
                     Self::step_ok(Vec::new())
                 } else {
                     self.wait_for(RecoveryStage::Affirming, self.config.poll_ms)
@@ -599,6 +667,9 @@ impl RecoveryEngine {
                         }
                         _ => Self::reject(RecoveryError::Stage),
                     };
+                }
+                if self.rearm_due.is_some_and(|due| now >= due) {
+                    return self.begin(Plan::Full, self.state.covered_lapses);
                 }
                 Self::step_ok(Vec::new())
             }
