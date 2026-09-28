@@ -13,6 +13,7 @@ mod fence;
 mod shell;
 mod snapshot_api;
 mod snapshot_runtime;
+mod subscription_api;
 
 pub use ack_api::{
     AckEvidenceSource, AckObservation, AckSourceFailure, AckSourceFuture, AckWaitStartError,
@@ -24,8 +25,12 @@ pub use api::{
     SourceBatch, SourceScanResult, TailLimit,
 };
 pub use fence::{InstallPermit, OperationFence, RevocationPermit};
-pub use shell::{OpenError, Replication, SessionHandle, SessionStatus};
+pub use shell::{
+    EventSubscriptions, NamedSubscriptionHandle, NamedSubscriptionStatus, OpenError, Replication,
+    SessionHandle, SessionStatus, SubscriptionStart,
+};
 pub use snapshot_api::{
     NativeSnapshot, ReplayOnly, SnapshotApplicationAdapter, SnapshotAttachment, SnapshotHold,
     SnapshotImage, SnapshotSourceAdapter, SnapshotStage,
 };
+pub use subscription_api::{DurableEventSink, DurableSubscriptionSource, SubscriptionSourceResult};

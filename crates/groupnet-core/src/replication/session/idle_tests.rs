@@ -1,6 +1,6 @@
 use super::*;
 use crate::Time;
-use crate::replication::{IdlePolicy, ProofId, SourceHistory, Stream};
+use crate::replication::{Event, IdlePolicy, ProofId, SourceHistory, Stream};
 
 fn scope() -> Scope {
     Scope {

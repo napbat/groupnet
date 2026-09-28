@@ -241,7 +241,16 @@ where
                 self.record_ack_terminal(*op, outcome.clone());
             }
             let operation = match effect {
-                Effect::AcquireSnapshotHold { op, .. }
+                Effect::CheckSubscriberTail { op, .. }
+                | Effect::ScanSubscriber { op, .. }
+                | Effect::ApplySubscriberBatch { op, .. }
+                | Effect::CommitSubscriberAck { op, .. }
+                | Effect::ReadSubscriberAck { op, .. }
+                | Effect::ReadCurrentSubscriber { op, .. }
+                | Effect::RegisterSubscriber { op, .. }
+                | Effect::ReadSubscriberRegistration { op, .. }
+                | Effect::BindSinkEpoch { op, .. }
+                | Effect::AcquireSnapshotHold { op, .. }
                 | Effect::OfferSnapshot { op, .. }
                 | Effect::OpenSnapshotStage { op, .. }
                 | Effect::ReadSnapshotChunk { op, .. }
@@ -803,6 +812,15 @@ where
             return;
         }
         match effect {
+            Effect::CheckSubscriberTail { .. }
+            | Effect::ScanSubscriber { .. }
+            | Effect::ApplySubscriberBatch { .. }
+            | Effect::CommitSubscriberAck { .. }
+            | Effect::ReadSubscriberAck { .. }
+            | Effect::ReadCurrentSubscriber { .. }
+            | Effect::RegisterSubscriber { .. }
+            | Effect::ReadSubscriberRegistration { .. }
+            | Effect::BindSinkEpoch { .. } => self.stop(FailureClass::Terminal),
             Effect::ObserveNamedAcks {
                 op,
                 request,

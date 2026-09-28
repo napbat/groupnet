@@ -56,13 +56,25 @@ impl SessionEngine {
         if let Some(due) = self.retry_due {
             if now >= due {
                 self.retry_due = None;
-                return if self.retry_target == RetryTarget::Bootstrap {
-                    self.load_checkpoint()
-                } else {
-                    self.check_tail()
+                return match self.retry_target {
+                    RetryTarget::Bootstrap => self.load_checkpoint(),
+                    RetryTarget::Tail => self.check_tail(),
+                    RetryTarget::SubscriptionCurrentRead
+                    | RetryTarget::SubscriptionReadback
+                    | RetryTarget::SubscriptionBind => self.retry_subscription(),
+                    RetryTarget::SubscriptionTail | RetryTarget::SubscriptionAckRead => {
+                        self.retry_subscription_delivery()
+                    }
                 };
             }
             return Step::ok(Vec::new());
+        }
+        if self.mode == crate::replication::Mode::EventComplete {
+            return if now >= self.tail_due && self.state.stage == Stage::Protected {
+                self.poll_subscriber()
+            } else {
+                Step::ok(Vec::new())
+            };
         }
         if now >= self.tail_due && self.state.stage != Stage::CheckingTail {
             self.request_tail()

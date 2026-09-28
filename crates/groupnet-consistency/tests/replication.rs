@@ -910,3 +910,35 @@ async fn closed_sessions_delayed_revoke_cannot_disable_a_reopened_scope() {
         ReadVerdict::Serve(0)
     ));
 }
+
+#[tokio::test]
+async fn delayed_old_close_cannot_remove_reopened_scope() {
+    let cluster = MemCluster::builder(&["reader-conditional-close"])
+        .group("stores")
+        .spawn();
+    let manager = Replication::new(
+        cluster.groups[0].clone(),
+        MemSource::new(),
+        MemApp::new(true),
+        limits(),
+    )
+    .expect("valid manager");
+    let key = scope("one");
+    let old_id = NonZeroU64::new(30).expect("nonzero");
+    let new_id = NonZeroU64::new(31).expect("nonzero");
+    let old = manager.open(key.clone(), old_id).expect("old session");
+    assert!(manager.close_if(&key, old_id));
+    assert!(matches!(
+        old.catch_up(0, Instant::now() + SETTLE).await,
+        CatchUp::Cancelled
+    ));
+    let current = manager.open(key.clone(), new_id).expect("replacement");
+    assert!(!manager.close_if(&key, old_id));
+    current.set_authority(true).expect("current authority");
+    eventually_within("replacement survives old close", SETTLE, || {
+        matches!(current.read_decision(None, true), ReadVerdict::Serve(0))
+    })
+    .await;
+    assert!(manager.close_if(&key, new_id));
+    assert!(!manager.close_if(&key, new_id));
+}

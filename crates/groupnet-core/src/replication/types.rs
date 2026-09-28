@@ -4,8 +4,11 @@ use crate::Time;
 
 use super::{
     AckEvidence, AckWaitError, AckWaitLimits, AckWaitOutcome, AckWaitRequest, BoundComparison,
-    ChunkReceipt, Coverage, Cursor, HoldReceipt, IdentityError, IdlePolicy, RequiredSubscriber,
-    Scope, SnapshotConfig, SnapshotOffer, SourceProof,
+    ChunkReceipt, CommitSubscriberAck, Coverage, Cursor, DurableDeliveryReceipt, FencedCheckpoint,
+    HoldReceipt, IdentityError, IdlePolicy, RegisterReceipt, RegisterSubscriber,
+    RequiredSubscriber, ResumeSubscriber, Scope, SnapshotConfig, SnapshotOffer, SourceProof,
+    SourceSubscriberState, SubscriberAckReceipt, SubscriberKey, SubscriptionError,
+    SubscriptionLimits,
 };
 
 /// Replay contract selected for this session.
@@ -119,6 +122,26 @@ pub enum SnapshotCleanupDisposition {
 pub enum Stage {
     /// No validated checkpoint or source barrier.
     Unready,
+    /// Atomically registering a protected native suffix for a named subscriber.
+    Registering,
+    /// Reading the current durable source ack before conditional incarnation replacement.
+    ReadingCurrentSubscriber,
+    /// Resolving an ambiguous registration by its stable source request ID.
+    ReadingRegistration,
+    /// Installing the registered source epoch as a durable sink fence.
+    BindingSink,
+    /// Source retention and sink epoch are bound; event replay can begin.
+    Protected,
+    /// Checking a committed source cut from the protected subscriber ack.
+    CheckingSubscriberTail,
+    /// Scanning one bounded protected suffix batch.
+    ScanningSubscriber,
+    /// Applying one batch durably under the sink's epoch fence.
+    ApplyingSubscriber,
+    /// Conditionally advancing the source-protected durable ack.
+    AckingSubscriber,
+    /// Resolving an ambiguous source ack by its stable request ID.
+    ReadingSubscriberAck,
     /// Loading a private atomic state/cursor checkpoint.
     LoadingCheckpoint,
     /// Installing the loaded checkpoint through a guarded operation.
@@ -215,6 +238,8 @@ pub enum ReadDecision {
 pub enum Reject {
     /// A named acknowledgement request or evidence failed exact validation.
     AckWait(AckWaitError),
+    /// Named subscription registration or sink fence failed exact validation.
+    Subscription(SubscriptionError),
     /// Cursor/proof identity or bounds are invalid.
     Identity(IdentityError),
     /// Response belongs to a stale generation or replaced operation.
@@ -262,6 +287,102 @@ pub struct ApplyReceipt {
 /// Input supplied by a driver after its source/application adapter acts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Prompt a source-backed named subscription independently of feed hints.
+    PollSubscriber,
+    /// Source-certified committed cut and retained boundary for this subscription.
+    SubscriberTail {
+        /// Exact core-issued source-tail operation.
+        op: Operation,
+        /// Source proof over the registered native history.
+        proof: SourceProof,
+        /// Proof-bound comparisons for ack/retention/head.
+        comparisons: Vec<BoundComparison>,
+    },
+    /// One bounded, contiguous source batch after the protected ack cursor.
+    SubscriberScanned {
+        /// Exact source scan operation.
+        op: Operation,
+        /// Trusted native batch metadata; worker retains typed records.
+        batch: Box<Batch>,
+    },
+    /// Sink atomically recorded effects and cursor under its epoch fence.
+    SubscriberApplied {
+        /// Exact sink apply operation.
+        op: Operation,
+        /// Durable sink result with stable subsequent source-ack request ID.
+        receipt: Box<DurableDeliveryReceipt>,
+        /// Source-proof-bound result cursor is at least the applied batch.
+        through_to_sink: Box<BoundComparison>,
+        /// Source-proof-bound sink cursor does not move backward.
+        previous_to_sink: Box<BoundComparison>,
+    },
+    /// Source durably accepted a conditional ack after sink effects.
+    SubscriberAcked {
+        /// Exact source ack operation.
+        op: Operation,
+        /// Durable source response bound to the original stable request.
+        receipt: Box<SubscriberAckReceipt>,
+    },
+    /// Exact stable request readback after an ambiguous source ack.
+    SubscriberAckRead {
+        /// Exact source readback operation.
+        op: Operation,
+        /// Durable result, or certified absence of that request.
+        receipt: Option<Box<SubscriberAckReceipt>>,
+    },
+    /// Resume a stable subscriber from its source-certified durable ack.
+    ResumeSubscription {
+        /// Stable key, fresh incarnation, policy, and replacement request ID.
+        request: Box<ResumeSubscriber>,
+        /// Bounded identity and retention limits.
+        limits: SubscriptionLimits,
+    },
+    /// Source-certified current named registration and durable ack.
+    CurrentSubscriberRead {
+        /// Exact source-current read operation.
+        op: Operation,
+        /// Current active registration, or certified absence/expiry.
+        state: Option<Box<SourceSubscriberState>>,
+    },
+    /// Source conclusively rejected a subscription operation without a write.
+    SubscriberRejected {
+        /// Exact in-flight registration or current-state read operation.
+        op: Operation,
+        /// Typed source rejection, distinct from an ambiguous failed response.
+        error: SubscriptionError,
+    },
+    /// Begin a durable named `EventComplete` registration from an explicit cursor.
+    StartSubscription {
+        /// Exact stable request, source policy, and fresh subscriber incarnation.
+        request: Box<RegisterSubscriber>,
+        /// Bounded subscription identity and retention limits.
+        limits: SubscriptionLimits,
+    },
+    /// Source atomically accepted the exact registration request.
+    SubscriberRegistered {
+        /// Exact register operation.
+        op: Operation,
+        /// Source-certified protected cursor and monotonic sink fence.
+        receipt: Box<RegisterReceipt>,
+    },
+    /// Readback of an ambiguous registration by the same stable request ID.
+    SubscriberRegistrationRead {
+        /// Exact readback operation.
+        op: Operation,
+        /// Exact receipt if durably accepted, or certified absent result.
+        receipt: Option<Box<RegisterReceipt>>,
+    },
+    /// Sink atomically installed the source epoch and durable application cursor.
+    SinkEpochBound {
+        /// Exact sink binding operation.
+        op: Operation,
+        /// Durable epoch/cursor receipt, possibly ahead of source ack.
+        checkpoint: Box<FencedCheckpoint>,
+        /// Proof-bound protected source ack <= recovered sink cursor.
+        source_to_sink: Box<BoundComparison>,
+        /// Proof-bound recovered sink cursor <= committed registration head.
+        sink_to_head: Box<BoundComparison>,
+    },
     /// Read or floor activity resets idle backoff and promptly rechecks stale proof.
     Activity,
     /// Begin one bounded named acknowledgement wait on a certified fixed roster.
@@ -482,6 +603,83 @@ pub enum Event {
 /// Driver work requested by the sans-IO session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// Check source committed cut from a subscriber-protected cursor.
+    CheckSubscriberTail {
+        /// Exact core-issued source check operation.
+        op: Operation,
+        /// Registered subscriber key and source epoch.
+        registration: Box<RegisterReceipt>,
+        /// Current source-protected durable ack.
+        from: Cursor,
+    },
+    /// Scan a bounded retained suffix for this exact subscriber.
+    ScanSubscriber {
+        /// Exact core-issued source scan operation.
+        op: Operation,
+        /// Registered subscriber lineage and protected cursor.
+        registration: Box<RegisterReceipt>,
+        /// Exclusive source-ack cursor.
+        from: Cursor,
+        /// Maximum committed records.
+        max_events: usize,
+        /// Maximum encoded bytes.
+        max_bytes: usize,
+    },
+    /// Durably apply or idempotently verify a batch under the sink epoch.
+    ApplySubscriberBatch {
+        /// Exact core-issued sink operation.
+        op: Operation,
+        /// Registered source epoch and monotonic sink-fence ordinal.
+        registration: Box<RegisterReceipt>,
+        /// Source-proven contiguous native batch.
+        batch: Box<Batch>,
+        /// Recovered durable sink cursor; never roll this cursor back.
+        previous_sink: Cursor,
+    },
+    /// Conditionally commit a protected source ack only after sink durability.
+    CommitSubscriberAck {
+        /// Exact core-issued source ack operation.
+        op: Operation,
+        /// Stable source request and expected prior protected cursor.
+        request: Box<CommitSubscriberAck>,
+    },
+    /// Resolve an ambiguous source ack by its exact stable request ID.
+    ReadSubscriberAck {
+        /// Exact core-issued source readback operation.
+        op: Operation,
+        /// Stable original request; never switch to another epoch or cursor.
+        request: Box<CommitSubscriberAck>,
+    },
+    /// Read current durable source ack before conditional replacement.
+    ReadCurrentSubscriber {
+        /// Core-issued source-current read operation.
+        op: Operation,
+        /// Exact existing named subscriber key.
+        key: SubscriberKey,
+    },
+    /// Atomically protect an explicit native suffix before event delivery.
+    RegisterSubscriber {
+        /// Core-issued register operation.
+        op: Operation,
+        /// Stable source request and finite retention policy.
+        request: Box<RegisterSubscriber>,
+    },
+    /// Resolve an ambiguous registration by its exact stable request ID.
+    ReadSubscriberRegistration {
+        /// Core-issued readback operation.
+        op: Operation,
+        /// Exact subscriber key.
+        key: SubscriberKey,
+        /// Stable original register request ID.
+        request_id: Vec<u8>,
+    },
+    /// Durably fence the sink to the certified source epoch before delivery.
+    BindSinkEpoch {
+        /// Core-issued sink binding operation.
+        op: Operation,
+        /// Exact validated source registration receipt.
+        registration: Box<RegisterReceipt>,
+    },
     /// Event-driven source observation for one exact named wait; return
     /// `AckObserved` or a bounded empty `AckChecked` result.
     ObserveNamedAcks {

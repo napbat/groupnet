@@ -1,5 +1,23 @@
 # Durable named subscriptions and required acknowledgements
 
+## Implementation status
+
+The first delivery slice implements explicit `StartAt` and `ResumeExisting`,
+source registration and exact ambiguous-outcome readback, durable sink epoch
+binding, protected replay, and source acknowledgement after durable sink
+application. `with_event_complete` adds these opt-in capabilities to the
+replication manager. State-sync and named subscriptions share registration,
+operation, and byte admission. A named session disables snapshot repair even
+when state-sync sessions in the same manager support snapshots.
+
+Local cancellation and `close_named_if` stop delivery and retain the durable
+source registration. Terminal unsubscribe, source expiry transitions, and
+explicit reset are the next slice; their contracts below remain required.
+Production retained-history adapters and consumer migration are unfinished.
+The initial seeded tests select crash, ambiguous-ack, and retention-gap
+scenarios. A queued fault simulation with independent durable ledgers follows
+with the lifecycle slice. This initial coverage is not a full delivery DST.
+
 Status: **accepted contract for the next implementation slice**. This refines
 [replication.md](replication.md#3-subscription-guarantees-and-retention). It
 adds an opt-in `EventComplete` capability above source-backed replay. It does
@@ -46,6 +64,15 @@ names its proof kind and exact scope/history.
    native position. Concurrent old-incarnation acks and deliveries are fenced.
    Registration uses a stable request ID; an unknown source response is read
    back by that ID before delivery or a conflicting incarnation starts.
+   The public start choice is explicit: `StartAt` conditionally claims an
+   absent name and must protect exactly the requested native cursor;
+   `ResumeExisting` first reads the source's current durable named ack and
+   ordinal, then atomically compares both that prior ordinal and durable ack
+   cursor before replacing them with a fresh
+   incarnation and a stable new request ID. A conclusive prior-ordinal
+   mismatch performs no write and stops this attempt; an unknown replacement
+   response is read back by its exact request ID. Missing, expired, or
+   unverifiable prior state never falls back to an attach-at-head claim.
    A confirmed registration alone does not fence a separate application
    store. The engine next enters `BindingSink` and emits a correlated
    `BindSinkEpoch` effect. The sink atomically installs that exact registered

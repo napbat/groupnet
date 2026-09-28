@@ -48,6 +48,7 @@ impl SessionEngine {
             Stage::Cancelled
                 | Stage::RetryWait
                 | Stage::RetryExhausted
+                | Stage::Protected
                 | Stage::NeedsSnapshot
                 | Stage::SnapshotAborted
                 | Stage::IrrecoverableGap

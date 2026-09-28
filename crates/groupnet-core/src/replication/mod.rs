@@ -12,6 +12,7 @@ mod idle;
 mod proof;
 mod session;
 mod snapshot;
+mod subscription;
 mod types;
 
 pub use ack_types::{
@@ -23,6 +24,12 @@ pub use idle::IdlePolicy;
 pub use proof::{BoundComparison, Comparison, Coverage, ProofId, SourceProof};
 pub use session::SessionEngine;
 pub use snapshot::{ChunkReceipt, HoldReceipt, SnapshotConfig, SnapshotOffer};
+pub use subscription::{
+    CommitSubscriberAck, DurableDeliveryReceipt, FencedCheckpoint, RegisterReceipt,
+    RegisterSubscriber, ResumeSubscriber, RetentionPolicy, SourceSubscriberState,
+    SubscriberAckReceipt, SubscriberId, SubscriberKey, SubscriptionEpoch, SubscriptionError,
+    SubscriptionLimits,
+};
 pub use types::{
     ApplyReceipt, Batch, Config, ConfigError, Effect, Event, Mode, Operation, ReadDecision,
     Refusal, Reject, SnapshotCleanupDisposition, Stage, State, Step,

@@ -1,6 +1,6 @@
 //! Bounded Tokio driver around the sans-IO replication session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
@@ -25,7 +25,11 @@ use super::snapshot_api::{
 use super::snapshot_runtime::SnapshotMode;
 
 mod ack;
+mod event_complete;
 use ack::AckSlot;
+pub use event_complete::{
+    EventSubscriptions, NamedSubscriptionHandle, NamedSubscriptionStatus, SubscriptionStart,
+};
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
@@ -172,6 +176,7 @@ where
     app: Arc<A>,
     limits: Limits,
     sessions: Mutex<HashMap<Scope, Arc<SessionShared>>>,
+    admission: Mutex<RegistrationAdmission>,
     operations: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     checkpoint_bytes: Arc<Semaphore>,
@@ -180,6 +185,66 @@ where
     snapshot_checkpoint_bytes: Arc<Semaphore>,
     ack: Option<AckCapability>,
     _mode: PhantomData<M>,
+}
+
+#[derive(Debug, Default)]
+struct RegistrationAdmission {
+    active: usize,
+    session_ids: HashSet<NonZeroU64>,
+}
+
+struct RegistrationReservation<'a> {
+    admission: &'a Mutex<RegistrationAdmission>,
+    session_id: NonZeroU64,
+    committed: bool,
+}
+
+impl RegistrationReservation<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RegistrationReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut admission = lock(self.admission);
+            assert!(admission.session_ids.remove(&self.session_id));
+            admission.active -= 1;
+        }
+    }
+}
+
+impl<S, A, M> Manager<S, A, M>
+where
+    S: SourceAdapter,
+    A: ApplicationAdapter<S::Position, S::Batch>,
+{
+    fn reserve_registration(
+        &self,
+        session_id: NonZeroU64,
+    ) -> Result<RegistrationReservation<'_>, OpenError> {
+        let mut admission = lock(&self.admission);
+        if admission.session_ids.contains(&session_id) {
+            return Err(OpenError::DuplicateSession);
+        }
+        if admission.active >= self.limits.max_scopes {
+            return Err(OpenError::Backpressured);
+        }
+        admission.active += 1;
+        admission.session_ids.insert(session_id);
+        Ok(RegistrationReservation {
+            admission: &self.admission,
+            session_id,
+            committed: false,
+        })
+    }
+
+    fn release_registration(&self, session_id: NonZeroU64) {
+        let mut admission = lock(&self.admission);
+        assert!(admission.session_ids.remove(&session_id));
+        admission.active -= 1;
+    }
 }
 
 impl<S, A, M> fmt::Debug for Manager<S, A, M>
@@ -265,6 +330,7 @@ where
                 app: Arc::new(app),
                 limits,
                 sessions: Mutex::new(HashMap::new()),
+                admission: Mutex::new(RegistrationAdmission::default()),
                 operations: Arc::new(Semaphore::new(limits.max_parallel_ops)),
                 bytes: Arc::new(Semaphore::new(limits.max_inflight_bytes)),
                 checkpoint_bytes: Arc::new(Semaphore::new(limits.max_checkpoint_inflight_bytes)),
@@ -349,15 +415,6 @@ where
         if registry.contains_key(&scope) {
             return Err(OpenError::AlreadyOpen);
         }
-        if registry.len() >= self.inner.limits.max_scopes {
-            return Err(OpenError::Backpressured);
-        }
-        if registry
-            .values()
-            .any(|session| session.session_id == session_id)
-        {
-            return Err(OpenError::DuplicateSession);
-        }
         let engine = SessionEngine::new(
             scope.clone(),
             Mode::StateSync,
@@ -365,6 +422,7 @@ where
             session_id.get(),
         )
         .map_err(|_| OpenError::InvalidConfig)?;
+        let reservation = self.inner.reserve_registration(session_id)?;
         let (commands, receiver) = mpsc::channel(self.inner.limits.queue_depth);
         let initial = Published {
             state: engine.state().clone(),
@@ -404,6 +462,7 @@ where
             tail_interval: Duration::from_millis(self.inner.limits.core.tail_check_ms),
         };
         registry.insert(scope, Arc::clone(&shared));
+        reservation.commit();
         let manager = Arc::clone(&self.inner);
         let task_shared = Arc::clone(&shared);
         let task = runtime.spawn(async move {
@@ -415,15 +474,63 @@ where
 
     /// Removes one scope and immediately closes its local read gate.
     pub fn close(&self, scope: &Scope) {
-        if let Some(shared) = lock(&self.inner.sessions).remove(scope) {
-            shared.local_gate.store(false, Ordering::Release);
-            shared.cancelled.store(true, Ordering::Release);
-            shared.alive.store(false, Ordering::Release);
-            shared.fence.retire();
-            shared.signals.send_replace(());
-            if let Some(task) = lock(&shared.task).take() {
-                task.abort();
+        let removed = {
+            let mut registry = lock(&self.inner.sessions);
+            if let Some(shared) = registry.get(scope) {
+                Self::retire_session(shared);
             }
+            let removed = registry.remove(scope);
+            if let Some(shared) = &removed {
+                self.inner.release_registration(shared.session_id);
+            }
+            removed
+        };
+        if let Some(shared) = removed {
+            Self::abort_session(&shared);
+        }
+    }
+
+    /// Closes only the exact local incarnation, so a delayed old owner cannot
+    /// evict a replacement registered under the same native scope.
+    /// Returns whether that incarnation was still registered and closed.
+    #[must_use]
+    pub fn close_if(&self, scope: &Scope, session_id: NonZeroU64) -> bool {
+        let shared = {
+            let mut registry = lock(&self.inner.sessions);
+            if registry
+                .get(scope)
+                .is_none_or(|entry| entry.session_id != session_id)
+            {
+                return false;
+            }
+            if let Some(shared) = registry.get(scope) {
+                Self::retire_session(shared);
+            }
+            let removed = registry.remove(scope);
+            if let Some(shared) = &removed {
+                self.inner.release_registration(shared.session_id);
+            }
+            removed
+        };
+        if let Some(shared) = shared {
+            Self::abort_session(&shared);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn retire_session(shared: &SessionShared) {
+        shared.local_gate.store(false, Ordering::Release);
+        shared.cancelled.store(true, Ordering::Release);
+        shared.alive.store(false, Ordering::Release);
+        shared.fence.retire();
+        shared.signals.send_replace(());
+    }
+
+    fn abort_session(shared: &SessionShared) {
+        if let Some(task) = lock(&shared.task).take() {
+            task.abort();
         }
     }
 }
@@ -435,6 +542,7 @@ where
 {
     fn drop(&mut self) {
         for (_, shared) in lock(&self.inner.sessions).drain() {
+            self.inner.release_registration(shared.session_id);
             shared.local_gate.store(false, Ordering::Release);
             shared.cancelled.store(true, Ordering::Release);
             shared.alive.store(false, Ordering::Release);
