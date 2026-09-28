@@ -23,10 +23,14 @@ fn operation(step: &RecoveryStep) -> RecoveryOperation {
         .find_map(|effect| match effect {
             RecoveryEffect::Invalidate { op, .. }
             | RecoveryEffect::RebuildOrigin { op }
+            | RecoveryEffect::AcquireBaseline { op }
             | RecoveryEffect::ObservePeers { op }
+            | RecoveryEffect::ObservePeerHeads { op }
             | RecoveryEffect::WaitFrontiers { op, .. }
             | RecoveryEffect::Affirm { op } => Some(*op),
-            RecoveryEffect::CloseGate { .. } | RecoveryEffect::ArmTimer(_) => None,
+            RecoveryEffect::CloseGate { .. }
+            | RecoveryEffect::CancelBaseline { .. }
+            | RecoveryEffect::ArmTimer(_) => None,
         })
         .expect("current operation effect")
 }

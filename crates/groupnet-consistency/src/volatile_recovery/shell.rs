@@ -590,7 +590,15 @@ async fn run<A: RecoveryAdapter>(
                     };
                     active_version = version;
                 }
-                RecoveryEffect::ArmTimer(_) => {}
+                RecoveryEffect::ArmTimer(_) | RecoveryEffect::CancelBaseline { .. } => {}
+                RecoveryEffect::AcquireBaseline { op }
+                | RecoveryEffect::ObservePeerHeads { op } => {
+                    // This constructor has no peer source capability. If a
+                    // future caller supplies one without the opt-in driver,
+                    // decline the operation instead of leaving serving open
+                    // or waiting forever for an unimplemented callback.
+                    effects.extend(engine.step(RecoveryEvent::Failed { op }).effects);
+                }
                 RecoveryEffect::Invalidate {
                     op,
                     distrust_bodies,

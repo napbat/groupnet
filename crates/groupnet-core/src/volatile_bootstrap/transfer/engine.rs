@@ -6,9 +6,10 @@ use super::super::BootstrapOperation;
 use super::super::journal::{
     AttachToken, BarrierReceipt, JournalBatch, JournalCursor, NativeCut, ReservationId,
 };
+use super::native_cuts_cover;
 use super::types::{
-    TransferBinding, TransferConfig, TransferEffect, TransferError, TransferEvent, TransferOffer,
-    TransferStage, TransferStep,
+    NativeCoverageReceipt, TransferBinding, TransferConfig, TransferEffect, TransferError,
+    TransferEvent, TransferOffer, TransferStage, TransferStep,
 };
 
 /// One bounded child of an exact provisional donor selection. The composite
@@ -26,6 +27,7 @@ pub struct TransferSession {
     reservation: Option<ReservationId>,
     attachment: Option<AttachToken>,
     barrier: Option<BarrierReceipt>,
+    coverage: Option<NativeCoverageReceipt>,
     next_chunk: usize,
     encoded_received: usize,
     replay_cuts: Vec<NativeCut>,
@@ -89,6 +91,7 @@ impl TransferSession {
             reservation: None,
             attachment: None,
             barrier: None,
+            coverage: None,
             next_chunk: 0,
             encoded_received: 0,
             replay_cuts: Vec::new(),
@@ -258,15 +261,6 @@ impl TransferSession {
         Ok(())
     }
 
-    fn cuts_cover(actual: &[NativeCut], expected: &[NativeCut]) -> bool {
-        actual.len() == expected.len()
-            && actual.iter().zip(expected).all(|(found, cut)| {
-                found.writer == cut.writer
-                    && found.epoch == cut.epoch
-                    && found.sequence >= cut.sequence
-            })
-    }
-
     fn barrier_valid(&self, receipt: &BarrierReceipt) -> bool {
         let Some(offer) = &self.offer else {
             return false;
@@ -284,11 +278,11 @@ impl TransferSession {
             && usize::try_from(receipt.cursor.position)
                 .is_ok_and(|position| position <= self.config.max_replay_events)
             && receipt.members == offer.members
-            && Self::cuts_cover(&receipt.covered_cuts, &offer.cuts)
+            && native_cuts_cover(&receipt.covered_cuts, &offer.cuts)
             && self.barrier.as_ref().is_none_or(|previous| {
                 receipt.barrier_operation != previous.barrier_operation
                     && receipt.cursor.position >= previous.cursor.position
-                    && Self::cuts_cover(&receipt.covered_cuts, &previous.covered_cuts)
+                    && native_cuts_cover(&receipt.covered_cuts, &previous.covered_cuts)
                     && self.applied == previous.cursor.position
             })
     }
@@ -619,6 +613,7 @@ impl TransferSession {
                     return self.abort(TransferError::Continuity);
                 }
                 self.barrier = Some(receipt);
+                self.coverage = None;
                 self.next_batch_or_coverage(allocator)
             }
             TransferEvent::BatchStaged { op, batch } => {
@@ -668,7 +663,7 @@ impl TransferSession {
                     || coverage.barrier != receipt
                     || coverage.staged_through != receipt.cursor
                     || coverage.members != receipt.members
-                    || !Self::cuts_cover(&coverage.proven_cuts, &receipt.covered_cuts)
+                    || !native_cuts_cover(&coverage.proven_cuts, &receipt.covered_cuts)
                     || coverage.buffered_bytes > self.config.max_native_buffer_bytes
                 {
                     return self.abort(TransferError::Continuity);
@@ -676,8 +671,12 @@ impl TransferSession {
                 let Ok(next) = self.allocate(allocator) else {
                     return self.abort(TransferError::Allocator);
                 };
+                self.coverage = Some(coverage.clone());
                 self.stage = TransferStage::Installing;
-                self.ok(vec![TransferEffect::InstallCandidate { op: next, receipt }])
+                self.ok(vec![TransferEffect::InstallCandidate {
+                    op: next,
+                    coverage: Box::new(coverage),
+                }])
             }
             TransferEvent::NativePending { op } => {
                 if !self.current(op, TransferStage::AwaitingNativeCoverage) {
@@ -696,9 +695,26 @@ impl TransferSession {
                 self.current = None;
                 self.ok(Vec::new())
             }
-            TransferEvent::Installed { op } => {
+            TransferEvent::Installed { op, handoff } => {
                 if !self.current(op, TransferStage::Installing) {
                     return Self::reject(TransferError::Stale);
+                }
+                if handoff.recovery.session == 0
+                    || handoff.recovery.generation == 0
+                    || handoff.recovery.token == 0
+                    || handoff.install != op
+                    || self.coverage.as_ref() != Some(&handoff.coverage)
+                    || self.attachment.as_ref() != Some(&handoff.attachment)
+                    || handoff.schema != self.config.expected_schema
+                    || self
+                        .offer
+                        .as_ref()
+                        .is_none_or(|offer| handoff.schema != offer.schema)
+                    || handoff.applier_generation == 0
+                    || !native_cuts_cover(&handoff.continued_cuts, &handoff.coverage.proven_cuts)
+                    || handoff.buffered_bytes > self.config.max_native_buffer_bytes
+                {
+                    return self.abort(TransferError::Continuity);
                 }
                 self.stage = TransferStage::Completed;
                 self.current = None;

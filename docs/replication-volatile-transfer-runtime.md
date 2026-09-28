@@ -30,13 +30,24 @@ claim/transfer effects under the current recovery generation and the
 original `RecoveryConfig::total_ms` deadline. The selected claim's finite
 episode deadline must be no later than that recovery deadline. The worker
 uses the minimum of claim renewal, exact selected-claim refresh, child work,
-and recovery operation deadlines for one timer. A failed or declined donor
+and recovery operation deadlines for one timer. The `AcquireBaseline` parent
+operation lasts only until that original total
+deadline; the claim and transfer engines separately bound each source and
+stage operation. Applying ordinary `attempt_ms` to the entire parent would
+abort healthy multi-step transfers. A failed or declined donor
 returns a typed `BootstrapDeclined { op }` to the recovery engine, which then
 emits a fresh guarded `RebuildOrigin` in the **same** original recovery
 episode. It never starts an unbounded new origin attempt. A local provisional
 builder also uses the existing `rebuild_origin` callback and publication
 permit; its correlated success supplies the local baseline and may publish
-`Ready` as donor availability, never as read authority. A peer install emits
+`Ready` as donor availability, never as read authority. It reports
+`LocalBaselineBuilt { op }` to recovery, which proceeds directly to its
+ordinary `Affirm` without a second origin scan. The one worker continues
+driving bounded `ClaimEngine` TTL renewals and donor journal expiry after
+local recovery reaches `Ready`; a source gap, invalidated capture, restart,
+or final handle drop withdraws that exact claim. Claim renewal after a
+completed local build advertises an available image and does not extend the
+already finished recovery episode or license local reads. A peer install emits
 `PeerBaselineInstalled { op, handoff }` only after the atomic native-delivery
 handoff below. It enters a **new peer-specific** recovery check: sample a
 complete bounded peer/head roster, wait the sampled native heads through the
@@ -51,7 +62,9 @@ external origin completeness or authoritative absence.
 
 `Start`, gap, lapse, rearm, cancellation, and last-handle drop synchronously
 close the shared serving/publication fence before the worker can touch an
-old page. The worker sends exact `CancelWork` before discarding its private
+old page. The recovery engine emits `CancelBaseline` for the original
+baseline operation before replacement origin work; the worker translates
+it to exact `CancelWork` before discarding its private
 stage or source reservation. Late source responses, queued chunks, image
 verification, and `Installed` replies carry both the recovery operation and
 the claim/transfer operation. A newer generation rejects them. The worker
@@ -115,12 +128,20 @@ to that installed index. There is **no interval** between candidate swap and
 normal-feed ownership in which an arriving native event can be discarded or
 applied only to the old index. A new typed `NativeHandoffReceipt` binds the
 transfer parent, exact B/cuts, native attachment incarnation and contiguous
-position, normal-applier generation, schema, and bounded buffer charge.
+position (including valid position zero for a quiet feed), fresh
+normal-applier generation, exact accepted schema, and bounded buffer charge.
+It also binds the exact outer `RecoveryOperation` that admitted the baseline.
+Recovery and claim-child sessions remain independent; the worker records
+their active mapping, and the recovery core rejects a receipt for any other
+outer operation even if its child transfer is internally valid.
 `Installed` must present that exact receipt; a caller boolean or sampled
 head does not qualify. The transfer core may release the donor reservation
 only after accepting it. A delayed old-generation receipt cannot release a
 new reservation or install over a newer index. If atomic handoff cannot be
 established, the private image is discarded and reads stay origin-routed.
+`InstallCandidate` carries the exact accepted `NativeCoverageReceipt` to the
+worker, so the guarded callback does not reconstruct B from a mutable donor
+head or an unbounded adapter-owned map.
 
 Candidate publication and serving permission are distinct. The follower
 need not hold a serving lease before this candidate swap, which permits a
@@ -129,9 +150,8 @@ The gate remains closed through the new peer head/frontier check and current
 lease/domain affirmation. Passing affirmation cannot repair a dropped feed
 event; it may open reads only after the exact continuous handoff and sampled
 barrier have succeeded. The donor attachment can be released after that
-handoff even if the independent lease check has not yet passed; update the
-transfer contract's current wording accordingly in the next implementation
-slice. The native attachment and normal applier continue while the donor
+handoff even if the independent lease check has not yet passed. The native
+attachment and normal applier continue while the donor
 reservation is released.
 
 Lock order is `RecoveryHandle` control/publication permit, then the short
@@ -164,6 +184,35 @@ network, clock, hash, or S3 dependency. The adapter verifies chunk length
 and commitment before private staging, and corrupted or interrupted streams
 discard the stage. The origin bucket receives no control object in either
 default or optional peer-bootstrap mode.
+
+## S3 scope and bounded donor lifetime
+
+The current S3 `WriteSync` owns one recovery handle and one `KeyIndex`; its
+`rebuild_origin` walks the bounded union of configured buckets and current
+`KeyIndex` bucket names. The first fleet slice therefore claims **one
+whole-index scope per `WriteSync`**, not a fictitious per-bucket recovery
+handle. Its partition identity is a canonical, length-prefixed encoding of
+that exact sorted union, index schema, and the configured origin
+endpoint/account namespace. The adapter must have a stable, explicit origin
+namespace identity; it cannot infer equivalence merely from equal bucket
+names. A new bucket discovered or created during capture changes that union
+and invalidates/rekeys the candidate before any offer or install. It must fit
+the declared scope-byte limit exactly; it is never truncated or replaced by
+an unchecked short hash. A changed bucket universe cannot adopt an old donor
+image. A deployment whose complete union exceeds the scope, image, capture,
+or global memory caps uses its existing guarded origin path. This makes the
+first slice finite as bucket count grows; splitting into independent bucket
+scopes requires a later explicit recovery-handle and publication-gate design.
+
+The local provisional builder may publish a `Ready` claim only after the
+guarded origin scan finished every bucket, the bounded private capture is
+complete at C, and the donor journal is attached to **every** subsequent
+index publication. A completed recovery lease alone is insufficient. The
+same worker services its TTL renewal and finite journal lifetime even after
+the local read gate opens; the donor image remains an availability hint, not
+authority. When the capture or global admission expires, withdraw or let the
+claim expire and reject new reservations. Continued local serving still
+depends on the ordinary recovery, lease, and application gates.
 
 ## First implementation and verification slices
 

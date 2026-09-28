@@ -1,11 +1,32 @@
 //! Typed, finite transfer inputs and effects. No type grants read authority.
 
 use crate::Time;
+use crate::volatile_recovery::RecoveryOperation;
 
 use super::super::journal::{
     AttachToken, BarrierReceipt, CaptureId, JournalBatch, JournalCursor, NativeCut, ReservationId,
 };
 use super::super::{BootstrapOperation, BootstrapScope, ClaimIdentity};
+
+/// Exact, sorted per-writer coverage; zero sequence denotes a quiet feed.
+pub(crate) fn native_cuts_cover(actual: &[NativeCut], expected: &[NativeCut]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .windows(2)
+            .all(|pair| pair[0].writer < pair[1].writer)
+        && expected
+            .windows(2)
+            .all(|pair| pair[0].writer < pair[1].writer)
+        && actual.iter().zip(expected).all(|(found, cut)| {
+            !found.writer.is_empty()
+                && found.epoch != 0
+                && !cut.writer.is_empty()
+                && cut.epoch != 0
+                && found.writer == cut.writer
+                && found.epoch == cut.epoch
+                && found.sequence >= cut.sequence
+        })
+}
 
 /// Finite per-transfer metadata, image, native buffer, and batch limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +112,7 @@ pub struct TransferOffer {
 
 /// Adapter-certified native feed coverage for one exact donor barrier. The
 /// adapter proves contiguous feed application, not merely an advertised head;
-/// current lease/read authority is checked separately at guarded install.
+/// current lease/read authority is checked separately after guarded handoff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeCoverageReceipt {
     /// Exact claim-selected transfer session whose private stage was checked.
@@ -105,6 +126,32 @@ pub struct NativeCoverageReceipt {
     /// Complete currently observed member identities.
     pub members: Vec<ClaimIdentity>,
     /// Current bounded native-effect buffer memory charge.
+    pub buffered_bytes: usize,
+}
+
+/// Adapter-certified atomic handoff from a private image to normal native
+/// delivery. This is a continuity receipt, never local serving permission.
+/// The application issues it only after a guarded candidate swap and feed
+/// applier switch occur in one publication critical section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeHandoffReceipt {
+    /// Exact outer recovery acquisition whose guarded permit installed it.
+    /// Claim and recovery sessions remain independent identities.
+    pub recovery: RecoveryOperation,
+    /// Exact guarded install operation whose callback performed the switch.
+    pub install: BootstrapOperation,
+    /// Previously accepted B, stage, membership, and native coverage proof.
+    pub coverage: NativeCoverageReceipt,
+    /// Donor stream held continuously until the normal applier took over.
+    pub attachment: AttachToken,
+    /// Installed private image schema, equal to the accepted donor offer.
+    pub schema: u32,
+    /// Fresh nonzero incarnation of the installed normal feed applier.
+    pub applier_generation: u64,
+    /// Contiguous native cuts owned by the normal applier after the switch.
+    /// A quiet feed may legitimately have sequence zero.
+    pub continued_cuts: Vec<NativeCut>,
+    /// Remaining charged native overlap bytes, bounded by transfer policy.
     pub buffered_bytes: usize,
 }
 
@@ -225,10 +272,13 @@ pub enum TransferEvent {
         /// Exact native coverage check operation.
         op: BootstrapOperation,
     },
-    /// Application atomically installed the exact private stage under its guard.
+    /// Application atomically installed the private stage and switched ongoing
+    /// native delivery under its publication guard.
     Installed {
         /// Exact guarded install operation.
         op: BootstrapOperation,
+        /// Source- and stage-correlated atomic native continuation proof.
+        handoff: Box<NativeHandoffReceipt>,
     },
     /// One current source/runtime operation failed or became unavailable.
     Failed {
@@ -337,8 +387,9 @@ pub enum TransferEffect {
     InstallCandidate {
         /// Exact guarded install operation.
         op: BootstrapOperation,
-        /// Native-covered atomic B receipt.
-        receipt: BarrierReceipt,
+        /// Exact previously accepted B, private-stage and native coverage
+        /// receipt for the worker's guarded handoff callback.
+        coverage: Box<NativeCoverageReceipt>,
     },
     /// Cancel and discard exact private stage/buffers; no serving grant.
     DiscardStage {

@@ -69,7 +69,11 @@ fn transient_full_scan_failures_retry_without_reviving_old_operations() {
                         );
                     }
                     RecoveryEffect::ArmTimer(_) => {}
-                    RecoveryEffect::ObservePeers { .. } | RecoveryEffect::WaitFrontiers { .. } => {
+                    RecoveryEffect::AcquireBaseline { .. }
+                    | RecoveryEffect::ObservePeerHeads { .. }
+                    | RecoveryEffect::CancelBaseline { .. }
+                    | RecoveryEffect::ObservePeers { .. }
+                    | RecoveryEffect::WaitFrontiers { .. } => {
                         panic!("seed {seed}: full plan requested lapse proof")
                     }
                 }

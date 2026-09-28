@@ -34,7 +34,12 @@ fn op(step: &RecoveryStep) -> RecoveryOperation {
             | RecoveryEffect::ObservePeers { op }
             | RecoveryEffect::WaitFrontiers { op, .. }
             | RecoveryEffect::Affirm { op } => Some(*op),
-            RecoveryEffect::CloseGate { .. } | RecoveryEffect::ArmTimer(_) => None,
+            RecoveryEffect::CloseGate { .. }
+            | RecoveryEffect::CancelBaseline { .. }
+            | RecoveryEffect::ArmTimer(_) => None,
+            RecoveryEffect::AcquireBaseline { .. } | RecoveryEffect::ObservePeerHeads { .. } => {
+                panic!("default recovery cannot request peer bootstrap")
+            }
         })
         .expect("operation effect")
 }
@@ -201,6 +206,11 @@ fn volatile_recovery_reaches_applied_heads_or_fences_full_fallback() {
                     RecoveryEffect::ArmTimer(due) => {
                         assert!(due >= Time(time), "seed {seed}: backward timer");
                         timers.push(due);
+                    }
+                    RecoveryEffect::AcquireBaseline { .. }
+                    | RecoveryEffect::ObservePeerHeads { .. }
+                    | RecoveryEffect::CancelBaseline { .. } => {
+                        panic!("seed {seed}: default recovery attempted peer bootstrap")
                     }
                 }
             }

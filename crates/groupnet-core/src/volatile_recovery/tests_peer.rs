@@ -1,0 +1,372 @@
+//! Exact peer-candidate continuity stays separate from serving authority.
+
+use super::*;
+use crate::volatile_bootstrap::journal::{
+    AttachToken, BarrierReceipt, CaptureId, JournalCursor, NativeCut, ReservationId,
+};
+use crate::volatile_bootstrap::transfer::{NativeCoverageReceipt, NativeHandoffReceipt};
+use crate::volatile_bootstrap::{BootId, BootstrapOperation, BootstrapScope, ClaimIdentity};
+use crate::{NodeId, Time};
+
+fn config() -> RecoveryConfig {
+    RecoveryConfig {
+        max_members: 2,
+        max_member_bytes: 16,
+        max_barrier_rounds: 2,
+        total_ms: 30,
+        attempt_ms: 5,
+        settle_ms: 2,
+        poll_ms: 1,
+    }
+}
+
+fn identity(node: &str, boot: u128, session: u64) -> ClaimIdentity {
+    ClaimIdentity {
+        node: NodeId::from(node),
+        incarnation: BootId(boot),
+        session,
+        attempt: 1,
+    }
+}
+
+fn members() -> Vec<ClaimIdentity> {
+    vec![identity("a", 8, 5), identity("me", 7, 9)]
+}
+
+fn handoff(recovery: RecoveryOperation) -> NativeHandoffReceipt {
+    let donor = identity("a", 8, 5);
+    let follower = identity("me", 7, 9);
+    let capture = CaptureId {
+        scope: BootstrapScope {
+            domain: "o".to_owned(),
+            partition: "b".to_owned(),
+        },
+        donor,
+        recovery_generation: 1,
+        serial: 1,
+    };
+    let reservation = ReservationId {
+        capture: capture.clone(),
+        follower,
+        serial: 1,
+    };
+    let barrier = BarrierReceipt {
+        reservation: reservation.clone(),
+        attach_operation: 1,
+        barrier_operation: 2,
+        cursor: JournalCursor {
+            capture,
+            position: 0,
+        },
+        covered_cuts: vec![NativeCut {
+            writer: b"w".to_vec(),
+            epoch: 1,
+            sequence: 0,
+        }],
+        members: members(),
+    };
+    let parent = BootstrapOperation {
+        session: 9,
+        incarnation: BootId(7),
+        generation: 1,
+        token: 1,
+    };
+    let coverage = NativeCoverageReceipt {
+        parent,
+        barrier: barrier.clone(),
+        staged_through: barrier.cursor.clone(),
+        proven_cuts: barrier.covered_cuts.clone(),
+        members: members(),
+        buffered_bytes: 0,
+    };
+    NativeHandoffReceipt {
+        recovery,
+        install: BootstrapOperation { token: 2, ..parent },
+        coverage,
+        attachment: AttachToken {
+            reservation,
+            operation: 1,
+        },
+        schema: 1,
+        applier_generation: 1,
+        continued_cuts: barrier.covered_cuts,
+        buffered_bytes: 0,
+    }
+}
+
+fn operation(step: &RecoveryStep) -> RecoveryOperation {
+    step.effects
+        .iter()
+        .find_map(|effect| match effect {
+            RecoveryEffect::Invalidate { op, .. }
+            | RecoveryEffect::AcquireBaseline { op }
+            | RecoveryEffect::RebuildOrigin { op }
+            | RecoveryEffect::ObservePeerHeads { op }
+            | RecoveryEffect::WaitFrontiers { op, .. }
+            | RecoveryEffect::Affirm { op } => Some(*op),
+            RecoveryEffect::CloseGate { .. }
+            | RecoveryEffect::CancelBaseline { .. }
+            | RecoveryEffect::ArmTimer(_)
+            | RecoveryEffect::ObservePeers { .. } => None,
+        })
+        .expect("one current operation")
+}
+
+fn bootstrap() -> (RecoveryEngine, RecoveryOperation) {
+    let mut engine = RecoveryEngine::new(config(), RecoveryMode::Leased, NodeId::from("me"), 7)
+        .unwrap()
+        .with_bootstrap()
+        .unwrap();
+    let started = engine.step(RecoveryEvent::Start);
+    let acquire = engine.step(RecoveryEvent::Invalidated {
+        op: operation(&started),
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::AcquiringBaseline);
+    assert_eq!(engine.next_deadline(), Some(Time(30)));
+    (engine, operation(&acquire))
+}
+
+fn quiet_peer() -> Peer {
+    Peer {
+        node: NodeId::from("a"),
+        alive: true,
+        grants_lease: true,
+        old_nonlive: false,
+        grant: None,
+        head: None,
+    }
+}
+
+#[test]
+fn empty_native_feed_handoff_waits_peer_barrier_then_affirms() {
+    let (mut engine, acquire) = bootstrap();
+    let sample = engine.step(RecoveryEvent::PeerBaselineInstalled {
+        op: acquire,
+        handoff: Box::new(handoff(acquire)),
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::PeerSamplingHeads);
+    assert!(!engine.state().recovered);
+    let barrier = engine.step(RecoveryEvent::PeerHeadsObserved {
+        op: operation(&sample),
+        peers: vec![quiet_peer()],
+        identities: members(),
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::PeerWaitingFrontiers);
+    assert!(barrier.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::WaitFrontiers { heads, .. } if heads.is_empty()
+    )));
+    let recheck = engine.step(RecoveryEvent::FrontiersReached {
+        op: operation(&barrier),
+    });
+    let affirm = engine.step(RecoveryEvent::PeerHeadsObserved {
+        op: operation(&recheck),
+        peers: vec![quiet_peer()],
+        identities: members(),
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::Affirming);
+    assert!(!engine.state().recovered);
+    engine.step(RecoveryEvent::Affirmed {
+        op: operation(&affirm),
+        accepted: true,
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::Ready);
+}
+
+#[test]
+fn stale_or_mismatched_handoff_never_releases_peer_to_serving() {
+    for variant in 0..3 {
+        let (mut engine, acquire) = bootstrap();
+        let mut invalid = handoff(acquire);
+        match variant {
+            0 => invalid.continued_cuts[0].epoch = 2,
+            1 => {
+                invalid.coverage.proven_cuts.clear();
+                invalid.continued_cuts.clear();
+            }
+            _ => invalid.recovery.token -= 1,
+        }
+        let refused = engine.step(RecoveryEvent::PeerBaselineInstalled {
+            op: acquire,
+            handoff: Box::new(invalid),
+        });
+        assert!(matches!(
+            refused.effects.first(),
+            Some(RecoveryEffect::CancelBaseline { op }) if *op == acquire
+        ));
+        assert!(
+            refused
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, RecoveryEffect::RebuildOrigin { .. }))
+        );
+        assert_eq!(engine.state().stage, RecoveryStage::Rebuilding);
+        assert!(!engine.state().recovered);
+    }
+}
+
+#[test]
+fn old_child_receipt_repackaged_under_new_acquisition_is_rejected() {
+    let (mut engine, first) = bootstrap();
+    let old = handoff(first);
+    let supersede = engine.step(RecoveryEvent::FeedGap { lapses: 1 });
+    let next = engine.step(RecoveryEvent::Invalidated {
+        op: operation(&supersede),
+    });
+    let current = operation(&next);
+    assert_ne!(first, current);
+    let refused = engine.step(RecoveryEvent::PeerBaselineInstalled {
+        op: current,
+        handoff: Box::new(old),
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::Rebuilding);
+    assert!(!engine.state().recovered);
+    assert!(matches!(
+        refused.effects.first(),
+        Some(RecoveryEffect::CancelBaseline { op }) if *op == current
+    ));
+    assert!(
+        refused
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RecoveryEffect::RebuildOrigin { .. }))
+    );
+}
+
+#[test]
+fn changed_boot_identity_or_lost_peer_falls_back_with_original_deadline() {
+    let (mut engine, acquire) = bootstrap();
+    let sample = engine.step(RecoveryEvent::PeerBaselineInstalled {
+        op: acquire,
+        handoff: Box::new(handoff(acquire)),
+    });
+    let barrier = engine.step(RecoveryEvent::PeerHeadsObserved {
+        op: operation(&sample),
+        peers: vec![quiet_peer()],
+        identities: members(),
+    });
+    let recheck = engine.step(RecoveryEvent::FrontiersReached {
+        op: operation(&barrier),
+    });
+    let mut changed = members();
+    changed[0].incarnation = BootId(10);
+    let fallback = engine.step(RecoveryEvent::PeerHeadsObserved {
+        op: operation(&recheck),
+        peers: vec![quiet_peer()],
+        identities: changed,
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::Rebuilding);
+    assert_eq!(engine.state().generation, acquire.generation);
+    assert_eq!(engine.next_deadline(), Some(Time(5)));
+    assert!(
+        fallback
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RecoveryEffect::RebuildOrigin { .. }))
+    );
+    let old = engine.step(RecoveryEvent::PeerHeadsObserved {
+        op: operation(&recheck),
+        peers: vec![quiet_peer()],
+        identities: members(),
+    });
+    assert_eq!(old.rejection, Some(RecoveryError::StaleOperation));
+}
+
+#[test]
+fn local_builder_affirms_without_second_scan_and_cancels_on_next_gap() {
+    let (mut engine, acquire) = bootstrap();
+    let built = engine.step(RecoveryEvent::LocalBaselineBuilt { op: acquire });
+    assert_eq!(engine.state().stage, RecoveryStage::Affirming);
+    assert!(
+        built
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RecoveryEffect::Affirm { .. }))
+    );
+    assert!(!built.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::RebuildOrigin { .. } | RecoveryEffect::CancelBaseline { .. }
+    )));
+    engine.step(RecoveryEvent::Affirmed {
+        op: operation(&built),
+        accepted: true,
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::Ready);
+    let gap = engine.step(RecoveryEvent::FeedGap { lapses: 1 });
+    assert!(matches!(
+        gap.effects.first(),
+        Some(RecoveryEffect::CloseGate { .. })
+    ));
+    assert!(matches!(
+        gap.effects.get(1),
+        Some(RecoveryEffect::CancelBaseline { op }) if *op == acquire
+    ));
+    assert!(!engine.state().recovered);
+}
+
+#[test]
+fn cancelled_acquisition_revokes_child_before_any_late_completion() {
+    let (mut engine, acquire) = bootstrap();
+    let cancel = engine.step(RecoveryEvent::Cancel);
+    assert!(matches!(
+        cancel.effects.first(),
+        Some(RecoveryEffect::CloseGate { .. })
+    ));
+    assert!(matches!(
+        cancel.effects.get(1),
+        Some(RecoveryEffect::CancelBaseline { op }) if *op == acquire
+    ));
+    assert_eq!(
+        engine
+            .step(RecoveryEvent::LocalBaselineBuilt { op: acquire })
+            .rejection,
+        Some(RecoveryError::StaleOperation)
+    );
+    assert_eq!(engine.state().stage, RecoveryStage::Cancelled);
+}
+
+#[test]
+fn failed_claim_cancels_child_and_origin_fallback_keeps_original_total() {
+    let (mut engine, acquire) = bootstrap();
+    engine.step(RecoveryEvent::Tick(Time(5)));
+    let failed = engine.step(RecoveryEvent::Failed { op: acquire });
+    assert!(matches!(
+        failed.effects.first(),
+        Some(RecoveryEffect::CancelBaseline { op }) if *op == acquire
+    ));
+    assert!(
+        failed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RecoveryEffect::RebuildOrigin { .. }))
+    );
+    assert_eq!(engine.state().stage, RecoveryStage::Rebuilding);
+    assert_eq!(engine.state().generation, acquire.generation);
+    assert_eq!(engine.next_deadline(), Some(Time(10)));
+    assert_eq!(
+        engine
+            .step(RecoveryEvent::LocalBaselineBuilt { op: acquire })
+            .rejection,
+        Some(RecoveryError::StaleOperation)
+    );
+    engine.step(RecoveryEvent::Tick(Time(30)));
+    assert_eq!(engine.state().stage, RecoveryStage::OriginOnly);
+    assert_eq!(engine.next_deadline(), None);
+}
+
+#[test]
+fn total_deadline_cancels_slow_transfer_without_starting_another_episode() {
+    let (mut engine, acquire) = bootstrap();
+    let expired = engine.step(RecoveryEvent::Tick(Time(30)));
+    assert!(matches!(
+        expired.effects.first(),
+        Some(RecoveryEffect::CancelBaseline { op }) if *op == acquire
+    ));
+    assert!(!expired.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::AcquireBaseline { .. } | RecoveryEffect::RebuildOrigin { .. }
+    )));
+    assert_eq!(engine.state().stage, RecoveryStage::OriginOnly);
+    assert_eq!(engine.state().generation, acquire.generation);
+    assert!(!engine.state().recovered);
+}

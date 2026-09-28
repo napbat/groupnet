@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::volatile_bootstrap::ClaimIdentity;
 use crate::{NodeId, Time};
 
 use super::types::{
@@ -9,10 +10,18 @@ use super::types::{
     RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState, RecoveryStep,
 };
 
+mod peer;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Plan {
     Full,
     Lapse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Baseline {
+    Origin,
+    Peer,
 }
 
 /// One bounded recovery turn. The shell synchronously intersects `recovered`
@@ -27,6 +36,9 @@ pub struct RecoveryEngine {
     now: Time,
     state: RecoveryState,
     plan: Plan,
+    baseline: Baseline,
+    bootstrap: bool,
+    baseline_op: Option<RecoveryOperation>,
     operation: Option<RecoveryOperation>,
     operation_due: Option<Time>,
     wait_due: Option<Time>,
@@ -43,6 +55,7 @@ pub struct RecoveryEngine {
     known_heads: BTreeMap<NodeId, Mark>,
     heads: BTreeMap<NodeId, Mark>,
     barrier_rounds: u32,
+    peer_members: Vec<ClaimIdentity>,
 }
 
 impl RecoveryEngine {
@@ -75,6 +88,9 @@ impl RecoveryEngine {
                 covered_lapses: 0,
             },
             plan: Plan::Full,
+            baseline: Baseline::Origin,
+            bootstrap: false,
+            baseline_op: None,
             operation: None,
             operation_due: None,
             wait_due: None,
@@ -91,6 +107,7 @@ impl RecoveryEngine {
             known_heads: BTreeMap::new(),
             heads: BTreeMap::new(),
             barrier_rounds: 0,
+            peer_members: Vec::new(),
         })
     }
 
@@ -106,6 +123,19 @@ impl RecoveryEngine {
         }
         self.rearm = Some(policy);
         self.next_rearm_ms = policy.initial_ms;
+        Ok(self)
+    }
+
+    /// Enables an opt-in, authority-free peer baseline attempt before the
+    /// guarded origin fallback. It must be selected before the first event.
+    ///
+    /// # Errors
+    /// Rejects an engine already used for recovery.
+    pub fn with_bootstrap(mut self) -> Result<Self, RecoveryError> {
+        if self.stepped {
+            return Err(RecoveryError::Stage);
+        }
+        self.bootstrap = true;
         Ok(self)
     }
 
@@ -165,37 +195,58 @@ impl RecoveryEngine {
         self.known_heads.clear();
         self.heads.clear();
         self.barrier_rounds = 0;
+        self.peer_members.clear();
+    }
+
+    fn cancel_baseline(&mut self) -> Vec<RecoveryEffect> {
+        self.baseline_op
+            .take()
+            .map_or_else(Vec::new, |op| vec![RecoveryEffect::CancelBaseline { op }])
     }
 
     fn origin_only(&mut self) -> RecoveryStep {
+        let cancel = self.cancel_baseline();
         self.clear_work();
         self.state.stage = RecoveryStage::OriginOnly;
         self.state.recovered = false;
         let Some(policy) = self.rearm else {
-            return Self::step_ok(Vec::new());
+            return Self::step_ok(cancel);
         };
         if self.rearm_exhausted || self.next_token == 0 || self.state.generation == u64::MAX {
             self.rearm_exhausted = true;
-            return Self::reject(RecoveryError::Exhausted);
+            return RecoveryStep {
+                effects: cancel,
+                rejection: Some(RecoveryError::Exhausted),
+            };
         }
         let Some(due) = self.now.0.checked_add(self.next_rearm_ms).map(Time) else {
             self.rearm_exhausted = true;
-            return Self::reject(RecoveryError::Exhausted);
+            return RecoveryStep {
+                effects: cancel,
+                rejection: Some(RecoveryError::Exhausted),
+            };
         };
         self.rearm_due = Some(due);
         self.next_rearm_ms = self.next_rearm_ms.saturating_mul(2).min(policy.max_ms);
-        self.with_timer(Vec::new())
+        self.with_timer(cancel)
     }
 
     fn issue(&mut self, stage: RecoveryStage) -> Result<RecoveryOperation, RecoveryError> {
         let total_due = self.total_due.ok_or(RecoveryError::Stage)?;
-        let operation_due = Time(
-            self.now
-                .0
-                .checked_add(self.config.attempt_ms)
-                .ok_or(RecoveryError::Exhausted)?,
-        )
-        .min(total_due);
+        // The baseline child has its own finite source-operation deadlines.
+        // Its parent spans the original recovery episode; charging it to one
+        // ordinary adapter attempt would abort a healthy multi-step transfer.
+        let operation_due = if stage == RecoveryStage::AcquiringBaseline {
+            total_due
+        } else {
+            Time(
+                self.now
+                    .0
+                    .checked_add(self.config.attempt_ms)
+                    .ok_or(RecoveryError::Exhausted)?,
+            )
+            .min(total_due)
+        };
         if self.now >= operation_due || self.next_token == 0 {
             return Err(RecoveryError::Exhausted);
         }
@@ -226,26 +277,32 @@ impl RecoveryEngine {
         if self.rearm_exhausted {
             return Self::reject(RecoveryError::Exhausted);
         }
+        let cancel = self.cancel_baseline();
         self.clear_work();
         self.state.recovered = false;
         self.state.covered_lapses = self.state.covered_lapses.max(lapses);
         let Some(next) = self.state.generation.checked_add(1) else {
             self.state.stage = RecoveryStage::OriginOnly;
             self.rearm_exhausted = true;
+            let mut effects = vec![RecoveryEffect::CloseGate {
+                generation: self.state.generation,
+            }];
+            effects.extend(cancel);
             return RecoveryStep {
-                effects: vec![RecoveryEffect::CloseGate {
-                    generation: self.state.generation,
-                }],
+                effects,
                 rejection: Some(RecoveryError::Exhausted),
             };
         };
         self.state.generation = next;
         self.plan = plan;
+        self.baseline = Baseline::Origin;
         let Some(due) = self.now.0.checked_add(self.config.total_ms).map(Time) else {
             self.state.stage = RecoveryStage::OriginOnly;
             self.rearm_exhausted = true;
+            let mut effects = vec![RecoveryEffect::CloseGate { generation: next }];
+            effects.extend(cancel);
             return RecoveryStep {
-                effects: vec![RecoveryEffect::CloseGate { generation: next }],
+                effects,
                 rejection: Some(RecoveryError::Exhausted),
             };
         };
@@ -254,18 +311,20 @@ impl RecoveryEngine {
             self.clear_work();
             self.state.stage = RecoveryStage::OriginOnly;
             self.rearm_exhausted = true;
+            let mut effects = vec![RecoveryEffect::CloseGate { generation: next }];
+            effects.extend(cancel);
             return RecoveryStep {
-                effects: vec![RecoveryEffect::CloseGate { generation: next }],
+                effects,
                 rejection: Some(RecoveryError::Exhausted),
             };
         };
-        self.with_timer(vec![
-            RecoveryEffect::CloseGate { generation: next },
-            RecoveryEffect::Invalidate {
-                op,
-                distrust_bodies: plan == Plan::Full,
-            },
-        ])
+        let mut effects = vec![RecoveryEffect::CloseGate { generation: next }];
+        effects.extend(cancel);
+        effects.push(RecoveryEffect::Invalidate {
+            op,
+            distrust_bodies: plan == Plan::Full,
+        });
+        self.with_timer(effects)
     }
 
     fn fallback(&mut self) -> RecoveryStep {
@@ -281,15 +340,52 @@ impl RecoveryEngine {
         let Ok(op) = self.issue(stage) else {
             return self.fallback_or_origin();
         };
-        self.with_timer(vec![RecoveryEffect::ObservePeers { op }])
+        let effect = if matches!(
+            stage,
+            RecoveryStage::PeerSamplingHeads | RecoveryStage::PeerRecheckingHeads
+        ) {
+            RecoveryEffect::ObservePeerHeads { op }
+        } else {
+            RecoveryEffect::ObservePeers { op }
+        };
+        self.with_timer(vec![effect])
     }
 
     fn fallback_or_origin(&mut self) -> RecoveryStep {
         if self.plan == Plan::Lapse {
             self.fallback()
+        } else if self.baseline == Baseline::Peer {
+            self.recover_origin()
         } else {
             self.origin_only()
         }
+    }
+
+    fn recover_origin(&mut self) -> RecoveryStep {
+        let mut effects = self.cancel_baseline();
+        self.baseline = Baseline::Origin;
+        self.seen.clear();
+        self.exempt.clear();
+        self.known_heads.clear();
+        self.heads.clear();
+        self.barrier_rounds = 0;
+        self.peer_members.clear();
+        let Ok(op) = self.issue(RecoveryStage::Rebuilding) else {
+            let mut terminal = self.origin_only();
+            effects.append(&mut terminal.effects);
+            terminal.effects = effects;
+            return terminal;
+        };
+        effects.push(RecoveryEffect::RebuildOrigin { op });
+        self.with_timer(effects)
+    }
+
+    fn acquire_baseline(&mut self) -> RecoveryStep {
+        let Ok(op) = self.issue(RecoveryStage::AcquiringBaseline) else {
+            return self.origin_only();
+        };
+        self.baseline_op = Some(op);
+        self.with_timer(vec![RecoveryEffect::AcquireBaseline { op }])
     }
 
     fn retry_full(&mut self) -> RecoveryStep {
@@ -410,7 +506,7 @@ impl RecoveryEngine {
         if self.seen.len().saturating_add(self.exempt.len()) > self.config.max_members
             || self.grants.len() > self.config.max_members
         {
-            return self.fallback();
+            return self.fallback_or_origin();
         }
         let all_advanced = self.grants.iter().all(|(node, before)| {
             present.get(node).is_none_or(|peer| !peer.grants_lease)
@@ -438,11 +534,11 @@ impl RecoveryEngine {
             }
         }
         if self.seen.len().saturating_add(self.exempt.len()) > self.config.max_members {
-            return self.fallback();
+            return self.fallback_or_origin();
         }
         let present: BTreeSet<&NodeId> = peers.iter().map(|peer| &peer.node).collect();
         if self.seen.iter().any(|node| !present.contains(node)) {
-            return self.fallback();
+            return self.fallback_or_origin();
         }
         let mut heads = BTreeMap::new();
         for peer in peers {
@@ -460,7 +556,7 @@ impl RecoveryEngine {
                 })
             })
         {
-            return self.fallback();
+            return self.fallback_or_origin();
         }
         if recheck && heads == self.heads {
             return self.affirm();
@@ -468,12 +564,17 @@ impl RecoveryEngine {
         if recheck {
             self.barrier_rounds += 1;
             if self.barrier_rounds >= self.config.max_barrier_rounds {
-                return self.fallback();
+                return self.fallback_or_origin();
             }
         }
         self.heads = heads;
-        let Ok(op) = self.issue(RecoveryStage::WaitingFrontiers) else {
-            return self.fallback();
+        let waiting = if self.baseline == Baseline::Peer {
+            RecoveryStage::PeerWaitingFrontiers
+        } else {
+            RecoveryStage::WaitingFrontiers
+        };
+        let Ok(op) = self.issue(waiting) else {
+            return self.fallback_or_origin();
         };
         self.with_timer(vec![RecoveryEffect::WaitFrontiers {
             op,
@@ -548,11 +649,10 @@ impl RecoveryEngine {
                 self.operation_due = None;
                 if self.plan == Plan::Lapse {
                     self.observe_peers(RecoveryStage::SamplingInitial)
+                } else if self.bootstrap {
+                    self.acquire_baseline()
                 } else {
-                    let Ok(op) = self.issue(RecoveryStage::Rebuilding) else {
-                        return self.origin_only();
-                    };
-                    self.with_timer(vec![RecoveryEffect::RebuildOrigin { op }])
+                    self.recover_origin()
                 }
             }
             RecoveryEvent::Materialized { op } => {
@@ -562,6 +662,34 @@ impl RecoveryEngine {
                 self.operation = None;
                 self.operation_due = None;
                 self.affirm()
+            }
+            RecoveryEvent::BootstrapDeclined { op } => {
+                if !self.expected(op, RecoveryStage::AcquiringBaseline) {
+                    return Self::reject(RecoveryError::StaleOperation);
+                }
+                self.recover_origin()
+            }
+            RecoveryEvent::LocalBaselineBuilt { op } => {
+                if !self.expected(op, RecoveryStage::AcquiringBaseline) {
+                    return Self::reject(RecoveryError::StaleOperation);
+                }
+                self.baseline = Baseline::Origin;
+                self.affirm()
+            }
+            RecoveryEvent::PeerBaselineInstalled { op, handoff } => {
+                if !self.expected(op, RecoveryStage::AcquiringBaseline) {
+                    return Self::reject(RecoveryError::StaleOperation);
+                }
+                if !self.valid_handoff(op, &handoff) {
+                    return self.recover_origin();
+                }
+                self.baseline = Baseline::Peer;
+                self.peer_members = handoff.coverage.members;
+                let mut cancel = self.cancel_baseline();
+                let mut observed = self.observe_peers(RecoveryStage::PeerSamplingHeads);
+                cancel.append(&mut observed.effects);
+                observed.effects = cancel;
+                observed
             }
             RecoveryEvent::PeersObserved {
                 op,
@@ -599,13 +727,46 @@ impl RecoveryEngine {
                     _ => Self::reject(RecoveryError::Stage),
                 }
             }
+            RecoveryEvent::PeerHeadsObserved {
+                op,
+                peers,
+                identities,
+            } => {
+                if !self.accepts_operation(op)
+                    || !matches!(
+                        self.state.stage,
+                        RecoveryStage::PeerSamplingHeads | RecoveryStage::PeerRecheckingHeads
+                    )
+                {
+                    return Self::reject(RecoveryError::StaleOperation);
+                }
+                if let Err(error) = self.validate_peers(&peers) {
+                    return Self::reject(error);
+                }
+                if !self.valid_peer_roster(&peers, &identities)
+                    || self.record_known_heads(&peers).is_err()
+                {
+                    return self.recover_origin();
+                }
+                self.operation = None;
+                self.operation_due = None;
+                let recheck = self.state.stage == RecoveryStage::PeerRecheckingHeads;
+                self.observed_heads(&peers, recheck)
+            }
             RecoveryEvent::FrontiersReached { op } => {
-                if !self.expected(op, RecoveryStage::WaitingFrontiers) {
+                if !self.expected(op, RecoveryStage::WaitingFrontiers)
+                    && !self.expected(op, RecoveryStage::PeerWaitingFrontiers)
+                {
                     return Self::reject(RecoveryError::StaleOperation);
                 }
                 self.operation = None;
                 self.operation_due = None;
-                self.observe_peers(RecoveryStage::RecheckingHeads)
+                let rechecking = if self.baseline == Baseline::Peer {
+                    RecoveryStage::PeerRecheckingHeads
+                } else {
+                    RecoveryStage::RecheckingHeads
+                };
+                self.observe_peers(rechecking)
             }
             RecoveryEvent::Affirmed { op, accepted } => {
                 if !self.expected(op, RecoveryStage::Affirming) {
@@ -630,7 +791,11 @@ impl RecoveryEngine {
                 if !self.accepts_operation(op) {
                     return Self::reject(RecoveryError::StaleOperation);
                 }
-                if self.plan == Plan::Full {
+                if self.state.stage == RecoveryStage::AcquiringBaseline
+                    || self.baseline == Baseline::Peer
+                {
+                    self.recover_origin()
+                } else if self.plan == Plan::Full {
                     self.retry_full()
                 } else {
                     self.fallback()
@@ -645,7 +810,11 @@ impl RecoveryEngine {
                     return self.fallback_or_origin();
                 }
                 if self.operation_due.is_some_and(|due| now >= due) {
-                    return if self.plan == Plan::Full {
+                    return if self.state.stage == RecoveryStage::AcquiringBaseline
+                        || self.baseline == Baseline::Peer
+                    {
+                        self.recover_origin()
+                    } else if self.plan == Plan::Full {
                         self.retry_full()
                     } else {
                         self.fallback()
@@ -674,19 +843,24 @@ impl RecoveryEngine {
                 Self::step_ok(Vec::new())
             }
             RecoveryEvent::Cancel => {
+                let cancel = self.cancel_baseline();
                 self.clear_work();
                 self.state.recovered = false;
                 self.state.stage = RecoveryStage::Cancelled;
                 let Some(next) = self.state.generation.checked_add(1) else {
+                    let mut effects = vec![RecoveryEffect::CloseGate {
+                        generation: self.state.generation,
+                    }];
+                    effects.extend(cancel);
                     return RecoveryStep {
-                        effects: vec![RecoveryEffect::CloseGate {
-                            generation: self.state.generation,
-                        }],
+                        effects,
                         rejection: Some(RecoveryError::Exhausted),
                     };
                 };
                 self.state.generation = next;
-                Self::step_ok(vec![RecoveryEffect::CloseGate { generation: next }])
+                let mut effects = vec![RecoveryEffect::CloseGate { generation: next }];
+                effects.extend(cancel);
+                Self::step_ok(effects)
             }
         }
     }

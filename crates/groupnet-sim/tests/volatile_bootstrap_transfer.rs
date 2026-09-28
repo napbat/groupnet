@@ -1,16 +1,18 @@
 //! Queued donor transfer callbacks under seeded delay, duplication, and loss.
 
 use groupnet_core::volatile_bootstrap::journal::{
-    BarrierReceipt, CaptureId, DeltaIdentity, DonorJournal, JournalConfig, JournalCursor,
-    NativeCut, ReservationId,
+    AttachToken, BarrierReceipt, CaptureId, DeltaIdentity, DonorJournal, JournalConfig,
+    JournalCursor, NativeCut, ReservationId,
 };
 use groupnet_core::volatile_bootstrap::transfer::{
-    NativeCoverageReceipt, TransferConfig, TransferEffect, TransferEvent, TransferOffer,
+    NativeCoverageReceipt, NativeHandoffReceipt, TransferConfig, TransferEffect, TransferEvent,
+    TransferOffer,
 };
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
     BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity, ClaimPhase,
 };
+use groupnet_core::volatile_recovery::RecoveryOperation;
 use groupnet_core::{NodeId, Time, placement};
 use groupnet_sim::SplitMix64;
 
@@ -394,12 +396,32 @@ fn reply(
                 }
             }
         }
-        TransferEffect::InstallCandidate { op, receipt } => {
+        TransferEffect::InstallCandidate { op, coverage } => {
+            let receipt = coverage.barrier.clone();
             assert_eq!(receipt.cursor.position, 3);
             assert_eq!(receipt.covered_cuts[0].sequence, 2);
             assert_eq!(fixture.staged_native_sequence, 2);
             assert_eq!(fixture.staged_image, fixture.reference_image);
-            TransferEvent::Installed { op }
+            TransferEvent::Installed {
+                op,
+                handoff: Box::new(NativeHandoffReceipt {
+                    recovery: RecoveryOperation {
+                        session: 1,
+                        generation: 1,
+                        token: 1,
+                    },
+                    install: op,
+                    coverage: *coverage,
+                    attachment: AttachToken {
+                        reservation: receipt.reservation.clone(),
+                        operation: receipt.attach_operation,
+                    },
+                    schema: 1,
+                    applier_generation: 1,
+                    continued_cuts: receipt.covered_cuts,
+                    buffered_bytes: 0,
+                }),
+            }
         }
         TransferEffect::DiscardStage { .. } => {
             fixture.staged_image = None;

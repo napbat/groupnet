@@ -3,8 +3,11 @@
 use super::journal::{
     AttachToken, BarrierReceipt, CaptureId, JournalCursor, NativeCut, ReservationId,
 };
-use super::transfer::{TransferConfig, TransferEffect, TransferEvent};
+use super::transfer::{
+    NativeCoverageReceipt, NativeHandoffReceipt, TransferConfig, TransferEffect, TransferEvent,
+};
 use super::*;
+use crate::volatile_recovery::RecoveryOperation;
 use crate::{NodeId, Time, placement};
 
 fn config() -> BootstrapConfig {
@@ -293,7 +296,12 @@ fn child_effect(engine: &mut ClaimEngine, event: TransferEvent) -> TransferEffec
     clippy::too_many_lines,
     reason = "the helper advances each exact private transfer callback to an outstanding install"
 )]
-fn installing() -> (ClaimEngine, BootstrapOperation, BootstrapOperation) {
+fn installing() -> (
+    ClaimEngine,
+    BootstrapOperation,
+    BootstrapOperation,
+    NativeHandoffReceipt,
+) {
     let (mut engine, parent, donor) = ready_follower_with_wait(20);
     let follower = ClaimIdentity {
         node: NodeId::from(if donor.node.as_str() == "a" { "b" } else { "a" }),
@@ -417,29 +425,47 @@ fn installing() -> (ClaimEngine, BootstrapOperation, BootstrapOperation) {
     ) else {
         panic!("native coverage")
     };
+    let coverage = NativeCoverageReceipt {
+        parent,
+        staged_through: barrier.cursor.clone(),
+        proven_cuts: barrier.covered_cuts.clone(),
+        members: barrier.members.clone(),
+        buffered_bytes: 0,
+        barrier,
+    };
     let TransferEffect::InstallCandidate { op: install, .. } = child_effect(
         &mut engine,
         TransferEvent::NativeCovered {
             op: cover,
-            coverage: super::transfer::NativeCoverageReceipt {
-                parent,
-                staged_through: barrier.cursor.clone(),
-                proven_cuts: barrier.covered_cuts.clone(),
-                members: barrier.members.clone(),
-                buffered_bytes: 0,
-                barrier,
-            },
+            coverage: coverage.clone(),
         },
     ) else {
         panic!("install")
     };
-    (engine, parent, install)
+    let handoff = NativeHandoffReceipt {
+        recovery: RecoveryOperation {
+            session: 1,
+            generation: 1,
+            token: 1,
+        },
+        install,
+        attachment: AttachToken {
+            reservation: coverage.barrier.reservation.clone(),
+            operation: 1,
+        },
+        schema: 1,
+        applier_generation: 1,
+        continued_cuts: coverage.proven_cuts.clone(),
+        buffered_bytes: 0,
+        coverage,
+    };
+    (engine, parent, install, handoff)
 }
 
 #[test]
 fn cancel_or_restart_during_install_fences_old_callback_before_cleanup() {
     for terminal in [false, true] {
-        let (mut engine, parent, install) = installing();
+        let (mut engine, parent, install, handoff) = installing();
         let event = if terminal {
             BootstrapEvent::Cancel
         } else {
@@ -454,7 +480,10 @@ fn cancel_or_restart_during_install_fences_old_callback_before_cleanup() {
         assert!(stopped.effects.iter().any(|effect| matches!(effect,
             BootstrapEffect::Transfer(inner) if matches!(inner.as_ref(), TransferEffect::ReleaseReservation(_)))));
         let late = engine.step(BootstrapEvent::Transfer(Box::new(
-            TransferEvent::Installed { op: install },
+            TransferEvent::Installed {
+                op: install,
+                handoff: Box::new(handoff),
+            },
         )));
         assert_eq!(late.rejection, Some(BootstrapError::Stage));
         assert_eq!(

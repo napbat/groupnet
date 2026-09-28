@@ -6,6 +6,15 @@ use crate::volatile_bootstrap::journal::{
     JournalDelta, NativeCut, ReservationId,
 };
 use crate::volatile_bootstrap::{BootId, BootstrapOperation, BootstrapScope, ClaimIdentity};
+use crate::volatile_recovery::RecoveryOperation;
+
+fn recovery() -> RecoveryOperation {
+    RecoveryOperation {
+        session: 1,
+        generation: 1,
+        token: 1,
+    }
+}
 
 fn identity(name: &str, session: u64) -> ClaimIdentity {
     ClaimIdentity {
@@ -369,18 +378,19 @@ fn image_and_two_barriers_finish_without_granting_authority() {
     else {
         panic!("final coverage")
     };
+    let coverage = NativeCoverageReceipt {
+        parent: op(1),
+        barrier: barrier(3, 2, 52),
+        staged_through: cursor(3),
+        proven_cuts: vec![cut(2)],
+        members: offer().members,
+        buffered_bytes: 3,
+    };
     let TransferEffect::InstallCandidate { op: install, .. } = accept(
         &mut engine,
         TransferEvent::NativeCovered {
             op: final_cover,
-            coverage: NativeCoverageReceipt {
-                parent: op(1),
-                barrier: barrier(3, 2, 52),
-                staged_through: cursor(3),
-                proven_cuts: vec![cut(2)],
-                members: offer().members,
-                buffered_bytes: 3,
-            },
+            coverage: coverage.clone(),
         },
         &mut allocate,
     ) else {
@@ -390,13 +400,116 @@ fn image_and_two_barriers_finish_without_granting_authority() {
     assert_eq!(
         accept(
             &mut engine,
-            TransferEvent::Installed { op: install },
+            TransferEvent::Installed {
+                op: install,
+                handoff: Box::new(NativeHandoffReceipt {
+                    recovery: recovery(),
+                    install,
+                    coverage,
+                    attachment: AttachToken {
+                        reservation: reservation(),
+                        operation: 42,
+                    },
+                    schema: 1,
+                    applier_generation: 1,
+                    continued_cuts: vec![cut(2)],
+                    buffered_bytes: 0,
+                }),
+            },
             &mut allocate,
         ),
         TransferEffect::ReleaseReservation(reservation())
     );
     assert_eq!(engine.stage(), TransferStage::Completed);
     assert_eq!(engine.next_deadline(), None);
+}
+
+#[test]
+fn quiet_zero_cut_handoff_is_valid_but_mismatched_attachment_aborts() {
+    for wrong_attachment in [false, true] {
+        let mut engine = TransferSession::new(config(), binding(), Time(0)).unwrap();
+        let mut next = 1;
+        let attach = through_image(&mut engine, &mut next);
+        let mut allocate = || {
+            next += 1;
+            Some(op(next))
+        };
+        let attachment = AttachToken {
+            reservation: reservation(),
+            operation: 42,
+        };
+        let TransferEffect::FetchBarrier { op: fetch, .. } = accept(
+            &mut engine,
+            TransferEvent::StreamAttached {
+                op: attach,
+                token: attachment.clone(),
+            },
+            &mut allocate,
+        ) else {
+            panic!("barrier")
+        };
+        let receipt = barrier(0, 0, 51);
+        let TransferEffect::CheckNativeCoverage { op: cover, .. } = accept(
+            &mut engine,
+            TransferEvent::BarrierReceived {
+                op: fetch,
+                receipt: receipt.clone(),
+            },
+            &mut allocate,
+        ) else {
+            panic!("quiet native coverage")
+        };
+        let coverage = NativeCoverageReceipt {
+            parent: op(1),
+            staged_through: receipt.cursor.clone(),
+            proven_cuts: receipt.covered_cuts.clone(),
+            members: receipt.members.clone(),
+            buffered_bytes: 0,
+            barrier: receipt,
+        };
+        let TransferEffect::InstallCandidate { op: install, .. } = accept(
+            &mut engine,
+            TransferEvent::NativeCovered {
+                op: cover,
+                coverage: coverage.clone(),
+            },
+            &mut allocate,
+        ) else {
+            panic!("quiet install")
+        };
+        let handoff = NativeHandoffReceipt {
+            recovery: recovery(),
+            install,
+            coverage,
+            attachment: AttachToken {
+                operation: if wrong_attachment { 43 } else { 42 },
+                ..attachment
+            },
+            schema: 1,
+            applier_generation: 1,
+            continued_cuts: vec![cut(0)],
+            buffered_bytes: 0,
+        };
+        let step = engine.step(
+            TransferEvent::Installed {
+                op: install,
+                handoff: Box::new(handoff),
+            },
+            &mut allocate,
+        );
+        if wrong_attachment {
+            assert_eq!(step.rejection, Some(TransferError::Continuity));
+            assert_eq!(engine.stage(), TransferStage::Aborted);
+            assert!(
+                step.effects
+                    .iter()
+                    .any(|effect| matches!(effect, TransferEffect::ReleaseReservation(_)))
+            );
+        } else {
+            assert_eq!(step.rejection, None);
+            assert_eq!(engine.stage(), TransferStage::Completed);
+        }
+    }
 }
 
 #[test]
@@ -480,7 +593,32 @@ fn expiry_and_cancel_release_exact_reservation_and_reject_late_install() {
     );
     assert_eq!(
         engine
-            .step(TransferEvent::Installed { op: attach }, &mut || None)
+            .step(
+                TransferEvent::Installed {
+                    op: attach,
+                    handoff: Box::new(NativeHandoffReceipt {
+                        recovery: recovery(),
+                        install: attach,
+                        coverage: NativeCoverageReceipt {
+                            parent: op(1),
+                            barrier: barrier(0, 0, 1),
+                            staged_through: cursor(0),
+                            proven_cuts: vec![cut(0)],
+                            members: offer().members,
+                            buffered_bytes: 0,
+                        },
+                        attachment: AttachToken {
+                            reservation: reservation(),
+                            operation: 42,
+                        },
+                        schema: 1,
+                        applier_generation: 1,
+                        continued_cuts: vec![cut(0)],
+                        buffered_bytes: 0,
+                    }),
+                },
+                &mut || None,
+            )
             .rejection,
         Some(TransferError::Stale)
     );

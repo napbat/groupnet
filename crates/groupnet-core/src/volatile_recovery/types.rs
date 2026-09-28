@@ -1,5 +1,7 @@
 //! Bounded facts and effects for recovery from a volatile coherence feed.
 
+use crate::volatile_bootstrap::ClaimIdentity;
+use crate::volatile_bootstrap::transfer::NativeHandoffReceipt;
 use crate::{NodeId, Time};
 
 /// Which existing reader-side coherence policy a consumer uses.
@@ -133,6 +135,8 @@ pub enum RecoveryStage {
     Invalidating,
     /// A bounded origin-index rebuild is pending.
     Rebuilding,
+    /// An opt-in claim/transfer child is acquiring a guarded baseline.
+    AcquiringBaseline,
     /// Recording the initial member/granter set for a lease-lapse proof.
     SamplingInitial,
     /// Waiting for each relevant granter to adopt a later renewal.
@@ -145,6 +149,12 @@ pub enum RecoveryStage {
     WaitingFrontiers,
     /// Confirming source heads and vanished peers after the frontier barrier.
     RecheckingHeads,
+    /// Checking the complete peer/head roster after atomic native handoff.
+    PeerSamplingHeads,
+    /// Waiting for sampled native heads through the normal feed applier.
+    PeerWaitingFrontiers,
+    /// Rechecking peer/head continuity after the peer-specific barrier.
+    PeerRecheckingHeads,
     /// A generation-bound lease affirmation is pending.
     Affirming,
     /// Recovery proof completed; read permission still intersects lease and app gates.
@@ -201,6 +211,27 @@ pub enum RecoveryEvent {
         /// Exact fenced origin rebuild operation.
         op: RecoveryOperation,
     },
+    /// The opt-in claim/transfer child declined or lost its donor; rebuild
+    /// from origin within the same original recovery episode.
+    BootstrapDeclined {
+        /// Exact baseline acquisition operation.
+        op: RecoveryOperation,
+    },
+    /// The selected local provisional builder completed a guarded origin
+    /// image. The claim may remain available for bounded donor service;
+    /// serving still requires independent lease/domain affirmation.
+    LocalBaselineBuilt {
+        /// Exact baseline acquisition operation.
+        op: RecoveryOperation,
+    },
+    /// A source-correlated private candidate was installed with continuous
+    /// normal native delivery, but still has no local serving permission.
+    PeerBaselineInstalled {
+        /// Exact baseline acquisition operation.
+        op: RecoveryOperation,
+        /// Exact transfer handoff accepted before donor release.
+        handoff: Box<NativeHandoffReceipt>,
+    },
     /// Bounded membership and per-granter renewal observation.
     PeersObserved {
         /// Exact observation operation.
@@ -209,6 +240,15 @@ pub enum RecoveryEvent {
         peers: Vec<Peer>,
         /// Roster-wide lease confirmation, used only alongside per-granter checks.
         confirmed: Option<Mark>,
+    },
+    /// Complete exact-incarnation roster and heads after peer handoff.
+    PeerHeadsObserved {
+        /// Exact peer-specific observation operation.
+        op: RecoveryOperation,
+        /// Bounded source-backed peer and head facts, excluding the local node.
+        peers: Vec<Peer>,
+        /// Complete current roster including incarnation and session identity.
+        identities: Vec<ClaimIdentity>,
     },
     /// All sampled per-writer heads were applied to the local index.
     FrontiersReached {
@@ -253,9 +293,25 @@ pub enum RecoveryEffect {
         /// Exact private origin rebuild operation.
         op: RecoveryOperation,
     },
+    /// Run opt-in claim/takeover/transfer under this original recovery turn.
+    AcquireBaseline {
+        /// Exact bounded baseline acquisition operation.
+        op: RecoveryOperation,
+    },
+    /// Cancel an exact provisional claim/transfer child before later work.
+    /// An installed normal feed applier is independent of this child.
+    CancelBaseline {
+        /// Original baseline acquisition operation.
+        op: RecoveryOperation,
+    },
     /// Observe complete bounded peer/granter/head facts for this stage.
     ObservePeers {
         /// Exact bounded membership observation operation.
+        op: RecoveryOperation,
+    },
+    /// Observe an exact bounded incarnation roster and its native feed heads.
+    ObservePeerHeads {
+        /// Exact peer-specific observation operation.
         op: RecoveryOperation,
     },
     /// Wait for each exact sampled head to be locally applied.
