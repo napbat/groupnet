@@ -20,8 +20,16 @@ existing worker without a new task, timer, map of stages, or operation
 allocator. Construction also pins a complete `BootstrapScope` and bulk limits.
 It constructs the client from the **same** admission handle passed to the
 worker, or rejects a separately supplied handle whose pool identity differs;
-a mismatched pool cannot evade the global cap. Local capture, guarded
-unlink, and incoming follower preparation delegate to `A`.
+a mismatched pool cannot evade the global cap. Local capture and guarded
+unlink delegate to `A`. Groupnet handles incoming Reserve, Attach, Barrier,
+Advance, Batch, Ack, and Release against `DonorJournal` under the shared
+ingress lock. `A` supplies only a charged immutable image offer and bounded
+image chunks. Native writer cuts must enter that journal under the
+application's index publication coordinator before the atomic B sample;
+the generic handler never samples separate native state after B.
+The image-offer callback receives the exact metadata cap before allocation;
+Groupnet checks the completed offer as well. Donor journal limits for roster,
+cuts, and batches must fit that same local policy before any mutable request.
 
 The Groupnet wrapper owns these translations. `FetchOffer`, `ReserveDonor`,
 `FetchChunk`, `AttachStream`, `FetchBarrier`, `AdvanceBarrier`, `FetchBatch`,
@@ -52,7 +60,11 @@ buffer/coverage proofs, application schema, image commitment check, and the
 single generation-fenced candidate swap plus normal-feed handoff. These
 callbacks own no network request selection or retry timer.
 
-The wrapper needs an ownership-preserving conversion from
+The wrapper charges outbound request/correlation copies before cloning and
+holds that permit through the network await. Retained reservation and
+attachment identities have a separate worker-owned charge until cleanup;
+source replies are charged before journal clones enter the inbox. The wrapper
+needs an ownership-preserving conversion from
 `Admitted<WireReply>` into an admitted chunk, batch, or `TransferEvent`.
 The shared decoded charge uses a checked maximum of the actual static
 `size_of::<WireReply>()` and `size_of::<TransferEvent>()` headers, bounded
@@ -62,6 +74,12 @@ clone may outlive that charge; a second retained copy reserves again first.
 The application receives borrowed or owned admitted values and cannot move
 buffers out of their permit. `TransferResources` remains the sole owner of
 private stage, logical donor attachment, at most one batch, and native overlap.
+The journal counts one logical outstanding batch across lost-response
+readbacks; each physical batch copy reserves a separate runtime byte charge
+before the journal clones it. Requests with metadata or batch caps other than
+the donor's configured local policy are refused before source state changes.
+Heterogeneous policy caps can therefore decline peer transfer and route the
+follower to origin; there is no cap negotiation in this first protocol.
 The network `Attach` reply is a source reservation/attachment token: this
 first protocol uses one short-lived request stream per operation, while the
 donor journal retains and serves the continuous bounded suffix. It is not an
