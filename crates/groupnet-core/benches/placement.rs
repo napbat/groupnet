@@ -46,14 +46,14 @@ fn weighted(members: usize, weight: u32) -> Vec<(NodeId, u32)> {
 
 /// The coordinator path: one owner over an unweighted live set, no allocation.
 #[divan::bench(args = SIZES)]
-fn owner(bencher: Bencher, members: usize) {
+fn owner(bencher: Bencher<'_, '_>, members: usize) {
     let set = member_set(members);
     bencher.bench(|| placement::owner(divan::black_box("shard-42"), divan::black_box(&set)));
 }
 
 /// The replica path: rank every member and take the top three.
 #[divan::bench(args = SIZES)]
-fn owners_unit_weight(bencher: Bencher, members: usize) {
+fn owners_unit_weight(bencher: Bencher<'_, '_>, members: usize) {
     let set = weighted(members, 1);
     bencher.bench(|| {
         placement::owners(
@@ -68,7 +68,7 @@ fn owners_unit_weight(bencher: Bencher, members: usize) {
 /// of its `HEAVY_WEIGHT` virtual tokens, so the hashing work scales with the
 /// weight total rather than the member count.
 #[divan::bench(args = SIZES)]
-fn owners_weighted(bencher: Bencher, members: usize) {
+fn owners_weighted(bencher: Bencher<'_, '_>, members: usize) {
     let set = weighted(members, HEAVY_WEIGHT);
     bencher.bench(|| {
         placement::owners(

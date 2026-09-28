@@ -122,7 +122,7 @@ fn request_frame(members: usize) -> Frame {
 }
 
 #[divan::bench(args = SIZES)]
-fn encode_digest(bencher: Bencher, members: usize) {
+fn encode_digest(bencher: Bencher<'_, '_>, members: usize) {
     let frame = digest_frame(members);
     bencher
         .counter(BytesCount::new(wire::encode(&frame).len()))
@@ -130,7 +130,7 @@ fn encode_digest(bencher: Bencher, members: usize) {
 }
 
 #[divan::bench(args = SIZES)]
-fn decode_digest(bencher: Bencher, members: usize) {
+fn decode_digest(bencher: Bencher<'_, '_>, members: usize) {
     let bytes = wire::encode(&digest_frame(members));
     bencher
         .counter(BytesCount::of_slice(&bytes))
@@ -138,7 +138,7 @@ fn decode_digest(bencher: Bencher, members: usize) {
 }
 
 #[divan::bench(args = SIZES)]
-fn encode_delta(bencher: Bencher, members: usize) {
+fn encode_delta(bencher: Bencher<'_, '_>, members: usize) {
     let frame = delta_frame(members);
     bencher
         .counter(BytesCount::new(wire::encode(&frame).len()))
@@ -146,7 +146,7 @@ fn encode_delta(bencher: Bencher, members: usize) {
 }
 
 #[divan::bench(args = SIZES)]
-fn decode_delta(bencher: Bencher, members: usize) {
+fn decode_delta(bencher: Bencher<'_, '_>, members: usize) {
     let bytes = wire::encode(&delta_frame(members));
     bencher
         .counter(BytesCount::of_slice(&bytes))
@@ -154,7 +154,7 @@ fn decode_delta(bencher: Bencher, members: usize) {
 }
 
 #[divan::bench(args = SIZES)]
-fn encode_delta_request(bencher: Bencher, members: usize) {
+fn encode_delta_request(bencher: Bencher<'_, '_>, members: usize) {
     let frame = request_frame(members);
     bencher
         .counter(BytesCount::new(wire::encode(&frame).len()))
@@ -164,7 +164,7 @@ fn encode_delta_request(bencher: Bencher, members: usize) {
 /// Demuxing an inbound frame to its group must not depend on frame size — this
 /// is the one that would show it if it ever did.
 #[divan::bench(args = SIZES)]
-fn peek_group(bencher: Bencher, members: usize) {
+fn peek_group(bencher: Bencher<'_, '_>, members: usize) {
     let bytes = wire::encode(&digest_frame(members));
     bencher.bench(|| wire::peek_group(divan::black_box(&bytes)));
 }
