@@ -4,8 +4,8 @@ use super::{DonorJournal, Follower, OutstandingBatch};
 use crate::Time;
 use crate::volatile_bootstrap::ClaimIdentity;
 use crate::volatile_bootstrap::journal::types::{
-    AttachToken, BarrierReceipt, DeltaIdentity, JournalBatch, JournalCursor, JournalError,
-    JournalState, ReservationId, ReservationStage,
+    AttachToken, BarrierReceipt, DeltaIdentity, Invalidation, JournalBatch, JournalCursor,
+    JournalError, JournalState, ReservationId, ReservationStage,
 };
 
 impl DonorJournal {
@@ -76,9 +76,32 @@ impl DonorJournal {
             attach_operation: None,
             barrier: None,
             acked: 0,
+            last_acked: None,
             outstanding: None,
         });
         Ok(id)
+    }
+
+    /// Read back a response-lost reservation for the same exact follower and
+    /// image cut. No new lifetime or source position is created by readback.
+    ///
+    /// # Errors
+    /// Rejects a stale image cut or expired capture.
+    pub fn reserved_for(
+        &mut self,
+        now: Time,
+        follower: &ClaimIdentity,
+        from: &JournalCursor,
+    ) -> Result<Option<ReservationId>, JournalError> {
+        self.advance(now)?;
+        if self.state != JournalState::Active || from.capture != self.id || from.position != 0 {
+            return Err(JournalError::Stale);
+        }
+        Ok(self
+            .followers
+            .iter()
+            .find(|item| &item.id.follower == follower)
+            .map(|item| item.id.clone()))
     }
 
     /// Issue one exact attachment token. The runtime must establish the live
@@ -102,6 +125,30 @@ impl DonorJournal {
         Ok(AttachToken {
             reservation: reservation.clone(),
             operation,
+        })
+    }
+
+    /// Read back an already started exact attachment after a lost reply.
+    ///
+    /// # Errors
+    /// Rejects stale, expired, or unattached reservations.
+    pub fn attachment_for(
+        &mut self,
+        now: Time,
+        reservation: &ReservationId,
+    ) -> Result<AttachToken, JournalError> {
+        self.advance(now)?;
+        let index = self.follower_index(reservation)?;
+        let follower = &self.followers[index];
+        if !matches!(
+            follower.stage,
+            ReservationStage::Attaching | ReservationStage::Attached
+        ) {
+            return Err(JournalError::Stage);
+        }
+        Ok(AttachToken {
+            reservation: reservation.clone(),
+            operation: follower.attach_operation.ok_or(JournalError::Stage)?,
         })
     }
 
@@ -156,6 +203,10 @@ impl DonorJournal {
             covered_cuts: self.cuts.clone(),
             members: self.members.clone(),
         };
+        if !self.saved_barrier_fits(&receipt) {
+            self.invalidate_inner(Invalidation::Capacity);
+            return Err(JournalError::Capacity);
+        }
         self.followers[index].barrier = Some(receipt.clone());
         Ok(receipt)
     }
@@ -190,12 +241,17 @@ impl DonorJournal {
             covered_cuts: self.cuts.clone(),
             members: self.members.clone(),
         };
+        if !self.saved_barrier_fits(&receipt) {
+            self.invalidate_inner(Invalidation::Capacity);
+            return Err(JournalError::Capacity);
+        }
         self.followers[index].barrier = Some(receipt.clone());
         Ok(receipt)
     }
 
-    /// Return a bounded contiguous suffix batch with separately charged
-    /// in-flight clone memory. At most one batch is outstanding per follower.
+    /// Return a bounded contiguous suffix batch. One logical batch remains
+    /// outstanding per follower; each physical readback clone needs its own
+    /// runtime memory admission before this method is called.
     ///
     /// # Errors
     /// Rejects forged barriers, unattached followers, or backpressure.
@@ -218,10 +274,23 @@ impl DonorJournal {
         {
             return Err(JournalError::Stale);
         }
-        if self.followers[index].outstanding.is_some() {
-            return Err(JournalError::Capacity);
-        }
         let from = self.followers[index].acked;
+        if let Some(outstanding) = &self.followers[index].outstanding {
+            let deltas = self
+                .deltas
+                .iter()
+                .filter(|delta| delta.position > from && delta.position <= outstanding.through)
+                .cloned()
+                .collect();
+            return Ok(Some(JournalBatch {
+                reservation: reservation.clone(),
+                operation: outstanding.operation,
+                from: self.cursor(from),
+                through: self.cursor(outstanding.through),
+                deltas,
+                bytes: outstanding.bytes,
+            }));
+        }
         if from == barrier.cursor.position {
             return Ok(None);
         }
@@ -296,6 +365,11 @@ impl DonorJournal {
         self.advance(now)?;
         let index = self.follower_index(reservation)?;
         let Some(outstanding) = self.followers[index].outstanding.clone() else {
+            if through.capture == self.id
+                && self.followers[index].last_acked == Some((operation, through.position))
+            {
+                return Ok(self.cursor(through.position));
+            }
             return Err(JournalError::Stale);
         };
         if through.capture != self.id
@@ -306,6 +380,7 @@ impl DonorJournal {
         }
         self.inflight_bytes -= outstanding.bytes;
         self.followers[index].acked = outstanding.through;
+        self.followers[index].last_acked = Some((operation, through.position));
         self.followers[index].outstanding = None;
         Ok(self.cursor(through.position))
     }

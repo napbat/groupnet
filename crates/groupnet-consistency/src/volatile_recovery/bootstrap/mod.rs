@@ -2,6 +2,8 @@
 
 pub mod admission;
 #[cfg(feature = "volatile-bootstrap-bulk")]
+pub mod bulk_adapter;
+#[cfg(feature = "volatile-bootstrap-bulk")]
 pub mod bulk_wire;
 pub mod driver;
 pub mod inbox;

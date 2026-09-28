@@ -30,11 +30,46 @@ fn captured_for_cleanup(
         .begin_capture(Time(0), 1, 1, vec![selected], Vec::new())
         .unwrap();
     journal.finish_capture(Time(0), 1, 1).unwrap();
-    let suffix = admission.reserve(AdmissionClass::Suffix, 64).unwrap();
+    let storage = DonorJournal::storage_bound(journal_config()).unwrap();
+    let suffix = admission.reserve(AdmissionClass::Suffix, storage).unwrap();
     let ingress = JournalIngress::new(journal, suffix, Arc::new(Notify::new())).unwrap();
     let encoded = admission.reserve(AdmissionClass::Encoded, 1).unwrap();
     let decoded = admission.reserve(AdmissionClass::Decoded, 1).unwrap();
     DonorCapture::new(vec![42], ingress, encoded, decoded).unwrap()
+}
+
+#[test]
+fn ingress_rejects_an_undercharged_whole_journal() {
+    let admission = admission();
+    let selected = ClaimIdentity {
+        node: NodeId::from("me"),
+        incarnation: BootId(31),
+        session: 14,
+        attempt: 1,
+    };
+    let mut journal = DonorJournal::new(
+        journal_config(),
+        CaptureId {
+            scope: BootstrapScope {
+                domain: "o".into(),
+                partition: "b".into(),
+            },
+            donor: selected.clone(),
+            recovery_generation: 1,
+            serial: 3,
+        },
+    )
+    .unwrap();
+    journal
+        .begin_capture(Time(0), 1, 1, vec![selected], Vec::new())
+        .unwrap();
+    journal.finish_capture(Time(0), 1, 1).unwrap();
+    let storage = DonorJournal::storage_bound(journal_config()).unwrap();
+    let insufficient = admission
+        .reserve(AdmissionClass::Suffix, storage - 1)
+        .unwrap();
+    assert!(JournalIngress::new(journal, insufficient, Arc::new(Notify::new())).is_err());
+    assert_eq!(admission.usage().0, 0);
 }
 
 #[test]
@@ -60,7 +95,10 @@ fn delayed_old_capture_unlink_preserves_replacement_and_its_charge() {
             .is_some_and(|live| { live.same_candidate(replacement.ingress()) })
     );
     assert!(replacement.is_active());
-    assert_eq!(admission.usage().0, 132);
+    assert_eq!(
+        admission.usage().0,
+        2 * (DonorJournal::storage_bound(journal_config()).unwrap() + 2)
+    );
     drop(old);
     assert!(replacement.is_active());
     donor.retire_local_capture(&replacement);

@@ -167,7 +167,8 @@ impl JournalIngress {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// Attaches an already active capture and its pre-acquired suffix budget.
+    /// Attaches an already active capture and its pre-acquired whole-journal
+    /// storage budget, including bounded vector/header and barrier copies.
     ///
     /// # Errors
     /// A partial capture cannot be exposed to live index publications.
@@ -176,7 +177,14 @@ impl JournalIngress {
         suffix: Reservation,
         changed: Arc<Notify>,
     ) -> Result<Self, AdapterError> {
-        if journal.state() != JournalState::Active || suffix.class() != AdmissionClass::Suffix {
+        if journal.state() != JournalState::Active
+            || suffix.class() != AdmissionClass::Suffix
+            || DonorJournal::storage_bound(journal.config())
+                .ok()
+                .is_none_or(|needed| suffix.bytes() < needed)
+        {
+            drop(journal);
+            drop(suffix);
             return Err(AdapterError);
         }
         Ok(Self(Arc::new(JournalIngressInner {
@@ -216,7 +224,7 @@ impl JournalIngress {
         self.0.changed.notified().await;
     }
 
-    /// Exact charged suffix capacity retained as long as ingress is attached.
+    /// Conservative charged journal storage retained while ingress is attached.
     #[must_use]
     pub fn reserved_suffix_bytes(&self) -> usize {
         self.0.suffix.bytes()
@@ -330,6 +338,10 @@ pub struct TransferResources<S, A, N> {
     pub stage: Option<StageResources<S>>,
     /// Exact attached donor stream handle.
     pub attachment: Option<A>,
+    /// Exact donor reservation retained from `ReserveDonor` through cleanup.
+    pub reservation: Option<ReservationId>,
+    /// Separate charge for retained reservation and attachment identity copies.
+    pub metadata_charge: Option<Reservation>,
     /// At most one returned batch clone charged until fully processed.
     pub batch: Option<Admitted<JournalBatch>>,
     /// Native overlap bytes and their charge stay owned together.
@@ -370,6 +382,8 @@ impl<S, A, N> Default for TransferResources<S, A, N> {
         Self {
             stage: None,
             attachment: None,
+            reservation: None,
+            metadata_charge: None,
             batch: None,
             native_overlap: None,
         }
@@ -450,11 +464,11 @@ pub enum DonorReply {
     /// Complete bounded image metadata.
     Offer(Admitted<TransferOffer>),
     /// Confirmed suffix reservation.
-    Reserved(ReservationId),
+    Reserved(Admitted<ReservationId>),
     /// One encoded chunk; its in-flight charge follows the bytes.
     Chunk(Admitted<Vec<u8>>),
     /// Confirmed live-stream attachment.
-    Attached(AttachToken),
+    Attached(Admitted<AttachToken>),
     /// Atomic B and native writer cuts.
     Barrier(Admitted<BarrierReceipt>),
     /// One contiguous suffix batch and its in-flight charge.
@@ -520,6 +534,7 @@ pub trait DonorPort: Send + Sync + 'static {
         &self,
         request: &DonorRequest,
         capture: &DonorCapture<Self::Image>,
+        now: Time,
         admission: &ByteAdmission,
     ) -> Result<DonorReply, AdapterError>;
 
@@ -531,6 +546,7 @@ pub trait DonorPort: Send + Sync + 'static {
         resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
         admission: &'a ByteAdmission,
         permit: Option<PublicationPermit>,
+        deadline: Instant,
     ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TransferEvent>>, AdapterError>>;
 
     /// Immediately retire an exact attachment after source-side cancellation.

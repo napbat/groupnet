@@ -251,6 +251,35 @@ impl<T> Admitted<T> {
         result
     }
 
+    /// Changes only the admitted value while retaining its exact charge.
+    /// The caller must prove the replacement fits within the original charge.
+    #[cfg(any(test, feature = "volatile-bootstrap-bulk"))]
+    pub(crate) fn map<U>(self, apply: impl FnOnce(T) -> U) -> Admitted<U> {
+        let Self { value, reservation } = self;
+        Admitted {
+            value: apply(value),
+            reservation,
+        }
+    }
+
+    /// Fallible ownership-preserving conversion. A failed conversion retires
+    /// the original value before releasing its charge.
+    #[cfg(any(test, feature = "volatile-bootstrap-bulk"))]
+    pub(crate) fn try_map<U, E>(
+        self,
+        apply: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<Admitted<U>, E> {
+        let Self { value, reservation } = self;
+        let converted = apply(value);
+        match converted {
+            Ok(value) => Ok(Admitted { value, reservation }),
+            Err(error) => {
+                drop(reservation);
+                Err(error)
+            }
+        }
+    }
+
     /// Exact charge held through this value's lifetime.
     #[must_use]
     pub const fn charged_bytes(&self) -> usize {
@@ -355,6 +384,44 @@ mod tests {
             .consume(drop);
         assert_eq!(retired.load(Ordering::Acquire), 1);
         assert_eq!(budget.usage(), (0, [0; 5], 0));
+    }
+
+    #[test]
+    fn owned_conversion_and_failed_conversion_release_after_payload() {
+        let budget = ByteAdmission::new(AdmissionLimits {
+            max_total_bytes: 1,
+            max_encoded_bytes: 0,
+            max_decoded_bytes: 0,
+            max_suffix_bytes: 0,
+            max_native_overlap_bytes: 0,
+            max_inflight_bytes: 1,
+            max_reservations: 1,
+        })
+        .unwrap();
+        let retired = Arc::new(AtomicUsize::new(0));
+        let value = budget
+            .reserve(AdmissionClass::Inflight, 1)
+            .unwrap()
+            .hold(Retired(Arc::clone(&retired), budget.clone()));
+        let mapped = value.map(Some);
+        assert_eq!(budget.usage().0, 1);
+        drop(mapped);
+        assert_eq!(retired.load(Ordering::Acquire), 1);
+
+        retired.store(0, Ordering::Release);
+        let value = budget
+            .reserve(AdmissionClass::Inflight, 1)
+            .unwrap()
+            .hold(Retired(Arc::clone(&retired), budget.clone()));
+        assert!(matches!(
+            value.try_map(|value| {
+                drop(value);
+                Err::<(), _>(())
+            }),
+            Err(())
+        ));
+        assert_eq!(retired.load(Ordering::Acquire), 1);
+        assert_eq!(budget.usage().0, 0);
     }
 
     #[test]

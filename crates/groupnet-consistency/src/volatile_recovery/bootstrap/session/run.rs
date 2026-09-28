@@ -306,6 +306,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                             &mut self.resources,
                             &self.admission,
                             None,
+                            retire_due,
                         ),
                     )
                     .await;

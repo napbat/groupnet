@@ -30,7 +30,7 @@ pub struct BulkLimits {
 }
 
 impl BulkLimits {
-    fn decoded_charge(self) -> Result<usize, BulkError> {
+    pub(crate) fn decoded_charge(self) -> Result<usize, BulkError> {
         // The body cap covers variable identity/effect/string bytes. These
         // terms cover the owned enum/header and bounded Vec elements, whose
         // in-memory size need not equal their encoded representation. Scope
@@ -38,7 +38,11 @@ impl BulkLimits {
         // and capture NodeIds are Arc strings with two refcount words per
         // allocation. A batch has at most three embedded captures; twelve
         // fixed Arc headers conservatively cover these and follower IDs.
-        let header = size_of::<DonorRequest>().max(size_of::<super::WireReply>());
+        let header = size_of::<DonorRequest>()
+            .max(size_of::<super::WireReply>())
+            .max(size_of::<
+                groupnet_core::volatile_bootstrap::transfer::TransferEvent,
+            >());
         let arc_count = self
             .phase
             .max_members
@@ -87,7 +91,7 @@ impl BulkLimits {
             .ok_or(BulkError::Config)
     }
 
-    fn correlation_charge(self) -> Result<usize, BulkError> {
+    pub(crate) fn correlation_charge(self) -> Result<usize, BulkError> {
         self.wire
             .max_frame_bytes
             .checked_add(size_of::<Correlation>())
@@ -210,6 +214,12 @@ pub struct BootstrapBulkClient<B: BulkTransport> {
 }
 
 impl<B: BulkTransport> BootstrapBulkClient<B> {
+    /// Whether this client charges the same global pool as its recovery worker.
+    #[must_use]
+    pub fn uses_admission(&self, admission: &ByteAdmission) -> bool {
+        self.admission.same_pool(admission)
+    }
+
     /// Binds a data plane and the existing shared global admission pool.
     ///
     /// # Errors

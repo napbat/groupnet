@@ -222,15 +222,16 @@ impl DonorPort for OriginDonor {
             let decoded = admission
                 .reserve(AdmissionClass::Decoded, 1)
                 .map_err(|_| AdapterError)?;
-            let suffix = admission
-                .reserve(AdmissionClass::Suffix, 64)
-                .map_err(|_| AdapterError)?;
             let mut config = journal_config();
             let capture_max_ms = self.capture_max_ms.load(Ordering::SeqCst);
             if capture_max_ms > 0 {
                 config.max_total_ms = capture_max_ms;
                 config.max_follower_ms = config.max_follower_ms.min(capture_max_ms);
             }
+            let storage = DonorJournal::storage_bound(config).map_err(|_| AdapterError)?;
+            let suffix = admission
+                .reserve(AdmissionClass::Suffix, storage)
+                .map_err(|_| AdapterError)?;
             let mut journal = DonorJournal::new(
                 config,
                 CaptureId {
@@ -268,6 +269,7 @@ impl DonorPort for OriginDonor {
         &self,
         _request: &DonorRequest,
         _capture: &DonorCapture<Self::Image>,
+        _now: Time,
         _admission: &ByteAdmission,
     ) -> Result<DonorReply, AdapterError> {
         self.follower_prepares.fetch_add(1, Ordering::SeqCst);
@@ -281,6 +283,7 @@ impl DonorPort for OriginDonor {
         _resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
         _admission: &'a ByteAdmission,
         _permit: Option<PublicationPermit>,
+        _deadline: Instant,
     ) -> BoxRecoveryFuture<
         'a,
         Result<
@@ -510,6 +513,7 @@ impl DonorPort for PeerDonor {
         &self,
         _request: &DonorRequest,
         _capture: &DonorCapture<Self::Image>,
+        _now: Time,
         _admission: &ByteAdmission,
     ) -> Result<DonorReply, AdapterError> {
         Err(AdapterError)
@@ -526,6 +530,7 @@ impl DonorPort for PeerDonor {
         resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
         admission: &'a ByteAdmission,
         permit: Option<PublicationPermit>,
+        _deadline: Instant,
     ) -> BoxRecoveryFuture<
         'a,
         Result<
@@ -693,10 +698,10 @@ impl DonorPort for PeerDonor {
 
 fn admission() -> ByteAdmission {
     ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: 8_192,
+        max_total_bytes: 100_000,
         max_encoded_bytes: 1_024,
         max_decoded_bytes: 1_024,
-        max_suffix_bytes: 1_024,
+        max_suffix_bytes: 50_000,
         max_native_overlap_bytes: 1_024,
         max_inflight_bytes: 8_192,
         max_reservations: 32,

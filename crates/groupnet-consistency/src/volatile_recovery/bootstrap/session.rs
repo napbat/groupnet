@@ -246,10 +246,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 let _ = capture.tick(self.now());
             }
             self.retire_capture_if_invalid();
+            let now = self.now();
             let reply = self.capture.as_ref().and_then(|capture| {
                 capture.is_active().then(|| {
                     self.donor
-                        .prepare_follower(incoming.request(), capture, &self.admission)
+                        .prepare_follower(incoming.request(), capture, now, &self.admission)
                 })
             });
             incoming.respond(reply.unwrap_or(Err(crate::volatile_recovery::AdapterError)));

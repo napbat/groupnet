@@ -69,6 +69,105 @@ fn captured() -> (DonorJournal, JournalCursor) {
     (journal, cut)
 }
 
+#[test]
+fn whole_journal_charge_is_finite_and_rejects_oversized_retained_vectors() {
+    let bound = DonorJournal::storage_bound(config()).unwrap();
+    assert!(bound > config().max_suffix_bytes);
+    let mut impossible = config();
+    impossible.max_followers = usize::MAX;
+    assert_eq!(
+        DonorJournal::storage_bound(impossible),
+        Err(JournalError::InvalidConfig)
+    );
+
+    let mut journal = DonorJournal::new(config(), capture_id()).unwrap();
+    let mut oversized_members = Vec::with_capacity(2 * config().max_members + 1);
+    oversized_members.extend(members());
+    assert_eq!(
+        journal.begin_capture(Time(1), 1, 1, oversized_members, cuts()),
+        Err(JournalError::Capacity)
+    );
+    assert_eq!(journal.state(), JournalState::Invalidated);
+
+    let mut oversized_scope = capture_id();
+    let mut domain = String::with_capacity(config().max_scope_bytes + 1);
+    domain.push('o');
+    oversized_scope.scope.domain = domain;
+    assert!(matches!(
+        DonorJournal::new(config(), oversized_scope),
+        Err(JournalError::InvalidConfig)
+    ));
+
+    let mut journal = DonorJournal::new(config(), capture_id()).unwrap();
+    let mut oversized_writer = Vec::with_capacity(config().max_cut_bytes + 1);
+    oversized_writer.push(b'w');
+    assert_eq!(
+        journal.begin_capture(
+            Time(1),
+            1,
+            1,
+            members(),
+            vec![NativeCut {
+                writer: oversized_writer,
+                epoch: 1,
+                sequence: 0,
+            }],
+        ),
+        Err(JournalError::Capacity)
+    );
+    assert_eq!(journal.state(), JournalState::Invalidated);
+
+    let (mut journal, _) = captured();
+    let mut oversized_effect = Vec::with_capacity(config().max_event_bytes + 1);
+    oversized_effect.push(1);
+    assert_eq!(
+        journal.append(
+            Time(3),
+            capture_id().recovery_generation,
+            DeltaIdentity::Local(b"repair".to_vec()),
+            oversized_effect,
+        ),
+        Err(JournalError::Capacity)
+    );
+    assert_eq!(journal.state(), JournalState::Invalidated);
+}
+
+#[test]
+fn lost_reservation_and_attachment_replies_read_back_exact_identity_without_renewal() {
+    let (mut journal, cut) = captured();
+    let follower = identity("peer", 2);
+    let reserved = journal.reserve(Time(3), follower.clone(), &cut).unwrap();
+    assert_eq!(
+        journal.reserved_for(Time(4), &follower, &cut),
+        Ok(Some(reserved.clone()))
+    );
+    assert_eq!(
+        journal.reserve(Time(4), follower.clone(), &cut),
+        Err(JournalError::Stale)
+    );
+    let attached = journal.begin_attach(Time(4), &reserved).unwrap();
+    journal.confirm_attach(Time(4), &attached).unwrap();
+    assert_eq!(
+        journal.attachment_for(Time(5), &reserved),
+        Ok(attached.clone())
+    );
+    assert_eq!(
+        journal.begin_attach(Time(5), &reserved),
+        Err(JournalError::Stage)
+    );
+    let mut wrong_cut = cut.clone();
+    wrong_cut.position = 1;
+    assert_eq!(
+        journal.reserved_for(Time(5), &follower, &wrong_cut),
+        Err(JournalError::Stale)
+    );
+    assert_eq!(journal.reserved_for(Time(16), &follower, &cut), Ok(None));
+    assert_eq!(
+        journal.attachment_for(Time(16), &reserved),
+        Err(JournalError::Stale)
+    );
+}
+
 fn native(sequence: u64) -> DeltaIdentity {
     DeltaIdentity::Native(NativeCut {
         writer: b"w".to_vec(),
@@ -218,7 +317,7 @@ fn attach_must_be_confirmed_before_barrier_and_batch_acks_are_exact() {
     assert!(journal.inflight_bytes() > 0);
     assert_eq!(
         journal.read_batch(Time(6), &reservation, &barrier),
-        Err(JournalError::Capacity)
+        Ok(Some(first.clone()))
     );
     assert_eq!(
         journal.ack_batch(Time(7), &reservation, first.operation + 1, &first.through),
@@ -234,6 +333,14 @@ fn attach_must_be_confirmed_before_barrier_and_batch_acks_are_exact() {
         first_through
     );
     assert_eq!(journal.inflight_bytes(), 0);
+    assert_eq!(
+        journal.ack_batch(Time(7), &reservation, first_operation, &first_through),
+        Ok(first_through.clone())
+    );
+    assert_eq!(
+        journal.ack_batch(Time(7), &reservation, first_operation + 1, &first_through),
+        Err(JournalError::Stale)
+    );
     let second = journal
         .read_batch(Time(8), &reservation, &barrier)
         .unwrap()

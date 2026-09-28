@@ -99,7 +99,7 @@ fn prefix_image(effects: &[Vec<u8>], through: u64) -> Option<u8> {
     reason = "the event queue, independent reference image, and safety floors form one schedule"
 )]
 fn queued_transfer_reconstructs_every_exact_barrier() {
-    let mut stale_replies = 0;
+    let mut duplicate_acks = 0;
     let mut continued_barriers = 0;
     for seed in 0..48 {
         let mut limits = config();
@@ -209,11 +209,14 @@ fn queued_transfer_reconstructs_every_exact_barrier() {
                         queue.push((due + 1, Delivery::Pump));
                     }
                     assert_eq!(image, prefix_image(&ordered, through.position));
+                    let retained = journal.inflight_bytes();
                     assert_eq!(
                         journal.ack_batch(Time(due), id, operation, &through),
-                        Err(JournalError::Stale)
+                        Ok(through.clone())
                     );
-                    stale_replies += 1;
+                    assert_eq!(journal.inflight_bytes(), retained);
+                    assert_eq!(journal.acknowledged(Time(due), id), Ok(through));
+                    duplicate_acks += 1;
                 }
             }
             assert!(journal.retained_bytes() <= limits.max_suffix_bytes);
@@ -234,7 +237,7 @@ fn queued_transfer_reconstructs_every_exact_barrier() {
             .unwrap();
     }
     assert!(continued_barriers >= 48);
-    assert!(stale_replies >= 48);
+    assert!(duplicate_acks >= 48);
 }
 
 /// Cancellation, expiry, and donor revocation race the exact batch reply;
@@ -385,8 +388,18 @@ fn consume_barrier(
         journal
             .ack_batch(Time(now), reservation, operation, &through)
             .unwrap();
+        let retained = journal.inflight_bytes();
         assert_eq!(
             journal.ack_batch(Time(now), reservation, operation, &through),
+            Ok(through.clone())
+        );
+        assert_eq!(journal.inflight_bytes(), retained);
+        assert_eq!(
+            journal.acknowledged(Time(now), reservation),
+            Ok(through.clone())
+        );
+        assert_eq!(
+            journal.ack_batch(Time(now), reservation, operation + 1, &through),
             Err(JournalError::Stale)
         );
     }

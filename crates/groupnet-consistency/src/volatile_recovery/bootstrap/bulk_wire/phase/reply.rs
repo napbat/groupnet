@@ -332,10 +332,10 @@ pub fn encode_reply(
             write_offer(&mut writer, offer.get(), limits)?;
         }
         (ExchangeKind::Reserve, DonorReply::Reserved(value)) => {
-            if !valid_reservation(value, &correlation) {
+            if !valid_reservation(value.get(), &correlation) {
                 return Err(WireError::Invalid);
             }
-            writer.reservation(value, limits)?;
+            writer.reservation(value.get(), limits)?;
         }
         (ExchangeKind::Chunk, DonorReply::Chunk(bytes)) => {
             if bytes.get().is_empty() {
@@ -344,10 +344,12 @@ pub fn encode_reply(
             writer.put(bytes.get())?;
         }
         (ExchangeKind::Attach, DonorReply::Attached(value)) => {
-            if !valid_reservation(&value.reservation, &correlation) || value.operation == 0 {
+            if !valid_reservation(&value.get().reservation, &correlation)
+                || value.get().operation == 0
+            {
                 return Err(WireError::Invalid);
             }
-            writer.attachment(value, limits)?;
+            writer.attachment(value.get(), limits)?;
         }
         (ExchangeKind::Barrier | ExchangeKind::AdvanceBarrier, DonorReply::Barrier(value)) => {
             if !valid_barrier(value.get())
@@ -586,7 +588,7 @@ mod tests {
             ),
             (
                 ExchangeKind::Reserve,
-                DonorReply::Reserved(reservation.clone()),
+                DonorReply::Reserved(admitted(reservation.clone())),
                 WireReply::Reserved(reservation.clone()),
             ),
             (
@@ -596,10 +598,10 @@ mod tests {
             ),
             (
                 ExchangeKind::Attach,
-                DonorReply::Attached(AttachToken {
+                DonorReply::Attached(admitted(AttachToken {
                     reservation: reservation.clone(),
                     operation: 5,
-                }),
+                })),
                 WireReply::Attached(AttachToken {
                     reservation: reservation.clone(),
                     operation: 5,
@@ -641,7 +643,7 @@ mod tests {
         stale.capture.scope.partition = "other".into();
         assert_eq!(
             encode_reply(
-                &DonorReply::Reserved(stale),
+                &DonorReply::Reserved(admitted(stale)),
                 correlation.clone(),
                 ExchangeKind::Reserve,
                 limits()

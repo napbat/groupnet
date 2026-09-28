@@ -256,15 +256,17 @@ pub enum ReservationStage {
 }
 
 /// Logical image charge from a successful capture admission. The runtime must
-/// also hold a real global memory permit for the private image and suffix;
-/// this copyable value alone does not allocate or own heap capacity.
+/// also hold real global memory permits for the private image and the
+/// whole-journal [`super::DonorJournal::storage_bound`]. The latter exceeds the
+/// logical suffix limit. This copyable value does not own heap capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureCharge {
     /// Current encoded private image bytes.
     pub encoded_bytes: usize,
     /// Current decoded private image bytes.
     pub decoded_bytes: usize,
-    /// Full bounded live suffix capacity reserved for the candidate.
+    /// Logical identity-plus-effect suffix limit, excluding retained journal
+    /// headers, barrier copies, and vector capacity.
     pub suffix_bytes: usize,
     /// Admission started at this caller-supplied logical time.
     pub started: Time,

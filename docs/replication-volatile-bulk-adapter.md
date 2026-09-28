@@ -1,8 +1,8 @@
 # Bulk donor adapter inside the existing recovery worker
 
-Status: **design contract; implementation pending**. This completes the
-reusable mapping between the opt-in [bulk client and listener](replication-volatile-bulk.md)
-and the already implemented `BootstrapSession`. The S3 consumer must not turn
+Status: **reusable adapter implemented; S3 fleet integration pending**. This
+binds the opt-in [bulk client and listener](replication-volatile-bulk.md)
+to `BootstrapSession`. The S3 consumer must not turn
 each `TransferEffect` into an application-owned network/retry state machine.
 The default S3 path still makes zero coordination or metadata writes to the
 origin.
@@ -60,9 +60,10 @@ buffer/coverage proofs, application schema, image commitment check, and the
 single generation-fenced candidate swap plus normal-feed handoff. These
 callbacks own no network request selection or retry timer.
 
-The wrapper charges outbound request/correlation copies before cloning and
-holds that permit through the network await. Retained reservation and
-attachment identities have a separate worker-owned charge until cleanup;
+The wrapper charges the checked sum of a request and its exact correlation
+before cloning either, and holds that permit through the network await.
+Retained reservation and attachment identities have a separate worker-owned
+charge until cleanup;
 source replies are charged before journal clones enter the inbox. The wrapper
 needs an ownership-preserving conversion from
 `Admitted<WireReply>` into an admitted chunk, batch, or `TransferEvent`.
@@ -76,8 +77,15 @@ buffers out of their permit. `TransferResources` remains the sole owner of
 private stage, logical donor attachment, at most one batch, and native overlap.
 The journal counts one logical outstanding batch across lost-response
 readbacks; each physical batch copy reserves a separate runtime byte charge
-before the journal clones it. Requests with metadata or batch caps other than
-the donor's configured local policy are refused before source state changes.
+before the journal clones it. The donor's whole-journal storage reservation
+includes bounded delta and
+follower vector slots with growth headroom, retained roster/cut bodies,
+identities, and every saved follower barrier. It is acquired before the
+guarded index capture and persists while ingress is attached. Image buffers
+and physical response/readback copies have separate admissions; this is a
+conservative finite ownership bound, not an exact process RSS estimate.
+Requests with metadata or batch caps other than the donor's configured local
+policy are refused before source state changes.
 Heterogeneous policy caps can therefore decline peer transfer and route the
 follower to origin; there is no cap negotiation in this first protocol.
 The network `Attach` reply is a source reservation/attachment token: this
@@ -85,14 +93,17 @@ first protocol uses one short-lived request stream per operation, while the
 donor journal retains and serves the continuous bounded suffix. It is not an
 unbounded open socket per follower.
 
-Safety tests use a real `MemBulkNet` binding and the existing
-`BootstrapSession`/recovery worker. They cover all nine phases, C→B nonempty
-suffix, B2 advancement after exact ack, lost reservation/ack response,
-duplicate or wrong-correlation replies, cancellation during chunk and install,
-and donor identity rotation. Faults must not produce `Installed`, `Ready`, or
-local serving; healthy schedules finish within the original episode deadline.
-`groupnet-testkit::MemCluster` exercises simultaneous claims and donor
-requests once the native claim source and consumer adapters are connected.
+`volatile_bootstrap_bulk_adapter.rs` exercises the real `MemBulkNet` mapping
+and all nine generic donor-journal request branches, including nonempty C→B
+and B2, reservation/ack readback, and exact wrong-operation refusal.
+`volatile_bootstrap_journal_readback.rs` checks seeded lost, duplicate, and
+reordered source replies; `volatile_bootstrap_runtime.rs` checks worker
+expiry, stale install, cancellation, and donor withdrawal. The earlier bulk
+client/listener tests cover correlation and listener identity rotation.
+These are reusable protocol boundaries, not a claim that a connected S3
+fleet already bootstraps from peers. Native claim propagation, concurrent
+network fault schedules, and S3 index/feed handoff remain acceptance work;
+they must prove failures cannot publish or grant local reads.
 The S3 integration keeps origin-routed reads, active lease grants, and native
 feed ingestion while this child runs; it supplies bounded index bytes and
 atomic capture/publication semantics, never a synthetic durable source cursor.
