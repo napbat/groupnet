@@ -31,6 +31,11 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 - **`groupnet-testkit` is internal**: `publish = false`, consumed only as a
   **path-only** dev-dependency (never add a `version` key; never add it to
   `[workspace.dependencies]` or any `[dependencies]`).
+- **Workspace dependency and lint policy.** Dependency versions belong in
+  `[workspace.dependencies]`; crates inherit them with `workspace = true`
+  and select their own features and optionality. The path-only testkit rule
+  above is the exception. Every crate uses `[lints] workspace = true`; shared
+  lint levels belong in the workspace root.
 - **Wire compatibility.** New protocol features add new frame kinds inside
   the current `FRAME_VERSION` (unknown kinds are dropped by old nodes).
   Changing an existing frame body forces a version bump — avoid it.

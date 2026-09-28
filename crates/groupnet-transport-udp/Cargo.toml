@@ -12,14 +12,14 @@ repository.workspace = true
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["net"] }
+tokio = { workspace = true, features = ["net"] }
 
 # Test-only: the unit tests exchange real datagrams over loopback, which needs
-# an async runtime + the `#[tokio::test]` macro. The workspace tokio carries
+# an async runtime + the `#[tokio::test]` macro. This dev dependency enables
 # `rt`/`macros`/`time`; it unifies with the `net` slice above for the test build
 # (no new crate — tokio is already a dependency).
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [lints]
 workspace = true

@@ -13,7 +13,7 @@ repository.workspace = true
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 # Concrete transports are pulled in only to exercise the tests.
 [dev-dependencies]

@@ -22,15 +22,15 @@ groupnet-runtime = { path = "crates/groupnet-runtime", version = "0.1.0" }
 groupnet-consistency = { path = "crates/groupnet-consistency", version = "0.1.0" }
 groupnet-sim = { path = "crates/groupnet-sim", version = "0.1.0" }
 
-# The single external dependency in the whole tree, and only the async runtime
-# layer pulls it in. Feature set is deliberately narrow.
-tokio = { version = "1", default-features = false, features = [
-    "rt",
-    "rt-multi-thread",
-    "sync",
-    "time",
-    "macros",
-] }
+# Keep feature activation at each dependency site. The workspace entries
+# centralize versions without enabling runtime or data-plane features.
+tokio = { version = "1", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false }
+futures = { version = "0.3", default-features = false }
+zerocopy = "0.8"
+divan = "0.1.21"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

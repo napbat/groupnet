@@ -21,12 +21,12 @@ bulk = ["groupnet-transport/bulk", "dep:tokio-util"]
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["net", "io-util"] }
-tokio-util = { version = "0.7", default-features = false, features = ["compat"], optional = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-util = { workspace = true, features = ["compat"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
-bytes = "1"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+bytes = { workspace = true }
 
 [lints]
 workspace = true

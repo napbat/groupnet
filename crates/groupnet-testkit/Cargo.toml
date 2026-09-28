@@ -19,7 +19,7 @@ cluster = ["dep:groupnet-runtime", "dep:groupnet-transport-mem", "dep:tokio"]
 groupnet-core = { workspace = true }
 groupnet-runtime = { workspace = true, optional = true }
 groupnet-transport-mem = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"], optional = true }
 
 [lints]
 workspace = true

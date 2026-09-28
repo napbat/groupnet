@@ -15,12 +15,12 @@ bulk = ["dep:bytes", "dep:futures-util", "dep:zerocopy"]
 [dependencies]
 groupnet-core = { workspace = true }
 # Data-plane only — inert unless the `bulk` feature is enabled.
-bytes = { version = "1", optional = true }
-futures-util = { version = "0.3", default-features = false, features = ["io"], optional = true }
-zerocopy = { version = "0.8", features = ["derive"], optional = true }
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, features = ["io"], optional = true }
+zerocopy = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]
-futures = { version = "0.3", default-features = false, features = ["executor"] }
+futures = { workspace = true, features = ["executor"] }
 
 [lints]
 workspace = true

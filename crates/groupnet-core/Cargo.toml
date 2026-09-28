@@ -18,7 +18,7 @@ repository.workspace = true
 groupnet-testkit = { path = "../groupnet-testkit" }
 # Benchmark harness. Dev-only, so the published dependency graph stays empty —
 # the core's `[dependencies]` is intentionally bare and must remain so.
-divan = "0.1.21"
+divan = { workspace = true }
 
 # `harness = false` hands the target to divan's own `#[divan::bench]` runner
 # instead of libtest.

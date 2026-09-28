@@ -77,12 +77,12 @@ groupnet-sim = { workspace = true, optional = true }
 
 # The async examples drive the runtime, so they need a Tokio executor.
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # The handoff facade test implements `SnapshotSource`/`SnapshotSink`, whose chunk
 # type is `bytes::Bytes`. The facade re-exports no `bytes`, so a consumer that
-# implements those two traits declares its own `bytes = "1"` exactly as this does
-# — same crate, same semver train. Dev-only: nothing enters the published graph.
-bytes = "1"
+# implements those two traits declares its own bytes dependency. This test uses
+# the workspace version. Dev-only: nothing enters the published graph.
+bytes = { workspace = true }
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,
 # so this never enters the published dependency graph. Do NOT add `version`.
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
