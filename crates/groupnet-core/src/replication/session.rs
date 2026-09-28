@@ -4,6 +4,9 @@ mod ack_wait;
 mod bootstrap;
 #[cfg(test)]
 mod exhaustion_tests;
+mod idle;
+#[cfg(test)]
+mod idle_tests;
 mod snapshot;
 mod tick;
 
@@ -30,7 +33,9 @@ pub struct SessionEngine {
     state: State,
     next_token: u64,
     now: Time,
+    freshness_due: Time,
     tail_due: Time,
+    idle_state: idle::IdleState,
     retry_due: Option<Time>,
     outstanding: Option<(Operation, Stage)>,
     operation_due: Option<Time>,
@@ -86,7 +91,9 @@ impl SessionEngine {
             },
             next_token: 1,
             now: Time::ZERO,
+            freshness_due: Time::ZERO,
             tail_due: Time::ZERO,
+            idle_state: idle::IdleState::default(),
             retry_due: None,
             outstanding: None,
             operation_due: None,
@@ -196,10 +203,14 @@ impl SessionEngine {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, None) | (None, a) => a,
         };
-        match (
+        let ordinary = match (
             ordinary,
             self.snapshot.as_ref().map(|snapshot| snapshot.total_due),
         ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) | (None, a) => a,
+        };
+        match (ordinary, self.ready.then_some(self.freshness_due)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, None) | (None, a) => a,
         }
@@ -217,7 +228,7 @@ impl SessionEngine {
         if !self.ready || self.state.stage != Stage::Ready {
             return ReadDecision::Refuse(Refusal::Unready);
         }
-        if self.now >= self.tail_due {
+        if self.now >= self.freshness_due {
             return ReadDecision::Refuse(Refusal::TailCheckDue);
         }
         if !self.mode_authority || !self.proof.as_ref().is_some_and(|p| p.read_authority) {
@@ -396,10 +407,19 @@ impl SessionEngine {
                 return self.start_scan();
             }
         }
+        if self.now >= self.freshness_due {
+            return self.check_tail();
+        }
         self.state.stage = Stage::Ready;
         self.ready = true;
         self.retries = 0;
-        self.finish_snapshot()
+        let mut ready = self.finish_snapshot();
+        if self.config.idle.is_some() && self.freshness_due < self.tail_due {
+            if let Some(due) = self.next_deadline() {
+                ready.effects.push(Effect::ArmTimer(due));
+            }
+        }
+        ready
     }
 
     /// Consumes one explicit input and returns the next bounded driver effects.
@@ -409,6 +429,7 @@ impl SessionEngine {
     )]
     pub fn step(&mut self, event: Event) -> Step {
         match event {
+            Event::Activity => self.activity(),
             Event::StartAckWait { request, limits } => self.start_ack_wait(*request, limits),
             Event::AckObserved { evidence } => self.observe_ack(&evidence),
             Event::AckChecked { op } => self.ack_checked(op),
@@ -490,6 +511,7 @@ impl SessionEngine {
                 ) {
                     Step::reject(Reject::Stage)
                 } else {
+                    self.idle_state.force_hot_next();
                     self.request_tail()
                 }
             }
@@ -535,6 +557,7 @@ impl SessionEngine {
                 } else {
                     self.state.target = Some(cursor);
                 }
+                self.idle_state.force_hot_next();
                 self.request_tail()
             }
             Event::Tick(now) => {
@@ -566,10 +589,6 @@ impl SessionEngine {
                 if let Err(e) = proof.validate(&self.scope, self.config.max_cursor_bytes) {
                     return Step::reject(Reject::Identity(e));
                 }
-                let Some(due) = self.now.0.checked_add(self.config.tail_check_ms) else {
-                    self.state.stage = Stage::Unready;
-                    return Step::reject(Reject::Exhausted);
-                };
                 let Some(materialized) = self.state.materialized.as_ref() else {
                     self.state.stage = match self.mode {
                         Mode::StateSync => Stage::NeedsSnapshot,
@@ -606,7 +625,19 @@ impl SessionEngine {
                 if to_head == Comparison::After || low_to_head == Comparison::After {
                     return Step::reject(Reject::Discontinuity);
                 }
-                self.tail_due = Time(due);
+                let unchanged = to_head == Comparison::Equal
+                    && proof.read_authority
+                    && to_low != Comparison::Before
+                    && !self.pending_tail
+                    && self.snapshot.is_none()
+                    && self.state.head.as_ref() == Some(&proof.head)
+                    && self
+                        .proof
+                        .as_ref()
+                        .is_some_and(|prior| prior.read_authority == proof.read_authority);
+                if self.record_tail_schedule(unchanged).is_err() {
+                    return self.idle_exhausted();
+                }
                 self.outstanding = None;
                 self.operation_due = None;
                 self.state.head = Some(proof.head.clone());
@@ -747,6 +778,7 @@ impl SessionEngine {
                 self.outstanding = None;
                 self.operation_due = None;
                 self.retries = 0;
+                self.idle_state.force_hot_next();
                 self.request_tail()
             }
             Event::Invalidated { op } => {
@@ -762,6 +794,9 @@ impl SessionEngine {
             Event::Authority(allowed) => {
                 let changed = self.mode_authority != allowed;
                 self.mode_authority = allowed;
+                if changed {
+                    self.idle_state.force_hot_next();
+                }
                 if allowed
                     && changed
                     && self.state.materialized.is_some()
@@ -779,7 +814,13 @@ impl SessionEngine {
                 } else if allowed {
                     Step::ok(Vec::new())
                 } else {
-                    self.close_gate()
+                    let mut closed = self.close_gate();
+                    if self.config.idle.is_some() && !closed.effects.is_empty() {
+                        if let Some(due) = self.next_deadline() {
+                            closed.effects.push(Effect::ArmTimer(due));
+                        }
+                    }
+                    closed
                 }
             }
             Event::Failed { op } => {
@@ -793,6 +834,7 @@ impl SessionEngine {
                 if self.outstanding.is_none_or(|(issued, _)| issued != op) {
                     return Step::reject(Reject::StaleOperation);
                 }
+                self.idle_state.force_hot_next();
                 if self.snapshot.is_some() {
                     return self.abort_snapshot();
                 }
@@ -849,6 +891,7 @@ impl SessionEngine {
                     self.bootstrap_candidate = None;
                     self.retry_target = RetryTarget::Tail;
                     self.proof = None;
+                    self.idle_state.reset();
                     self.retry_due = None;
                     let mut effects = if was_ready {
                         vec![Effect::RevokeServingUnconfirmed]
@@ -878,6 +921,7 @@ impl SessionEngine {
                 self.bootstrap_candidate = None;
                 self.retry_target = RetryTarget::Tail;
                 self.proof = None;
+                self.idle_state.reset();
                 self.retry_due = None;
                 let mut closed = self.close_gate();
                 closed.effects.extend(cleanup);

@@ -1,8 +1,8 @@
 # Idle source checks without weakening read gates
 
-Status: **accepted contract for a later replication slice**. This refines the
+Status: **implemented optional replication policy**. This refines the
 scale requirements in [replication.md](replication.md). It follows named
-acknowledgement waits; it is not implemented by the snapshot commit.
+acknowledgement waits. The default cadence remains unchanged.
 
 ## Contract
 
@@ -99,3 +99,25 @@ and workload for comparisons. Consumer tests additionally count native object
 store requests and optional control-store writes. S3cache's default path
 continues to perform zero coordination writes to S3; this scheduling policy
 cannot introduce storage or a durable startup requirement.
+
+## Virtual-time source-call measurements
+
+The effects-driven `replication_idle_scale` test compares unchanged sources
+for 0 through 100 logical milliseconds, with a 10 ms freshness/hot interval,
+one unchanged check before backoff, an 80 ms maximum idle interval, and no
+jitter. Active scopes receive activity every 5 ms. Source checks and
+revocation receipts complete immediately in this model. Half-active means
+`floor(scopes / 2)` active scopes. Counts include the initial source check.
+
+| Registered scopes | Backoff off | All idle | Half active | All active |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 11 | 4 | 4 | 11 |
+| 4 | 44 | 16 | 30 | 44 |
+| 16 | 176 | 64 | 120 | 176 |
+
+These are simulated request counts, not measured network throughput or
+wall-clock latency. Quiet scopes stop serving when the original freshness
+budget expires; a later read requires refresh. Runtime tests separately
+exercise blocked I/O, missed hints, read bursts, and already-covered RYW
+floor waits. Larger consumer load tests and measured latency/memory remain
+required before making deployment capacity claims.

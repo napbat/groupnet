@@ -117,6 +117,27 @@ where
         groupnet_core::Time(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
+    fn process_wakeups(&mut self) {
+        let hinted = self.shared.hinted.swap(false, Ordering::AcqRel);
+        let activity = self.shared.activity.swap(false, Ordering::AcqRel);
+        let stale_activity = self.shared.stale_activity.swap(false, Ordering::AcqRel);
+        if (hinted || activity || stale_activity)
+            && self
+                .engine
+                .next_deadline()
+                .is_some_and(|due| due <= self.logical_now())
+        {
+            // Activity must observe the current logical clock. The read hot
+            // path already rejects expired proof age without waiting here.
+            self.tick();
+        }
+        if hinted || stale_activity {
+            self.step(Event::Hint);
+        } else if activity {
+            self.step(Event::Activity);
+        }
+    }
+
     fn publish(&self) {
         let decision = self.engine.read_decision();
         let fresh = self.tail_checked_at.is_some_and(|when| {
@@ -172,7 +193,11 @@ where
         };
         let ignorable = matches!(
             &event,
-            Event::Hint | Event::Demand { .. } | Event::Authority(_) | Event::Cancel
+            Event::Hint
+                | Event::Activity
+                | Event::Demand { .. }
+                | Event::Authority(_)
+                | Event::Cancel
         );
         let Step { effects, rejection } = self.engine.step(event);
         if let Some(op) = completed {
@@ -861,6 +886,12 @@ where
             Command::Floor(cursor, reply) => {
                 let accepted =
                     !self.shared.cancelled.load(Ordering::Acquire) && self.demand(cursor);
+                // Demand already resets idle backoff and requests the same
+                // revalidation. A pre-enqueue activity wake must not queue a
+                // redundant check behind its in-flight source operation.
+                // Keep stale-proof activity: a slow response may itself be
+                // too old to restore the read gate.
+                self.shared.activity.store(false, Ordering::Release);
                 let _ = reply.send(accepted);
             }
             Command::Authority(allowed) => self.step(Event::Authority(allowed)),

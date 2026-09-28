@@ -8,6 +8,7 @@
 mod ack_types;
 pub mod admission;
 mod identity;
+mod idle;
 mod proof;
 mod session;
 mod snapshot;
@@ -18,6 +19,7 @@ pub use ack_types::{
     CertifiedRoster, RequiredSubscriber,
 };
 pub use identity::{Cursor, IdentityError, Scope, SourceHistory, Stream};
+pub use idle::IdlePolicy;
 pub use proof::{BoundComparison, Comparison, Coverage, ProofId, SourceProof};
 pub use session::SessionEngine;
 pub use snapshot::{ChunkReceipt, HoldReceipt, SnapshotConfig, SnapshotOffer};

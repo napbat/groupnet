@@ -22,8 +22,9 @@ second commit log. Snapshot recovery requires a source
 retention hold and a guarded application install; replay-only adapters keep
 their existing API. Named waits pin a bounded source-certified roster and
 return a target-bound invalidation or materialization outcome; they do not
-register durable subscribers. Durable subscriptions and consumer migrations
-remain in development. Contracts and implementation status are in
+register durable subscribers. Optional idle backoff reduces source checks on
+quiet scopes while preserving the original proof-freshness gate. Durable
+subscriptions and consumer migrations remain in development. Contracts and implementation status are in
 [`docs/replication.md`](docs/replication.md).
 
 > Status: early scaffold. The architecture and public API are in place with a

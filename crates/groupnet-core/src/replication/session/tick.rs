@@ -6,6 +6,21 @@ use crate::replication::{Event, Stage, Step};
 
 impl SessionEngine {
     pub(super) fn tick_replay(&mut self, now: Time) -> Step {
+        let freshness = self.expire_freshness();
+        let mut ordinary = self.tick_replay_progress(now);
+        if !freshness.effects.is_empty() {
+            let mut effects = freshness.effects;
+            effects.extend(ordinary.effects);
+            if let Some(due) = self.next_deadline() {
+                effects.push(crate::replication::Effect::ArmTimer(due));
+            }
+            ordinary.effects = effects;
+        }
+        ordinary.rejection = freshness.rejection.or(ordinary.rejection);
+        ordinary
+    }
+
+    fn tick_replay_progress(&mut self, now: Time) -> Step {
         if self
             .snapshot_cleanup
             .as_ref()

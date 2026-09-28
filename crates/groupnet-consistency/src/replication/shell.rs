@@ -136,6 +136,9 @@ struct SessionShared {
     commands: mpsc::Sender<Command>,
     hints: Notify,
     hinted: AtomicBool,
+    activity: AtomicBool,
+    stale_activity: AtomicBool,
+    idle_enabled: bool,
     published: watch::Receiver<Published>,
     signals: watch::Sender<()>,
     local_gate: AtomicBool,
@@ -378,6 +381,9 @@ where
             commands,
             hints: Notify::new(),
             hinted: AtomicBool::new(false),
+            activity: AtomicBool::new(false),
+            stale_activity: AtomicBool::new(false),
+            idle_enabled: self.inner.limits.core.idle.is_some(),
             published,
             signals,
             local_gate: AtomicBool::new(false),
@@ -486,6 +492,25 @@ where
     S: SourceAdapter,
     A: ApplicationAdapter<S::Position, S::Batch>,
 {
+    fn record_activity(&self) {
+        if self.shared.idle_enabled
+            && self.shared.alive.load(Ordering::Acquire)
+            && !self.shared.cancelled.load(Ordering::Acquire)
+        {
+            if let Some(checked_at) = self.shared.published.borrow().tail_checked_at {
+                if checked_at.elapsed() >= self.tail_interval {
+                    // The shell dates freshness at request start. A delayed
+                    // response can expire here before the core's response-
+                    // time logical deadline, so force a prompt source check.
+                    self.shared.stale_activity.store(true, Ordering::Release);
+                } else {
+                    self.shared.activity.store(true, Ordering::Release);
+                }
+                self.shared.hints.notify_one();
+            }
+        }
+    }
+
     /// Coalesces a best-effort feed hint into one source-tail wakeup.
     pub fn hint(&self) {
         self.shared.hinted.store(true, Ordering::Release);
@@ -524,13 +549,24 @@ where
             }
         }
         self.shared.signals.send_replace(());
-        self.shared
+        let queued = self
+            .shared
             .commands
             .try_send(Command::Authority(allowed))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Closed(_) => CatchUp::Cancelled,
                 mpsc::error::TrySendError::Full(_) => CatchUp::Backpressured,
-            })
+            });
+        if allowed
+            && self.shared.authority_revalidation.load(Ordering::Acquire)
+            && self.shared.published.borrow().tail_checked_at.is_some()
+        {
+            // A false command may have been backpressured while the shell
+            // synchronously revoked serving. Even if the core still sees
+            // true -> true, the next source check must be prompt.
+            self.hint();
+        }
+        queued
     }
 
     /// Current typed positions and stage, independent of whether a local read
@@ -560,13 +596,15 @@ where
 
     /// Checks the immediate local gate, a native floor, current authority, and
     /// the application's final domain read predicate. The wall-time expiry is
-    /// checked here even if the worker is blocked or has stopped.
+    /// checked here even if the worker is blocked or has stopped. With idle
+    /// polling enabled, a read coalesces an asynchronous activity wake.
     #[must_use]
     pub fn read_decision(
         &self,
         floor: Option<&S::Position>,
         authority_now: bool,
     ) -> ReadVerdict<S::Position> {
+        self.record_activity();
         if !self.shared.alive.load(Ordering::Acquire)
             || self.shared.cancelled.load(Ordering::Acquire)
             || !self.shared.local_gate.load(Ordering::Acquire)
@@ -615,6 +653,8 @@ where
 
     /// Waits for a native source floor with a caller deadline. Timeout reports
     /// incomplete catch-up and never rolls back an external source commit.
+    /// With idle polling enabled, it coalesces activity before entering the
+    /// bounded worker queue; the demand itself resets the core's idle backoff.
     #[expect(
         clippy::too_many_lines,
         reason = "the waiter checks the complete published evidence and all terminal outcomes in one loop"
@@ -622,6 +662,15 @@ where
     pub async fn catch_up(&self, floor: S::Position, deadline: Instant) -> CatchUp<S::Position> {
         if Instant::now() >= deadline {
             return CatchUp::TimedOut;
+        }
+        // A fresh local proof that already covers the floor needs no new
+        // source request. This also records coalesced idle activity.
+        if let ReadVerdict::Serve(position) = self.read_decision(Some(&floor), true) {
+            return if Instant::now() < deadline {
+                CatchUp::Ready(position)
+            } else {
+                CatchUp::TimedOut
+            };
         }
         let cursor = match self.source.cursor(&self.shared.scope, &floor) {
             Ok(cursor) => cursor,

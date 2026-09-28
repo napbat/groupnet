@@ -133,6 +133,9 @@ impl SessionEngine {
         self.bootstrap_candidate = None;
         self.retry_target = RetryTarget::Tail;
         self.proof = None;
+        self.idle_state.force_hot_next();
+        self.freshness_due = crate::Time::ZERO;
+        self.tail_due = crate::Time::ZERO;
         self.retries = 0;
         self.retry_due = None;
         self.revoke_op = None;

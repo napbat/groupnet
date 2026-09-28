@@ -1,11 +1,11 @@
-//! Replay-only, source-backed replica session decisions.
+//! Source-backed replica replay, snapshot, and idle-session decisions.
 
 use crate::Time;
 
 use super::{
     AckEvidence, AckWaitError, AckWaitLimits, AckWaitOutcome, AckWaitRequest, BoundComparison,
-    ChunkReceipt, Coverage, Cursor, HoldReceipt, IdentityError, RequiredSubscriber, Scope,
-    SnapshotConfig, SnapshotOffer, SourceProof,
+    ChunkReceipt, Coverage, Cursor, HoldReceipt, IdentityError, IdlePolicy, RequiredSubscriber,
+    Scope, SnapshotConfig, SnapshotOffer, SourceProof,
 };
 
 /// Replay contract selected for this session.
@@ -20,6 +20,8 @@ pub enum Mode {
 /// Limits enforced before effects and before accepting adapter responses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
+    /// Optional source-check backoff for inactive scopes; never extends proof freshness.
+    pub idle: Option<IdlePolicy>,
     /// Optional finite state-sync snapshot recovery; absent for replay-only sessions.
     pub snapshot: Option<SnapshotConfig>,
     /// Maximum encoded native cursor or proof byte length.
@@ -41,6 +43,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            idle: None,
             snapshot: None,
             max_cursor_bytes: 4096,
             max_batch_events: 4096,
@@ -79,6 +82,12 @@ impl Config {
             return Err(ConfigError::Zero);
         }
         if self.snapshot.is_some_and(|snapshot| !snapshot.valid()) {
+            return Err(ConfigError::Zero);
+        }
+        if self
+            .idle
+            .is_some_and(|policy| !policy.valid(self.tail_check_ms))
+        {
             return Err(ConfigError::Zero);
         }
         Ok(self)
@@ -253,6 +262,8 @@ pub struct ApplyReceipt {
 /// Input supplied by a driver after its source/application adapter acts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Read or floor activity resets idle backoff and promptly rechecks stale proof.
+    Activity,
     /// Begin one bounded named acknowledgement wait on a certified fixed roster.
     StartAckWait {
         /// Stable external request, exact target, and certified required set.

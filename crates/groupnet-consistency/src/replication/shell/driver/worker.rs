@@ -79,6 +79,7 @@ pub(in crate::replication::shell) async fn worker<S, A, M>(
         if let Ok(command) = receiver.try_recv() {
             driver.dispatch_command(command).await;
         }
+        driver.process_wakeups();
         if let Some(effect) = driver.effects.pop_front() {
             driver.effect(effect).await;
             continue;
@@ -94,9 +95,7 @@ pub(in crate::replication::shell) async fn worker<S, A, M>(
                 driver.dispatch_command(command).await;
             }
             () = shared.hints.notified() => {
-                if shared.hinted.swap(false, Ordering::AcqRel) {
-                    driver.step(Event::Hint);
-                }
+                driver.process_wakeups();
             }
             () = async {
                 if let Some(instant) = next_timer {
