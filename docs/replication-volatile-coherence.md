@@ -1,7 +1,7 @@
 # Volatile coherence recovery for origin-backed caches
 
-Status: **implementation contract** for a separate sans-IO recovery slice. This
-complements [replication.md](replication.md); it is not a durable replay source.
+Status: **sans-IO core implemented; runtime and consumer integration pending**.
+This complements [replication.md](replication.md); it is not a durable replay source.
 The first consumer is s3cache's default mode, which performs zero coordination
 or metadata writes to S3. Its origin bucket remains untouched by control data.
 
@@ -53,7 +53,12 @@ and publication permit while updating lease state. A new gap supersedes every
 old rescan or affirmation.
 
 `LeaseLapse(counter)` starts the cheaper arm only in the lease-backed mode and
-only if that counter is not covered by a newer gap recovery. It revokes local
+only from a previously affirmed, complete local baseline and if that counter
+is not covered by a newer gap recovery. A cold node, an origin-only node, or a
+node still invalidating/rebuilding after a gap retains the mandatory full
+origin rebuild; a newer lapse supersedes it with another full rebuild rather
+than downgrading to the cheap arm. A lapse arriving during an unfinished cheap
+arm likewise forces full fallback. It revokes local
 serving first through the same read-verdict and publication-permit latch. The
 adapter supplies a bounded initial membership and per-granter renewal
 sample, including members not currently `Alive` and a
@@ -66,7 +71,12 @@ writer vanished, samples advertised per-writer feed heads, and waits for the
 application's applied frontier to reach them. It resamples boundedly if
 heads move, checks vanished writers again, and requests affirmation for the
 same generation. Successful affirmation retains validated cached bodies and
-avoids origin LIST. A frozen grant, vanished writer, absent head, failed
+avoids origin LIST. The existing volatile-feed policy assumes a peer with no
+advertised feed head contributes no frontier target; this does not prove it
+made no unpublished origin mutation. An unreadable feed observation is a
+failure, not an empty head. A head observed earlier in the same recovery turn
+cannot disappear into an empty feed and erase its barrier obligation; that
+forces the full fallback. A frozen grant, vanished writer, failed
 barrier, capacity error, or deadline takes the full gap-style fallback.
 
 The adapter reports a stable local `ObservedLapse` counter and must bind its
@@ -75,7 +85,9 @@ watermark and generation advance together on gap fallback, so a lapse and
 its covering gap do not start duplicate origin rescans. Cancel, supersede,
 timeout, and token exhaustion fail closed. Effect admission and application
 callbacks have bounded deadlines and correlation; late completions cannot
-reopen serving. No whole-fleet barrier is imposed on ordinary reads or writes.
+reopen serving. Cancel is terminal for automatic gap/lapse signals; only an
+explicit `Start` begins a new full rebuild. No whole-fleet barrier is imposed
+on ordinary reads or writes.
 
 The API should expose a small core `RecoveryConfig`, `RecoveryEvent`,
 `RecoveryEffect`, `RecoveryState`, and `RecoveryEngine::step`. Events include
@@ -88,6 +100,15 @@ and `ArmTimer`. Exact names may change during implementation, but the two
 distinct completion receipts and every stage's correlation may not.
 
 ## Consumer cutover and evidence
+
+The current core slice ends a failed full origin rebuild in `OriginOnly`;
+an explicit `Start` can begin another full rebuild. Before consumer cutover,
+the runtime slice must add bounded full-plan retries to the core itself,
+preserving the original total deadline and issuing a fresh operation token.
+Every publication permit must fence that token as well as its generation, so
+a callback from a failed attempt cannot publish during its retry. The shell
+and consumer must not recreate a separate scan-retry state machine.
+
 
 The s3cache shell replaces `sync::recovery::ResyncGate`, `LapseWatch`, and
 their staged retry/generation loops with one driver of these effects. It
