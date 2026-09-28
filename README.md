@@ -14,6 +14,9 @@ elected epoch-fenced host paying a majority round-trip per write at the other,
 and the session and coherence tiers in between. Each rung, its price, and what
 it deliberately does *not* promise are in
 [`docs/consistency-modes.md`](docs/consistency-modes.md).
+The proposed source-backed replication tier, including native cursor resume,
+snapshot recovery, and durable subscription guarantees, is specified in
+[`docs/replication.md`](docs/replication.md).
 
 > Status: early scaffold. The architecture and public API are in place with a
 > working gossip/coordinator core; several protocol pieces are stubbed and

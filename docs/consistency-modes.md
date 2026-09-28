@@ -9,6 +9,11 @@ honestly guarantees, where each lives, and the order it gets built. It is
 grounded in a review of the two real consumers (docres/shardstore and s3cache)
 rather than in taxonomy for its own sake.
 
+The additive source-backed replication proposal for issue #3 is specified in
+[`replication.md`](replication.md). It owns native-cursor replay, snapshot
+recovery, subscriber retention, and read gating above these modes. It does not
+change the Hosted-mode decisions or the build order in Section 6.
+
 ---
 
 ## 1. Terminology
