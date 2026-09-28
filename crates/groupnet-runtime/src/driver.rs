@@ -2,17 +2,21 @@
 //! [`GroupEngine`] and a [`Transport`], and executes the effects the engine
 //! returns.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use groupnet_core::{Command, Effect, GroupEngine, GroupId, NetStats, NodeId, Status, Time, wire};
 use groupnet_transport::Transport;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
-use crate::group::Leadership;
+use crate::group::{EntryInspectionError, EntryInspectionLimits, InspectedEntries, Leadership};
 use crate::store::GrantStore;
+
+mod entry_inspection;
+use entry_inspection::inspect_scoped_entry;
 
 /// A change notification a consumer can subscribe to via
 /// [`Group::events`](crate::Group::events). The stream is bounded: a slow
@@ -106,9 +110,36 @@ pub(crate) type NodeEntriesSnapshot = Arc<BTreeMap<NodeId, Arc<BTreeMap<String, 
 
 /// An event delivered to a group actor: either a decoded network frame or a
 /// local command from the [`Group`](crate::Group) handle.
+type ErasedBudget = Box<dyn Any + Send>;
+type InspectionReply =
+    oneshot::Sender<Result<(InspectedEntries, ErasedBudget), EntryInspectionError>>;
+type MutationReply = oneshot::Sender<(bool, ErasedBudget)>;
+
 pub(crate) enum Event {
-    Message { from: NodeId, wire: Vec<u8> },
+    Message {
+        from: NodeId,
+        wire: Vec<u8>,
+    },
     Local(Command),
+    InspectScopedEntry {
+        key: String,
+        limits: EntryInspectionLimits,
+        budget: ErasedBudget,
+        reply: InspectionReply,
+    },
+    SetEntryConfirmed {
+        key: String,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+        budget: ErasedBudget,
+        reply: MutationReply,
+    },
+    DeleteEntryIfValue {
+        key: String,
+        expected: Vec<u8>,
+        budget: ErasedBudget,
+        reply: MutationReply,
+    },
 }
 
 /// The `watch` senders a group actor publishes its readable state through.
@@ -145,6 +176,95 @@ pub(crate) struct GroupViews {
 )]
 pub(crate) fn now_since(start: Instant) -> Time {
     Time(start.elapsed().as_millis() as u64)
+}
+
+struct MutationCompletion {
+    reply: MutationReply,
+    applied: bool,
+    budget: ErasedBudget,
+}
+
+struct ActorTurn {
+    effects: Vec<Effect>,
+    completion: Option<MutationCompletion>,
+}
+
+/// Handles one actor command without crossing an await. Inspection sends its
+/// read-only reply directly; a mutation's completion waits for publication.
+fn apply_actor_event(engine: &mut GroupEngine, event: Event, start: Instant) -> Option<ActorTurn> {
+    let (effects, completion) = match event {
+        Event::Message { from, wire } => (engine.on_message(from, &wire, now_since(start)), None),
+        Event::Local(cmd) => (engine.apply(cmd), None),
+        Event::InspectScopedEntry {
+            key,
+            limits,
+            budget,
+            reply,
+        } => {
+            let sampled_at = Instant::now();
+            let result = inspect_scoped_entry(engine, &key, limits, now_since(start), sampled_at)
+                .map(|entries| (entries, budget));
+            let _ = reply.send(result);
+            return None;
+        }
+        Event::SetEntryConfirmed {
+            key,
+            value,
+            ttl_ms,
+            budget,
+            reply,
+        } => {
+            let mut effects = engine.on_tick(now_since(start));
+            let applied = engine.apply(Command::SetLocalEntry { key, value, ttl_ms });
+            let accepted = !applied.is_empty();
+            effects.extend(applied);
+            (
+                effects,
+                Some(MutationCompletion {
+                    reply,
+                    applied: accepted,
+                    budget,
+                }),
+            )
+        }
+        Event::DeleteEntryIfValue {
+            key,
+            expected,
+            budget,
+            reply,
+        } => {
+            let now = now_since(start);
+            let mut effects = engine.on_tick(now);
+            let matching = engine
+                .node_entry(engine.local(), &key)
+                .filter(|_| {
+                    engine
+                        .node_entry_expires_at(engine.local(), &key)
+                        .is_none_or(|expiry| expiry > now)
+                })
+                .is_some_and(|value| value == expected.as_slice());
+            let applied = if matching {
+                let applied = engine.apply(Command::DeleteLocalEntry { key });
+                let accepted = !applied.is_empty();
+                effects.extend(applied);
+                accepted
+            } else {
+                false
+            };
+            (
+                effects,
+                Some(MutationCompletion {
+                    reply,
+                    applied,
+                    budget,
+                }),
+            )
+        }
+    };
+    Some(ActorTurn {
+        effects,
+        completion,
+    })
 }
 
 /// Everything one group actor is spawned with: its engine, its inbox, and the
@@ -237,29 +357,23 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
     let mut entries_master: BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>> = BTreeMap::new();
 
     loop {
-        let effects = tokio::select! {
+        let turn = tokio::select! {
             maybe = inbox.recv() => match maybe {
-                Some(Event::Message { from, wire }) => {
-                    engine.on_message(from, &wire, now_since(start))
-                }
-                Some(Event::Local(cmd)) => engine.apply(cmd),
+                Some(event) => apply_actor_event(&mut engine, event, start),
                 None => break, // handle and all route senders dropped
             },
-            _ = ticker.tick() => engine.on_tick(now_since(start)),
+            _ = ticker.tick() => Some(ActorTurn {
+                effects: engine.on_tick(now_since(start)),
+                completion: None,
+            }),
         };
-        let meta_dirty = effects
-            .iter()
-            .any(|e| matches!(e, Effect::MetadataChanged { .. }));
-        let members_dirty = effects
-            .iter()
-            .any(|e| matches!(e, Effect::MembershipChanged));
-        let touched: BTreeSet<NodeId> = effects
-            .iter()
-            .filter_map(|e| match e {
-                Effect::NodeStateChanged { node, .. } => Some(node.clone()),
-                _ => None,
-            })
-            .collect();
+        let Some(ActorTurn {
+            effects,
+            completion,
+        }) = turn
+        else {
+            continue;
+        };
         // Publish first, wake second. Every `watch` and snapshot this batch
         // touches is republished *before* the matching `GroupEvent` goes out at
         // the bottom of the loop, so a consumer woken by an edge always reads
@@ -274,38 +388,70 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
             &mut undurable,
         )
         .await;
-        // Republish snapshots; readers borrow them lock-free.
-        if meta_dirty {
-            let snapshot: BTreeMap<String, String> = engine
-                .metadata_iter()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect();
-            let _ = publishers.metadata.send(Arc::new(snapshot));
-        }
-        if members_dirty {
-            let snapshot: Vec<NodeId> = engine.members().cloned().collect();
-            let _ = publishers.members.send(Arc::new(snapshot));
-            let _ = publishers.statuses.send(statuses_snapshot(&engine));
-            announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
-        }
-        republish_entries(
+        publish_actor_views(
             &engine,
             &publishers,
-            touched,
-            members_dirty,
+            routing.as_ref(),
+            &mut announced_coordinator,
             &mut entries_master,
+            &effects,
         );
-        let stats = engine.net_stats();
-        publishers.net_stats.send_if_modified(|current| {
-            let changed = *current != stats;
-            if changed {
-                *current = stats;
-            }
-            changed
-        });
-        // Last: the edges. Everything they announce is already readable.
-        emit_events(&publishers.events, &effects);
+        if let Some(MutationCompletion {
+            reply,
+            applied,
+            budget,
+        }) = completion
+        {
+            let _ = reply.send((applied, budget));
+        }
     }
+}
+
+/// Republishes all readable views before the matching edge notifications.
+fn publish_actor_views(
+    engine: &GroupEngine,
+    publishers: &Publishers,
+    routing: Option<&mpsc::Sender<Event>>,
+    announced_coordinator: &mut Option<NodeId>,
+    entries_master: &mut BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>>,
+    effects: &[Effect],
+) {
+    let meta_dirty = effects
+        .iter()
+        .any(|e| matches!(e, Effect::MetadataChanged { .. }));
+    let members_dirty = effects
+        .iter()
+        .any(|e| matches!(e, Effect::MembershipChanged));
+    let touched: BTreeSet<NodeId> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::NodeStateChanged { node, .. } => Some(node.clone()),
+            _ => None,
+        })
+        .collect();
+    if meta_dirty {
+        let snapshot: BTreeMap<String, String> = engine
+            .metadata_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let _ = publishers.metadata.send(Arc::new(snapshot));
+    }
+    if members_dirty {
+        let snapshot: Vec<NodeId> = engine.members().cloned().collect();
+        let _ = publishers.members.send(Arc::new(snapshot));
+        let _ = publishers.statuses.send(statuses_snapshot(engine));
+        announce_coordinator(engine, routing, announced_coordinator);
+    }
+    republish_entries(engine, publishers, touched, members_dirty, entries_master);
+    let stats = engine.net_stats();
+    publishers.net_stats.send_if_modified(|current| {
+        let changed = *current != stats;
+        if changed {
+            *current = stats;
+        }
+        changed
+    });
+    emit_events(&publishers.events, effects);
 }
 
 /// Maintains and republishes the per-node entries snapshot for one batch.

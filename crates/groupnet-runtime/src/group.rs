@@ -1,8 +1,9 @@
+use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use groupnet_core::{Command, Config, GroupId, NetStats, NodeId, Role, Status};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::driver::{
     Event, GroupEvent, GroupViews, MembersSnapshot, MetaSnapshot, NodeEntriesSnapshot,
@@ -24,6 +25,85 @@ pub enum BoundedRosterError {
     TooManyMembers,
     /// At least one observed identity exceeds the caller's byte limit.
     IdentityTooLong,
+}
+
+/// Finite actor-side observation limits, checked before cloning any entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryInspectionLimits {
+    /// Maximum bytes in the requested key.
+    pub max_key_bytes: usize,
+    /// Maximum returned members, including the local node.
+    pub max_members: usize,
+    /// Maximum bytes in one member identity.
+    pub max_member_bytes: usize,
+    /// Maximum bytes in one entry value.
+    pub max_value_bytes: usize,
+    /// Maximum combined response charge, including the fixed result and
+    /// per-entry record headers, identities, and value bytes.
+    pub max_response_bytes: usize,
+}
+
+/// An owned admission guard carried through the actor queue and response.
+///
+/// A cancelled requester does not release its budget while the actor still
+/// owns or allocates the reply. The runtime is independent of any particular
+/// admission implementation.
+pub trait EntryBudget: Any + Send {
+    /// Maximum queued or response bytes already reserved by this owner.
+    fn bytes(&self) -> usize;
+}
+
+/// One member and exactly one scoped entry from an actor-state cut.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InspectedEntry {
+    /// Member identity.
+    pub node: NodeId,
+    /// Membership status at the same actor cut.
+    pub status: Status,
+    /// Entry bytes, if present and unexpired.
+    pub value: Option<Vec<u8>>,
+    /// Observer-local remaining TTL in milliseconds, if the entry has one.
+    pub remaining_ttl_ms: Option<u64>,
+}
+
+/// One complete bounded actor-state cut with its monotonic sample instant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InspectedEntries {
+    /// Local monotonic instant at or before the actor's expiry calculation.
+    pub sampled_at: Instant,
+    /// Complete known roster in node-id order, including absent entries.
+    pub entries: Vec<InspectedEntry>,
+}
+
+/// A bounded actor-side inspection failed without returning a partial roster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryInspectionError {
+    /// Zero, inverted, or unrepresentable bound.
+    InvalidLimit,
+    /// The complete roster exceeded its count cap.
+    TooManyMembers,
+    /// One member identity exceeded its byte cap.
+    IdentityTooLong,
+    /// One present value exceeded its byte cap.
+    ValueTooLong,
+    /// The complete response exceeded the caller's owned budget.
+    Capacity,
+    /// The group actor is full or closed, or its reply was lost.
+    Unavailable,
+    /// The runtime could not recover its exact type-erased budget owner.
+    Internal,
+}
+
+/// A confirmed local entry mutation failed or its outcome is unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryMutationError {
+    /// The key or value violates the caller's finite bounds.
+    InvalidLimit,
+    /// The actor inbox is full or closed, or its reply was lost. The caller
+    /// must read back the exact value before deciding whether it applied.
+    Unavailable,
+    /// The actor did not apply a local set operation.
+    NotApplied,
 }
 
 impl std::fmt::Display for CommandRejected {
@@ -183,6 +263,12 @@ impl Group {
     #[must_use]
     pub fn id(&self) -> &GroupId {
         &self.id
+    }
+
+    /// Stable local member identity used for actor-owned entries.
+    #[must_use]
+    pub fn local_node(&self) -> &NodeId {
+        &self.local
     }
 
     /// The **effective** protocol config this node is running — the
@@ -446,6 +532,62 @@ impl Group {
             .map_err(|_| CommandRejected)
     }
 
+    /// Applies a bounded local entry and waits until the actor has published
+    /// the resulting local view. This confirms only local publication; gossip
+    /// delivery and remote adoption remain advisory.
+    ///
+    /// A lost reply has an unknown outcome. Read back the exact scoped entry
+    /// rather than issuing an unrelated claim with the same identity.
+    ///
+    /// # Errors
+    /// Returns [`EntryMutationError`] for invalid bounds, actor overload or
+    /// closure, a lost reply, or a rejected local application.
+    pub async fn set_entry_confirmed<B: EntryBudget>(
+        &self,
+        key: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+        ttl_ms: Option<u64>,
+        max_key_bytes: usize,
+        max_value_bytes: usize,
+        budget: B,
+    ) -> Result<B, EntryMutationError> {
+        let key = key.into();
+        let value = value.into();
+        if key.is_empty()
+            || max_key_bytes == 0
+            || max_value_bytes == 0
+            || key.len() > max_key_bytes
+            || value.len() > max_value_bytes
+            || key
+                .len()
+                .checked_add(value.len())
+                .is_none_or(|bytes| bytes > budget.bytes())
+        {
+            return Err(EntryMutationError::InvalidLimit);
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .try_send(Event::SetEntryConfirmed {
+                key,
+                value,
+                ttl_ms,
+                budget: Box::new(budget),
+                reply,
+            })
+            .map_err(|_| EntryMutationError::Unavailable)?;
+        let (applied, erased) = response
+            .await
+            .map_err(|_| EntryMutationError::Unavailable)?;
+        let budget = erased
+            .downcast::<B>()
+            .map_err(|_| EntryMutationError::Unavailable)?;
+        if applied {
+            Ok(*budget)
+        } else {
+            Err(EntryMutationError::NotApplied)
+        }
+    }
+
     /// Delete one key of this node's state (a versioned tombstone disseminates
     /// so every peer drops it).
     ///
@@ -456,6 +598,54 @@ impl Group {
         self.tx
             .try_send(Event::Local(Command::DeleteLocalEntry { key: key.into() }))
             .map_err(|_| CommandRejected)
+    }
+
+    /// Deletes this node's entry only if its actor-visible bytes exactly match
+    /// `expected`. A distinct renewal/incarnation must change those bytes for
+    /// this to fence delayed withdrawals. A `false` result does not delete a
+    /// newer claim. Publication precedes the successful reply.
+    ///
+    /// # Errors
+    /// Returns [`EntryMutationError`] for invalid bounds or an unavailable
+    /// actor/reply. A lost reply has an unknown outcome and needs readback.
+    pub async fn delete_entry_if_value<B: EntryBudget>(
+        &self,
+        key: impl Into<String>,
+        expected: impl Into<Vec<u8>>,
+        max_key_bytes: usize,
+        max_value_bytes: usize,
+        budget: B,
+    ) -> Result<(bool, B), EntryMutationError> {
+        let key = key.into();
+        let expected = expected.into();
+        if key.is_empty()
+            || max_key_bytes == 0
+            || max_value_bytes == 0
+            || key.len() > max_key_bytes
+            || expected.len() > max_value_bytes
+            || key
+                .len()
+                .checked_add(expected.len())
+                .is_none_or(|bytes| bytes > budget.bytes())
+        {
+            return Err(EntryMutationError::InvalidLimit);
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .try_send(Event::DeleteEntryIfValue {
+                key,
+                expected,
+                budget: Box::new(budget),
+                reply,
+            })
+            .map_err(|_| EntryMutationError::Unavailable)?;
+        let (deleted, erased) = response
+            .await
+            .map_err(|_| EntryMutationError::Unavailable)?;
+        let budget = erased
+            .downcast::<B>()
+            .map_err(|_| EntryMutationError::Unavailable)?;
+        Ok((deleted, *budget))
     }
 
     /// One key of `node`'s state, as this node currently sees it.
@@ -472,6 +662,56 @@ impl Group {
             .get(node)
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default()
+    }
+
+    /// Samples one key across the complete group roster inside the group
+    /// actor, including each entry's observer-local remaining TTL.
+    ///
+    /// The budget moves into the bounded actor command before any response
+    /// allocation. If this future is cancelled, that command or its reply
+    /// keeps the budget until its cloned bytes are dropped.
+    ///
+    /// # Errors
+    /// Rejects invalid limits, a full/closed actor, or any response overflow
+    /// without returning a truncated roster.
+    pub async fn inspect_scoped_entry<B: EntryBudget>(
+        &self,
+        key: impl Into<String>,
+        limits: EntryInspectionLimits,
+        budget: B,
+    ) -> Result<(InspectedEntries, B), EntryInspectionError> {
+        let key = key.into();
+        if key.is_empty()
+            || limits.max_key_bytes == 0
+            || key.len() > limits.max_key_bytes
+            || limits.max_members == 0
+            || limits.max_member_bytes == 0
+            || limits.max_value_bytes == 0
+            || limits.max_response_bytes == 0
+            || limits.max_response_bytes > budget.bytes()
+        {
+            return Err(EntryInspectionError::InvalidLimit);
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .try_send(Event::InspectScopedEntry {
+                key,
+                limits,
+                budget: Box::new(budget),
+                reply,
+            })
+            .map_err(|_| EntryInspectionError::Unavailable)?;
+        let (entries, erased) = response
+            .await
+            .map_err(|_| EntryInspectionError::Unavailable)??;
+        match erased.downcast::<B>() {
+            Ok(budget) => Ok((entries, *budget)),
+            Err(erased) => {
+                drop(entries);
+                drop(erased);
+                Err(EntryInspectionError::Internal)
+            }
+        }
     }
 
     /// A snapshot of every node's live state entries (the full map, one
