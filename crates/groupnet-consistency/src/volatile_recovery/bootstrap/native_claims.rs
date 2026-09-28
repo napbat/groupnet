@@ -107,8 +107,12 @@ impl NativeClaimSource {
             return Err(AdapterError);
         }
         let inspection_limits = self.inspection_limits(limits)?;
+        let raw_charge = limits
+            .max_metadata_bytes
+            .checked_add(self.key.len())
+            .ok_or(AdapterError)?;
         let raw_budget = admission
-            .reserve(AdmissionClass::Inflight, limits.max_metadata_bytes)
+            .reserve(AdmissionClass::Inflight, raw_charge)
             .map_err(|_| AdapterError)?;
         let (raw, raw_budget) = self
             .group
@@ -183,9 +187,13 @@ impl NativeClaimSource {
                 .ok_or(AdapterError)?,
         };
         let inspection_limits = self.inspection_limits(limits)?;
+        let raw_charge = limits
+            .max_metadata_bytes
+            .checked_add(self.key.len())
+            .ok_or(AdapterError)?;
         let budget = self
             .admission
-            .reserve(AdmissionClass::Inflight, limits.max_metadata_bytes)
+            .reserve(AdmissionClass::Inflight, raw_charge)
             .map_err(|_| AdapterError)?;
         let (observed, budget) = self
             .group

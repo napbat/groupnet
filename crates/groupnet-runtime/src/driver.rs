@@ -12,11 +12,13 @@ use groupnet_transport::Transport;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
-use crate::group::{EntryInspectionError, EntryInspectionLimits, InspectedEntries, Leadership};
+use crate::group::{
+    EntryInspectionError, EntryInspectionLimits, InspectedEntries, InspectedPair, Leadership,
+};
 use crate::store::GrantStore;
 
 mod entry_inspection;
-use entry_inspection::inspect_scoped_entry;
+use entry_inspection::{inspect_scoped_entry, inspect_scoped_pair};
 
 /// A change notification a consumer can subscribe to via
 /// [`Group::events`](crate::Group::events). The stream is bounded: a slow
@@ -113,6 +115,8 @@ pub(crate) type NodeEntriesSnapshot = Arc<BTreeMap<NodeId, Arc<BTreeMap<String, 
 type ErasedBudget = Box<dyn Any + Send>;
 type InspectionReply =
     oneshot::Sender<Result<(InspectedEntries, ErasedBudget), EntryInspectionError>>;
+type PairInspectionReply =
+    oneshot::Sender<Result<(InspectedPair, ErasedBudget), EntryInspectionError>>;
 type MutationReply = oneshot::Sender<(bool, ErasedBudget)>;
 
 pub(crate) enum Event {
@@ -127,10 +131,25 @@ pub(crate) enum Event {
         budget: ErasedBudget,
         reply: InspectionReply,
     },
+    InspectScopedPair {
+        first: String,
+        second: String,
+        limits: EntryInspectionLimits,
+        budget: ErasedBudget,
+        reply: PairInspectionReply,
+    },
     SetEntryConfirmed {
         key: String,
         value: Vec<u8>,
         ttl_ms: Option<u64>,
+        budget: ErasedBudget,
+        reply: MutationReply,
+    },
+    SetEntryIfRevision {
+        key: String,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+        expected: crate::group::EntryRevision,
         budget: ErasedBudget,
         reply: MutationReply,
     },
@@ -192,9 +211,15 @@ struct ActorTurn {
 /// Handles one actor command without crossing an await. Inspection sends its
 /// read-only reply directly; a mutation's completion waits for publication.
 fn apply_actor_event(engine: &mut GroupEngine, event: Event, start: Instant) -> Option<ActorTurn> {
-    let (effects, completion) = match event {
-        Event::Message { from, wire } => (engine.on_message(from, &wire, now_since(start)), None),
-        Event::Local(cmd) => (engine.apply(cmd), None),
+    match event {
+        Event::Message { from, wire } => Some(ActorTurn {
+            effects: engine.on_message(from, &wire, now_since(start)),
+            completion: None,
+        }),
+        Event::Local(cmd) => Some(ActorTurn {
+            effects: engine.apply(cmd),
+            completion: None,
+        }),
         Event::InspectScopedEntry {
             key,
             limits,
@@ -205,8 +230,35 @@ fn apply_actor_event(engine: &mut GroupEngine, event: Event, start: Instant) -> 
             let result = inspect_scoped_entry(engine, &key, limits, now_since(start), sampled_at)
                 .map(|entries| (entries, budget));
             let _ = reply.send(result);
-            return None;
+            None
         }
+        Event::InspectScopedPair {
+            first,
+            second,
+            limits,
+            budget,
+            reply,
+        } => {
+            let sampled_at = Instant::now();
+            let result = inspect_scoped_pair(
+                engine,
+                &first,
+                &second,
+                limits,
+                now_since(start),
+                sampled_at,
+            )
+            .map(|entries| (entries, budget));
+            let _ = reply.send(result);
+            None
+        }
+        mutation => Some(apply_mutation_event(engine, mutation, start)),
+    }
+}
+
+/// Executes one actor-owned entry mutation; completion follows publication.
+fn apply_mutation_event(engine: &mut GroupEngine, event: Event, start: Instant) -> ActorTurn {
+    let (effects, completion) = match event {
         Event::SetEntryConfirmed {
             key,
             value,
@@ -218,6 +270,37 @@ fn apply_actor_event(engine: &mut GroupEngine, event: Event, start: Instant) -> 
             let applied = engine.apply(Command::SetLocalEntry { key, value, ttl_ms });
             let accepted = !applied.is_empty();
             effects.extend(applied);
+            (
+                effects,
+                Some(MutationCompletion {
+                    reply,
+                    applied: accepted,
+                    budget,
+                }),
+            )
+        }
+        Event::SetEntryIfRevision {
+            key,
+            value,
+            ttl_ms,
+            expected,
+            budget,
+            reply,
+        } => {
+            let mut effects = engine.on_tick(now_since(start));
+            let local = engine.local();
+            let current_key = engine.node_entry_version(local, &key);
+            let accepted = engine.member_state_version(local).is_some_and(|version| {
+                version < u64::MAX
+                    && if let Some(expected_key) = expected.key {
+                        current_key == Some(expected_key)
+                    } else {
+                        current_key.is_none() && version == expected.member
+                    }
+            });
+            if accepted {
+                effects.extend(engine.apply(Command::SetLocalEntry { key, value, ttl_ms }));
+            }
             (
                 effects,
                 Some(MutationCompletion {
@@ -260,11 +343,15 @@ fn apply_actor_event(engine: &mut GroupEngine, event: Event, start: Instant) -> 
                 }),
             )
         }
+        Event::Message { .. }
+        | Event::Local(_)
+        | Event::InspectScopedEntry { .. }
+        | Event::InspectScopedPair { .. } => unreachable!("inspection is handled before mutation"),
     };
-    Some(ActorTurn {
+    ActorTurn {
         effects,
         completion,
-    })
+    }
 }
 
 /// Everything one group actor is spawned with: its engine, its inbox, and the

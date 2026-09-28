@@ -43,6 +43,25 @@ pub struct EntryInspectionLimits {
     pub max_response_bytes: usize,
 }
 
+/// Exact actor-cut revision precondition for one local entry mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryRevision {
+    /// Retained key revision, including a tombstone. An absent revision also
+    /// binds `member` to prevent an old create after a publish and removal.
+    pub key: Option<u64>,
+    /// Native member state high-water at the observation cut.
+    pub member: u64,
+}
+
+/// Actor-side byte limits for one conditional entry publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryMutationLimits {
+    /// Maximum owned bytes in the scoped key.
+    pub max_key_bytes: usize,
+    /// Maximum owned bytes in its value.
+    pub max_value_bytes: usize,
+}
+
 /// An owned admission guard carried through the actor queue and response.
 ///
 /// A cancelled requester does not release its budget while the actor still
@@ -73,6 +92,42 @@ pub struct InspectedEntries {
     pub sampled_at: Instant,
     /// Complete known roster in node-id order, including absent entries.
     pub entries: Vec<InspectedEntry>,
+}
+
+/// One member and two scoped entries from the same actor-state cut.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InspectedPairEntry {
+    /// Native member identity.
+    pub node: NodeId,
+    /// Native membership status.
+    pub status: Status,
+    /// SWIM refutation incarnation; the entry's boot token fences restarts.
+    pub member_incarnation: u64,
+    /// Native high-water version including deleted entries. Conditional local
+    /// publication binds this value so an old absent-value create cannot
+    /// revive after a newer publication and withdrawal.
+    pub member_state_version: u64,
+    /// First entry bytes, if present and unexpired.
+    pub first: Option<Vec<u8>>,
+    /// Retained first-entry revision, including an absent tombstone.
+    pub first_version: Option<u64>,
+    /// Native remaining TTL for the first entry at the sample.
+    pub first_remaining_ttl_ms: Option<u64>,
+    /// Second entry bytes, if present and unexpired.
+    pub second: Option<Vec<u8>>,
+    /// Retained second-entry revision, including an absent tombstone.
+    pub second_version: Option<u64>,
+    /// Native remaining TTL for the second entry at the sample.
+    pub second_remaining_ttl_ms: Option<u64>,
+}
+
+/// Complete bounded two-entry roster at one observer-local actor instant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InspectedPair {
+    /// Instant at or before the actor's native TTL calculation.
+    pub sampled_at: Instant,
+    /// Complete known roster in `NodeId` order, including absent entries.
+    pub entries: Vec<InspectedPairEntry>,
 }
 
 /// A bounded actor-side inspection failed without returning a partial roster.
@@ -558,9 +613,11 @@ impl Group {
             || max_value_bytes == 0
             || key.len() > max_key_bytes
             || value.len() > max_value_bytes
+            || key.capacity() > max_key_bytes
+            || value.capacity() > max_value_bytes
             || key
-                .len()
-                .checked_add(value.len())
+                .capacity()
+                .checked_add(value.capacity())
                 .is_none_or(|bytes| bytes > budget.bytes())
         {
             return Err(EntryMutationError::InvalidLimit);
@@ -585,6 +642,69 @@ impl Group {
             Ok(*budget)
         } else {
             Err(EntryMutationError::NotApplied)
+        }
+    }
+
+    /// Publishes one bounded local entry only while its retained per-key
+    /// revision still matches the actor cut. An absent key also binds the
+    /// member's state-version high-water mark, so a delayed old create cannot
+    /// revive after a newer create and withdrawal have both disappeared.
+    /// Unrelated local writes do not reject a renewal with a retained key
+    /// revision. The actor checks the condition after processing expiries.
+    ///
+    /// A `false` result confirms rejection without mutation. A lost reply is
+    /// unknown and requires exact readback. The owned budget follows queued
+    /// work and the response even if the requester is cancelled.
+    ///
+    /// # Errors
+    /// Rejects invalid limits, an unavailable actor, or a lost reply.
+    pub async fn set_entry_if_revision<B: EntryBudget>(
+        &self,
+        key: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+        ttl_ms: Option<u64>,
+        expected: EntryRevision,
+        limits: EntryMutationLimits,
+        budget: B,
+    ) -> Result<(bool, B), EntryMutationError> {
+        let key = key.into();
+        let value = value.into();
+        if key.is_empty()
+            || limits.max_key_bytes == 0
+            || limits.max_value_bytes == 0
+            || key.len() > limits.max_key_bytes
+            || value.len() > limits.max_value_bytes
+            || key.capacity() > limits.max_key_bytes
+            || value.capacity() > limits.max_value_bytes
+            || expected.member == u64::MAX
+            || expected.key == Some(u64::MAX)
+            || key
+                .capacity()
+                .checked_add(value.capacity())
+                .is_none_or(|bytes| bytes > budget.bytes())
+        {
+            return Err(EntryMutationError::InvalidLimit);
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .try_send(Event::SetEntryIfRevision {
+                key,
+                value,
+                ttl_ms,
+                expected,
+                budget: Box::new(budget),
+                reply,
+            })
+            .map_err(|_| EntryMutationError::Unavailable)?;
+        let (applied, erased) = response
+            .await
+            .map_err(|_| EntryMutationError::Unavailable)?;
+        match erased.downcast::<B>() {
+            Ok(budget) => Ok((applied, *budget)),
+            Err(erased) => {
+                drop(erased);
+                Err(EntryMutationError::Unavailable)
+            }
         }
     }
 
@@ -623,9 +743,11 @@ impl Group {
             || max_value_bytes == 0
             || key.len() > max_key_bytes
             || expected.len() > max_value_bytes
+            || key.capacity() > max_key_bytes
+            || expected.capacity() > max_value_bytes
             || key
-                .len()
-                .checked_add(expected.len())
+                .capacity()
+                .checked_add(expected.capacity())
                 .is_none_or(|bytes| bytes > budget.bytes())
         {
             return Err(EntryMutationError::InvalidLimit);
@@ -684,11 +806,15 @@ impl Group {
         if key.is_empty()
             || limits.max_key_bytes == 0
             || key.len() > limits.max_key_bytes
+            || key.capacity() > limits.max_key_bytes
             || limits.max_members == 0
             || limits.max_member_bytes == 0
             || limits.max_value_bytes == 0
             || limits.max_response_bytes == 0
-            || limits.max_response_bytes > budget.bytes()
+            || limits
+                .max_response_bytes
+                .checked_add(key.capacity())
+                .is_none_or(|bytes| bytes > budget.bytes())
         {
             return Err(EntryInspectionError::InvalidLimit);
         }
@@ -696,6 +822,74 @@ impl Group {
         self.tx
             .try_send(Event::InspectScopedEntry {
                 key,
+                limits,
+                budget: Box::new(budget),
+                reply,
+            })
+            .map_err(|_| EntryInspectionError::Unavailable)?;
+        let (entries, erased) = response
+            .await
+            .map_err(|_| EntryInspectionError::Unavailable)??;
+        match erased.downcast::<B>() {
+            Ok(budget) => Ok((entries, *budget)),
+            Err(erased) => {
+                drop(entries);
+                drop(erased);
+                Err(EntryInspectionError::Internal)
+            }
+        }
+    }
+
+    /// Samples two scoped keys and native membership incarnations from one
+    /// complete actor cut, with the owned budget held through cancellation.
+    ///
+    /// # Errors
+    /// Rejects invalid limits, a full/closed actor, or a response too large
+    /// to retain without returning a truncated roster.
+    pub async fn inspect_scoped_pair<B: EntryBudget>(
+        &self,
+        first: &str,
+        second: &str,
+        limits: EntryInspectionLimits,
+        budget: B,
+    ) -> Result<(InspectedPair, B), EntryInspectionError> {
+        let key_bytes = first
+            .len()
+            .checked_add(second.len())
+            .ok_or(EntryInspectionError::InvalidLimit)?;
+        if first.is_empty()
+            || second.is_empty()
+            || first == second
+            || first.len() > limits.max_key_bytes
+            || second.len() > limits.max_key_bytes
+            || limits.max_members == 0
+            || limits.max_member_bytes == 0
+            || limits.max_value_bytes == 0
+            || limits.max_response_bytes == 0
+            || limits
+                .max_response_bytes
+                .checked_add(key_bytes)
+                .is_none_or(|bytes| bytes > budget.bytes())
+        {
+            return Err(EntryInspectionError::InvalidLimit);
+        }
+        let first = first.to_owned();
+        let second = second.to_owned();
+        if first.capacity() > limits.max_key_bytes
+            || second.capacity() > limits.max_key_bytes
+            || limits
+                .max_response_bytes
+                .checked_add(first.capacity())
+                .and_then(|bytes| bytes.checked_add(second.capacity()))
+                .is_none_or(|bytes| bytes > budget.bytes())
+        {
+            return Err(EntryInspectionError::InvalidLimit);
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .try_send(Event::InspectScopedPair {
+                first,
+                second,
                 limits,
                 budget: Box::new(budget),
                 reply,

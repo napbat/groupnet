@@ -245,6 +245,36 @@ impl GroupEngine {
         self.members.get(node).map(|m| m.status)
     }
 
+    /// Observer's current SWIM incarnation of one known member. This is a
+    /// refutation counter, not a process-fresh boot identity; applications
+    /// requiring restart fencing bind a separate fresh participation token.
+    #[must_use]
+    pub fn member_incarnation(&self, node: &NodeId) -> Option<u64> {
+        self.members.get(node).map(|member| member.incarnation)
+    }
+
+    /// Highest local-entry version retained for a known member, including
+    /// versions of deleted keys. A scoped conditional writer uses this to
+    /// fence delayed creates after a newer create and withdrawal.
+    #[must_use]
+    pub fn member_state_version(&self, node: &NodeId) -> Option<u64> {
+        self.members
+            .get(node)
+            .map(|member| member.max_state_version)
+    }
+
+    /// Current version of one member entry, including its tombstone. `None`
+    /// means no retained per-key revision; a conditional creator must also
+    /// bind the member high-water mark to fence absent-value ABA.
+    #[must_use]
+    pub fn node_entry_version(&self, node: &NodeId, key: &str) -> Option<u64> {
+        self.members
+            .get(node)?
+            .entries
+            .get(key)
+            .map(|entry| entry.version)
+    }
+
     /// Iterates every known member with its status, in id order — including
     /// `Suspect` members and `Dead` tombstones that have not yet been reaped. A
     /// consumer that needs the Alive/Suspect/Dead distinction (not just the

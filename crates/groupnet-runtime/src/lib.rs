@@ -50,7 +50,8 @@ pub use anchor::{Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf};
 pub use driver::GroupEvent;
 pub use group::{
     BoundedRosterError, CommandRejected, EntryBudget, EntryInspectionError, EntryInspectionLimits,
-    EntryMutationError, Group, InspectedEntries, InspectedEntry, Leadership, SyncCtx,
+    EntryMutationError, EntryMutationLimits, EntryRevision, Group, InspectedEntries,
+    InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
 pub use groupnet_core::{RecoveredGrant, Role, Status};
 pub use node::{GroupProfile, Node, NodeBuilder};
