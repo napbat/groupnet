@@ -69,18 +69,15 @@
 //! | [`NotCovered`](RefusalCode::NotCovered) | [`HandoffError::NotCovered`] `{ have }` — the donor's own map, carried |
 //! | [`Unavailable`](RefusalCode::Unavailable) | [`HandoffError::Refused`] `{ code }` |
 //! | [`BadRequest`](RefusalCode::BadRequest) | [`HandoffError::Refused`] `{ code }` |
-//! | [`Version`](RefusalCode::Version) | [`HandoffError::Refused`] `{ code }` |
 //!
 //! `NotCovered` folding into [`HandoffError::NotCovered`] rather than into
 //! `Refused { code }` is deliberate: that is also what the requester raises when
 //! it detects short coverage *itself*, and the two are the same fact learned two
 //! ways. A caller picking its next donor reads one variant, not two.
 //!
-//! [`RefusalCode::Version`] is the one code this driver never sends. A frame
-//! carrying a version this build does not know is refused by the codec before
-//! any driver sees it, and answering it in-band would mean encoding a reply in
-//! the version the peer has just shown it cannot read. The code exists so that
-//! a *future* version has a word for it, and so this one can decode it.
+//! A frame carrying a version this build does not know is refused by the codec
+//! before any driver sees it: peers upgrade together, so an unknown version is
+//! a mis-deployed peer, not a conversation to answer in-band.
 //!
 //! # What `offer` does not do
 //!
@@ -750,11 +747,7 @@ mod tests {
             HandoffError::NotCovered { have: carried } => assert_eq!(carried, have),
             other => panic!("unexpected {other:?}"),
         }
-        for code in [
-            RefusalCode::Unavailable,
-            RefusalCode::BadRequest,
-            RefusalCode::Version,
-        ] {
+        for code in [RefusalCode::Unavailable, RefusalCode::BadRequest] {
             match refused(code, Watermarks::new()) {
                 HandoffError::Refused { code: got } => assert_eq!(got, code),
                 other => panic!("unexpected {other:?}"),

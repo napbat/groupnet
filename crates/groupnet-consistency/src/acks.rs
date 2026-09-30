@@ -37,8 +37,8 @@ const ACK_KEY: &str = "~applied";
 /// [`Group::advertise_capabilities`]) to declare that it runs an
 /// [`AckLedger`] — i.e. that waiting on it is not waiting on a timeout.
 ///
-/// Pair it with [`applied_by_selected`] to scope a wait to the participating
-/// half of a mixed deployment:
+/// Pair it with [`applied_by_selected`] to scope a wait to the nodes that opted
+/// in, in a deployment where only some of them run a ledger:
 ///
 /// ```no_run
 /// # use std::time::Duration;
@@ -156,17 +156,17 @@ pub async fn applied_cluster_wide(
 /// there is nobody to wait on, and that is a real (if weak) answer, not a
 /// failure.
 ///
-/// # The rolling-upgrade footgun
+/// # The advertisement-lag footgun
 ///
 /// A capability selector such as `|peer| group.node_has_capability(peer,
 /// CAP_ACKS)` is only as good as the advertisements that have converged. A
-/// peer that *does* run an [`AckLedger`] but has not advertised
-/// [`CAP_ACKS`] yet — an older build, or a newer one whose advertisement is
-/// still in flight — is **invisible to the selector and silently skipped**,
-/// so the wait can resolve before that peer has applied the write. The
-/// guarantee quietly weakens instead of failing loudly.
+/// peer that *does* run an [`AckLedger`] but whose [`CAP_ACKS`] advertisement
+/// has not reached this node yet — it just opted in, or just joined — is
+/// **invisible to the selector and silently skipped**, so the wait can resolve
+/// before that peer has applied the write. The guarantee quietly weakens
+/// instead of failing loudly.
 ///
-/// So the safe rollout order is: advertise fleet-wide first, confirm the
+/// So the safe order is: advertise on every participant first, confirm the
 /// advertisements have landed (e.g. every member of interest appears in
 /// [`Group::members_with_capability`]), and only then narrow writers onto a
 /// capability selector. Selectors built from a source that cannot lag —

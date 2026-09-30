@@ -223,9 +223,9 @@ impl LeaseCore {
     /// newest published renewal is the confirmed one. That is a real, if weak,
     /// answer — the same posture
     /// [`applied_by_selected`](crate::applied_by_selected) takes for an empty
-    /// selection — and it carries the same rolling-upgrade footgun: a writer
-    /// that has not advertised [`CAP_LEASE`](super::CAP_LEASE) yet is
-    /// invisible here and is not waited for.
+    /// selection — and it carries the same advertisement-lag footgun: a writer
+    /// whose [`CAP_LEASE`](super::CAP_LEASE) advertisement has not landed yet
+    /// is invisible here and is not waited for.
     pub fn set_roster(&mut self, roster: impl IntoIterator<Item = NodeId>) {
         self.roster = roster.into_iter().filter(|node| *node != self.me).collect();
     }

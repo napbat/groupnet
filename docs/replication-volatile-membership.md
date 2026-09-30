@@ -62,8 +62,8 @@ it. Missing, malformed, duplicate, expired, or wrong-policy participation for
 an eligible member declines peer bootstrap; it never creates a synthetic boot
 identity from NodeId or SWIM incarnation. A retained old-process entry
 conflicting with a new-process entry also declines until the source resolves
-the conflict. The source may fall back to origin when mixed-version peers lack
-participation; ordinary coherence and origin reads remain available.
+the conflict. A declined peer bootstrap falls back to origin; ordinary
+coherence and origin reads remain available.
 
 The narrow runtime primitive is a fixed two-key
 `Group::inspect_scoped_pair(presence_key, claim_key, limits, owned_budget)`.
@@ -159,9 +159,9 @@ gap, or insufficient admission.
 The scoped participation entry uses a new reserved key and body kind. The
 existing VBC1 builder-claim value is unchanged. The canonical bulk Offer
 and Barrier bodies carry the single canonical full-native roster under bulk
-codec version 2; version 1 bulk peers refuse the exchange. There is no parallel
-legacy bulk-body path. The global Groupnet `FRAME_VERSION`
-and its existing frame bodies are unchanged. A healthy two-node run with a transferred follower must still
+codec version 2. Peers upgrade together, so there is no parallel bulk-body
+path for another version; the version byte only rejects a mis-deployed peer.
+A healthy two-node run with a transferred follower must still
 select the already-Ready donor for a third joining follower. Tests must prove
 that schedule, old/new boot and same-boot new-session overlap, stale TTL or
 renewal replay, missing participation fallback, cancellation and admission

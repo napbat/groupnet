@@ -35,9 +35,12 @@ pub struct BootstrapRuntimeConfig {
     pub max_claim_metadata_bytes: usize,
     /// Bounded incoming donor requests served by the same worker.
     pub donor_inbox_capacity: usize,
-    /// Require a complete native participation cut. Until the roster-bearing
-    /// bulk format is enabled, this mode uses local origin recovery and
-    /// declines peer transfer rather than downgrading to claims-only proof.
+    /// Require a complete native participation cut. Donor capture and peer
+    /// transfer then bind to that roster, which the bulk Offer and Barrier
+    /// carry; a missing or changed roster declines peer transfer to guarded
+    /// origin recovery rather than downgrading to claims-only proof. Without
+    /// it, selection is claims-only and a peer handoff has no roster to
+    /// verify, so it also fails closed to guarded origin recovery.
     pub require_participation: bool,
 }
 

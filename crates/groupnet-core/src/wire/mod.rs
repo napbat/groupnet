@@ -20,9 +20,8 @@
 //!   SWIM liveness probes. Since v3 these carry **no** piggybacked view; they are
 //!   tiny.
 //! * [`Kind::LeadClaim`] / [`Kind::LeadGrant`] / [`Kind::LeadState`] — the
-//!   Hosted-mode election, carried in a [`LeadBody`]. Added inside `v3` as new
-//!   kinds (an old node drops an unknown kind), so an `Eventual` group's bytes
-//!   are untouched and never sees one.
+//!   Hosted-mode election, carried in a [`LeadBody`]. An `Eventual` group
+//!   never emits one.
 //!
 //! The codec is a small hand-rolled length-prefixed format (little-endian),
 //! deliberately dependency-free.
@@ -240,13 +239,10 @@ pub struct Frame {
     pub lead: Option<LeadBody>,
 }
 
-/// Protocol version, the first byte of every frame. Bumped to **3** for
-/// digest/delta anti-entropy (v2 frames piggybacked the full view). As with the
-/// v1→v2 bump this is a hard cut: a v2 frame is simply undecodable to a v3 node
-/// and vice versa, so a mixed-version cluster degrades to two disjoint gossip
-/// meshes rather than misreading each other — gossip is loss-tolerant, so this
-/// is the safe failure mode, and a rolling deployment converges once the last v2
-/// node is upgraded.
+/// Protocol version, the first byte of every frame. Every peer in a cluster
+/// runs the same build, so this is not a compatibility mechanism: it is a guard
+/// that makes a mis-deployed node's frames undecodable instead of misparsed.
+/// Frame bodies may change freely; any change to a kind or body bumps it.
 const FRAME_VERSION: u8 = 3;
 
 const KIND_DIGEST: u8 = 1;

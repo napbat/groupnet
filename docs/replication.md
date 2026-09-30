@@ -202,10 +202,10 @@ Groupnet still owns session ordering, cursor/proof validation, cancellation,
 and cutover. Targeted, correlated bootstrap requests and replies carry
 `session_id`, `generation`, operation token, scope, source proof, and deadline.
 They do not replace application RPC for document search or peer forwarding.
-If control-plane replication messages are needed, they add new frame kinds
-inside the current `FRAME_VERSION`; old nodes drop unknown kinds, and existing
-frame bodies stay unchanged. Bulk data has its own versioned framing and
-limits. The initial replay-only slice needs no new control-plane frame.
+If control-plane replication messages are needed, they add or change frame
+kinds and bodies freely and bump `FRAME_VERSION`; peers upgrade together, so
+no other peer version is accommodated. Bulk data has its own versioned framing
+and limits. The initial replay-only slice needs no new control-plane frame.
 
 ## 5. Adapter and public API sketch
 

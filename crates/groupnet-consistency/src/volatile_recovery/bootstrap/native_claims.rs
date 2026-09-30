@@ -31,9 +31,10 @@ impl EntryBudget for Reservation {
 /// serializes its own local publication and exact withdrawal, while all
 /// roster/entry observations are one bounded Group actor cut. Queue copies,
 /// responses, and the source-retained exact value are charged here. The
-/// `GroupEngine`'s adopted entry and legacy watcher copies use separate
-/// ownership; this admission does not bound their memory. Deployments must
-/// also bound the number of configured bootstrap scopes and claims.
+/// `GroupEngine`'s adopted entry and the Group's published entry-watch
+/// snapshots use separate ownership; this admission does not bound their
+/// memory. Deployments must also bound the number of configured bootstrap
+/// scopes and claims.
 #[derive(Debug)]
 pub struct NativeClaimSource {
     group: Group,

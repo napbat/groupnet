@@ -193,8 +193,8 @@ fn an_election_frame_missing_its_body_decodes_to_none() {
 
 #[test]
 fn an_unknown_kind_decodes_to_none() {
-    // 11 is the first unassigned tag: an old node must drop a future kind
-    // rather than misread it, which is what lets new kinds land inside v3.
+    // 11 is the first unassigned tag: an unknown kind is malformed and must
+    // be rejected rather than misread as some other body.
     let mut bytes = encode(&digest_sample());
     bytes[1] = 11;
     assert_eq!(decode(&bytes), None);
@@ -246,10 +246,13 @@ fn truncated_input_decodes_to_none_not_panic() {
 }
 
 #[test]
-fn a_v2_framed_byte_stream_is_rejected() {
-    // Hard cut: a frame stamped with the old version byte does not decode.
-    let mut bytes = encode(&digest_sample());
-    bytes[0] = 2;
-    assert_eq!(decode(&bytes), None);
-    assert_eq!(peek_group(&bytes), None);
+fn a_frame_stamped_with_another_version_is_rejected() {
+    // The version byte guards against a mis-deployed node: a frame from any
+    // other version, older or newer, does not decode.
+    for version in [FRAME_VERSION - 1, FRAME_VERSION + 1] {
+        let mut bytes = encode(&digest_sample());
+        bytes[0] = version;
+        assert_eq!(decode(&bytes), None);
+        assert_eq!(peek_group(&bytes), None);
+    }
 }

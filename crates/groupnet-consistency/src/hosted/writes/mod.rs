@@ -681,10 +681,11 @@ impl<K: 'static> HostedWrites<K> {
     /// node currently believes `Alive` that advertises [`CAP_HOSTED`].
     ///
     /// This node is excluded because it is the author, not a witness. The
-    /// capability selector carries the ack tier's rolling-upgrade footgun
-    /// verbatim: a peer that runs the follower loop but has not advertised yet
-    /// is invisible here and **silently skipped**, so the guarantee weakens
-    /// quietly instead of failing loudly. Advertise fleet-wide and confirm the
+    /// capability selector carries the ack tier's advertisement-lag footgun
+    /// verbatim: a peer that runs the follower loop but whose advertisement has
+    /// not landed yet is invisible here and **silently skipped**, so the
+    /// guarantee weakens quietly instead of failing loudly. Advertise on every
+    /// participant and confirm the
     /// advertisements have landed before relying on this level. An empty
     /// selection resolves immediately — a real, if weak, answer, and the same
     /// one [`applied_by_selected`](crate::applied_by_selected) gives.

@@ -124,7 +124,7 @@ async fn a_healthy_group_serves_under_leases_and_invalidates_at_ack_speed() {
     }
     // Readers wait for a confirmation from every member advertising the
     // capability, so the advertisements must land before a lease can converge —
-    // the rolling-upgrade order `CAP_LEASE` documents.
+    // the advertise-first order `CAP_LEASE` documents.
     eventually_within(
         "every node sees all three lease participants",
         SETTLE,

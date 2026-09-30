@@ -251,8 +251,8 @@ pub struct HandoffReceipt {
 ///
 /// A refusal is a *donor's* verdict about itself, and the requester treats every
 /// variant the same way: drop the sink, try the next donor. The codes exist so
-/// an operator can tell "nobody has the state yet" from "somebody is speaking
-/// the wrong protocol".
+/// an operator can tell "nobody has the state yet" from "this donor does not
+/// serve that group".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefusalCode {
     /// The donor's own state does not cover what the requester asked for. The
@@ -266,8 +266,6 @@ pub enum RefusalCode {
     Unavailable,
     /// The request did not name a group or write path this donor serves.
     BadRequest,
-    /// The requester's protocol version is not one this donor speaks.
-    Version,
 }
 
 impl RefusalCode {
@@ -278,20 +276,17 @@ impl RefusalCode {
             RefusalCode::NotCovered => 1,
             RefusalCode::Unavailable => 2,
             RefusalCode::BadRequest => 3,
-            RefusalCode::Version => 4,
         }
     }
 
-    /// The code that byte names, or `None` for a byte this version does not
-    /// define — which the codec refuses loudly rather than folding into a
-    /// plausible neighbour.
+    /// The code that byte names, or `None` for an undefined byte — which the
+    /// codec refuses loudly rather than folding into a plausible neighbour.
     #[must_use]
     pub const fn from_code(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(RefusalCode::NotCovered),
             2 => Some(RefusalCode::Unavailable),
             3 => Some(RefusalCode::BadRequest),
-            4 => Some(RefusalCode::Version),
             _ => None,
         }
     }
@@ -303,7 +298,6 @@ impl fmt::Display for RefusalCode {
             RefusalCode::NotCovered => "donor does not cover the request",
             RefusalCode::Unavailable => "donor cannot serve a snapshot now",
             RefusalCode::BadRequest => "donor does not serve that group or write path",
-            RefusalCode::Version => "donor does not speak that protocol version",
         })
     }
 }
@@ -421,7 +415,6 @@ mod tests {
             RefusalCode::NotCovered,
             RefusalCode::Unavailable,
             RefusalCode::BadRequest,
-            RefusalCode::Version,
         ];
         for code in codes {
             assert_eq!(RefusalCode::from_code(code.code()), Some(code));
@@ -436,7 +429,7 @@ mod tests {
         }
         // Undefined bytes are refused, never folded into a neighbour.
         assert_eq!(RefusalCode::from_code(0), None);
-        for byte in 5..=u8::MAX {
+        for byte in 4..=u8::MAX {
             assert_eq!(RefusalCode::from_code(byte), None, "byte {byte}");
         }
     }

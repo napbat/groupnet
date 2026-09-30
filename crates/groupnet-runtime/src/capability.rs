@@ -1,10 +1,10 @@
 //! Capability advertisement: what a node tells the group it can *do*.
 //!
 //! Membership answers "is this peer alive". It does not answer "does this
-//! peer speak the protocol I am about to wait on" — and in a mixed or
-//! mid-upgrade deployment those are different questions. A strong-mode
-//! writer that waits on every alive member eats a timeout for every peer
-//! that simply does not run the acknowledging half. Capabilities let it
+//! peer run the protocol half I am about to wait on" — and in a deployment
+//! where only some nodes opt into a tier those are different questions. A
+//! strong-mode writer that waits on every alive member eats a timeout for every
+//! peer that simply does not run the acknowledging half. Capabilities let it
 //! wait on the peers that actually participate instead.
 //!
 //! # One entry, written wholesale

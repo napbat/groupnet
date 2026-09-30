@@ -428,6 +428,17 @@ impl GroupEngine {
         if frame.group != self.group {
             return Vec::new(); // not ours
         }
+        // A status byte outside the known codes makes the whole frame
+        // malformed: drop it rather than merge the members around it.
+        if frame
+            .digest
+            .iter()
+            .map(|d| d.status)
+            .chain(frame.members.iter().map(|m| m.status))
+            .any(|code| Status::from_wire(code).is_none())
+        {
+            return Vec::new();
+        }
 
         match frame.kind {
             wire::Kind::Digest => self.on_digest(&from, &frame, now),

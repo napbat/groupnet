@@ -48,8 +48,9 @@ impl Status {
         }
     }
 
-    /// Decodes a one-byte wire code, or `None` for an unrecognised one — a
-    /// forward-compatible peer may advertise codes this version doesn't know.
+    /// Decodes a one-byte wire code, or `None` for an unrecognised one. Peers
+    /// run the same build, so an unknown code is malformed input, and the
+    /// engine drops any frame that carries one.
     ///
     /// The inverse of [`Status::to_wire`], and public for the same reason.
     #[must_use]

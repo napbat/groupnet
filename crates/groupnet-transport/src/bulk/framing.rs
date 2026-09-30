@@ -22,8 +22,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 struct FrameHeader {
     /// Payload length in bytes.
     len: U32,
-    /// Frame kind; only [`FRAME_KIND_DATA`] today, reserved so future framing
-    /// needs (control frames, end-of-stream markers) can be added compatibly.
+    /// Frame kind; only [`FRAME_KIND_DATA`] today. Any other kind, like any
+    /// nonzero reserved byte, is rejected as malformed.
     kind: u8,
     /// Padding to a round 8 bytes.
     reserved: [u8; 3],

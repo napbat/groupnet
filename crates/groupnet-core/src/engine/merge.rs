@@ -98,6 +98,7 @@ impl GroupEngine {
         let mut membership_changed = false;
         let mut refute_to: Option<u64> = None;
         for d in digest {
+            // `on_message` already dropped any frame carrying an unknown code.
             let Some(status) = Status::from_wire(d.status) else {
                 continue;
             };
@@ -134,8 +135,9 @@ impl GroupEngine {
         let mut refute_to: Option<u64> = None;
 
         for delta in deltas {
+            // `on_message` already dropped any frame carrying an unknown code.
             let Some(status) = Status::from_wire(delta.status) else {
-                continue; // unknown status code — ignore
+                continue;
             };
 
             if delta.node == self.local {

@@ -213,8 +213,9 @@ use crate::token::WriteToken;
 /// to declare that it participates in the Hosted write path: that it runs the
 /// follower loop and publishes a [`CommitLedger`].
 ///
-/// It carries the same rolling-upgrade footgun the other tiers document: a node
-/// that participates but has not advertised yet is invisible to a selector and
+/// It carries the same advertisement-lag footgun the other tiers document: a
+/// node that participates but whose advertisement has not landed yet is
+/// invisible to a selector and
 /// is not waited for. It is **advisory here and nowhere else** — the
 /// [`Commit::QuorumApplied`] denominator is the static voter roster, which no
 /// advertisement can move. Use it to build the

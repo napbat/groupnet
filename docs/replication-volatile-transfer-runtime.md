@@ -214,8 +214,9 @@ origin fallback for indexed misses, LIST uncertainty, and origin-validated
 positive bodies remains in force unless a separate absence proof is built.
 
 Bulk transfer is a separate opt-in transport feature. It uses bounded frames
-for offer, chunk, delta, barrier, ack, and cancellation; new frame kinds may
-be added without altering existing frame bodies. The core has no Tokio,
+for offer, chunk, delta, barrier, ack, and cancellation; peers upgrade
+together, so frame kinds and bodies change with a bulk codec version bump
+rather than through compatibility paths. The core has no Tokio,
 network, clock, hash, or S3 dependency. The adapter verifies chunk length
 and commitment before private staging, and corrupted or interrupted streams
 discard the stage. The origin bucket receives no control object in either

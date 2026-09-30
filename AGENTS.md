@@ -36,9 +36,15 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
   and select their own features and optionality. The path-only testkit rule
   above is the exception. Every crate uses `[lints] workspace = true`; shared
   lint levels belong in the workspace root.
-- **Wire compatibility.** New protocol features add new frame kinds inside
-  the current `FRAME_VERSION` (unknown kinds are dropped by old nodes).
-  Changing an existing frame body forces a version bump — avoid it.
+- **Peers upgrade together.** Every node in a cluster runs the same groupnet
+  build; groupnet keeps no compatibility with any other peer version (older
+  or newer). Frame bodies, frame kinds and bulk/handoff codecs may change
+  freely — never add capability negotiation, version gates or fallbacks for
+  another peer version. `FRAME_VERSION` (and each codec's own version byte)
+  stays only as a guard that rejects a mis-deployed node's frames instead of
+  misparsing them; bump it whenever a kind or body changes. Decoders still
+  fail closed on malformed or unknown bytes. Persisted formats keep their
+  migration paths.
 
 ## Engineering rules (owner-set, 2026-08-05)
 

@@ -116,7 +116,7 @@ async fn selected_waits_skip_members_that_do_not_participate() {
     // The advertisement must land BEFORE the writer narrows onto it: a
     // selector cannot see a peer that has not advertised yet, so scoping too
     // early would skip B as well and resolve vacuously. This is exactly the
-    // rolling-upgrade footgun `applied_by_selected` documents.
+    // advertisement-lag footgun `applied_by_selected` documents.
     eventually("a sees b, and only b, advertising acks", || {
         a_group.members_with_capability(CAP_ACKS) == vec![b_id.clone()]
     })

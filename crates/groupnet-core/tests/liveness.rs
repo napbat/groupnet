@@ -350,6 +350,38 @@ fn voluntary_leave_is_not_refuted() {
     assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Dead));
 }
 
+#[test]
+fn a_frame_with_an_unknown_status_code_is_dropped_whole() {
+    // One bad status byte makes the frame malformed. The well-formed member
+    // beside it must not be merged either.
+    const UNKNOWN: u8 = 3;
+    let mut a = engine("a", &["b"]);
+    let mut digest = ndigest("c", 0, Status::Alive, 0);
+    digest.status = UNKNOWN;
+    let effects = a.on_message(
+        NodeId::new("b"),
+        &digest_frame(vec![ndigest("b", 0, Status::Alive, 0), digest], vec![]),
+        Time(1),
+    );
+    assert!(effects.is_empty());
+    assert_eq!(a.member_status(&NodeId::new("b")), None);
+    assert_eq!(a.member_status(&NodeId::new("c")), None);
+
+    let mut member = member_delta("c", vec![entry("k", 1, 0, false, b"v")]);
+    member.status = UNKNOWN;
+    let effects = a.on_message(
+        NodeId::new("b"),
+        &delta_frame(vec![
+            member_delta("b", vec![entry("k", 1, 0, false, b"v")]),
+            member,
+        ]),
+        Time(2),
+    );
+    assert!(effects.is_empty());
+    assert_eq!(a.member_status(&NodeId::new("b")), None);
+    assert_eq!(a.member_status(&NodeId::new("c")), None);
+}
+
 /// The command path carries no clock, so its status writes stamp from the
 /// freshest time the engine has been *told* about — `now_hint`, one event-loop
 /// turn stale at worst. Both command-path status sites are pinned here; the

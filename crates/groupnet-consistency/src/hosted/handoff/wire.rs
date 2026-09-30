@@ -86,9 +86,10 @@ use crate::hosted::ledger::{decode_records, encode_records};
 /// The four bytes that say "this stream is a groupnet handoff".
 const MAGIC: [u8; 4] = *b"GNHO";
 
-/// The protocol version. A peer that sends anything else is refused loudly —
-/// there is no negotiation here, and [`RefusalCode::Version`] is how a donor
-/// says so in its own words.
+/// The protocol version. Peers upgrade together, so this only guards against a
+/// mis-deployed peer: a frame stamped with anything else is refused loudly as
+/// [`HandoffError::Protocol`], with no negotiation. Bump it whenever a frame
+/// body changes.
 const VERSION: u8 = 1;
 
 const KIND_REQUEST: u8 = 1;
@@ -439,10 +440,6 @@ mod tests {
             },
             Frame::Refuse {
                 code: RefusalCode::BadRequest,
-                have: Watermarks::new(),
-            },
-            Frame::Refuse {
-                code: RefusalCode::Version,
                 have: Watermarks::new(),
             },
             Frame::Chunk(Bytes::from_static(b"")),

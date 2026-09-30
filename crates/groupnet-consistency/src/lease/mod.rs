@@ -212,9 +212,10 @@ pub use self::wire::{
 ///
 /// Readers wait for a confirmation from **every** not-reaped member
 /// advertising this, so the advertisement is load-bearing in both directions —
-/// and it carries the same rolling-upgrade footgun the ack tier documents: a
-/// node that participates but has not advertised yet is invisible to readers'
-/// rosters and is not waited for. Advertise fleet-wide first, confirm the
+/// and it carries the same advertisement-lag footgun the ack tier documents: a
+/// node that participates but whose advertisement has not landed yet is
+/// invisible to readers' rosters and is not waited for. Advertise on every
+/// participant first, confirm the
 /// advertisements have landed
 /// ([`Group::members_with_capability`](groupnet_runtime::Group::members_with_capability)),
 /// and only then let readers start serving under leases.

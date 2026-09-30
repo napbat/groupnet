@@ -222,7 +222,7 @@ protocol refines the sketch above in ways that are now contract:
   instant on the writer's side is the writer's *own engine's* TTL expiry of
   that reader's `~lease` entry — armed at adoption, so propagation delay is
   free safety margin in the safe direction. Zero wire changes: the whole
-  tier rides existing TTL'd entries, and non-upgraded nodes relay them.
+  tier rides existing TTL'd entries.
 * **Lapse ⇒ NeedsResync ⇒ affirmation.** A lapsed (or booting) reader stays
   invalid even with a fresh confirmed lease until it affirms catch-up
   (`mark_caught_up`, accepted only while a lease is live) — a lapsed reader
@@ -438,8 +438,8 @@ refine the sketch above and are now contract:
   round trip, not a one-way hop, that has to fit inside the cadence. A deployment
   that cannot
   hold that sizing needs per-round identity on the wire; the escape hatch is a
-  nonce carried by a **new frame kind** (no existing body changes, so still
-  `FRAME_VERSION 3`). An election round has no such slack — its anchor is the
+  nonce carried in the election frames (a body change, so a `FRAME_VERSION`
+  bump). An election round has no such slack — its anchor is the
   instant the claim was opened, and re-offers deliberately do not move it.
 * **Recovery restores the pair, not the time** — correcting the M1 sketch
   above, which read as though persistence replaced the blackout. It does not:
@@ -1406,10 +1406,9 @@ the name describes, and a long one is a re-framing or a duplicated chunk, which
 is the same mistake pointed the other way.
 
 Version and kind bytes are refused loudly rather than folded into a plausible
-neighbour. `RefusalCode::Version` is the one code this version never *sends* —
-answering an unreadable version in-band would mean encoding a reply in the
-version the peer has just demonstrated it cannot read — and it exists so a future
-version has a word for it and this one can decode it.
+neighbour. Peers upgrade together, so an unknown version is a mis-deployed
+peer: the codec rejects it as `HandoffError::Protocol` and no refusal code
+answers it in-band.
 
 ##### Three verification points, and what they prove
 
@@ -1678,12 +1677,10 @@ and rendezvous ranking already resident in the engine; zero new dependencies.
 | `groupnet-consistency` | feature `hosted` (following the `acks` pattern): `HostedWrites` — a `WriteFeed` whose epoch *is* the leadership epoch; fence surfacing; commit levels composing with T2 |
 | `groupnet` facade | feature `hosted` → `consistency` layering, mirroring `consistency-acks` |
 
-**Wire compatibility:** new frame kinds only — an unknown kind decodes to
-`None` and is dropped, so v3 stays v3. A mixed cluster degrades to "no host
-electable until enough nodes upgrade": Quorum mode fails safe automatically
-(no majority of grants); Settle mode simply never settles cluster-wide until
-the upgrade completes (documented). Digest bodies are not touched (that would
-force v4).
+**Wire:** the election adds new frame kinds; digest bodies are untouched.
+Peers upgrade together, so there is no mixed-version cluster to plan for: an
+unknown kind is malformed and decodes to `None`, and `FRAME_VERSION` rejects a
+mis-deployed node rather than letting it misparse frames.
 
 **API sketch** (consumer's view):
 
@@ -1777,7 +1774,8 @@ heal schedules) assert the safety and liveness properties:
 
 Plus: codec round-trip tests for the new frames (testkit `frames` fixtures),
 mem-transport end-to-end (elect → kill host → observe migration as a `Gap`),
-and mixed-version compat tests (old node drops the new kinds).
+and rejection tests for malformed election frames (a kind without its body,
+an unknown kind).
 
 **Handoff (M6)** carries no DST family of its own, and deliberately: its three
 verdicts and its phase table are pure functions unit-tested exhaustively beside

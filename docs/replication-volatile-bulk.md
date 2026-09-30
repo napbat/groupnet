@@ -29,9 +29,9 @@ boot, transfer operation, or scope cannot complete current work. Native
 and cursor are encoded in the operation payload whenever that phase requires
 them. The wire encoding has a version, bounded length-prefixed strings and
 vectors, checked integer conversion, canonical ordering for member and
-native-cut sets, and rejects trailing bytes. Versioning lives in the new bulk
-message body; existing control-plane `FRAME_VERSION` and frame bodies remain
-unchanged.
+native-cut sets, and rejects trailing bytes. The bulk codec carries its own
+version byte, which only rejects a mis-deployed peer; the control-plane
+`FRAME_VERSION` and frame bodies are untouched.
 
 The typed request/reply pairs mirror `DonorRequest`: `Offer`, `Reserve`,
 `Chunk`, `Attach`, `Barrier`, `AdvanceBarrier`, `Batch`, `Ack`, and `Release`.
