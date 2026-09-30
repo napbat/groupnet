@@ -59,11 +59,30 @@ response bytes are checked before cloning inside the actor. Its response
 carries an observer-local monotonic sample instant and native remaining TTL,
 which ages through the actor, adapter, and worker before a core event accepts
 it. Missing, malformed, duplicate, expired, or wrong-policy participation for
-an eligible member declines peer bootstrap; it never creates a synthetic boot
+an eligible member refuses that cut; it never creates a synthetic boot
 identity from NodeId or SWIM incarnation. A retained old-process entry
-conflicting with a new-process entry also declines until the source resolves
-the conflict. A declined peer bootstrap falls back to origin; ordinary
-coherence and origin reads remain available.
+conflicting with a new-process entry is refused likewise until the source
+resolves the conflict. The worker reports a refused, failed or timed-out
+sample to the core as `ObservationFailed`. A follower still inside its grace
+for a selected remote builder samples again at the observation interval,
+since under load a read times out or a peer's presence renewal lands late
+without ending the build it follows; neither the grace nor the episode budget
+is renewed by a failed sample, so both still bound the wait. Any other
+selection declines peer bootstrap and falls back to origin; ordinary coherence
+and origin reads remain available.
+
+Each selection sample is a fresh decision over its own complete cut, pinned
+for that decision only: a member refuting a suspicion with a higher
+incarnation between two samples does not refuse the next one. Only the
+verification of an already selected candidate (before capture, Ready, and
+each barrier) holds a decision to the cut it was verified at. A followed
+builder whose node is merely not eligible in a sample, as while SWIM suspects
+a loaded peer, is sampled again inside the grace rather than replaced; a
+builder that withdraws its claim while it is still an eligible member ended
+its build and is taken over at once. The core reports every wait it gives up
+as an informational `Released { builder, reason }` effect (`Stalled`,
+`Withdrawn`, `DonorUnavailable`, `Unverified` or `Ended`), which the runtime
+passes to an optional `BootstrapObserver` for operator logs.
 
 The narrow runtime primitive is a fixed two-key
 `Group::inspect_scoped_pair(presence_key, claim_key, limits, owned_budget)`.
@@ -119,6 +138,15 @@ interrupts a recapture retries it at once under the new roster, while a
 failure the roster did not cause never loops, and a later membership change
 gets one fresh attempt. A cut equal to the failed one withdraws the claim at
 once, since no recapture will follow under it.
+While the worker awaits any adapter operation that does not itself drive the
+bootstrap child (invalidation, the origin rebuild, peer observation and
+frontier waits), it keeps the child's maintenance turns running on the
+child's own deadline and wake. A node's own origin scan can outlast its
+presence TTL many times over; its presence must stay renewed meanwhile, or
+every peer's complete participation cut, which a donor's Ready recapture
+needs, misses this live member for the whole scan, and the lapsed presence is
+refused when the scan ends. No Ready recapture starts during such an
+operation: the worker offers no Ready capture guard while one is armed.
 The worker also runs this maintenance once immediately after the outer
 recovery affirms Ready, so an already-complete local image need not wait for
 its next presence renewal. Each turn obtains a read-only Ready capture guard

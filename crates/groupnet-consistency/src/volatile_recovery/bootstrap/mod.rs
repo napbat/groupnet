@@ -9,4 +9,5 @@ pub mod driver;
 pub mod inbox;
 pub mod native_claims;
 pub mod ports;
+pub mod report;
 pub mod session;

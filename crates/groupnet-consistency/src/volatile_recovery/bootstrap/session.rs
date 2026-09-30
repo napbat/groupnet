@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use groupnet_core::volatile_bootstrap::transfer::{TransferConfig, TransferEffect, TransferEvent};
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMemberIdentity,
-    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine,
+    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity,
 };
 use groupnet_core::volatile_recovery::RecoveryOperation;
 use groupnet_core::{NodeId, Time};
@@ -20,6 +20,7 @@ use super::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSource, DonorCapture, DonorPort,
     LogicalClock, TransferContext, TransferResources,
 };
+use super::report::{BootstrapDecision, BootstrapObserver, RecaptureDecline};
 use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit};
 
 const MAX_DONOR_SERVICE_BATCH: usize = 32;
@@ -83,6 +84,12 @@ pub struct BootstrapSession<C: ClaimSource, D: DonorPort> {
     ready_guard: Option<ReadyCapturePermit>,
     child_parent: Option<BootstrapOperation>,
     transfer_context: Option<TransferContext>,
+    observer: Option<Arc<dyn BootstrapObserver>>,
+    /// The builder attempt last reported as followed.
+    followed: Option<ClaimIdentity>,
+    /// The recapture outcome last reported, so a pending recapture that keeps
+    /// retrying on every maintenance turn reports each reason once.
+    recapture_report: Option<RecaptureDecline>,
     _core_metadata: Reservation,
 }
 
@@ -180,10 +187,36 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 ready_guard: None,
                 child_parent: None,
                 transfer_context: None,
+                observer: None,
+                followed: None,
+                recapture_report: None,
                 _core_metadata: core_metadata,
             },
             sender,
         ))
+    }
+
+    /// Report every peer-bootstrap decision to `observer`, for example as
+    /// operator log lines.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn BootstrapObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    fn report(&self, decision: &BootstrapDecision) {
+        if let Some(observer) = &self.observer {
+            observer.decided(decision);
+        }
+    }
+
+    /// Report why a completed local image offered no Ready capture, once per
+    /// reason until another recapture outcome is reported.
+    fn report_recapture(&mut self, reason: RecaptureDecline) {
+        if self.recapture_report != Some(reason) {
+            self.recapture_report = Some(reason);
+            self.report(&BootstrapDecision::RecaptureDeclined { reason });
+        }
     }
 
     fn now(&self) -> Time {
@@ -207,6 +240,32 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
 
     fn accept(&mut self, event: BootstrapEvent) -> bool {
         let step = self.engine.step(event);
+        for effect in &step.effects {
+            match effect {
+                BootstrapEffect::FollowBuilder { selected, .. }
+                    if self.followed.as_ref() != Some(selected) =>
+                {
+                    self.followed = Some(selected.clone());
+                    self.report(&BootstrapDecision::Following {
+                        builder: selected.clone(),
+                    });
+                }
+                BootstrapEffect::Released { builder, reason } => {
+                    self.followed = None;
+                    self.report(&BootstrapDecision::Released {
+                        builder: builder.clone(),
+                        reason: *reason,
+                    });
+                }
+                BootstrapEffect::RecaptureCurrent { selected, .. } => {
+                    self.recapture_report = None;
+                    self.report(&BootstrapDecision::RecaptureStarted {
+                        donor: selected.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
         self.effects.extend(step.effects);
         step.rejection.is_none()
     }
@@ -474,10 +533,16 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
                 && guard
                     .capture(|generation| Some(generation) == self.recovery.map(|op| op.generation))
                     == Some(true)
-                && self.current_participation(deadline).await.is_some()
             {
-                self.ready_guard = Some(guard);
-                let _ = self.accept(BootstrapEvent::StartReadyRecapture);
+                if self.current_participation(deadline).await.is_some() {
+                    self.ready_guard = Some(guard);
+                    let _ = self.accept(BootstrapEvent::StartReadyRecapture);
+                    if self.engine.stage() != BootstrapStage::Building {
+                        self.report_recapture(RecaptureDecline::SameCut);
+                    }
+                } else {
+                    self.report_recapture(RecaptureDecline::NoCompleteCut);
+                }
             }
             self.drain_maintenance().await;
             self.service_pending().await;

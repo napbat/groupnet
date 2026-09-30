@@ -518,6 +518,7 @@ fn enqueue(
             | BootstrapEffect::BuildOrigin { .. }
             | BootstrapEffect::FollowBuilder { .. }
             | BootstrapEffect::BuilderProgressed
+            | BootstrapEffect::Released { .. }
             | BootstrapEffect::DonorAvailable { .. }
             | BootstrapEffect::ArmTimer(_)
             | BootstrapEffect::RecaptureCurrent { .. } => None,

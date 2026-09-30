@@ -253,80 +253,6 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         }
     }
 
-    /// One bounded recapture of the completed local image. Any failure only
-    /// makes the recapture pending again in the core; it retries under a
-    /// different participation cut and never scans the origin.
-    async fn recapture_current(
-        &mut self,
-        op: groupnet_core::volatile_bootstrap::BootstrapOperation,
-        selected: ClaimIdentity,
-        outer: Instant,
-    ) {
-        let Some(deadline) = self.operation_due(op, outer) else {
-            return;
-        };
-        let Some(guard) = self
-            .ready_guard
-            .take()
-            .map(|guard| guard.restricted_to(deadline))
-        else {
-            let _ = self.accept(BootstrapEvent::BuildFailed { op, selected });
-            return;
-        };
-        let Some(recovery_generation) = self.recovery.map(|recovery| recovery.generation) else {
-            let _ = self.accept(BootstrapEvent::BuildFailed { op, selected });
-            return;
-        };
-        let Some(members) = self.current_participation(deadline).await else {
-            let _ = self.accept(BootstrapEvent::BuildFailed { op, selected });
-            return;
-        };
-        let donor = Arc::clone(&self.donor);
-        let admission = self.admission.clone();
-        let capture = donor.recapture_current_index(
-            ReadyCaptureRequest {
-                operation: op,
-                selected: selected.clone(),
-                recovery_generation,
-                members: members.clone(),
-                guard: guard.clone(),
-                deadline,
-                clock: self.clock,
-                wake: Arc::clone(&self.wake),
-            },
-            &admission,
-        );
-        let built = self
-            .await_renewing(op, None, || Some(deadline), capture)
-            .await;
-        let _ = self.tick_after_io();
-        if let Some(Ok(capture)) = built {
-            if guard.valid()
-                && self.engine.current_operation() == Some(op)
-                && capture.is_active()
-                && self.current_participation(deadline).await.as_deref() == Some(members.as_slice())
-                && guard.valid()
-            {
-                self.capture = Some(capture);
-                if self.accept(BootstrapEvent::Built {
-                    op,
-                    selected: selected.clone(),
-                }) {
-                    self.inbox.set_identity(Some(selected));
-                    self.drain_ready_publication(deadline).await;
-                    return;
-                }
-                self.drop_capture();
-            } else {
-                self.donor.retire_local_capture(&capture);
-                drop(capture);
-            }
-        }
-        if self.engine.current_operation() == Some(op) {
-            let _ = self.accept(BootstrapEvent::BuildFailed { op, selected });
-        }
-    }
-
     pub(super) async fn run_acquisition(
         &mut self,
         recovery: RecoveryOperation,
@@ -406,7 +332,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         match effect {
             BootstrapEffect::ArmTimer(_)
             | BootstrapEffect::CancelWork { .. }
-            | BootstrapEffect::FollowBuilder { .. } => {}
+            | BootstrapEffect::FollowBuilder { .. }
+            | BootstrapEffect::Released { .. } => {}
             BootstrapEffect::BuilderProgressed => {
                 // A followed build that keeps advancing keeps this follower's
                 // parent recovery alive past any fixed wait.
@@ -459,85 +386,15 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             } => {
                 let operation_due = self.operation_due(op, due)?;
                 let limits = self.claim_limits(max_members, max_member_bytes);
-                if self.config.require_participation {
-                    let snapshot = tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(operation_due),
-                        self.claims
-                            .observe_participation(op, limits, &self.admission),
-                    )
-                    .await;
-                    // No engine tick between the read and its verification: a
-                    // renewal scheduled by that tick is not in the cut yet and
-                    // would contradict this worker's own claim sequence. The
-                    // next loop tick publishes it; the deadline is wall time.
-                    let Ok(Ok(snapshot)) = snapshot else {
-                        return Some(BootstrapOutcome::Declined);
-                    };
-                    if Instant::now() < operation_due && self.engine.current_operation() == Some(op)
-                    {
-                        let accepted = snapshot.consume(|mut snapshot| {
-                            let Some(age_ms) =
-                                observation_age_ms(snapshot.sampled_at, Instant::now())
-                            else {
-                                return false;
-                            };
-                            for participant in &mut snapshot.participants {
-                                participant.remaining_ms =
-                                    participant.remaining_ms.saturating_sub(age_ms);
-                            }
-                            for claim in &mut snapshot.claims {
-                                claim.remaining_ms = claim.remaining_ms.saturating_sub(age_ms);
-                            }
-                            snapshot.claims.retain(|claim| claim.remaining_ms > 0);
-                            self.accept(BootstrapEvent::ParticipantsObserved {
-                                op,
-                                members: snapshot.members,
-                                roster: snapshot.roster,
-                                participants: snapshot
-                                    .participants
-                                    .into_iter()
-                                    .map(|participant| BootstrapParticipant {
-                                        member: participant.member,
-                                        renewal: participant.renewal,
-                                        remaining_ms: participant.remaining_ms,
-                                    })
-                                    .collect(),
-                                claims: snapshot.claims,
-                            })
-                        });
-                        if !accepted {
-                            return Some(BootstrapOutcome::Declined);
-                        }
-                    }
-                    return None;
-                }
-                let snapshot = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(operation_due),
-                    self.claims.observe_claims(op, limits, &self.admission),
-                )
-                .await;
-                let Ok(Ok(snapshot)) = snapshot else {
-                    return Some(BootstrapOutcome::Declined);
+                let usable = if self.config.require_participation {
+                    self.observe_participants(op, limits, operation_due).await
+                } else {
+                    self.observe_claim_set(op, limits, operation_due).await
                 };
-                if Instant::now() < operation_due && self.engine.current_operation() == Some(op) {
-                    let accepted = snapshot.consume(|mut snapshot| {
-                        let Some(age_ms) = observation_age_ms(snapshot.sampled_at, Instant::now())
-                        else {
-                            return false;
-                        };
-                        for claim in &mut snapshot.claims {
-                            claim.remaining_ms = claim.remaining_ms.saturating_sub(age_ms);
-                        }
-                        snapshot.claims.retain(|claim| claim.remaining_ms > 0);
-                        self.accept(BootstrapEvent::ClaimsObserved {
-                            op,
-                            members: snapshot.members,
-                            claims: snapshot.claims,
-                        })
-                    });
-                    if !accepted {
-                        return Some(BootstrapOutcome::Declined);
-                    }
+                if !usable {
+                    // The core decides: a follower inside its grace samples
+                    // again, any other selection falls back to origin.
+                    let _ = self.accept(BootstrapEvent::ObservationFailed { op });
                 }
             }
             BootstrapEffect::BuildOrigin { op, selected } => {
@@ -710,6 +567,94 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         None
     }
 
+    /// Read one complete participation cut for the selection `op` and hand
+    /// it to the core. No engine tick runs between the read and its
+    /// verification: a renewal scheduled by that tick is not in the cut yet
+    /// and would contradict this worker's own claim sequence. The next loop
+    /// tick publishes it; the deadline is wall time. False when the read
+    /// failed or timed out, or the core refused the cut; a cut that arrived
+    /// after its operation is dropped, and the core samples again.
+    async fn observe_participants(
+        &mut self,
+        op: groupnet_core::volatile_bootstrap::BootstrapOperation,
+        limits: super::ClaimObservationLimits,
+        operation_due: Instant,
+    ) -> bool {
+        let snapshot = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(operation_due),
+            self.claims
+                .observe_participation(op, limits, &self.admission),
+        )
+        .await;
+        let Ok(Ok(snapshot)) = snapshot else {
+            return false;
+        };
+        if Instant::now() >= operation_due || self.engine.current_operation() != Some(op) {
+            return true;
+        }
+        snapshot.consume(|mut snapshot| {
+            let Some(age_ms) = observation_age_ms(snapshot.sampled_at, Instant::now()) else {
+                return false;
+            };
+            for participant in &mut snapshot.participants {
+                participant.remaining_ms = participant.remaining_ms.saturating_sub(age_ms);
+            }
+            for claim in &mut snapshot.claims {
+                claim.remaining_ms = claim.remaining_ms.saturating_sub(age_ms);
+            }
+            snapshot.claims.retain(|claim| claim.remaining_ms > 0);
+            self.accept(BootstrapEvent::ParticipantsObserved {
+                op,
+                members: snapshot.members,
+                roster: snapshot.roster,
+                participants: snapshot
+                    .participants
+                    .into_iter()
+                    .map(|participant| BootstrapParticipant {
+                        member: participant.member,
+                        renewal: participant.renewal,
+                        remaining_ms: participant.remaining_ms,
+                    })
+                    .collect(),
+                claims: snapshot.claims,
+            })
+        })
+    }
+
+    /// [`Self::observe_participants`] for a claims-only selection.
+    async fn observe_claim_set(
+        &mut self,
+        op: groupnet_core::volatile_bootstrap::BootstrapOperation,
+        limits: super::ClaimObservationLimits,
+        operation_due: Instant,
+    ) -> bool {
+        let snapshot = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(operation_due),
+            self.claims.observe_claims(op, limits, &self.admission),
+        )
+        .await;
+        let Ok(Ok(snapshot)) = snapshot else {
+            return false;
+        };
+        if Instant::now() >= operation_due || self.engine.current_operation() != Some(op) {
+            return true;
+        }
+        snapshot.consume(|mut snapshot| {
+            let Some(age_ms) = observation_age_ms(snapshot.sampled_at, Instant::now()) else {
+                return false;
+            };
+            for claim in &mut snapshot.claims {
+                claim.remaining_ms = claim.remaining_ms.saturating_sub(age_ms);
+            }
+            snapshot.claims.retain(|claim| claim.remaining_ms > 0);
+            self.accept(BootstrapEvent::ClaimsObserved {
+                op,
+                members: snapshot.members,
+                claims: snapshot.claims,
+            })
+        })
+    }
+
     async fn drain_ready_publication(&mut self, due: Instant) {
         while let Some(effect) = self.effects.pop_front() {
             match effect {
@@ -880,6 +825,7 @@ fn observation_age_ms(sampled_at: Instant, now: Instant) -> Option<u64> {
     u64::try_from(rounded).ok()?.checked_add(1)
 }
 
+mod recapture;
 mod transfer;
 
 #[cfg(test)]

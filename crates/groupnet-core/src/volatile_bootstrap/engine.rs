@@ -10,6 +10,7 @@ use super::types::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
     BootstrapMember, BootstrapMemberIdentity, BootstrapOperation, BootstrapPresence,
     BootstrapScope, BootstrapStage, BootstrapStep, ClaimIdentity, ClaimPhase, PresenceIdentity,
+    ReleaseReason,
 };
 
 mod participation;
@@ -322,8 +323,14 @@ impl ClaimEngine {
     }
 
     fn terminate(&mut self) -> BootstrapStep {
+        self.end(ReleaseReason::Ended)
+    }
+
+    /// End the selection episode in the origin fallback, reporting `reason`
+    /// when this node was still waiting for a peer's image.
+    fn end(&mut self, reason: ReleaseReason) -> BootstrapStep {
+        let mut effects: Vec<_> = self.release(reason).into_iter().collect();
         let previous = self.operation.take();
-        let mut effects = Vec::new();
         if let Some(op) = previous {
             effects.push(BootstrapEffect::CancelWork { op });
         }
@@ -643,11 +650,13 @@ impl ClaimEngine {
             if self.follow_due.is_some_and(|due| now >= due)
                 && let Some(selected) = self.selected.clone()
             {
-                self.excluded.insert(selected);
-                self.follow_due = None;
+                let released = self.release_stalled(selected);
                 if self.excluded.len() > self.config.max_members {
-                    return self.terminate();
+                    let mut ended = self.terminate();
+                    ended.effects.insert(0, released);
+                    return ended;
                 }
+                effects.push(released);
             }
             let observation = self.observe();
             effects.extend(
@@ -763,6 +772,7 @@ impl ClaimEngine {
                 }
                 self.choose_participants(&members, &roster, &participants, claims)
             }
+            BootstrapEvent::ObservationFailed { op } => self.observation_failed(op),
             BootstrapEvent::Built { op, selected } => {
                 if self.stage != BootstrapStage::Building
                     || self.operation != Some(op)
@@ -795,7 +805,7 @@ impl ClaimEngine {
                 {
                     Self::reject(BootstrapError::StaleOperation)
                 } else {
-                    self.terminate()
+                    self.end(ReleaseReason::Unverified)
                 }
             }
             BootstrapEvent::BuildFailed { op, selected } => {
@@ -812,39 +822,7 @@ impl ClaimEngine {
                 }
             }
             BootstrapEvent::DonorUnavailable { op, selected } => {
-                if self.stage == BootstrapStage::Transferring
-                    && self.operation == Some(op)
-                    && self.selected.as_ref() == Some(&selected)
-                {
-                    let mut effects = vec![BootstrapEffect::CancelWork { op }];
-                    effects.extend(self.cancel_transfer());
-                    self.operation = None;
-                    self.operation_due = None;
-                    self.observed.remove(&selected);
-                    self.excluded.insert(selected);
-                    let next = self.observe();
-                    effects.extend(
-                        next.effects
-                            .into_iter()
-                            .filter(|effect| !matches!(effect, BootstrapEffect::ArmTimer(_))),
-                    );
-                    return self.ok(effects);
-                }
-                if !matches!(
-                    self.stage,
-                    BootstrapStage::Following | BootstrapStage::DonorAvailable
-                ) || self.operation != Some(op)
-                    || self.selected.as_ref() != Some(&selected)
-                {
-                    return Self::reject(BootstrapError::StaleOperation);
-                }
-                self.observed.remove(&selected);
-                self.excluded.insert(selected);
-                self.follow_due = None;
-                if self.excluded.len() > self.config.max_members {
-                    return self.terminate();
-                }
-                self.observe()
+                self.donor_unavailable(op, selected)
             }
             BootstrapEvent::StartTransfer { op, selected } => self.start_transfer(op, selected),
             BootstrapEvent::SelectedClaimObserved { op, claim } => {

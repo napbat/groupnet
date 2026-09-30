@@ -225,9 +225,14 @@ fn failed_builder_withdraws_and_exact_followers_choose_one_takeover() {
             op: follow_op,
             selected: failed_identity.clone(),
         });
-        assert!(
-            matches!(next.effects.first(), Some(BootstrapEffect::CancelWork { op }) if *op == follow_op)
-        );
+        assert!(next.effects.iter().any(
+            |effect| matches!(effect, BootstrapEffect::CancelWork { op } if *op == follow_op)
+        ));
+        assert!(next.effects.iter().any(|effect| matches!(
+            effect,
+            BootstrapEffect::Released { builder, reason: crate::volatile_bootstrap::ReleaseReason::DonorUnavailable }
+                if *builder == failed_identity
+        )));
         let decision = engine.step(BootstrapEvent::ClaimsObserved {
             op: observed_op(&next),
             members: roster(&names),

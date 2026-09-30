@@ -284,8 +284,9 @@ pub enum BootstrapEvent {
         claims: Vec<BootstrapClaim>,
     },
     /// Complete native member, participation, and transient claim cut.
-    /// Required for an opted-in peer path; a missing eligible presence is a
-    /// terminal invalid observation for this selection episode.
+    /// Required for an opted-in peer path. A cut that is incomplete, such as
+    /// an eligible member without presence, is refused; the runtime then
+    /// reports [`Self::ObservationFailed`] for the same operation.
     ParticipantsObserved {
         /// Exact observation operation.
         op: BootstrapOperation,
@@ -298,6 +299,14 @@ pub enum BootstrapEvent {
         participants: Vec<BootstrapParticipant>,
         /// Optional donor/builder claims at the same source cut.
         claims: Vec<BootstrapClaim>,
+    },
+    /// The observation for `op` produced no usable complete cut: the source
+    /// read failed or timed out, or the cut was refused. A follower still
+    /// inside its grace for the selected builder samples again; any other
+    /// selection ends in the ordinary origin fallback.
+    ObservationFailed {
+        /// Exact observation operation.
+        op: BootstrapOperation,
     },
     /// Local guarded origin build completed; image still needs transfer proof.
     Built {
@@ -452,6 +461,15 @@ pub enum BootstrapEffect {
     /// The followed builder's claim advertised new build progress. The runtime
     /// renews the parent recovery's liveness budget; this is no read authority.
     BuilderProgressed,
+    /// This node stopped waiting for the builder or donor it had selected.
+    /// Informational for the runtime's operator log: the core has already
+    /// acted on it, by selecting again or ending in the origin fallback.
+    Released {
+        /// The builder or donor this node was waiting for.
+        builder: ClaimIdentity,
+        /// Why the wait ended.
+        reason: ReleaseReason,
+    },
     /// A ready donor can be tried for a separate bounded transfer session.
     DonorAvailable {
         /// Exact follow operation.
@@ -472,6 +490,25 @@ pub enum BootstrapEffect {
     FallbackOrigin,
     /// Earliest logical deadline across claim renewal and current work.
     ArmTimer(Time),
+}
+
+/// Why a follower stopped waiting for its selected builder or donor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseReason {
+    /// The followed build advertised no progress for the follower's whole
+    /// grace: the builder's own stall bound, one claim TTL and one sample.
+    Stalled,
+    /// The builder withdrew its claim while it was still a live member: its
+    /// build, or its pending Ready recapture, ended without an image.
+    Withdrawn,
+    /// The selected Ready donor could not serve its image.
+    DonorUnavailable,
+    /// No complete participation cut confirmed the Ready donor before the
+    /// transfer.
+    Unverified,
+    /// The selection episode ended: its budget ran out, no usable cut arrived
+    /// outside the grace, or a bound's arithmetic was exhausted.
+    Ended,
 }
 
 /// One deterministic transition result.

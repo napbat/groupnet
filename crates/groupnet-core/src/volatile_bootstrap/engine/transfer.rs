@@ -8,7 +8,7 @@ use super::super::transfer::{
 };
 use super::super::types::{
     BootstrapClaim, BootstrapEffect, BootstrapError, BootstrapOperation, BootstrapStage,
-    BootstrapStep, ClaimIdentity, ClaimPhase,
+    BootstrapStep, ClaimIdentity, ClaimPhase, ReleaseReason,
 };
 use super::ClaimEngine;
 
@@ -96,6 +96,56 @@ impl ClaimEngine {
         self.transfer_event(TransferEvent::Start)
     }
 
+    /// The selected donor could not serve its image: exclude that exact
+    /// attempt for this episode, report the release, and sample again.
+    pub(super) fn donor_unavailable(
+        &mut self,
+        op: BootstrapOperation,
+        selected: ClaimIdentity,
+    ) -> BootstrapStep {
+        let released = BootstrapEffect::Released {
+            builder: selected.clone(),
+            reason: ReleaseReason::DonorUnavailable,
+        };
+        if self.stage == BootstrapStage::Transferring
+            && self.operation == Some(op)
+            && self.selected.as_ref() == Some(&selected)
+        {
+            let mut effects = vec![BootstrapEffect::CancelWork { op }];
+            effects.extend(self.cancel_transfer());
+            self.operation = None;
+            self.operation_due = None;
+            self.observed.remove(&selected);
+            self.excluded.insert(selected);
+            effects.push(released);
+            let next = self.observe();
+            effects.extend(
+                next.effects
+                    .into_iter()
+                    .filter(|effect| !matches!(effect, BootstrapEffect::ArmTimer(_))),
+            );
+            return self.ok(effects);
+        }
+        if !matches!(
+            self.stage,
+            BootstrapStage::Following | BootstrapStage::DonorAvailable
+        ) || self.operation != Some(op)
+            || self.selected.as_ref() != Some(&selected)
+        {
+            return Self::reject(BootstrapError::StaleOperation);
+        }
+        self.observed.remove(&selected);
+        self.excluded.insert(selected);
+        self.follow_due = None;
+        let mut step = if self.excluded.len() > self.config.max_members {
+            self.terminate()
+        } else {
+            self.observe()
+        };
+        step.effects.insert(0, released);
+        step
+    }
+
     fn abandon_transfer(&mut self) -> BootstrapStep {
         let mut effects = Vec::new();
         if let Some(op) = self.operation {
@@ -106,7 +156,11 @@ impl ClaimEngine {
         effects.extend(self.cancel_transfer());
         if let Some(selected) = self.selected.clone() {
             self.observed.remove(&selected);
-            self.excluded.insert(selected);
+            self.excluded.insert(selected.clone());
+            effects.push(BootstrapEffect::Released {
+                builder: selected,
+                reason: ReleaseReason::DonorUnavailable,
+            });
         }
         if self.total_due.is_some_and(|due| self.now >= due)
             || self.excluded.len() > self.config.max_members

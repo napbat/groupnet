@@ -193,6 +193,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                         (active_version, op),
                         &mut effects,
                         child.acquire(op, permit),
+                        None,
                     )
                     .await;
                     shared.disarm(op);
@@ -246,6 +247,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                                 (active_version, op),
                                 &mut effects,
                                 child.peer_roster(due),
+                                None,
                             )
                             .await
                         }
@@ -259,6 +261,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                             (active_version, op),
                             &mut effects,
                             shared.adapter.observe_peers(op, config),
+                            bootstrap.as_mut().map(|child| (&config, child)),
                         )
                         .await
                         .map(|observed| observed.map(|(peers, _)| (peers, identities))),
@@ -314,6 +317,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                         (active_version, op),
                         &mut effects,
                         shared.adapter.invalidate(op, distrust_bodies, permit),
+                        bootstrap.as_mut().map(|child| (&config, child)),
                     )
                     .await;
                     shared.disarm(op);
@@ -357,6 +361,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                         (active_version, op),
                         &mut effects,
                         shared.adapter.rebuild_origin(op, permit),
+                        bootstrap.as_mut().map(|child| (&config, child)),
                     )
                     .await;
                     shared.disarm(op);
@@ -389,6 +394,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                         (active_version, op),
                         &mut effects,
                         shared.adapter.observe_peers(op, config),
+                        bootstrap.as_mut().map(|child| (&config, child)),
                     )
                     .await;
                     if let Some(result) = response {
@@ -424,6 +430,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                         (active_version, op),
                         &mut effects,
                         shared.adapter.wait_frontiers(op, heads),
+                        bootstrap.as_mut().map(|child| (&config, child)),
                     )
                     .await;
                     if let Some(result) = response {
@@ -547,6 +554,12 @@ async fn bootstrap_wake(wake: Option<&Arc<tokio::sync::Notify>>) {
 /// renews the operation and the permit's deadline follows, so a scan that
 /// keeps committing work outlives any fixed attempt or episode bound. If the
 /// operation expired before the report, the core's fallback is queued instead.
+///
+/// An adapter operation, such as a whole origin scan, can outlast the child's
+/// presence TTL many times over. `child` keeps its maintenance turns, and so
+/// its presence, meanwhile: a peer's complete participation cut, which a
+/// donor's Ready recapture needs, would otherwise miss this live member for
+/// the whole operation, and the lapsed presence could never be renewed.
 async fn await_operation<A: RecoveryAdapter, T>(
     shared: &Arc<Shared<A>>,
     engine: &mut RecoveryEngine,
@@ -554,6 +567,7 @@ async fn await_operation<A: RecoveryAdapter, T>(
     (active_version, op): (u64, RecoveryOperation),
     effects: &mut VecDeque<RecoveryEffect>,
     future: BoxRecoveryFuture<'_, T>,
+    mut child: Maintained<'_>,
 ) -> Option<T> {
     let due = engine.next_deadline()?;
     let mut deadline = terminal_deadline(shared, absolute_deadline(started, due))?;
@@ -561,6 +575,8 @@ async fn await_operation<A: RecoveryAdapter, T>(
     tokio::pin!(future);
     loop {
         let delay = deadline.saturating_duration_since(Instant::now());
+        let child_due = child.as_ref().and_then(|(_, child)| child.next_deadline());
+        let child_wake = child.as_ref().map(|(_, child)| child.wake());
         tokio::select! {
             biased;
             () = shared.notify.notified() => {
@@ -591,6 +607,29 @@ async fn await_operation<A: RecoveryAdapter, T>(
             }
             () = tokio::time::sleep(delay) => return None,
             value = &mut future => return Some(value),
+            () = child_turn(child_due, child_wake.as_ref()) => {
+                if let Some((config, child)) = child.as_mut() {
+                    maintain_child(shared, config, child).await;
+                }
+            }
         }
+    }
+}
+
+/// The bootstrap child kept maintained while the worker awaits an operation
+/// that does not drive the child itself.
+type Maintained<'a> = Option<(&'a RecoveryConfig, &'a mut Box<dyn BootstrapDriver>)>;
+
+/// The child's next maintenance turn: its own deadline or its wake.
+async fn child_turn(due: Option<Instant>, wake: Option<&Arc<tokio::sync::Notify>>) {
+    let deadline = async {
+        match due {
+            Some(due) => tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        () = deadline => {}
+        () = bootstrap_wake(wake) => {}
     }
 }

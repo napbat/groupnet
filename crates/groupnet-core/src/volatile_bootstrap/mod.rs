@@ -21,7 +21,7 @@ pub use types::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
     BootstrapMember, BootstrapMemberIdentity, BootstrapOperation, BootstrapParticipant,
     BootstrapPresence, BootstrapScope, BootstrapStage, BootstrapStep, ClaimIdentity, ClaimPhase,
-    PresenceIdentity,
+    PresenceIdentity, ReleaseReason,
 };
 
 #[cfg(test)]
@@ -29,3 +29,6 @@ mod tests;
 
 #[cfg(test)]
 mod tests_transfer;
+
+#[cfg(test)]
+mod tests_release;

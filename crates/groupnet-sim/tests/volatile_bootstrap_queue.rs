@@ -165,19 +165,7 @@ fn enqueue_effects(
                     });
                 }
             }
-            BootstrapEffect::ArmTimer(due) => {
-                if !queue.iter().any(|queued| {
-                    queued.at == due.0
-                        && queued.recipient == from
-                        && matches!(queued.delivery, Delivery::Tick)
-                }) {
-                    queue.push(Queued {
-                        at: due.0,
-                        recipient: from,
-                        delivery: Delivery::Tick,
-                    });
-                }
-            }
+            BootstrapEffect::ArmTimer(due) => arm_tick(queue, from, due.0),
             BootstrapEffect::DonorAvailable { .. } => {
                 coverage.ready_donors += 1;
                 coverage.donor_nodes_this_seed.insert(from);
@@ -188,10 +176,26 @@ fn enqueue_effects(
             | BootstrapEffect::WithdrawPresence(_)
             | BootstrapEffect::FollowBuilder { .. }
             | BootstrapEffect::BuilderProgressed
+            | BootstrapEffect::Released { .. }
             | BootstrapEffect::ObserveSelectedClaim { .. }
             | BootstrapEffect::RecaptureCurrent { .. }
             | BootstrapEffect::Transfer(_) => {}
         }
+    }
+}
+
+/// Queue one Tick for `recipient` at `at`, unless one is already queued.
+fn arm_tick(queue: &mut Vec<Queued>, recipient: usize, at: u64) {
+    if !queue.iter().any(|queued| {
+        queued.at == at
+            && queued.recipient == recipient
+            && matches!(queued.delivery, Delivery::Tick)
+    }) {
+        queue.push(Queued {
+            at,
+            recipient,
+            delivery: Delivery::Tick,
+        });
     }
 }
 

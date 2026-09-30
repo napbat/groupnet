@@ -48,6 +48,8 @@ impl ClaimEngine {
 
     /// Recheck an already selected candidate against one complete source cut.
     /// This never chooses a new builder or grants local serving permission.
+    /// The first verified cut is pinned; every later one must equal it until
+    /// the candidate's next selection or recapture.
     ///
     /// # Errors
     /// Rejects stale, incomplete, or changed participation before capture or
@@ -74,12 +76,29 @@ impl ClaimEngine {
         }
         let (roster, observed) =
             self.validate_participants(members, roster, participants, claims)?;
+        self.matches_pinned_roster(&roster)?;
         if self.participant_roster.is_none() {
             self.participant_roster = Some(roster);
         }
         self.roster_poll = None;
         self.roster_poll_due = None;
         self.observed_presence = observed;
+        Ok(())
+    }
+
+    /// A status, incarnation, boot or session change since the pinned cut
+    /// invalidates the decision that cut was verified for.
+    fn matches_pinned_roster(
+        &self,
+        roster: &[BootstrapMemberIdentity],
+    ) -> Result<(), BootstrapError> {
+        if self
+            .participant_roster
+            .as_deref()
+            .is_some_and(|pinned| pinned != roster)
+        {
+            return Err(BootstrapError::InvalidObservation);
+        }
         Ok(())
     }
 
@@ -115,6 +134,11 @@ impl ClaimEngine {
         Ok(roster)
     }
 
+    /// Choose from one complete cut, and pin it for the decision taken now.
+    /// Membership may change between two selection samples, for example a
+    /// member refuting a suspicion under load: each sample is a fresh
+    /// decision, so it is not compared with the previous sample's pin. Only
+    /// [`Self::verify_participant_roster`] holds a decision to its cut.
     pub(super) fn choose_participants(
         &mut self,
         members: &[BootstrapMember],
@@ -237,15 +261,7 @@ impl ClaimEngine {
         {
             return Err(BootstrapError::InvalidObservation);
         }
-        let roster = roster.to_vec();
-        if self
-            .participant_roster
-            .as_ref()
-            .is_some_and(|previous| previous != &roster)
-        {
-            return Err(BootstrapError::InvalidObservation);
-        }
-        Ok((roster, observed))
+        Ok((roster.to_vec(), observed))
     }
 }
 
@@ -561,19 +577,21 @@ mod tests {
         engine.participant_roster = Some(accepted.0);
         let mut changed = exact.clone();
         changed[1].member_incarnation = 5;
+        let refuted = engine
+            .validate_participants(&members, &changed, &participants, &claims)
+            .expect("a refuted suspicion is still a complete cut");
         assert_eq!(
-            engine
-                .validate_participants(&members, &changed, &participants, &claims)
-                .unwrap_err(),
-            BootstrapError::InvalidObservation
+            engine.matches_pinned_roster(&refuted.0),
+            Err(BootstrapError::InvalidObservation)
         );
         changed[1].member_incarnation = 4;
         changed[1].status = Status::Dead;
+        let dead = engine
+            .validate_participants(&members, &changed, &participants, &claims)
+            .expect("a dead member is still a complete cut");
         assert_eq!(
-            engine
-                .validate_participants(&members, &changed, &participants, &claims)
-                .unwrap_err(),
-            BootstrapError::InvalidObservation
+            engine.matches_pinned_roster(&dead.0),
+            Err(BootstrapError::InvalidObservation)
         );
     }
 

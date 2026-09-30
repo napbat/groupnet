@@ -51,20 +51,26 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 1. **No Rust source file over 1000 lines.** Split modules before they get
    there. (Largest today, and the only ones still within ~50 lines of the
    limit, so the next addition to them splits them *first*:
-   `groupnet-consistency`'s `tests/volatile_bootstrap_runtime.rs` ~969 (new
-   scenarios go in its `volatile_bootstrap_runtime/` children) and
-   `tests/lease_dst.rs` ~948. The band under them, with ~75–150 lines of
-   room: `groupnet-sim`'s `tests/election_external_skew.rs`
-   ~910, `tests/election_quorum.rs` ~896 and `src/simulation.rs` ~894;
-   `groupnet-core`'s `tests/election.rs` ~909, `src/volatile_recovery/engine.rs`
-   ~912, `src/volatile_bootstrap/engine.rs` ~904,
-   `src/engine/election/mod.rs` ~873, `src/config.rs` ~861,
-   `src/engine/election/quorum.rs` ~859 and
-   `src/volatile_bootstrap/engine/participation.rs` ~849;
-   `groupnet-consistency`'s `tests/volatile_bootstrap_runtime/scenarios.rs`
-   ~923, `src/volatile_recovery/bootstrap/session/run.rs` ~906,
-   `src/lease/shell.rs` ~889, `tests/hosted_dst_liveness.rs` ~875 and
-   `tests/lease_dst_liveness.rs` ~853.
+   `groupnet-consistency`'s `src/replication/shell/driver.rs` ~967,
+   `tests/lease_dst.rs` ~948 and `tests/replication.rs` ~944;
+   `groupnet-runtime`'s `src/driver.rs` ~960 and `src/group.rs` ~960. The
+   band under them, with ~60–150 lines of room: `groupnet-core`'s
+   `src/volatile_recovery/engine.rs` ~939, `tests/election.rs` ~909,
+   `src/volatile_bootstrap/engine.rs` ~882, `src/engine/election/mod.rs` ~873,
+   `src/volatile_bootstrap/engine/participation.rs` ~869,
+   `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861 and
+   `src/engine/election/quorum.rs` ~859; `groupnet-sim`'s
+   `tests/election_external_skew.rs` ~910, `tests/election_quorum.rs` ~896
+   and `src/simulation.rs` ~894; `groupnet-consistency`'s
+   `tests/volatile_bootstrap_runtime/scenarios.rs` ~923 (new runtime
+   scenarios go in their own `volatile_bootstrap_runtime/` children; the
+   parent, ~698 since `PeerDonor` moved to `peer_donor.rs`, keeps the shared
+   fakes), `src/replication/shell.rs` ~914, `src/lease/shell.rs` ~889,
+   `tests/hosted_dst_liveness.rs` ~875, `tests/volatile_bootstrap_bulk_adapter.rs`
+   ~864, `tests/lease_dst_liveness.rs` ~853,
+   `src/volatile_recovery/bootstrap/session/run.rs` ~852,
+   `src/replication/shell/driver/snapshot.rs` ~844 and
+   `tests/replication_snapshot.rs` ~840.
    With room still: `groupnet-runtime`'s `src/node.rs` ~803,
    `tests/external_faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
    ~754 and `tests/external.rs` ~706; `groupnet-consistency`'s

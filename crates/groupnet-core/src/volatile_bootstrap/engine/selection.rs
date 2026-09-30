@@ -3,7 +3,7 @@
 use super::{
     BTreeMap, BTreeSet, BootstrapClaim, BootstrapEffect, BootstrapError, BootstrapMember,
     BootstrapOperation, BootstrapStage, BootstrapStep, ClaimEngine, ClaimIdentity, ClaimPhase,
-    Time,
+    NodeId, ReleaseReason, Time,
 };
 use crate::placement;
 
@@ -16,11 +16,11 @@ impl ClaimEngine {
         if self.validate_roster(members, &claims).is_err() {
             return Self::reject(BootstrapError::InvalidObservation);
         }
+        let mut released = None;
         if self.follow_due.is_some_and(|due| self.now >= due)
             && let Some(selected) = self.selected.take()
         {
-            self.excluded.insert(selected);
-            self.follow_due = None;
+            released = Some(self.release_stalled(selected));
         }
         // Keep the bounded renewal high-water marks until the episode ends.
         // Forgetting an expired mark would let a stale source record revive it.
@@ -43,6 +43,12 @@ impl ClaimEngine {
         if candidates.len() > self.config.max_members || !candidates.contains_key(&self.me) {
             return Self::reject(BootstrapError::InvalidObservation);
         }
+        if self.followed_builder_unseen(members, &candidates) {
+            return self.resample();
+        }
+        if released.is_none() {
+            released = self.followed_builder_withdrawn(&candidates);
+        }
         let incumbents: BTreeSet<_> = candidates
             .iter()
             .filter(|(_, claim)| claim.phase != ClaimPhase::Willing)
@@ -61,10 +67,117 @@ impl ClaimEngine {
         self.selected = Some(selected.identity.clone());
         self.operation = None;
         self.operation_due = None;
-        if winner == self.me {
+        let mut step = if winner == self.me {
             self.choose_local(selected)
         } else {
             self.choose_remote(selected, same_selection)
+        };
+        if let Some(released) = released {
+            step.effects.insert(0, released);
+        }
+        step
+    }
+
+    /// Whether this node waits for a remote builder inside its grace.
+    fn following_within_grace(&self) -> bool {
+        self.selected
+            .as_ref()
+            .is_some_and(|selected| selected.node != self.me)
+            && self.follow_due.is_some_and(|due| self.now < due)
+    }
+
+    /// Whether the followed build is missing from this cut only because its
+    /// node is not an eligible member right now, as while the membership
+    /// layer suspects a loaded peer. That does not end the build. A builder
+    /// that did end withdraws its claim while it stays eligible, and one that
+    /// stalls stays invisible or unadvanced until the follower's grace
+    /// releases it.
+    fn followed_builder_unseen(
+        &self,
+        members: &[BootstrapMember],
+        candidates: &BTreeMap<NodeId, BootstrapClaim>,
+    ) -> bool {
+        let Some(selected) = self.selected.as_ref() else {
+            return false;
+        };
+        self.following_within_grace()
+            && !candidates.contains_key(&selected.node)
+            && !members
+                .iter()
+                .any(|member| member.node == selected.node && member.eligible)
+    }
+
+    /// A followed builder whose claim is gone before its TTL, while it is
+    /// still an eligible member, withdrew it: its build ended without an
+    /// image for this node.
+    fn followed_builder_withdrawn(
+        &self,
+        candidates: &BTreeMap<NodeId, BootstrapClaim>,
+    ) -> Option<BootstrapEffect> {
+        let selected = self.selected.as_ref()?;
+        (self.following_within_grace() && !candidates.contains_key(&selected.node)).then(|| {
+            BootstrapEffect::Released {
+                builder: selected.clone(),
+                reason: ReleaseReason::Withdrawn,
+            }
+        })
+    }
+
+    /// Stop following a build that advertised no progress for the whole
+    /// grace: its attempt is excluded for this episode.
+    pub(super) fn release_stalled(&mut self, selected: ClaimIdentity) -> BootstrapEffect {
+        self.excluded.insert(selected.clone());
+        self.follow_due = None;
+        BootstrapEffect::Released {
+            builder: selected,
+            reason: ReleaseReason::Stalled,
+        }
+    }
+
+    /// The release to report when a selection that still waits for a peer's
+    /// image ends for `reason`. An excluded attempt was reported already.
+    pub(super) fn release(&self, reason: ReleaseReason) -> Option<BootstrapEffect> {
+        let waiting = matches!(
+            self.stage,
+            BootstrapStage::Observing
+                | BootstrapStage::Following
+                | BootstrapStage::DonorAvailable
+                | BootstrapStage::Transferring
+        );
+        self.selected
+            .clone()
+            .filter(|selected| {
+                waiting && selected.node != self.me && !self.excluded.contains(selected)
+            })
+            .map(|builder| BootstrapEffect::Released { builder, reason })
+    }
+
+    /// Keep following the selected builder and sample again after one
+    /// observation interval. Neither its grace nor the episode budget is
+    /// renewed, so they still bound the wait.
+    fn resample(&mut self) -> BootstrapStep {
+        let Some(selected) = self.selected.clone() else {
+            return self.terminate();
+        };
+        let Ok(op) = self.operation(self.config.observe_ms) else {
+            return self.terminate();
+        };
+        self.stage = BootstrapStage::Following;
+        self.ok(vec![BootstrapEffect::FollowBuilder { op, selected }])
+    }
+
+    /// The observation for `op` gave no usable complete cut. A follower
+    /// inside its grace samples again: under load a read times out, or a
+    /// peer's presence renewal lands late, without ending the build it
+    /// follows. Any other selection falls back to origin.
+    pub(super) fn observation_failed(&mut self, op: BootstrapOperation) -> BootstrapStep {
+        if self.stage != BootstrapStage::Observing || self.operation != Some(op) {
+            return Self::reject(BootstrapError::StaleOperation);
+        }
+        if self.following_within_grace() {
+            self.resample()
+        } else {
+            self.terminate()
         }
     }
 
