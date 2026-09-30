@@ -19,7 +19,8 @@ const PUBLISH_RETRIES: usize = 8;
 type EncodeFn<K> = dyn Fn(&K) -> Vec<u8> + Send + Sync;
 
 /// Ring of the last N encoded writes; all mutation keeps `first_seq` equal
-/// to the sequence number of the front element.
+/// to the sequence number of the front element. A sealed ring's life ends
+/// with the seal at the position after its last write.
 struct Ring {
     epoch: u64,
     first_seq: u64,
@@ -27,6 +28,7 @@ struct Ring {
     capacity: usize,
     max_frame_bytes: usize,
     encoded_keys_bytes: usize,
+    sealed: bool,
 }
 
 impl Ring {
@@ -49,7 +51,7 @@ impl Ring {
     }
 
     fn encoded_len(&self) -> usize {
-        20_usize.saturating_add(self.encoded_keys_bytes)
+        21_usize.saturating_add(self.encoded_keys_bytes)
     }
 
     /// Retires the acknowledged prefix while keeping the current head as a
@@ -79,6 +81,7 @@ impl Ring {
             epoch: self.epoch,
             first_seq: self.first_seq,
             keys: self.keys.iter().cloned().collect(),
+            sealed: self.sealed,
         }
     }
 }
@@ -158,6 +161,7 @@ impl<K> WriteFeed<K> {
                 capacity: capacity.get(),
                 max_frame_bytes,
                 encoded_keys_bytes: 0,
+                sealed: false,
             }),
             encode: Box::new(encode),
         }
@@ -210,6 +214,11 @@ impl<K> WriteFeed<K> {
     /// The write is recorded in the ring synchronously (before the returned
     /// future is polled), so even a dropped future is re-carried by the
     /// next publish. The future borrows only the feed, not `key`.
+    ///
+    /// # Panics
+    /// Panics after [`seal`](Self::seal): a sealed life promised its peers
+    /// that no write follows the seal, and one that did could be missed by a
+    /// subscriber that already crossed into the writer's next life.
     pub fn publish<'feed>(
         &'feed self,
         key: &K,
@@ -219,12 +228,50 @@ impl<K> WriteFeed<K> {
                 .ring
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!ring.sealed, "WriteFeed::publish after the feed was sealed");
             let token = WriteToken {
                 epoch: ring.epoch,
                 seq: ring.first_seq + ring.keys.len() as u64,
             };
             ring.push((self.encode)(key));
             token
+        };
+        async move {
+            self.advertise_current().await;
+            token
+        }
+    }
+
+    /// Seals this feed life at its current end and advertises the sealed
+    /// feed: the writer's promise that this life publishes no further write.
+    /// The seal takes the position after the last write and resolves to that
+    /// token, which subscribers acknowledge the way they acknowledge a write
+    /// ([`PeerWrite::Sealed`](crate::PeerWrite::Sealed)), so a writer can
+    /// wait until its peers have observed the seal before it exits.
+    ///
+    /// A subscriber that delivered this life through its seal crosses into
+    /// the writer's next epoch with
+    /// [`PeerWrite::Renewed`](crate::PeerWrite::Renewed): nothing of the old
+    /// life can be missing, so there is nothing to remediate. A subscriber
+    /// that never saw the sealed frame — its advertisement was lost, or the
+    /// next life's frame replaced it first — still gets the
+    /// [`PeerWrite::Gap`](crate::PeerWrite::Gap), which is always safe.
+    ///
+    /// Seal only once no write of this life can still be published. A write
+    /// the application made durable but never published through this feed is
+    /// exactly the loss a restart gap covers, and a seal would hide it.
+    /// Sealing again resolves to the same token.
+    pub fn seal(&self) -> impl Future<Output = WriteToken> + Send + '_ {
+        let token = {
+            let mut ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ring.sealed = true;
+            WriteToken {
+                epoch: ring.epoch,
+                seq: ring.first_seq + ring.keys.len() as u64,
+            }
         };
         async move {
             self.advertise_current().await;
@@ -311,6 +358,7 @@ mod tests {
             capacity: 2,
             max_frame_bytes: usize::MAX,
             encoded_keys_bytes: 0,
+            sealed: false,
         };
         for key in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()] {
             ring.push(key);
@@ -329,6 +377,7 @@ mod tests {
             capacity: 32,
             max_frame_bytes: 40,
             encoded_keys_bytes: 0,
+            sealed: false,
         };
         for key in [
             b"aaaaaaaa".to_vec(),
@@ -352,6 +401,7 @@ mod tests {
             capacity: 8,
             max_frame_bytes: usize::MAX,
             encoded_keys_bytes: 0,
+            sealed: false,
         };
         for key in [b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()] {
             ring.push(key);
@@ -377,6 +427,7 @@ mod tests {
             capacity: 8,
             max_frame_bytes: usize::MAX,
             encoded_keys_bytes: 0,
+            sealed: false,
         };
         assert!(!empty.retire_through(crate::WriteToken { epoch: 11, seq: 1 }));
 
@@ -387,6 +438,7 @@ mod tests {
             capacity: 8,
             max_frame_bytes: usize::MAX,
             encoded_keys_bytes: 0,
+            sealed: false,
         };
         for key in [
             b"w1".to_vec(),

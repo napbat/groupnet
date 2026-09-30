@@ -73,8 +73,8 @@
 //!   [`WriteToken`] (epoch-major, then sequence), and subscribers observe
 //!   its writes in publication order.
 //! - **Loss is detected, never silent.** Ring overflow past a slow
-//!   subscriber — and a writer restart — degrade to an explicit
-//!   [`PeerWrite::Gap`], not a skip.
+//!   subscriber — and a writer restart without a delivered seal — degrade
+//!   to an explicit [`PeerWrite::Gap`], not a skip.
 //! - **Read-your-writes and monotonic reads, per writer.**
 //!   [`WriteFeed::publish`] resolves to the write's [`WriteToken`]; hand
 //!   `(writer, token)` to the client as a session token, and any node
@@ -113,6 +113,25 @@
 //!   the gap remediation advances it into the new epoch, old-life barriers
 //!   remain satisfied (the remediation covered them) and new-life barriers
 //!   behave normally.
+//!
+//! A restart's gap exists because the old life's end is unknown: a write it
+//! made durable but never delivered (it died before publishing, or before the
+//! frame propagated) is missing from every subscriber, and only coarse
+//! remediation can find it. A writer that stops on purpose can end that
+//! uncertainty. [`WriteFeed::seal`] is its promise that the life publishes
+//! nothing more; the seal takes the position after the last write, and
+//! subscribers deliver it as [`PeerWrite::Sealed`] and acknowledge it like a
+//! write, so the writer can wait for its peers to have seen it before it
+//! exits. A subscriber that delivered the old life through its seal then
+//! crosses into the new epoch with [`PeerWrite::Renewed`] instead of a gap —
+//! the old life is complete, so there is nothing to remediate. Every other
+//! path still gaps: a subscriber that never saw the seal (lost, or replaced
+//! by the new life's frame first), a seal that arrives after the subscriber
+//! already crossed (a previous life's frame is ignored), and a new life whose
+//! first writes already left its ring. A restarted writer should advertise
+//! its new epoch ([`WriteFeed::republish`]) before its first write, so
+//! subscribers cross — or gap — as soon as it is back rather than at its next
+//! write.
 //!
 //! # Semantics (read this once, rely on it forever)
 //!
@@ -196,6 +215,11 @@
 //!             } => {
 //!                 local.lock().unwrap().clear(); // coarse remediation
 //!                 frontier.advance(&peer, missed_through);
+//!             }
+//!             // A sealed life delivered in full: nothing was missed.
+//!             PeerWrite::Sealed { peer, token } => frontier.advance(&peer, token),
+//!             PeerWrite::Renewed { peer, epoch, .. } => {
+//!                 frontier.advance(&peer, groupnet_consistency::WriteToken { epoch, seq: 0 });
 //!             }
 //!         }
 //!     }

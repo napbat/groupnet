@@ -101,6 +101,12 @@ async fn main() {
                     );
                     frontier.advance(&peer, missed_through);
                 }
+                // A sealed life delivered in full: nothing was missed, so
+                // nothing cached is suspect.
+                PeerWrite::Sealed { peer, token } => frontier.advance(&peer, token),
+                PeerWrite::Renewed { peer, epoch, .. } => {
+                    frontier.advance(&peer, groupnet_consistency::WriteToken { epoch, seq: 0 });
+                }
             }
         }
     });

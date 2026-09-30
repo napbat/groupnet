@@ -375,13 +375,19 @@ impl TransferSession {
                     else {
                         return false;
                     };
-                    if cut.epoch != covered.epoch
-                        || cut.epoch != replayed.epoch
-                        || replayed.sequence.checked_add(1) != Some(cut.sequence)
-                        || cut.sequence > covered.sequence
+                    // A native delta continues its writer by one sequence
+                    // in the replayed epoch, or renews it at sequence zero
+                    // of a newer epoch after a sealed life (the donor
+                    // journal records only that crossing); never past B.
+                    let continues = cut.epoch == replayed.epoch
+                        && replayed.sequence.checked_add(1) == Some(cut.sequence);
+                    let renews = cut.epoch > replayed.epoch && cut.sequence == 0;
+                    if !(continues || renews)
+                        || (cut.epoch, cut.sequence) > (covered.epoch, covered.sequence)
                     {
                         return false;
                     }
+                    replayed.epoch = cut.epoch;
                     replayed.sequence = cut.sequence;
                     cut.writer.len()
                 }

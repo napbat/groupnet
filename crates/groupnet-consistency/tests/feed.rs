@@ -96,7 +96,7 @@ async fn peer_writes_arrive_in_order_and_apply_locally() {
                 assert_eq!(key, expected);
                 fresh.lock().expect("lock").remove(&key);
             }
-            PeerWrite::Gap { .. } => panic!("no gap expected"),
+            other => panic!("no gap expected: {other:?}"),
         }
     }
     assert!(
@@ -123,7 +123,7 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
     feed.publish(&"w1".to_owned()).await;
     match next_event(&mut peers).await {
         PeerWrite::Wrote { key, .. } => assert_eq!(key, "w1"),
-        PeerWrite::Gap { .. } => panic!("no gap yet"),
+        other => panic!("no gap yet: {other:?}"),
     }
 
     // …then A writes three more without B draining: w2 falls off the ring.
@@ -295,7 +295,7 @@ async fn encoded_feed_budget_degrades_to_an_explicit_gap() {
                 "the byte budget must retire writes beyond the subscriber's cursor"
             );
         }
-        PeerWrite::Wrote { .. } => panic!("byte-window overflow must surface before survivors"),
+        other => panic!("byte-window overflow must surface before survivors: {other:?}"),
     }
     let mut applied = None;
     while applied != Some(last) {
@@ -304,7 +304,7 @@ async fn encoded_feed_budget_degrades_to_an_explicit_gap() {
                 assert_eq!(peer, a_id);
                 applied = Some(token);
             }
-            PeerWrite::Gap { .. } => panic!("one byte-window gap must cover the retired prefix"),
+            other => panic!("one byte-window gap must cover the retired prefix: {other:?}"),
         }
     }
     assert_eq!(peers.gaps_seen(), 1);
@@ -409,6 +409,10 @@ async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
                     peer,
                     missed_through,
                 } => frontier.advance(&peer, missed_through),
+                PeerWrite::Sealed { peer, token } => frontier.advance(&peer, token),
+                PeerWrite::Renewed { peer, epoch, .. } => {
+                    frontier.advance(&peer, WriteToken { epoch, seq: 0 });
+                }
             }
         }
     });
@@ -459,7 +463,7 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
     for _ in 0..3 {
         match next_event(&mut peers).await {
             PeerWrite::Wrote { peer, token, .. } => frontier.advance(&peer, token),
-            PeerWrite::Gap { .. } => panic!("no gap in the first life"),
+            other => panic!("no gap in the first life: {other:?}"),
         }
     }
     assert!(view.reached(&a_id, old_life_last).await);
@@ -500,7 +504,7 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
             );
             frontier.advance(&peer, missed_through);
         }
-        PeerWrite::Wrote { .. } => panic!("the epoch change must surface before new writes"),
+        other => panic!("the epoch change must surface before new writes: {other:?}"),
     }
     // Old-life tokens stay satisfied: the remediation covered that life.
     assert!(view.reached(&a_id, old_life_last).await);
@@ -512,7 +516,7 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
             assert_eq!(key, "n1");
             frontier.advance(&peer, token);
         }
-        PeerWrite::Gap { .. } => panic!("only one gap expected"),
+        other => panic!("only one gap expected: {other:?}"),
     }
     assert!(view.reached(&a_id, new_token).await);
 }
@@ -540,11 +544,11 @@ async fn named_feeds_do_not_cross_talk() {
 
     match next_event(&mut docs).await {
         PeerWrite::Wrote { key, .. } => assert_eq!(key, "d1"),
-        PeerWrite::Gap { .. } => panic!("no gap expected"),
+        other => panic!("no gap expected: {other:?}"),
     }
     match next_event(&mut index).await {
         PeerWrite::Wrote { key, .. } => assert_eq!(key, "i1"),
-        PeerWrite::Gap { .. } => panic!("no gap expected"),
+        other => panic!("no gap expected: {other:?}"),
     }
     // And nothing further on either: one write each, no cross-talk.
     let quiet = tokio::time::timeout(Duration::from_millis(200), docs.next()).await;

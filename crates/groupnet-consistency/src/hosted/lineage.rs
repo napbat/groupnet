@@ -251,8 +251,11 @@ impl<K> Lineage<K> {
             HostedRead::Migrated { .. } => true,
         });
         self.held.retain(|event| match event {
-            PeerWrite::Wrote { token, .. } => token.epoch >= epoch,
+            PeerWrite::Wrote { token, .. } | PeerWrite::Sealed { token, .. } => {
+                token.epoch >= epoch
+            }
             PeerWrite::Gap { missed_through, .. } => missed_through.epoch >= epoch,
+            PeerWrite::Renewed { epoch: renewed, .. } => *renewed >= epoch,
         });
     }
 
@@ -272,14 +275,27 @@ impl<K> Lineage<K> {
     }
 
     /// Judges one peer-write against the cursor and the adopted pair — the
-    /// table in the module docs, in order.
+    /// table in the module docs, in order. A hosted writer never seals its
+    /// feed, and every lineage epoch opens with a gap of its own, so a seal
+    /// carries nothing a hosted reader needs and a renewal is read as the
+    /// restart gap it stands in for.
     pub(super) fn admit(&mut self, event: PeerWrite<K>) {
+        let event = match event {
+            PeerWrite::Sealed { .. } => return,
+            PeerWrite::Renewed { peer, epoch, .. } => PeerWrite::Gap {
+                peer,
+                missed_through: WriteToken { epoch, seq: 0 },
+            },
+            event => event,
+        };
         let (peer, epoch) = match &event {
             PeerWrite::Wrote { peer, token, .. } => (peer, token.epoch),
             PeerWrite::Gap {
                 peer,
                 missed_through,
             } => (peer, missed_through.epoch),
+            // Normalized away above.
+            PeerWrite::Sealed { .. } | PeerWrite::Renewed { .. } => return,
         };
         if epoch < self.floor {
             return; // this node serves above it: the whole lineage is dead
@@ -317,6 +333,8 @@ impl<K> Lineage<K> {
             // A ring that has already overflowed: the first *visible* write is
             // the one after what was missed.
             PeerWrite::Gap { missed_through, .. } => missed_through.seq.saturating_add(1),
+            // `admit` normalizes both away.
+            PeerWrite::Sealed { .. } | PeerWrite::Renewed { .. } => return,
         };
         let missed_through = WriteToken {
             epoch,
@@ -374,6 +392,8 @@ impl<K> Lineage<K> {
                 self.gaps += 1;
                 missed_through.seq.saturating_add(1)
             }
+            // `admit` normalizes both away.
+            PeerWrite::Sealed { .. } | PeerWrite::Renewed { .. } => return,
         };
         if let Some(open) = self.open.as_mut() {
             open.next = advanced;
@@ -496,6 +516,27 @@ mod tests {
             ]
         );
         assert_eq!(lineage.gaps, 1, "one gap opens a lineage, and only one");
+    }
+
+    /// A hosted writer never seals, but a subscriber can still be handed a
+    /// seal and a renewal: the seal delivers nothing, and the renewal opens
+    /// the adopted epoch's lineage with its gap, as a restart gap would.
+    #[test]
+    fn a_seal_delivers_nothing_and_a_renewal_opens_as_the_restart_gap() {
+        let mut lineage = adopted(5, "h1");
+        drain(&mut lineage);
+        lineage.admit(PeerWrite::Sealed {
+            peer: node("h1"),
+            token: WriteToken { epoch: 5, seq: 1 },
+        });
+        assert!(drain(&mut lineage).is_empty());
+        lineage.admit(PeerWrite::Renewed {
+            peer: node("h1"),
+            sealed: WriteToken { epoch: 4, seq: 3 },
+            epoch: 5,
+        });
+        lineage.admit(wrote("h1", 5, 1));
+        assert_eq!(drain(&mut lineage), vec![gap(5, 0), read("h1", 5, 1)]);
     }
 
     #[test]

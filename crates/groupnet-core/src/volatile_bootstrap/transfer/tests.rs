@@ -796,3 +796,109 @@ fn expiry_and_cancel_release_exact_reservation_and_reject_late_install() {
     assert_eq!(step.rejection, None);
     assert_eq!(cancelled.stage(), TransferStage::Aborted);
 }
+
+/// Replay one barrier covering `covered` through one batch of the native
+/// `deltas`, from the offer's writer at epoch 1, sequence 0. Returns the
+/// session's first effect after the batch.
+fn replay_native(covered: NativeCut, deltas: &[NativeCut]) -> (TransferSession, TransferStep) {
+    let mut engine = TransferSession::new(config(), binding(), Time(0)).unwrap();
+    let mut next = 1;
+    let attach = through_image(&mut engine, &mut next);
+    let mut allocate = || {
+        next += 1;
+        Some(op(next))
+    };
+    let TransferEffect::FetchBarrier { op: first_b, .. } = accept(
+        &mut engine,
+        TransferEvent::StreamAttached {
+            op: attach,
+            token: AttachToken {
+                reservation: reservation(),
+                operation: 42,
+            },
+        },
+        &mut allocate,
+    ) else {
+        panic!("first B")
+    };
+    let through = u64::try_from(deltas.len()).unwrap();
+    let receipt = BarrierReceipt {
+        covered_cuts: vec![covered],
+        ..barrier(through, 0, 51)
+    };
+    let TransferEffect::FetchBatch { op: fetch, .. } = accept(
+        &mut engine,
+        TransferEvent::BarrierReceived {
+            op: first_b,
+            receipt,
+        },
+        &mut allocate,
+    ) else {
+        panic!("batch")
+    };
+    let deltas: Vec<_> = (1..)
+        .zip(deltas)
+        .map(|(position, cut)| JournalDelta {
+            position,
+            identity: DeltaIdentity::Native(cut.clone()),
+            effect: vec![2],
+        })
+        .collect();
+    let bytes = deltas.len() * 2;
+    let step = engine.step(
+        TransferEvent::BatchStaged {
+            op: fetch,
+            batch: JournalBatch {
+                reservation: reservation(),
+                operation: 60,
+                from: cursor(0),
+                through: cursor(through),
+                deltas,
+                bytes,
+            },
+        },
+        &mut allocate,
+    );
+    (engine, step)
+}
+
+fn renewed(epoch: u64, sequence: u64) -> NativeCut {
+    NativeCut {
+        epoch,
+        ..cut(sequence)
+    }
+}
+
+/// The donor journal records a sealed renewal as a native delta at sequence
+/// zero of the writer's newer epoch. A follower replaying the suffix crosses
+/// with it, and a barrier in the new life covers the offer's older cut.
+#[test]
+fn a_sealed_renewal_in_the_suffix_replays_into_the_new_life() {
+    let (engine, step) = replay_native(renewed(3, 1), &[cut(1), renewed(3, 0), renewed(3, 1)]);
+    assert_eq!(step.rejection, None);
+    assert!(matches!(
+        step.effects.first(),
+        Some(TransferEffect::AckBatch { .. })
+    ));
+    assert_ne!(engine.stage(), TransferStage::Aborted);
+}
+
+/// A crossing is only ever to sequence zero of a newer epoch and never past
+/// the barrier; a native delta that skips into another life, or back into an
+/// older one, breaks replay continuity and aborts the transfer.
+#[test]
+fn a_native_delta_that_is_not_a_contiguous_step_or_renewal_aborts_replay() {
+    for (covered, deltas) in [
+        (renewed(3, 1), vec![renewed(3, 1)]),
+        (renewed(3, 0), vec![cut(1), renewed(3, 0), cut(2)]),
+        (cut(1), vec![cut(1), renewed(3, 0)]),
+        (renewed(3, 0), vec![renewed(3, 0), renewed(4, 0)]),
+    ] {
+        let (engine, step) = replay_native(covered.clone(), &deltas);
+        assert_eq!(
+            engine.stage(),
+            TransferStage::Aborted,
+            "{covered:?} {deltas:?} {step:?}"
+        );
+    }
+}

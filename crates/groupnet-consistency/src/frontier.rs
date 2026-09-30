@@ -53,8 +53,9 @@ impl Frontier {
 impl FrontierView {
     /// Waits until `peer`'s writes through `token` have been applied
     /// locally. A watermark from a newer epoch also satisfies older-epoch
-    /// tokens: the frontier only enters a new epoch through gap
-    /// remediation, which covered the previous life.
+    /// tokens: the frontier only enters a new epoch through gap remediation,
+    /// which covered the previous life, or through a sealed renewal, after
+    /// the previous life was delivered through its seal.
     ///
     /// Returns `false` if the [`Frontier`] was dropped first (the apply
     /// loop is gone — do not serve reads assuming freshness). Combine with

@@ -1,4 +1,16 @@
 //! Follower-side comparison of live native writer positions with a barrier.
+//!
+//! A native writer's position is `(epoch, sequence)`, ordered epoch-major: a
+//! writer that restarts opens a new epoch, and every position of the new life
+//! follows every position of the old one. Moving a writer from one life into
+//! the next is never this comparison's decision. A subscriber crosses either
+//! with a gap, which covers the whole previous life and remediates it
+//! coarsely, or with a sealed renewal, after the previous life promised it
+//! ended and every write up to that promise was delivered. A donor's capture
+//! records only a sealed renewal and withdraws on a gap; a follower's gap
+//! restarts its own recovery and discards its stage. So two positions of one
+//! writer in different epochs are only a side that has not crossed yet:
+//! pending, like two positions of one life.
 
 use std::cmp::Ordering;
 
@@ -8,15 +20,16 @@ use super::types::NativeCut;
 /// barrier's covered cuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CutAlignment {
-    /// Every writer is at the same incarnation and position. A writer known
-    /// to only one side aligns only as a quiet zero-position feed.
+    /// Every writer is at the same epoch and sequence. A writer known to
+    /// only one side aligns only as a quiet zero-position feed.
     Exact,
-    /// Same writer incarnations at different positions, or a non-quiet
-    /// writer known to one side only. Either side may still be applying
-    /// the same feed, so a later barrier can align.
+    /// A writer's positions differ, in either direction and in the same or
+    /// different epochs, or a non-quiet writer is known to one side only.
+    /// The side behind is still applying the same feed, or has yet to cross
+    /// into the writer's newer life; a later barrier can align, and a gap on
+    /// either side ends the transfer instead.
     Pending,
-    /// A writer incarnation differs, or an input is not strictly sorted by
-    /// writer. No later barrier of this capture can align.
+    /// An input is not strictly sorted by writer.
     Conflict,
 }
 
@@ -37,9 +50,8 @@ pub struct CutDifference<'a> {
 pub struct Alignment<'a> {
     /// How the two sides compare.
     pub verdict: CutAlignment,
-    /// The first writer, in writer order, that made the verdict other than
-    /// [`CutAlignment::Exact`]. `None` when exact, or when an input is not
-    /// strictly sorted.
+    /// The first writer, in writer order, whose positions made the verdict
+    /// [`CutAlignment::Pending`]. `None` otherwise.
     pub deciding: Option<CutDifference<'a>>,
 }
 
@@ -52,6 +64,11 @@ pub struct Alignment<'a> {
 /// its live index holds effects the stage lacks. The transfer protocol
 /// answers [`CutAlignment::Pending`] with `NativePending`, which samples a
 /// later barrier.
+///
+/// A barrier cut in an older epoch than the live one covers the writer's old
+/// life only up to that cut, and none of the new life; a live cut in the
+/// older epoch has not applied the new life the barrier covers. Neither may
+/// install until both sides stand in one life at one sequence.
 pub fn align_cuts<'a>(
     local: impl IntoIterator<Item = (&'a [u8], u64, u64)>,
     covered: &'a [NativeCut],
@@ -114,13 +131,7 @@ pub fn align_cuts<'a>(
                     live: Some((epoch, sequence)),
                     covered: Some((cut.epoch, cut.sequence)),
                 };
-                if epoch != cut.epoch {
-                    return Alignment {
-                        verdict: CutAlignment::Conflict,
-                        deciding: Some(difference),
-                    };
-                }
-                (difference, sequence == cut.sequence)
+                (difference, (epoch, sequence) == (cut.epoch, cut.sequence))
             }
             (Ordering::Greater, _, Some(cut)) => {
                 covered.next();
@@ -184,19 +195,56 @@ mod tests {
         );
     }
 
+    /// The production rejoin: the donor still covers the restarted writer's
+    /// old life, through its fourth write, while the rejoiner stands at the
+    /// start of the writer's new life. The donor covers the old life only up
+    /// to its cut and none of the new one, so the pair pends until the donor
+    /// crosses into the new life; the reverse pair pends until the follower
+    /// does. A quiet new life does not make an old-life barrier exact.
     #[test]
-    fn a_changed_incarnation_or_unsorted_input_conflicts_even_when_others_pend() {
-        let barrier = [cut("a", 1, 4), cut("b", 1, 2)];
+    fn a_writer_in_different_lives_pends_in_both_directions() {
+        let old_barrier = [cut("b", 7, 4)];
+        let rejoiner = [cut("b", 9, 0)];
+        let pending = align_cuts(local(&rejoiner), &old_barrier);
+        assert_eq!(pending.verdict, CutAlignment::Pending);
         assert_eq!(
-            verdict(&[cut("a", 1, 3), cut("b", 2, 2)], &barrier),
-            CutAlignment::Conflict
+            pending.deciding,
+            Some(CutDifference {
+                writer: b"b",
+                live: Some((9, 0)),
+                covered: Some((7, 4)),
+            })
         );
+        assert_eq!(
+            verdict(&[cut("b", 9, 2)], &old_barrier),
+            CutAlignment::Pending
+        );
+        // The follower still in the old life, the donor already renewed.
+        assert_eq!(
+            verdict(&[cut("b", 7, 4)], &[cut("b", 9, 0)]),
+            CutAlignment::Pending
+        );
+        assert_eq!(
+            verdict(&[cut("b", 7, 9)], &[cut("b", 9, 0)]),
+            CutAlignment::Pending
+        );
+        // Once both stand at one position of the new life, they align.
+        assert_eq!(verdict(&rejoiner, &[cut("b", 9, 0)]), CutAlignment::Exact);
+    }
+
+    #[test]
+    fn only_unsorted_input_conflicts_even_when_others_pend() {
+        let barrier = [cut("a", 1, 4), cut("b", 1, 2)];
         assert_eq!(
             verdict(&[cut("b", 1, 2), cut("a", 1, 4)], &barrier),
             CutAlignment::Conflict
         );
         assert_eq!(
             verdict(&[cut("a", 1, 4)], &[cut("b", 1, 0), cut("a", 1, 4)]),
+            CutAlignment::Conflict
+        );
+        assert_eq!(
+            verdict(&[cut("a", 1, 3), cut("b", 1, 2), cut("a", 2, 0)], &barrier),
             CutAlignment::Conflict
         );
     }
@@ -215,14 +263,12 @@ mod tests {
                 covered: Some((1, 2)),
             })
         );
-        let changed = [cut("a", 1, 3), cut("c", 2, 7)];
-        let conflict = align_cuts(local(&changed), &barrier);
-        assert_eq!(conflict.verdict, CutAlignment::Conflict);
+        let one_sided = [cut("a", 1, 4), cut("b", 1, 2)];
         assert_eq!(
-            conflict.deciding,
+            align_cuts(local(&one_sided), &barrier).deciding,
             Some(CutDifference {
                 writer: b"c",
-                live: Some((2, 7)),
+                live: None,
                 covered: Some((1, 7)),
             })
         );

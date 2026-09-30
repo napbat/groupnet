@@ -9,6 +9,8 @@ use super::super::journal::{
 use super::super::{BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity};
 
 /// Exact, sorted per-writer coverage; zero sequence denotes a quiet feed.
+/// Positions compare epoch-major: a writer renewed into a newer epoch after a
+/// sealed life covers every position of that life.
 pub(crate) fn native_cuts_cover(actual: &[NativeCut], expected: &[NativeCut]) -> bool {
     actual.len() == expected.len()
         && actual
@@ -23,8 +25,7 @@ pub(crate) fn native_cuts_cover(actual: &[NativeCut], expected: &[NativeCut]) ->
                 && !cut.writer.is_empty()
                 && cut.epoch != 0
                 && found.writer == cut.writer
-                && found.epoch == cut.epoch
-                && found.sequence >= cut.sequence
+                && (found.epoch, found.sequence) >= (cut.epoch, cut.sequence)
         })
 }
 

@@ -207,13 +207,30 @@ head or an unbounded adapter-owned map.
 
 Coverage compares the follower's live native writer positions with B through
 the core's `align_cuts`. An exact match (a writer known to one side only
-aligns as a quiet zero-position feed) may install. A same-incarnation
-position that differs in either direction is `Pending`: the follower is
-still applying those feeds, or its live index already holds effects past B
-that the stage lacks. The adapter answers `NativePending`, keeps its stage,
-and the transfer samples a later barrier with `AdvanceBarrier` after
-`coverage_poll_ms`, bounded by the transfer deadline. A changed writer
-incarnation or an incomparable local repair is a conflict and aborts the
+aligns as a quiet zero-position feed) may install. Any other pair of
+positions is `Pending`: a position behind or ahead of B in the same writer
+life, and a position in a different life. Positions are `(epoch, sequence)`,
+ordered epoch-major, and a restart opens a new epoch. A B cut in an older epoch
+than the live one covers the writer's old life only up to that cut and none
+of the new life, whose writes are native effects B must cover; a live cut in
+the older epoch has not applied the new life B covers. Neither side may
+install until both stand at one position of one life, and no pair of
+positions is itself a refusal: the side behind crosses into the newer life
+either by a sealed renewal (`WriteFeed::seal`, `PeerWrite::Renewed`), after
+which the positions compare within one life, or by a gap, which withdraws the
+donor's capture or restarts the follower's recovery and discards its stage.
+A donor journal records a renewal with `DonorJournal::renew` only from the
+exact sealed cut, as a native delta at sequence zero of the new epoch, and a
+follower replaying the suffix crosses with it; any other move into a new
+epoch withdraws the candidate. The rejoin this matters for: a restarted node
+joining a Ready peer holds its own writer at `(new epoch, 0)` while the peer's
+image still covers the old life through its last write. That pair is
+`Pending` until the peer applies the restarted writer's seal and renewal, and
+if the old life ended without a seal the peer takes the restart gap instead,
+whose unknown tail only an origin scan can remediate. The adapter answers
+`NativePending`, keeps its stage, and the transfer samples a later barrier with
+`AdvanceBarrier` after `coverage_poll_ms`, bounded by the transfer deadline. An
+unsorted cut list or an incomparable local repair is a conflict and aborts the
 candidate. The install repeats the same check under the index write lock
 and swaps only if it still holds; if a live effect landed after the coverage
 check it answers `NativePending` too, again keeping the stage.

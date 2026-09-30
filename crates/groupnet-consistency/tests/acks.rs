@@ -49,11 +49,16 @@ async fn applied_acknowledgements_round_trip() {
     tokio::spawn(async move {
         while let Some(event) = peers.next().await {
             match event {
-                PeerWrite::Wrote { peer, token, .. } => ledger.record(&peer, token).await,
+                PeerWrite::Wrote { peer, token, .. } | PeerWrite::Sealed { peer, token } => {
+                    ledger.record(&peer, token).await;
+                }
                 PeerWrite::Gap {
                     peer,
                     missed_through,
                 } => ledger.record(&peer, missed_through).await,
+                PeerWrite::Renewed { peer, epoch, .. } => {
+                    ledger.record(&peer, WriteToken { epoch, seq: 0 }).await;
+                }
             }
         }
     });
@@ -81,6 +86,48 @@ async fn applied_acknowledgements_round_trip() {
     );
 }
 
+/// A writer stopping on purpose waits for its peers to observe its seal
+/// before it exits. The seal is acknowledged like a write: the wait for the
+/// seal's token resolves only once the subscriber delivered the seal itself,
+/// not merely the last write before it.
+#[tokio::test]
+async fn a_seal_is_acknowledged_like_a_write() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "seal-ack-a", &["seal-ack-b"], &opts());
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "seal-ack-b", &["seal-ack-a"], &opts());
+    converged_within(&[&a_group, &b_group], SETTLE).await;
+    let mut peers = PeerWrites::new(b_group.clone(), b_id.clone(), decode);
+    let ledger = AckLedger::new(b_group);
+    tokio::spawn(async move {
+        while let Some(event) = peers.next().await {
+            match event {
+                PeerWrite::Wrote { peer, token, .. } | PeerWrite::Sealed { peer, token } => {
+                    ledger.record(&peer, token).await;
+                }
+                other => panic!("no gap or renewal in one life: {other:?}"),
+            }
+        }
+    });
+
+    let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
+        key.clone().into_bytes()
+    })
+    .with_epoch(4);
+    let last = feed.publish(&"w1".to_owned()).await;
+    assert!(applied_cluster_wide(&a_group, &a_id, last, Duration::from_secs(5)).await);
+    let seal = WriteToken { epoch: 4, seq: 2 };
+    assert!(
+        !applied_cluster_wide(&a_group, &a_id, seal, Duration::from_millis(200)).await,
+        "the last write's acknowledgement is not the seal's"
+    );
+    assert_eq!(feed.seal().await, seal);
+    assert!(
+        applied_cluster_wide(&a_group, &a_id, seal, Duration::from_secs(5)).await,
+        "the subscriber acknowledged the seal"
+    );
+    assert_eq!(applied_by(&a_group, &b_id, &a_id), Some(seal));
+}
+
 /// The mixed deployment the capability selector exists for: three nodes, one
 /// of which runs no ledger at all. The cluster-wide wait eats its whole
 /// timeout on that member (pinned behavior); a wait scoped to the peers
@@ -100,11 +147,16 @@ async fn selected_waits_skip_members_that_do_not_participate() {
     tokio::spawn(async move {
         while let Some(event) = peers.next().await {
             match event {
-                PeerWrite::Wrote { peer, token, .. } => ledger.record(&peer, token).await,
+                PeerWrite::Wrote { peer, token, .. } | PeerWrite::Sealed { peer, token } => {
+                    ledger.record(&peer, token).await;
+                }
                 PeerWrite::Gap {
                     peer,
                     missed_through,
                 } => ledger.record(&peer, missed_through).await,
+                PeerWrite::Renewed { peer, epoch, .. } => {
+                    ledger.record(&peer, WriteToken { epoch, seq: 0 }).await;
+                }
             }
         }
     });

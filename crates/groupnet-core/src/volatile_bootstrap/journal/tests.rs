@@ -367,6 +367,81 @@ fn native_noop_advances_exact_writer_coverage_without_index_change() {
     assert_eq!(journal.covered_cuts()[0].sequence, 2);
 }
 
+fn cut_at(epoch: u64, sequence: u64) -> NativeCut {
+    NativeCut {
+        writer: b"w".to_vec(),
+        epoch,
+        sequence,
+    }
+}
+
+/// A writer that sealed its life at its covered cut continues into the next
+/// life with no gap: the covered cut moves to sequence zero of the new epoch,
+/// a retried renewal is the same delta, and new-life effects continue it.
+#[test]
+fn a_sealed_renewal_continues_the_writer_into_its_next_life() {
+    let (mut journal, _) = captured();
+    journal
+        .append(Time(3), 2, native(1), b"put".to_vec())
+        .unwrap();
+    // The seal's own feed position, recorded as a native no-op.
+    journal
+        .append(Time(3), 2, native(2), b"seal".to_vec())
+        .unwrap();
+    let renewed = journal
+        .renew(Time(4), 2, &cut_at(1, 2), 5, b"noop".to_vec())
+        .unwrap();
+    assert_eq!(renewed.position, 3);
+    assert_eq!(journal.covered_cuts(), [cut_at(5, 0)]);
+    assert_eq!(journal.image_cuts(), [cut_at(1, 0)]);
+    assert_eq!(
+        journal.renew(Time(4), 2, &cut_at(1, 2), 5, b"noop".to_vec()),
+        Ok(renewed)
+    );
+    let next = journal
+        .append(
+            Time(5),
+            2,
+            DeltaIdentity::Native(cut_at(5, 1)),
+            b"put".to_vec(),
+        )
+        .unwrap();
+    assert_eq!(next.position, 4);
+    assert_eq!(journal.covered_cuts(), [cut_at(5, 1)]);
+    assert_eq!(journal.invalidation(), None);
+}
+
+/// A renewal is only ever the exact continuation of the covered cut. From
+/// another position, into an epoch that is not newer, or by a plain native
+/// append in a new epoch, the move into another life is a gap the journal
+/// cannot cover, and the candidate is withdrawn.
+#[test]
+fn a_move_into_another_life_that_is_not_a_sealed_renewal_withdraws_the_candidate() {
+    for (sealed, epoch) in [(cut_at(1, 0), 5), (cut_at(1, 2), 5), (cut_at(1, 1), 1)] {
+        let (mut journal, _) = captured();
+        journal
+            .append(Time(3), 2, native(1), b"put".to_vec())
+            .unwrap();
+        assert_eq!(
+            journal.renew(Time(4), 2, &sealed, epoch, b"noop".to_vec()),
+            Err(JournalError::Conflict),
+            "{sealed:?} into {epoch}"
+        );
+        assert_eq!(journal.invalidation(), Some(Invalidation::Gap));
+    }
+    let (mut journal, _) = captured();
+    assert_eq!(
+        journal.append(
+            Time(3),
+            2,
+            DeltaIdentity::Native(cut_at(5, 1)),
+            b"put".to_vec()
+        ),
+        Err(JournalError::Conflict)
+    );
+    assert_eq!(journal.invalidation(), Some(Invalidation::Membership));
+}
+
 #[test]
 #[expect(
     clippy::too_many_lines,

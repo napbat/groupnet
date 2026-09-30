@@ -65,11 +65,18 @@ fn apply_loop(group: &Group, me: &NodeId) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = peers.next().await {
             match event {
-                PeerWrite::Wrote { peer, token, .. } => ledger.record(&peer, token).await,
+                PeerWrite::Wrote { peer, token, .. } | PeerWrite::Sealed { peer, token } => {
+                    ledger.record(&peer, token).await;
+                }
                 PeerWrite::Gap {
                     peer,
                     missed_through,
                 } => ledger.record(&peer, missed_through).await,
+                PeerWrite::Renewed { peer, epoch, .. } => {
+                    ledger
+                        .record(&peer, groupnet_consistency::WriteToken { epoch, seq: 0 })
+                        .await;
+                }
             }
         }
     })

@@ -326,7 +326,7 @@ fn stale_or_mismatched_handoff_never_releases_peer_to_serving() {
         let (mut engine, acquire) = bootstrap();
         let mut invalid = handoff(acquire);
         match variant {
-            0 => invalid.continued_cuts[0].epoch = 2,
+            0 => invalid.continued_cuts[0].writer = b"v".to_vec(),
             1 => {
                 invalid.coverage.proven_cuts.clear();
                 invalid.continued_cuts.clear();

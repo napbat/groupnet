@@ -667,6 +667,62 @@ impl DonorJournal {
         identity: DeltaIdentity,
         effect: Vec<u8>,
     ) -> Result<JournalCursor, JournalError> {
+        self.record(now, recovery_generation, identity, effect, None)
+    }
+
+    /// Record that the native writer of `sealed` sealed its life exactly at
+    /// `sealed`, that the application applied that life through the seal,
+    /// and that the writer now continues in the newer `epoch`. `effect` is
+    /// the application's own no-op. The covered cut moves to `(epoch, 0)`
+    /// with no gap, and a follower replaying the suffix crosses with it.
+    ///
+    /// Only a feed that proved the seal may call this. Any other move into
+    /// a newer epoch is a gap: [`Self::append`] of a native effect in another
+    /// epoch withdraws the candidate, and so does a renewal whose `sealed`
+    /// position is not exactly the covered cut.
+    ///
+    /// # Errors
+    /// Rejects stale generation, a renewal that does not continue the covered
+    /// cut, or capacity.
+    pub fn renew(
+        &mut self,
+        now: Time,
+        recovery_generation: u64,
+        sealed: &NativeCut,
+        epoch: u64,
+        effect: Vec<u8>,
+    ) -> Result<JournalCursor, JournalError> {
+        let mut writer = Vec::new();
+        if writer.try_reserve_exact(sealed.writer.len()).is_err() {
+            self.invalidate_inner(Invalidation::Capacity);
+            return Err(JournalError::Capacity);
+        }
+        writer.extend_from_slice(&sealed.writer);
+        let identity = DeltaIdentity::Native(NativeCut {
+            writer,
+            epoch,
+            sequence: 0,
+        });
+        self.record(
+            now,
+            recovery_generation,
+            identity,
+            effect,
+            Some((sealed.epoch, sealed.sequence)),
+        )
+    }
+
+    /// Append one delta. A native identity continues its writer's covered
+    /// cut by one sequence, or, with `renewed_from`, renews it from exactly
+    /// that sealed position into a newer epoch at sequence zero.
+    fn record(
+        &mut self,
+        now: Time,
+        recovery_generation: u64,
+        identity: DeltaIdentity,
+        effect: Vec<u8>,
+        renewed_from: Option<(u64, u64)>,
+    ) -> Result<JournalCursor, JournalError> {
         self.advance(now)?;
         if !matches!(self.state, JournalState::Capturing | JournalState::Active) {
             return Err(JournalError::Stage);
@@ -718,19 +774,31 @@ impl DonorJournal {
                 self.invalidate_inner(Invalidation::Membership);
                 return Err(JournalError::Conflict);
             };
-            if covered.epoch != cut.epoch {
-                self.invalidate_inner(Invalidation::Membership);
-                return Err(JournalError::Conflict);
+            if let Some(sealed) = renewed_from {
+                if (covered.epoch, covered.sequence) != sealed
+                    || cut.epoch <= sealed.0
+                    || cut.sequence != 0
+                {
+                    self.invalidate_inner(Invalidation::Gap);
+                    return Err(JournalError::Conflict);
+                }
+                covered.epoch = cut.epoch;
+                covered.sequence = 0;
+            } else {
+                if covered.epoch != cut.epoch {
+                    self.invalidate_inner(Invalidation::Membership);
+                    return Err(JournalError::Conflict);
+                }
+                let Some(next) = covered.sequence.checked_add(1) else {
+                    self.invalidate_inner(Invalidation::Conflict);
+                    return Err(JournalError::Exhausted);
+                };
+                if cut.sequence != next {
+                    self.invalidate_inner(Invalidation::Gap);
+                    return Err(JournalError::Conflict);
+                }
+                covered.sequence = cut.sequence;
             }
-            let Some(next) = covered.sequence.checked_add(1) else {
-                self.invalidate_inner(Invalidation::Conflict);
-                return Err(JournalError::Exhausted);
-            };
-            if cut.sequence != next {
-                self.invalidate_inner(Invalidation::Gap);
-                return Err(JournalError::Conflict);
-            }
-            covered.sequence = cut.sequence;
         }
         let Some(position) = self.last_position.checked_add(1) else {
             self.invalidate_inner(Invalidation::Capacity);
