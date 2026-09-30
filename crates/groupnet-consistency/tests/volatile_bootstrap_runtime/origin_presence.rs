@@ -68,6 +68,13 @@ impl RecoveryAdapter for SlowOrigin {
     fn affirm(&self, _op: RecoveryOperation) -> bool {
         true
     }
+
+    fn fell_back(
+        &self,
+        _from: groupnet_consistency::volatile_recovery::RecoveryStage,
+        _reason: groupnet_consistency::volatile_recovery::RecoveryFallback,
+    ) {
+    }
 }
 
 /// The bootstrap child declines (its donor cannot admit a local capture), so

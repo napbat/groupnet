@@ -3,8 +3,8 @@
 use crate::Time;
 
 use super::super::transfer::{
-    TransferBinding, TransferConfig, TransferEffect, TransferEvent, TransferSession, TransferStage,
-    TransferStep,
+    TransferBinding, TransferConfig, TransferEffect, TransferError, TransferEvent, TransferSession,
+    TransferStage, TransferStep,
 };
 use super::super::types::{
     BootstrapClaim, BootstrapEffect, BootstrapError, BootstrapOperation, BootstrapStage,
@@ -205,6 +205,65 @@ impl ClaimEngine {
         self.ok(Vec::new())
     }
 
+    /// A refresh read of the selected donor's claim failed or timed out:
+    /// sample again after one observation interval. The transfer keeps
+    /// running while the claim last observed is unexpired, so a loaded
+    /// source read cannot end a live donor's transfer; an unrenewed claim
+    /// still does, at its own expiry.
+    pub(super) fn selected_claim_unobserved(&mut self, op: BootstrapOperation) -> BootstrapStep {
+        if self.stage != BootstrapStage::Transferring || self.claim_poll != Some(op) {
+            return Self::reject(BootstrapError::StaleOperation);
+        }
+        if !self.resample_selected_claim() {
+            return self.abandon_transfer();
+        }
+        self.ok(Vec::new())
+    }
+
+    /// Forget the current claim refresh read and schedule the next one.
+    fn resample_selected_claim(&mut self) -> bool {
+        self.claim_poll = None;
+        self.claim_poll_due = None;
+        self.claim_refresh_due = self.now.0.checked_add(self.config.observe_ms).map(Time);
+        self.claim_refresh_due.is_some()
+    }
+
+    /// Whether `event` is real transfer progress: data or a completed step
+    /// moved the transfer forward. A coverage recheck that found the feed
+    /// still pending is not, so a transfer stuck waiting still expires.
+    fn transfer_advanced(event: &TransferEvent) -> bool {
+        matches!(
+            event,
+            TransferEvent::Offered { .. }
+                | TransferEvent::StageReserved { .. }
+                | TransferEvent::DonorReserved { .. }
+                | TransferEvent::ChunkStored { .. }
+                | TransferEvent::ImageVerified { .. }
+                | TransferEvent::StreamAttached { .. }
+                | TransferEvent::BatchStaged { .. }
+                | TransferEvent::BatchAcknowledged { .. }
+                | TransferEvent::NativeCovered { .. }
+        )
+    }
+
+    /// The transfer advanced: like a followed build's advance, it restarts
+    /// the transfer's stall bound (`donor_wait_ms`) and the selection
+    /// episode, and reports progress so the parent recovery renews too. A
+    /// transfer that keeps moving data outlives every fixed bound.
+    fn renew_transfer(&mut self, child: &mut TransferSession) -> Option<BootstrapEffect> {
+        let total_due = self.now.0.checked_add(self.config.total_ms).map(Time)?;
+        let stall_due = self
+            .now
+            .0
+            .checked_add(self.config.donor_wait_ms)
+            .map(Time)?
+            .min(total_due);
+        self.total_due = Some(total_due);
+        self.operation_due = Some(stall_due);
+        child.renew(stall_due);
+        Some(BootstrapEffect::BuilderProgressed)
+    }
+
     pub(super) fn transfer_event(&mut self, event: TransferEvent) -> BootstrapStep {
         if self.stage != BootstrapStage::Transferring {
             return Self::reject(BootstrapError::Stage);
@@ -224,6 +283,7 @@ impl ClaimEngine {
         let incarnation = self.boot_incarnation;
         let generation = self.generation;
         let next_token = &mut self.next_token;
+        let advanced = Self::transfer_advanced(&event);
         let step = child.step(event, &mut || {
             let token = *next_token;
             *next_token = token.checked_add(1)?;
@@ -234,7 +294,25 @@ impl ClaimEngine {
                 token,
             })
         });
-        self.finish_transfer(child, step)
+        let progressed = if advanced
+            && step.rejection.is_none()
+            && !matches!(
+                child.stage(),
+                TransferStage::Completed | TransferStage::Aborted
+            ) {
+            let Some(progressed) = self.renew_transfer(&mut child) else {
+                self.transfer = Some(child);
+                return self.terminate();
+            };
+            Some(progressed)
+        } else {
+            None
+        };
+        let mut finished = self.finish_transfer(child, step);
+        if let Some(progressed) = progressed {
+            finished.effects.insert(0, progressed);
+        }
+        finished
     }
 
     fn finish_transfer(&mut self, child: TransferSession, step: TransferStep) -> BootstrapStep {
@@ -256,7 +334,13 @@ impl ClaimEngine {
                 self.claim_poll_due = None;
                 if let Some(selected) = self.selected.clone() {
                     self.observed.remove(&selected);
-                    self.excluded.insert(selected);
+                    self.excluded.insert(selected.clone());
+                    effects.push(BootstrapEffect::Released {
+                        builder: selected,
+                        reason: ReleaseReason::TransferAborted(
+                            step.rejection.unwrap_or(TransferError::Stage),
+                        ),
+                    });
                 }
                 if self.total_due.is_some_and(|due| self.now >= due)
                     || self.excluded.len() > self.config.max_members
@@ -298,13 +382,17 @@ impl ClaimEngine {
 
     pub(super) fn tick_transfer(&mut self, now: Time) -> BootstrapStep {
         if self.total_due.is_some_and(|due| now >= due)
-            || self.claim_poll_due.is_some_and(|due| now >= due)
             || self
                 .selected
                 .as_ref()
                 .and_then(|id| self.observed.get(id))
                 .is_none_or(|claim| claim.expires <= now)
         {
+            return self.abandon_transfer();
+        }
+        // An unanswered refresh read is only a failed sample; the claim it
+        // would have renewed still bounds the transfer at its expiry.
+        if self.claim_poll_due.is_some_and(|due| now >= due) && !self.resample_selected_claim() {
             return self.abandon_transfer();
         }
         let mut renewal = Vec::new();

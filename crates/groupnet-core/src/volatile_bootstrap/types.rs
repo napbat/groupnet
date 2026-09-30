@@ -1,6 +1,6 @@
 //! Bounded, non-authoritative claim decisions for peer index bootstrap.
 
-use super::transfer::{TransferEffect, TransferEvent};
+use super::transfer::{TransferEffect, TransferError, TransferEvent};
 use crate::{NodeId, Status, Time};
 
 /// Stable application scope for one index image and origin builder.
@@ -399,6 +399,13 @@ pub enum BootstrapEvent {
         /// Absent means the donor claim is no longer source-visible.
         claim: Option<BootstrapClaim>,
     },
+    /// The refresh read of the selected donor's claim failed or timed out.
+    /// Not evidence that the donor left: the transfer continues while the
+    /// claim it last observed is unexpired, and samples again.
+    SelectedClaimUnobserved {
+        /// Exact refresh operation whose read failed.
+        op: BootstrapOperation,
+    },
     /// Begin the opt-in transfer for this exact selected ready donor.
     StartTransfer {
         /// Original follow operation retained as the transfer parent.
@@ -485,8 +492,9 @@ pub enum BootstrapEffect {
         /// Exact candidate identity.
         selected: ClaimIdentity,
     },
-    /// The followed builder's claim advertised new build progress. The runtime
-    /// renews the parent recovery's liveness budget; this is no read authority.
+    /// The followed builder's claim advertised new build progress, or the
+    /// transfer of its image advanced. The runtime renews the parent
+    /// recovery's liveness budget; this is no read authority.
     BuilderProgressed,
     /// This node stopped waiting for the builder or donor it had selected.
     /// Informational for the runtime's operator log: the core has already
@@ -536,6 +544,10 @@ pub enum ReleaseReason {
     /// The selection episode ended: its budget ran out, no usable cut arrived
     /// outside the grace, or a bound's arithmetic was exhausted.
     Ended,
+    /// The peer transfer from the selected Ready donor aborted, for the
+    /// transfer's own reason, such as a stall past its bound or a failed
+    /// operation.
+    TransferAborted(TransferError),
 }
 
 /// One deterministic transition result.

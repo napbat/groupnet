@@ -40,6 +40,19 @@ pub(super) fn terminal_deadline<A: RecoveryAdapter>(
     deadline
 }
 
+/// Queued work a later transition superseded is dropped, but a fallback it
+/// recorded still reaches the operator log.
+fn report_superseded<A: RecoveryAdapter>(
+    shared: &Shared<A>,
+    dropped: impl Iterator<Item = RecoveryEffect>,
+) {
+    for effect in dropped {
+        if let RecoveryEffect::FellBack { from, reason } = effect {
+            shared.adapter.fell_back(from, reason);
+        }
+    }
+}
+
 pub(super) fn affirm_effect<A: RecoveryAdapter>(
     shared: &Shared<A>,
     engine: &mut RecoveryEngine,
@@ -103,7 +116,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
             // interval. Start their finite deadlines at this actual time.
             let tick = engine.step(RecoveryEvent::Tick(logical_now(started)));
             let transition = engine.step(pending_event(pending));
-            effects.clear();
+            report_superseded(&shared, effects.drain(..));
             effects.extend(signal_effects(tick, transition));
             lock(&shared.control).state = engine.state();
             if pending.cancel {
@@ -118,7 +131,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
         if let Some(effect) = effects.pop_front() {
             let elapsed = engine.step(RecoveryEvent::Tick(logical_now(started)));
             if !elapsed.effects.is_empty() {
-                effects.clear();
+                report_superseded(&shared, std::iter::once(effect).chain(effects.drain(..)));
                 effects.extend(elapsed.effects);
                 lock(&shared.control).state = engine.state();
                 continue;
@@ -131,6 +144,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     active_version = version;
                 }
                 RecoveryEffect::ArmTimer(_) => {}
+                RecoveryEffect::FellBack { from, reason } => shared.adapter.fell_back(from, reason),
                 RecoveryEffect::CancelBaseline { op } => {
                     if let Some(child) = bootstrap.as_mut() {
                         child.cancel(op).await;

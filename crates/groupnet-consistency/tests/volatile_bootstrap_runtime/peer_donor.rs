@@ -11,10 +11,25 @@ pub(super) struct PeerDonor {
     pub(super) pause_install: std::sync::atomic::AtomicBool,
     pub(super) install_started: Notify,
     pub(super) resume_install: Notify,
+    /// Each chunk fetch takes this long, as on a loaded follower.
+    chunk_ms: u64,
+    /// Origin scans this follower started as its own builder.
+    pub(super) local_builds: AtomicUsize,
 }
 
 impl PeerDonor {
     pub(super) fn new(peer: &ClaimIdentity, follower: &ClaimIdentity) -> Self {
+        Self::paced(peer, follower, 1, 0)
+    }
+
+    /// A donor whose image is `chunks` one-byte chunks, each served after
+    /// `chunk_ms`.
+    pub(super) fn paced(
+        peer: &ClaimIdentity,
+        follower: &ClaimIdentity,
+        chunks: usize,
+        chunk_ms: u64,
+    ) -> Self {
         let scope = BootstrapScope {
             domain: "o".into(),
             partition: "b".into(),
@@ -42,9 +57,9 @@ impl PeerDonor {
             capture: image_cut.capture.clone(),
             image_cut,
             schema: 1,
-            encoded_bytes: 1,
-            decoded_bytes: 1,
-            chunks: 1,
+            encoded_bytes: chunks,
+            decoded_bytes: chunks,
+            chunks,
             commitment: [9; 32],
             members,
             cuts: Vec::new(),
@@ -57,6 +72,8 @@ impl PeerDonor {
             pause_install: std::sync::atomic::AtomicBool::new(false),
             install_started: Notify::new(),
             resume_install: Notify::new(),
+            chunk_ms,
+            local_builds: AtomicUsize::new(0),
         }
     }
 
@@ -87,6 +104,7 @@ impl DonorPort for PeerDonor {
         _request: LocalCaptureRequest,
         _admission: &'a ByteAdmission,
     ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
+        self.local_builds.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Err(AdapterError) })
     }
 
@@ -164,9 +182,10 @@ impl DonorPort for PeerDonor {
                     Self::admitted(admission, TransferEvent::DonorReserved { op, reservation })
                 }
                 TransferEffect::FetchChunk { op, sequence, .. } => {
-                    if sequence != 0 {
+                    if sequence >= self.offer.chunks {
                         return Err(AdapterError);
                     }
+                    tokio::time::sleep(Duration::from_millis(self.chunk_ms)).await;
                     let stage = resources.stage.as_mut().ok_or(AdapterError)?;
                     stage.stage_mut().push(42);
                     Self::admitted(
@@ -181,10 +200,9 @@ impl DonorPort for PeerDonor {
                 }
                 TransferEffect::VerifyImage { op, commitment } => {
                     if commitment != [9; 32]
-                        || resources
-                            .stage
-                            .as_mut()
-                            .is_none_or(|stage| stage.stage_mut().as_slice() != [42])
+                        || resources.stage.as_mut().is_none_or(|stage| {
+                            stage.stage_mut().as_slice() != vec![42; self.offer.chunks].as_slice()
+                        })
                     {
                         return Err(AdapterError);
                     }

@@ -350,8 +350,42 @@ pub enum RecoveryEffect {
         /// Exact recovery affirmation operation.
         op: RecoveryOperation,
     },
+    /// The episode abandoned the path it was on: `from` is the stage it
+    /// left. The effects before this one in the same step start the
+    /// fallback (an origin rebuild, a full rebuild after a lapse proof, or
+    /// origin-only service). Informational, for the operator log.
+    FellBack {
+        /// Stage the episode was in when it gave up.
+        from: RecoveryStage,
+        /// Why it gave up.
+        reason: RecoveryFallback,
+    },
     /// Arm the earliest finite logical deadline.
     ArmTimer(Time),
+}
+
+/// Why a recovery episode abandoned its current path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryFallback {
+    /// The episode made no progress for its whole `total_ms`.
+    EpisodeExpired,
+    /// One operation outlived its bound without completing or progressing.
+    OperationExpired,
+    /// The adapter or child reported the current operation failed.
+    OperationFailed,
+    /// The peer-bootstrap child ended without an image.
+    BaselineDeclined,
+    /// A peer handoff did not bind this exact acquisition and roster.
+    HandoffRejected,
+    /// Peer evidence contradicted itself: a head moved backward, or a peer
+    /// roster did not match the peer baseline's members.
+    EvidenceRejected,
+    /// A member appeared, disappeared, or exceeded the configured roster.
+    MembershipChanged,
+    /// Frontier rechecks kept moving past `max_barrier_rounds`.
+    BarrierExhausted,
+    /// A counter, token, or deadline's arithmetic was exhausted.
+    Exhausted,
 }
 
 /// Reason a recovery input or bounded proof was refused.

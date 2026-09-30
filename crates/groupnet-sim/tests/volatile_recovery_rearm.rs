@@ -34,6 +34,7 @@ fn op(step: &RecoveryStep) -> RecoveryOperation {
             | RecoveryEffect::CancelBaseline { .. }
             | RecoveryEffect::SuspendLocalBaseline { .. }
             | RecoveryEffect::ResumeLocalBaseline { .. }
+            | RecoveryEffect::FellBack { .. }
             | RecoveryEffect::ArmTimer(_) => None,
         })
         .expect("the current full turn emits one operation")

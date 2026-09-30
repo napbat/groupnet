@@ -6,10 +6,11 @@ use crate::volatile_bootstrap::BootstrapMemberIdentity;
 use crate::{NodeId, Time};
 
 use super::types::{
-    Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryError, RecoveryEvent, RecoveryMode,
-    RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState, RecoveryStep,
+    Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryError, RecoveryEvent, RecoveryFallback,
+    RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState, RecoveryStep,
 };
 
+mod fallback;
 mod peer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,33 +210,6 @@ impl RecoveryEngine {
             .collect()
     }
 
-    fn origin_only(&mut self) -> RecoveryStep {
-        let cancel = self.cancel_baseline();
-        self.clear_work();
-        self.state.stage = RecoveryStage::OriginOnly;
-        self.state.recovered = false;
-        let Some(policy) = self.rearm else {
-            return Self::step_ok(cancel);
-        };
-        if self.rearm_exhausted || self.next_token == 0 || self.state.generation == u64::MAX {
-            self.rearm_exhausted = true;
-            return RecoveryStep {
-                effects: cancel,
-                rejection: Some(RecoveryError::Exhausted),
-            };
-        }
-        let Some(due) = self.now.0.checked_add(self.next_rearm_ms).map(Time) else {
-            self.rearm_exhausted = true;
-            return RecoveryStep {
-                effects: cancel,
-                rejection: Some(RecoveryError::Exhausted),
-            };
-        };
-        self.rearm_due = Some(due);
-        self.next_rearm_ms = self.next_rearm_ms.saturating_mul(2).min(policy.max_ms);
-        self.with_timer(cancel)
-    }
-
     fn issue(&mut self, stage: RecoveryStage) -> Result<RecoveryOperation, RecoveryError> {
         let total_due = self.total_due.ok_or(RecoveryError::Stage)?;
         // The baseline child has its own finite source-operation deadlines.
@@ -353,18 +327,13 @@ impl RecoveryEngine {
         self.with_timer(effects)
     }
 
-    fn fallback(&mut self) -> RecoveryStep {
-        let lapses = self.state.covered_lapses;
-        self.begin(Plan::Full, lapses)
-    }
-
     fn expected(&self, op: RecoveryOperation, stage: RecoveryStage) -> bool {
         self.state.stage == stage && self.accepts_operation(op)
     }
 
     fn observe_peers(&mut self, stage: RecoveryStage) -> RecoveryStep {
         let Ok(op) = self.issue(stage) else {
-            return self.fallback_or_origin();
+            return self.fallback_or_origin(RecoveryFallback::Exhausted);
         };
         let effect = if matches!(
             stage,
@@ -377,67 +346,12 @@ impl RecoveryEngine {
         self.with_timer(vec![effect])
     }
 
-    fn fallback_or_origin(&mut self) -> RecoveryStep {
-        if self.plan == Plan::Lapse {
-            self.fallback()
-        } else if self.baseline == Baseline::Peer {
-            self.recover_origin()
-        } else {
-            self.origin_only()
-        }
-    }
-
-    fn recover_origin(&mut self) -> RecoveryStep {
-        let mut effects = self.cancel_baseline();
-        self.baseline = Baseline::Origin;
-        self.seen.clear();
-        self.exempt.clear();
-        self.known_heads.clear();
-        self.heads.clear();
-        self.barrier_rounds = 0;
-        self.peer_members.clear();
-        let Ok(op) = self.issue(RecoveryStage::Rebuilding) else {
-            let mut terminal = self.origin_only();
-            effects.append(&mut terminal.effects);
-            terminal.effects = effects;
-            return terminal;
-        };
-        effects.push(RecoveryEffect::RebuildOrigin { op });
-        self.with_timer(effects)
-    }
-
     fn acquire_baseline(&mut self) -> RecoveryStep {
         let Ok(op) = self.issue(RecoveryStage::AcquiringBaseline) else {
-            return self.origin_only();
+            return self.origin_only(RecoveryFallback::Exhausted);
         };
         self.baseline_op = Some(op);
         self.with_timer(vec![RecoveryEffect::AcquireBaseline { op }])
-    }
-
-    fn retry_full(&mut self) -> RecoveryStep {
-        match self.state.stage {
-            RecoveryStage::Invalidating | RecoveryStage::Rebuilding | RecoveryStage::Affirming => {
-                self.wait_for(self.state.stage, self.config.poll_ms)
-            }
-            _ => self.origin_only(),
-        }
-    }
-
-    fn retry_invalidation(&mut self) -> RecoveryStep {
-        let Ok(op) = self.issue(RecoveryStage::Invalidating) else {
-            return self.origin_only();
-        };
-        self.with_timer(vec![RecoveryEffect::Invalidate {
-            op,
-            distrust_bodies: true,
-        }])
-    }
-
-    fn retry_rebuild(&mut self) -> RecoveryStep {
-        let Ok(op) = self.issue(RecoveryStage::Rebuilding) else {
-            return self.origin_only();
-        };
-        self.with_timer(vec![RecoveryEffect::RebuildOrigin { op }])
     }
 
     /// A long-running operation that keeps committing work stays alive: its
@@ -468,10 +382,10 @@ impl RecoveryEngine {
 
     fn wait_for(&mut self, stage: RecoveryStage, delay: u64) -> RecoveryStep {
         let Some(total_due) = self.total_due else {
-            return self.origin_only();
+            return self.origin_only(RecoveryFallback::Exhausted);
         };
         let Some(due) = self.now.0.checked_add(delay).map(Time) else {
-            return self.fallback_or_origin();
+            return self.fallback_or_origin(RecoveryFallback::Exhausted);
         };
         self.state.stage = stage;
         self.operation = None;
@@ -558,7 +472,7 @@ impl RecoveryEngine {
         if self.seen.len().saturating_add(self.exempt.len()) > self.config.max_members
             || self.grants.len() > self.config.max_members
         {
-            return self.fallback_or_origin();
+            return self.fallback_or_origin(RecoveryFallback::MembershipChanged);
         }
         let all_advanced = self.grants.iter().all(|(node, before)| {
             present.get(node).is_none_or(|peer| !peer.grants_lease)
@@ -586,11 +500,11 @@ impl RecoveryEngine {
             }
         }
         if self.seen.len().saturating_add(self.exempt.len()) > self.config.max_members {
-            return self.fallback_or_origin();
+            return self.fallback_or_origin(RecoveryFallback::MembershipChanged);
         }
         let present: BTreeSet<&NodeId> = peers.iter().map(|peer| &peer.node).collect();
         if self.seen.iter().any(|node| !present.contains(node)) {
-            return self.fallback_or_origin();
+            return self.fallback_or_origin(RecoveryFallback::MembershipChanged);
         }
         let mut heads = BTreeMap::new();
         for peer in peers {
@@ -608,7 +522,7 @@ impl RecoveryEngine {
                 })
             })
         {
-            return self.fallback_or_origin();
+            return self.fallback_or_origin(RecoveryFallback::EvidenceRejected);
         }
         if recheck && heads == self.heads {
             return self.affirm();
@@ -616,7 +530,7 @@ impl RecoveryEngine {
         if recheck {
             self.barrier_rounds += 1;
             if self.barrier_rounds >= self.config.max_barrier_rounds {
-                return self.fallback_or_origin();
+                return self.fallback_or_origin(RecoveryFallback::BarrierExhausted);
             }
         }
         self.heads = heads;
@@ -626,7 +540,7 @@ impl RecoveryEngine {
             RecoveryStage::WaitingFrontiers
         };
         let Ok(op) = self.issue(waiting) else {
-            return self.fallback_or_origin();
+            return self.fallback_or_origin(RecoveryFallback::Exhausted);
         };
         self.with_timer(vec![RecoveryEffect::WaitFrontiers {
             op,
@@ -640,7 +554,7 @@ impl RecoveryEngine {
 
     fn affirm(&mut self) -> RecoveryStep {
         let Ok(op) = self.issue(RecoveryStage::Affirming) else {
-            return self.origin_only();
+            return self.origin_only(RecoveryFallback::Exhausted);
         };
         self.with_timer(vec![RecoveryEffect::Affirm { op }])
     }
@@ -704,7 +618,7 @@ impl RecoveryEngine {
                 } else if self.bootstrap {
                     self.acquire_baseline()
                 } else {
-                    self.recover_origin()
+                    self.rebuild_origin()
                 }
             }
             RecoveryEvent::Materialized { op } => {
@@ -719,7 +633,7 @@ impl RecoveryEngine {
                 if !self.expected(op, RecoveryStage::AcquiringBaseline) {
                     return Self::reject(RecoveryError::StaleOperation);
                 }
-                self.recover_origin()
+                self.recover_origin(RecoveryFallback::BaselineDeclined)
             }
             RecoveryEvent::LocalBaselineBuilt { op } => {
                 if !self.expected(op, RecoveryStage::AcquiringBaseline) {
@@ -734,7 +648,7 @@ impl RecoveryEngine {
                     return Self::reject(RecoveryError::StaleOperation);
                 }
                 if !self.valid_handoff(op, &handoff) {
-                    return self.recover_origin();
+                    return self.recover_origin(RecoveryFallback::HandoffRejected);
                 }
                 self.baseline = Baseline::Peer;
                 self.peer_members = handoff.coverage.members;
@@ -768,7 +682,7 @@ impl RecoveryEngine {
                     return Self::reject(RecoveryError::InvalidEvidence);
                 }
                 if self.record_known_heads(&peers).is_err() {
-                    return self.fallback_or_origin();
+                    return self.fallback_or_origin(RecoveryFallback::EvidenceRejected);
                 }
                 self.operation = None;
                 self.operation_due = None;
@@ -799,7 +713,7 @@ impl RecoveryEngine {
                 if !self.valid_peer_roster(&peers, &identities)
                     || self.record_known_heads(&peers).is_err()
                 {
-                    return self.recover_origin();
+                    return self.recover_origin(RecoveryFallback::EvidenceRejected);
                 }
                 self.operation = None;
                 self.operation_due = None;
@@ -866,11 +780,11 @@ impl RecoveryEngine {
                 if self.state.stage == RecoveryStage::AcquiringBaseline
                     || self.baseline == Baseline::Peer
                 {
-                    self.recover_origin()
+                    self.recover_origin(RecoveryFallback::OperationFailed)
                 } else if self.plan == Plan::Full {
-                    self.retry_full()
+                    self.retry_full(RecoveryFallback::OperationFailed)
                 } else {
-                    self.fallback()
+                    self.fallback(RecoveryFallback::OperationFailed)
                 }
             }
             RecoveryEvent::Tick(now) => {
@@ -879,17 +793,17 @@ impl RecoveryEngine {
                 }
                 self.now = now;
                 if self.total_due.is_some_and(|due| now >= due) {
-                    return self.fallback_or_origin();
+                    return self.fallback_or_origin(RecoveryFallback::EpisodeExpired);
                 }
                 if self.operation_due.is_some_and(|due| now >= due) {
                     return if self.state.stage == RecoveryStage::AcquiringBaseline
                         || self.baseline == Baseline::Peer
                     {
-                        self.recover_origin()
+                        self.recover_origin(RecoveryFallback::OperationExpired)
                     } else if self.plan == Plan::Full {
-                        self.retry_full()
+                        self.retry_full(RecoveryFallback::OperationExpired)
                     } else {
-                        self.fallback()
+                        self.fallback(RecoveryFallback::OperationExpired)
                     };
                 }
                 if self.wait_due.is_some_and(|due| now >= due) {

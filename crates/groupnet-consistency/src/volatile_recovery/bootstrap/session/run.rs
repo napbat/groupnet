@@ -2,7 +2,7 @@
 
 use super::{
     Arc, BootstrapEffect, BootstrapEvent, BootstrapOutcome, BootstrapSession, BootstrapStage,
-    ClaimSource, DonorPort, Duration, Instant, PublicationPermit, RecoveryOperation,
+    ClaimSource, DeclineReason, DonorPort, Duration, Instant, PublicationPermit, RecoveryOperation,
     TransferContext, TransferEffect, TransferEvent, TransferResources,
 };
 use crate::volatile_recovery::bootstrap::ports::{
@@ -259,10 +259,10 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         permit: PublicationPermit,
     ) -> BootstrapOutcome {
         if permit.deadline().is_none() {
-            return BootstrapOutcome::Declined;
+            return self.declined(DeclineReason::ParentExpired);
         }
         if self.engine.stage() == BootstrapStage::Cancelled && !self.reset_engine() {
-            return BootstrapOutcome::Declined;
+            return self.declined(DeclineReason::Cancelled);
         }
         self.drop_capture();
         self.resources = TransferResources::default();
@@ -273,41 +273,43 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         self.permit = Some(permit.clone());
         self.ready_guard = None;
         if !self.accept(BootstrapEvent::Tick(self.now())) || !self.accept(BootstrapEvent::Start) {
-            return BootstrapOutcome::Declined;
+            return self.declined(DeclineReason::Refused);
         }
         loop {
             // The parent's deadline is the permit's current one: it moves
-            // later while the selected build reports progress.
+            // later while the selected build, or the transfer of its image,
+            // reports progress.
             if permit.deadline().is_none() {
-                return BootstrapOutcome::Declined;
+                return self.declined(DeclineReason::ParentExpired);
             }
             if !self.accept(BootstrapEvent::Tick(self.now())) {
-                return BootstrapOutcome::Declined;
+                return self.declined(DeclineReason::Refused);
             }
             // Every accepted step re-arms its timer. Drain the queued work
             // before the next Tick; re-ticking after a no-op effect queues a
             // fresh `ArmTimer` forever and never yields to the runtime.
             while let Some(effect) = self.effects.pop_front() {
                 let Some(due) = permit.deadline() else {
-                    return BootstrapOutcome::Declined;
+                    return self.declined(DeclineReason::ParentExpired);
                 };
                 if let Some(outcome) = self.execute_claim_effect(effect, due).await {
                     return outcome;
                 }
             }
-            if matches!(
-                self.engine.stage(),
-                BootstrapStage::Fallback | BootstrapStage::Cancelled
-            ) {
-                return BootstrapOutcome::Declined;
+            match self.engine.stage() {
+                BootstrapStage::Fallback => return self.declined(DeclineReason::SelectionEnded),
+                BootstrapStage::Cancelled => return self.declined(DeclineReason::Cancelled),
+                _ => {}
             }
-            let (Some(next), Some(due)) = (
-                self.engine
-                    .next_deadline()
-                    .and_then(|time| self.absolute(time)),
-                permit.deadline(),
-            ) else {
-                return BootstrapOutcome::Declined;
+            let Some(due) = permit.deadline() else {
+                return self.declined(DeclineReason::ParentExpired);
+            };
+            let Some(next) = self
+                .engine
+                .next_deadline()
+                .and_then(|time| self.absolute(time))
+            else {
+                return self.declined(DeclineReason::SelectionEnded);
             };
             let wake = Arc::clone(&self.wake);
             tokio::select! {
@@ -335,8 +337,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             | BootstrapEffect::FollowBuilder { .. }
             | BootstrapEffect::Released { .. } => {}
             BootstrapEffect::BuilderProgressed => {
-                // A followed build that keeps advancing keeps this follower's
-                // parent recovery alive past any fixed wait.
+                // A followed build, or the transfer of its image, that keeps
+                // advancing keeps this follower's parent recovery alive past
+                // any fixed wait.
                 if let Some(permit) = &self.permit {
                     permit.progress();
                 }
@@ -348,7 +351,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 )
                 .await;
                 if !matches!(result, Ok(Ok(()))) {
-                    return Some(BootstrapOutcome::Declined);
+                    return Some(self.declined(DeclineReason::ClaimPublishFailed));
                 }
             }
             BootstrapEffect::PublishPresence(presence) => {
@@ -362,7 +365,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                         identity: presence.identity,
                         renewal: presence.renewal,
                     });
-                    return Some(BootstrapOutcome::Declined);
+                    return Some(self.declined(DeclineReason::PresencePublishFailed));
                 }
             }
             BootstrapEffect::WithdrawClaim(identity) => {
@@ -401,17 +404,17 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 self.operation_due(op, due)?;
                 let members = if self.config.require_participation {
                     let Some(members) = self.acquisition_participation(due).await else {
-                        return Some(BootstrapOutcome::Declined);
+                        return Some(self.declined(DeclineReason::NoParticipation));
                     };
                     members
                 } else {
                     Vec::new()
                 };
                 let Some(recovery) = self.recovery else {
-                    return Some(BootstrapOutcome::Declined);
+                    return Some(self.declined(DeclineReason::Unbound));
                 };
                 let Some(permit) = self.permit.clone() else {
-                    return Some(BootstrapOutcome::Declined);
+                    return Some(self.declined(DeclineReason::Unbound));
                 };
                 let donor = Arc::clone(&self.donor);
                 let admission = self.admission.clone();
@@ -442,7 +445,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                         self.drain_maintenance().await;
                         return Some(BootstrapOutcome::LocalBuilt);
                     }
-                    return Some(BootstrapOutcome::Declined);
+                    return Some(self.declined(DeclineReason::BuildNotAccepted));
                 }
                 if let Some(Ok(LocalCaptureOutcome::Ready(capture))) = built {
                     // The build may have outlived the deadline sampled before
@@ -467,7 +470,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                                     self.drain_maintenance().await;
                                     return Some(BootstrapOutcome::LocalBuilt);
                                 }
-                                return Some(BootstrapOutcome::Declined);
+                                return Some(self.declined(DeclineReason::BuildNotAccepted));
                             }
                         }
                         self.capture = Some(capture);
@@ -476,7 +479,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                             selected: selected.clone(),
                         }) {
                             self.drop_capture();
-                            return Some(BootstrapOutcome::Declined);
+                            return Some(self.declined(DeclineReason::BuildNotAccepted));
                         }
                         // The same worker that owns the captured image
                         // updates the listener's exact admitted claim. A
@@ -502,7 +505,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     && self.acquisition_participation(due).await.is_none()
                 {
                     let _ = self.accept(BootstrapEvent::PeerTransferDeclined { op, selected });
-                    return Some(BootstrapOutcome::Declined);
+                    return Some(self.declined(DeclineReason::NoParticipation));
                 }
                 self.child_parent = Some(op);
                 self.transfer_context = Some(TransferContext {
@@ -516,7 +519,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     },
                 });
                 if !self.accept(BootstrapEvent::StartTransfer { op, selected }) {
-                    return Some(BootstrapOutcome::Declined);
+                    return Some(self.declined(DeclineReason::Refused));
                 }
             }
             BootstrapEffect::ObserveSelectedClaim { op, selected } => {
@@ -549,20 +552,27 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                             })
                         });
                         if !accepted {
-                            return Some(BootstrapOutcome::Declined);
+                            return Some(self.declined(DeclineReason::Refused));
                         }
                     }
                     Ok(Ok(None)) => {
                         let _ =
                             self.accept(BootstrapEvent::SelectedClaimObserved { op, claim: None });
                     }
-                    _ => return Some(BootstrapOutcome::Declined),
+                    // A failed or late read is one missed sample, not a
+                    // withdrawn donor: the core keeps the transfer running
+                    // while the claim it last saw is unexpired.
+                    _ => {
+                        let _ = self.accept(BootstrapEvent::SelectedClaimUnobserved { op });
+                    }
                 }
             }
             BootstrapEffect::Transfer(effect) => {
                 return self.execute_transfer_effect(*effect, due).await;
             }
-            BootstrapEffect::FallbackOrigin => return Some(BootstrapOutcome::Declined),
+            BootstrapEffect::FallbackOrigin => {
+                return Some(self.declined(DeclineReason::SelectionEnded));
+            }
         }
         None
     }

@@ -20,7 +20,7 @@ use super::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSource, DonorCapture, DonorPort,
     LogicalClock, TransferContext, TransferResources,
 };
-use super::report::{BootstrapDecision, BootstrapObserver, RecaptureDecline};
+use super::report::{BootstrapDecision, BootstrapObserver, DeclineReason, RecaptureDecline};
 use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit};
 
 const MAX_DONOR_SERVICE_BATCH: usize = 32;
@@ -217,6 +217,12 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             self.recapture_report = Some(reason);
             self.report(&BootstrapDecision::RecaptureDeclined { reason });
         }
+    }
+
+    /// End the acquisition without an image and report why.
+    fn declined(&self, reason: DeclineReason) -> BootstrapOutcome {
+        self.report(&BootstrapDecision::Declined { reason });
+        BootstrapOutcome::Declined
     }
 
     fn now(&self) -> Time {

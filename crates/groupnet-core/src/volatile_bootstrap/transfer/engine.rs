@@ -38,8 +38,8 @@ pub struct TransferSession {
 }
 
 impl TransferSession {
-    /// Construct an unstarted, authority-free transfer under immutable parent
-    /// selection and total deadlines.
+    /// Construct an unstarted, authority-free transfer under an exact parent
+    /// selection and its initial stall deadline.
     ///
     /// # Errors
     /// Rejects malformed identities, bounds, or a deadline already elapsed.
@@ -114,8 +114,8 @@ impl TransferSession {
         self.current
     }
 
-    /// Immutable claim-constrained deadline; every active effect is charged
-    /// to this absolute caller clock time.
+    /// Current stall deadline; every active effect is charged to this
+    /// absolute caller clock time. Only [`Self::renew`] moves it, later.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Time> {
         (!matches!(
@@ -132,6 +132,19 @@ impl TransferSession {
     #[must_use]
     pub fn parent(&self) -> BootstrapOperation {
         self.binding.parent
+    }
+
+    /// The transfer advanced: its stall deadline moves to `due` if that is
+    /// later. A transfer that keeps moving data is never expired by a fixed
+    /// bound; one that stalls still expires at its last renewed deadline.
+    pub fn renew(&mut self, due: Time) {
+        if !matches!(
+            self.stage,
+            TransferStage::Completed | TransferStage::Aborted
+        ) && due > self.binding.due
+        {
+            self.binding.due = due;
+        }
     }
 
     fn ok(&self, mut effects: Vec<TransferEffect>) -> TransferStep {
@@ -739,7 +752,7 @@ impl TransferSession {
                 if self.current != Some(op) {
                     return Self::reject(TransferError::Stale);
                 }
-                self.abort(TransferError::Continuity)
+                self.abort(TransferError::Unavailable)
             }
         }
     }

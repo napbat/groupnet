@@ -18,7 +18,8 @@ use groupnet_consistency::volatile_recovery::bootstrap::session::{
 };
 use groupnet_consistency::volatile_recovery::{
     AdapterError, BoxRecoveryFuture, Mark, PeerObservation, PublicationPermit, RecoveryAdapter,
-    RecoveryConfig, RecoveryHandle, RecoveryMode, RecoveryOperation, RecoveryRearm,
+    RecoveryConfig, RecoveryFallback, RecoveryHandle, RecoveryMode, RecoveryOperation,
+    RecoveryRearm, RecoveryStage,
 };
 use groupnet_core::volatile_bootstrap::journal::{CaptureId, DonorJournal, JournalConfig};
 use groupnet_core::volatile_bootstrap::transfer::{
@@ -52,7 +53,8 @@ fn member_from_claim(claim: &ClaimIdentity) -> BootstrapMemberIdentity {
 struct Claims {
     local: Mutex<Option<BootstrapClaim>>,
     presence: Mutex<Option<BootstrapPresence>>,
-    peer: Option<BootstrapClaim>,
+    /// The remote node's claim, which a scenario may advance or end.
+    peer: Mutex<Option<BootstrapClaim>>,
     joiner: Mutex<Option<(BootstrapMemberIdentity, bool)>>,
     pause_ready_renewal: std::sync::atomic::AtomicBool,
     ready_publishes: AtomicUsize,
@@ -99,7 +101,7 @@ impl ClaimSource for Claims {
                 remaining_ms: presence.remaining_ms,
             }];
             let mut claims = claim.into_iter().collect::<Vec<_>>();
-            if let Some(peer) = &self.peer {
+            if let Some(peer) = self.peer.lock().unwrap().clone() {
                 members.push(BootstrapMember {
                     node: peer.identity.node.clone(),
                     eligible: true,
@@ -115,10 +117,11 @@ impl ClaimSource for Claims {
                         member_incarnation: 1,
                         status: Status::Alive,
                     },
-                    renewal: 1,
+                    // The peer renews its presence whenever it renews its claim.
+                    renewal: peer.renewal,
                     remaining_ms: peer.remaining_ms,
                 });
-                claims.push(peer.clone());
+                claims.push(peer);
             }
             if let Some((member, present)) = self.joiner.lock().unwrap().clone() {
                 members.push(BootstrapMember {
@@ -233,12 +236,12 @@ impl ClaimSource for Claims {
                 node: NodeId::from("me"),
                 eligible: true,
             }];
-            if let Some(peer) = &self.peer {
+            if let Some(peer) = self.peer.lock().unwrap().clone() {
                 members.push(BootstrapMember {
                     node: peer.identity.node.clone(),
                     eligible: true,
                 });
-                claims.push(peer.clone());
+                claims.push(peer);
             }
             Ok(charge.hold(ClaimSnapshot {
                 sampled_at: Instant::now(),
@@ -264,16 +267,15 @@ impl ClaimSource for Claims {
         >,
     > {
         Box::pin(async move {
-            self.peer
-                .as_ref()
-                .filter(|peer| peer.identity == selected)
+            let peer = self.peer.lock().unwrap().clone();
+            peer.filter(|peer| peer.identity == selected)
                 .map(|peer| {
                     admission
                         .reserve(AdmissionClass::Inflight, 64)
                         .map(|reservation| {
                             reservation.hold(TimedClaim {
                                 sampled_at: Instant::now(),
-                                claim: peer.clone(),
+                                claim: peer,
                             })
                         })
                         .map_err(|_| AdapterError)
@@ -540,6 +542,8 @@ struct ReadAdapter {
     lapse_hold: AtomicBool,
     peer: Option<ClaimIdentity>,
     latest_origin_permit: Mutex<Option<PublicationPermit>>,
+    /// Every recovery fallback the worker reported, in order.
+    fallbacks: Mutex<Vec<(RecoveryStage, RecoveryFallback)>>,
 }
 
 impl RecoveryAdapter for ReadAdapter {
@@ -625,6 +629,10 @@ impl RecoveryAdapter for ReadAdapter {
     fn affirm(&self, _op: RecoveryOperation) -> bool {
         true
     }
+
+    fn fell_back(&self, from: RecoveryStage, reason: RecoveryFallback) {
+        self.fallbacks.lock().unwrap().push((from, reason));
+    }
 }
 
 fn bootstrap_config() -> BootstrapRuntimeConfig {
@@ -696,3 +704,6 @@ use peer_donor::PeerDonor;
 
 #[path = "volatile_bootstrap_runtime/origin_presence.rs"]
 mod origin_presence;
+
+#[path = "volatile_bootstrap_runtime/follower_progress.rs"]
+mod follower_progress;

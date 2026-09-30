@@ -849,6 +849,7 @@ impl ClaimEngine {
             BootstrapEvent::SelectedClaimObserved { op, claim } => {
                 self.selected_claim_observed(op, claim)
             }
+            BootstrapEvent::SelectedClaimUnobserved { op } => self.selected_claim_unobserved(op),
             BootstrapEvent::Transfer(event) => {
                 if matches!(
                     event.as_ref(),

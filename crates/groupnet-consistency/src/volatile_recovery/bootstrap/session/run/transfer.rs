@@ -2,8 +2,8 @@
 
 use super::super::{AcquisitionBinding, AdmissionClass, BootstrapOperation};
 use super::{
-    BootstrapEvent, BootstrapOutcome, BootstrapSession, BootstrapStage, ClaimSource, DonorPort,
-    Instant, TransferEffect, TransferEvent,
+    BootstrapEvent, BootstrapOutcome, BootstrapSession, BootstrapStage, ClaimSource, DeclineReason,
+    DonorPort, Instant, TransferEffect, TransferEvent,
 };
 
 impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
@@ -35,7 +35,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 .checked_mul(4)
                 .and_then(|bytes| bytes.checked_add(256));
             let Some(bytes) = bytes else {
-                return Some(BootstrapOutcome::Declined);
+                return Some(self.declined(DeclineReason::Admission));
             };
             let Ok(reservation) = self.admission.reserve(AdmissionClass::Inflight, bytes) else {
                 if let Some(op) = op {
@@ -58,10 +58,10 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             None
         };
         if installing && permit.as_ref().is_none_or(|permit| !permit.valid()) {
-            return Some(BootstrapOutcome::Declined);
+            return Some(self.declined(DeclineReason::ParentExpired));
         }
         let Some(context) = self.transfer_context.as_ref() else {
-            return Some(BootstrapOutcome::Declined);
+            return Some(self.declined(DeclineReason::Unbound));
         };
         let response = tokio::time::timeout_at(
             tokio::time::Instant::from_std(operation_due),
@@ -106,14 +106,14 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     (accepted, installed)
                 });
                 if !accepted {
-                    return Some(BootstrapOutcome::Declined);
+                    return Some(self.declined(DeclineReason::Refused));
                 }
                 if let Some(handoff) = installed {
                     if self.engine.stage() != BootstrapStage::Transferred {
-                        return Some(BootstrapOutcome::Declined);
+                        return Some(self.declined(DeclineReason::Refused));
                     }
                     let Some(charge) = handoff_charge else {
-                        return Some(BootstrapOutcome::Declined);
+                        return Some(self.declined(DeclineReason::Admission));
                     };
                     return Some(BootstrapOutcome::PeerInstalled(charge.hold(handoff)));
                 }

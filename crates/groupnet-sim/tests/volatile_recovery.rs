@@ -38,6 +38,7 @@ fn op(step: &RecoveryStep) -> RecoveryOperation {
             | RecoveryEffect::CancelBaseline { .. }
             | RecoveryEffect::SuspendLocalBaseline { .. }
             | RecoveryEffect::ResumeLocalBaseline { .. }
+            | RecoveryEffect::FellBack { .. }
             | RecoveryEffect::ArmTimer(_) => None,
             RecoveryEffect::AcquireBaseline { .. } | RecoveryEffect::ObservePeerHeads { .. } => {
                 panic!("default recovery cannot request peer bootstrap")
@@ -99,6 +100,7 @@ fn volatile_recovery_reaches_applied_heads_or_fences_full_fallback() {
         let mut applied_head = 1;
         let mut moved = false;
         let mut fell_back = false;
+        let mut reported_fallback = false;
         let mut observed_failure = false;
         let mut observed_disappearance = false;
         queue(
@@ -209,6 +211,9 @@ fn volatile_recovery_reaches_applied_heads_or_fences_full_fallback() {
                         assert!(due >= Time(time), "seed {seed}: backward timer");
                         timers.push(due);
                     }
+                    RecoveryEffect::FellBack { .. } => {
+                        reported_fallback = true;
+                    }
                     RecoveryEffect::AcquireBaseline { .. }
                     | RecoveryEffect::ObservePeerHeads { .. }
                     | RecoveryEffect::CancelBaseline { .. }
@@ -222,6 +227,10 @@ fn volatile_recovery_reaches_applied_heads_or_fences_full_fallback() {
                 assert!(engine.state().recovered);
                 assert!(applied_head >= source_head, "seed {seed}: stale index");
                 if fell_back {
+                    assert!(
+                        reported_fallback,
+                        "seed {seed}: a full fallback was not reported"
+                    );
                     fallback += 1;
                 } else {
                     cheap += 1;

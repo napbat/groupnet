@@ -124,6 +124,7 @@ fn operation(step: &RecoveryStep) -> RecoveryOperation {
             | RecoveryEffect::CancelBaseline { .. }
             | RecoveryEffect::SuspendLocalBaseline { .. }
             | RecoveryEffect::ResumeLocalBaseline { .. }
+            | RecoveryEffect::FellBack { .. }
             | RecoveryEffect::ArmTimer(_) => None,
         })
         .expect("one current operation")
@@ -486,6 +487,10 @@ fn failed_claim_cancels_child_and_origin_fallback_keeps_original_total() {
             .iter()
             .any(|effect| matches!(effect, RecoveryEffect::RebuildOrigin { .. }))
     );
+    assert!(failed.effects.contains(&RecoveryEffect::FellBack {
+        from: RecoveryStage::AcquiringBaseline,
+        reason: RecoveryFallback::OperationFailed,
+    }));
     assert_eq!(engine.state().stage, RecoveryStage::Rebuilding);
     assert_eq!(engine.state().generation, acquire.generation);
     assert_eq!(engine.next_deadline(), Some(Time(10)));
@@ -512,6 +517,10 @@ fn total_deadline_cancels_slow_transfer_without_starting_another_episode() {
         effect,
         RecoveryEffect::AcquireBaseline { .. } | RecoveryEffect::RebuildOrigin { .. }
     )));
+    assert!(expired.effects.contains(&RecoveryEffect::FellBack {
+        from: RecoveryStage::AcquiringBaseline,
+        reason: RecoveryFallback::EpisodeExpired,
+    }));
     assert_eq!(engine.state().stage, RecoveryStage::OriginOnly);
     assert_eq!(engine.state().generation, acquire.generation);
     assert!(!engine.state().recovered);

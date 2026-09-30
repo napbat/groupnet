@@ -656,7 +656,7 @@ async fn donor_only_invalidation_withdraws_ready_without_revoking_local_reads() 
     .await;
 }
 
-fn peer_identity() -> ClaimIdentity {
+pub(super) fn peer_identity() -> ClaimIdentity {
     ClaimIdentity {
         node: NodeId::from("peer"),
         incarnation: BootId(12),
@@ -665,7 +665,7 @@ fn peer_identity() -> ClaimIdentity {
     }
 }
 
-fn follower_identity() -> ClaimIdentity {
+pub(super) fn follower_identity() -> ClaimIdentity {
     ClaimIdentity {
         node: NodeId::from("me"),
         incarnation: BootId(17),
@@ -711,24 +711,55 @@ fn follower_setup_with_mode(
     RecoveryHandle<ReadAdapter>,
     Arc<ReadAdapter>,
 ) {
-    let peer = peer_identity();
     let claims = Arc::new(Claims {
-        local: Mutex::new(None),
-        peer: Some(BootstrapClaim {
-            identity: peer.clone(),
+        peer: Mutex::new(Some(BootstrapClaim {
+            identity: peer_identity(),
             renewal: 1,
             phase: groupnet_core::volatile_bootstrap::ClaimPhase::Ready,
             progress: 0,
             remaining_ms: 500,
-        }),
+        })),
         ..Claims::default()
     });
-    let donor = Arc::new(PeerDonor::new(&peer, &follower_identity()));
+    let donor = PeerDonor::new(&peer_identity(), &follower_identity());
     donor.pause_install.store(paused, Ordering::SeqCst);
+    let (donor, admission, handle, reads) = open_follower(
+        &claims,
+        donor,
+        config,
+        mode,
+        RecoveryConfig {
+            max_members: 2,
+            max_member_bytes: 8,
+            max_barrier_rounds: 2,
+            total_ms: 1_000,
+            attempt_ms: 500,
+            settle_ms: 5,
+            poll_ms: 5,
+        },
+    );
+    (claims, donor, admission, handle, reads)
+}
+
+/// Opens the follower "me" against `claims`, whose peer is `donor`.
+pub(super) fn open_follower(
+    claims: &Arc<Claims>,
+    donor: PeerDonor,
+    config: BootstrapRuntimeConfig,
+    mode: RecoveryMode,
+    recovery: RecoveryConfig,
+) -> (
+    Arc<PeerDonor>,
+    ByteAdmission,
+    RecoveryHandle<ReadAdapter>,
+    Arc<ReadAdapter>,
+) {
+    let peer = peer_identity();
+    let donor = Arc::new(donor);
     let admission = admission();
     let (driver, _sender) = BootstrapSession::new(
         BootstrapCapabilities {
-            claims: Arc::clone(&claims),
+            claims: Arc::clone(claims),
             donor: Arc::clone(&donor),
             admission: admission.clone(),
         },
@@ -748,22 +779,14 @@ fn follower_setup_with_mode(
     });
     let handle = RecoveryHandle::open_with_bootstrap(
         Arc::clone(&reads),
-        RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
-            total_ms: 1_000,
-            attempt_ms: 500,
-            settle_ms: 5,
-            poll_ms: 5,
-        },
+        recovery,
         mode,
         NodeId::from("me"),
         15,
         Box::new(driver),
     )
     .unwrap();
-    (claims, donor, admission, handle, reads)
+    (donor, admission, handle, reads)
 }
 
 #[tokio::test]

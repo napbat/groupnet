@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use groupnet_core::NodeId;
 use groupnet_core::volatile_recovery::{
     Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryEngine, RecoveryError, RecoveryEvent,
-    RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryState, RecoveryStep,
+    RecoveryFallback, RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState,
+    RecoveryStep,
 };
 use tokio::sync::Notify;
 
@@ -82,6 +83,11 @@ pub trait RecoveryAdapter: Send + Sync + 'static {
     /// This method is synchronous and must not block on network or origin I/O.
     /// It runs under the same short lock as public gate closure.
     fn affirm(&self, op: RecoveryOperation) -> bool;
+
+    /// The episode abandoned its path in stage `from` for `reason` and
+    /// started the fallback the core chose. Informational: report it in the
+    /// operator log. It runs on the worker and must return promptly.
+    fn fell_back(&self, from: RecoveryStage, reason: RecoveryFallback);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,11 +143,16 @@ fn pending_event(pending: Pending) -> RecoveryEvent {
 }
 
 fn signal_effects(tick: RecoveryStep, transition: RecoveryStep) -> Vec<RecoveryEffect> {
-    // A no-op signal must not erase a newly due timer's recovery work.
+    // A no-op signal must not erase a newly due timer's recovery work. A
+    // signal that supersedes that work still reports the fallback it made.
     if transition.effects.is_empty() {
         tick.effects
     } else {
-        transition.effects
+        tick.effects
+            .into_iter()
+            .filter(|effect| matches!(effect, RecoveryEffect::FellBack { .. }))
+            .chain(transition.effects)
+            .collect()
     }
 }
 

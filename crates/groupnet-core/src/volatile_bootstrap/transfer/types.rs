@@ -405,7 +405,7 @@ pub enum TransferEffect {
     },
     /// Drop the exact donor stream and reservation after resource retirement.
     ReleaseReservation(ReservationId),
-    /// Immutable parent-constrained total transfer deadline.
+    /// The transfer's current stall deadline, renewed as the transfer advances.
     ArmTimer(Time),
 }
 
@@ -428,8 +428,10 @@ pub enum TransferError {
     Continuity,
     /// Caller-supplied time moved backward.
     BackwardTime,
-    /// Immutable total transfer deadline elapsed.
+    /// The transfer made no progress for its whole stall bound.
     Expired,
+    /// One runtime or source operation failed or outlived its deadline.
+    Unavailable,
 }
 
 /// One deterministic transition with effects and an optional rejection.
@@ -452,6 +454,7 @@ pub struct TransferBinding {
     pub donor: ClaimIdentity,
     /// Exact local follower identity; its boot/session/attempt match `parent`.
     pub follower: ClaimIdentity,
-    /// Original min(donor wait, selection total) absolute deadline.
+    /// Initial stall bound: min(donor wait, selection total) from the start.
+    /// The claim parent moves it later on each advance of the transfer.
     pub due: Time,
 }

@@ -60,6 +60,8 @@ impl RecoveryAdapter for Adapter {
     fn affirm(&self, _op: RecoveryOperation) -> bool {
         true
     }
+
+    fn fell_back(&self, _from: RecoveryStage, _reason: RecoveryFallback) {}
 }
 
 fn shared() -> Arc<Shared<Adapter>> {

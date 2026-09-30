@@ -36,6 +36,42 @@ pub enum BootstrapDecision {
         /// Why no Ready donor image was offered.
         reason: RecaptureDecline,
     },
+    /// This node's peer bootstrap ended without an image for the reason
+    /// given; the recovery continues on its own origin path, which the
+    /// recovery adapter's fallback report names.
+    Declined {
+        /// Why the acquisition ended.
+        reason: DeclineReason,
+    },
+}
+
+/// Why one peer-bootstrap acquisition ended without an image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The parent recovery operation expired or was fenced, by a gap, a
+    /// lapse, or cancellation, before the acquisition finished.
+    ParentExpired,
+    /// The acquisition had no current parent binding to run under.
+    Unbound,
+    /// The claim core ended the selection in its origin fallback; any wait
+    /// it abandoned was reported as `Released` first.
+    SelectionEnded,
+    /// The claim core was cancelled and could not start a fresh selection.
+    Cancelled,
+    /// The claim core refused a result as stale or invalid.
+    Refused,
+    /// Publishing this node's claim failed or timed out.
+    ClaimPublishFailed,
+    /// Publishing this node's presence failed or timed out.
+    PresencePublishFailed,
+    /// No complete participation cut was available for the local build or
+    /// the peer transfer.
+    NoParticipation,
+    /// The local build finished, but its image could not be offered or
+    /// was not accepted by the claim core.
+    BuildNotAccepted,
+    /// Memory admission refused the installed handoff's receipt.
+    Admission,
 }
 
 /// Why a completed local image offered no Ready donor capture.

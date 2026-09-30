@@ -96,6 +96,13 @@ impl RecoveryAdapter for MemoryAdapter {
     fn affirm(&self, _op: RecoveryOperation) -> bool {
         true
     }
+
+    fn fell_back(
+        &self,
+        _from: groupnet_consistency::volatile_recovery::RecoveryStage,
+        _reason: groupnet_consistency::volatile_recovery::RecoveryFallback,
+    ) {
+    }
 }
 
 fn config() -> RecoveryConfig {

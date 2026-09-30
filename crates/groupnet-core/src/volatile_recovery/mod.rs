@@ -8,8 +8,8 @@ mod types;
 
 pub use engine::RecoveryEngine;
 pub use types::{
-    Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryError, RecoveryEvent, RecoveryMode,
-    RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState, RecoveryStep,
+    Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryError, RecoveryEvent, RecoveryFallback,
+    RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState, RecoveryStep,
 };
 
 #[cfg(test)]

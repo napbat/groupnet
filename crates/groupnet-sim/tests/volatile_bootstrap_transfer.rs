@@ -286,10 +286,16 @@ fn reply(
         TransferEffect::ReserveDonor { op, capture, cut } => {
             assert_eq!(capture, fixture.offer.capture);
             assert_eq!(cut, fixture.offer.image_cut);
-            let reservation = fixture
-                .journal
-                .reserve(Time(now), fixture.follower.clone(), &cut)
-                .unwrap();
+            // A donor journal operation after the reservation's own bound
+            // (a faulted transfer that kept advancing) fails as the real
+            // donor does, and the follower aborts.
+            let Ok(reservation) =
+                fixture
+                    .journal
+                    .reserve(Time(now), fixture.follower.clone(), &cut)
+            else {
+                return Some(failed(op));
+            };
             fixture.reservation = Some(reservation.clone());
             TransferEvent::DonorReserved { op, reservation }
         }
@@ -308,19 +314,22 @@ fn reply(
             commitment: fixture.offer.commitment,
         },
         TransferEffect::AttachStream { op, reservation } => {
-            let token = fixture
-                .journal
-                .begin_attach(Time(now), &reservation)
-                .unwrap();
-            fixture.journal.confirm_attach(Time(now), &token).unwrap();
+            let Ok(token) = fixture.journal.begin_attach(Time(now), &reservation) else {
+                return Some(failed(op));
+            };
+            if fixture.journal.confirm_attach(Time(now), &token).is_err() {
+                return Some(failed(op));
+            }
             TransferEvent::StreamAttached { op, token }
         }
         TransferEffect::FetchBarrier { op, reservation } => {
-            let receipt = fixture.journal.barrier(Time(now), &reservation).unwrap();
+            let Ok(receipt) = fixture.journal.barrier(Time(now), &reservation) else {
+                return Some(failed(op));
+            };
             assert_eq!(receipt.cursor.position, 2);
             fixture.barrier = Some(receipt.clone());
             // The donor publishes after B was sampled but before B is delivered.
-            fixture
+            if fixture
                 .journal
                 .append(
                     Time(now),
@@ -332,17 +341,22 @@ fn reply(
                     }),
                     vec![0],
                 )
-                .unwrap();
+                .is_err()
+            {
+                return Some(failed(op));
+            }
             apply(&mut fixture.reference_image, &[0]);
             TransferEvent::BarrierReceived { op, receipt }
         }
         TransferEffect::AdvanceBarrier { op, expected } => {
             assert_eq!(fixture.barrier.as_ref(), Some(&expected));
             let reservation = fixture.reservation.as_ref().unwrap();
-            let receipt = fixture
+            let Ok(receipt) = fixture
                 .journal
                 .advance_barrier(Time(now), reservation, &expected)
-                .unwrap();
+            else {
+                return Some(failed(op));
+            };
             assert_eq!(receipt.cursor.position, 3);
             fixture.barrier = Some(receipt.clone());
             fixture.barrier_advances += 1;
@@ -350,11 +364,10 @@ fn reply(
         }
         TransferEffect::FetchBatch { op, receipt } => {
             let reservation = fixture.reservation.as_ref().unwrap();
-            let batch = fixture
-                .journal
-                .read_batch(Time(now), reservation, &receipt)
-                .unwrap()
-                .unwrap();
+            let Ok(batch) = fixture.journal.read_batch(Time(now), reservation, &receipt) else {
+                return Some(failed(op));
+            };
+            let batch = batch.unwrap();
             for delta in &batch.deltas {
                 if let DeltaIdentity::Native(cut) = &delta.identity {
                     assert_eq!(cut.sequence, fixture.staged_native_sequence + 1);
@@ -371,10 +384,13 @@ fn reply(
             batch_operation,
             through,
         } => {
-            let confirmed = fixture
-                .journal
-                .ack_batch(Time(now), &reservation, batch_operation, &through)
-                .unwrap();
+            let Ok(confirmed) =
+                fixture
+                    .journal
+                    .ack_batch(Time(now), &reservation, batch_operation, &through)
+            else {
+                return Some(failed(op));
+            };
             TransferEvent::BatchAcknowledged {
                 op,
                 through: confirmed,
@@ -448,6 +464,11 @@ fn reply(
         TransferEffect::ArmTimer(_) => return None,
     };
     Some(BootstrapEvent::Transfer(Box::new(event)))
+}
+
+/// The donor answered `op` with an error.
+fn failed(op: BootstrapOperation) -> BootstrapEvent {
+    BootstrapEvent::Transfer(Box::new(TransferEvent::Failed { op }))
 }
 
 #[derive(Default)]
@@ -578,7 +599,10 @@ fn run(seed: u64, healthy: bool, coverage: &mut Coverage) {
             coverage,
         );
     }
-    for now in 3..=31 {
+    // Every transfer advance restarts the 14 ms stall bound, so a faulted run
+    // that stalls late ends a stall bound after its last advance, past the
+    // original 24 ms total; the horizon still bounds every run.
+    for now in 3..=64 {
         let tick = engine.step(BootstrapEvent::Tick(Time(now)));
         enqueue(
             tick.effects,

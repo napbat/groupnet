@@ -68,7 +68,7 @@ fn transient_full_scan_failures_retry_without_reviving_old_operations() {
                                 .effects,
                         );
                     }
-                    RecoveryEffect::ArmTimer(_) => {}
+                    RecoveryEffect::ArmTimer(_) | RecoveryEffect::FellBack { .. } => {}
                     RecoveryEffect::AcquireBaseline { .. }
                     | RecoveryEffect::ObservePeerHeads { .. }
                     | RecoveryEffect::CancelBaseline { .. }
