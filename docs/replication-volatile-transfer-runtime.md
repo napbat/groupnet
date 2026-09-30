@@ -35,7 +35,8 @@ and recovery operation deadlines for one timer. The claim and transfer
 engines separately bound each source and stage operation. Applying ordinary
 `attempt_ms` to the entire parent would abort healthy multi-step transfers.
 
-Only build progress renews these bounds. The builder's local build reports
+Only progress renews these bounds: build progress, and the progress of a
+peer transfer. The builder's local build reports
 each committed origin page through the parent `PublicationPermit::progress`,
 which renews the recovery episode exactly as for `RebuildOrigin`. While the
 build runs the worker keeps publishing claim and presence renewals, and on
@@ -49,11 +50,39 @@ keeps advancing, however long its scan runs. It releases the builder only when
 the claim disappears (the builder's own stall bound ended it and withdrew the
 claim) or when no advance has been seen for `donor_wait_ms + claim_ttl_ms +
 observe_ms` — the builder's own bound plus the time its last advance takes to
-become visible and be sampled — and then scans the origin itself. A failed or
-declined donor
+become visible and be sampled — and then scans the origin itself.
+
+A peer transfer from a Ready donor is bounded the same way. It starts with
+the stall bound min(`donor_wait_ms`, the claim episode's total), but every
+real advance of the transfer (`Offered`, `StageReserved`, `DonorReserved`,
+`ChunkStored`, `ImageVerified`, `StreamAttached`, `BatchStaged`,
+`BatchAcknowledged`, `NativeCovered`) restarts that stall bound, the parent
+operation deadline and the claim episode, and emits `BuilderProgressed`, which
+the worker turns into `PublicationPermit::progress` on its parent permit. A
+large image on a loaded node may therefore take longer than `donor_wait_ms`,
+or than the recovery `total_ms`, as long as it keeps advancing. Pending native
+coverage and coverage re-polls are not advances, so a stalled transfer still
+aborts at its last bound (`TransferError::Expired`); a failed or timed-out
+runtime operation aborts it with `TransferError::Unavailable`. An abort is
+reported as `Released { reason: TransferAborted(error) }`. A failed or
+timed-out refresh read of the donor's claim during the transfer
+(`SelectedClaimUnobserved`) is not evidence that the donor left: the transfer
+continues while the claim last observed is unexpired and samples again.
+
+A failed or declined donor
 returns a typed `BootstrapDeclined { op }` to the recovery engine, which then
 emits a fresh guarded `RebuildOrigin` in the **same** original recovery
-episode. It never starts an unbounded new origin attempt. A local provisional
+episode. It never starts an unbounded new origin attempt. The session reports
+each decline to the `BootstrapObserver` as `BootstrapDecision::Declined {
+reason }` (`ParentExpired`, `Unbound`, `SelectionEnded`, `Cancelled`,
+`Refused`, `ClaimPublishFailed`, `PresencePublishFailed`, `NoParticipation`,
+`BuildNotAccepted` or `Admission`), and every path on which the recovery
+engine abandons its current stage emits `RecoveryEffect::FellBack { from,
+reason }` (`EpisodeExpired`, `OperationExpired`, `OperationFailed`,
+`BaselineDeclined`, `HandoffRejected`, `EvidenceRejected`,
+`MembershipChanged`, `BarrierExhausted` or `Exhausted`). The shell delivers it
+to the required `RecoveryAdapter::fell_back(from, reason)`, also when a signal
+supersedes the queued fallback work, so no origin fallback is silent. A local provisional
 builder also uses the existing `rebuild_origin` callback and publication
 permit; its correlated success supplies the local baseline and may publish
 `Ready` as donor availability, never as read authority. It reports

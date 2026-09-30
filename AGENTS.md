@@ -52,24 +52,26 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    there. (Largest today, and the only ones still within ~50 lines of the
    limit, so the next addition to them splits them *first*:
    `groupnet-consistency`'s `src/replication/shell/driver.rs` ~967,
-   `tests/lease_dst.rs` ~948 and `tests/replication.rs` ~944;
+   `tests/lease_dst.rs` ~948, `tests/replication.rs` ~944 and
+   `tests/volatile_bootstrap_runtime/scenarios.rs` ~949 (new runtime
+   scenarios go in their own `volatile_bootstrap_runtime/` children, as
+   `follower_progress.rs` does; the parent, ~709 since `PeerDonor` moved to
+   `peer_donor.rs`, keeps the shared fakes);
    `groupnet-runtime`'s `src/driver.rs` ~960 and `src/group.rs` ~960. The
    band under them, with ~60–150 lines of room: `groupnet-core`'s
-   `src/volatile_recovery/engine.rs` ~939, `tests/election.rs` ~909,
-   `src/volatile_bootstrap/engine.rs` ~906,
+   `tests/election.rs` ~909, `src/volatile_bootstrap/engine.rs` ~907,
    `src/volatile_bootstrap/engine/participation.rs` ~883,
    `src/engine/election/mod.rs` ~873,
-   `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861 and
-   `src/engine/election/quorum.rs` ~859; `groupnet-sim`'s
+   `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861,
+   `src/engine/election/quorum.rs` ~859 and
+   `src/volatile_recovery/engine.rs` ~853 (its fallback paths moved to
+   `engine/fallback.rs`); `groupnet-sim`'s
    `tests/election_external_skew.rs` ~910, `tests/election_quorum.rs` ~896
    and `src/simulation.rs` ~894; `groupnet-consistency`'s
-   `tests/volatile_bootstrap_runtime/scenarios.rs` ~926 (new runtime
-   scenarios go in their own `volatile_bootstrap_runtime/` children; the
-   parent, ~698 since `PeerDonor` moved to `peer_donor.rs`, keeps the shared
-   fakes), `src/replication/shell.rs` ~914, `src/lease/shell.rs` ~889,
+   `src/replication/shell.rs` ~914, `src/lease/shell.rs` ~889,
    `tests/hosted_dst_liveness.rs` ~875, `tests/volatile_bootstrap_bulk_adapter.rs`
-   ~864, `tests/lease_dst_liveness.rs` ~853,
-   `src/volatile_recovery/bootstrap/session/run.rs` ~852,
+   ~864, `src/volatile_recovery/bootstrap/session/run.rs` ~862,
+   `tests/lease_dst_liveness.rs` ~853,
    `src/replication/shell/driver/snapshot.rs` ~844 and
    `tests/replication_snapshot.rs` ~840.
    With room still: `groupnet-runtime`'s `src/node.rs` ~803,

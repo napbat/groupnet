@@ -81,8 +81,15 @@ a loaded peer, is sampled again inside the grace rather than replaced; a
 builder that withdraws its claim while it is still an eligible member ended
 its build and is taken over at once. The core reports every wait it gives up
 as an informational `Released { builder, reason }` effect (`Stalled`,
-`Withdrawn`, `DonorUnavailable`, `Unverified` or `Ended`), which the runtime
-passes to an optional `BootstrapObserver` for operator logs.
+`Withdrawn`, `DonorUnavailable`, `Unverified`, `Ended` or
+`TransferAborted(error)` when the transfer from a Ready donor aborts), which
+the runtime passes to an optional `BootstrapObserver` for operator logs. The
+observer also receives `BootstrapDecision::Declined { reason }` whenever the
+session ends without an image, and the recovery adapter's `fell_back(from,
+reason)` names the origin path the episode then takes. A transfer that keeps
+advancing renews its own stall bound and the parent budgets, so a slow but
+live transfer is never released for outliving `donor_wait_ms` (see
+`replication-volatile-transfer-runtime.md`).
 
 The narrow runtime primitive is a fixed two-key
 `Group::inspect_scoped_pair(presence_key, claim_key, limits, owned_budget)`.

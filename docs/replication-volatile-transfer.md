@@ -24,16 +24,23 @@ The claim parent chooses a bounded donor takeover or its existing guarded
 origin fallback after the child reports failure.
 
 The first `DonorAvailable` operation's absolute `operation_due` and the
-original follower episode's `total_due` are retained when transfer starts.
-Its effective transfer deadline is their minimum. The ordinary claim poll
+original follower episode's `total_due` bound the transfer when it starts:
+its initial stall deadline is their minimum. Each real advance of the
+transfer (an offer, a reservation, a stored chunk, a verified image, an
+attached stream, a staged or acknowledged batch, native coverage) restarts
+that stall bound as `donor_wait_ms` from the advance, renews the parent
+operation and claim episode, and reports progress to the parent recovery, so
+only a transfer that stops advancing expires. The ordinary claim poll
 timer pauses while transfer is active; `ClaimEngine::Tick` drives the child
 deadline, local claim renewals, and a separately correlated native TTL
-refresh for the exact selected donor. An absent, expired, contradictory, or
-unrefreshed claim aborts transfer without replacing the parent operation
-with `ObserveClaims`. Transfer success completes the candidate handoff;
-failure excludes that exact donor and resumes bounded observation/takeover
-within the original total budget. Neither a delayed offer nor a later ready
-advertisement extends either deadline. A self-built `Ready` donor may remain
+refresh for the exact selected donor. An absent, expired, or contradictory
+claim aborts transfer without replacing the parent operation with
+`ObserveClaims`; a refresh read that fails or times out is sampled again, and
+the donor's last observed claim expiry still bounds the transfer. Transfer
+success completes the candidate handoff; failure excludes that exact donor,
+reports `Released { reason: TransferAborted(error) }`, and resumes bounded
+observation/takeover. A later ready advertisement alone extends no deadline.
+A self-built `Ready` donor may remain
 available to others, but its own claim grants no serving authority.
 
 The donor offer binds the scope, exact donor boot/session/attempt, fresh
