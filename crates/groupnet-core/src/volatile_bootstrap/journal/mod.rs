@@ -6,7 +6,7 @@ mod cuts;
 mod types;
 
 pub use core::DonorJournal;
-pub use cuts::{CutAlignment, align_cuts};
+pub use cuts::{Alignment, CutAlignment, CutDifference, align_cuts};
 pub use types::{
     AttachToken, BarrierReceipt, CaptureCharge, CaptureId, DeltaIdentity, Invalidation,
     JournalBatch, JournalConfig, JournalCursor, JournalDelta, JournalError, JournalState,
