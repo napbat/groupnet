@@ -315,16 +315,20 @@ pub enum BootstrapEvent {
         selected: ClaimIdentity,
     },
     /// A guarded local origin build completed, but this episode cannot
-    /// advertise a donor candidate. Withdraw only the transient claim;
-    /// ordinary local recovery may still affirm independently.
+    /// advertise a donor candidate yet; ordinary local recovery may still
+    /// affirm independently. With participation required a Ready recapture
+    /// follows, so the builder's claim stays until that recapture's claim
+    /// supersedes it or native TTL expires it; otherwise it is withdrawn.
     LocalOnlyBuilt {
         /// Exact build operation.
         op: BootstrapOperation,
         /// Exact selected local builder identity.
         selected: ClaimIdentity,
     },
-    /// Local origin is serving, so attempt one fresh bounded donor recapture.
-    /// This is separate from the completed origin build and cannot rescan it.
+    /// Local origin is serving, so attempt one fresh bounded donor recapture
+    /// under the complete participation cut just verified. This is separate
+    /// from the completed origin build and cannot rescan it. A cut equal to
+    /// the one the last recapture failed under starts nothing.
     StartReadyRecapture,
     /// Peer transfer cannot represent the required roster format. Retire the
     /// transient local claim while leaving participation renewal active and
@@ -335,7 +339,9 @@ pub enum BootstrapEvent {
         /// Exact selected peer that cannot be transferred in this mode.
         selected: ClaimIdentity,
     },
-    /// Local guarded origin build failed or lost its recovery permit.
+    /// Local guarded origin build failed or lost its recovery permit. For a
+    /// Ready recapture this only makes the recapture pending again, to be
+    /// retried under a different participation cut; it is no origin fallback.
     BuildFailed {
         /// Exact build operation.
         op: BootstrapOperation,
@@ -429,7 +435,7 @@ pub enum BootstrapEffect {
     RecaptureCurrent {
         /// Fresh operation from the same token allocator.
         op: BootstrapOperation,
-        /// New donor claim attempt after old Ready withdrawal.
+        /// New donor claim attempt, superseding the previous claim.
         selected: ClaimIdentity,
     },
     /// Await a selected builder's candidate without opening local reads.

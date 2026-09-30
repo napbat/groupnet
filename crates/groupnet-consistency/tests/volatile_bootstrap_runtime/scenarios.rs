@@ -286,17 +286,33 @@ async fn required_participation_keeps_local_origin_and_declines_claim_only_donor
         || handle.status().may_serve && donor.builds.load(Ordering::SeqCst) == 1,
     )
     .await;
+    // The declined image is never advertised Ready. Its one failed recapture
+    // leaves the last Building claim to native TTL and is not retried under
+    // the unchanged roster.
     eventually_within(
         "claim-only donor retires but participation remains",
         SETTLE,
         || {
-            claims.local.lock().unwrap().is_none()
-                && claims.presence.lock().unwrap().is_some()
+            claims.local.lock().unwrap().as_ref().is_none_or(|claim| {
+                claim.phase != groupnet_core::volatile_bootstrap::ClaimPhase::Ready
+            }) && claims.presence.lock().unwrap().is_some()
                 && sender.current_identity().is_none()
                 && donor.ingress.lock().unwrap().is_none()
+                && donor.recapture_attempts.load(Ordering::SeqCst) == 1
         },
     )
     .await;
+    let renewal = claims.presence.lock().unwrap().as_ref().unwrap().renewal;
+    eventually_within("maintenance turns keep running", SETTLE, || {
+        claims
+            .presence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|presence| presence.renewal > renewal + 2)
+    })
+    .await;
+    assert_eq!(donor.recapture_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
     handle.cancel().unwrap();
     eventually_within("cancel withdraws the exact participation", SETTLE, || {

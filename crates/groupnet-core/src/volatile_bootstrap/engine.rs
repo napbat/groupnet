@@ -13,6 +13,7 @@ use super::types::{
 };
 
 mod participation;
+mod recapture;
 mod selection;
 mod transfer;
 
@@ -51,6 +52,11 @@ pub struct ClaimEngine {
     presence_due: Option<Time>,
     participation_required: bool,
     participant_roster: Option<Vec<BootstrapMemberIdentity>>,
+    /// The complete cut a running Ready recapture started under.
+    recapture_roster: Option<Vec<BootstrapMemberIdentity>>,
+    /// The cut the last Ready recapture failed under; only a different cut
+    /// retries it.
+    failed_recapture: Option<Vec<BootstrapMemberIdentity>>,
     observed_presence: BTreeMap<PresenceIdentity, ObservedPresence>,
     settle_due: Option<Time>,
     renew_due: Option<Time>,
@@ -118,6 +124,8 @@ impl ClaimEngine {
             presence_due: None,
             participation_required: false,
             participant_roster: None,
+            recapture_roster: None,
+            failed_recapture: None,
             observed_presence: BTreeMap::new(),
             settle_due: None,
             renew_due: None,
@@ -322,6 +330,7 @@ impl ClaimEngine {
         self.ready_retry_due = None;
         self.total_due = None;
         self.selected = None;
+        self.recapture_roster = None;
         effects.push(BootstrapEffect::WithdrawClaim(self.identity()));
         effects.push(BootstrapEffect::FallbackOrigin);
         self.ok(effects)
@@ -420,6 +429,8 @@ impl ClaimEngine {
         self.observed.clear();
         self.observed_presence.clear();
         self.participant_roster = None;
+        self.recapture_roster = None;
+        self.failed_recapture = None;
         self.roster_poll = None;
         self.roster_poll_due = None;
         self.excluded.clear();
@@ -596,17 +607,23 @@ impl ClaimEngine {
         if self.total_due.is_some_and(|due| now >= due) {
             return self.terminate();
         }
+        if self.stage == BootstrapStage::Building
+            && self.operation_due.is_some_and(|due| now >= due)
+        {
+            // Checked before any renewal: a failed recapture keeps its last
+            // published claim, which must match this engine's own sequence.
+            return if self.recapturing() {
+                self.recapture_failed()
+            } else {
+                self.terminate()
+            };
+        }
         let mut effects = Vec::new();
         if self.renew_due.is_some_and(|due| now >= due) {
             match self.publish_renewal() {
                 Ok(claim) => effects.push(claim),
                 Err(_) => return self.terminate(),
             }
-        }
-        if self.stage == BootstrapStage::Building
-            && self.operation_due.is_some_and(|due| now >= due)
-        {
-            return self.terminate();
         }
         if self.settle_due.is_some_and(|due| now >= due)
             || self.operation_due.is_some_and(|due| now >= due)
@@ -743,6 +760,8 @@ impl ClaimEngine {
                 self.operation = None;
                 self.operation_due = None;
                 self.total_due = None;
+                self.recapture_roster = None;
+                self.failed_recapture = None;
                 self.stage = BootstrapStage::DonorAvailable;
                 self.local_phase = ClaimPhase::Ready;
                 let Ok(claim) = self.publish_renewal() else {
@@ -773,7 +792,11 @@ impl ClaimEngine {
                 {
                     return Self::reject(BootstrapError::StaleOperation);
                 }
-                self.terminate()
+                if self.recapturing() {
+                    self.recapture_failed()
+                } else {
+                    self.terminate()
+                }
             }
             BootstrapEvent::DonorUnavailable { op, selected } => {
                 if self.stage == BootstrapStage::Transferring

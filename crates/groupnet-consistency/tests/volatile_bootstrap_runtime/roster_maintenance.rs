@@ -268,8 +268,12 @@ async fn ready_donor_retires_changed_roster_then_recaptures_without_origin_scan(
     handle.cancel().unwrap();
 }
 
+/// An invalidated Ready capture is retired at once and its replacement
+/// recapture fails. Under the unchanged roster that failure is neither
+/// advertised Ready nor retried, while local serving stays up. A membership
+/// change then retries it once, and nothing ever scans the origin again.
 #[tokio::test]
-async fn invalidated_ready_capture_wakes_worker_and_failed_replacement_stays_withdrawn() {
+async fn failed_replacement_waits_for_a_roster_change_then_recaptures_once() {
     let (claims, donor, reads, handle) = open_local_only_donor();
     wait_ready(&claims, &donor, &handle).await;
     donor.allow_recapture.store(false, Ordering::SeqCst);
@@ -277,15 +281,65 @@ async fn invalidated_ready_capture_wakes_worker_and_failed_replacement_stays_wit
     old.with_journal(|journal| {
         journal.invalidate(groupnet_core::volatile_bootstrap::journal::Invalidation::DonorLost);
     });
-    eventually_within("invalidated capture withdraws Ready", SETTLE, || {
+    eventually_within("invalidated capture's replacement fails", SETTLE, || {
         donor.ingress.lock().unwrap().is_none()
-            && claims.local.lock().unwrap().is_none()
-            && claims.presence.lock().unwrap().is_some()
+            && donor.recapture_attempts.load(Ordering::SeqCst) == 2
     })
     .await;
+    let renewal = claims.presence.lock().unwrap().as_ref().unwrap().renewal;
+    eventually_within("maintenance turns keep running", SETTLE, || {
+        claims
+            .presence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|presence| presence.renewal > renewal + 2)
+    })
+    .await;
+    assert_eq!(donor.recapture_attempts.load(Ordering::SeqCst), 2);
+    assert!(
+        claims
+            .local
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|claim| claim.phase != ClaimPhase::Ready)
+    );
+    assert!(handle.status().may_serve);
+
+    donor.allow_recapture.store(true, Ordering::SeqCst);
+    let joiner = BootstrapMemberIdentity {
+        node: NodeId::from("peer"),
+        presence: Some(PresenceIdentity {
+            node: NodeId::from("peer"),
+            boot: BootId(9),
+            session: 2,
+        }),
+        member_incarnation: 2,
+        status: Status::Alive,
+    };
+    *claims.joiner.lock().unwrap() = Some((joiner, true));
+    eventually_within("a changed roster retries the recapture", SETTLE, || {
+        claims
+            .local
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|claim| claim.phase == ClaimPhase::Ready)
+            && donor
+                .ingress
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|ingress| {
+                    ingress.with_journal(|journal| journal.image_members().len() == 2)
+                })
+    })
+    .await;
+    assert_eq!(donor.recapture_attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(donor.recaptures.load(Ordering::SeqCst), 2);
     assert!(handle.status().may_serve);
     assert_eq!(donor.builds.load(Ordering::SeqCst), 1);
-    assert_eq!(donor.recaptures.load(Ordering::SeqCst), 1);
     assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
     handle.cancel().unwrap();
 }

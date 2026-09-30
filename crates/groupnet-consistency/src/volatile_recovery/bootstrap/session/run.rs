@@ -184,23 +184,31 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         Some(())
     }
 
-    /// Drive the local origin build while keeping its Building claim alive.
-    /// Claim and presence renewals publish on their cadence during the scan,
-    /// and each renewal turn converts progress the build reported on the
-    /// parent permit into `BuildProgressed`, which restarts the build's stall
-    /// bound and advertises the advance to followers. `None` once the stall
-    /// bound, the parent deadline, or a failed renewal ends the build first;
-    /// dropping the future stops it before any later publication.
-    async fn await_build<T>(
+    /// Drive local work, an origin build or a Ready recapture, while keeping
+    /// this node's claim and presence renewed on their cadence, so neither
+    /// lapses however long the work runs. For a build, each renewal turn
+    /// converts progress the build reported on the parent permit into
+    /// `BuildProgressed`, which restarts the build's stall bound and
+    /// advertises the advance to followers. `outer` is the work's current
+    /// outer deadline. `None` once the operation's bound, `outer`, or a
+    /// failed renewal ends the work first; dropping the future stops it
+    /// before any later publication.
+    async fn await_renewing<T>(
         &mut self,
         op: groupnet_core::volatile_bootstrap::BootstrapOperation,
-        selected: &ClaimIdentity,
-        permit: &PublicationPermit,
-        mut build: crate::volatile_recovery::BoxRecoveryFuture<'_, T>,
+        build: Option<(&ClaimIdentity, &PublicationPermit)>,
+        outer: impl Fn() -> Option<Instant>,
+        mut work: crate::volatile_recovery::BoxRecoveryFuture<'_, T>,
     ) -> Option<T> {
-        let mut reported = permit.progress_reports()?;
+        let mut reported = match build {
+            Some((_, permit)) => Some(permit.progress_reports()?),
+            None => None,
+        };
         loop {
-            let operation_due = self.operation_due(op, permit.deadline()?)?;
+            let operation_due = self.operation_due(op, outer()?)?;
+            if Instant::now() >= operation_due {
+                return None;
+            }
             let wake = self
                 .engine
                 .next_deadline()
@@ -208,14 +216,15 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 .map_or(operation_due, |due| due.min(operation_due));
             tokio::select! {
                 biased;
-                value = &mut build => return Some(value),
+                value = &mut work => return Some(value),
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
             }
             let queued = self.effects.len();
-            if let Some(progress) = permit.progress_reports()
-                && progress != reported
+            if let Some((selected, permit)) = build
+                && let Some(progress) = permit.progress_reports()
+                && Some(progress) != reported
             {
-                reported = progress;
+                reported = Some(progress);
                 // Applied before this turn's tick, so progress reported just
                 // before the stall bound still renews it. A refused report
                 // leaves the tick below to end the build.
@@ -227,7 +236,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             if !self.accept(BootstrapEvent::Tick(self.now())) {
                 return None;
             }
-            self.publish_scheduled(queued, permit.deadline()?, RosterCheck::Acquisition)
+            self.publish_scheduled(queued, outer()?, RosterCheck::Acquisition)
                 .await?;
             if self.engine.current_operation() != Some(op) {
                 return None;
@@ -235,6 +244,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         }
     }
 
+    /// One bounded recapture of the completed local image. Any failure only
+    /// makes the recapture pending again in the core; it retries under a
+    /// different participation cut and never scans the origin.
     async fn recapture_current(
         &mut self,
         op: groupnet_core::volatile_bootstrap::BootstrapOperation,
@@ -260,25 +272,26 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             let _ = self.accept(BootstrapEvent::BuildFailed { op, selected });
             return;
         };
-        let built = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            self.donor.recapture_current_index(
-                ReadyCaptureRequest {
-                    operation: op,
-                    selected: selected.clone(),
-                    recovery_generation,
-                    members: members.clone(),
-                    guard: guard.clone(),
-                    deadline,
-                    clock: self.clock,
-                    wake: Arc::clone(&self.wake),
-                },
-                &self.admission,
-            ),
-        )
-        .await;
+        let donor = Arc::clone(&self.donor);
+        let admission = self.admission.clone();
+        let capture = donor.recapture_current_index(
+            ReadyCaptureRequest {
+                operation: op,
+                selected: selected.clone(),
+                recovery_generation,
+                members: members.clone(),
+                guard: guard.clone(),
+                deadline,
+                clock: self.clock,
+                wake: Arc::clone(&self.wake),
+            },
+            &admission,
+        );
+        let built = self
+            .await_renewing(op, None, || Some(deadline), capture)
+            .await;
         let _ = self.tick_after_io();
-        if let Ok(Ok(capture)) = built {
+        if let Some(Ok(capture)) = built {
             if guard.valid()
                 && self.engine.current_operation() == Some(op)
                 && capture.is_active()
@@ -548,7 +561,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     },
                     &admission,
                 );
-                let built = self.await_build(op, &selected, &permit, scan).await;
+                let built = self
+                    .await_renewing(op, Some((&selected, &permit)), || permit.deadline(), scan)
+                    .await;
                 let _ = self.tick_after_io();
                 if let Some(Ok(LocalCaptureOutcome::LocalOnly)) = &built {
                     if permit.valid()
@@ -777,10 +792,13 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
     }
 
     pub(super) async fn drain_maintenance(&mut self) {
-        let due = Instant::now()
-            .checked_add(Duration::from_millis(self.config.claim.observe_ms))
-            .unwrap_or_else(Instant::now);
         while let Some(effect) = self.effects.pop_front() {
+            // Each publication gets its own observation bound from when it
+            // runs: a Ready recapture earlier in this drain may have held the
+            // worker far past any bound sampled before it.
+            let due = Instant::now()
+                .checked_add(Duration::from_millis(self.config.claim.observe_ms))
+                .unwrap_or_else(Instant::now);
             match effect {
                 BootstrapEffect::PublishPresence(presence) => {
                     if !matches!(

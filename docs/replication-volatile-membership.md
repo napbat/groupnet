@@ -97,10 +97,20 @@ If the origin LIST completed but donor capture is refused or the roster changed
 while C was encoded, the worker reports a local-only baseline. It does not
 repeat the LIST or advertise Ready. Once that baseline reaches the independent
 local serving gate, the existing worker waits for a complete fresh source cut
-before starting one finite Ready recapture. A transient newly Alive member
-without presence leaves the old claim withdrawn and participation renewing;
-the existing maintenance timer rechecks without repeating the LIST. A failed
-admitted capture callback stops donation while presence renewal continues.
+before starting one finite Ready recapture. The builder's Building claim is
+not withdrawn at the local-only baseline: the recapture's claim supersedes it,
+or its native TTL expires it. A follower that samples between the two
+therefore keeps waiting for this image instead of scanning the origin again.
+A transient newly Alive member without presence leaves participation renewing;
+the existing maintenance timer rechecks without repeating the LIST. The
+recapture renews its claim and presence while C is encoded, so a large image
+cannot let either lapse. A recapture that fails or outlives its donor-wait
+bound is pending again, never an origin fallback, and keeps its last claim
+for the next recapture to supersede or native TTL to expire. It retries only
+under a complete cut that differs from the one it failed under: a join that
+interrupts a recapture retries it at once under the new roster, while a
+failure the roster did not cause never loops, and a later membership change
+gets one fresh attempt.
 The worker also runs this maintenance once immediately after the outer
 recovery affirms Ready, so an already-complete local image need not wait for
 its next presence renewal. Each turn obtains a read-only Ready capture guard

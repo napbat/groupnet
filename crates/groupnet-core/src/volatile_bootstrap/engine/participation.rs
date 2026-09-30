@@ -6,73 +6,11 @@ use crate::{NodeId, Time};
 
 use super::{ClaimEngine, ObservedPresence};
 use crate::volatile_bootstrap::{
-    BootstrapClaim, BootstrapEffect, BootstrapError, BootstrapMember, BootstrapMemberIdentity,
-    BootstrapOperation, BootstrapParticipant, BootstrapStage, BootstrapStep, ClaimIdentity,
-    ClaimPhase, PresenceIdentity,
+    BootstrapClaim, BootstrapError, BootstrapMember, BootstrapMemberIdentity, BootstrapParticipant,
+    BootstrapStep, PresenceIdentity,
 };
 
 impl ClaimEngine {
-    pub(super) fn local_only_built(
-        &mut self,
-        op: BootstrapOperation,
-        selected: ClaimIdentity,
-    ) -> BootstrapStep {
-        if self.stage != BootstrapStage::Building
-            || self.operation != Some(op)
-            || self.selected.as_ref() != Some(&selected)
-            || selected != self.identity()
-        {
-            return Self::reject(BootstrapError::StaleOperation);
-        }
-        self.operation = None;
-        self.operation_due = None;
-        self.total_due = None;
-        self.settle_due = None;
-        self.renew_due = None;
-        self.follow_due = None;
-        self.claim_poll_due = None;
-        self.claim_refresh_due = None;
-        self.roster_poll = None;
-        self.roster_poll_due = None;
-        // The completed local image remains usable, but its pre-scan roster
-        // must not prevent a later Ready recapture from accepting a new cut.
-        self.participant_roster = None;
-        self.stage = BootstrapStage::DonorAvailable;
-        self.local_phase = ClaimPhase::Building;
-        self.ok(vec![BootstrapEffect::WithdrawClaim(selected)])
-    }
-
-    pub(super) fn start_ready_recapture(&mut self) -> BootstrapStep {
-        if !self.participation_required
-            || self.stage != BootstrapStage::DonorAvailable
-            || self.local_phase != ClaimPhase::Building
-            || self.selected.as_ref() != Some(&self.identity())
-        {
-            return Self::reject(BootstrapError::Stage);
-        }
-        let Some(generation) = self.generation.checked_add(1) else {
-            return self.terminate();
-        };
-        self.generation = generation;
-        self.local_renewal = 0;
-        self.local_progress = 0;
-        self.stage = BootstrapStage::Building;
-        self.observed.retain(|identity, _| identity.node != self.me);
-        self.participant_roster = None;
-        let selected = self.identity();
-        self.selected = Some(selected.clone());
-        let Ok(claim) = self.publish_renewal() else {
-            return self.terminate();
-        };
-        let Ok(op) = self.operation(self.config.donor_wait_ms) else {
-            return self.terminate();
-        };
-        self.ok(vec![
-            claim,
-            BootstrapEffect::RecaptureCurrent { op, selected },
-        ])
-    }
-
     /// Allocate one finite fresh-roster read under the existing session token
     /// allocator. The worker performs no source I/O while holding a core lock.
     /// A transferred or retired candidate still participates, so the recovery
@@ -455,21 +393,30 @@ mod tests {
         });
         assert_eq!(engine.stage(), BootstrapStage::DonorAvailable);
         assert!(engine.ready_recapture_pending());
-        assert!(
-            local_only
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, BootstrapEffect::WithdrawClaim(_)))
+        // The Building claim stays for the recapture to supersede.
+        assert!(!local_only.effects.iter().any(|effect| matches!(
+            effect,
+            BootstrapEffect::WithdrawClaim(_)
+                | BootstrapEffect::WithdrawPresence(_)
+                | BootstrapEffect::PublishClaim(_)
+        )));
+        // A recapture starts only under a freshly verified complete cut.
+        assert_eq!(
+            engine.step(BootstrapEvent::StartReadyRecapture).rejection,
+            Some(BootstrapError::Stage)
         );
-        assert!(!local_only.effects.iter().any(|effect| {
-            matches!(effect, BootstrapEffect::PublishClaim(claim) if claim.phase == ClaimPhase::Ready)
-        }));
-        assert!(
-            !local_only
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, BootstrapEffect::WithdrawPresence(_)))
-        );
+        let (members, participants, _) = facts();
+        let cut = engine.begin_roster_observation().unwrap();
+        let claims = vec![engine.claim()];
+        engine
+            .verify_participant_roster(
+                cut,
+                &members,
+                &roster(&participants),
+                &participants,
+                &claims,
+            )
+            .unwrap();
         let recapture = engine.step(BootstrapEvent::StartReadyRecapture);
         assert!(recapture.rejection.is_none());
         assert!(

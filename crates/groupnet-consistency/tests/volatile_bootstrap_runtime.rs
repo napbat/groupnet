@@ -287,6 +287,7 @@ impl ClaimSource for Claims {
 struct OriginDonor {
     builds: AtomicUsize,
     recaptures: AtomicUsize,
+    recapture_attempts: AtomicUsize,
     allow_recapture: std::sync::atomic::AtomicBool,
     local_only: std::sync::atomic::AtomicBool,
     follower_prepares: AtomicUsize,
@@ -427,6 +428,7 @@ impl DonorPort for OriginDonor {
         admission: &'a ByteAdmission,
     ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
         Box::pin(async move {
+            self.recapture_attempts.fetch_add(1, Ordering::SeqCst);
             if !self.allow_recapture.load(Ordering::SeqCst) {
                 return Err(AdapterError);
             }
