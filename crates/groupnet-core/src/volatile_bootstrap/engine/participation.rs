@@ -428,6 +428,31 @@ mod tests {
         assert!(!engine.ready_recapture_pending());
     }
 
+    /// A second live participant and the two-member roster that includes it.
+    fn second_participant() -> (BootstrapParticipant, Vec<BootstrapMember>) {
+        let peer = BootstrapParticipant {
+            member: BootstrapMemberIdentity {
+                node: NodeId::from("peer"),
+                presence: Some(PresenceIdentity {
+                    node: NodeId::from("peer"),
+                    boot: BootId(9),
+                    session: 2,
+                }),
+                member_incarnation: 1,
+                status: Status::Alive,
+            },
+            renewal: 1,
+            remaining_ms: 10,
+        };
+        let members = ["me", "peer"]
+            .map(|node| BootstrapMember {
+                node: NodeId::from(node),
+                eligible: true,
+            })
+            .to_vec();
+        (peer, members)
+    }
+
     #[test]
     fn retired_ready_waits_for_complete_new_roster_before_one_recapture() {
         let mut engine = engine();
@@ -482,30 +507,7 @@ mod tests {
         )));
         assert!(engine.next_deadline().is_some()); // Presence renews while donation waits.
 
-        let peer = BootstrapParticipant {
-            member: BootstrapMemberIdentity {
-                node: NodeId::from("peer"),
-                presence: Some(PresenceIdentity {
-                    node: NodeId::from("peer"),
-                    boot: BootId(9),
-                    session: 2,
-                }),
-                member_incarnation: 1,
-                status: Status::Alive,
-            },
-            renewal: 1,
-            remaining_ms: 10,
-        };
-        let members = vec![
-            BootstrapMember {
-                node: NodeId::from("me"),
-                eligible: true,
-            },
-            BootstrapMember {
-                node: NodeId::from("peer"),
-                eligible: true,
-            },
-        ];
+        let (peer, members) = second_participant();
         let mut exact = roster(&participants);
         exact.push(peer.member.clone());
         let incomplete = engine.begin_roster_observation().unwrap();
