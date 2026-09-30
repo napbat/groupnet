@@ -53,10 +53,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
     }
 
     /// Sample the native participation cut and verify it against this
-    /// worker's own claim and presence sequence. A renewal the engine
-    /// schedules is published before the source is read back, and the engine
-    /// is not ticked again until the cut is verified, so the cut reflects its
-    /// current renewal. The operation deadline is checked on the wall clock.
+    /// worker's own claim and presence sequence. Every renewal the engine
+    /// has scheduled is published before the source is read back, and the
+    /// engine is not ticked again until the cut is verified, so the cut
+    /// reflects its current renewal. The operation deadline is checked on
+    /// the wall clock.
     async fn sample_participation(
         &mut self,
         due: Instant,
@@ -124,16 +125,26 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         })
     }
 
-    /// Advance the engine's clock and publish any claim or presence renewal
-    /// that tick schedules, before the caller reads the native source back.
-    /// Other scheduled work stays queued in order. `None` if the tick or a
+    /// Advance the engine's clock and publish every claim or presence renewal
+    /// still queued, including one an earlier tick scheduled, before the
+    /// caller reads the native source back: the cut is verified against this
+    /// worker's latest own sequence, so an unpublished renewal would refute
+    /// it. Other scheduled work stays queued in order. `None` if the tick or a
     /// publication failed.
     async fn tick_publishing_renewals(&mut self, due: Instant, check: RosterCheck) -> Option<()> {
-        let queued = self.effects.len();
         if !self.accept(BootstrapEvent::Tick(self.now())) {
             return None;
         }
-        self.publish_scheduled(queued, due, check).await
+        self.publish_scheduled(0, due, check).await
+    }
+
+    /// Whether this worker's own claim is live: advertised by a capture, held
+    /// by a running build or recapture, or kept for a pending recapture.
+    /// Outside an acquisition only a live claim's renewal is published.
+    fn claim_live(&self) -> bool {
+        self.capture.is_some()
+            || self.engine.stage() == BootstrapStage::Building
+            || self.engine.ready_recapture_pending()
     }
 
     /// Publish the claim and presence renewals queued after `queued`,
@@ -150,9 +161,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 // Outside an acquisition a withdrawn donor claim stays
                 // withdrawn until its recapture, as in `drain_maintenance`.
                 BootstrapEffect::PublishClaim(_)
-                    if check != RosterCheck::Acquisition
-                        && self.capture.is_none()
-                        && self.engine.stage() != BootstrapStage::Building => {}
+                    if check != RosterCheck::Acquisition && !self.claim_live() => {}
                 BootstrapEffect::PublishClaim(claim) => {
                     let published = tokio::time::timeout_at(
                         tokio::time::Instant::from_std(due),
@@ -823,10 +832,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     )
                     .await;
                 }
-                BootstrapEffect::PublishClaim(claim)
-                    if self.capture.is_some()
-                        || self.engine.stage() == BootstrapStage::Building =>
-                {
+                BootstrapEffect::PublishClaim(claim) if self.claim_live() => {
                     let selected = claim.identity.clone();
                     if !matches!(
                         tokio::time::timeout_at(

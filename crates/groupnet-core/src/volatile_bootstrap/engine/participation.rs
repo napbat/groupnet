@@ -460,16 +460,25 @@ mod tests {
         assert_eq!(engine.stage(), BootstrapStage::DonorAvailable);
         assert!(engine.ready_recapture_pending());
         assert_eq!(engine.participant_roster(), None);
-        assert!(
-            retired
-                .effects
-                .contains(&BootstrapEffect::WithdrawClaim(old))
-        );
+        // The Ready claim is superseded by a fresh attempt's Building claim,
+        // never withdrawn, so a joiner keeps waiting for the recapture.
+        let superseding: Vec<_> = retired
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                BootstrapEffect::PublishClaim(claim) => Some(claim),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(superseding.len(), 1);
+        assert_eq!(superseding[0].phase, ClaimPhase::Building);
+        assert_eq!(superseding[0].identity.node, old.node);
+        assert!(superseding[0].identity.attempt > old.attempt);
         assert!(!retired.effects.iter().any(|effect| matches!(
             effect,
-            BootstrapEffect::BuildOrigin { .. }
+            BootstrapEffect::WithdrawClaim(_)
+                | BootstrapEffect::BuildOrigin { .. }
                 | BootstrapEffect::RecaptureCurrent { .. }
-                | BootstrapEffect::PublishClaim(_)
         )));
         assert!(engine.next_deadline().is_some()); // Presence renews while donation waits.
 

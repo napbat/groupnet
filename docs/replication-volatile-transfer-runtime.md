@@ -60,8 +60,10 @@ permit; its correlated success supplies the local baseline and may publish
 `LocalBaselineBuilt { op }` to recovery, which proceeds directly to its
 ordinary `Affirm` without a second origin scan. The one worker continues
 driving bounded `ClaimEngine` TTL renewals and donor journal expiry after
-local recovery reaches `Ready`; a source gap, invalidated capture, restart,
-or final handle drop withdraws that exact claim. Claim renewal after a
+local recovery reaches `Ready`; a source gap, restart, or final handle drop
+withdraws that exact claim. An invalidated capture withdraws it too, unless
+participation is required: then a renewed Building claim supersedes it until
+the recapture (see `replication-volatile-membership.md`). Claim renewal after a
 completed local build advertises an available image and does not extend the
 already finished recovery episode or license local reads. A peer install emits
 `PeerBaselineInstalled { op, handoff }` only after the atomic native-delivery

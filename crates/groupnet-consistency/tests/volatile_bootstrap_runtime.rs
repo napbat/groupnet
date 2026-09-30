@@ -297,6 +297,9 @@ struct OriginDonor {
     ingress: Mutex<Option<JournalIngress>>,
     latest_permit: Mutex<Option<PublicationPermit>>,
     capture_max_ms: std::sync::atomic::AtomicU64,
+    /// A Ready recapture's clone at C blocks its worker this long, as a
+    /// bucket-sized clone under the publication fence does.
+    recapture_block_ms: std::sync::atomic::AtomicU64,
     /// A paged local origin scan: build starts, and this many pages each
     /// published after `page_ms` with a progress report.
     build_starts: AtomicUsize,
@@ -468,6 +471,10 @@ impl DonorPort for OriginDonor {
                         },
                     )
                     .map_err(|_| AdapterError)?;
+                    let block = self.recapture_block_ms.load(Ordering::SeqCst);
+                    if block > 0 {
+                        std::thread::sleep(Duration::from_millis(block));
+                    }
                     journal
                         .begin_capture(request.clock.now(), 1, 1, request.members, Vec::new())
                         .map_err(|_| AdapterError)?;

@@ -317,8 +317,9 @@ pub enum BootstrapEvent {
     /// A guarded local origin build completed, but this episode cannot
     /// advertise a donor candidate yet; ordinary local recovery may still
     /// affirm independently. With participation required a Ready recapture
-    /// follows, so the builder's claim stays until that recapture's claim
-    /// supersedes it or native TTL expires it; otherwise it is withdrawn.
+    /// follows, so the builder's claim stays renewed until that recapture's
+    /// claim supersedes it, for at most `donor_wait_ms`; otherwise it is
+    /// withdrawn.
     LocalOnlyBuilt {
         /// Exact build operation.
         op: BootstrapOperation,
@@ -382,7 +383,10 @@ pub enum BootstrapEvent {
         renewal: u64,
     },
     /// Exact local donor capture retired while ordinary local recovery may
-    /// remain healthy. Withdraw donor availability, retaining participation.
+    /// remain healthy. With participation required a recapture follows under
+    /// the next verified cut, and a renewed Building claim keeps joiners
+    /// waiting for it; otherwise donor availability ends, retaining
+    /// participation.
     CaptureRetired {
         /// Local builder claim that owned the retired capture.
         selected: ClaimIdentity,

@@ -98,19 +98,27 @@ while C was encoded, the worker reports a local-only baseline. It does not
 repeat the LIST or advertise Ready. Once that baseline reaches the independent
 local serving gate, the existing worker waits for a complete fresh source cut
 before starting one finite Ready recapture. The builder's Building claim is
-not withdrawn at the local-only baseline: the recapture's claim supersedes it,
-or its native TTL expires it. A follower that samples between the two
+not withdrawn at the local-only baseline: it stays renewed until the
+recapture's claim supersedes it. A follower that samples between the two
 therefore keeps waiting for this image instead of scanning the origin again.
+A pending recapture makes no progress, so that claim is renewed for at most
+the builder's own stall bound, `donor_wait_ms`, and then withdrawn; a follower
+stops waiting within its own bound, `donor_wait_ms + claim_ttl_ms +
+observe_ms`, of the last advance it saw.
 A transient newly Alive member without presence leaves participation renewing;
 the existing maintenance timer rechecks without repeating the LIST. The
 recapture renews its claim and presence while C is encoded, so a large image
-cannot let either lapse. A recapture that fails or outlives its donor-wait
-bound is pending again, never an origin fallback, and keeps its last claim
-for the next recapture to supersede or native TTL to expire. It retries only
-under a complete cut that differs from the one it failed under: a join that
+cannot let either lapse. Before it checks the encoded image against a fresh
+participation cut, the worker publishes every renewal the engine has
+scheduled, including one that came due while the capture held the worker:
+that cut is verified against the worker's own claim sequence. A recapture that
+fails or outlives its donor-wait bound is pending again, never an origin
+fallback, and its claim stays renewed as above. It retries only under a
+complete cut that differs from the one it failed under: a join that
 interrupts a recapture retries it at once under the new roster, while a
 failure the roster did not cause never loops, and a later membership change
-gets one fresh attempt.
+gets one fresh attempt. A cut equal to the failed one withdraws the claim at
+once, since no recapture will follow under it.
 The worker also runs this maintenance once immediately after the outer
 recovery affirms Ready, so an already-complete local image need not wait for
 its next presence renewal. Each turn obtains a read-only Ready capture guard
@@ -121,11 +129,17 @@ recapture occurs until the new recovery episode reaffirms and its exact child
 generation matches the new guard. Every attempt keeps a fresh finite
 donor-wait deadline and never repeats the completed origin LIST.
 For a lease lapse that retains a locally built baseline, the sans-IO recovery
-engine suspends the child first: its old Ready claim and capture are withdrawn,
-its origin publication permit is discarded, and only bounded presence renewal
-continues. The engine issues a new child binding only after that same lapse
-episode passes renewal, head, frontier, and final affirmation checks. The
-child then uses the new Ready guard and a new claim/capture identity. A feed
+engine suspends the child first: its old capture is retired, its origin
+publication permit is discarded, and a Ready claim is superseded by a fresh
+attempt's Building claim, renewed under the same bound as above while presence
+renewal continues. A join commonly causes exactly such a lapse, so withdrawing
+the claim here would let the joiner, sampling during the lapse, scan the
+origin. The retirement also grants the next verified cut one recapture, even
+one equal to a cut a recapture failed under, because that failure belonged to
+the suspended Ready generation. The engine issues a new child binding only
+after that same lapse episode passes renewal, head, frontier, and final
+affirmation checks. The child then uses the new Ready guard and a new
+claim/capture identity. A feed
 gap, full rebuild, or failed lapse retires the suspended candidate instead.
 Candidate retirement withdraws its claim and transfer resources but preserves
 the process's bounded presence renewal. A completed peer transfer follows the
@@ -148,10 +162,12 @@ remain available during this wait; no stale donor permission is accepted.
 
 A healthy donor checks its exact roster on the existing worker maintenance
 turn, and also before serving an Offer or Barrier. A changed or unprovable cut
-withdraws its old Ready claim and unlinks the old journal before offering any
-replacement. Once a complete fresh cut is available, the existing recovery
-worker may issue a finite recapture operation against its already-Ready
-complete index; this does not repeat origin LIST. This is a distinct trusted
+retires its old capture and unlinks the old journal before offering any
+replacement; its Ready claim is superseded by a renewed Building claim, as
+after a lapse, so joiners wait for the replacement. Once a complete fresh cut
+is available, the existing recovery worker may issue a finite recapture
+operation against its already-Ready complete index; this does not repeat
+origin LIST. This is a distinct trusted
 `recapture_current_index` callback, not a reuse or extension of the expired
 origin-build `PublicationPermit`. It binds the new claim/capture identity,
 recovery generation, complete participation roster, and original operation

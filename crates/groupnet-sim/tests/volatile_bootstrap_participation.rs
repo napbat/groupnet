@@ -215,15 +215,18 @@ fn ready_then_retired() -> (ClaimEngine, BootstrapParticipant, ClaimIdentity) {
     });
     assert!(engine.ready_recapture_pending());
     assert_eq!(engine.participant_roster(), None);
+    // A fresh attempt's Building claim supersedes the Ready one; nothing is
+    // withdrawn, so a joiner waits for the recapture.
     assert!(retired.effects.iter().any(|effect| matches!(
         effect,
-        BootstrapEffect::WithdrawClaim(identity) if *identity == old
+        BootstrapEffect::PublishClaim(claim)
+            if claim.phase == ClaimPhase::Building && claim.identity.attempt > old.attempt
     )));
     assert!(!retired.effects.iter().any(|effect| matches!(
         effect,
-        BootstrapEffect::BuildOrigin { .. }
+        BootstrapEffect::WithdrawClaim(_)
+            | BootstrapEffect::BuildOrigin { .. }
             | BootstrapEffect::RecaptureCurrent { .. }
-            | BootstrapEffect::PublishClaim(_)
     )));
     (engine, me, old)
 }

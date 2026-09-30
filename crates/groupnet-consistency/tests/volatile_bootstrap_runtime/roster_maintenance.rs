@@ -32,8 +32,21 @@ fn open_local_only_donor_with(
     Arc<ReadAdapter>,
     RecoveryHandle<ReadAdapter>,
 ) {
+    open_local_only(OriginDonor::default(), renew_ms, mode)
+}
+
+fn open_local_only(
+    donor: OriginDonor,
+    renew_ms: u64,
+    mode: RecoveryMode,
+) -> (
+    Arc<Claims>,
+    Arc<OriginDonor>,
+    Arc<ReadAdapter>,
+    RecoveryHandle<ReadAdapter>,
+) {
     let claims = Arc::new(Claims::default());
-    let donor = Arc::new(OriginDonor::default());
+    let donor = Arc::new(donor);
     donor.local_only.store(true, Ordering::SeqCst);
     donor.allow_recapture.store(true, Ordering::SeqCst);
     let mut config = bootstrap_config();
@@ -94,10 +107,14 @@ async fn affirmed_lapse_resumes_local_donor_with_a_new_capture_and_no_origin_sca
         .clone();
     let old_ingress = donor.ingress.lock().unwrap().clone().unwrap();
     handle.lease_lapse(1).unwrap();
-    eventually_within("lapse withdraws old donor claim", SETTLE, || {
+    // The Ready claim is superseded, never withdrawn: a renewed Building
+    // claim keeps a joiner waiting through the lapse for the recapture.
+    eventually_within("lapse supersedes the Ready claim", SETTLE, || {
         !handle.status().may_serve
             && donor.ingress.lock().unwrap().is_none()
-            && claims.local.lock().unwrap().is_none()
+            && claims.local.lock().unwrap().as_ref().is_some_and(|claim| {
+                claim.phase == ClaimPhase::Building && claim.identity != old && claim.renewal > 2
+            })
             && claims.presence.lock().unwrap().is_some()
     })
     .await;
@@ -139,10 +156,15 @@ async fn cancelled_lapse_withdraws_suspended_presence_and_never_recaptures() {
     reads.lapse_hold.store(true, Ordering::SeqCst);
     wait_ready(&claims, &donor, &handle).await;
     handle.lease_lapse(1).unwrap();
-    eventually_within("suspended local capture withdraws Ready", SETTLE, || {
+    eventually_within("suspended local capture is no longer Ready", SETTLE, || {
         !handle.status().may_serve
             && donor.ingress.lock().unwrap().is_none()
-            && claims.local.lock().unwrap().is_none()
+            && claims
+                .local
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|claim| claim.phase == ClaimPhase::Building)
             && claims.presence.lock().unwrap().is_some()
     })
     .await;
@@ -229,11 +251,16 @@ async fn ready_donor_retires_changed_roster_then_recaptures_without_origin_scan(
         status: Status::Alive,
     };
     // Native Alive may precede its presence publication. The old C must be
-    // withdrawn, but one incomplete sample must not end future donation.
+    // retired, but one incomplete sample must not end future donation.
     *claims.joiner.lock().unwrap() = Some((joiner.clone(), false));
-    eventually_within("maintenance withdraws obsolete donor C", SETTLE, || {
+    eventually_within("maintenance retires obsolete donor C", SETTLE, || {
         handle.status().may_serve
-            && claims.local.lock().unwrap().is_none()
+            && claims
+                .local
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|claim| claim.phase != ClaimPhase::Ready)
             && donor.ingress.lock().unwrap().is_none()
     })
     .await;
@@ -339,6 +366,25 @@ async fn failed_replacement_waits_for_a_roster_change_then_recaptures_once() {
     assert_eq!(donor.recapture_attempts.load(Ordering::SeqCst), 3);
     assert_eq!(donor.recaptures.load(Ordering::SeqCst), 2);
     assert!(handle.status().may_serve);
+    assert_eq!(donor.builds.load(Ordering::SeqCst), 1);
+    assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
+    handle.cancel().unwrap();
+}
+
+/// The Ready recapture's clone at C blocks the worker past a claim renewal, as
+/// a bucket-sized clone does, so that renewal comes due in the same turn the
+/// capture returns. The worker publishes it before sampling the participation
+/// cut it checks the capture against, whose own-claim sequence would refute an
+/// unpublished one, and advertises the image Ready on its first attempt.
+#[tokio::test]
+async fn recapture_outlasting_a_claim_renewal_is_advertised_ready() {
+    let donor = OriginDonor {
+        recapture_block_ms: std::sync::atomic::AtomicU64::new(150),
+        ..OriginDonor::default()
+    };
+    let (claims, donor, reads, handle) = open_local_only(donor, 100, RecoveryMode::Unleased);
+    wait_ready(&claims, &donor, &handle).await;
+    assert_eq!(donor.recapture_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(donor.builds.load(Ordering::SeqCst), 1);
     assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
     handle.cancel().unwrap();

@@ -1,10 +1,11 @@
 //! Seeded donor/joiner schedules around a completed local build's Ready
 //! recapture, with participation required as in production. The builder's
-//! claim stays visible from its local build until the recapture's Ready claim:
-//! a joiner that samples in the window between them, or during a recapture its
-//! own arrival interrupts, waits for that image instead of scanning the origin.
-//! A recapture that never comes lets the claim expire by native TTL, and the
-//! joiner then takes over within one observation.
+//! claim stays visible and renewed from its local build until the recapture's
+//! Ready claim: a joiner that samples in the window between them, during a
+//! recapture its own arrival interrupts, or during a recovery lapse that
+//! retires the donor's capture, waits for that image instead of scanning the
+//! origin. A recapture that never comes ends the claim at the builder's own
+//! stall bound, and the joiner then takes over within one observation.
 
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
@@ -82,14 +83,6 @@ impl Source {
             || self.joined.is_some_and(|joined| now >= joined + self.lag)
     }
 
-    /// When `reader` stops seeing `node`'s latest claim, if it is a claim.
-    fn claim_expiry(&self, node: usize) -> Option<u64> {
-        match self.claims[node].last() {
-            Some((at, Some(_))) => Some(at + CONFIG.claim_ttl_ms),
-            _ => None,
-        }
-    }
-
     /// One complete native cut as `reader` sees it at `now`.
     fn cut(&self, reader: usize, now: u64) -> Cut {
         let mut cut = Cut {
@@ -156,11 +149,17 @@ struct Donor {
     recaptures: u32,
     failed: u32,
     built: Option<u64>,
+    /// Recovery lapsed: no recapture starts before this time.
+    suspended_until: Option<u64>,
+    /// The lapse revoked the in-flight recapture's guard.
+    doomed: bool,
+    retired: u32,
 }
 
 #[derive(Default)]
 struct Joiner {
     in_window: u32,
+    in_lapse: u32,
     build: Option<u64>,
     declined: Option<u64>,
     donor: Option<u64>,
@@ -171,6 +170,8 @@ struct Schedule {
     affirm: u64,
     encode: u64,
     join: u64,
+    /// A recovery lapse `(start, length)`.
+    lapse: Option<(u64, u64)>,
 }
 
 /// Both workers over one source. Each worker publishes the renewals a tick
@@ -180,6 +181,7 @@ struct World {
     build_len: u64,
     affirm: u64,
     encode: u64,
+    lapse: Option<(u64, u64)>,
     source: Source,
     engines: [Option<ClaimEngine>; 2],
     donor: Donor,
@@ -223,6 +225,10 @@ impl World {
                         && (donor.ready_recapture_pending() || self.donor.capture.is_some())
                     {
                         self.joiner.in_window += 1;
+                    }
+                    if node == JOINER && self.donor.suspended_until.is_some_and(|until| now < until)
+                    {
+                        self.joiner.in_lapse += 1;
                     }
                     let cut = self.source.cut(node, now);
                     let step = self.engines[node].as_mut().unwrap().step(
@@ -291,8 +297,25 @@ impl World {
             .is_ok()
     }
 
+    /// A recovery lapse suspends the Ready generation, and the worker retires
+    /// the donor capture, as `suspend_local` does.
+    fn retire(&mut self, now: u64) {
+        let engine = self.engines[DONOR].as_mut().unwrap();
+        if engine.stage() != BootstrapStage::DonorAvailable {
+            return;
+        }
+        let Some(selected) = engine.selected().cloned() else {
+            return;
+        };
+        let step = engine.step(BootstrapEvent::CaptureRetired { selected });
+        self.donor.retired += 1;
+        self.apply(DONOR, now, step.effects);
+    }
+
     /// The donor's build completes, recovery affirms `affirm` later, and the
-    /// worker's maintenance turns start and finish the recapture.
+    /// worker's maintenance turns start and finish the recapture. A lapse
+    /// suspends those turns; the serial worker handles it only once a running
+    /// recapture, whose guard the lapse revoked, has failed.
     fn donor_turn(&mut self, now: u64) {
         let seed = self.seed;
         if let Some((op, selected, end)) = self.donor.build.clone()
@@ -305,12 +328,22 @@ impl World {
             self.apply(DONOR, now, step.effects);
             self.donor.ready_at = Some(now + self.affirm);
         }
+        if let Some((start, len)) = self.lapse
+            && now == start
+        {
+            self.donor.suspended_until = Some(start + len);
+            if self.donor.capture.is_some() {
+                self.donor.doomed = true;
+            } else {
+                self.retire(now);
+            }
+        }
         if let Some((op, selected, end)) = self.donor.capture.clone()
             && end == now
         {
             self.donor.capture = None;
             if self.engines[DONOR].as_ref().unwrap().current_operation() == Some(op) {
-                let event = if self.verify(DONOR, now) {
+                let event = if !self.donor.doomed && self.verify(DONOR, now) {
                     self.donor.built = Some(now);
                     BootstrapEvent::Built { op, selected }
                 } else {
@@ -320,11 +353,15 @@ impl World {
                 let step = self.engines[DONOR].as_mut().unwrap().step(event);
                 self.apply(DONOR, now, step.effects);
             }
+            if std::mem::take(&mut self.donor.doomed) {
+                self.retire(now);
+            }
         }
         if self
             .donor
             .ready_at
             .is_some_and(|at| now >= at && (now - at) % CONFIG.renew_ms == 0)
+            && self.donor.suspended_until.is_none_or(|until| now >= until)
             && self.donor.capture.is_none()
             && self.engines[DONOR]
                 .as_ref()
@@ -345,6 +382,7 @@ fn run(seed: u64, schedule: &Schedule, source: Source) -> World {
         build_len: schedule.build_len,
         affirm: schedule.affirm,
         encode: schedule.encode,
+        lapse: schedule.lapse,
         source,
         engines: [None, None],
         donor: Donor::default(),
@@ -405,6 +443,7 @@ fn joiner_sampling_between_local_build_and_ready_claim_waits_for_the_donor() {
             affirm,
             encode,
             join: first_sample - CONFIG.settle_ms,
+            lapse: None,
         };
         let source = Source::new(u64::from(rng.below(3)), u64::from(rng.below(2)));
         let World { donor, joiner, .. } = run(seed, &schedule, source);
@@ -439,11 +478,11 @@ fn joiner_sampling_between_local_build_and_ready_claim_waits_for_the_donor() {
     );
 }
 
-/// A donor whose recapture never starts leaves its last Building claim to
-/// expire by TTL. The joiner follows it while it is visible and scans the
-/// origin itself within one observation once it is gone.
+/// A donor whose recapture never starts renews its Building claim up to its
+/// own stall bound and then withdraws it. The joiner follows it until then and
+/// scans the origin itself within one observation once it is gone.
 #[test]
-fn unrecaptured_local_build_expires_by_ttl_and_the_joiner_takes_over() {
+fn unrecaptured_local_build_ends_its_claim_at_the_stall_bound_and_the_joiner_takes_over() {
     for seed in 0..48_u64 {
         let mut rng = SplitMix64::new(seed);
         let build_len = 6 + u64::from(rng.below(4));
@@ -454,6 +493,7 @@ fn unrecaptured_local_build_expires_by_ttl_and_the_joiner_takes_over() {
             affirm: HORIZON,
             encode: 1,
             join: first_sample - CONFIG.settle_ms,
+            lapse: None,
         };
         let World {
             donor,
@@ -462,25 +502,105 @@ fn unrecaptured_local_build_expires_by_ttl_and_the_joiner_takes_over() {
             ..
         } = run(seed, &schedule, Source::new(u64::from(rng.below(3)), 0));
         assert_eq!(donor.recaptures, 0, "seed {seed}");
-        let expired = source.claim_expiry(DONOR).expect("claim left to expire");
-        let last = source.claims[DONOR]
-            .last()
-            .and_then(|(_, claim)| claim.clone());
+        let claims = &source.claims[DONOR];
+        let released = claims
+            .iter()
+            .rev()
+            .find(|(_, claim)| claim.is_none())
+            .map(|(at, _)| *at)
+            .expect("the claim was withdrawn");
+        assert_eq!(
+            released,
+            build_end + CONFIG.donor_wait_ms,
+            "seed {seed}: the claim ends at the builder's stall bound"
+        );
         assert!(
-            last.is_some_and(|claim| claim.phase == ClaimPhase::Building),
-            "seed {seed}: the local build's claim was not withdrawn"
+            claims.iter().any(|(at, claim)| *at > build_end
+                && *at < released
+                && claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.phase == ClaimPhase::Building)),
+            "seed {seed}: the pending claim was renewed"
         );
         let took_over = joiner
             .build
-            .expect("the joiner scanned once the claim expired");
+            .expect("the joiner scanned once the claim was gone");
         assert_eq!(joiner.declined, None, "seed {seed}");
         assert!(
-            took_over >= expired,
-            "seed {seed}: scanned at {took_over} while the claim lived to {expired}"
+            took_over >= released,
+            "seed {seed}: scanned at {took_over} while the claim lived to {released}"
         );
         assert!(
-            took_over <= expired.max(first_sample) + CONFIG.observe_ms,
-            "seed {seed}: took over at {took_over}, claim gone at {expired}"
+            took_over <= released + source.lag + CONFIG.observe_ms,
+            "seed {seed}: took over at {took_over}, claim gone at {released}"
         );
     }
+}
+
+/// A recovery lapse, as a join itself can trigger, retires the donor's
+/// capture: a pending one, a running recapture whose guard it revokes, or an
+/// already Ready one. The joiner's first observation lands inside the lapse,
+/// which may outlast a claim TTL. The donor keeps a renewed Building claim
+/// through it and recaptures once recovery is Ready again, so the joiner
+/// never scans the origin: it waits and then finds the Ready donor.
+#[test]
+fn recovery_lapse_retiring_the_capture_keeps_the_joiner_waiting() {
+    let (mut in_lapse, mut waited, mut beyond_ttl, mut ready_retired) = (0, 0, 0, 0);
+    for seed in 0..96_u64 {
+        let mut rng = SplitMix64::new(seed);
+        let build_len = 6 + u64::from(rng.below(4));
+        let (affirm, encode) = (rng.below(3), 1 + rng.below(4));
+        let build_end = CONFIG.settle_ms + build_len;
+        let start = build_end + u64::from(rng.below(affirm + encode + 3));
+        // Shorter than the stall bound, so the pending claim outlives it.
+        let len = 1 + rng.below(9);
+        let first_sample = start + u64::from(rng.below(len));
+        let len = u64::from(len);
+        let schedule = Schedule {
+            build_len,
+            affirm: u64::from(affirm),
+            encode: u64::from(encode),
+            join: first_sample - CONFIG.settle_ms,
+            lapse: Some((start, len)),
+        };
+        let source = Source::new(u64::from(rng.below(3)), u64::from(rng.below(2)));
+        let World { donor, joiner, .. } = run(seed, &schedule, source);
+        assert_eq!(
+            joiner.build, None,
+            "seed {seed}: the joiner scanned the origin"
+        );
+        assert_eq!(joiner.declined, None, "seed {seed}: the joiner fell back");
+        let found = joiner.donor.expect("the joiner found the donor");
+        assert!(
+            donor.built.is_some_and(|built| built <= found),
+            "seed {seed}"
+        );
+        assert!(donor.retired >= 1, "seed {seed}: the lapse retired nothing");
+        // At most the join and the lapse each fail one recapture.
+        assert!(donor.failed <= 2, "seed {seed}: {} failures", donor.failed);
+        if joiner.in_lapse > 0 {
+            in_lapse += 1;
+        }
+        // A Ready claim published just before the lapse can still reach the
+        // lagging joiner first; otherwise it waited out the whole lapse.
+        if donor.built.is_some_and(|built| built >= start + len) {
+            waited += 1;
+            if len > CONFIG.claim_ttl_ms {
+                beyond_ttl += 1;
+            }
+        }
+        if donor.recaptures > donor.failed + 1 {
+            ready_retired += 1;
+        }
+    }
+    assert_eq!(in_lapse, 96, "every joiner first sampled inside the lapse");
+    assert!(waited > 64, "{waited} joiners waited out the lapse");
+    assert!(
+        beyond_ttl > 16,
+        "{beyond_ttl} of them outlasted a claim TTL"
+    );
+    assert!(
+        ready_retired > 4,
+        "{ready_retired} lapses retired a Ready capture"
+    );
 }
