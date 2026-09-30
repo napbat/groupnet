@@ -58,6 +58,9 @@ struct Claims {
     ready_publishes: AtomicUsize,
     renewal_started: Notify,
     resume_renewal: Notify,
+    /// Every claim publication takes this long, so a claim renewal is always
+    /// due again by the worker's next engine tick.
+    claim_publish_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ClaimSource for Claims {
@@ -176,6 +179,10 @@ impl ClaimSource for Claims {
         claim: BootstrapClaim,
     ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
         Box::pin(async move {
+            let delay = self.claim_publish_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             if claim.phase == groupnet_core::volatile_bootstrap::ClaimPhase::Ready
                 && self.ready_publishes.fetch_add(1, Ordering::SeqCst) > 0
                 && self.pause_ready_renewal.load(Ordering::SeqCst)

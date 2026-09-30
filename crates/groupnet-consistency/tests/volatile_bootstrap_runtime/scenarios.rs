@@ -767,6 +767,36 @@ async fn complete_presence_enables_canonical_peer_transfer() {
     .await;
 }
 
+/// A claim renewal can fall due exactly when the follower rechecks its
+/// roster before accepting a Ready donor. The worker publishes that renewal
+/// before reading the source back, so the source shows the worker's own
+/// current claim instead of contradicting it and forcing an origin build.
+#[tokio::test]
+async fn renewal_due_at_donor_selection_does_not_decline_the_peer() {
+    let mut config = bootstrap_config();
+    config.require_participation = true;
+    config.max_claim_metadata_bytes = 512;
+    config.claim.settle_ms = 50;
+    config.claim.renew_ms = 1;
+    let (claims, donor, admission, handle, reads) =
+        follower_setup_with_mode(false, config, RecoveryMode::Unleased);
+    // Each publication outlasts the renewal interval, so every engine tick,
+    // including the one that starts the donor's roster recheck, renews.
+    claims.claim_publish_delay_ms.store(2, Ordering::SeqCst);
+    eventually_within(
+        "the peer image installs despite a renewal at selection",
+        SETTLE,
+        || handle.status().may_serve && donor.installed.load(Ordering::SeqCst) == 1,
+    )
+    .await;
+    assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
+    handle.cancel().unwrap();
+    eventually_within("peer transfer releases admission", SETTLE, || {
+        admission.usage().0 == 0
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn completed_peer_keeps_presence_through_lapse_for_a_third_join() {
     let mut config = bootstrap_config();

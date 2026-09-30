@@ -12,66 +12,34 @@ use groupnet_core::volatile_bootstrap::{
     BootstrapMemberIdentity, BootstrapParticipant, ClaimIdentity,
 };
 
+/// Where one participation cut is sampled and how it is verified.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RosterCheck {
+    /// Pin or recheck the roster of a candidate this acquisition drives.
+    Acquisition,
+    /// Recheck a completed candidate's roster on a maintenance turn.
+    Maintenance,
+    /// Return the roster for the recovery core's post-handoff peer check.
+    PeerHandoff,
+}
+
 impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
+    /// The active acquisition's complete participation roster.
+    pub(super) async fn acquisition_participation(
+        &mut self,
+        due: Instant,
+    ) -> Option<Vec<BootstrapMemberIdentity>> {
+        self.sample_participation(due, RosterCheck::Acquisition)
+            .await
+    }
+
+    /// A completed candidate's participation roster on a maintenance turn.
     pub(super) async fn current_participation(
         &mut self,
         due: Instant,
     ) -> Option<Vec<BootstrapMemberIdentity>> {
-        if !self.accept(BootstrapEvent::Tick(self.now())) {
-            return None;
-        }
-        let parent = self.engine.current_operation();
-        let op = self.engine.begin_roster_observation().ok()?;
-        let operation_due = self.operation_due(op, due)?;
-        let limits = self.claim_limits(
-            self.config.claim.max_members,
-            self.config.claim.max_member_bytes,
-        );
-        let snapshot = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(operation_due),
-            self.claims
-                .observe_participation(op, limits, &self.admission),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        if !self.tick_after_io() {
-            return None;
-        }
-        if self.engine.current_operation() != parent {
-            return None;
-        }
-        snapshot.consume(|mut snapshot| {
-            let age_ms = observation_age_ms(snapshot.sampled_at, Instant::now())?;
-            for participant in &mut snapshot.participants {
-                participant.remaining_ms = participant.remaining_ms.saturating_sub(age_ms);
-            }
-            for claim in &mut snapshot.claims {
-                claim.remaining_ms = claim.remaining_ms.saturating_sub(age_ms);
-            }
-            snapshot.claims.retain(|claim| claim.remaining_ms > 0);
-            let participants: Vec<_> = snapshot
-                .participants
-                .into_iter()
-                .map(|participant| BootstrapParticipant {
-                    member: participant.member,
-                    renewal: participant.renewal,
-                    remaining_ms: participant.remaining_ms,
-                })
-                .collect();
-            self.engine
-                .verify_participant_roster(
-                    op,
-                    &snapshot.members,
-                    &snapshot.roster,
-                    &participants,
-                    &snapshot.claims,
-                )
-                .ok()?;
-            self.engine
-                .participant_roster()
-                .map(<[BootstrapMemberIdentity]>::to_vec)
-        })
+        self.sample_participation(due, RosterCheck::Maintenance)
+            .await
     }
 
     /// One complete current participation cut for the recovery core's
@@ -80,9 +48,21 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         &mut self,
         due: Instant,
     ) -> Option<Vec<BootstrapMemberIdentity>> {
-        if !self.accept(BootstrapEvent::Tick(self.now())) {
-            return None;
-        }
+        self.sample_participation(due, RosterCheck::PeerHandoff)
+            .await
+    }
+
+    /// Sample the native participation cut and verify it against this
+    /// worker's own claim and presence sequence. A renewal the engine
+    /// schedules is published before the source is read back, and the engine
+    /// is not ticked again until the cut is verified, so the cut reflects its
+    /// current renewal. The operation deadline is checked on the wall clock.
+    async fn sample_participation(
+        &mut self,
+        due: Instant,
+        check: RosterCheck,
+    ) -> Option<Vec<BootstrapMemberIdentity>> {
+        self.tick_publishing_renewals(due, check).await?;
         let op = self.engine.begin_roster_observation().ok()?;
         let operation_due = self.operation_due(op, due)?;
         let limits = self.claim_limits(
@@ -97,7 +77,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         .await
         .ok()?
         .ok()?;
-        if !self.tick_after_io() {
+        if Instant::now() >= operation_due {
             return None;
         }
         snapshot.consume(|mut snapshot| {
@@ -115,16 +95,82 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     remaining_ms: participant.remaining_ms.saturating_sub(age_ms),
                 })
                 .collect();
-            self.engine
-                .verify_peer_roster(
-                    op,
-                    &snapshot.members,
-                    &snapshot.roster,
-                    &participants,
-                    &snapshot.claims,
-                )
-                .ok()
+            match check {
+                RosterCheck::Acquisition | RosterCheck::Maintenance => {
+                    self.engine
+                        .verify_participant_roster(
+                            op,
+                            &snapshot.members,
+                            &snapshot.roster,
+                            &participants,
+                            &snapshot.claims,
+                        )
+                        .ok()?;
+                    self.engine
+                        .participant_roster()
+                        .map(<[BootstrapMemberIdentity]>::to_vec)
+                }
+                RosterCheck::PeerHandoff => self
+                    .engine
+                    .verify_peer_roster(
+                        op,
+                        &snapshot.members,
+                        &snapshot.roster,
+                        &participants,
+                        &snapshot.claims,
+                    )
+                    .ok(),
+            }
         })
+    }
+
+    /// Advance the engine's clock and publish any claim or presence renewal
+    /// that tick schedules, before the caller reads the native source back.
+    /// Other scheduled work stays queued in order. `None` if the tick or a
+    /// publication failed.
+    async fn tick_publishing_renewals(&mut self, due: Instant, check: RosterCheck) -> Option<()> {
+        let queued = self.effects.len();
+        if !self.accept(BootstrapEvent::Tick(self.now())) {
+            return None;
+        }
+        let scheduled = self.effects.split_off(queued);
+        for effect in scheduled {
+            match effect {
+                // Outside an acquisition a withdrawn donor claim stays
+                // withdrawn until its recapture, as in `drain_maintenance`.
+                BootstrapEffect::PublishClaim(_)
+                    if check != RosterCheck::Acquisition
+                        && self.capture.is_none()
+                        && self.engine.stage() != BootstrapStage::Building => {}
+                BootstrapEffect::PublishClaim(claim) => {
+                    let published = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(due),
+                        self.claims.publish_claim(claim),
+                    )
+                    .await;
+                    if !matches!(published, Ok(Ok(()))) {
+                        return None;
+                    }
+                }
+                BootstrapEffect::PublishPresence(presence) => {
+                    let published = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(due),
+                        self.claims.publish_presence(presence.clone()),
+                    )
+                    .await;
+                    if !matches!(published, Ok(Ok(()))) {
+                        let _ = self.accept(BootstrapEvent::PresenceFailed {
+                            identity: presence.identity,
+                            renewal: presence.renewal,
+                        });
+                        return None;
+                    }
+                }
+                BootstrapEffect::ArmTimer(_) => {}
+                other => self.effects.push_back(other),
+            }
+        }
+        Some(())
     }
 
     async fn recapture_current(
@@ -328,11 +374,15 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                             .observe_participation(op, limits, &self.admission),
                     )
                     .await;
-                    let _ = self.tick_after_io();
+                    // No engine tick between the read and its verification: a
+                    // renewal scheduled by that tick is not in the cut yet and
+                    // would contradict this worker's own claim sequence. The
+                    // next loop tick publishes it; the deadline is wall time.
                     let Ok(Ok(snapshot)) = snapshot else {
                         return Some(BootstrapOutcome::Declined);
                     };
-                    if self.engine.current_operation() == Some(op) {
+                    if Instant::now() < operation_due && self.engine.current_operation() == Some(op)
+                    {
                         let accepted = snapshot.consume(|mut snapshot| {
                             let Some(age_ms) =
                                 observation_age_ms(snapshot.sampled_at, Instant::now())
@@ -374,11 +424,10 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     self.claims.observe_claims(op, limits, &self.admission),
                 )
                 .await;
-                let _ = self.tick_after_io();
                 let Ok(Ok(snapshot)) = snapshot else {
                     return Some(BootstrapOutcome::Declined);
                 };
-                if self.engine.current_operation() == Some(op) {
+                if Instant::now() < operation_due && self.engine.current_operation() == Some(op) {
                     let accepted = snapshot.consume(|mut snapshot| {
                         let Some(age_ms) = observation_age_ms(snapshot.sampled_at, Instant::now())
                         else {
@@ -402,7 +451,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             BootstrapEffect::BuildOrigin { op, selected } => {
                 let operation_due = self.operation_due(op, due)?;
                 let members = if self.config.require_participation {
-                    let Some(members) = self.current_participation(due).await else {
+                    let Some(members) = self.acquisition_participation(due).await else {
                         return Some(BootstrapOutcome::Declined);
                     };
                     members
@@ -454,7 +503,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                         if self.config.require_participation {
                             // An image encoded across a membership change is
                             // never advertised as a complete donor capture.
-                            if self.current_participation(due).await.as_deref()
+                            if self.acquisition_participation(due).await.as_deref()
                                 != Some(members.as_slice())
                             {
                                 self.donor.retire_local_capture(&capture);
@@ -498,7 +547,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             }
             BootstrapEffect::DonorAvailable { op, selected } => {
                 if self.config.require_participation
-                    && self.current_participation(due).await.is_none()
+                    && self.acquisition_participation(due).await.is_none()
                 {
                     let _ = self.accept(BootstrapEvent::PeerTransferDeclined { op, selected });
                     return Some(BootstrapOutcome::Declined);
