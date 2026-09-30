@@ -45,15 +45,18 @@ pub enum RecaptureDecline {
     /// current presence, or the source read failed. Each maintenance turn
     /// retries.
     NoCompleteCut,
-    /// The cut equals the one the last recapture failed under; only a
-    /// membership change or a retired capture retries.
+    /// The claim window has closed, and the cut binds the same membership as
+    /// the one the last recapture failed under; only a membership change or
+    /// a retired capture retries.
     SameCut,
     /// The consumer refused or failed the capture; its own log names why.
     CaptureFailed,
     /// The recapture outlived its donor-wait bound, or could not keep its
     /// claim renewed meanwhile.
     TimedOut,
-    /// Membership changed while the image was captured and encoded.
+    /// Membership changed while the image was captured and encoded: a member
+    /// joined, left, or restarted, or its presence lapsed. SWIM status and
+    /// incarnation changes alone do not count.
     RosterChanged,
     /// The local Ready generation or the recapture's operation ended first.
     Superseded,

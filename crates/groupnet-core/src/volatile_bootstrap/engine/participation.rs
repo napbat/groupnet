@@ -7,7 +7,7 @@ use crate::{NodeId, Time};
 use super::{ClaimEngine, ObservedPresence};
 use crate::volatile_bootstrap::{
     BootstrapClaim, BootstrapError, BootstrapMember, BootstrapMemberIdentity, BootstrapParticipant,
-    BootstrapStep, PresenceIdentity,
+    BootstrapStep, PresenceIdentity, same_membership,
 };
 
 impl ClaimEngine {
@@ -48,8 +48,8 @@ impl ClaimEngine {
 
     /// Recheck an already selected candidate against one complete source cut.
     /// This never chooses a new builder or grants local serving permission.
-    /// The first verified cut is pinned; every later one must equal it until
-    /// the candidate's next selection or recapture.
+    /// The first verified cut is pinned; every later one must bind the same
+    /// membership until the candidate's next selection or recapture.
     ///
     /// # Errors
     /// Rejects stale, incomplete, or changed participation before capture or
@@ -86,8 +86,10 @@ impl ClaimEngine {
         Ok(())
     }
 
-    /// A status, incarnation, boot or session change since the pinned cut
-    /// invalidates the decision that cut was verified for.
+    /// A join, a leave, or a boot or session change since the pinned cut
+    /// invalidates the decision that cut was verified for. A member's SWIM
+    /// status or incarnation changing alone does not: see
+    /// [`same_membership`].
     fn matches_pinned_roster(
         &self,
         roster: &[BootstrapMemberIdentity],
@@ -95,7 +97,7 @@ impl ClaimEngine {
         if self
             .participant_roster
             .as_deref()
-            .is_some_and(|pinned| pinned != roster)
+            .is_some_and(|pinned| !same_membership(pinned, roster))
         {
             return Err(BootstrapError::InvalidObservation);
         }
@@ -555,6 +557,11 @@ mod tests {
         );
     }
 
+    /// A noneligible member without presence belongs to the roster, so its
+    /// leaving, or its presence appearing, is a membership change. A SWIM
+    /// suspicion, its refutation, or a Dead verdict changes only the
+    /// observer's status and incarnation for the same process: the pinned
+    /// decision stands.
     #[test]
     fn noneligible_native_member_without_presence_is_part_of_exact_roster() {
         let mut engine = engine();
@@ -577,20 +584,25 @@ mod tests {
         engine.participant_roster = Some(accepted.0);
         let mut changed = exact.clone();
         changed[1].member_incarnation = 5;
-        let refuted = engine
-            .validate_participants(&members, &changed, &participants, &claims)
-            .expect("a refuted suspicion is still a complete cut");
-        assert_eq!(
-            engine.matches_pinned_roster(&refuted.0),
-            Err(BootstrapError::InvalidObservation)
-        );
-        changed[1].member_incarnation = 4;
         changed[1].status = Status::Dead;
         let dead = engine
             .validate_participants(&members, &changed, &participants, &claims)
             .expect("a dead member is still a complete cut");
+        assert_eq!(engine.matches_pinned_roster(&dead.0), Ok(()));
+        let left = engine
+            .validate_participants(&members[..1], &exact[..1], &participants, &claims)
+            .expect("a cut without the member is complete");
         assert_eq!(
-            engine.matches_pinned_roster(&dead.0),
+            engine.matches_pinned_roster(&left.0),
+            Err(BootstrapError::InvalidObservation)
+        );
+        changed[1].presence = Some(PresenceIdentity {
+            node: NodeId::from("peer"),
+            boot: BootId(9),
+            session: 2,
+        });
+        assert_eq!(
+            engine.matches_pinned_roster(&changed),
             Err(BootstrapError::InvalidObservation)
         );
     }

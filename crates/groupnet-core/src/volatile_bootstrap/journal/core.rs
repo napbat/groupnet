@@ -8,7 +8,7 @@ use super::types::{
     ReservationStage,
 };
 use crate::Time;
-use crate::volatile_bootstrap::BootstrapMemberIdentity;
+use crate::volatile_bootstrap::{BootstrapMemberIdentity, same_membership};
 
 #[derive(Clone, Debug)]
 struct OutstandingBatch {
@@ -630,8 +630,9 @@ impl DonorJournal {
 
     /// Compare an exact bounded complete membership roster with the capture,
     /// including during off-lock image encoding. This does not make a
-    /// `Capturing` image available to followers. A changed or malformed
-    /// roster invalidates all transfer candidates.
+    /// `Capturing` image available to followers. A roster that does not bind
+    /// the same membership ([`same_membership`]), or a malformed one,
+    /// invalidates all transfer candidates.
     ///
     /// # Errors
     /// Fails closed on changed source membership or malformed metadata.
@@ -644,7 +645,7 @@ impl DonorJournal {
         if !matches!(self.state, JournalState::Capturing | JournalState::Active) {
             return Err(JournalError::Stage);
         }
-        if self.valid_members(members).is_err() || members != self.members {
+        if self.valid_members(members).is_err() || !same_membership(members, &self.members) {
             self.invalidate_inner(Invalidation::Membership);
             return Err(JournalError::Conflict);
         }

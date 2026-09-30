@@ -21,7 +21,7 @@ pub use types::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
     BootstrapMember, BootstrapMemberIdentity, BootstrapOperation, BootstrapParticipant,
     BootstrapPresence, BootstrapScope, BootstrapStage, BootstrapStep, ClaimIdentity, ClaimPhase,
-    PresenceIdentity, ReleaseReason,
+    PresenceIdentity, ReleaseReason, same_membership,
 };
 
 #[cfg(test)]

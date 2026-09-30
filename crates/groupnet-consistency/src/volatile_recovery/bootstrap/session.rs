@@ -526,7 +526,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             }
             self.drain_maintenance().await;
             self.ready_guard = None;
-            if self.engine.ready_recapture_pending()
+            // A failed recapture waits out its backoff before the next cut
+            // is even sampled for it: each attempt clones the whole index.
+            if self.engine.ready_recapture_due()
                 && let Some(deadline) = Instant::now()
                     .checked_add(Duration::from_millis(self.config.claim.donor_wait_ms))
                 && let Some(guard) = ready.map(|guard| guard.restricted_to(deadline))

@@ -55,13 +55,20 @@ pub struct ClaimEngine {
     participant_roster: Option<Vec<BootstrapMemberIdentity>>,
     /// The complete cut a running Ready recapture started under.
     recapture_roster: Option<Vec<BootstrapMemberIdentity>>,
-    /// The cut the last Ready recapture failed under; only a different cut
-    /// retries it.
+    /// The cut the last Ready recapture failed under. Once the claim window
+    /// below has closed, only a cut binding a different membership retries.
     failed_recapture: Option<Vec<BootstrapMemberIdentity>>,
     /// While a completed local image awaits its Ready recapture, its claim is
-    /// renewed until this bound: the builder's own stall bound, since a
-    /// pending recapture makes no progress.
+    /// renewed until this bound: the builder's own stall bound from when the
+    /// image became pending, since a pending recapture makes no progress. A
+    /// failed attempt does not extend it. It only acts while the recapture is
+    /// pending: a running attempt holds its own operation bound instead.
     recapture_due: Option<Time>,
+    /// No Ready recapture starts before this: the backoff after the last
+    /// failed one. Cleared once it passes.
+    recapture_retry_due: Option<Time>,
+    /// Consecutive failed Ready recaptures since the last one succeeded.
+    recapture_failures: u32,
     observed_presence: BTreeMap<PresenceIdentity, ObservedPresence>,
     settle_due: Option<Time>,
     renew_due: Option<Time>,
@@ -132,6 +139,8 @@ impl ClaimEngine {
             recapture_roster: None,
             failed_recapture: None,
             recapture_due: None,
+            recapture_retry_due: None,
+            recapture_failures: 0,
             observed_presence: BTreeMap::new(),
             settle_due: None,
             renew_due: None,
@@ -226,6 +235,15 @@ impl ClaimEngine {
             && self.selected.as_ref() == Some(&self.identity())
     }
 
+    /// A pending Ready recapture may start now: the backoff after its last
+    /// failed attempt has passed. The worker samples a cut for it only then,
+    /// so failures cost at most one capture per backoff, however often the
+    /// membership changes.
+    #[must_use]
+    pub fn ready_recapture_due(&self) -> bool {
+        self.ready_recapture_pending() && self.recapture_retry_due.is_none()
+    }
+
     /// Earliest finite local deadline; the runtime must drive `Tick` at it.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Time> {
@@ -236,7 +254,9 @@ impl ClaimEngine {
             self.operation_due,
             self.follow_due,
             self.total_due,
-            self.recapture_due,
+            self.recapture_due
+                .filter(|_| self.ready_recapture_pending()),
+            self.recapture_retry_due,
             self.transfer
                 .as_ref()
                 .and_then(TransferSession::next_deadline),
@@ -345,6 +365,8 @@ impl ClaimEngine {
         self.selected = None;
         self.recapture_roster = None;
         self.recapture_due = None;
+        self.recapture_retry_due = None;
+        self.recapture_failures = 0;
         effects.push(BootstrapEffect::WithdrawClaim(self.identity()));
         effects.push(BootstrapEffect::FallbackOrigin);
         self.ok(effects)
@@ -446,6 +468,8 @@ impl ClaimEngine {
         self.recapture_roster = None;
         self.failed_recapture = None;
         self.recapture_due = None;
+        self.recapture_retry_due = None;
+        self.recapture_failures = 0;
         self.roster_poll = None;
         self.roster_poll_due = None;
         self.excluded.clear();
@@ -633,7 +657,10 @@ impl ClaimEngine {
                 self.terminate()
             };
         }
-        if self.recapture_due.is_some_and(|due| now >= due) {
+        if self.recapture_retry_due.is_some_and(|due| now >= due) {
+            self.recapture_retry_due = None;
+        }
+        if self.ready_recapture_pending() && self.recapture_due.is_some_and(|due| now >= due) {
             return self.release_pending_claim();
         }
         let mut effects = Vec::new();
@@ -699,6 +726,8 @@ impl ClaimEngine {
         self.ready_retry_due = None;
         self.total_due = None;
         self.recapture_due = None;
+        self.recapture_retry_due = None;
+        self.recapture_failures = 0;
         self.selected = None;
         self.participant_roster = None;
         self.ok(effects)
@@ -720,6 +749,8 @@ impl ClaimEngine {
         self.ready_retry_due = None;
         self.total_due = None;
         self.recapture_due = None;
+        self.recapture_retry_due = None;
+        self.recapture_failures = 0;
         self.operation = None;
         self.selected = None;
         let mut effects = Vec::new();
@@ -785,6 +816,9 @@ impl ClaimEngine {
                 self.total_due = None;
                 self.recapture_roster = None;
                 self.failed_recapture = None;
+                self.recapture_due = None;
+                self.recapture_retry_due = None;
+                self.recapture_failures = 0;
                 self.stage = BootstrapStage::DonorAvailable;
                 self.local_phase = ClaimPhase::Ready;
                 let Ok(claim) = self.publish_renewal() else {
@@ -880,3 +914,6 @@ impl ClaimEngine {
 
 #[cfg(test)]
 mod renewal_tests;
+
+#[cfg(test)]
+mod recapture_tests;

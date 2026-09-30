@@ -8,8 +8,8 @@ use super::{
 
 impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
     /// One bounded recapture of the completed local image. Any failure only
-    /// makes the recapture pending again in the core; it retries under a
-    /// different participation cut and never scans the origin.
+    /// makes the recapture pending again in the core; it is retried after a
+    /// backoff, as the core decides, and never scans the origin.
     pub(super) async fn recapture_current(
         &mut self,
         op: groupnet_core::volatile_bootstrap::BootstrapOperation,

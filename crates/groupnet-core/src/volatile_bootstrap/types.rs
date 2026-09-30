@@ -119,7 +119,9 @@ pub struct BootstrapPresence {
 /// Exact native member from one complete actor cut retained by a donor image.
 /// A noneligible member may have no participation entry, but its status and
 /// native incarnation still belong to the roster. The participation boot
-/// separately fences processes reusing the same `NodeId`.
+/// separately fences processes reusing the same `NodeId`. Two cuts bind the
+/// same membership by [`same_membership`], not by equality: status and
+/// incarnation are the observer's SWIM opinion of a member.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapMemberIdentity {
     /// Native member node, including a nonparticipant or noneligible member.
@@ -159,6 +161,28 @@ impl BootstrapMemberIdentity {
                 presence.node == self.node && presence.boot.0 != 0 && presence.session != 0
             })
     }
+
+    /// Whether `other` is this same member process: the same node with the
+    /// same participation presence (boot and session), or with none in both.
+    /// Native status and membership incarnation are not compared. They are
+    /// the observing node's SWIM opinion of the member, which a suspicion and
+    /// its refutation change without changing the process, its presence or
+    /// the writes it can make; a restart, a lapsed presence, a join and a
+    /// leave all change the presence or the node set instead.
+    #[must_use]
+    pub fn same_member(&self, other: &Self) -> bool {
+        self.node == other.node && self.presence == other.presence
+    }
+}
+
+/// Whether two sorted complete rosters bind the same membership: the same
+/// members in order, each [`BootstrapMemberIdentity::same_member`]. This is
+/// what a donor image's roster binds, from the cut at C through Ready, each
+/// barrier and a follower's post-handoff check; a cut that differs only in
+/// member status or incarnation is not a roster change.
+#[must_use]
+pub fn same_membership(a: &[BootstrapMemberIdentity], b: &[BootstrapMemberIdentity]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.same_member(b))
 }
 
 /// One live, source-observed participation entry at a complete native cut.
@@ -327,8 +351,8 @@ pub enum BootstrapEvent {
     /// advertise a donor candidate yet; ordinary local recovery may still
     /// affirm independently. With participation required a Ready recapture
     /// follows, so the builder's claim stays renewed until that recapture's
-    /// claim supersedes it, for at most `donor_wait_ms`; otherwise it is
-    /// withdrawn.
+    /// claim supersedes it, for at most `donor_wait_ms` from now, however
+    /// many attempts fail meanwhile; otherwise it is withdrawn.
     LocalOnlyBuilt {
         /// Exact build operation.
         op: BootstrapOperation,
@@ -337,8 +361,11 @@ pub enum BootstrapEvent {
     },
     /// Local origin is serving, so attempt one fresh bounded donor recapture
     /// under the complete participation cut just verified. This is separate
-    /// from the completed origin build and cannot rescan it. A cut equal to
-    /// the one the last recapture failed under starts nothing.
+    /// from the completed origin build and cannot rescan it. It is refused
+    /// until the backoff after a failed attempt has passed
+    /// ([`ClaimEngine::ready_recapture_due`](crate::volatile_bootstrap::ClaimEngine::ready_recapture_due)).
+    /// Once the claim window has closed, a cut binding the same membership as
+    /// the one the last attempt failed under starts nothing.
     StartReadyRecapture,
     /// Peer transfer cannot represent the required roster format. Retire the
     /// transient local claim while leaving participation renewal active and
@@ -351,7 +378,7 @@ pub enum BootstrapEvent {
     },
     /// Local guarded origin build failed or lost its recovery permit. For a
     /// Ready recapture this only makes the recapture pending again, to be
-    /// retried under a different participation cut; it is no origin fallback.
+    /// retried after a backoff; it is no origin fallback.
     BuildFailed {
         /// Exact build operation.
         op: BootstrapOperation,

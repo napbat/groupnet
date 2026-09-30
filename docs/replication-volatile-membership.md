@@ -96,8 +96,11 @@ policy-bound values into a new complete observation. Claim selection may use
 only claim-bearing candidates. The journal, Offer, Barrier, and coverage roster
 records every native member at that cut with exact status and membership
 incarnation, including noneligible members without a participation entry.
-Eligible members require a current compatible presence; a status, incarnation,
-boot, or session change invalidates the old capture.
+Eligible members require a current compatible presence. Across cuts the
+roster binds each member's node and presence, not its status or incarnation:
+a join, a leave, a restart's new boot or session, or a presence that lapses or
+appears invalidates the old capture; a suspicion, a Dead verdict, or a
+refutation alone does not (see "What a donor roster binds" below).
 The current one-key inspection and builder-claim APIs remain usable unchanged.
 
 The donor journal records a sorted, exact, count-and-byte-bounded native
@@ -111,6 +114,38 @@ withdraws donor availability. Source gossip is not a linearizable admission
 barrier: a new writer unseen at C can still join. The follower therefore
 keeps native overlap/continuity and its independent current lease/frontier
 affirmation; it must origin-route if those proofs cannot cover the join.
+
+**What a donor roster binds.** Each cut is validated exactly as above. Two
+cuts, at C and after encoding, at C and at Ready, a barrier or the donor's
+maintenance recheck, or the donor's C roster and a follower's post-handoff
+cut, bind the same membership (`same_membership`) when they list the same
+members in order and each member has the same presence (boot and session) or
+none in both. Status and incarnation are left out because they are the
+observing node's SWIM opinion, not a fact about the member: a suspicion or a
+Dead verdict changes only the observer's status for the member, and a
+refutation raises only the member's incarnation, while the process, its
+presence, and the writes it can make stay the same. Nothing a donor image must
+cover depends on them. Writes are bound by native cuts: C records each
+writer's epoch and sequence under the same publication lock, every later
+effect enters the journal contiguously, and a new writer or epoch
+(`Invalidation::Membership`) or a sequence gap (`Invalidation::Gap`) retires
+the capture. Lease and feed continuity are bound by the outer recovery gate,
+which closes on a gap, a lapse, or a join and revokes the Ready guard, and by
+the follower's own lease/frontier affirmation and native overlap. What the
+roster does bind still catches every change of the membership itself: a join
+adds a node, a reap removes one, a restart shows a new boot or session (a
+restarted process starts again at incarnation zero, so its incarnation never
+reliably revealed it), and a member that really died loses its presence
+within one claim TTL even while peers only suspect it. A noneligible member
+without presence is bound only by its node; it can neither donate nor
+receive, and any write from a restart of it arrives as a new native writer.
+Binding SWIM opinions made the check fail on churn it cannot use: on a loaded
+one-CPU pod the capture itself pauses the node (below), a peer suspects it, and
+it refutes, so the donor's own incarnation rose between C and the
+post-encode cut, and a loaded follower went from Suspect to Dead in the
+donor's view, in almost every attempt. Different observers also disagree on
+both fields until gossip converges, which a follower comparing the donor's
+roster with its own cut would otherwise have to wait out.
 
 If the origin LIST completed but donor capture is refused or the roster changed
 while C was encoded, the worker reports a local-only baseline. It does not
@@ -132,12 +167,27 @@ participation cut, the worker publishes every renewal the engine has
 scheduled, including one that came due while the capture held the worker:
 that cut is verified against the worker's own claim sequence. A recapture that
 fails or outlives its donor-wait bound is pending again, never an origin
-fallback, and its claim stays renewed as above. It retries only under a
-complete cut that differs from the one it failed under: a join that
-interrupts a recapture retries it at once under the new roster, while a
-failure the roster did not cause never loops, and a later membership change
-gets one fresh attempt. A cut equal to the failed one withdraws the claim at
-once, since no recapture will follow under it.
+fallback. Its retry waits a backoff of one observation interval after the
+first failure, doubling, capped at a quarter of `donor_wait_ms` but never
+under one interval; the worker does not even sample a cut for it before then.
+The claim window opened when the image became pending (the local-only build,
+or a retired capture) is not extended by failures: inside it the claim stays
+renewed and a retry runs under any complete cut, so a transient failure or a
+join that interrupts a recapture is retried once its backoff has passed. When
+the window closes the claim is withdrawn, and only a cut binding a different
+membership than the one the last attempt failed under starts another attempt,
+which opens a fresh window; a failure the membership did not cause never
+loops, and no joiner waits on it. Each attempt clones the whole index under the
+publication fence and the index write lock, and C must stay one atomic cut
+with its journal ingress and native cuts, so the clone keeps holding both
+(the S3 consumer measured about 300 ms at 800k rows in release). A runtime task
+needing either waits meanwhile, so a node on one runtime worker pauses for the
+clone, and with a 50 ms SWIM probe timeout its peer suspects it; the roster
+binding above makes that harmless to the capture, and the pacing bounds its
+cost. With `observe_ms` = 1 s and `donor_wait_ms` = 30 s, starts are at
+least 1, 2, 4, 7.5, 7.5 and 7.5 s apart after each failure, so one window
+holds at most seven attempts, about 2 s of clone at production size, and
+after it at most one attempt per 7.5 s, only on a membership change.
 While the worker awaits any adapter operation that does not itself drive the
 bootstrap child (invalidation, the origin rebuild, peer observation and
 frontier waits), it keeps the child's maintenance turns running on the
@@ -188,8 +238,9 @@ not extend either budget on subsequent refusals. If no independently valid
 replacement arrives, the ordinary origin fallback proceeds. Origin reads
 remain available during this wait; no stale donor permission is accepted.
 
-A healthy donor checks its exact roster on the existing worker maintenance
-turn, and also before serving an Offer or Barrier. A changed or unprovable cut
+A healthy donor checks its roster on the existing worker maintenance turn,
+and also before serving an Offer or Barrier. A cut binding a different
+membership, or an unprovable cut,
 retires its old capture and unlinks the old journal before offering any
 replacement; its Ready claim is superseded by a renewed Building claim, as
 after a lapse, so joiners wait for the replacement. Once a complete fresh cut
@@ -220,4 +271,6 @@ A healthy two-node run with a transferred follower must still
 select the already-Ready donor for a third joining follower. Tests must prove
 that schedule, old/new boot and same-boot new-session overlap, stale TTL or
 renewal replay, missing participation fallback, cancellation and admission
-release, and member change during C encoding or B replay.
+release, and member change during C encoding or B replay; and that SWIM
+suspicion, Dead verdicts and refutations during C encoding fail no capture,
+while failed recaptures are paced and bounded as above.

@@ -3,7 +3,10 @@
 use std::collections::BTreeSet;
 
 use crate::volatile_bootstrap::transfer::{NativeHandoffReceipt, native_cuts_cover};
-use crate::{NodeId, volatile_bootstrap::BootstrapMemberIdentity};
+use crate::{
+    NodeId,
+    volatile_bootstrap::{BootstrapMemberIdentity, same_membership},
+};
 
 use super::RecoveryEngine;
 use crate::volatile_recovery::{Peer, RecoveryOperation};
@@ -63,13 +66,16 @@ impl RecoveryEngine {
             && native_cuts_cover(&handoff.continued_cuts, &coverage.proven_cuts)
     }
 
+    /// A fresh cut after the handoff must bind the same membership as the
+    /// donor's roster at C ([`same_membership`]), and name exactly the peers
+    /// this node's lease and frontier checks covered.
     pub(super) fn valid_peer_roster(
         &self,
         peers: &[Peer],
         identities: &[BootstrapMemberIdentity],
     ) -> bool {
         if identities.len() > self.config.max_members.saturating_add(1)
-            || identities != self.peer_members
+            || !same_membership(identities, &self.peer_members)
             || identities
                 .iter()
                 .any(|identity| !identity.valid_bounded(self.config.max_member_bytes))

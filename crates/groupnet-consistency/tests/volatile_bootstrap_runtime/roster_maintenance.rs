@@ -296,11 +296,13 @@ async fn ready_donor_retires_changed_roster_then_recaptures_without_origin_scan(
 }
 
 /// An invalidated Ready capture is retired at once and its replacement
-/// recapture fails. Under the unchanged roster that failure is neither
-/// advertised Ready nor retried, while local serving stays up. A membership
-/// change then retries it once, and nothing ever scans the origin again.
+/// recapture keeps failing. Each retry waits its backoff, and only inside
+/// the claim window of `donor_wait_ms` (500 ms) the retirement opened; then
+/// the claim is withdrawn and nothing retries it under the unchanged roster,
+/// while local serving stays up. A membership change then retries it once,
+/// and nothing ever scans the origin again.
 #[tokio::test]
-async fn failed_replacement_waits_for_a_roster_change_then_recaptures_once() {
+async fn failed_replacement_backs_off_then_waits_for_a_roster_change() {
     let (claims, donor, reads, handle) = open_local_only_donor();
     wait_ready(&claims, &donor, &handle).await;
     donor.allow_recapture.store(false, Ordering::SeqCst);
@@ -308,11 +310,19 @@ async fn failed_replacement_waits_for_a_roster_change_then_recaptures_once() {
     old.with_journal(|journal| {
         journal.invalidate(groupnet_core::volatile_bootstrap::journal::Invalidation::DonorLost);
     });
-    eventually_within("invalidated capture's replacement fails", SETTLE, || {
-        donor.ingress.lock().unwrap().is_none()
-            && donor.recapture_attempts.load(Ordering::SeqCst) == 2
-    })
+    eventually_within(
+        "the failing replacement's claim window closes",
+        SETTLE,
+        || {
+            donor.ingress.lock().unwrap().is_none()
+                && donor.recapture_attempts.load(Ordering::SeqCst) > 1
+                && claims.local.lock().unwrap().is_none()
+        },
+    )
     .await;
+    let attempts = donor.recapture_attempts.load(Ordering::SeqCst);
+    // The first capture, then replacements 100, 125, 125, 125 ms apart.
+    assert!((3..=6).contains(&attempts), "{attempts} attempts");
     let renewal = claims.presence.lock().unwrap().as_ref().unwrap().renewal;
     eventually_within("maintenance turns keep running", SETTLE, || {
         claims
@@ -323,17 +333,9 @@ async fn failed_replacement_waits_for_a_roster_change_then_recaptures_once() {
             .is_some_and(|presence| presence.renewal > renewal + 2)
     })
     .await;
-    assert_eq!(donor.recapture_attempts.load(Ordering::SeqCst), 2);
-    assert!(
-        claims
-            .local
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_none_or(|claim| claim.phase != ClaimPhase::Ready)
-    );
+    assert_eq!(donor.recapture_attempts.load(Ordering::SeqCst), attempts);
+    assert!(claims.local.lock().unwrap().is_none());
     assert!(handle.status().may_serve);
-
     donor.allow_recapture.store(true, Ordering::SeqCst);
     let joiner = BootstrapMemberIdentity {
         node: NodeId::from("peer"),
@@ -363,7 +365,10 @@ async fn failed_replacement_waits_for_a_roster_change_then_recaptures_once() {
                 })
     })
     .await;
-    assert_eq!(donor.recapture_attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        donor.recapture_attempts.load(Ordering::SeqCst),
+        attempts + 1
+    );
     assert_eq!(donor.recaptures.load(Ordering::SeqCst), 2);
     assert!(handle.status().may_serve);
     assert_eq!(donor.builds.load(Ordering::SeqCst), 1);
