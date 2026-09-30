@@ -460,6 +460,138 @@ fn image_and_two_barriers_finish_without_granting_authority() {
     assert_eq!(engine.next_deadline(), None);
 }
 
+/// An install that finds its live cuts moved since the coverage check keeps
+/// its stage: the session samples a later barrier instead of aborting, and
+/// the stale install reply can no longer complete the handoff.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one transfer walks image, barrier, batch, coverage, and install callbacks"
+)]
+fn install_reporting_moved_cuts_advances_the_barrier_instead_of_aborting() {
+    let mut engine = TransferSession::new(config(), binding(), Time(0)).unwrap();
+    let mut next = 1;
+    let attach = through_image(&mut engine, &mut next);
+    let mut allocate = || {
+        next += 1;
+        Some(op(next))
+    };
+    let TransferEffect::FetchBarrier { op: first_b, .. } = accept(
+        &mut engine,
+        TransferEvent::StreamAttached {
+            op: attach,
+            token: AttachToken {
+                reservation: reservation(),
+                operation: 42,
+            },
+        },
+        &mut allocate,
+    ) else {
+        panic!("first B")
+    };
+    let TransferEffect::FetchBatch { op: fetch, .. } = accept(
+        &mut engine,
+        TransferEvent::BarrierReceived {
+            op: first_b,
+            receipt: barrier(2, 1, 51),
+        },
+        &mut allocate,
+    ) else {
+        panic!("batch")
+    };
+    let TransferEffect::AckBatch { op: ack, .. } = accept(
+        &mut engine,
+        TransferEvent::BatchStaged {
+            op: fetch,
+            batch: JournalBatch {
+                reservation: reservation(),
+                operation: 60,
+                from: cursor(0),
+                through: cursor(2),
+                deltas: vec![
+                    JournalDelta {
+                        position: 1,
+                        identity: DeltaIdentity::Native(cut(1)),
+                        effect: vec![1, 5],
+                    },
+                    JournalDelta {
+                        position: 2,
+                        identity: DeltaIdentity::Local(b"x".to_vec()),
+                        effect: vec![0],
+                    },
+                ],
+                bytes: 5,
+            },
+        },
+        &mut allocate,
+    ) else {
+        panic!("ack")
+    };
+    let TransferEffect::CheckNativeCoverage { op: cover, .. } = accept(
+        &mut engine,
+        TransferEvent::BatchAcknowledged {
+            op: ack,
+            through: cursor(2),
+        },
+        &mut allocate,
+    ) else {
+        panic!("coverage")
+    };
+    let coverage = NativeCoverageReceipt {
+        parent: op(1),
+        barrier: barrier(2, 1, 51),
+        staged_through: cursor(2),
+        proven_cuts: vec![cut(1)],
+        members: offer().members,
+        buffered_bytes: 0,
+    };
+    let TransferEffect::InstallCandidate { op: install, .. } = accept(
+        &mut engine,
+        TransferEvent::NativeCovered {
+            op: cover,
+            coverage: coverage.clone(),
+        },
+        &mut allocate,
+    ) else {
+        panic!("install")
+    };
+    assert_eq!(
+        accept(
+            &mut engine,
+            TransferEvent::NativePending { op: install },
+            &mut allocate,
+        ),
+        TransferEffect::ArmTimer(Time(2))
+    );
+    assert_eq!(engine.stage(), TransferStage::WaitingCoverage);
+    let stale = engine.step(
+        TransferEvent::Installed {
+            op: install,
+            handoff: Box::new(NativeHandoffReceipt {
+                recovery: recovery(),
+                install,
+                coverage,
+                attachment: AttachToken {
+                    reservation: reservation(),
+                    operation: 42,
+                },
+                schema: 1,
+                applier_generation: 1,
+                continued_cuts: vec![cut(1)],
+                buffered_bytes: 0,
+            }),
+        },
+        &mut allocate,
+    );
+    assert_eq!(stale.rejection, Some(TransferError::Stale));
+    let TransferEffect::AdvanceBarrier { expected, .. } =
+        accept(&mut engine, TransferEvent::Tick(Time(2)), &mut allocate)
+    else {
+        panic!("later B from the retained stage")
+    };
+    assert_eq!(expected, barrier(2, 1, 51));
+}
+
 #[test]
 fn quiet_zero_cut_handoff_is_valid_but_mismatched_attachment_aborts() {
     for wrong_attachment in [false, true] {

@@ -157,7 +157,9 @@ fn peer_handoff_shaped_barrier_faults_keep_reads_closed_until_independent_affirm
                     assert!(!engine.state().recovered, "seed {seed}");
                     None
                 }
-                RecoveryEffect::CancelBaseline { .. } => None,
+                RecoveryEffect::CancelBaseline { .. }
+                | RecoveryEffect::SuspendLocalBaseline { .. }
+                | RecoveryEffect::ResumeLocalBaseline { .. } => None,
                 RecoveryEffect::Invalidate { op, .. } => Some(RecoveryEvent::Invalidated { op }),
                 RecoveryEffect::AcquireBaseline { op } => {
                     Some(RecoveryEvent::PeerBaselineInstalled {
@@ -335,7 +337,9 @@ fn delayed_duplicate_and_lost_peer_callbacks_cannot_reopen_a_superseded_image() 
                             })
                         }
                     }
-                    RecoveryEffect::CancelBaseline { .. } => None,
+                    RecoveryEffect::CancelBaseline { .. }
+                    | RecoveryEffect::SuspendLocalBaseline { .. }
+                    | RecoveryEffect::ResumeLocalBaseline { .. } => None,
                     RecoveryEffect::ObservePeerHeads { op } => {
                         let mut identities = members();
                         if family == 4 && engine.state().stage == RecoveryStage::PeerRecheckingHeads

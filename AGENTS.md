@@ -48,10 +48,15 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `groupnet-consistency/tests/lease_dst.rs` ~948. The band under it, with
    ~90–150 lines of room: `groupnet-sim`'s `tests/election_external_skew.rs`
    ~910, `tests/election_quorum.rs` ~896 and `src/simulation.rs` ~894;
-   `groupnet-core`'s `tests/election.rs` ~909, `src/engine/election/mod.rs`
-   ~873, `src/config.rs` ~861 and `src/engine/election/quorum.rs` ~859;
-   `groupnet-consistency`'s `src/lease/shell.rs` ~889,
-   `tests/hosted_dst_liveness.rs` ~875 and `tests/lease_dst_liveness.rs` ~853.
+   `groupnet-core`'s `tests/election.rs` ~909, `src/volatile_recovery/engine.rs`
+   ~912, `src/volatile_bootstrap/engine/participation.rs` ~888,
+   `src/engine/election/mod.rs` ~873, `src/volatile_bootstrap/engine.rs` ~862,
+   `src/config.rs` ~861 and `src/engine/election/quorum.rs` ~859;
+   `groupnet-consistency`'s `tests/volatile_bootstrap_runtime.rs` ~932 (new
+   scenarios go in its `volatile_bootstrap_runtime/` children),
+   `src/lease/shell.rs` ~889, `tests/volatile_bootstrap_runtime/scenarios.rs`
+   ~876, `tests/hosted_dst_liveness.rs` ~875 and `tests/lease_dst_liveness.rs`
+   ~853.
    With room still: `groupnet-runtime`'s `src/node.rs` ~803,
    `tests/external_faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
    ~754 and `tests/external.rs` ~706; `groupnet-consistency`'s

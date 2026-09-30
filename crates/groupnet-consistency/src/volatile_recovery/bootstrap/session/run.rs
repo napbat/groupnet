@@ -74,6 +74,59 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         })
     }
 
+    /// One complete current participation cut for the recovery core's
+    /// post-handoff peer check, after this child's candidate has retired.
+    pub(super) async fn observe_peer_roster(
+        &mut self,
+        due: Instant,
+    ) -> Option<Vec<BootstrapMemberIdentity>> {
+        if !self.accept(BootstrapEvent::Tick(self.now())) {
+            return None;
+        }
+        let op = self.engine.begin_roster_observation().ok()?;
+        let operation_due = self.operation_due(op, due)?;
+        let limits = self.claim_limits(
+            self.config.claim.max_members,
+            self.config.claim.max_member_bytes,
+        );
+        let snapshot = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(operation_due),
+            self.claims
+                .observe_participation(op, limits, &self.admission),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !self.tick_after_io() {
+            return None;
+        }
+        snapshot.consume(|mut snapshot| {
+            let age_ms = observation_age_ms(snapshot.sampled_at, Instant::now())?;
+            for claim in &mut snapshot.claims {
+                claim.remaining_ms = claim.remaining_ms.saturating_sub(age_ms);
+            }
+            snapshot.claims.retain(|claim| claim.remaining_ms > 0);
+            let participants: Vec<_> = snapshot
+                .participants
+                .into_iter()
+                .map(|participant| BootstrapParticipant {
+                    member: participant.member,
+                    renewal: participant.renewal,
+                    remaining_ms: participant.remaining_ms.saturating_sub(age_ms),
+                })
+                .collect();
+            self.engine
+                .verify_peer_roster(
+                    op,
+                    &snapshot.members,
+                    &snapshot.roster,
+                    &participants,
+                    &snapshot.claims,
+                )
+                .ok()
+        })
+    }
+
     async fn recapture_current(
         &mut self,
         op: groupnet_core::volatile_bootstrap::BootstrapOperation,
@@ -84,9 +137,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             return;
         };
         let Some(guard) = self
-            .permit
-            .as_ref()
-            .and_then(|permit| permit.ready_capture(deadline))
+            .ready_guard
+            .take()
+            .map(|guard| guard.restricted_to(deadline))
         else {
             let _ = self.accept(BootstrapEvent::BuildFailed { op, selected });
             return;
@@ -161,7 +214,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         self.child_parent = None;
         self.transfer_context = None;
         self.recovery = Some(recovery);
+        self.suspended_recovery = None;
         self.permit = Some(permit.clone());
+        self.ready_guard = None;
         self.due = Some(due);
         if !self.accept(BootstrapEvent::Tick(self.now())) || !self.accept(BootstrapEvent::Start) {
             return BootstrapOutcome::Declined;
@@ -173,11 +228,16 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             if !self.accept(BootstrapEvent::Tick(self.now())) {
                 return BootstrapOutcome::Declined;
             }
-            if let Some(effect) = self.effects.pop_front() {
+            // Every accepted step re-arms its timer. Drain the queued work
+            // before the next Tick; re-ticking after a no-op effect queues a
+            // fresh `ArmTimer` forever and never yields to the runtime.
+            while let Some(effect) = self.effects.pop_front() {
+                if Instant::now() >= due || !permit.valid() {
+                    return BootstrapOutcome::Declined;
+                }
                 if let Some(outcome) = self.execute_claim_effect(effect, due).await {
                     return outcome;
                 }
-                continue;
             }
             if matches!(
                 self.engine.stage(),

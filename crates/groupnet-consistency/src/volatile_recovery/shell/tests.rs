@@ -152,6 +152,32 @@ fn ready_recapture_uses_a_fresh_finite_guard_and_generation_change_revokes_it() 
     assert!(old.ready_capture(Instant::now()).is_none());
     shared.signal(Signal::Gap(1)).unwrap();
     assert!(guard.capture(|_| 3).is_none());
+    assert!(
+        shared
+            .ready_capture(Instant::now() + Duration::from_secs(1))
+            .is_none()
+    );
+
+    // Only a newly affirmed outer owner can mint the replacement. The old
+    // generation's guard stays revoked even after the read gate reopens.
+    {
+        let mut control = lock(&shared.control);
+        control.state.generation = 2;
+        control.state.stage = groupnet_core::volatile_recovery::RecoveryStage::Ready;
+        control.state.recovered = true;
+        control.open = true;
+    }
+    let fresh = shared
+        .ready_capture(Instant::now() + Duration::from_secs(1))
+        .expect("newly affirmed owner may issue a finite capture guard");
+    assert!(guard.capture(|_| ()).is_none());
+    assert_eq!(fresh.capture(|generation| generation), Some(2));
+    assert!(
+        fresh
+            .restricted_to(Instant::now())
+            .capture(|_| ())
+            .is_none()
+    );
 }
 
 #[test]

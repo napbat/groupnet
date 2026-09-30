@@ -238,6 +238,8 @@ pub enum BootstrapStage {
     Transferred,
     /// Selection budget ended; the ordinary origin fallback remains available.
     Fallback,
+    /// Candidate retired while this process continues scoped presence renewal.
+    Participating,
     /// Terminal local cancellation.
     Cancelled,
 }
@@ -262,6 +264,8 @@ pub enum BootstrapError {
 /// Explicit observation, completion, failure, and clock inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootstrapEvent {
+    /// Retire one recovery candidate without withdrawing process presence.
+    RetireCandidate,
     /// Publish a fresh local claim and start one finite selection episode.
     Start,
     /// One source-certified complete bounded member and claim snapshot.

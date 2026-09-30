@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::placement;
 use crate::{NodeId, Time};
 
 use super::transfer::{TransferConfig, TransferSession};
@@ -14,6 +13,7 @@ use super::types::{
 };
 
 mod participation;
+mod selection;
 mod transfer;
 
 #[derive(Clone, Copy, Debug)]
@@ -53,6 +53,7 @@ pub struct ClaimEngine {
     renew_due: Option<Time>,
     operation_due: Option<Time>,
     follow_due: Option<Time>,
+    ready_retry_due: Option<Time>,
     total_due: Option<Time>,
     operation: Option<BootstrapOperation>,
     selected: Option<ClaimIdentity>,
@@ -117,6 +118,7 @@ impl ClaimEngine {
             renew_due: None,
             operation_due: None,
             follow_due: None,
+            ready_retry_due: None,
             total_due: None,
             operation: None,
             selected: None,
@@ -311,6 +313,7 @@ impl ClaimEngine {
         self.renew_due = None;
         self.operation_due = None;
         self.follow_due = None;
+        self.ready_retry_due = None;
         self.total_due = None;
         self.selected = None;
         effects.push(BootstrapEffect::WithdrawClaim(self.identity()));
@@ -404,10 +407,13 @@ impl ClaimEngine {
         self.operation = None;
         self.operation_due = None;
         self.follow_due = None;
+        self.ready_retry_due = None;
         self.selected = None;
         self.observed.clear();
         self.observed_presence.clear();
         self.participant_roster = None;
+        self.roster_poll = None;
+        self.roster_poll_due = None;
         self.excluded.clear();
         let mut effects = Vec::new();
         if let Some(op) = previous_operation {
@@ -549,111 +555,6 @@ impl ClaimEngine {
         Ok(expiry > self.now && claim.remaining_ms > 0)
     }
 
-    fn choose(
-        &mut self,
-        members: &[BootstrapMember],
-        claims: Vec<BootstrapClaim>,
-    ) -> BootstrapStep {
-        if self.validate_roster(members, &claims).is_err() {
-            return Self::reject(BootstrapError::InvalidObservation);
-        }
-        if self.follow_due.is_some_and(|due| self.now >= due)
-            && let Some(selected) = self.selected.take()
-        {
-            self.excluded.insert(selected);
-            self.follow_due = None;
-        }
-        // Keep the bounded renewal high-water marks until the episode ends.
-        // Forgetting an expired mark would let a stale source record revive it.
-        let mut candidates = BTreeMap::new();
-        for claim in claims {
-            match self.track_claim(&claim) {
-                Ok(true) if !self.excluded.contains(&claim.identity) => {
-                    candidates.insert(claim.identity.node.clone(), claim);
-                }
-                Ok(_) => {}
-                Err(error) => return Self::reject(error),
-            }
-        }
-        if candidates.len() > self.config.max_members || !candidates.contains_key(&self.me) {
-            return Self::reject(BootstrapError::InvalidObservation);
-        }
-        let incumbents: BTreeSet<_> = candidates
-            .iter()
-            .filter(|(_, claim)| claim.phase != ClaimPhase::Willing)
-            .map(|(node, _)| node.clone())
-            .collect();
-        let roster = if incumbents.is_empty() {
-            candidates.keys().cloned().collect()
-        } else {
-            incumbents
-        };
-        let Some(winner) = placement::owner(&self.scope.placement_key(), &roster) else {
-            return Self::reject(BootstrapError::InvalidObservation);
-        };
-        let selected = candidates.remove(&winner).expect("winner was in roster");
-        let same_selection = self.selected.as_ref() == Some(&selected.identity);
-        self.selected = Some(selected.identity.clone());
-        self.operation = None;
-        self.operation_due = None;
-        if winner == self.me {
-            self.follow_due = None;
-            if selected.phase == ClaimPhase::Ready {
-                self.stage = BootstrapStage::DonorAvailable;
-                self.total_due = None;
-                return self.ok(Vec::new());
-            }
-            self.local_phase = ClaimPhase::Building;
-            let Ok(claim) = self.publish_renewal() else {
-                return self.terminate();
-            };
-            let Ok(op) = self.operation(self.config.donor_wait_ms) else {
-                return self.terminate();
-            };
-            self.stage = BootstrapStage::Building;
-            self.ok(vec![
-                claim,
-                BootstrapEffect::BuildOrigin {
-                    op,
-                    selected: selected.identity,
-                },
-            ])
-        } else {
-            if selected.phase == ClaimPhase::Ready {
-                self.follow_due = None;
-            } else if !same_selection || self.follow_due.is_none() {
-                let Some(due) = self.now.0.checked_add(self.config.donor_wait_ms).map(Time) else {
-                    return self.terminate();
-                };
-                self.follow_due = Some(due.min(self.total_due.unwrap_or(due)));
-            }
-            let Ok(op) = self.operation(if selected.phase == ClaimPhase::Ready {
-                self.config.donor_wait_ms
-            } else {
-                self.config.observe_ms
-            }) else {
-                return self.terminate();
-            };
-            self.stage = if selected.phase == ClaimPhase::Ready {
-                BootstrapStage::DonorAvailable
-            } else {
-                BootstrapStage::Following
-            };
-            let effect = if selected.phase == ClaimPhase::Ready {
-                BootstrapEffect::DonorAvailable {
-                    op,
-                    selected: selected.identity,
-                }
-            } else {
-                BootstrapEffect::FollowBuilder {
-                    op,
-                    selected: selected.identity,
-                }
-            };
-            self.ok(vec![effect])
-        }
-    }
-
     fn tick(&mut self, now: Time) -> BootstrapStep {
         if now < self.now {
             return Self::reject(BootstrapError::BackwardTime);
@@ -721,6 +622,40 @@ impl ClaimEngine {
         self.ok(effects)
     }
 
+    fn retire_candidate(&mut self) -> BootstrapStep {
+        if matches!(
+            self.stage,
+            BootstrapStage::Cancelled | BootstrapStage::Participating
+        ) {
+            return self.ok(Vec::new());
+        }
+        let identity = (self.generation > 0).then(|| self.identity());
+        let previous_operation = self.operation.take();
+        let roster_poll = self.roster_poll.take();
+        let mut effects = Vec::new();
+        if let Some(op) = previous_operation {
+            effects.push(BootstrapEffect::CancelWork { op });
+        }
+        if let Some(op) = roster_poll.filter(|op| Some(*op) != previous_operation) {
+            effects.push(BootstrapEffect::CancelWork { op });
+        }
+        effects.extend(self.cancel_transfer());
+        if let Some(id) = identity {
+            effects.push(BootstrapEffect::WithdrawClaim(id));
+        }
+        self.stage = BootstrapStage::Participating;
+        self.settle_due = None;
+        self.renew_due = None;
+        self.operation_due = None;
+        self.roster_poll_due = None;
+        self.follow_due = None;
+        self.ready_retry_due = None;
+        self.total_due = None;
+        self.selected = None;
+        self.participant_roster = None;
+        self.ok(effects)
+    }
+
     fn cancel(&mut self) -> BootstrapStep {
         if self.stage == BootstrapStage::Cancelled {
             return self.ok(Vec::new());
@@ -734,6 +669,7 @@ impl ClaimEngine {
         self.presence_due = None;
         self.operation_due = None;
         self.follow_due = None;
+        self.ready_retry_due = None;
         self.total_due = None;
         self.operation = None;
         self.selected = None;
@@ -835,6 +771,7 @@ impl ClaimEngine {
                     effects.extend(self.cancel_transfer());
                     self.operation = None;
                     self.operation_due = None;
+                    self.observed.remove(&selected);
                     self.excluded.insert(selected);
                     let next = self.observe();
                     effects.extend(
@@ -852,6 +789,7 @@ impl ClaimEngine {
                 {
                     return Self::reject(BootstrapError::StaleOperation);
                 }
+                self.observed.remove(&selected);
                 self.excluded.insert(selected);
                 self.follow_due = None;
                 if self.excluded.len() > self.config.max_members {
@@ -915,6 +853,7 @@ impl ClaimEngine {
                 }
             }
             BootstrapEvent::Cancel => self.cancel(),
+            BootstrapEvent::RetireCandidate => self.retire_candidate(),
         }
     }
 }

@@ -105,6 +105,7 @@ impl ClaimEngine {
         self.operation_due = None;
         effects.extend(self.cancel_transfer());
         if let Some(selected) = self.selected.clone() {
+            self.observed.remove(&selected);
             self.excluded.insert(selected);
         }
         if self.total_due.is_some_and(|due| self.now >= due)
@@ -200,6 +201,7 @@ impl ClaimEngine {
                 self.claim_poll = None;
                 self.claim_poll_due = None;
                 if let Some(selected) = self.selected.clone() {
+                    self.observed.remove(&selected);
                     self.excluded.insert(selected);
                 }
                 if self.total_due.is_some_and(|due| self.now >= due)

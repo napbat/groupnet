@@ -9,8 +9,8 @@ pub mod bootstrap;
 mod shell;
 
 pub use shell::{
-    AdapterError, BoxRecoveryFuture, PeerHeadObservation, PeerObservation, PublicationPermit,
-    ReadyCapturePermit, RecoveryAdapter, RecoveryHandle, RecoveryOpenError, RecoveryStatus,
+    AdapterError, BoxRecoveryFuture, PeerObservation, PublicationPermit, ReadyCapturePermit,
+    RecoveryAdapter, RecoveryHandle, RecoveryOpenError, RecoveryStatus,
 };
 
 pub use groupnet_core::volatile_recovery::{

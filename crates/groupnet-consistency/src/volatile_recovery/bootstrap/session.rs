@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use groupnet_core::volatile_bootstrap::transfer::{TransferConfig, TransferEffect, TransferEvent};
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapOperation, BootstrapScope,
-    BootstrapStage, ClaimEngine,
+    BootId, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMemberIdentity,
+    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine,
 };
 use groupnet_core::volatile_recovery::RecoveryOperation;
 use groupnet_core::{NodeId, Time};
@@ -20,7 +20,7 @@ use super::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSource, DonorCapture, DonorPort,
     TransferContext, TransferResources,
 };
-use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit};
+use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit};
 
 const MAX_DONOR_SERVICE_BATCH: usize = 32;
 
@@ -75,7 +75,9 @@ pub struct BootstrapSession<C: ClaimSource, D: DonorPort> {
     capture: Option<DonorCapture<D::Image>>,
     resources: TransferResources<D::Stage, D::Attachment, D::NativeBuffer>,
     recovery: Option<RecoveryOperation>,
+    suspended_recovery: Option<RecoveryOperation>,
     permit: Option<PublicationPermit>,
+    ready_guard: Option<ReadyCapturePermit>,
     due: Option<Instant>,
     child_parent: Option<BootstrapOperation>,
     transfer_context: Option<TransferContext>,
@@ -174,7 +176,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 capture: None,
                 resources: TransferResources::default(),
                 recovery: None,
+                suspended_recovery: None,
                 permit: None,
+                ready_guard: None,
                 due: None,
                 child_parent: None,
                 transfer_context: None,
@@ -347,14 +351,75 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             if self.recovery != Some(recovery) {
                 return;
             }
-            let _ = self.accept(BootstrapEvent::Cancel);
+            let _ = self.accept(BootstrapEvent::RetireCandidate);
             self.retire_cancel_effects().await;
             self.recovery = None;
+            self.suspended_recovery = None;
             self.permit = None;
+            self.ready_guard = None;
             self.due = None;
             self.resources = TransferResources::default();
             self.child_parent = None;
             self.transfer_context = None;
+        })
+    }
+
+    fn shutdown(&mut self) -> BoxRecoveryFuture<'_, ()> {
+        Box::pin(async move {
+            let _ = self.accept(BootstrapEvent::Cancel);
+            self.retire_cancel_effects().await;
+            self.recovery = None;
+            self.suspended_recovery = None;
+            self.permit = None;
+            self.ready_guard = None;
+            self.due = None;
+            self.resources = TransferResources::default();
+            self.child_parent = None;
+            self.transfer_context = None;
+        })
+    }
+
+    fn suspend_local(&mut self, recovery: RecoveryOperation) -> BoxRecoveryFuture<'_, ()> {
+        Box::pin(async move {
+            if self.recovery != Some(recovery)
+                || self.engine.stage() != BootstrapStage::DonorAvailable
+            {
+                return;
+            }
+            self.retire_donor_capture();
+            self.permit = None;
+            self.ready_guard = None;
+            self.due = None;
+            self.suspended_recovery = Some(recovery);
+            self.drain_maintenance().await;
+        })
+    }
+
+    fn resume_local(&mut self, previous: RecoveryOperation, current: RecoveryOperation) -> bool {
+        if self.suspended_recovery != Some(previous)
+            || self.recovery != Some(previous)
+            || self.engine.stage() != BootstrapStage::DonorAvailable
+            || !self.engine.ready_recapture_pending()
+            || current.session != previous.session
+            || current.generation != previous.generation.saturating_add(1)
+            || current.token <= previous.token
+        {
+            return false;
+        }
+        self.recovery = Some(current);
+        self.suspended_recovery = None;
+        true
+    }
+
+    fn peer_roster(
+        &mut self,
+        due: Instant,
+    ) -> BoxRecoveryFuture<'_, Option<Vec<BootstrapMemberIdentity>>> {
+        Box::pin(async move {
+            if !self.config.require_participation {
+                return None;
+            }
+            self.observe_peer_roster(due).await
         })
     }
 
@@ -375,7 +440,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
         Arc::clone(&self.wake)
     }
 
-    fn maintain(&mut self, now: Instant) -> BoxRecoveryFuture<'_, ()> {
+    fn maintain(
+        &mut self,
+        now: Instant,
+        ready: Option<ReadyCapturePermit>,
+    ) -> BoxRecoveryFuture<'_, ()> {
         Box::pin(async move {
             let claim_timer_due = self
                 .engine
@@ -403,16 +472,17 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
                 }
             }
             self.drain_maintenance().await;
+            self.ready_guard = None;
             if self.engine.ready_recapture_pending()
                 && let Some(deadline) = Instant::now()
                     .checked_add(Duration::from_millis(self.config.claim.donor_wait_ms))
-                && self
-                    .permit
-                    .as_ref()
-                    .and_then(|permit| permit.ready_capture(deadline))
-                    .is_some()
+                && let Some(guard) = ready.map(|guard| guard.restricted_to(deadline))
+                && guard
+                    .capture(|generation| Some(generation) == self.recovery.map(|op| op.generation))
+                    == Some(true)
                 && self.current_participation(deadline).await.is_some()
             {
+                self.ready_guard = Some(guard);
                 let _ = self.accept(BootstrapEvent::StartReadyRecapture);
             }
             self.drain_maintenance().await;

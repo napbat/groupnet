@@ -72,6 +72,8 @@ fn transient_full_scan_failures_retry_without_reviving_old_operations() {
                     RecoveryEffect::AcquireBaseline { .. }
                     | RecoveryEffect::ObservePeerHeads { .. }
                     | RecoveryEffect::CancelBaseline { .. }
+                    | RecoveryEffect::SuspendLocalBaseline { .. }
+                    | RecoveryEffect::ResumeLocalBaseline { .. }
                     | RecoveryEffect::ObservePeers { .. }
                     | RecoveryEffect::WaitFrontiers { .. } => {
                         panic!("seed {seed}: full plan requested lapse proof")

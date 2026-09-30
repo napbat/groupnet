@@ -1,7 +1,7 @@
 //! In-memory opt-in builder integration for the one recovery worker.
 #![cfg(feature = "volatile-recovery")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -89,7 +89,7 @@ impl ClaimSource for Claims {
                 member: BootstrapMemberIdentity {
                     node: presence.identity.node.clone(),
                     presence: Some(presence.identity),
-                    member_incarnation: 0,
+                    member_incarnation: 1,
                     status: Status::Alive,
                 },
                 renewal: presence.renewal,
@@ -109,7 +109,7 @@ impl ClaimSource for Claims {
                             boot: peer.identity.incarnation,
                             session: peer.identity.session,
                         }),
-                        member_incarnation: 0,
+                        member_incarnation: 1,
                         status: Status::Alive,
                     },
                     renewal: 1,
@@ -502,6 +502,8 @@ impl DonorPort for OriginDonor {
 #[derive(Debug, Default)]
 struct ReadAdapter {
     old_origin_builds: AtomicUsize,
+    lapse_sequences: AtomicUsize,
+    lapse_hold: AtomicBool,
     peer: Option<ClaimIdentity>,
     latest_origin_permit: Mutex<Option<PublicationPermit>>,
 }
@@ -535,48 +537,45 @@ impl RecoveryAdapter for ReadAdapter {
         _op: RecoveryOperation,
         _limits: RecoveryConfig,
     ) -> BoxRecoveryFuture<'_, PeerObservation> {
-        Box::pin(async { Err(AdapterError) })
-    }
-
-    fn observe_peer_heads(
-        &self,
-        _op: RecoveryOperation,
-        _limits: RecoveryConfig,
-    ) -> BoxRecoveryFuture<'_, groupnet_consistency::volatile_recovery::PeerHeadObservation> {
         Box::pin(async move {
-            let peer = self.peer.clone().ok_or(AdapterError)?;
-            let peer_node = peer.node.clone();
-            let members = [
-                ClaimIdentity {
-                    node: NodeId::from("me"),
-                    incarnation: BootId(17),
-                    session: 7,
-                    attempt: 1,
-                },
-                peer,
-            ]
-            .into_iter()
-            .map(|claim| BootstrapMemberIdentity {
-                node: claim.node.clone(),
-                presence: Some(PresenceIdentity {
-                    node: claim.node,
-                    boot: claim.incarnation,
-                    session: claim.session,
-                }),
-                member_incarnation: 1,
-                status: Status::Alive,
-            })
-            .collect();
+            if self.lapse_sequences.load(Ordering::SeqCst) == 0 {
+                // Post-handoff check only: the bootstrap child supplies the
+                // member identities, this adapter just the quiet peer's head.
+                let peer = self.peer.as_ref().ok_or(AdapterError)?;
+                return Ok((
+                    vec![groupnet_consistency::volatile_recovery::Peer {
+                        node: peer.node.clone(),
+                        alive: true,
+                        grants_lease: false,
+                        old_nonlive: false,
+                        grant: None,
+                        head: None,
+                    }],
+                    None,
+                ));
+            }
+            let sequence = if self.lapse_hold.load(Ordering::SeqCst) {
+                1
+            } else {
+                self.lapse_sequences.fetch_add(1, Ordering::SeqCst)
+            };
+            let mark = Mark {
+                epoch: 1,
+                sequence: u64::try_from(sequence).map_err(|_| AdapterError)?,
+            };
             Ok((
                 vec![groupnet_consistency::volatile_recovery::Peer {
-                    node: peer_node,
+                    node: NodeId::from("peer"),
                     alive: true,
-                    grants_lease: false,
+                    grants_lease: true,
                     old_nonlive: false,
-                    grant: None,
-                    head: None,
+                    grant: Some(mark),
+                    head: Some(Mark {
+                        epoch: 1,
+                        sequence: 1,
+                    }),
                 }],
-                members,
+                Some(mark),
             ))
         })
     }
@@ -928,3 +927,6 @@ mod bulk_recapture;
 
 #[path = "volatile_bootstrap_runtime/roster_maintenance.rs"]
 mod roster_maintenance;
+
+#[path = "volatile_bootstrap_runtime/scheduling.rs"]
+mod scheduling;

@@ -267,9 +267,12 @@ pub enum TransferEvent {
         /// Exact source- and stage-correlated coverage receipt, never a boolean.
         coverage: NativeCoverageReceipt,
     },
-    /// Native feeds are still behind B; retain the attached donor bridge.
+    /// Live native positions differ from B in either direction
+    /// ([`CutAlignment::Pending`](crate::volatile_bootstrap::journal::CutAlignment));
+    /// retain the attached bridge and sample a later barrier. Answers either
+    /// a coverage check or an install that found its cuts moved.
     NativePending {
-        /// Exact native coverage check operation.
+        /// Exact coverage check or install operation.
         op: BootstrapOperation,
     },
     /// Application atomically installed the private stage and switched ongoing

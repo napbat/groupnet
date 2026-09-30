@@ -209,8 +209,11 @@ impl<K> WriteFeed<K> {
     ///
     /// The write is recorded in the ring synchronously (before the returned
     /// future is polled), so even a dropped future is re-carried by the
-    /// next publish.
-    pub fn publish(&self, key: &K) -> impl Future<Output = WriteToken> + Send + '_ {
+    /// next publish. The future borrows only the feed, not `key`.
+    pub fn publish<'feed>(
+        &'feed self,
+        key: &K,
+    ) -> impl Future<Output = WriteToken> + Send + use<'feed, K> {
         let token = {
             let mut ring = self
                 .ring

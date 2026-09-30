@@ -116,13 +116,15 @@ fn operation(step: &RecoveryStep) -> RecoveryOperation {
             RecoveryEffect::Invalidate { op, .. }
             | RecoveryEffect::AcquireBaseline { op }
             | RecoveryEffect::RebuildOrigin { op }
+            | RecoveryEffect::ObservePeers { op }
             | RecoveryEffect::ObservePeerHeads { op }
             | RecoveryEffect::WaitFrontiers { op, .. }
             | RecoveryEffect::Affirm { op } => Some(*op),
             RecoveryEffect::CloseGate { .. }
             | RecoveryEffect::CancelBaseline { .. }
-            | RecoveryEffect::ArmTimer(_)
-            | RecoveryEffect::ObservePeers { .. } => None,
+            | RecoveryEffect::SuspendLocalBaseline { .. }
+            | RecoveryEffect::ResumeLocalBaseline { .. }
+            | RecoveryEffect::ArmTimer(_) => None,
         })
         .expect("one current operation")
 }
@@ -150,6 +152,135 @@ fn quiet_peer() -> Peer {
         grant: None,
         head: None,
     }
+}
+
+fn renewing_peer(sequence: u64) -> Peer {
+    Peer {
+        node: NodeId::from("a"),
+        alive: true,
+        grants_lease: true,
+        old_nonlive: false,
+        grant: Some(Mark { epoch: 1, sequence }),
+        head: Some(Mark {
+            epoch: 1,
+            sequence: 1,
+        }),
+    }
+}
+
+#[test]
+fn affirmed_local_lapse_resumes_only_the_exact_suspended_baseline() {
+    let (mut engine, acquire) = bootstrap();
+    let initial = engine.step(RecoveryEvent::LocalBaselineBuilt { op: acquire });
+    engine.step(RecoveryEvent::Affirmed {
+        op: operation(&initial),
+        accepted: true,
+    });
+    let lapse = engine.step(RecoveryEvent::LeaseLapse { count: 1 });
+    assert!(lapse.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::SuspendLocalBaseline { op } if *op == acquire
+    )));
+    assert!(!lapse.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::CancelBaseline { .. } | RecoveryEffect::RebuildOrigin { .. }
+    )));
+    let first = engine.step(RecoveryEvent::Invalidated {
+        op: operation(&lapse),
+    });
+    let renew = engine.step(RecoveryEvent::PeersObserved {
+        op: operation(&first),
+        peers: vec![renewing_peer(1)],
+        confirmed: Some(Mark {
+            epoch: 1,
+            sequence: 1,
+        }),
+    });
+    let settled = engine.step(RecoveryEvent::PeersObserved {
+        op: operation(&renew),
+        peers: vec![renewing_peer(2)],
+        confirmed: Some(Mark {
+            epoch: 1,
+            sequence: 2,
+        }),
+    });
+    assert!(
+        settled
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RecoveryEffect::ArmTimer(Time(2))))
+    );
+    let heads = engine.step(RecoveryEvent::Tick(Time(2)));
+    let barrier = engine.step(RecoveryEvent::PeersObserved {
+        op: operation(&heads),
+        peers: vec![renewing_peer(2)],
+        confirmed: Some(Mark {
+            epoch: 1,
+            sequence: 2,
+        }),
+    });
+    let recheck = engine.step(RecoveryEvent::FrontiersReached {
+        op: operation(&barrier),
+    });
+    let affirm = engine.step(RecoveryEvent::PeersObserved {
+        op: operation(&recheck),
+        peers: vec![renewing_peer(2)],
+        confirmed: Some(Mark {
+            epoch: 1,
+            sequence: 2,
+        }),
+    });
+    assert_eq!(engine.state().stage, RecoveryStage::Affirming);
+    assert_eq!(
+        engine
+            .step(RecoveryEvent::Affirmed {
+                op: acquire,
+                accepted: true,
+            })
+            .rejection,
+        Some(RecoveryError::StaleOperation)
+    );
+    let resumed = engine.step(RecoveryEvent::Affirmed {
+        op: operation(&affirm),
+        accepted: true,
+    });
+    assert!(resumed.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::ResumeLocalBaseline { previous, current }
+            if *previous == acquire && current.generation == 2 && current.token > acquire.token
+    )));
+    assert!(engine.state().recovered);
+    assert!(!resumed.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::RebuildOrigin { .. } | RecoveryEffect::AcquireBaseline { .. }
+    )));
+    let gap = engine.step(RecoveryEvent::FeedGap { lapses: 1 });
+    assert!(gap.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::CancelBaseline { op } if op.generation == 2
+    )));
+}
+
+#[test]
+fn interrupted_lapse_cancels_suspended_child_without_resume() {
+    let (mut engine, acquire) = bootstrap();
+    let initial = engine.step(RecoveryEvent::LocalBaselineBuilt { op: acquire });
+    engine.step(RecoveryEvent::Affirmed {
+        op: operation(&initial),
+        accepted: true,
+    });
+    engine.step(RecoveryEvent::LeaseLapse { count: 1 });
+    let full = engine.step(RecoveryEvent::FeedGap { lapses: 1 });
+    assert!(full.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::CancelBaseline { op } if *op == acquire
+    )));
+    assert!(
+        !full
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RecoveryEffect::ResumeLocalBaseline { .. }))
+    );
 }
 
 #[test]

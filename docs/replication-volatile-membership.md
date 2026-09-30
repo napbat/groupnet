@@ -44,8 +44,13 @@ An initial create after no retained per-key revision also compares the member
 high-water mark, preventing absent-value ABA: an old queued create cannot
 publish after a newer presence was installed and then withdrawn or expired.
 The actor checks after advancing expiries and refuses revision exhaustion;
-an unknown response requires exact readback rather than blind retry. The
-queued request and exact response own admission through actor completion.
+an unknown response requires exact readback rather than blind retry. Because
+an initial create binds the whole member revision, any unrelated local entry
+write between the cut and the actor rejects it without mutation. The source
+answers that confirmed rejection by taking a fresh cut and re-running every
+check, a bounded number of times inside the caller's operation deadline; a
+retained key revision or newer presence still refuses. The queued request
+and exact response own admission through actor completion.
 
 The source exposes one **complete, bounded actor cut** of native membership
 status/incarnation, participation entries, and builder claims for a bootstrap
@@ -96,6 +101,40 @@ before starting one finite Ready recapture. A transient newly Alive member
 without presence leaves the old claim withdrawn and participation renewing;
 the existing maintenance timer rechecks without repeating the LIST. A failed
 admitted capture callback stops donation while presence renewal continues.
+The worker also runs this maintenance once immediately after the outer
+recovery affirms Ready, so an already-complete local image need not wait for
+its next presence renewal. Each turn obtains a read-only Ready capture guard
+from the current outer recovery control version and generation. The original
+origin-build permit remains expired or revoked and cannot authorize recapture.
+A gap, lapse, or join closes the gate and invalidates that guard; no donor
+recapture occurs until the new recovery episode reaffirms and its exact child
+generation matches the new guard. Every attempt keeps a fresh finite
+donor-wait deadline and never repeats the completed origin LIST.
+For a lease lapse that retains a locally built baseline, the sans-IO recovery
+engine suspends the child first: its old Ready claim and capture are withdrawn,
+its origin publication permit is discarded, and only bounded presence renewal
+continues. The engine issues a new child binding only after that same lapse
+episode passes renewal, head, frontier, and final affirmation checks. The
+child then uses the new Ready guard and a new claim/capture identity. A feed
+gap, full rebuild, or failed lapse retires the suspended candidate instead.
+Candidate retirement withdraws its claim and transfer resources but preserves
+the process's bounded presence renewal. A completed peer transfer follows the
+same rule: its candidate is retired, while presence remains through later
+lapses and can participate in a third join. A later acquisition starts a fresh
+candidate under its own generation without republishing or duplicating that
+presence. Only terminal worker shutdown withdraws presence. This carry-forward
+never reuses an old capture or authorizes reads
+while the outer gate is closed.
+
+A follower may select a Ready claim just as that donor loses its outer lease.
+An unavailable Offer or retired transfer excludes that exact claim attempt; it
+does not grant another use of its C. The sans-IO selection engine may sample
+fresh complete source cuts at the configured finite observation interval,
+waiting for a new eligible claim identity only until the first Ready attempt's
+original donor-wait deadline, capped by the episode's total deadline. It does
+not extend either budget on subsequent refusals. If no independently valid
+replacement arrives, the ordinary origin fallback proceeds. Origin reads
+remain available during this wait; no stale donor permission is accepted.
 
 A healthy donor checks its exact roster on the existing worker maintenance
 turn, and also before serving an Offer or Barrier. A changed or unprovable cut

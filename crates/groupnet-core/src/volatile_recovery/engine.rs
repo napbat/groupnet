@@ -39,6 +39,7 @@ pub struct RecoveryEngine {
     baseline: Baseline,
     bootstrap: bool,
     baseline_op: Option<RecoveryOperation>,
+    suspended_local: Option<RecoveryOperation>,
     operation: Option<RecoveryOperation>,
     operation_due: Option<Time>,
     wait_due: Option<Time>,
@@ -91,6 +92,7 @@ impl RecoveryEngine {
             baseline: Baseline::Origin,
             bootstrap: false,
             baseline_op: None,
+            suspended_local: None,
             operation: None,
             operation_due: None,
             wait_due: None,
@@ -201,7 +203,10 @@ impl RecoveryEngine {
     fn cancel_baseline(&mut self) -> Vec<RecoveryEffect> {
         self.baseline_op
             .take()
-            .map_or_else(Vec::new, |op| vec![RecoveryEffect::CancelBaseline { op }])
+            .into_iter()
+            .chain(self.suspended_local.take())
+            .map(|op| RecoveryEffect::CancelBaseline { op })
+            .collect()
     }
 
     fn origin_only(&mut self) -> RecoveryStep {
@@ -277,11 +282,24 @@ impl RecoveryEngine {
         if self.rearm_exhausted {
             return Self::reject(RecoveryError::Exhausted);
         }
-        let cancel = self.cancel_baseline();
+        let cancel = if plan == Plan::Lapse && self.baseline == Baseline::Origin {
+            if let Some(op) = self.baseline_op.take() {
+                self.suspended_local = Some(op);
+                vec![RecoveryEffect::SuspendLocalBaseline { op }]
+            } else {
+                self.cancel_baseline()
+            }
+        } else {
+            self.cancel_baseline()
+        };
         self.clear_work();
         self.state.recovered = false;
         self.state.covered_lapses = self.state.covered_lapses.max(lapses);
         let Some(next) = self.state.generation.checked_add(1) else {
+            let cancel = self
+                .suspended_local
+                .take()
+                .map_or(cancel, |op| vec![RecoveryEffect::CancelBaseline { op }]);
             self.state.stage = RecoveryStage::OriginOnly;
             self.rearm_exhausted = true;
             let mut effects = vec![RecoveryEffect::CloseGate {
@@ -297,6 +315,10 @@ impl RecoveryEngine {
         self.plan = plan;
         self.baseline = Baseline::Origin;
         let Some(due) = self.now.0.checked_add(self.config.total_ms).map(Time) else {
+            let cancel = self
+                .suspended_local
+                .take()
+                .map_or(cancel, |op| vec![RecoveryEffect::CancelBaseline { op }]);
             self.state.stage = RecoveryStage::OriginOnly;
             self.rearm_exhausted = true;
             let mut effects = vec![RecoveryEffect::CloseGate { generation: next }];
@@ -308,6 +330,10 @@ impl RecoveryEngine {
         };
         self.total_due = Some(due);
         let Ok(op) = self.issue(RecoveryStage::Invalidating) else {
+            let cancel = self
+                .suspended_local
+                .take()
+                .map_or(cancel, |op| vec![RecoveryEffect::CancelBaseline { op }]);
             self.clear_work();
             self.state.stage = RecoveryStage::OriginOnly;
             self.rearm_exhausted = true;
@@ -782,7 +808,26 @@ impl RecoveryEngine {
                     if let Some(policy) = self.rearm {
                         self.next_rearm_ms = policy.initial_ms;
                     }
-                    Self::step_ok(Vec::new())
+                    if let Some(previous) = self.suspended_local.take() {
+                        if self.next_token == 0 {
+                            return Self::step_ok(vec![RecoveryEffect::CancelBaseline {
+                                op: previous,
+                            }]);
+                        }
+                        let current = RecoveryOperation {
+                            session: self.session,
+                            generation: self.state.generation,
+                            token: self.next_token,
+                        };
+                        self.next_token = self.next_token.checked_add(1).unwrap_or(0);
+                        self.baseline_op = Some(current);
+                        Self::step_ok(vec![RecoveryEffect::ResumeLocalBaseline {
+                            previous,
+                            current,
+                        }])
+                    } else {
+                        Self::step_ok(Vec::new())
+                    }
                 } else {
                     self.wait_for(RecoveryStage::Affirming, self.config.poll_ms)
                 }

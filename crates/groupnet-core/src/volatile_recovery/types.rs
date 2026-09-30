@@ -304,6 +304,20 @@ pub enum RecoveryEffect {
         /// Original baseline acquisition operation.
         op: RecoveryOperation,
     },
+    /// Withdraw a local donor's old capture and claim while a lease-lapse
+    /// episode proves the already-built baseline again. Presence may renew.
+    SuspendLocalBaseline {
+        /// Exact prior locally built baseline binding.
+        op: RecoveryOperation,
+    },
+    /// A lease-lapse episode has re-affirmed its retained local baseline.
+    /// The child may start one new bounded Ready recapture, with no origin IO.
+    ResumeLocalBaseline {
+        /// Exact suspended prior binding.
+        previous: RecoveryOperation,
+        /// Fresh unique binding in the affirmed recovery generation.
+        current: RecoveryOperation,
+    },
     /// Observe complete bounded peer/granter/head facts for this stage.
     ObservePeers {
         /// Exact bounded membership observation operation.

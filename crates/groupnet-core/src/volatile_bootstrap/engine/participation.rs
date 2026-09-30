@@ -74,6 +74,8 @@ impl ClaimEngine {
 
     /// Allocate one finite fresh-roster read under the existing session token
     /// allocator. The worker performs no source I/O while holding a core lock.
+    /// A transferred or retired candidate still participates, so the recovery
+    /// core's post-handoff peer check reads the roster through the same path.
     ///
     /// # Errors
     /// Rejects a non-participating or inactive candidate, or exhausted time
@@ -87,6 +89,8 @@ impl ClaimEngine {
                 crate::volatile_bootstrap::BootstrapStage::Building
                     | crate::volatile_bootstrap::BootstrapStage::DonorAvailable
                     | crate::volatile_bootstrap::BootstrapStage::Transferring
+                    | crate::volatile_bootstrap::BootstrapStage::Transferred
+                    | crate::volatile_bootstrap::BootstrapStage::Participating
             )
         {
             return Err(BootstrapError::Stage);
@@ -138,6 +142,38 @@ impl ClaimEngine {
         self.roster_poll_due = None;
         self.observed_presence = observed;
         Ok(())
+    }
+
+    /// Validate one complete source cut for the recovery core's post-handoff
+    /// peer check and return its exact roster. Unlike
+    /// [`Self::verify_participant_roster`] it pins nothing: the recovery core
+    /// compares the result with the handoff's covered members itself.
+    ///
+    /// # Errors
+    /// Rejects a stale read, a candidate that has not finished transfer, or an
+    /// incomplete or malformed participation cut.
+    pub fn verify_peer_roster(
+        &mut self,
+        op: crate::volatile_bootstrap::BootstrapOperation,
+        members: &[BootstrapMember],
+        roster: &[BootstrapMemberIdentity],
+        participants: &[BootstrapParticipant],
+        claims: &[BootstrapClaim],
+    ) -> Result<Vec<BootstrapMemberIdentity>, BootstrapError> {
+        if self.roster_poll != Some(op)
+            || self.roster_poll_due.is_none_or(|due| self.now >= due)
+            || !matches!(
+                self.stage,
+                crate::volatile_bootstrap::BootstrapStage::Transferred
+                    | crate::volatile_bootstrap::BootstrapStage::Participating
+            )
+        {
+            return Err(BootstrapError::Stage);
+        }
+        let (roster, _) = self.validate_participants(members, roster, participants, claims)?;
+        self.roster_poll = None;
+        self.roster_poll_due = None;
+        Ok(roster)
     }
 
     pub(super) fn choose_participants(

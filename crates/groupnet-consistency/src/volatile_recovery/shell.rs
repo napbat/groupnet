@@ -31,15 +31,6 @@ pub struct AdapterError;
 /// Bounded native membership, lease confirmation, and feed-head sample.
 pub type PeerObservation = Result<(Vec<Peer>, Option<Mark>), AdapterError>;
 
-/// Complete exact-incarnation peer observation after private peer handoff.
-pub type PeerHeadObservation = Result<
-    (
-        Vec<Peer>,
-        Vec<groupnet_core::volatile_bootstrap::BootstrapMemberIdentity>,
-    ),
-    AdapterError,
->;
-
 /// Consumer-owned facts and application effects for volatile coherence.
 ///
 /// Implementations must honor the supplied operation and publication permit.
@@ -70,22 +61,15 @@ pub trait RecoveryAdapter: Send + Sync + 'static {
     ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
 
     /// Observe at most `limits.max_members` complete native peer facts.
+    ///
+    /// After a private peer handoff the worker pairs these feed heads with
+    /// the bootstrap child's native participation roster; the adapter does
+    /// not supply member identities itself.
     fn observe_peers(
         &self,
         op: RecoveryOperation,
         limits: RecoveryConfig,
     ) -> BoxRecoveryFuture<'_, PeerObservation>;
-
-    /// Observe bounded current peer identities and native feed heads after
-    /// a private peer handoff. Replay-only adapters can decline this optional
-    /// path; the core then falls back to its origin recovery policy.
-    fn observe_peer_heads(
-        &self,
-        _op: RecoveryOperation,
-        _limits: RecoveryConfig,
-    ) -> BoxRecoveryFuture<'_, PeerHeadObservation> {
-        Box::pin(async { Err(AdapterError) })
-    }
 
     /// Wait for every sampled native writer head to be applied locally.
     fn wait_frontiers(
@@ -254,6 +238,21 @@ impl<A: RecoveryAdapter> Shared<A> {
         }
     }
 
+    fn ready_capture(&self, deadline: Instant) -> Option<ReadyCapturePermit> {
+        let control = lock(&self.control);
+        (Instant::now() < deadline
+            && !control.terminal
+            && control.open
+            && control.state.recovered
+            && control.operation.is_none())
+        .then(|| ReadyCapturePermit {
+            control: Arc::clone(&self.control),
+            version: control.version,
+            generation: control.state.generation,
+            deadline,
+        })
+    }
+
     fn force_close(&self, terminal: bool) {
         let mut control = lock(&self.control);
         control.open = false;
@@ -368,6 +367,14 @@ pub struct ReadyCapturePermit {
 }
 
 impl ReadyCapturePermit {
+    /// Narrows a current Ready guard to one finite donor operation deadline.
+    #[must_use]
+    pub fn restricted_to(&self, deadline: Instant) -> Self {
+        let mut restricted = self.clone();
+        restricted.deadline = restricted.deadline.min(deadline);
+        restricted
+    }
+
     /// Runs one short application critical section only while the original
     /// Ready generation remains current. No await may occur inside `capture`.
     pub fn capture<T>(&self, capture: impl FnOnce(u64) -> T) -> Option<T> {

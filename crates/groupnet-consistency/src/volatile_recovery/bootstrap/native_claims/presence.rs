@@ -12,6 +12,10 @@ use groupnet_runtime::{
 
 use super::{AdapterError, AdmissionClass, Admitted, NativeClaimSource};
 
+/// Confirmed CAS rejections re-inspected per publication. Each attempt is two
+/// bounded actor round trips inside the caller's own operation deadline.
+const MAX_PRESENCE_ATTEMPTS: usize = 4;
+
 impl NativeClaimSource {
     fn pair_limits(&self) -> Result<EntryInspectionLimits, AdapterError> {
         let per_member = size_of::<InspectedPairEntry>()
@@ -82,7 +86,7 @@ impl NativeClaimSource {
             .len()
             .checked_add(value_len)
             .ok_or(AdapterError)?;
-        let queued = self
+        let mut queued = self
             .admission
             .reserve(AdmissionClass::Inflight, queued_bytes)
             .map_err(|_| AdapterError)?;
@@ -94,73 +98,88 @@ impl NativeClaimSource {
             encode_presence_value(&self.scope, self.policy, &presence, self.max_value_bytes)
                 .map_err(|_| AdapterError)?;
         let value = retained.hold(value);
-        let observed = self.inspect_local_presence().await?;
-        let local = observed
-            .get()
-            .entries
-            .iter()
-            .find(|entry| &entry.node == self.group.local_node())
-            .ok_or(AdapterError)?;
-        if let Some(existing) = &local.first {
-            let existing = decode_presence_value(
-                &self.scope,
-                self.policy,
-                &local.node,
-                existing,
-                self.max_value_bytes,
-            )
-            .map_err(|_| AdapterError)?;
-            if existing.identity != presence.identity || existing.renewal > presence.renewal {
-                return Err(AdapterError);
-            }
-            if existing.renewal == presence.renewal {
-                if local.first_remaining_ttl_ms.is_none_or(|ttl| ttl == 0) {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let observed = self.inspect_local_presence().await?;
+            let local = observed
+                .get()
+                .entries
+                .iter()
+                .find(|entry| &entry.node == self.group.local_node())
+                .ok_or(AdapterError)?;
+            if let Some(existing) = &local.first {
+                let existing = decode_presence_value(
+                    &self.scope,
+                    self.policy,
+                    &local.node,
+                    existing,
+                    self.max_value_bytes,
+                )
+                .map_err(|_| AdapterError)?;
+                if existing.identity != presence.identity || existing.renewal > presence.renewal {
                     return Err(AdapterError);
                 }
-                *published = Some((presence.identity, value));
-                return Ok(());
-            }
-        } else if published.is_some() {
-            // A previously confirmed local presence lapsed. Do not silently
-            // re-create it with a later renewal after the peer proof broke.
-            return Err(AdapterError);
-        }
-        let expected = EntryRevision {
-            key: local.first_version,
-            member: local.member_state_version,
-        };
-        drop(observed);
-        let result = self
-            .group
-            .set_entry_if_revision(
-                self.presence_key.clone(),
-                value.get().clone(),
-                Some(self.policy.claim_ttl_ms),
-                expected,
-                EntryMutationLimits {
-                    max_key_bytes: self.presence_key.len(),
-                    max_value_bytes: self.max_value_bytes,
-                },
-                queued,
-            )
-            .await;
-        match result {
-            Ok((true, budget)) => drop(budget),
-            Ok((false, budget)) => {
-                drop(budget);
+                if existing.renewal == presence.renewal {
+                    if local.first_remaining_ttl_ms.is_none_or(|ttl| ttl == 0) {
+                        return Err(AdapterError);
+                    }
+                    *published = Some((presence.identity, value));
+                    return Ok(());
+                }
+            } else if published.is_some() {
+                // A previously confirmed local presence lapsed. Do not silently
+                // re-create it with a later renewal after the peer proof broke.
                 return Err(AdapterError);
             }
-            Err(_) => {
-                // Lost replies have an unknown outcome. Exact native readback
-                // can confirm this body's publication, never a blind retry.
-                let readback = self.inspect_local_presence().await?;
-                let matches = readback.get().entries.iter().any(|entry| {
-                    &entry.node == self.group.local_node()
-                        && entry.first.as_deref() == Some(value.get().as_slice())
-                        && entry.first_remaining_ttl_ms.is_some_and(|ttl| ttl > 0)
-                });
-                if !matches {
-                    return Err(AdapterError);
+            let expected = EntryRevision {
+                key: local.first_version,
+                member: local.member_state_version,
+            };
+            drop(observed);
+            let result = self
+                .group
+                .set_entry_if_revision(
+                    self.presence_key.clone(),
+                    value.get().clone(),
+                    Some(self.policy.claim_ttl_ms),
+                    expected,
+                    EntryMutationLimits {
+                        max_key_bytes: self.presence_key.len(),
+                        max_value_bytes: self.max_value_bytes,
+                    },
+                    queued,
+                )
+                .await;
+            match result {
+                Ok((true, budget)) => {
+                    drop(budget);
+                    break;
+                }
+                Ok((false, budget)) => {
+                    // A confirmed rejection made no mutation. A first create
+                    // binds the whole member revision, so an unrelated local
+                    // write between the cut and the actor rejects it. Take a
+                    // fresh cut and re-run every check above; a retained key
+                    // revision or a newer presence still refuses.
+                    if attempts >= MAX_PRESENCE_ATTEMPTS {
+                        return Err(AdapterError);
+                    }
+                    queued = budget;
+                }
+                Err(_) => {
+                    // Lost replies have an unknown outcome. Exact native readback
+                    // can confirm this body's publication, never a blind retry.
+                    let readback = self.inspect_local_presence().await?;
+                    let matches = readback.get().entries.iter().any(|entry| {
+                        &entry.node == self.group.local_node()
+                            && entry.first.as_deref() == Some(value.get().as_slice())
+                            && entry.first_remaining_ttl_ms.is_some_and(|ttl| ttl > 0)
+                    });
+                    if !matches {
+                        return Err(AdapterError);
+                    }
+                    break;
                 }
             }
         }

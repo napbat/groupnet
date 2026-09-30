@@ -8,12 +8,12 @@ use std::time::Instant;
 
 use tokio::sync::Notify;
 
-use groupnet_core::volatile_bootstrap::BootstrapOperation;
 use groupnet_core::volatile_bootstrap::transfer::NativeHandoffReceipt;
+use groupnet_core::volatile_bootstrap::{BootstrapMemberIdentity, BootstrapOperation};
 use groupnet_core::volatile_recovery::{RecoveryEvent, RecoveryOperation};
 
 use super::admission::Admitted;
-use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit};
+use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit};
 
 /// One bounded acquisition outcome under the original outer operation.
 #[derive(Debug)]
@@ -98,8 +98,28 @@ pub trait BootstrapDriver: Send + 'static {
         due: Instant,
     ) -> BoxRecoveryFuture<'_, BootstrapOutcome>;
 
-    /// Fence exact old claim/transfer work and release its private resources.
+    /// Retire exact candidate work while keeping this process's scoped presence.
     fn cancel(&mut self, recovery: RecoveryOperation) -> BoxRecoveryFuture<'_, ()>;
+
+    /// Terminal worker shutdown withdraws process presence as well as candidates.
+    fn shutdown(&mut self) -> BoxRecoveryFuture<'_, ()>;
+
+    /// Withdraw the exact old donor capture on a locally built baseline's
+    /// lease lapse, retaining only presence until the outer proof completes.
+    fn suspend_local(&mut self, recovery: RecoveryOperation) -> BoxRecoveryFuture<'_, ()>;
+
+    /// Bind a suspended local image to a newly affirmed outer generation.
+    /// No old publication permission or donor capture becomes valid again.
+    fn resume_local(&mut self, previous: RecoveryOperation, current: RecoveryOperation) -> bool;
+
+    /// One complete native participation roster for the recovery core's
+    /// post-handoff peer check; `None` if participation is not required or
+    /// the cut is incomplete, stale, or malformed. A hint, never authority:
+    /// the core itself compares it with the handoff's covered members.
+    fn peer_roster(
+        &mut self,
+        due: Instant,
+    ) -> BoxRecoveryFuture<'_, Option<Vec<BootstrapMemberIdentity>>>;
 
     /// Earliest claim renewal, journal expiry, or source operation deadline.
     fn next_deadline(&self) -> Option<Instant>;
@@ -108,6 +128,11 @@ pub trait BootstrapDriver: Send + 'static {
     /// synchronous journal invalidation; no second worker is spawned.
     fn wake(&self) -> Arc<Notify>;
 
-    /// Drive due source/capture maintenance in the existing worker.
-    fn maintain(&mut self, now: Instant) -> BoxRecoveryFuture<'_, ()>;
+    /// Drive due source/capture maintenance under the current outer Ready
+    /// guard, if that exact recovery generation is open.
+    fn maintain(
+        &mut self,
+        now: Instant,
+        ready: Option<ReadyCapturePermit>,
+    ) -> BoxRecoveryFuture<'_, ()>;
 }

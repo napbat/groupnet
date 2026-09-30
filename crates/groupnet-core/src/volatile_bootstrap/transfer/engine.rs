@@ -686,9 +686,14 @@ impl TransferSession {
                 }])
             }
             TransferEvent::NativePending { op } => {
-                if !self.current(op, TransferStage::AwaitingNativeCoverage) {
+                // An install may also find its live cuts moved after the
+                // coverage check; it keeps its stage for a later barrier.
+                if !self.current(op, TransferStage::AwaitingNativeCoverage)
+                    && !self.current(op, TransferStage::Installing)
+                {
                     return Self::reject(TransferError::Stale);
                 }
+                self.coverage = None;
                 let Some(due) = self
                     .now
                     .0

@@ -8,7 +8,9 @@ use groupnet_core::volatile_recovery::{
     RecoveryConfig, RecoveryEffect, RecoveryEngine, RecoveryEvent, RecoveryOperation,
 };
 
-use super::{BoxRecoveryFuture, RecoveryAdapter, Shared, lock, pending_event, signal_effects};
+use super::{
+    AdapterError, BoxRecoveryFuture, RecoveryAdapter, Shared, lock, pending_event, signal_effects,
+};
 use crate::volatile_recovery::bootstrap::driver::{BootstrapDriver, BootstrapOutcome};
 
 fn logical_now(start: Instant) -> Time {
@@ -105,8 +107,8 @@ pub(super) async fn run<A: RecoveryAdapter>(
             lock(&shared.control).state = engine.state();
             if pending.cancel {
                 lock(&shared.control).pending.cancel = true;
-                if let (Some(child), Some(op)) = (bootstrap.as_mut(), active_baseline) {
-                    child.cancel(op).await;
+                if let Some(child) = bootstrap.as_mut() {
+                    child.shutdown().await;
                 }
                 return;
             }
@@ -134,6 +136,32 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     }
                     if active_baseline == Some(op) {
                         active_baseline = None;
+                    }
+                }
+                RecoveryEffect::SuspendLocalBaseline { op } => {
+                    if let Some(child) = bootstrap.as_mut() {
+                        child.suspend_local(op).await;
+                    }
+                    // Keep the exact old cleanup binding until Resume or
+                    // CancelBaseline. A terminal signal can interrupt the
+                    // lapse before the core's queued cleanup effects run.
+                }
+                RecoveryEffect::ResumeLocalBaseline { previous, current } => {
+                    if let Some(child) = bootstrap.as_mut() {
+                        let ready = Instant::now()
+                            .checked_add(Duration::from_millis(config.total_ms))
+                            .and_then(|deadline| shared.ready_capture(deadline));
+                        if ready
+                            .as_ref()
+                            .and_then(|guard| guard.capture(|generation| generation))
+                            == Some(current.generation)
+                            && child.resume_local(previous, current)
+                        {
+                            active_baseline = Some(current);
+                            maintain_child(&shared, &config, child).await;
+                        } else {
+                            child.cancel(previous).await;
+                        }
                     }
                 }
                 RecoveryEffect::AcquireBaseline { op } => {
@@ -195,14 +223,44 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     if !engine.accepts_operation(op) {
                         continue;
                     }
-                    let response = await_operation(
+                    let Some(due) = terminal_deadline(
                         &shared,
-                        &engine,
-                        started,
-                        active_version,
-                        shared.adapter.observe_peer_heads(op, config),
-                    )
-                    .await;
+                        engine
+                            .next_deadline()
+                            .and_then(|due| absolute_deadline(started, due)),
+                    ) else {
+                        return;
+                    };
+                    // The child owns native participation; the adapter adds
+                    // only its domain feed heads through the existing peer
+                    // observation. Without a participation roster the check
+                    // fails closed and the core recovers from origin.
+                    let identities = match bootstrap.as_mut() {
+                        Some(child) => {
+                            await_operation(
+                                &shared,
+                                &engine,
+                                started,
+                                active_version,
+                                child.peer_roster(due),
+                            )
+                            .await
+                        }
+                        None => Some(None),
+                    };
+                    let response = match identities {
+                        Some(Some(identities)) => await_operation(
+                            &shared,
+                            &engine,
+                            started,
+                            active_version,
+                            shared.adapter.observe_peers(op, config),
+                        )
+                        .await
+                        .map(|observed| observed.map(|(peers, _)| (peers, identities))),
+                        Some(None) => Some(Err(AdapterError)),
+                        None => None,
+                    };
                     if let Some(result) = response {
                         effects.extend(
                             engine
@@ -387,6 +445,13 @@ pub(super) async fn run<A: RecoveryAdapter>(
                         op,
                         Instant::now,
                     ));
+                    // LocalOnly may become donor-eligible at this exact
+                    // affirmation. Do not wait for the next presence timer;
+                    // derive a fresh Ready guard after the control lock is
+                    // released and let the child decide from its source cut.
+                    if let Some(child) = bootstrap.as_mut() {
+                        maintain_child(&shared, &config, child).await;
+                    }
                 }
             }
             lock(&shared.control).state = engine.state();
@@ -398,7 +463,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                 .next_deadline()
                 .is_some_and(|due| due <= Instant::now())
         {
-            child.maintain(Instant::now()).await;
+            maintain_child(&shared, &config, child).await;
             continue;
         }
         let child_wake = bootstrap.as_ref().map(|child| child.wake());
@@ -408,17 +473,17 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     tokio::select! {
                         () = shared.notify.notified() => {},
                         () = bootstrap_wake(child_wake.as_ref()) => {
-                            child.maintain(Instant::now()).await;
+                            maintain_child(&shared, &config, child).await;
                         }
                         () = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {
-                            child.maintain(Instant::now()).await;
+                            maintain_child(&shared, &config, child).await;
                         }
                     }
                 } else {
                     tokio::select! {
                         () = shared.notify.notified() => {},
                         () = bootstrap_wake(child_wake.as_ref()) => {
-                            child.maintain(Instant::now()).await;
+                            maintain_child(&shared, &config, child).await;
                         }
                     }
                 }
@@ -438,7 +503,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
             () = shared.notify.notified() => {}
             () = bootstrap_wake(child_wake.as_ref()) => {
                 if let Some(child) = bootstrap.as_mut() {
-                    child.maintain(Instant::now()).await;
+                    maintain_child(&shared, &config, child).await;
                 }
             }
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
@@ -447,6 +512,18 @@ pub(super) async fn run<A: RecoveryAdapter>(
             }
         }
     }
+}
+
+async fn maintain_child<A: RecoveryAdapter>(
+    shared: &Shared<A>,
+    config: &RecoveryConfig,
+    child: &mut Box<dyn BootstrapDriver>,
+) {
+    let now = Instant::now();
+    let ready = now
+        .checked_add(Duration::from_millis(config.total_ms))
+        .and_then(|deadline| shared.ready_capture(deadline));
+    child.maintain(now, ready).await;
 }
 
 async fn bootstrap_wake(wake: Option<&Arc<tokio::sync::Notify>>) {

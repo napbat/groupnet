@@ -183,3 +183,196 @@ fn repeated_stale_claim_never_refreshes_its_original_expiry() {
     assert!(engine.track_claim(&claim).unwrap());
     assert_eq!(engine.observed[&claim.identity].expires, Time(20));
 }
+
+#[test]
+fn candidate_retirement_keeps_one_process_presence_across_fallback_and_reacquire() {
+    let mut engine = engine();
+    let started = engine.step(BootstrapEvent::Start);
+    let presence = started
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::PublishPresence(presence) => Some(presence.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let old_claim = engine.identity();
+    engine.stage = BootstrapStage::Transferred;
+    engine.claim_refresh_due = Some(Time(0));
+    engine.claim_poll_due = Some(Time(0));
+    engine.roster_poll_due = Some(Time(0));
+    let retired = engine.step(BootstrapEvent::RetireCandidate);
+    assert_eq!(engine.stage(), BootstrapStage::Participating);
+    assert_eq!(engine.next_deadline(), engine.presence_due);
+    assert!(
+        retired
+            .effects
+            .contains(&BootstrapEffect::WithdrawClaim(old_claim.clone()))
+    );
+    assert!(
+        !retired
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BootstrapEffect::WithdrawPresence(_)))
+    );
+    assert_eq!(
+        engine.step(BootstrapEvent::RetireCandidate).effects.len(),
+        1
+    ); // timer only
+    let renewal = engine.step(BootstrapEvent::Tick(Time(6)));
+    assert!(renewal.effects.iter().any(|effect| matches!(effect,
+        BootstrapEffect::PublishPresence(next) if next.identity == presence.identity && next.renewal > presence.renewal)));
+    assert!(
+        !renewal
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BootstrapEffect::PublishClaim(_)))
+    );
+    let reacquired = engine.step(BootstrapEvent::Start);
+    assert!(reacquired.effects.iter().any(|effect| matches!(effect,
+        BootstrapEffect::PublishClaim(claim) if claim.identity != old_claim)));
+    assert!(
+        !reacquired
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BootstrapEffect::PublishPresence(_)))
+    );
+    assert_eq!(engine.step(BootstrapEvent::RetireCandidate).rejection, None);
+    let terminal = engine.step(BootstrapEvent::Cancel);
+    assert!(
+        terminal
+            .effects
+            .contains(&BootstrapEffect::WithdrawPresence(presence.identity))
+    );
+}
+
+fn retry_observation(engine: &mut ClaimEngine, peer: BootstrapClaim) -> BootstrapStep {
+    let waiting = engine.step(BootstrapEvent::DonorUnavailable {
+        op: engine.current_operation().unwrap(),
+        selected: engine.selected().unwrap().clone(),
+    });
+    let op = waiting
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::ObserveClaims { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap();
+    engine.step(BootstrapEvent::ClaimsObserved {
+        op,
+        members: vec![
+            BootstrapMember {
+                node: NodeId::from("me"),
+                eligible: true,
+            },
+            BootstrapMember {
+                node: NodeId::from("peer"),
+                eligible: true,
+            },
+        ],
+        claims: vec![engine.claim(), peer],
+    })
+}
+
+#[test]
+fn unavailable_ready_attempt_reobserves_without_resetting_original_wait_or_building_twice() {
+    let mut engine = engine();
+    let started = engine.step(BootstrapEvent::Start);
+    let _me = started
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::PublishClaim(claim) => Some(claim.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let identity = |attempt| ClaimIdentity {
+        node: NodeId::from("peer"),
+        incarnation: BootId(8),
+        session: 1,
+        attempt,
+    };
+    let claim = |attempt| BootstrapClaim {
+        identity: identity(attempt),
+        renewal: 1,
+        phase: ClaimPhase::Ready,
+        remaining_ms: 10,
+    };
+    engine.stage = BootstrapStage::DonorAvailable;
+    engine.selected = Some(identity(1));
+    engine.ready_retry_due = Some(Time(10));
+    engine.total_due = Some(Time(20));
+    engine.now = Time(2);
+    engine.operation(8).unwrap();
+    let first = retry_observation(&mut engine, claim(1));
+    assert_eq!(engine.stage(), BootstrapStage::Settling);
+    assert_eq!(engine.ready_retry_due, Some(Time(10)));
+    assert!(
+        !first
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BootstrapEffect::BuildOrigin { .. }))
+    );
+    let wake = engine.step(BootstrapEvent::Tick(Time(5)));
+    let op = wake
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::ObserveClaims { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap();
+    let next = engine.step(BootstrapEvent::ClaimsObserved {
+        op,
+        members: vec![
+            BootstrapMember {
+                node: NodeId::from("me"),
+                eligible: true,
+            },
+            BootstrapMember {
+                node: NodeId::from("peer"),
+                eligible: true,
+            },
+        ],
+        claims: vec![engine.claim(), claim(2)],
+    });
+    assert!(
+        next.effects.iter().any(|effect| matches!(effect,
+        BootstrapEffect::DonorAvailable { selected, .. } if *selected == identity(2))),
+        "{next:?}"
+    );
+    assert_eq!(engine.operation_due, Some(Time(10)));
+    let second = retry_observation(&mut engine, claim(2));
+    assert_eq!(engine.stage(), BootstrapStage::Settling);
+    assert!(
+        !second
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BootstrapEffect::BuildOrigin { .. }))
+    );
+    let due = engine.step(BootstrapEvent::Tick(Time(10)));
+    let op = due
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::ObserveClaims { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap();
+    let fallback = engine.step(BootstrapEvent::ClaimsObserved {
+        op,
+        members: vec![BootstrapMember {
+            node: NodeId::from("me"),
+            eligible: true,
+        }],
+        claims: vec![engine.claim()],
+    });
+    assert!(
+        fallback
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BootstrapEffect::BuildOrigin { .. }))
+    );
+    assert_eq!(engine.ready_retry_due, None);
+}

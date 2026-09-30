@@ -143,6 +143,61 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
     assert_eq!(budget.usage().0, 0);
 }
 
+/// A first presence create binds the whole local member revision, so any
+/// unrelated local write landing between its inspection cut and the actor's
+/// conditional apply rejects it without mutation. That benign race must not
+/// fail publication (and with it the process's whole bootstrap episode).
+#[tokio::test]
+async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_apply() {
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let budget = admission();
+    let source = NativeClaimSource::new(
+        cluster.groups[0].clone(),
+        scope(),
+        policy(),
+        128,
+        256,
+        budget.clone(),
+    )
+    .unwrap();
+    // Fewer racing writes than the bounded re-inspection allows. Each one
+    // queues behind the publication's cut and ahead of its conditional apply.
+    let writer = {
+        let group = cluster.groups[0].clone();
+        let budget = budget.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let queued = budget.reserve(AdmissionClass::Inflight, 32).unwrap();
+                group
+                    .set_entry_confirmed("hot", b"x".to_vec(), None, 32, 32, queued)
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    let published = presence(cluster.ids[0].clone(), 7, 8);
+    source.publish_presence(published.clone()).await.unwrap();
+    writer.await.unwrap();
+    let key = presence_entry_key(&scope(), 128).unwrap();
+    let bytes = cluster.groups[0]
+        .node_entry(&cluster.ids[0], &key)
+        .expect("the created presence is visible");
+    let visible = groupnet_core::volatile_bootstrap::decode_presence_value(
+        &scope(),
+        policy(),
+        &cluster.ids[0],
+        &bytes,
+        256,
+    )
+    .unwrap();
+    assert_eq!(
+        (visible.identity, visible.renewal),
+        (published.identity, published.renewal)
+    );
+    drop(source);
+    assert_eq!(budget.usage().0, 0);
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,

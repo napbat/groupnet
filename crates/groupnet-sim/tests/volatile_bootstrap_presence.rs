@@ -139,3 +139,69 @@ fn reject_old(engine: &mut ClaimEngine, old: &ClaimIdentity) {
     assert!(stale.rejection.is_some());
     assert!(stale.effects.is_empty());
 }
+
+#[test]
+fn retired_peer_candidate_keeps_presence_and_rejects_old_capture_over_seeded_restarts() {
+    for seed in 0..48 {
+        let mut rng = SplitMix64::new(seed);
+        let mut engine = ClaimEngine::new(
+            config(),
+            BootstrapScope {
+                domain: "o".into(),
+                partition: "b".into(),
+            },
+            NodeId::from("me"),
+            BootId(1),
+            1,
+        )
+        .unwrap();
+        let first = published_claim(&engine.step(BootstrapEvent::Start).effects);
+        build_local(&mut engine, &first, 2);
+        let retired = engine.step(BootstrapEvent::RetireCandidate);
+        assert_eq!(engine.stage(), BootstrapStage::Participating);
+        assert!(
+            retired
+                .effects
+                .contains(&BootstrapEffect::WithdrawClaim(first.identity.clone()))
+        );
+        assert!(
+            !retired
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, BootstrapEffect::WithdrawPresence(_)))
+        );
+        let before = engine.step(BootstrapEvent::Tick(Time(3 + u64::from(rng.below(2)))));
+        assert!(
+            before
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, BootstrapEffect::PublishPresence(_)))
+        );
+        if rng.below(2) == 0 {
+            reject_old(&mut engine, &first.identity);
+        }
+        let second = published_claim(&engine.step(BootstrapEvent::Start).effects);
+        assert_ne!(first.identity, second.identity);
+        reject_old(&mut engine, &first.identity);
+        let fallback = engine.step(BootstrapEvent::RetireCandidate);
+        assert!(
+            fallback
+                .effects
+                .contains(&BootstrapEffect::WithdrawClaim(second.identity))
+        );
+        assert_eq!(engine.stage(), BootstrapStage::Participating);
+        assert!(
+            !fallback
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, BootstrapEffect::WithdrawPresence(_)))
+        );
+        let terminal = engine.step(BootstrapEvent::Cancel);
+        assert!(
+            terminal
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, BootstrapEffect::WithdrawPresence(_)))
+        );
+    }
+}

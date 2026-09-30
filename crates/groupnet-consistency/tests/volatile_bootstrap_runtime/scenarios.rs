@@ -675,6 +675,23 @@ fn follower_setup_with_config(
     RecoveryHandle<ReadAdapter>,
     Arc<ReadAdapter>,
 ) {
+    let (claims, donor, admission, handle, reads) =
+        follower_setup_with_mode(paused, config, RecoveryMode::Unleased);
+    drop(claims);
+    (donor, admission, handle, reads)
+}
+
+fn follower_setup_with_mode(
+    paused: bool,
+    config: BootstrapRuntimeConfig,
+    mode: RecoveryMode,
+) -> (
+    Arc<Claims>,
+    Arc<PeerDonor>,
+    ByteAdmission,
+    RecoveryHandle<ReadAdapter>,
+    Arc<ReadAdapter>,
+) {
     let peer = peer_identity();
     let claims = Arc::new(Claims {
         local: Mutex::new(None),
@@ -691,7 +708,7 @@ fn follower_setup_with_config(
     let admission = admission();
     let (driver, _sender) = BootstrapSession::new(
         BootstrapCapabilities {
-            claims,
+            claims: Arc::clone(&claims),
             donor: Arc::clone(&donor),
             admission: admission.clone(),
         },
@@ -720,13 +737,13 @@ fn follower_setup_with_config(
             settle_ms: 5,
             poll_ms: 5,
         },
-        RecoveryMode::Unleased,
+        mode,
         NodeId::from("me"),
         15,
         Box::new(driver),
     )
     .unwrap();
-    (donor, admission, handle, reads)
+    (claims, donor, admission, handle, reads)
 }
 
 #[tokio::test]
@@ -746,6 +763,52 @@ async fn complete_presence_enables_canonical_peer_transfer() {
     handle.cancel().unwrap();
     eventually_within("canonical transfer releases admission", SETTLE, || {
         admission.usage().0 == 0
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn completed_peer_keeps_presence_through_lapse_for_a_third_join() {
+    let mut config = bootstrap_config();
+    config.require_participation = true;
+    config.max_claim_metadata_bytes = 512;
+    let (claims, donor, _admission, handle, reads) =
+        follower_setup_with_mode(false, config, RecoveryMode::Leased);
+    reads.lapse_sequences.store(1, Ordering::SeqCst);
+    eventually_within("peer baseline is affirmed", SETTLE, || {
+        handle.status().may_serve && donor.installed.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let before = claims
+        .presence
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("presence survives transfer");
+    assert!(
+        claims.local.lock().unwrap().is_none(),
+        "candidate claim retired"
+    );
+    handle.lease_lapse(1).unwrap();
+    eventually_within(
+        "lapse reaffirms without retiring process participation",
+        SETTLE,
+        || {
+            handle.status().may_serve
+                && handle.status().state.generation == 2
+                && claims
+                    .presence
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|p| p.identity == before.identity)
+        },
+    )
+    .await;
+    assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
+    handle.cancel().unwrap();
+    eventually_within("terminal worker withdraws participation", SETTLE, || {
+        claims.presence.lock().unwrap().is_none()
     })
     .await;
 }
@@ -772,17 +835,22 @@ async fn child_deadline_rejects_delayed_install_before_outer_episode_expires() {
     .await;
 }
 
+/// Without required participation no native roster can prove the handoff's
+/// covered members, so the installed image is discarded for guarded origin
+/// recovery instead of opening reads on an unverified roster.
 #[tokio::test]
-async fn quiet_feed_peer_handoff_installs_once_then_independent_heads_affirm() {
+async fn peer_handoff_without_participation_roster_recovers_from_origin() {
     let (donor, admission, handle, reads) = follower_setup(false);
     eventually_within(
-        "quiet peer transfer and fresh native handoff",
+        "unverifiable peer handoff falls back to one guarded origin build",
         SETTLE,
-        || handle.status().may_serve && donor.installed.load(Ordering::SeqCst) == 1,
+        || {
+            handle.status().may_serve
+                && donor.installed.load(Ordering::SeqCst) == 1
+                && reads.old_origin_builds.load(Ordering::SeqCst) == 1
+        },
     )
     .await;
-    assert_eq!(*donor.live.lock().unwrap(), Some(vec![42]));
-    assert_eq!(reads.old_origin_builds.load(Ordering::SeqCst), 0);
     handle.cancel().unwrap();
     eventually_within("follower transfer admission released", SETTLE, || {
         admission.usage().0 == 0

@@ -52,7 +52,12 @@ already finished recovery episode or license local reads. A peer install emits
 handoff below. It enters a **new peer-specific** recovery check: sample a
 complete bounded peer/head roster, wait the sampled native heads through the
 normal feed path, recheck the roster and heads, then request independent
-lease/domain affirmation. The current full-origin `Materialized` path goes
+lease/domain affirmation. The worker composes each roster sample itself:
+member identities come from the bootstrap child's fresh native
+participation cut, and feed heads from the adapter's ordinary
+`observe_peers`. Without required participation there is no roster to
+compare with the handoff's covered members, so the check fails closed to
+guarded origin recovery. The current full-origin `Materialized` path goes
 straight to `Affirm`; it does not already contain this peer barrier. A
 changed roster, missing head that was previously observed, feed gap, lapse,
 or handoff loss closes the candidate and uses guarded origin recovery within
@@ -147,6 +152,27 @@ established, the private image is discarded and reads stay origin-routed.
 `InstallCandidate` carries the exact accepted `NativeCoverageReceipt` to the
 worker, so the guarded callback does not reconstruct B from a mutable donor
 head or an unbounded adapter-owned map.
+
+Coverage compares the follower's live native writer positions with B through
+the core's `align_cuts`. An exact match (a writer known to one side only
+aligns as a quiet zero-position feed) may install. A same-incarnation
+position that differs in either direction is `Pending`: the follower is
+still applying those feeds, or its live index already holds effects past B
+that the stage lacks. The adapter answers `NativePending`, keeps its stage,
+and the transfer samples a later barrier with `AdvanceBarrier` after
+`coverage_poll_ms`, bounded by the transfer deadline. A changed writer
+incarnation or an incomparable local repair is a conflict and aborts the
+candidate. The install repeats the same check under the index write lock
+and swaps only if it still holds; if a live effect landed after the coverage
+check it answers `NativePending` too, again keeping the stage.
+
+A donor's own writes are native effects of its own feed writer. The
+consumer declares that writer at its current position before any capture
+starts, and assigns each own write's feed position under the same index
+publication lock that applies the write. The index, the donor journal, and
+the feed therefore see own writes in one contiguous order, so B covers them
+exactly and a follower that applied the same feed events aligns without a
+separate donor-local writer rule.
 
 Candidate publication and serving permission are distinct. The follower
 need not hold a serving lease before this candidate swap, which permits a

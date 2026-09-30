@@ -36,6 +36,8 @@ fn op(step: &RecoveryStep) -> RecoveryOperation {
             | RecoveryEffect::Affirm { op } => Some(*op),
             RecoveryEffect::CloseGate { .. }
             | RecoveryEffect::CancelBaseline { .. }
+            | RecoveryEffect::SuspendLocalBaseline { .. }
+            | RecoveryEffect::ResumeLocalBaseline { .. }
             | RecoveryEffect::ArmTimer(_) => None,
             RecoveryEffect::AcquireBaseline { .. } | RecoveryEffect::ObservePeerHeads { .. } => {
                 panic!("default recovery cannot request peer bootstrap")
@@ -209,7 +211,9 @@ fn volatile_recovery_reaches_applied_heads_or_fences_full_fallback() {
                     }
                     RecoveryEffect::AcquireBaseline { .. }
                     | RecoveryEffect::ObservePeerHeads { .. }
-                    | RecoveryEffect::CancelBaseline { .. } => {
+                    | RecoveryEffect::CancelBaseline { .. }
+                    | RecoveryEffect::SuspendLocalBaseline { .. }
+                    | RecoveryEffect::ResumeLocalBaseline { .. } => {
                         panic!("seed {seed}: default recovery attempted peer bootstrap")
                     }
                 }
