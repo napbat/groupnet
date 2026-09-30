@@ -22,9 +22,12 @@ pub struct RecoveryConfig {
     pub max_member_bytes: usize,
     /// Maximum source-head resamples after a reached frontier moves.
     pub max_barrier_rounds: u32,
-    /// Absolute duration allowed for one recovery attempt.
+    /// Liveness budget for one recovery episode: time allowed since the
+    /// episode began or since its long-running rebuild or baseline operation
+    /// last reported progress. A progressing operation is never failed over.
     pub total_ms: u64,
-    /// Duration allowed for one adapter operation, bounded by `total_ms`.
+    /// Duration one adapter operation may run without completing or, for an
+    /// origin rebuild, without reporting progress. Bounded by `total_ms`.
     pub attempt_ms: u64,
     /// Delay after all per-granter renewals advance.
     pub settle_ms: u64,
@@ -222,6 +225,13 @@ pub enum RecoveryEvent {
     /// serving still requires independent lease/domain affirmation.
     LocalBaselineBuilt {
         /// Exact baseline acquisition operation.
+        op: RecoveryOperation,
+    },
+    /// The current origin rebuild or baseline acquisition committed work.
+    /// Renews that operation's stall bound and the episode budget from now;
+    /// any other stage or a stale operation is refused.
+    Progressed {
+        /// Exact rebuild or baseline acquisition operation.
         op: RecoveryOperation,
     },
     /// A source-correlated private candidate was installed with continuous

@@ -54,8 +54,10 @@ bounded, versioned member/claim observations, logical ticks, capture and
 transfer receipts, and loss signals. It emits claim, hold, request, transfer,
 install, release, and fallback effects. A deterministic rank among converged
 healthy members selects one provisional builder after a bounded claim-settle
-window. Followers wait for that builder's certified image; a disappeared or
-failed builder triggers a bounded takeover round with a fresh generation.
+window. Followers wait for that builder's certified image for as long as its
+Building claim keeps advertising build progress, however long the origin scan
+takes; a disappeared, failed, or stalled builder (no advance for its stall
+bound) triggers a bounded takeover round with a fresh generation.
 Claims and liveness hints never open the serving gate. The runtime owns one
 worker/session allocator and bounded fair per-scope queues, not a second
 application retry state machine. Builder identity and attempt incarnation bind

@@ -378,6 +378,7 @@ fn follower_observes_ready_donor_before_wait_budget_expires() {
         },
         renewal: 1,
         phase: ClaimPhase::Willing,
+        progress: 0,
         remaining_ms: config().claim_ttl_ms,
     };
     let tick = follower.step(BootstrapEvent::Tick(crate::Time(3)));

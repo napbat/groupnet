@@ -90,8 +90,24 @@ struct Control {
     open: bool,
     state: RecoveryState,
     operation: Option<RecoveryOperation>,
+    /// Current deadline of `operation`; the worker moves it later only when
+    /// the core accepts a progress report for that exact operation.
+    deadline: Option<Instant>,
+    /// Progress reports for `operation`, restarted for every new operation.
+    progress: u64,
     pending: Pending,
     terminal: bool,
+}
+
+impl Control {
+    fn current(&self, version: u64, operation: RecoveryOperation, limit: Option<Instant>) -> bool {
+        let now = Instant::now();
+        !self.terminal
+            && self.version == version
+            && self.operation == Some(operation)
+            && self.deadline.is_some_and(|deadline| now < deadline)
+            && limit.is_none_or(|limit| now < limit)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -134,7 +150,7 @@ struct Shared<A> {
     mode: RecoveryMode,
     control: Arc<Mutex<Control>>,
     handles: AtomicUsize,
-    notify: Notify,
+    notify: Arc<Notify>,
 }
 
 impl<A: RecoveryAdapter> Shared<A> {
@@ -223,18 +239,37 @@ impl<A: RecoveryAdapter> Shared<A> {
             return None;
         }
         control.operation = Some(op);
+        control.deadline = Some(deadline);
+        control.progress = 0;
         Some(PublicationPermit {
             control: Arc::clone(&self.control),
+            notify: Arc::clone(&self.notify),
             version: control.version,
             operation: op,
-            deadline,
+            limit: None,
         })
+    }
+
+    /// Progress reports recorded for this exact armed operation, if current.
+    fn progress(&self, op: RecoveryOperation, version: u64) -> Option<u64> {
+        let control = lock(&self.control);
+        (!control.terminal && control.version == version && control.operation == Some(op))
+            .then_some(control.progress)
+    }
+
+    /// Move the armed operation's deadline to the core's renewed one.
+    fn extend(&self, op: RecoveryOperation, version: u64, deadline: Instant) {
+        let mut control = lock(&self.control);
+        if !control.terminal && control.version == version && control.operation == Some(op) {
+            control.deadline = Some(deadline);
+        }
     }
 
     fn disarm(&self, op: RecoveryOperation) {
         let mut control = lock(&self.control);
         if control.operation == Some(op) {
             control.operation = None;
+            control.deadline = None;
         }
     }
 
@@ -276,22 +311,26 @@ enum Signal {
 
 /// A generation-fenced permission to publish a rebuilt index page or swap.
 /// A gap, lapse, or cancellation revokes all previously issued permits before
-/// its public signal returns. A rejected closure is never invoked.
+/// its public signal returns. A rejected closure is never invoked. Its
+/// deadline is the exact operation's current one, which only the core moves,
+/// and only after [`Self::progress`] reported committed work.
 #[derive(Debug)]
 pub struct PublicationPermit {
     control: Arc<Mutex<Control>>,
+    notify: Arc<Notify>,
     version: u64,
     operation: RecoveryOperation,
-    deadline: Instant,
+    limit: Option<Instant>,
 }
 
 impl Clone for PublicationPermit {
     fn clone(&self) -> Self {
         Self {
             control: Arc::clone(&self.control),
+            notify: Arc::clone(&self.notify),
             version: self.version,
             operation: self.operation,
-            deadline: self.deadline,
+            limit: self.limit,
         }
     }
 }
@@ -330,29 +369,75 @@ impl PublicationPermit {
     #[must_use]
     pub fn restricted_to(&self, deadline: Instant) -> Self {
         let mut restricted = self.clone();
-        restricted.deadline = restricted.deadline.min(deadline);
+        restricted.limit = Some(
+            restricted
+                .limit
+                .map_or(deadline, |limit| limit.min(deadline)),
+        );
         restricted
     }
+
     /// Runs one bounded index mutation only if this exact permit still owns
     /// the publication generation. The closure runs under the short gate lock
     /// so a concurrent public signal cannot return before it has finished.
     pub fn publish<T>(&self, apply: impl FnOnce() -> T) -> Option<T> {
         let control = lock(&self.control);
-        (Instant::now() < self.deadline
-            && !control.terminal
-            && control.version == self.version
-            && control.operation == Some(self.operation))
-        .then(apply)
+        control
+            .current(self.version, self.operation, self.limit)
+            .then(apply)
     }
 
     /// Whether this publication generation remains current.
     #[must_use]
     pub fn valid(&self) -> bool {
+        lock(&self.control).current(self.version, self.operation, self.limit)
+    }
+
+    /// The operation's current deadline, narrowed by any restriction, while
+    /// this permit remains current. It moves later only after progress.
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
         let control = lock(&self.control);
-        Instant::now() < self.deadline
-            && !control.terminal
-            && control.version == self.version
-            && control.operation == Some(self.operation)
+        control
+            .current(self.version, self.operation, self.limit)
+            .then_some(control.deadline)
+            .flatten()
+            .map(|deadline| self.limit.map_or(deadline, |limit| limit.min(deadline)))
+    }
+
+    /// Report that the operation committed more work, such as one origin
+    /// LIST page published through [`Self::publish`]. The recovery core then
+    /// renews the operation's stall bound and the episode budget, so a scan
+    /// that keeps progressing is never failed over or restarted. Call it only
+    /// after real committed work. Returns false for a fenced or expired
+    /// permit, whose report is discarded.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "a report is fire-and-forget; the result only tells a scan it was fenced"
+    )]
+    pub fn progress(&self) -> bool {
+        {
+            let mut control = lock(&self.control);
+            if !control.current(self.version, self.operation, self.limit) {
+                return false;
+            }
+            let Some(progress) = control.progress.checked_add(1) else {
+                return false;
+            };
+            control.progress = progress;
+        }
+        self.notify.notify_one();
+        true
+    }
+
+    /// Progress reports recorded for this exact operation, while current.
+    /// A child driving the operation can observe that it advanced.
+    #[must_use]
+    pub fn progress_reports(&self) -> Option<u64> {
+        let control = lock(&self.control);
+        control
+            .current(self.version, self.operation, self.limit)
+            .then_some(control.progress)
     }
 }
 
@@ -572,6 +657,8 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
                 open: false,
                 state: engine.state(),
                 operation: None,
+                deadline: None,
+                progress: 0,
                 pending: Pending {
                     start: true,
                     ..Pending::default()
@@ -579,7 +666,7 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
                 terminal: false,
             })),
             handles: AtomicUsize::new(1),
-            notify: Notify::new(),
+            notify: Arc::new(Notify::new()),
         });
         shared.force_close(false);
         runtime.spawn(run(Arc::clone(&shared), engine, config, bootstrap));

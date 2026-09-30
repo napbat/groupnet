@@ -81,7 +81,6 @@ pub struct BootstrapSession<C: ClaimSource, D: DonorPort> {
     suspended_recovery: Option<RecoveryOperation>,
     permit: Option<PublicationPermit>,
     ready_guard: Option<ReadyCapturePermit>,
-    due: Option<Instant>,
     child_parent: Option<BootstrapOperation>,
     transfer_context: Option<TransferContext>,
     _core_metadata: Reservation,
@@ -179,7 +178,6 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 suspended_recovery: None,
                 permit: None,
                 ready_guard: None,
-                due: None,
                 child_parent: None,
                 transfer_context: None,
                 _core_metadata: core_metadata,
@@ -341,9 +339,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
         &mut self,
         recovery: RecoveryOperation,
         permit: PublicationPermit,
-        due: Instant,
     ) -> BoxRecoveryFuture<'_, BootstrapOutcome> {
-        Box::pin(async move { self.run_acquisition(recovery, permit, due).await })
+        Box::pin(async move { self.run_acquisition(recovery, permit).await })
     }
 
     fn cancel(&mut self, recovery: RecoveryOperation) -> BoxRecoveryFuture<'_, ()> {
@@ -357,7 +354,6 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             self.suspended_recovery = None;
             self.permit = None;
             self.ready_guard = None;
-            self.due = None;
             self.resources = TransferResources::default();
             self.child_parent = None;
             self.transfer_context = None;
@@ -372,7 +368,6 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             self.suspended_recovery = None;
             self.permit = None;
             self.ready_guard = None;
-            self.due = None;
             self.resources = TransferResources::default();
             self.child_parent = None;
             self.transfer_context = None;
@@ -389,7 +384,6 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             self.retire_donor_capture();
             self.permit = None;
             self.ready_guard = None;
-            self.due = None;
             self.suspended_recovery = Some(recovery);
             self.drain_maintenance().await;
         })

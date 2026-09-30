@@ -17,6 +17,7 @@ fn claim(attempt: u64) -> BootstrapClaim {
         },
         renewal: 1,
         phase: ClaimPhase::Ready,
+        progress: 0,
         remaining_ms: 10,
     }
 }

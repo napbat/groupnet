@@ -86,6 +86,7 @@ fn ready_follower_with_wait(wait: u64) -> (ClaimEngine, BootstrapOperation, Clai
         identity: selected.clone(),
         renewal: 2,
         phase: ClaimPhase::Ready,
+        progress: 0,
         remaining_ms: 9,
     };
     let decision = engine.step(BootstrapEvent::ClaimsObserved {
@@ -220,6 +221,7 @@ fn selected_claim_refresh_is_correlated_and_does_not_replace_transfer_parent() {
             identity: selected.clone(),
             renewal: 3,
             phase: ClaimPhase::Ready,
+            progress: 0,
             remaining_ms: 9,
         }),
     });
@@ -263,6 +265,7 @@ fn repeated_old_renewal_cannot_extend_selected_claim_lifetime() {
                     identity: selected,
                     renewal: 2,
                     phase: ClaimPhase::Ready,
+                    progress: 0,
                     remaining_ms: 9,
                 }),
             })

@@ -27,14 +27,30 @@ application-owned retry state machine. Add a pure recovery effect for
 `AcquireBaseline { op }` after a full invalidation when bootstrap is enabled;
 the default configuration still emits `RebuildOrigin`. The shell drives the
 claim/transfer effects under the current recovery generation and the
-original `RecoveryConfig::total_ms` deadline. The selected claim's finite
+`AcquireBaseline` operation's deadline, which is the episode's `total_ms`
+budget and which the child reads from its permit. The selected claim's finite
 episode deadline must be no later than that recovery deadline. The worker
 uses the minimum of claim renewal, exact selected-claim refresh, child work,
-and recovery operation deadlines for one timer. The `AcquireBaseline` parent
-operation lasts only until that original total
-deadline; the claim and transfer engines separately bound each source and
-stage operation. Applying ordinary `attempt_ms` to the entire parent would
-abort healthy multi-step transfers. A failed or declined donor
+and recovery operation deadlines for one timer. The claim and transfer
+engines separately bound each source and stage operation. Applying ordinary
+`attempt_ms` to the entire parent would abort healthy multi-step transfers.
+
+Only build progress renews these bounds. The builder's local build reports
+each committed origin page through the parent `PublicationPermit::progress`,
+which renews the recovery episode exactly as for `RebuildOrigin`. While the
+build runs the worker keeps publishing claim and presence renewals, and on
+each renewal turn converts new permit progress into `BuildProgressed`: that
+restarts the build's stall bound `donor_wait_ms` and the claim episode, and a
+fresh renewal advertises the claim's monotone `progress`. A follower that
+observes the selected Building claim's `progress` advance renews its own claim
+episode and emits `BuilderProgressed`, which the worker turns into a progress
+report on its own parent permit. A follower therefore waits for a builder that
+keeps advancing, however long its scan runs. It releases the builder only when
+the claim disappears (the builder's own stall bound ended it and withdrew the
+claim) or when no advance has been seen for `donor_wait_ms + claim_ttl_ms +
+observe_ms` — the builder's own bound plus the time its last advance takes to
+become visible and be sampled — and then scans the origin itself. A failed or
+declined donor
 returns a typed `BootstrapDeclined { op }` to the recovery engine, which then
 emits a fresh guarded `RebuildOrigin` in the **same** original recovery
 episode. It never starts an unbounded new origin attempt. A local provisional
@@ -75,7 +91,7 @@ verification, and `Installed` replies carry both the recovery operation and
 the claim/transfer operation. A newer generation rejects them. The worker
 must not drain a public signal and then accidentally adopt a later fence
 version. It must not extend the total deadline when a donor changes, a
-claim renewal arrives, or the worker waits for cleanup.
+claim renewal without new progress arrives, or the worker waits for cleanup.
 
 ## Bounded capability surface
 

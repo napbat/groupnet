@@ -144,6 +144,7 @@ fn repeated_stale_claim_never_refreshes_its_original_expiry() {
         },
         renewal: 1,
         phase: ClaimPhase::Building,
+        progress: 0,
         remaining_ms: 10,
     };
     assert!(engine.track_claim(&claim).unwrap());
@@ -162,6 +163,7 @@ fn repeated_stale_claim_never_refreshes_its_original_expiry() {
         },
         renewal: 1,
         phase: ClaimPhase::Willing,
+        progress: 0,
         remaining_ms: 10,
     };
     engine.generation = 1;
@@ -297,6 +299,7 @@ fn unavailable_ready_attempt_reobserves_without_resetting_original_wait_or_build
         identity: identity(attempt),
         renewal: 1,
         phase: ClaimPhase::Ready,
+        progress: 0,
         remaining_ms: 10,
     };
     engine.stage = BootstrapStage::DonorAvailable;

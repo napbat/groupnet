@@ -20,6 +20,7 @@ mod transfer;
 struct ObservedRenewal {
     sequence: u64,
     phase: ClaimPhase,
+    progress: u64,
     expires: Time,
 }
 
@@ -44,6 +45,8 @@ pub struct ClaimEngine {
     next_token: u64,
     local_phase: ClaimPhase,
     local_renewal: u64,
+    local_progress: u64,
+    follow_progress: Option<u64>,
     presence_renewal: u64,
     presence_due: Option<Time>,
     participation_required: bool,
@@ -109,6 +112,8 @@ impl ClaimEngine {
             next_token: 1,
             local_phase: ClaimPhase::Willing,
             local_renewal: 0,
+            local_progress: 0,
+            follow_progress: None,
             presence_renewal: 0,
             presence_due: None,
             participation_required: false,
@@ -280,6 +285,7 @@ impl ClaimEngine {
             identity: self.identity(),
             renewal: self.local_renewal,
             phase: self.local_phase,
+            progress: self.local_progress,
             remaining_ms: self.config.claim_ttl_ms,
         }
     }
@@ -401,6 +407,8 @@ impl ClaimEngine {
         self.stage = BootstrapStage::Settling;
         self.local_phase = ClaimPhase::Willing;
         self.local_renewal = 1;
+        self.local_progress = 0;
+        self.follow_progress = None;
         self.renew_due = Some(renew_due);
         self.total_due = Some(total_due);
         self.settle_due = Some(settle_due);
@@ -499,7 +507,8 @@ impl ClaimEngine {
             if id.node == self.me
                 && (id.attempt != self.generation
                     || claim.phase != self.local_phase
-                    || claim.renewal != self.local_renewal)
+                    || claim.renewal != self.local_renewal
+                    || claim.progress != self.local_progress)
             {
                 return Err(BootstrapError::InvalidObservation);
             }
@@ -528,13 +537,13 @@ impl ClaimEngine {
                 return Err(BootstrapError::InvalidObservation);
             }
             Some(previous) if claim.renewal == previous.sequence => {
-                if claim.phase != previous.phase {
+                if claim.phase != previous.phase || claim.progress != previous.progress {
                     return Err(BootstrapError::InvalidObservation);
                 }
                 previous.expires.min(new_expiry)
             }
             Some(previous) => {
-                if claim.phase < previous.phase {
+                if claim.phase < previous.phase || claim.progress < previous.progress {
                     return Err(BootstrapError::InvalidObservation);
                 }
                 new_expiry
@@ -549,6 +558,7 @@ impl ClaimEngine {
             ObservedRenewal {
                 sequence: claim.renewal,
                 phase: claim.phase,
+                progress: claim.progress,
                 expires: expiry,
             },
         );
@@ -739,6 +749,9 @@ impl ClaimEngine {
                     return self.terminate();
                 };
                 self.ok(vec![claim])
+            }
+            BootstrapEvent::BuildProgressed { op, selected } => {
+                self.build_progressed(op, &selected)
             }
             BootstrapEvent::LocalOnlyBuilt { op, selected } => self.local_only_built(op, selected),
             BootstrapEvent::StartReadyRecapture => self.start_ready_recapture(),

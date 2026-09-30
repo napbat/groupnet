@@ -478,7 +478,10 @@ pub struct LocalCaptureRequest {
     pub selected: ClaimIdentity,
     /// Complete source-observed participation roster checked before C.
     pub members: Vec<BootstrapMemberIdentity>,
-    /// Publication permission narrowed to the child operation deadline.
+    /// The outer recovery's publication permission. Report each committed
+    /// origin page through [`PublicationPermit::progress`]: that keeps the
+    /// outer episode, the build's stall bound and this node's Building claim
+    /// alive. The worker drops the build once it stalls past that bound.
     pub permit: PublicationPermit,
     /// The session clock the capture's journal must be driven by.
     pub clock: LogicalClock,

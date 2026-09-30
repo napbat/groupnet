@@ -70,7 +70,7 @@ restart its lifetime merely because gossip arrived again.
 One node-owned entry key is derived from a length-delimited encoding of
 `BootstrapScope`, under a reserved bootstrap namespace. The bounded value
 contains a codec version, exact scope and policy fingerprint, `NodeId`,
-128-bit boot nonce, session, attempt, renewal, phase, and no wall-clock
+128-bit boot nonce, session, attempt, renewal, phase, build progress, and no wall-clock
 deadline. `Group::set_entry` supplies a finite TTL duration; each observer
 measures remaining life on its own monotonic clock. The codec rejects trailing
 bytes, oversized fields, unknown versions, zero identity components, and a

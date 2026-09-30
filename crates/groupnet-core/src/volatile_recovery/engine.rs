@@ -440,6 +440,32 @@ impl RecoveryEngine {
         self.with_timer(vec![RecoveryEffect::RebuildOrigin { op }])
     }
 
+    /// A long-running operation that keeps committing work stays alive: its
+    /// stall bound and the episode budget both restart now. Neither deadline
+    /// can move earlier, and a fenced or expired operation is refused.
+    fn progressed(&mut self, op: RecoveryOperation) -> RecoveryStep {
+        if !self.accepts_operation(op) {
+            return Self::reject(RecoveryError::StaleOperation);
+        }
+        let baseline = self.state.stage == RecoveryStage::AcquiringBaseline;
+        if !baseline && self.state.stage != RecoveryStage::Rebuilding {
+            return Self::reject(RecoveryError::Stage);
+        }
+        let (Some(total_due), Some(attempt_due)) = (
+            self.now.0.checked_add(self.config.total_ms).map(Time),
+            self.now.0.checked_add(self.config.attempt_ms).map(Time),
+        ) else {
+            return Self::reject(RecoveryError::Exhausted);
+        };
+        self.total_due = Some(total_due);
+        self.operation_due = Some(if baseline {
+            total_due
+        } else {
+            attempt_due.min(total_due)
+        });
+        self.with_timer(Vec::new())
+    }
+
     fn wait_for(&mut self, stage: RecoveryStage, delay: u64) -> RecoveryStep {
         let Some(total_due) = self.total_due else {
             return self.origin_only();
@@ -702,6 +728,7 @@ impl RecoveryEngine {
                 self.baseline = Baseline::Origin;
                 self.affirm()
             }
+            RecoveryEvent::Progressed { op } => self.progressed(op),
             RecoveryEvent::PeerBaselineInstalled { op, handoff } => {
                 if !self.expected(op, RecoveryStage::AcquiringBaseline) {
                     return Self::reject(RecoveryError::StaleOperation);

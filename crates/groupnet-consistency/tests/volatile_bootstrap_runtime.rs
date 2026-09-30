@@ -296,6 +296,11 @@ struct OriginDonor {
     ingress: Mutex<Option<JournalIngress>>,
     latest_permit: Mutex<Option<PublicationPermit>>,
     capture_max_ms: std::sync::atomic::AtomicU64,
+    /// A paged local origin scan: build starts, and this many pages each
+    /// published after `page_ms` with a progress report.
+    build_starts: AtomicUsize,
+    build_pages: AtomicUsize,
+    page_ms: std::sync::atomic::AtomicU64,
 }
 
 fn journal_config() -> JournalConfig {
@@ -389,6 +394,13 @@ impl DonorPort for OriginDonor {
                     Vec::new(),
                 )
                 .map_err(|_| AdapterError)?;
+            self.build_starts.fetch_add(1, Ordering::SeqCst);
+            let page = Duration::from_millis(self.page_ms.load(Ordering::SeqCst));
+            for _ in 0..self.build_pages.load(Ordering::SeqCst) {
+                tokio::time::sleep(page).await;
+                permit.publish(|| ()).ok_or(AdapterError)?;
+                permit.progress();
+            }
             if self.pause.load(Ordering::SeqCst) {
                 *self.latest_permit.lock().unwrap() = Some(permit.clone());
                 self.started.notify_one();
@@ -943,3 +955,6 @@ mod roster_maintenance;
 
 #[path = "volatile_bootstrap_runtime/scheduling.rs"]
 mod scheduling;
+
+#[path = "volatile_bootstrap_runtime/slow_build.rs"]
+mod slow_build;

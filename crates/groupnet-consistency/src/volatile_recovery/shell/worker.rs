@@ -1,5 +1,6 @@
 //! One bounded asynchronous worker for volatile recovery effects.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -87,7 +88,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
 ) {
     let _exit_guard = WorkerExitGuard(Arc::clone(&shared));
     let started = Instant::now();
-    let mut effects = std::collections::VecDeque::new();
+    let mut effects = VecDeque::new();
     let mut active_version = 1;
     let mut active_baseline = None;
     loop {
@@ -187,10 +188,11 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     };
                     let response = await_operation(
                         &shared,
-                        &engine,
+                        &mut engine,
                         started,
-                        active_version,
-                        child.acquire(op, permit, due),
+                        (active_version, op),
+                        &mut effects,
+                        child.acquire(op, permit),
                     )
                     .await;
                     shared.disarm(op);
@@ -239,9 +241,10 @@ pub(super) async fn run<A: RecoveryAdapter>(
                         Some(child) => {
                             await_operation(
                                 &shared,
-                                &engine,
+                                &mut engine,
                                 started,
-                                active_version,
+                                (active_version, op),
+                                &mut effects,
                                 child.peer_roster(due),
                             )
                             .await
@@ -251,9 +254,10 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     let response = match identities {
                         Some(Some(identities)) => await_operation(
                             &shared,
-                            &engine,
+                            &mut engine,
                             started,
-                            active_version,
+                            (active_version, op),
+                            &mut effects,
                             shared.adapter.observe_peers(op, config),
                         )
                         .await
@@ -305,9 +309,10 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     };
                     let response = await_operation(
                         &shared,
-                        &engine,
+                        &mut engine,
                         started,
-                        active_version,
+                        (active_version, op),
+                        &mut effects,
                         shared.adapter.invalidate(op, distrust_bodies, permit),
                     )
                     .await;
@@ -347,9 +352,10 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     };
                     let response = await_operation(
                         &shared,
-                        &engine,
+                        &mut engine,
                         started,
-                        active_version,
+                        (active_version, op),
+                        &mut effects,
                         shared.adapter.rebuild_origin(op, permit),
                     )
                     .await;
@@ -378,9 +384,10 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     }
                     let response = await_operation(
                         &shared,
-                        &engine,
+                        &mut engine,
                         started,
-                        active_version,
+                        (active_version, op),
+                        &mut effects,
                         shared.adapter.observe_peers(op, config),
                     )
                     .await;
@@ -412,9 +419,10 @@ pub(super) async fn run<A: RecoveryAdapter>(
                     }
                     let response = await_operation(
                         &shared,
-                        &engine,
+                        &mut engine,
                         started,
-                        active_version,
+                        (active_version, op),
+                        &mut effects,
                         shared.adapter.wait_frontiers(op, heads),
                     )
                     .await;
@@ -534,25 +542,52 @@ async fn bootstrap_wake(wake: Option<&Arc<tokio::sync::Notify>>) {
     }
 }
 
+/// Await one adapter or child operation until the core's current deadline for
+/// it. A progress report on the operation's permit wakes this loop: the core
+/// renews the operation and the permit's deadline follows, so a scan that
+/// keeps committing work outlives any fixed attempt or episode bound. If the
+/// operation expired before the report, the core's fallback is queued instead.
 async fn await_operation<A: RecoveryAdapter, T>(
     shared: &Arc<Shared<A>>,
-    engine: &RecoveryEngine,
+    engine: &mut RecoveryEngine,
     started: Instant,
-    active_version: u64,
+    (active_version, op): (u64, RecoveryOperation),
+    effects: &mut VecDeque<RecoveryEffect>,
     future: BoxRecoveryFuture<'_, T>,
 ) -> Option<T> {
     let due = engine.next_deadline()?;
-    let deadline = terminal_deadline(shared, absolute_deadline(started, due))?;
+    let mut deadline = terminal_deadline(shared, absolute_deadline(started, due))?;
+    let mut reported = 0;
     tokio::pin!(future);
     loop {
         let delay = deadline.saturating_duration_since(Instant::now());
         tokio::select! {
             biased;
             () = shared.notify.notified() => {
-                let control = lock(&shared.control);
-                if control.version != active_version || control.pending.cancel {
+                {
+                    let control = lock(&shared.control);
+                    if control.version != active_version || control.pending.cancel {
+                        return None;
+                    }
+                }
+                let Some(progress) = shared.progress(op, active_version) else {
+                    continue;
+                };
+                if progress == reported {
+                    continue;
+                }
+                reported = progress;
+                let elapsed = engine.step(RecoveryEvent::Tick(logical_now(started)));
+                effects.extend(elapsed.effects);
+                if !engine.accepts_operation(op) {
                     return None;
                 }
+                if engine.step(RecoveryEvent::Progressed { op }).rejection.is_some() {
+                    continue;
+                }
+                let due = engine.next_deadline()?;
+                deadline = terminal_deadline(shared, absolute_deadline(started, due))?;
+                shared.extend(op, active_version, deadline);
             }
             () = tokio::time::sleep(delay) => return None,
             value = &mut future => return Some(value),

@@ -83,11 +83,13 @@ fn shared() -> Arc<Shared<Adapter>> {
             open: true,
             state,
             operation: None,
+            deadline: None,
+            progress: 0,
             pending: Pending::default(),
             terminal: false,
         })),
         handles: AtomicUsize::new(1),
-        notify: Notify::new(),
+        notify: Arc::new(Notify::new()),
     })
 }
 
@@ -113,15 +115,50 @@ fn expired_publication_permit_refuses_page_before_worker_tick() {
         generation: 1,
         token: 1,
     };
-    let expired = PublicationPermit {
-        control: Arc::clone(&shared.control),
-        version: 1,
-        operation: op,
-        deadline: Instant::now(),
-    };
-    lock(&shared.control).operation = Some(op);
+    let expired = shared
+        .permit(op, 1, Instant::now() + Duration::from_secs(1))
+        .expect("current operation");
+    lock(&shared.control).deadline = Some(Instant::now());
     assert!(!expired.valid());
     assert_eq!(expired.publish(|| 7), None);
+    assert!(
+        !expired.progress(),
+        "an expired operation cannot report progress"
+    );
+}
+
+#[test]
+fn progress_renews_only_the_current_operation_and_never_a_restriction() {
+    let shared = shared();
+    let op = RecoveryOperation {
+        session: 1,
+        generation: 1,
+        token: 1,
+    };
+    let permit = shared
+        .permit(op, 1, Instant::now() + Duration::from_secs(1))
+        .expect("current operation");
+    assert!(permit.progress());
+    assert!(permit.progress());
+    assert_eq!(shared.progress(op, 1), Some(2));
+    assert_eq!(permit.progress_reports(), Some(2));
+
+    let child = permit.restricted_to(Instant::now());
+    let renewed = Instant::now() + Duration::from_secs(60);
+    shared.extend(op, 1, renewed);
+    assert_eq!(permit.deadline(), Some(renewed));
+    assert!(permit.publish(|| ()).is_some());
+    assert!(
+        child.deadline().is_none(),
+        "a narrowed child stays narrowed"
+    );
+    assert!(!child.progress());
+
+    shared.signal(Signal::Gap(1)).unwrap();
+    assert!(!permit.progress(), "a fenced operation discards its report");
+    assert_eq!(permit.progress_reports(), None);
+    shared.extend(op, 1, renewed + Duration::from_secs(60));
+    assert!(!permit.valid(), "no renewal revives a fenced permit");
 }
 
 #[test]
@@ -133,16 +170,15 @@ fn ready_recapture_uses_a_fresh_finite_guard_and_generation_change_revokes_it() 
         control.state.recovered = true;
         control.state.generation = 1;
     }
-    let old = PublicationPermit {
-        control: Arc::clone(&shared.control),
-        version: 1,
-        operation: RecoveryOperation {
-            session: 1,
-            generation: 1,
-            token: 1,
-        },
-        deadline: Instant::now(),
+    let old_op = RecoveryOperation {
+        session: 1,
+        generation: 1,
+        token: 1,
     };
+    let old = shared
+        .permit(old_op, 1, Instant::now() + Duration::from_secs(1))
+        .expect("current operation");
+    shared.disarm(old_op);
     assert!(old.publish(|| ()).is_none());
     let guard = old
         .ready_capture(Instant::now() + Duration::from_secs(1))

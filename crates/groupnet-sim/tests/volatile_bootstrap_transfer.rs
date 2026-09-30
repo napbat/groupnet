@@ -157,6 +157,7 @@ fn start() -> (ClaimEngine, Fixture, Vec<BootstrapEffect>) {
         identity: donor.clone(),
         renewal: 2,
         phase: ClaimPhase::Ready,
+        progress: 0,
         remaining_ms: 12,
     };
     let chosen = engine.step(BootstrapEvent::ClaimsObserved {
@@ -498,6 +499,7 @@ fn enqueue(
                         identity: fixture.donor.clone(),
                         renewal: fixture.renewal,
                         phase: ClaimPhase::Ready,
+                        progress: 0,
                         remaining_ms: 12,
                     })
                 };
@@ -515,6 +517,7 @@ fn enqueue(
             | BootstrapEffect::ObserveClaims { .. }
             | BootstrapEffect::BuildOrigin { .. }
             | BootstrapEffect::FollowBuilder { .. }
+            | BootstrapEffect::BuilderProgressed
             | BootstrapEffect::DonorAvailable { .. }
             | BootstrapEffect::ArmTimer(_)
             | BootstrapEffect::RecaptureCurrent { .. } => None,

@@ -79,7 +79,7 @@ records every native member at that cut with exact status and membership
 incarnation, including noneligible members without a participation entry.
 Eligible members require a current compatible presence; a status, incarnation,
 boot, or session change invalidates the old capture.
-The current one-key inspection and VBC1 claim APIs remain usable unchanged.
+The current one-key inspection and builder-claim APIs remain usable unchanged.
 
 The donor journal records a sorted, exact, count-and-byte-bounded native
 membership roster (NodeId, incarnation/status, and optional fresh presence
@@ -157,7 +157,8 @@ must decline recapture on incomplete/uncertain buckets, changed scope, a feed
 gap, or insufficient admission.
 
 The scoped participation entry uses a new reserved key and body kind. The
-existing VBC1 builder-claim value is unchanged. The canonical bulk Offer
+existing builder-claim value is unchanged (codec `VBC2` since it gained
+build progress). The canonical bulk Offer
 and Barrier bodies carry the single canonical full-native roster under bulk
 codec version 2. Peers upgrade together, so there is no parallel bulk-body
 path for another version; the version byte only rejects a mis-deployed peer.

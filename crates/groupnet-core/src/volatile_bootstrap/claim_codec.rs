@@ -8,7 +8,7 @@ use super::{
 };
 use crate::NodeId;
 
-const MAGIC: &[u8; 4] = b"VBC1";
+const MAGIC: &[u8; 4] = b"VBC2";
 const PRESENCE_MAGIC: &[u8; 4] = b"VBP1";
 
 /// A bootstrap claim key or value is invalid or exceeds its declared bound.
@@ -95,6 +95,7 @@ pub fn encode_claim_value(
         ClaimPhase::Building => 2,
         ClaimPhase::Ready => 3,
     });
+    out.extend_from_slice(&claim.progress.to_le_bytes());
     Ok(out)
 }
 
@@ -123,7 +124,7 @@ pub fn encoded_claim_len(
         .checked_add(2 * 3)
         .and_then(|n| n.checked_add(scope_bytes))
         .and_then(|n| n.checked_add(node.len()))
-        .and_then(|n| n.checked_add(9 * 8 + 16 + 3 * 8 + 1))
+        .and_then(|n| n.checked_add(9 * 8 + 16 + 4 * 8 + 1))
         .ok_or(ClaimCodecError::Bound)?;
     if size > max_bytes {
         return Err(ClaimCodecError::Bound);
@@ -175,6 +176,7 @@ pub fn decode_claim_value(
         3 => ClaimPhase::Ready,
         _ => return Err(ClaimCodecError::Malformed),
     };
+    let progress = reader.u64()?;
     if reader.offset != bytes.len()
         || incarnation.0 == 0
         || session == 0
@@ -192,6 +194,7 @@ pub fn decode_claim_value(
         },
         renewal,
         phase,
+        progress,
         remaining_ms: 0,
     })
 }
@@ -451,6 +454,7 @@ mod tests {
             },
             renewal: 4,
             phase: ClaimPhase::Ready,
+            progress: 0x0102_0304_0506_0708,
             remaining_ms: 99,
         }
     }
@@ -468,6 +472,7 @@ mod tests {
         assert_eq!(decoded.identity, claim().identity);
         assert_eq!(decoded.renewal, 4);
         assert_eq!(decoded.phase, ClaimPhase::Ready);
+        assert_eq!(decoded.progress, 0x0102_0304_0506_0708);
 
         let left = BootstrapScope {
             domain: "a".into(),
@@ -513,7 +518,7 @@ mod tests {
             Err(ClaimCodecError::Bound)
         );
         let mut bad_version = bytes;
-        bad_version[3] = b'2';
+        bad_version[3] = b'1';
         assert_eq!(
             decode_claim_value(
                 &scope(),

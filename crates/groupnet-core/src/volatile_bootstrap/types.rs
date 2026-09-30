@@ -37,9 +37,11 @@ pub struct BootstrapConfig {
     pub claim_ttl_ms: u64,
     /// Finite observation attempt timeout.
     pub observe_ms: u64,
-    /// Finite wait for a selected builder or donor.
+    /// Stall bound for a builder: how long its local origin build may run,
+    /// and a follower keeps waiting for it, without the build advancing.
     pub donor_wait_ms: u64,
-    /// Total budget for this bootstrap selection episode.
+    /// Liveness budget for this bootstrap selection episode, restarted each
+    /// time the selected build advances.
     pub total_ms: u64,
 }
 
@@ -191,6 +193,10 @@ pub struct BootstrapClaim {
     pub renewal: u64,
     /// Candidate's advertised phase.
     pub phase: ClaimPhase,
+    /// Builder progress, monotone within this exact claim. A Building claim
+    /// advances it as its origin build commits work; followers treat an
+    /// unchanged value as a stalled build once `donor_wait_ms` passes.
+    pub progress: u64,
     /// Native source TTL remaining at the observation, not a fresh local TTL.
     pub remaining_ms: u64,
 }
@@ -295,6 +301,14 @@ pub enum BootstrapEvent {
     },
     /// Local guarded origin build completed; image still needs transfer proof.
     Built {
+        /// Exact build operation.
+        op: BootstrapOperation,
+        /// Exact selected local builder identity.
+        selected: ClaimIdentity,
+    },
+    /// The local guarded origin build committed more work. Renews the build's
+    /// stall bound and advertises the advance in a fresh claim renewal.
+    BuildProgressed {
         /// Exact build operation.
         op: BootstrapOperation,
         /// Exact selected local builder identity.
@@ -425,6 +439,9 @@ pub enum BootstrapEffect {
         /// Exact candidate identity.
         selected: ClaimIdentity,
     },
+    /// The followed builder's claim advertised new build progress. The runtime
+    /// renews the parent recovery's liveness budget; this is no read authority.
+    BuilderProgressed,
     /// A ready donor can be tried for a separate bounded transfer session.
     DonorAvailable {
         /// Exact follow operation.

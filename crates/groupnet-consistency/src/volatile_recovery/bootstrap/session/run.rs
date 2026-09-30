@@ -133,6 +133,17 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         if !self.accept(BootstrapEvent::Tick(self.now())) {
             return None;
         }
+        self.publish_scheduled(queued, due, check).await
+    }
+
+    /// Publish the claim and presence renewals queued after `queued`,
+    /// keeping every other effect queued in order.
+    async fn publish_scheduled(
+        &mut self,
+        queued: usize,
+        due: Instant,
+        check: RosterCheck,
+    ) -> Option<()> {
         let scheduled = self.effects.split_off(queued);
         for effect in scheduled {
             match effect {
@@ -171,6 +182,57 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             }
         }
         Some(())
+    }
+
+    /// Drive the local origin build while keeping its Building claim alive.
+    /// Claim and presence renewals publish on their cadence during the scan,
+    /// and each renewal turn converts progress the build reported on the
+    /// parent permit into `BuildProgressed`, which restarts the build's stall
+    /// bound and advertises the advance to followers. `None` once the stall
+    /// bound, the parent deadline, or a failed renewal ends the build first;
+    /// dropping the future stops it before any later publication.
+    async fn await_build<T>(
+        &mut self,
+        op: groupnet_core::volatile_bootstrap::BootstrapOperation,
+        selected: &ClaimIdentity,
+        permit: &PublicationPermit,
+        mut build: crate::volatile_recovery::BoxRecoveryFuture<'_, T>,
+    ) -> Option<T> {
+        let mut reported = permit.progress_reports()?;
+        loop {
+            let operation_due = self.operation_due(op, permit.deadline()?)?;
+            let wake = self
+                .engine
+                .next_deadline()
+                .and_then(|due| self.absolute(due))
+                .map_or(operation_due, |due| due.min(operation_due));
+            tokio::select! {
+                biased;
+                value = &mut build => return Some(value),
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
+            }
+            let queued = self.effects.len();
+            if let Some(progress) = permit.progress_reports()
+                && progress != reported
+            {
+                reported = progress;
+                // Applied before this turn's tick, so progress reported just
+                // before the stall bound still renews it. A refused report
+                // leaves the tick below to end the build.
+                let _ = self.accept(BootstrapEvent::BuildProgressed {
+                    op,
+                    selected: selected.clone(),
+                });
+            }
+            if !self.accept(BootstrapEvent::Tick(self.now())) {
+                return None;
+            }
+            self.publish_scheduled(queued, permit.deadline()?, RosterCheck::Acquisition)
+                .await?;
+            if self.engine.current_operation() != Some(op) {
+                return None;
+            }
+        }
     }
 
     async fn recapture_current(
@@ -247,9 +309,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         &mut self,
         recovery: RecoveryOperation,
         permit: PublicationPermit,
-        due: Instant,
     ) -> BootstrapOutcome {
-        if Instant::now() >= due || !permit.valid() {
+        if permit.deadline().is_none() {
             return BootstrapOutcome::Declined;
         }
         if self.engine.stage() == BootstrapStage::Cancelled && !self.reset_engine() {
@@ -263,12 +324,13 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         self.suspended_recovery = None;
         self.permit = Some(permit.clone());
         self.ready_guard = None;
-        self.due = Some(due);
         if !self.accept(BootstrapEvent::Tick(self.now())) || !self.accept(BootstrapEvent::Start) {
             return BootstrapOutcome::Declined;
         }
         loop {
-            if Instant::now() >= due || !permit.valid() {
+            // The parent's deadline is the permit's current one: it moves
+            // later while the selected build reports progress.
+            if permit.deadline().is_none() {
                 return BootstrapOutcome::Declined;
             }
             if !self.accept(BootstrapEvent::Tick(self.now())) {
@@ -278,9 +340,9 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             // before the next Tick; re-ticking after a no-op effect queues a
             // fresh `ArmTimer` forever and never yields to the runtime.
             while let Some(effect) = self.effects.pop_front() {
-                if Instant::now() >= due || !permit.valid() {
+                let Some(due) = permit.deadline() else {
                     return BootstrapOutcome::Declined;
-                }
+                };
                 if let Some(outcome) = self.execute_claim_effect(effect, due).await {
                     return outcome;
                 }
@@ -291,11 +353,12 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             ) {
                 return BootstrapOutcome::Declined;
             }
-            let Some(next) = self
-                .engine
-                .next_deadline()
-                .and_then(|time| self.absolute(time))
-            else {
+            let (Some(next), Some(due)) = (
+                self.engine
+                    .next_deadline()
+                    .and_then(|time| self.absolute(time)),
+                permit.deadline(),
+            ) else {
                 return BootstrapOutcome::Declined;
             };
             let wake = Arc::clone(&self.wake);
@@ -322,6 +385,13 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             BootstrapEffect::ArmTimer(_)
             | BootstrapEffect::CancelWork { .. }
             | BootstrapEffect::FollowBuilder { .. } => {}
+            BootstrapEffect::BuilderProgressed => {
+                // A followed build that keeps advancing keeps this follower's
+                // parent recovery alive past any fixed wait.
+                if let Some(permit) = &self.permit {
+                    permit.progress();
+                }
+            }
             BootstrapEffect::PublishClaim(claim) => {
                 let result = tokio::time::timeout_at(
                     tokio::time::Instant::from_std(due),
@@ -449,7 +519,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 }
             }
             BootstrapEffect::BuildOrigin { op, selected } => {
-                let operation_due = self.operation_due(op, due)?;
+                self.operation_due(op, due)?;
                 let members = if self.config.require_participation {
                     let Some(members) = self.acquisition_participation(due).await else {
                         return Some(BootstrapOutcome::Declined);
@@ -464,25 +534,23 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 let Some(permit) = self.permit.clone() else {
                     return Some(BootstrapOutcome::Declined);
                 };
-                let permit = permit.restricted_to(operation_due);
-                let built = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(operation_due),
-                    self.donor.build_local_capture(
-                        LocalCaptureRequest {
-                            recovery,
-                            build: op,
-                            selected: selected.clone(),
-                            members: members.clone(),
-                            permit: permit.clone(),
-                            clock: self.clock,
-                            wake: Arc::clone(&self.wake),
-                        },
-                        &self.admission,
-                    ),
-                )
-                .await;
+                let donor = Arc::clone(&self.donor);
+                let admission = self.admission.clone();
+                let scan = donor.build_local_capture(
+                    LocalCaptureRequest {
+                        recovery,
+                        build: op,
+                        selected: selected.clone(),
+                        members: members.clone(),
+                        permit: permit.clone(),
+                        clock: self.clock,
+                        wake: Arc::clone(&self.wake),
+                    },
+                    &admission,
+                );
+                let built = self.await_build(op, &selected, &permit, scan).await;
                 let _ = self.tick_after_io();
-                if let Ok(Ok(LocalCaptureOutcome::LocalOnly)) = &built {
+                if let Some(Ok(LocalCaptureOutcome::LocalOnly)) = &built {
                     if permit.valid()
                         && self.engine.current_operation() == Some(op)
                         && self.accept(BootstrapEvent::LocalOnlyBuilt {
@@ -495,7 +563,10 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     }
                     return Some(BootstrapOutcome::Declined);
                 }
-                if let Ok(Ok(LocalCaptureOutcome::Ready(capture))) = built {
+                if let Some(Ok(LocalCaptureOutcome::Ready(capture))) = built {
+                    // The build may have outlived the deadline sampled before
+                    // it; continue under the parent's renewed one.
+                    let due = permit.deadline().unwrap_or(due);
                     if permit.valid()
                         && self.engine.current_operation() == Some(op)
                         && capture.is_active()

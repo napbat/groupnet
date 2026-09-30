@@ -1,7 +1,7 @@
 //! In-memory driver checks for volatile coherence recovery.
 #![cfg(feature = "volatile-recovery")]
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,10 @@ struct MemoryAdapter {
     fail_first: AtomicBool,
     fail_all: AtomicBool,
     first_permit: Mutex<Option<PublicationPermit>>,
+    /// A paged scan: this many pages, each published after `page_ms`.
+    pages: AtomicUsize,
+    page_ms: AtomicU64,
+    report_progress: AtomicBool,
 }
 
 impl RecoveryAdapter for MemoryAdapter {
@@ -47,6 +51,20 @@ impl RecoveryAdapter for MemoryAdapter {
     ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
         Box::pin(async move {
             self.rebuilds.fetch_add(1, Ordering::SeqCst);
+            let pages = self.pages.load(Ordering::SeqCst);
+            if pages > 0 {
+                let page = Duration::from_millis(self.page_ms.load(Ordering::SeqCst));
+                for _ in 0..pages {
+                    tokio::time::sleep(page).await;
+                    permit
+                        .publish(|| self.published.fetch_add(1, Ordering::SeqCst))
+                        .ok_or(AdapterError)?;
+                    if self.report_progress.load(Ordering::SeqCst) {
+                        permit.progress();
+                    }
+                }
+                return Ok(());
+            }
             if self.fail_first.swap(false, Ordering::SeqCst) {
                 *self.first_permit.lock().unwrap() = Some(permit);
                 return Err(AdapterError);
@@ -120,6 +138,65 @@ async fn failed_full_scan_retries_and_old_page_cannot_publish() {
             .is_none()
     );
     assert_eq!(adapter.published.load(Ordering::SeqCst), 1);
+    handle.cancel().unwrap();
+}
+
+/// Forty 50 ms pages take two seconds, four times the 500 ms episode budget
+/// and twenty times the 100 ms attempt bound, yet the one scan completes: each
+/// committed page renews both bounds, so nothing restarts it from zero.
+#[tokio::test]
+async fn progressing_scan_outlives_attempt_and_episode_bounds_in_one_pass() {
+    let adapter = Arc::new(MemoryAdapter {
+        pages: AtomicUsize::new(40),
+        page_ms: AtomicU64::new(50),
+        report_progress: AtomicBool::new(true),
+        ..MemoryAdapter::default()
+    });
+    let started = Instant::now();
+    let handle = RecoveryHandle::open(
+        Arc::clone(&adapter),
+        config(),
+        RecoveryMode::Unleased,
+        NodeId::from("me"),
+        1,
+    )
+    .unwrap();
+    eventually_within("slow progressing scan affirmed", SETTLE * 3, || {
+        handle.status().may_serve
+    })
+    .await;
+    assert!(started.elapsed() > Duration::from_millis(config().total_ms));
+    assert_eq!(adapter.rebuilds.load(Ordering::SeqCst), 1, "one pass");
+    assert_eq!(adapter.published.load(Ordering::SeqCst), 40);
+    handle.cancel().unwrap();
+}
+
+/// The same scan without progress reports is a stall: its attempt expires,
+/// its permit stops publishing, and the core retries instead of waiting.
+#[tokio::test]
+async fn scan_without_progress_reports_is_failed_at_its_attempt_bound() {
+    let adapter = Arc::new(MemoryAdapter {
+        pages: AtomicUsize::new(40),
+        page_ms: AtomicU64::new(50),
+        ..MemoryAdapter::default()
+    });
+    let handle = RecoveryHandle::open(
+        Arc::clone(&adapter),
+        config(),
+        RecoveryMode::Unleased,
+        NodeId::from("me"),
+        1,
+    )
+    .unwrap();
+    eventually_within("stalled scan retried", SETTLE, || {
+        adapter.rebuilds.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    assert!(!handle.status().may_serve);
+    assert!(
+        adapter.published.load(Ordering::SeqCst) < 40,
+        "no attempt outlived its bound to finish the scan"
+    );
     handle.cancel().unwrap();
 }
 

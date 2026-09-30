@@ -59,6 +59,7 @@ fn claim(node: groupnet_core::NodeId) -> BootstrapClaim {
         },
         renewal: 1,
         phase: ClaimPhase::Willing,
+        progress: 0,
         remaining_ms: policy().claim_ttl_ms,
     }
 }

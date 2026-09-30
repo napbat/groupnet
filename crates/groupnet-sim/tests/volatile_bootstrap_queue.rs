@@ -187,6 +187,7 @@ fn enqueue_effects(
             | BootstrapEffect::PublishPresence(_)
             | BootstrapEffect::WithdrawPresence(_)
             | BootstrapEffect::FollowBuilder { .. }
+            | BootstrapEffect::BuilderProgressed
             | BootstrapEffect::ObserveSelectedClaim { .. }
             | BootstrapEffect::RecaptureCurrent { .. }
             | BootstrapEffect::Transfer(_) => {}

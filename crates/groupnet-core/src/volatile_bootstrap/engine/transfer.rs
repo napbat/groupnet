@@ -362,6 +362,7 @@ mod tests {
             ObservedRenewal {
                 sequence: 1,
                 phase: ClaimPhase::Ready,
+                progress: 0,
                 expires: Time(10),
             },
         );

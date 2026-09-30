@@ -61,6 +61,7 @@ fn claim(node: &str, boot: u128, session: u64, phase: ClaimPhase) -> BootstrapCl
         },
         renewal: 1,
         phase,
+        progress: 0,
         remaining_ms: 8,
     }
 }

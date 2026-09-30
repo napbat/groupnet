@@ -55,6 +55,7 @@ impl ClaimEngine {
         };
         self.generation = generation;
         self.local_renewal = 0;
+        self.local_progress = 0;
         self.stage = BootstrapStage::Building;
         self.observed.retain(|identity, _| identity.node != self.me);
         self.participant_roster = None;
@@ -379,6 +380,7 @@ mod tests {
                 },
                 renewal: 1,
                 phase: ClaimPhase::Willing,
+                progress: 0,
                 remaining_ms: 10,
             }],
         )
@@ -674,6 +676,7 @@ mod tests {
                 },
                 renewal: 1,
                 phase: ClaimPhase::Willing,
+                progress: 0,
                 remaining_ms: 10,
             });
             let (_, current) = engine
@@ -707,6 +710,7 @@ mod tests {
             },
             renewal: 1,
             phase: ClaimPhase::Willing,
+            progress: 0,
             remaining_ms: 10,
         });
         assert_eq!(
@@ -853,6 +857,7 @@ mod tests {
             identity: selected.clone(),
             renewal: 1,
             phase: ClaimPhase::Ready,
+            progress: 0,
             remaining_ms: 10,
         });
         let following = engine.step(BootstrapEvent::ParticipantsObserved {

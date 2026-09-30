@@ -90,12 +90,13 @@ pub enum BootstrapBindingError {
 /// core cleanup effects. Donor-only expiry withdraws availability without
 /// closing an otherwise healthy local read gate.
 pub trait BootstrapDriver: Send + 'static {
-    /// Begin one bounded acquisition with the original parent deadline.
+    /// Begin one bounded acquisition under the parent's permit. Its deadline
+    /// is the permit's current one, renewed while the acquisition reports
+    /// progress through [`PublicationPermit::progress`].
     fn acquire(
         &mut self,
         recovery: RecoveryOperation,
         permit: PublicationPermit,
-        due: Instant,
     ) -> BoxRecoveryFuture<'_, BootstrapOutcome>;
 
     /// Retire exact candidate work while keeping this process's scoped presence.

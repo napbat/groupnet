@@ -104,13 +104,26 @@ distinct completion receipts and every stage's correlation may not.
 ## Consumer cutover and evidence
 
 The full-origin path retries a failed invalidation or rebuild with a fresh
-operation token and a bounded poll delay under its **original** total
-deadline. An operation timeout follows the same rule. At total expiry it
-ends in `OriginOnly`; an explicit `Start` can begin another full rebuild.
+operation token and a bounded poll delay under the episode's total deadline.
+An operation timeout follows the same rule. At total expiry it ends in
+`OriginOnly`; an explicit `Start` can begin another full rebuild.
 The runtime's publication permit checks that exact token and generation,
-plus the operation's absolute deadline, on every page publication. A callback
+plus the operation's current deadline, on every page publication. A callback
 from a failed attempt cannot publish during its retry. The consumer must not
 recreate a separate scan-retry state machine.
+
+Rebuild liveness is progress-based, never a fixed bound that must exceed one
+bucket's scan time. After each committed page the adapter calls
+`PublicationPermit::progress`; the worker steps `RecoveryEvent::Progressed`
+for that exact operation, which restarts both `attempt_ms` (the operation's
+stall bound) and `total_ms` (the episode's budget) from that instant and moves
+the permit's deadline with them. A scan that keeps committing pages therefore
+runs to completion in one pass however long it takes; only a scan that
+commits nothing for `attempt_ms` fails and retries, and only an episode with
+no progress for `total_ms` ends in `OriginOnly`. A retry after a stall is a
+fresh scan from the first page; there is no resume cursor. Progress from a
+fenced operation (gap, lapse, cancel, expiry, or a newer token) is discarded
+by the permit and refused by the core, so it can never revive old work.
 
 The opt-in runtime is `groupnet-consistency/volatile-recovery` (facade feature
 `groupnet/consistency-volatile-recovery`). `RecoveryHandle::open` starts closed

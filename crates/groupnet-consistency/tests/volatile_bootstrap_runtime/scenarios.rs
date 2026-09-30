@@ -699,6 +699,7 @@ fn follower_setup_with_mode(
             identity: peer.clone(),
             renewal: 1,
             phase: groupnet_core::volatile_bootstrap::ClaimPhase::Ready,
+            progress: 0,
             remaining_ms: 500,
         }),
         ..Claims::default()
