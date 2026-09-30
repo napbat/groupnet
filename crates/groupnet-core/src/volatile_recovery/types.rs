@@ -95,6 +95,20 @@ pub struct Mark {
     pub sequence: u64,
 }
 
+/// A writer's restart that this observer crossed without a gap: its feed
+/// delivered the previous life through the writer's seal and then renewed
+/// the writer's cursor into `epoch`
+/// (`groupnet_consistency::PeerWrite::Renewed`). The old life ended at its
+/// seal, so an advertised head that moved from that life into `epoch` is a
+/// progression, not lost evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Renewal {
+    /// The previous life's delivered seal: the position after its last write.
+    pub sealed: Mark,
+    /// The life the observer crossed into; must be newer than `sealed`'s.
+    pub epoch: u64,
+}
+
 /// One bounded membership, lease, and advertised-head observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
@@ -115,6 +129,10 @@ pub struct Peer {
     /// the whole adapter operation, not be converted to `None`. This does not
     /// prove that no origin mutation committed before publication.
     pub head: Option<Mark>,
+    /// The observer's latest crossing of this writer's restarts, when it was a
+    /// sealed renewal into the writer's current life. Report `None` once any
+    /// later crossing of the same writer was a gap.
+    pub renewal: Option<Renewal>,
 }
 
 /// Exact operation correlation; no token is reused within an engine session.

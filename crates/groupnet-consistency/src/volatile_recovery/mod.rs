@@ -15,5 +15,5 @@ pub use shell::{
 
 pub use groupnet_core::volatile_recovery::{
     Mark, Peer, RecoveryConfig, RecoveryError, RecoveryFallback, RecoveryMode, RecoveryOperation,
-    RecoveryRearm, RecoveryStage,
+    RecoveryRearm, RecoveryStage, Renewal,
 };

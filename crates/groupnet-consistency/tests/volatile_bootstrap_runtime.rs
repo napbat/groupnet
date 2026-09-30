@@ -588,6 +588,7 @@ impl RecoveryAdapter for ReadAdapter {
                         old_nonlive: false,
                         grant: None,
                         head: None,
+                        renewal: None,
                     }],
                     None,
                 ));
@@ -612,6 +613,7 @@ impl RecoveryAdapter for ReadAdapter {
                         epoch: 1,
                         sequence: 1,
                     }),
+                    renewal: None,
                 }],
                 Some(mark),
             ))

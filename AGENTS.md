@@ -55,16 +55,19 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `tests/lease_dst.rs` ~948, `tests/replication.rs` ~944 and
    `tests/volatile_bootstrap_runtime/scenarios.rs` ~949 (new runtime
    scenarios go in their own `volatile_bootstrap_runtime/` children, as
-   `follower_progress.rs` does; the parent, ~709 since `PeerDonor` moved to
+   `follower_progress.rs` does; the parent, ~711 since `PeerDonor` moved to
    `peer_donor.rs`, keeps the shared fakes);
    `groupnet-runtime`'s `src/driver.rs` ~960 and `src/group.rs` ~960. The
    band under them, with ~60–150 lines of room: `groupnet-core`'s
-   `tests/election.rs` ~909, `src/volatile_bootstrap/engine.rs` ~907,
+   `src/volatile_recovery/tests.rs` ~930 (the next lapse-arm test goes in a
+   sibling file, as `tests_peer.rs` did), `tests/election.rs` ~909,
+   `src/volatile_bootstrap/transfer/tests.rs` ~904,
+   `src/volatile_bootstrap/engine.rs` ~907,
    `src/volatile_bootstrap/engine/participation.rs` ~883,
    `src/engine/election/mod.rs` ~873,
    `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861,
    `src/engine/election/quorum.rs` ~859 and
-   `src/volatile_recovery/engine.rs` ~853 (its fallback paths moved to
+   `src/volatile_recovery/engine.rs` ~878 (its fallback paths moved to
    `engine/fallback.rs`); `groupnet-sim`'s
    `tests/election_external_skew.rs` ~910, `tests/election_quorum.rs` ~896
    and `src/simulation.rs` ~894; `groupnet-consistency`'s
@@ -78,7 +81,7 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `tests/external_faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
    ~754 and `tests/external.rs` ~706; `groupnet-consistency`'s
    `src/hosted/writes/mod.rs` ~795, `src/hosted/handoff/stream.rs` ~775,
-   `tests/handoff_fence.rs` ~761, `src/hosted/lineage.rs` ~759,
+   `tests/handoff_fence.rs` ~761, `src/hosted/lineage.rs` ~800,
    `tests/handoff_migration.rs` ~757, `tests/hosted_migration.rs` ~752,
    `src/hosted/ledger.rs` ~725, `src/hosted/handoff/wire.rs` ~717 and
    `tests/handoff_resync.rs` ~702; `groupnet-sim/tests/election_external.rs`

@@ -22,6 +22,7 @@ fn peer(name: &str, grant: u64, head: u64, alive: bool) -> Peer {
         old_nonlive: false,
         grant: Some(mark(grant)),
         head: Some(mark(head)),
+        renewal: None,
     }
 }
 

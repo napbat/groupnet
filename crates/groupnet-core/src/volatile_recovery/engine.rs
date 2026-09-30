@@ -405,6 +405,9 @@ impl RecoveryEngine {
                 || peer.node.as_str().len() > self.config.max_member_bytes
                 || peer.grant.is_some_and(|mark| mark.sequence == 0)
                 || peer.head.is_some_and(|mark| mark.sequence == 0)
+                || peer.renewal.is_some_and(|renewal| {
+                    renewal.sealed.sequence == 0 || renewal.epoch <= renewal.sealed.epoch
+                })
                 || !unique.insert(&peer.node)
             {
                 return Err(RecoveryError::InvalidEvidence);
@@ -415,11 +418,12 @@ impl RecoveryEngine {
 
     fn record_known_heads(&mut self, peers: &[Peer]) -> Result<(), RecoveryError> {
         for peer in peers {
-            match (self.known_heads.get(&peer.node), peer.head) {
+            match (self.known_heads.get(&peer.node).copied(), peer.head) {
+                (Some(before), None) if crossed(before, peer) => {
+                    self.known_heads.remove(&peer.node);
+                }
                 (Some(_), None) => return Err(RecoveryError::InvalidEvidence),
-                (Some(before), Some(now))
-                    if now.epoch != before.epoch || now.sequence < before.sequence =>
-                {
+                (Some(before), Some(now)) if regressed(before, now) && !crossed(before, peer) => {
                     return Err(RecoveryError::InvalidEvidence);
                 }
                 (_, Some(now)) => {
@@ -516,9 +520,12 @@ impl RecoveryEngine {
             }
         }
         if recheck
-            && heads.iter().any(|(node, head)| {
-                self.heads.get(node).is_some_and(|before| {
-                    head.epoch != before.epoch || head.sequence < before.sequence
+            && peers.iter().any(|peer| {
+                self.heads.get(&peer.node).is_some_and(|before| {
+                    heads
+                        .get(&peer.node)
+                        .is_some_and(|head| regressed(*before, *head))
+                        && !crossed(*before, peer)
                 })
             })
         {
@@ -850,4 +857,22 @@ impl RecoveryEngine {
             }
         }
     }
+}
+
+/// A head that left its life or moved backwards within it: evidence the
+/// engine cannot account for unless the observer [`crossed`] a sealed renewal.
+fn regressed(before: Mark, now: Mark) -> bool {
+    now.epoch != before.epoch || now.sequence < before.sequence
+}
+
+/// The observer delivered the life `before` belongs to through its seal —
+/// which lies after `before`, so no write of that life is unaccounted for —
+/// and renewed into the life `peer` advertises now. Such a head change is a
+/// progression: the frontier barrier on the new head covers the rest.
+fn crossed(before: Mark, peer: &Peer) -> bool {
+    peer.renewal.is_some_and(|renewal| {
+        renewal.sealed.epoch == before.epoch
+            && renewal.sealed.sequence > before.sequence
+            && peer.head.is_none_or(|now| now.epoch == renewal.epoch)
+    })
 }

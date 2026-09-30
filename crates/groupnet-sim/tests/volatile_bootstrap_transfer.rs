@@ -1,4 +1,6 @@
-//! Queued donor transfer callbacks under seeded delay, duplication, and loss.
+//! Queued donor transfer callbacks under seeded delay, duplication, and loss,
+//! with the donor's native writer either continuing its life or sealing it
+//! and renewing into its next life between the barrier sample and delivery.
 
 use groupnet_core::volatile_bootstrap::journal::{
     AttachToken, BarrierReceipt, CaptureId, DeltaIdentity, DonorJournal, JournalConfig,
@@ -32,11 +34,26 @@ struct Fixture {
     reservation: Option<ReservationId>,
     barrier: Option<BarrierReceipt>,
     staged_image: Option<u8>,
-    staged_native_sequence: u64,
+    /// The follower's staged native position of writer `w`, epoch-major.
+    staged_native: (u64, u64),
     reference_image: Option<u8>,
     barrier_advances: usize,
     batches: usize,
     renewal: u64,
+    /// The writer seals and renews mid-transfer instead of writing once more.
+    renews: bool,
+}
+
+impl Fixture {
+    /// The journal position the advanced barrier reaches, and the writer's
+    /// cut there.
+    fn final_barrier(&self) -> (u64, (u64, u64)) {
+        if self.renews {
+            (5, (2, 1))
+        } else {
+            (3, (1, 2))
+        }
+    }
 }
 
 fn scope() -> BootstrapScope {
@@ -70,7 +87,7 @@ fn transfer_config() -> TransferConfig {
         max_chunks: 2,
         max_batch_bytes: 8,
         max_batch_events: 2,
-        max_replay_events: 4,
+        max_replay_events: 6,
         max_native_buffer_bytes: 8,
         max_members: 2,
         max_cuts: 1,
@@ -82,7 +99,7 @@ fn journal_config() -> JournalConfig {
     JournalConfig {
         max_encoded_bytes: 8,
         max_decoded_bytes: 8,
-        max_events: 4,
+        max_events: 6,
         max_suffix_bytes: 16,
         max_event_bytes: 4,
         max_identity_bytes: 2,
@@ -114,7 +131,7 @@ fn apply(image: &mut Option<u8>, effect: &[u8]) {
     clippy::too_many_lines,
     reason = "one fixture binds the claim selection, real donor capture, and exact source identities"
 )]
-fn start() -> (ClaimEngine, Fixture, Vec<BootstrapEffect>) {
+fn start(renews: bool) -> (ClaimEngine, Fixture, Vec<BootstrapEffect>) {
     let names = [NodeId::from("a"), NodeId::from("b")];
     let roster = names.iter().cloned().collect();
     let owner = placement::owner(&scope().placement_key(), &roster).unwrap();
@@ -254,11 +271,12 @@ fn start() -> (ClaimEngine, Fixture, Vec<BootstrapEffect>) {
             reservation: None,
             barrier: None,
             staged_image: None,
-            staged_native_sequence: 0,
+            staged_native: (1, 0),
             reference_image: Some(9),
             barrier_advances: 0,
             batches: 0,
             renewal: 2,
+            renews,
         },
         effects,
     )
@@ -328,10 +346,33 @@ fn reply(
             };
             assert_eq!(receipt.cursor.position, 2);
             fixture.barrier = Some(receipt.clone());
-            // The donor publishes after B was sampled but before B is delivered.
-            if fixture
-                .journal
-                .append(
+            // The donor's writer moves after B was sampled but before B is
+            // delivered: one more write, or a seal, its renewal into the
+            // next life, and that life's first write.
+            let moved = if fixture.renews {
+                let seal = NativeCut {
+                    writer: b"w".to_vec(),
+                    epoch: 1,
+                    sequence: 2,
+                };
+                fixture
+                    .journal
+                    .append(Time(now), 1, DeltaIdentity::Native(seal.clone()), vec![2])
+                    .and_then(|_| fixture.journal.renew(Time(now), 1, &seal, 2, vec![2]))
+                    .and_then(|_| {
+                        fixture.journal.append(
+                            Time(now),
+                            1,
+                            DeltaIdentity::Native(NativeCut {
+                                writer: b"w".to_vec(),
+                                epoch: 2,
+                                sequence: 1,
+                            }),
+                            vec![0],
+                        )
+                    })
+            } else {
+                fixture.journal.append(
                     Time(now),
                     1,
                     DeltaIdentity::Native(NativeCut {
@@ -341,8 +382,8 @@ fn reply(
                     }),
                     vec![0],
                 )
-                .is_err()
-            {
+            };
+            if moved.is_err() {
                 return Some(failed(op));
             }
             apply(&mut fixture.reference_image, &[0]);
@@ -357,7 +398,7 @@ fn reply(
             else {
                 return Some(failed(op));
             };
-            assert_eq!(receipt.cursor.position, 3);
+            assert_eq!(receipt.cursor.position, fixture.final_barrier().0);
             fixture.barrier = Some(receipt.clone());
             fixture.barrier_advances += 1;
             TransferEvent::BarrierReceived { op, receipt }
@@ -370,8 +411,16 @@ fn reply(
             let batch = batch.unwrap();
             for delta in &batch.deltas {
                 if let DeltaIdentity::Native(cut) = &delta.identity {
-                    assert_eq!(cut.sequence, fixture.staged_native_sequence + 1);
-                    fixture.staged_native_sequence = cut.sequence;
+                    let (epoch, sequence) = fixture.staged_native;
+                    // Each native delta continues its life by one, or a
+                    // sealed renewal opens the next life at zero.
+                    assert!(
+                        (cut.epoch, cut.sequence) == (epoch, sequence + 1)
+                            || (fixture.renews && cut.epoch > epoch && cut.sequence == 0),
+                        "native replay out of order: {cut:?} after {:?}",
+                        fixture.staged_native
+                    );
+                    fixture.staged_native = (cut.epoch, cut.sequence);
                 }
                 apply(&mut fixture.staged_image, &delta.effect);
             }
@@ -406,13 +455,17 @@ fn reply(
                 }
             );
             assert_eq!(
-                fixture.staged_native_sequence,
-                if receipt.cursor.position == 2 { 1 } else { 2 }
+                fixture.staged_native,
+                if receipt.cursor.position == 2 {
+                    (1, 1)
+                } else {
+                    fixture.final_barrier().1
+                }
             );
             if receipt.cursor.position == 2 {
                 TransferEvent::NativePending { op }
             } else {
-                assert_eq!(receipt.cursor.position, 3);
+                assert_eq!(receipt.cursor.position, fixture.final_barrier().0);
                 TransferEvent::NativeCovered {
                     op,
                     coverage: NativeCoverageReceipt {
@@ -428,9 +481,16 @@ fn reply(
         }
         TransferEffect::InstallCandidate { op, coverage } => {
             let receipt = coverage.barrier.clone();
-            assert_eq!(receipt.cursor.position, 3);
-            assert_eq!(receipt.covered_cuts[0].sequence, 2);
-            assert_eq!(fixture.staged_native_sequence, 2);
+            let (position, (epoch, sequence)) = fixture.final_barrier();
+            assert_eq!(receipt.cursor.position, position);
+            assert_eq!(
+                (
+                    receipt.covered_cuts[0].epoch,
+                    receipt.covered_cuts[0].sequence
+                ),
+                (epoch, sequence)
+            );
+            assert_eq!(fixture.staged_native, (epoch, sequence));
             assert_eq!(fixture.staged_image, fixture.reference_image);
             TransferEvent::Installed {
                 op,
@@ -568,8 +628,8 @@ fn enqueue(
     }
 }
 
-fn run(seed: u64, healthy: bool, coverage: &mut Coverage) {
-    let (mut engine, mut fixture, effects) = start();
+fn run(seed: u64, healthy: bool, renews: bool, coverage: &mut Coverage) {
+    let (mut engine, mut fixture, effects) = start(renews);
     assert_ne!(fixture.follower, fixture.donor);
     let mut rng = SplitMix64::new(seed);
     let mut queue = Vec::new();
@@ -662,15 +722,15 @@ fn run(seed: u64, healthy: bool, coverage: &mut Coverage) {
     }
 }
 
-#[test]
-fn queued_transfer_healthy_and_faulted_families_preserve_deadlines_and_cleanup() {
+fn transfer_families(renews: bool) {
     let mut healthy = Coverage::default();
     for seed in 1..=48 {
-        run(seed, true, &mut healthy);
+        run(seed, true, renews, &mut healthy);
     }
+    let batches = if renews { 5 } else { 3 };
     assert_eq!(healthy.completed, 48);
     assert_eq!(healthy.fallback, 0);
-    assert_eq!(healthy.complete_batches, 48 * 3);
+    assert_eq!(healthy.complete_batches, 48 * batches);
     assert_eq!(healthy.complete_barriers, 48);
     assert!(healthy.duplicated > 0);
     assert!(healthy.stale > 0);
@@ -678,7 +738,7 @@ fn queued_transfer_healthy_and_faulted_families_preserve_deadlines_and_cleanup()
 
     let mut faulty = Coverage::default();
     for seed in 49..=96 {
-        run(seed, false, &mut faulty);
+        run(seed, false, renews, &mut faulty);
     }
     assert!(faulty.dropped > 0);
     assert!(faulty.ack_drops > 0);
@@ -686,4 +746,18 @@ fn queued_transfer_healthy_and_faulted_families_preserve_deadlines_and_cleanup()
     assert!(faulty.cleanup > 0);
     assert!(faulty.fallback > 0);
     assert!(faulty.restarts > 0);
+}
+
+#[test]
+fn queued_transfer_healthy_and_faulted_families_preserve_deadlines_and_cleanup() {
+    transfer_families(false);
+}
+
+/// A writer that seals and renews into its next life while a transfer is in
+/// flight is followed across the restart: every healthy run installs at the
+/// new life's cut with no fallback, and faulted runs still end installed or
+/// on the origin with their stage discarded.
+#[test]
+fn queued_transfer_follows_a_sealed_renewal_in_the_middle_of_the_transfer() {
+    transfer_families(true);
 }

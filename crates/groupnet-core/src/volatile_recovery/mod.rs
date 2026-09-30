@@ -10,6 +10,7 @@ pub use engine::RecoveryEngine;
 pub use types::{
     Mark, Peer, RecoveryConfig, RecoveryEffect, RecoveryError, RecoveryEvent, RecoveryFallback,
     RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState, RecoveryStep,
+    Renewal,
 };
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ fn peer(sequence: u64) -> Peer {
             epoch: 1,
             sequence: 1,
         }),
+        renewal: None,
     }
 }
 

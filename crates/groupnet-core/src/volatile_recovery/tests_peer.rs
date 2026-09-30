@@ -152,6 +152,7 @@ fn quiet_peer() -> Peer {
         old_nonlive: false,
         grant: None,
         head: None,
+        renewal: None,
     }
 }
 
@@ -166,6 +167,7 @@ fn renewing_peer(sequence: u64) -> Peer {
             epoch: 1,
             sequence: 1,
         }),
+        renewal: None,
     }
 }
 

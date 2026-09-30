@@ -52,6 +52,7 @@ fn peer(name: &str, grant: u64, head: u64) -> Peer {
             epoch: 1,
             sequence: head,
         }),
+        renewal: None,
     }
 }
 
@@ -647,6 +648,142 @@ fn previously_advertised_head_cannot_disappear_into_empty_feed() {
         }
     )));
     assert!(!recovery.state().recovered);
+}
+
+/// Drives a lapse arm to its first recheck with `a` advertising `(1, 3)`,
+/// then reports `restarted` for it and returns the step.
+fn lapse_recheck_after(recovery: &mut RecoveryEngine, restarted: Peer) -> RecoveryStep {
+    full_ready(recovery);
+    let lapse = recovery.step(RecoveryEvent::LeaseLapse { count: 1 });
+    let initial = recovery.step(RecoveryEvent::Invalidated {
+        op: operation(&lapse),
+    });
+    let renewal = recovery.step(RecoveryEvent::PeersObserved {
+        op: operation(&initial),
+        peers: vec![peer("a", 1, 3)],
+        confirmed: confirmed(1),
+    });
+    recovery.step(RecoveryEvent::PeersObserved {
+        op: operation(&renewal),
+        peers: vec![peer("a", 2, 3)],
+        confirmed: confirmed(2),
+    });
+    let sample = recovery.step(RecoveryEvent::Tick(Time(5)));
+    let wait = recovery.step(RecoveryEvent::PeersObserved {
+        op: operation(&sample),
+        peers: vec![peer("a", 2, 3)],
+        confirmed: confirmed(2),
+    });
+    let recheck = recovery.step(RecoveryEvent::FrontiersReached {
+        op: operation(&wait),
+    });
+    recovery.step(RecoveryEvent::PeersObserved {
+        op: operation(&recheck),
+        peers: vec![restarted],
+        confirmed: confirmed(2),
+    })
+}
+
+fn restarted(renewal: Option<Renewal>) -> Peer {
+    let mut restarted = peer("a", 2, 1);
+    restarted.head = Some(Mark {
+        epoch: 2,
+        sequence: 1,
+    });
+    restarted.renewal = renewal;
+    restarted
+}
+
+fn sealed_at(sequence: u64) -> Renewal {
+    Renewal {
+        sealed: Mark { epoch: 1, sequence },
+        epoch: 2,
+    }
+}
+
+fn distrusts(step: &RecoveryStep) -> bool {
+    step.effects.iter().any(|effect| {
+        matches!(
+            effect,
+            RecoveryEffect::Invalidate {
+                distrust_bodies: true,
+                ..
+            }
+        )
+    })
+}
+
+#[test]
+fn a_lapse_barrier_follows_a_delivered_seal_into_the_writers_next_life() {
+    let mut recovery = engine();
+    let next = lapse_recheck_after(&mut recovery, restarted(Some(sealed_at(4))));
+    assert!(!distrusts(&next), "a delivered seal is not lost evidence");
+    let new_head = Mark {
+        epoch: 2,
+        sequence: 1,
+    };
+    assert!(next.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::WaitFrontiers { heads, .. } if heads == &vec![(NodeId::from("a"), new_head)]
+    )));
+    let recheck = recovery.step(RecoveryEvent::FrontiersReached {
+        op: operation(&next),
+    });
+    let affirm = recovery.step(RecoveryEvent::PeersObserved {
+        op: operation(&recheck),
+        peers: vec![restarted(Some(sealed_at(4)))],
+        confirmed: confirmed(2),
+    });
+    recovery.step(RecoveryEvent::Affirmed {
+        op: operation(&affirm),
+        accepted: true,
+    });
+    assert!(recovery.state().recovered);
+}
+
+#[test]
+fn a_sealed_writer_that_restarts_with_nothing_written_yet_still_affirms() {
+    let mut recovery = engine();
+    let mut announced = restarted(Some(sealed_at(4)));
+    announced.head = None;
+    let next = lapse_recheck_after(&mut recovery, announced.clone());
+    assert!(!distrusts(&next));
+    let recheck = recovery.step(RecoveryEvent::FrontiersReached {
+        op: operation(&next),
+    });
+    let affirm = recovery.step(RecoveryEvent::PeersObserved {
+        op: operation(&recheck),
+        peers: vec![announced],
+        confirmed: confirmed(2),
+    });
+    recovery.step(RecoveryEvent::Affirmed {
+        op: operation(&affirm),
+        accepted: true,
+    });
+    assert!(recovery.state().recovered);
+}
+
+#[test]
+fn a_restart_without_a_covering_delivered_seal_still_falls_back() {
+    for (case, renewal) in [
+        ("no seal was delivered", None),
+        ("the seal precedes the sampled head", Some(sealed_at(3))),
+        (
+            "the renewal is into another life",
+            Some(Renewal {
+                sealed: Mark {
+                    epoch: 1,
+                    sequence: 4,
+                },
+                epoch: 3,
+            }),
+        ),
+    ] {
+        let mut recovery = engine();
+        let next = lapse_recheck_after(&mut recovery, restarted(renewal));
+        assert!(distrusts(&next), "{case}");
+        assert!(!recovery.state().recovered, "{case}");
+    }
 }
 
 #[test]

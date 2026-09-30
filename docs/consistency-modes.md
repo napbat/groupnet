@@ -159,6 +159,54 @@ Per-writer sequenced feeds with explicit `Gap` on loss/restart; `Frontier`
 barriers where "reached" means *applied*, not delivered. Adds read-your-writes,
 monotonic reads, per-writer order, detected-never-silent loss. Still AP/EL.
 
+#### Sealed restarts: the one restart that is not a gap
+
+A writer restart is a `Gap` because the dead life's unknown tail — writes the
+origin took that no peer applied — cannot be known without the origin. A
+planned stop can prove that tail empty, and `WriteFeed::seal` is how it says
+so. The contract, as built:
+
+* **The promise.** `seal()` marks the feed life ended at the position after its
+  last write and resolves to that token. It promises that this life publishes
+  nothing more; `publish` after a seal panics, and sealing again resolves to
+  the same token. Seal only once every write the application made durable has
+  been published through the feed — a durable write that bypassed the feed is
+  exactly the loss the restart gap covers, and a seal would hide it.
+* **Observation.** A subscriber that has delivered every write of the life
+  delivers `PeerWrite::Sealed { peer, token }` and acknowledges it like a
+  write, so the writer can wait (`applied_by_selected`, `applied_cluster_wide`)
+  until its peers have observed the seal before it exits.
+* **Crossing.** A subscriber that delivered the seal and then sees the next
+  life's frame with its first write still visible (`first_seq == 1`) delivers
+  `PeerWrite::Renewed { peer, sealed, epoch }`: advance the frontier to
+  `(epoch, 0)` and remediate nothing.
+* **Everything else still gaps.** No seal (a crash, a drain that timed out); a
+  seal this subscriber never saw (its frame was replaced by the next life's
+  first); a late seal (an old-epoch frame after the new life is known is
+  ignored); or a new life whose first writes already left its ring. Each is
+  `PeerWrite::Gap` through the new life's head, which is always safe.
+* **Wire.** The feed frame carries a trailing sealed flag. Old and new decoders
+  reject each other's frames, so a cluster upgrades together.
+* **Announcement.** A restarted writer should `republish()` at start: its new
+  epoch then reaches subscribers immediately, so an unsealed restart gaps at
+  once instead of at the new life's first write.
+
+Two consumers of the crossing sit outside the feed and honor it the same way:
+
+* **Peer bootstrap journal.** `DonorJournal::renew(sealed, epoch)` records the
+  crossing only from exactly the covered cut (the seal position appended as a
+  native no-op). The covered cut moves to `(epoch, 0)` and a follower replaying
+  the suffix crosses with it. Any other move into a newer epoch withdraws the
+  candidate. Native cuts order epoch-major, so a barrier sampled before the
+  crossing is `Pending` against the live index, never a conflict.
+* **Volatile recovery.** A head barrier (the lease-lapse arm and the peer
+  baseline's rechecks) treats a head that left its life as lost evidence and
+  falls back — unless the observer reports `Peer::renewal`: it delivered that
+  life's seal at a position after the sampled head and renewed into the life
+  the head now names. Then the move is a progression and the barrier simply
+  waits for the new head. A renewal the observer did not deliver, a seal that
+  precedes the sampled head, or a renewal into another life all still fall back.
+
 ### T2 — Write-coherence tier (`consistency-acks` feature; today)
 
 Applied-watermark ledgers; `applied_cluster_wide` waits on every member the
