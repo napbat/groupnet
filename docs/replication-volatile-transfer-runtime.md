@@ -97,7 +97,12 @@ private state under that lock. The pre-reserved journal accepts later index
 effects during off-lock blocking encoding, but serves no follower RPC or
 `Ready` claim before `finish_capture` revalidates the exact ingress and
 original deadline. Cancelled blocking work retains its real buffer permits
-through completion. Every
+through completion. The journal refuses time that runs backwards, and both
+the worker and the application's publication path drive it, so every journal
+time — at C, on each journaled effect, and at `finish_capture` — comes from
+the session's one `LogicalClock`, handed to the application in its capture
+request. A second clock, even one sampling the same instant, can round a step
+ahead and fail the capture. Every
 subsequent actual index effect, including origin-validated repair, native
 no-op, and tombstone, enters the same guarded journal. A source gap, lapse,
 rebuild, changed complete membership identity, or budget overflow invalidates

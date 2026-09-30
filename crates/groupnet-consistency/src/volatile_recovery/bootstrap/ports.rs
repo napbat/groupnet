@@ -4,7 +4,7 @@
 //! schedule claim retries or extend the parent recovery episode themselves.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -431,6 +431,42 @@ pub struct TransferContext {
     pub follower: ClaimIdentity,
 }
 
+/// The one logical clock of a bootstrap session: whole milliseconds since the
+/// session started, rounded down, never decreasing.
+///
+/// A [`DonorJournal`] rejects time that runs backwards, and both the worker and
+/// the application's index publication path drive the same journal. Two clocks,
+/// even two sampling the same instant, can disagree by a rounding step and fail
+/// the capture; the application therefore takes every journal time — at
+/// `begin_capture`, on each journaled effect, and at `finish_capture` — from the
+/// clock in its capture request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogicalClock {
+    started: Instant,
+}
+
+impl LogicalClock {
+    /// A clock whose zero is now.
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+
+    /// Current logical time. Saturates rather than wrapping.
+    #[must_use]
+    pub fn now(&self) -> Time {
+        Time(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// The wall instant a logical deadline falls on, if representable.
+    #[must_use]
+    pub fn absolute(&self, due: Time) -> Option<Instant> {
+        self.started.checked_add(Duration::from_millis(due.0))
+    }
+}
+
 /// Exact locally selected builder and its guarded capture budget.
 #[derive(Clone, Debug)]
 pub struct LocalCaptureRequest {
@@ -444,8 +480,8 @@ pub struct LocalCaptureRequest {
     pub members: Vec<BootstrapMemberIdentity>,
     /// Publication permission narrowed to the child operation deadline.
     pub permit: PublicationPermit,
-    /// Current logical time supplied by the worker.
-    pub now: Time,
+    /// The session clock the capture's journal must be driven by.
+    pub clock: LogicalClock,
     /// Shared worker wake for synchronous journal invalidation.
     pub wake: Arc<Notify>,
 }
@@ -468,8 +504,8 @@ pub struct ReadyCaptureRequest {
     pub guard: ReadyCapturePermit,
     /// Original finite recapture deadline.
     pub deadline: Instant,
-    /// Current core logical time.
-    pub now: Time,
+    /// The session clock the capture's journal must be driven by.
+    pub clock: LogicalClock,
     /// Existing recovery worker wake for journal invalidation.
     pub wake: Arc<Notify>,
 }

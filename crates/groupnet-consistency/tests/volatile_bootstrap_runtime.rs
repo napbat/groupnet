@@ -347,7 +347,7 @@ impl DonorPort for OriginDonor {
                 recovery,
                 selected,
                 permit,
-                now,
+                clock,
                 wake,
                 ..
             } = request;
@@ -381,7 +381,13 @@ impl DonorPort for OriginDonor {
             )
             .map_err(|_| AdapterError)?;
             journal
-                .begin_capture(now, 1, 1, vec![member_from_claim(&selected)], Vec::new())
+                .begin_capture(
+                    clock.now(),
+                    1,
+                    1,
+                    vec![member_from_claim(&selected)],
+                    Vec::new(),
+                )
                 .map_err(|_| AdapterError)?;
             if self.pause.load(Ordering::SeqCst) {
                 *self.latest_permit.lock().unwrap() = Some(permit.clone());
@@ -395,7 +401,7 @@ impl DonorPort for OriginDonor {
                 return Ok(LocalCaptureOutcome::LocalOnly);
             }
             journal
-                .finish_capture(now, 1, 1)
+                .finish_capture(clock.now(), 1, 1)
                 .map_err(|_| AdapterError)?;
             let ingress = JournalIngress::new(journal, suffix, wake)?;
             *self.ingress.lock().unwrap() = Some(ingress.clone());
@@ -449,14 +455,14 @@ impl DonorPort for OriginDonor {
                     )
                     .map_err(|_| AdapterError)?;
                     journal
-                        .begin_capture(request.now, 1, 1, request.members, Vec::new())
+                        .begin_capture(request.clock.now(), 1, 1, request.members, Vec::new())
                         .map_err(|_| AdapterError)?;
                     Ok(journal)
                 })
                 .ok_or(AdapterError)??;
             let mut journal = journal;
             journal
-                .finish_capture(request.now, 1, 1)
+                .finish_capture(request.clock.now(), 1, 1)
                 .map_err(|_| AdapterError)?;
             let ingress = JournalIngress::new(journal, suffix, request.wake)?;
             *self.ingress.lock().unwrap() = Some(ingress.clone());

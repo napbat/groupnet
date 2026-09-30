@@ -8,7 +8,9 @@ use groupnet_consistency::volatile_recovery::bootstrap::bulk_adapter::{
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
     BulkLimits, PhaseLimits, WireLimits,
 };
-use groupnet_consistency::volatile_recovery::bootstrap::ports::ReadyCaptureRequest;
+use groupnet_consistency::volatile_recovery::bootstrap::ports::{
+    LogicalClock, ReadyCaptureRequest,
+};
 use groupnet_core::volatile_bootstrap::journal::{AttachToken, JournalBatch};
 use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_mem::MemBulkNet;
@@ -67,14 +69,14 @@ impl BootstrapStatePort for RecaptureState {
                     )
                     .map_err(|_| AdapterError)?;
                     journal
-                        .begin_capture(request.now, 1, 1, request.members, Vec::new())
+                        .begin_capture(request.clock.now(), 1, 1, request.members, Vec::new())
                         .map_err(|_| AdapterError)?;
                     self.captures.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, AdapterError>(journal)
                 })
                 .ok_or(AdapterError)??;
             journal
-                .finish_capture(request.now, 1, 1)
+                .finish_capture(request.clock.now(), 1, 1)
                 .map_err(|_| AdapterError)?;
             let ingress = JournalIngress::new(journal, suffix, request.wake)?;
             DonorCapture::new(vec![42], ingress, encoded, decoded)
@@ -215,7 +217,7 @@ async fn bulk_port_recaptures_only_a_real_ready_generation() {
         members: vec![member_from_claim(&selected)],
         guard: guard.clone(),
         deadline,
-        now: Time(1),
+        clock: LogicalClock::start(),
         wake: Arc::new(Notify::new()),
     };
     let capture = port

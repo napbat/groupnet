@@ -18,7 +18,7 @@ use super::driver::{AcquisitionBinding, BootstrapDriver, BootstrapOutcome};
 use super::inbox::{DonorInbox, DonorInboxError, DonorSender};
 use super::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSource, DonorCapture, DonorPort,
-    TransferContext, TransferResources,
+    LogicalClock, TransferContext, TransferResources,
 };
 use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit};
 
@@ -68,7 +68,7 @@ pub struct BootstrapSession<C: ClaimSource, D: DonorPort> {
     boot: BootId,
     session: u64,
     engine: ClaimEngine,
-    started: Instant,
+    clock: LogicalClock,
     effects: VecDeque<BootstrapEffect>,
     inbox: DonorInbox,
     wake: Arc<Notify>,
@@ -151,11 +151,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         let (sender, inbox) =
             DonorInbox::new(config.donor_inbox_capacity).map_err(BootstrapSessionError::Inbox)?;
         let wake = inbox.wake();
-        let started = Instant::now();
-        if started
-            .checked_add(Duration::from_millis(config.claim.total_ms))
-            .is_none()
-        {
+        let clock = LogicalClock::start();
+        if clock.absolute(Time(config.claim.total_ms)).is_none() {
             return Err(BootstrapSessionError::ClockRange);
         }
         Ok((
@@ -169,7 +166,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 boot,
                 session,
                 engine,
-                started,
+                clock,
                 effects: VecDeque::new(),
                 inbox,
                 wake,
@@ -189,11 +186,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
     }
 
     fn now(&self) -> Time {
-        Time(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))
+        self.clock.now()
     }
 
     fn absolute(&self, due: Time) -> Option<Instant> {
-        self.started.checked_add(Duration::from_millis(due.0))
+        self.clock.absolute(due)
     }
 
     fn operation_due(&self, op: BootstrapOperation, outer: Instant) -> Option<Instant> {
