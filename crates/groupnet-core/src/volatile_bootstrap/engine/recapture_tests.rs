@@ -5,7 +5,8 @@
 //! suspected peer change member incarnation and status between the two, with
 //! every presence unchanged: the capture must still complete. A failed
 //! attempt is retried only after a doubling backoff, and only inside the
-//! claim window unless the membership changes.
+//! claim window unless the membership changes. A Ready capture retired before
+//! it has stayed Ready for a claim window is such a failed attempt.
 
 use super::*;
 use crate::Status;
@@ -318,25 +319,151 @@ fn failed_recaptures_back_off_inside_the_claim_window() {
     );
 }
 
-/// A recapture that succeeds after failures clears the backoff: a later
-/// retirement of that Ready capture is recaptured without waiting.
-#[test]
-fn a_ready_capture_clears_the_backoff() {
-    let mut donor = Donor::pending();
-    let first = donor.start().unwrap();
-    let _ = donor.fail(first);
-    assert!(!donor.engine.ready_recapture_due());
-    let _ = donor.advance(CONFIG.observe_ms);
-    assert!(donor.engine.ready_recapture_due());
-    let op = donor.start().unwrap();
+/// Build a Ready capture for the running recapture `op`.
+fn build(donor: &mut Donor, op: BootstrapOperation) -> Vec<BootstrapEffect> {
     let selected = donor.engine.selected().unwrap().clone();
     let built = donor.engine.step(BootstrapEvent::Built { op, selected });
     assert_eq!(built.rejection, None);
+    built.effects
+}
+
+/// Retire the Ready capture, as a lapse or an expiry does.
+fn retire(donor: &mut Donor) -> Vec<BootstrapEffect> {
     let selected = donor.engine.selected().unwrap().clone();
     let retired = donor
         .engine
         .step(BootstrapEvent::CaptureRetired { selected });
     assert_eq!(retired.rejection, None);
+    retired.effects
+}
+
+/// Every capture stalls the node past its lease, so each Ready capture is
+/// retired by a lapse moments after it is built. Each retirement supersedes
+/// the Ready claim with a Building one for a fresh window, so a joiner waits
+/// through the lapse, but each such capture is also a failed attempt: retries
+/// back off as failures do, and once the backoffs add up to a claim window
+/// the unchanged membership starts nothing more, however long the node runs.
+/// The last window then runs out. A restarted peer still starts one attempt,
+/// with the backoff carried on, and a lapse of that capture starts nothing.
+#[test]
+fn a_capture_that_costs_its_own_lapse_cannot_cycle() {
+    let mut donor = Donor::pending();
+    let mut starts = Vec::new();
+    let mut last_retired = 0;
+    let mut withdrawn = None;
+    let limit = donor.now + 6 * CONFIG.donor_wait_ms;
+    while donor.now < limit {
+        if donor.engine.ready_recapture_due()
+            && let Some(op) = donor.start()
+        {
+            assert_eq!(withdrawn, None, "{starts:?}");
+            starts.push(donor.now);
+            let _ = donor.advance(1);
+            assert!(publishes(&build(&mut donor, op)), "the capture goes Ready");
+            let _ = donor.advance(2);
+            let retired = retire(&mut donor);
+            assert!(
+                retired.iter().any(|effect| matches!(
+                    effect,
+                    BootstrapEffect::PublishClaim(claim) if claim.phase == ClaimPhase::Building
+                )),
+                "a Building claim keeps a joiner waiting through the lapse"
+            );
+            last_retired = donor.now;
+        }
+        let effects = donor.advance(1);
+        if withdraws(&effects) {
+            withdrawn.get_or_insert(donor.now);
+        }
+        if withdrawn.is_some() {
+            assert!(!publishes(&effects), "a withdrawn claim stays withdrawn");
+        }
+    }
+    let gaps: Vec<_> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    for (failures, gap) in (1_u32..).zip(&gaps) {
+        let backoff = (CONFIG.observe_ms << (failures - 1)).min(CONFIG.donor_wait_ms / 4);
+        assert!(
+            *gap > backoff,
+            "retry {failures} after {gap} ms: {starts:?}"
+        );
+    }
+    // Backoffs of 2, 4, 8, 10 and 10 ms stay under the 40 ms window; the
+    // sixth failure's 10 ms reaches it.
+    assert_eq!(starts.len(), 6, "{starts:?}");
+    assert_eq!(
+        withdrawn,
+        Some(last_retired + CONFIG.donor_wait_ms),
+        "the last lapse's claim window runs out"
+    );
+    assert!(
+        donor.engine.ready_recapture_pending(),
+        "the image still awaits one"
+    );
+
+    donor.peer_boot += 1;
+    let limit = donor.now + CONFIG.donor_wait_ms;
+    let mut after = None;
+    while after.is_none() && donor.now < limit {
+        let _ = donor.advance(1);
+        if donor.engine.ready_recapture_due() {
+            after = donor.start();
+        }
+    }
+    let op = after.expect("a membership change retries");
+    let _ = build(&mut donor, op);
+    let _ = retire(&mut donor);
+    assert!(
+        donor.engine.recapture_retry_due.unwrap().0 >= donor.now + CONFIG.donor_wait_ms / 4,
+        "the backoff carries on across the membership change"
+    );
+    let limit = donor.now + CONFIG.donor_wait_ms;
+    while donor.now < limit {
+        let _ = donor.advance(1);
+        if donor.engine.ready_recapture_due() {
+            assert_eq!(
+                donor.start(),
+                None,
+                "an unchanged membership retries nothing"
+            );
+        }
+    }
+}
+
+/// A capture that stays Ready for a whole claim window proves the attempts
+/// behind it: its retirement is recaptured without waiting, and the next
+/// failure backs off from one observation interval again. One retired a
+/// millisecond sooner failed instead.
+#[test]
+fn a_capture_that_survives_its_claim_window_clears_the_backoff() {
+    let mut short = Donor::pending();
+    let op = short.start().unwrap();
+    let _ = build(&mut short, op);
+    let _ = short.advance(CONFIG.donor_wait_ms - 1);
+    let _ = retire(&mut short);
+    assert!(
+        !short.engine.ready_recapture_due(),
+        "retired one millisecond short of its window, the capture failed"
+    );
+    assert_eq!(short.engine.recapture_failures, 1);
+
+    let mut donor = Donor::pending();
+    let first = donor.start().unwrap();
+    let _ = donor.fail(first);
+    let _ = donor.advance(CONFIG.observe_ms);
+    let second = donor.start().unwrap();
+    let _ = donor.fail(second);
+    let _ = donor.advance(2 * CONFIG.observe_ms);
+    let op = donor.start().unwrap();
+    let _ = build(&mut donor, op);
+    let _ = donor.advance(CONFIG.donor_wait_ms);
+    let retired = retire(&mut donor);
+    assert!(publishes(&retired), "a Building claim for the next attempt");
     assert!(donor.engine.ready_recapture_due());
-    assert!(donor.start().is_some());
+    let op = donor.start().expect("recaptured without waiting");
+    let _ = donor.fail(op);
+    assert_eq!(
+        donor.engine.recapture_retry_due,
+        Some(Time(donor.now + CONFIG.observe_ms)),
+        "the backoff starts over"
+    );
 }

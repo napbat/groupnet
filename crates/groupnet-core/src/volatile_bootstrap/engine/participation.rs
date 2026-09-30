@@ -497,6 +497,8 @@ mod tests {
                 .rejection
                 .is_none()
         );
+        // The joiner arrives after the capture has been Ready a claim window.
+        let _ = engine.step(BootstrapEvent::Tick(Time(7)));
         let retired = engine.step(BootstrapEvent::CaptureRetired {
             selected: old.clone(),
         });

@@ -210,6 +210,8 @@ fn ready_then_retired() -> (ClaimEngine, BootstrapParticipant, ClaimIdentity) {
             .rejection
             .is_none()
     );
+    // The joiner arrives after the capture has been Ready a claim window.
+    let _ = engine.step(BootstrapEvent::Tick(Time(7)));
     let retired = engine.step(BootstrapEvent::CaptureRetired {
         selected: old.clone(),
     });
@@ -268,7 +270,7 @@ fn retired_ready_waits_for_complete_join_then_recaptures_once() {
             assert!(engine.ready_recapture_pending());
             incomplete_cuts += 1;
         }
-        let _ = engine.step(BootstrapEvent::Tick(Time(3 + u64::from(rng.below(2)))));
+        let _ = engine.step(BootstrapEvent::Tick(Time(8 + u64::from(rng.below(2)))));
         let op = engine.begin_roster_observation().unwrap();
         assert_eq!(
             engine.verify_participant_roster(op, &members, &roster, &[me, peer], &[]),

@@ -56,13 +56,14 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `groupnet-runtime`'s `src/driver.rs` ~960 and `src/group.rs` ~960. The
    band under them, with ~60–150 lines of room: `groupnet-core`'s
    `src/volatile_recovery/engine.rs` ~939, `tests/election.rs` ~909,
-   `src/volatile_bootstrap/engine.rs` ~882, `src/engine/election/mod.rs` ~873,
-   `src/volatile_bootstrap/engine/participation.rs` ~869,
+   `src/volatile_bootstrap/engine.rs` ~906,
+   `src/volatile_bootstrap/engine/participation.rs` ~883,
+   `src/engine/election/mod.rs` ~873,
    `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861 and
    `src/engine/election/quorum.rs` ~859; `groupnet-sim`'s
    `tests/election_external_skew.rs` ~910, `tests/election_quorum.rs` ~896
    and `src/simulation.rs` ~894; `groupnet-consistency`'s
-   `tests/volatile_bootstrap_runtime/scenarios.rs` ~923 (new runtime
+   `tests/volatile_bootstrap_runtime/scenarios.rs` ~926 (new runtime
    scenarios go in their own `volatile_bootstrap_runtime/` children; the
    parent, ~698 since `PeerDonor` moved to `peer_donor.rs`, keeps the shared
    fakes), `src/replication/shell.rs` ~914, `src/lease/shell.rs` ~889,
@@ -74,12 +75,12 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    With room still: `groupnet-runtime`'s `src/node.rs` ~803,
    `tests/external_faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
    ~754 and `tests/external.rs` ~706; `groupnet-consistency`'s
-   `src/hosted/writes/mod.rs` ~794, `src/hosted/handoff/stream.rs` ~782,
+   `src/hosted/writes/mod.rs` ~795, `src/hosted/handoff/stream.rs` ~775,
    `tests/handoff_fence.rs` ~761, `src/hosted/lineage.rs` ~759,
    `tests/handoff_migration.rs` ~757, `tests/hosted_migration.rs` ~752,
-   `src/hosted/ledger.rs` ~725, `src/hosted/handoff/wire.rs` ~720 and
+   `src/hosted/ledger.rs` ~725, `src/hosted/handoff/wire.rs` ~717 and
    `tests/handoff_resync.rs` ~702; `groupnet-sim/tests/election_external.rs`
-   ~786; `groupnet-core`'s `tests/state.rs` ~774 and `src/wire/mod.rs` ~705.
+   ~786; `groupnet-core`'s `tests/state.rs` ~774 and `src/wire/mod.rs` ~701.
    `simulation.rs` has now absorbed three subsystems' event kinds —
    **the next addition to it splits the probe/liveness dispatch out** rather
    than growing it again.) Four splits worth copying:

@@ -8,22 +8,75 @@
 //! claim is renewed for at most the builder's own stall bound from when the
 //! image became pending; a failed attempt does not extend that window.
 //!
-//! Attempts are paced. Each clones and encodes the whole index, which on a
-//! loaded one-CPU node costs a CPU for a second or more and can itself make
-//! the membership layer suspect this node. A failed attempt is retried only
-//! after a backoff: one observation interval, doubling, capped at a quarter
-//! of the stall bound. Inside the claim window the retry runs under any
-//! complete cut; after it, only under a cut binding a different membership,
-//! and that attempt opens a fresh window for the member that changed it.
+//! Attempts are paced. Each captures the whole index, which on a loaded
+//! one-CPU node can itself make the membership layer suspect this node or
+//! lapse its lease. A failed attempt is retried only after a backoff: one
+//! observation interval, doubling, capped at a quarter of the stall bound.
+//! Inside the claim window the retry runs under any complete cut; after it,
+//! only under a cut binding a different membership, and that attempt opens a
+//! fresh window for the member that changed it.
+//!
+//! A capture proves itself by staying Ready for one whole claim window. One
+//! retired sooner, by a lapse it may have caused itself, is one more failed
+//! attempt: the failures and their backoff carry on until a capture does
+//! prove itself. Its retirement still opens a fresh claim window, so a joiner
+//! waits through the lapse, but under an unchanged membership the failures
+//! may back off for only one claim window in total: after that, as after a
+//! closed window, only a membership change starts another attempt. So a
+//! capture that keeps costing its own lapse is retried a bounded few times,
+//! not once per lapse.
 
 use super::ClaimEngine;
 use crate::Time;
 use crate::volatile_bootstrap::{
-    BootstrapEffect, BootstrapError, BootstrapOperation, BootstrapStage, BootstrapStep,
-    ClaimIdentity, ClaimPhase, same_membership,
+    BootstrapEffect, BootstrapError, BootstrapMemberIdentity, BootstrapOperation, BootstrapStage,
+    BootstrapStep, ClaimIdentity, ClaimPhase, same_membership,
 };
 
+/// This node's Ready capture: when it went Ready, and the complete cut it
+/// was taken under.
+#[derive(Debug)]
+pub(super) struct ReadyCapture {
+    built: Time,
+    roster: Option<Vec<BootstrapMemberIdentity>>,
+}
+
 impl ClaimEngine {
+    /// The Building operation produced a Ready capture. The failures that
+    /// led here are kept until it has stayed Ready for a whole claim window.
+    pub(super) fn built(
+        &mut self,
+        op: BootstrapOperation,
+        selected: &ClaimIdentity,
+    ) -> BootstrapStep {
+        if self.stage != BootstrapStage::Building
+            || self.operation != Some(op)
+            || self.selected.as_ref() != Some(selected)
+        {
+            return Self::reject(BootstrapError::StaleOperation);
+        }
+        self.operation = None;
+        self.operation_due = None;
+        self.total_due = None;
+        let roster = self
+            .recapture_roster
+            .take()
+            .or_else(|| self.participant_roster.clone());
+        self.ready_capture = Some(ReadyCapture {
+            built: self.now,
+            roster,
+        });
+        self.failed_recapture = None;
+        self.recapture_due = None;
+        self.recapture_retry_due = None;
+        self.stage = BootstrapStage::DonorAvailable;
+        self.local_phase = ClaimPhase::Ready;
+        let Ok(claim) = self.publish_renewal() else {
+            return self.terminate();
+        };
+        self.ok(vec![claim])
+    }
+
     pub(super) fn local_only_built(
         &mut self,
         op: BootstrapOperation,
@@ -69,11 +122,13 @@ impl ClaimEngine {
     /// Start one bounded recapture of the completed local image under the
     /// complete participation cut the worker just verified. That cut is
     /// consumed here. Nothing starts before the backoff after a failed
-    /// attempt has passed. Once the claim window has closed, a cut binding
-    /// the same membership as the one the last attempt failed under starts
-    /// nothing either: only a membership change or a retired capture retries
-    /// then, so a failure that neither caused never loops, and no joiner
-    /// waits on it. A membership change opens a fresh claim window.
+    /// attempt has passed. Once the claim window has closed, or the failures
+    /// have backed off for a whole window, a cut binding the same membership
+    /// as the one the last attempt failed under starts nothing either: only a
+    /// membership change, or a retirement that is not itself a failed
+    /// capture, retries then, so a failure that neither caused never loops,
+    /// and no joiner waits on it. A membership change opens a fresh claim
+    /// window if none is open.
     pub(super) fn start_ready_recapture(&mut self) -> BootstrapStep {
         if !self.ready_recapture_due() {
             return Self::reject(BootstrapError::Stage);
@@ -81,7 +136,7 @@ impl ClaimEngine {
         let Some(roster) = self.participant_roster.take() else {
             return Self::reject(BootstrapError::Stage);
         };
-        if self.recapture_due.is_none() {
+        if self.recapture_due.is_none() || self.retries_spent() {
             let changed = self
                 .failed_recapture
                 .as_deref()
@@ -89,7 +144,7 @@ impl ClaimEngine {
             if !changed {
                 return self.ok(Vec::new());
             }
-            if self.await_recapture().is_err() {
+            if self.recapture_due.is_none() && self.await_recapture().is_err() {
                 return self.terminate();
             }
         }
@@ -160,11 +215,33 @@ impl ClaimEngine {
     /// of `donor_wait_ms` so holds a bounded few attempts, and after it each
     /// membership change costs at most one capture per capped backoff.
     fn recapture_backoff(&self) -> u64 {
+        self.backoff_after(self.recapture_failures)
+    }
+
+    fn backoff_after(&self, failures: u32) -> u64 {
         let cap = (self.config.donor_wait_ms / 4).max(self.config.observe_ms);
         let doubling = 1_u64
-            .checked_shl(self.recapture_failures.saturating_sub(1))
+            .checked_shl(failures.saturating_sub(1))
             .unwrap_or(u64::MAX);
         self.config.observe_ms.saturating_mul(doubling).min(cap)
+    }
+
+    /// Whether the failures since a capture last proved itself have backed
+    /// off for a whole claim window between them: as many attempts as one
+    /// window holds. Inside the window the failures open, this only becomes
+    /// true as the window closes; it bounds the retries that a failed Ready
+    /// capture's fresh window would otherwise allow. Each backoff is at least
+    /// one interval and doubles to a quarter of the window, so the sum reaches
+    /// the window within a few dozen terms.
+    fn retries_spent(&self) -> bool {
+        let mut spent = 0_u64;
+        for failures in 1..=self.recapture_failures {
+            spent = spent.saturating_add(self.backoff_after(failures));
+            if spent >= self.config.donor_wait_ms {
+                return true;
+            }
+        }
+        false
     }
 
     /// The capture behind this node's donor role was retired while its local
@@ -176,9 +253,33 @@ impl ClaimEngine {
     /// is dropped. Until then a joiner waits for this image: a Ready claim, or
     /// one already withdrawn, is superseded by a fresh attempt's Building
     /// claim, and a pending Building claim stays, for a fresh claim window.
+    ///
+    /// A Ready capture that had not stayed Ready for a whole claim window is
+    /// a failed attempt instead. Its failure backs off like any other, and
+    /// only a cut binding a membership other than its own is granted the
+    /// recapture once the failures' retries are spent. The fresh window still
+    /// keeps a joiner waiting through the lapse that retired it.
     pub(super) fn capture_retired(&mut self) -> BootstrapStep {
         self.participant_roster = None;
         self.failed_recapture = None;
+        if let Some(ready) = self.ready_capture.take() {
+            if ready
+                .built
+                .0
+                .checked_add(self.config.donor_wait_ms)
+                .is_some_and(|proved| self.now.0 < proved)
+            {
+                self.failed_recapture = ready.roster;
+                self.recapture_failures = self.recapture_failures.saturating_add(1);
+                let Some(retry) = self.now.0.checked_add(self.recapture_backoff()) else {
+                    return self.terminate();
+                };
+                self.recapture_retry_due = Some(Time(retry));
+            } else {
+                self.recapture_failures = 0;
+                self.recapture_retry_due = None;
+            }
+        }
         let mut effects = Vec::new();
         if self.local_phase == ClaimPhase::Ready || self.recapture_due.is_none() {
             let Some(generation) = self.generation.checked_add(1) else {

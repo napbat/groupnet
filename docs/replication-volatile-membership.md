@@ -177,17 +177,28 @@ join that interrupts a recapture is retried once its backoff has passed. When
 the window closes the claim is withdrawn, and only a cut binding a different
 membership than the one the last attempt failed under starts another attempt,
 which opens a fresh window; a failure the membership did not cause never
-loops, and no joiner waits on it. Each attempt clones the whole index under the
-publication fence and the index write lock, and C must stay one atomic cut
-with its journal ingress and native cuts, so the clone keeps holding both
-(the S3 consumer measured about 300 ms at 800k rows in release). A runtime task
-needing either waits meanwhile, so a node on one runtime worker pauses for the
-clone, and with a 50 ms SWIM probe timeout its peer suspects it; the roster
-binding above makes that harmless to the capture, and the pacing bounds its
-cost. With `observe_ms` = 1 s and `donor_wait_ms` = 30 s, starts are at
-least 1, 2, 4, 7.5, 7.5 and 7.5 s apart after each failure, so one window
-holds at most seven attempts, about 2 s of clone at production size, and
-after it at most one attempt per 7.5 s, only on a membership change.
+loops, and no joiner waits on it.
+A Ready capture proves itself by staying Ready for one whole claim window.
+One retired sooner, by a lapse, an expiry or a membership change, is one more
+failed attempt: failures accumulate and the backoff keeps doubling until a
+capture has proved itself. Its retirement still opens a fresh claim window,
+so a joiner waits through the lapse that retired it, but once the failures'
+backoffs add up to a whole window, a cut binding the membership the last
+attempt failed under starts nothing, as after a closed window. A capture that
+stalls its own node into a lease lapse therefore costs at most one window's
+worth of attempts per membership, not one per lapse. With `observe_ms` = 1 s
+and `donor_wait_ms` = 30 s, starts are at least 1, 2, 4, 7.5, 7.5 and 7.5 s
+apart after each failure, so one window's backoff holds at most seven
+attempts, and after it each membership change grants one attempt at most
+every 7.5 s.
+Each attempt's cut at C is taken under the publication fence and the index
+write lock, and C must stay one atomic cut with its journal ingress and native
+cuts. A runtime task needing either waits meanwhile, so a node on one runtime
+worker pauses for as long as C holds them, and a pause past the lease makes
+the capture cause its own lapse. The consumer therefore keeps C to O(1) work
+in its row count: the S3 consumer sizes the image from per-bucket tallies its
+index keeps current and snapshots persistent maps that share their nodes with
+the live index, then measures and encodes that snapshot off-lock.
 While the worker awaits any adapter operation that does not itself drive the
 bootstrap child (invalidation, the origin rebuild, peer observation and
 frontier waits), it keeps the child's maintenance turns running on the
@@ -214,9 +225,10 @@ renewal continues. A join commonly causes exactly such a lapse, so withdrawing
 the claim here would let the joiner, sampling during the lapse, scan the
 origin. The retirement also grants the next verified cut one recapture, even
 one equal to a cut a recapture failed under, because that failure belonged to
-the suspended Ready generation. The engine issues a new child binding only
-after that same lapse episode passes renewal, head, frontier, and final
-affirmation checks. The child then uses the new Ready guard and a new
+the suspended Ready generation, unless the retired capture is itself a failed
+attempt (above) whose retries are spent. The engine issues a new child
+binding only after that same lapse episode passes renewal, head, frontier,
+and final affirmation checks. The child then uses the new Ready guard and a new
 claim/capture identity. A feed
 gap, full rebuild, or failed lapse retires the suspended candidate instead.
 Candidate retirement withdraws its claim and transfer resources but preserves

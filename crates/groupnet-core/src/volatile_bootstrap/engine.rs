@@ -67,8 +67,11 @@ pub struct ClaimEngine {
     /// No Ready recapture starts before this: the backoff after the last
     /// failed one. Cleared once it passes.
     recapture_retry_due: Option<Time>,
-    /// Consecutive failed Ready recaptures since the last one succeeded.
+    /// Consecutive failed Ready recaptures since a capture last stayed Ready
+    /// for a whole claim window.
     recapture_failures: u32,
+    /// The Ready capture this node donates, while it does.
+    ready_capture: Option<recapture::ReadyCapture>,
     observed_presence: BTreeMap<PresenceIdentity, ObservedPresence>,
     settle_due: Option<Time>,
     renew_due: Option<Time>,
@@ -141,6 +144,7 @@ impl ClaimEngine {
             recapture_due: None,
             recapture_retry_due: None,
             recapture_failures: 0,
+            ready_capture: None,
             observed_presence: BTreeMap::new(),
             settle_due: None,
             renew_due: None,
@@ -367,6 +371,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.ready_capture = None;
         effects.push(BootstrapEffect::WithdrawClaim(self.identity()));
         effects.push(BootstrapEffect::FallbackOrigin);
         self.ok(effects)
@@ -470,6 +475,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.ready_capture = None;
         self.roster_poll = None;
         self.roster_poll_due = None;
         self.excluded.clear();
@@ -728,6 +734,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.ready_capture = None;
         self.selected = None;
         self.participant_roster = None;
         self.ok(effects)
@@ -751,6 +758,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.ready_capture = None;
         self.operation = None;
         self.selected = None;
         let mut effects = Vec::new();
@@ -804,28 +812,7 @@ impl ClaimEngine {
                 self.choose_participants(&members, &roster, &participants, claims)
             }
             BootstrapEvent::ObservationFailed { op } => self.observation_failed(op),
-            BootstrapEvent::Built { op, selected } => {
-                if self.stage != BootstrapStage::Building
-                    || self.operation != Some(op)
-                    || self.selected.as_ref() != Some(&selected)
-                {
-                    return Self::reject(BootstrapError::StaleOperation);
-                }
-                self.operation = None;
-                self.operation_due = None;
-                self.total_due = None;
-                self.recapture_roster = None;
-                self.failed_recapture = None;
-                self.recapture_due = None;
-                self.recapture_retry_due = None;
-                self.recapture_failures = 0;
-                self.stage = BootstrapStage::DonorAvailable;
-                self.local_phase = ClaimPhase::Ready;
-                let Ok(claim) = self.publish_renewal() else {
-                    return self.terminate();
-                };
-                self.ok(vec![claim])
-            }
+            BootstrapEvent::Built { op, selected } => self.built(op, &selected),
             BootstrapEvent::BuildProgressed { op, selected } => {
                 self.build_progressed(op, &selected)
             }
