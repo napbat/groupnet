@@ -446,7 +446,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             {
                 return;
             }
-            self.retire_donor_capture();
+            // An adopted installed image may hold no capture yet: nothing is
+            // retired, and its recapture still waits for a membership change.
+            if self.capture.is_some() {
+                self.retire_donor_capture();
+            }
             self.permit = None;
             self.ready_guard = None;
             self.suspended_recovery = Some(recovery);
