@@ -54,10 +54,9 @@ impl SessionEngine {
         if self
             .outstanding
             .is_some_and(|_| self.operation_due.is_some_and(|due| now >= due))
+            && let Some((op, _)) = self.outstanding
         {
-            if let Some((op, _)) = self.outstanding {
-                return self.step(Event::Failed { op });
-            }
+            return self.step(Event::Failed { op });
         }
         if let Some(due) = self.retry_due {
             if now >= due {

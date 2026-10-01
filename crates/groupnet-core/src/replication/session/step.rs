@@ -234,10 +234,8 @@ impl SessionEngine {
                 let should_rearm =
                     had_ack && (!ack_effects.is_empty() || !ordinary.effects.is_empty());
                 ordinary.effects.extend(ack_effects);
-                if should_rearm {
-                    if let Some(due) = self.next_deadline() {
-                        ordinary.effects.push(Effect::ArmTimer(due));
-                    }
+                if should_rearm && let Some(due) = self.next_deadline() {
+                    ordinary.effects.push(Effect::ArmTimer(due));
                 }
                 ordinary
             }
@@ -483,10 +481,11 @@ impl SessionEngine {
                     Step::ok(Vec::new())
                 } else {
                     let mut closed = self.close_gate();
-                    if self.config.idle.is_some() && !closed.effects.is_empty() {
-                        if let Some(due) = self.next_deadline() {
-                            closed.effects.push(Effect::ArmTimer(due));
-                        }
+                    if self.config.idle.is_some()
+                        && !closed.effects.is_empty()
+                        && let Some(due) = self.next_deadline()
+                    {
+                        closed.effects.push(Effect::ArmTimer(due));
                     }
                     closed
                 }

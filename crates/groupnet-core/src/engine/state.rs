@@ -503,14 +503,14 @@ impl GroupEngine {
             wire::Kind::PingReq => {
                 // We were asked to probe `frame.target` on `from`'s behalf.
                 let mut effects = Vec::new();
-                if let Some(target) = frame.target {
-                    if target != self.local {
-                        self.relaying
-                            .entry(target.clone())
-                            .or_default()
-                            .insert(from);
-                        effects.push(self.send_probe(target, wire::Kind::Ping, None));
-                    }
+                if let Some(target) = frame.target
+                    && target != self.local
+                {
+                    self.relaying
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(from);
+                    effects.push(self.send_probe(target, wire::Kind::Ping, None));
                 }
                 effects
             }

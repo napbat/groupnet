@@ -58,19 +58,19 @@ struct FixedSource(Watermarks, Vec<Bytes>);
 impl SnapshotSource for FixedSource {
     type Chunks = FixedChunks;
 
-    async fn open(&self) -> io::Result<Snapshot<FixedChunks>> {
-        Ok(Snapshot {
+    fn open(&self) -> impl Future<Output = io::Result<Snapshot<FixedChunks>>> {
+        std::future::ready(Ok(Snapshot {
             covers: self.0.clone(),
             chunks: FixedChunks(self.1.clone().into_iter()),
-        })
+        }))
     }
 }
 
 struct FixedChunks(std::vec::IntoIter<Bytes>);
 
 impl SnapshotChunks for FixedChunks {
-    async fn next(&mut self) -> io::Result<Option<Bytes>> {
-        Ok(self.0.next())
+    fn next(&mut self) -> impl Future<Output = io::Result<Option<Bytes>>> {
+        std::future::ready(Ok(self.0.next()))
     }
 }
 
@@ -79,14 +79,14 @@ impl SnapshotChunks for FixedChunks {
 struct VecSink(tokio::sync::mpsc::UnboundedSender<Vec<u8>>, Vec<u8>);
 
 impl SnapshotSink for VecSink {
-    async fn apply(&mut self, chunk: Bytes) -> io::Result<()> {
+    fn apply(&mut self, chunk: Bytes) -> impl Future<Output = io::Result<()>> {
         self.1.extend_from_slice(&chunk);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
-    async fn finish(self) -> io::Result<()> {
+    fn finish(self) -> impl Future<Output = io::Result<()>> {
         let VecSink(installed, staged) = self;
-        installed.send(staged).map_err(io::Error::other)
+        std::future::ready(installed.send(staged).map_err(io::Error::other))
     }
 }
 

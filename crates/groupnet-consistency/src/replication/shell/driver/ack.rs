@@ -50,10 +50,10 @@ where
     ) {
         let mut slot = lock(&self.shared.ack_slot);
         if slot.matches(generation, request_id) {
-            if let Ok(outcome) = &result {
-                if let Some(active) = slot.active.as_ref() {
-                    lock(&active.progress).terminal = Some(outcome.clone());
-                }
+            if let Ok(outcome) = &result
+                && let Some(active) = slot.active.as_ref()
+            {
+                lock(&active.progress).terminal = Some(outcome.clone());
             }
             slot.active = None;
             slot.cancel_requested = false;
@@ -261,10 +261,10 @@ where
             return;
         };
         let slot = lock(&self.shared.ack_slot);
-        if slot.matches(active.generation, &active.request_id) {
-            if let Some(current) = slot.active.as_ref() {
-                lock(&current.progress).terminal = Some(outcome);
-            }
+        if slot.matches(active.generation, &active.request_id)
+            && let Some(current) = slot.active.as_ref()
+        {
+            lock(&current.progress).terminal = Some(outcome);
         }
     }
 
@@ -276,10 +276,10 @@ where
             return;
         };
         let slot = lock(&self.shared.ack_slot);
-        if slot.matches(active.generation, &active.request_id) {
-            if let Some(current) = slot.active.as_ref() {
-                lock(&current.progress).waiting = waiting;
-            }
+        if slot.matches(active.generation, &active.request_id)
+            && let Some(current) = slot.active.as_ref()
+        {
+            lock(&current.progress).waiting = waiting;
         }
     }
 

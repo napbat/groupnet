@@ -605,18 +605,17 @@ where
         if self.shared.idle_enabled
             && self.shared.alive.load(Ordering::Acquire)
             && !self.shared.cancelled.load(Ordering::Acquire)
+            && let Some(checked_at) = self.shared.published.borrow().tail_checked_at
         {
-            if let Some(checked_at) = self.shared.published.borrow().tail_checked_at {
-                if checked_at.elapsed() >= self.tail_interval {
-                    // The shell dates freshness at request start. A delayed
-                    // response can expire here before the core's response-
-                    // time logical deadline, so force a prompt source check.
-                    self.shared.stale_activity.store(true, Ordering::Release);
-                } else {
-                    self.shared.activity.store(true, Ordering::Release);
-                }
-                self.shared.hints.notify_one();
+            if checked_at.elapsed() >= self.tail_interval {
+                // The shell dates freshness at request start. A delayed
+                // response can expire here before the core's response-
+                // time logical deadline, so force a prompt source check.
+                self.shared.stale_activity.store(true, Ordering::Release);
+            } else {
+                self.shared.activity.store(true, Ordering::Release);
             }
+            self.shared.hints.notify_one();
         }
     }
 
@@ -841,27 +840,27 @@ where
                 if materialized.scope != cursor.scope || materialized.history != cursor.history {
                     return CatchUp::InvalidFloor;
                 }
-                if let Ok(comparison) = self.source.compare(materialized, &cursor, proof) {
-                    if matches!(
+                if let Ok(comparison) = self.source.compare(materialized, &cursor, proof)
+                    && matches!(
                         comparison.for_operands(materialized, &cursor, &proof.id),
                         Some(Comparison::After | Comparison::Equal)
-                    ) && matches!(published.decision, CoreReadDecision::Serve(_))
-                        && self.shared.local_gate.load(Ordering::Acquire)
-                        && self.shared.external_authority.load(Ordering::Acquire)
-                        && !self.shared.authority_revalidation.load(Ordering::Acquire)
-                        && published
-                            .tail_checked_at
-                            .is_some_and(|at| at.elapsed() < self.tail_interval)
-                        && !self.shared.cancelled.load(Ordering::Acquire)
-                    {
-                        return match self.source.position(materialized) {
-                            Ok(position) if self.app.may_serve(&self.shared.scope, &position) => {
-                                CatchUp::Ready(position)
-                            }
-                            Ok(_) => CatchUp::ReadPolicyBlocked,
-                            Err(error) => CatchUp::Failed(error.class()),
-                        };
-                    }
+                    )
+                    && matches!(published.decision, CoreReadDecision::Serve(_))
+                    && self.shared.local_gate.load(Ordering::Acquire)
+                    && self.shared.external_authority.load(Ordering::Acquire)
+                    && !self.shared.authority_revalidation.load(Ordering::Acquire)
+                    && published
+                        .tail_checked_at
+                        .is_some_and(|at| at.elapsed() < self.tail_interval)
+                    && !self.shared.cancelled.load(Ordering::Acquire)
+                {
+                    return match self.source.position(materialized) {
+                        Ok(position) if self.app.may_serve(&self.shared.scope, &position) => {
+                            CatchUp::Ready(position)
+                        }
+                        Ok(_) => CatchUp::ReadPolicyBlocked,
+                        Err(error) => CatchUp::Failed(error.class()),
+                    };
                 }
             }
             let until = tokio::time::Instant::from_std(deadline);

@@ -303,10 +303,10 @@ impl Election {
     /// from [`RecoveredGrant::none`]) is left exactly as it is.
     pub(super) fn quorum_start(&mut self, now: Time) {
         let lease_ms = self.cfg.lease_ms;
-        if let Some(q) = self.quorum.as_mut() {
-            if q.grant_promise_until == Time::MAX {
-                q.grant_promise_until = now.saturating_add(lease_ms);
-            }
+        if let Some(q) = self.quorum.as_mut()
+            && q.grant_promise_until == Time::MAX
+        {
+            q.grant_promise_until = now.saturating_add(lease_ms);
         }
     }
 }

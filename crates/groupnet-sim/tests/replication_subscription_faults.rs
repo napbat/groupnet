@@ -251,7 +251,7 @@ impl Model {
 
     fn reply(&mut self, event: Event) {
         let faulted = (15..35).contains(&self.now);
-        if faulted && self.rng.next_u64() % 7 == 0 {
+        if faulted && self.rng.next_u64().is_multiple_of(7) {
             self.faults.lost_replies += 1;
             return; // Lost notification/response; core timeout must recover.
         }
@@ -262,7 +262,7 @@ impl Model {
         };
         let sequence = self.next_reply_sequence;
         self.next_reply_sequence += 1;
-        if faulted && self.rng.next_u64() % 5 == 0 {
+        if faulted && self.rng.next_u64().is_multiple_of(5) {
             self.faults.duplicated_replies += 1;
             self.later(
                 Action::Reply {
@@ -348,7 +348,7 @@ impl Model {
             self.faults.partition_drops += 1;
             return; // Every source/sink request is unreachable in this interval.
         }
-        if self.now < 35 && self.rng.next_u64() % 8 == 0 {
+        if self.now < 35 && self.rng.next_u64().is_multiple_of(8) {
             self.faults.random_request_drops += 1;
             return; // Loss continues intermittently after the partition heals.
         }

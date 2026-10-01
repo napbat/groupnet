@@ -213,7 +213,7 @@ fn seeded_crash_ambiguity_and_retention_schedules_preserve_protected_ack() {
     for seed in 0..48 {
         let mut rng = SplitMix64::new(seed);
         let (mut engine, registration) = registered(seed + 1, seed + 10, 1);
-        if rng.next_u64() % 5 == 0 {
+        if rng.next_u64().is_multiple_of(5) {
             let result = tail(&mut engine, 2);
             assert_eq!(engine.state().stage, Stage::IrrecoverableGap);
             assert!(
@@ -230,7 +230,7 @@ fn seeded_crash_ambiguity_and_retention_schedules_preserve_protected_ack() {
         let request = ack_request(&applied);
         let old_ack_op = op(&applied, "ack");
         assert_eq!(engine.subscription_acknowledged(), Some(&cursor(1)));
-        if rng.next_u64() % 2 == 0 {
+        if rng.next_u64().is_multiple_of(2) {
             // Process dies after sink commit and before source ack. A new
             // source epoch replays from the old protected ack without sink
             // rollback, then an old operation reply is rejected.

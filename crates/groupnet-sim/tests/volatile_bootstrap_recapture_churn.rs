@@ -452,7 +452,7 @@ impl World {
         let turn = self
             .donor
             .ready_at
-            .is_some_and(|at| now >= at && (now - at) % CONFIG.renew_ms == 0);
+            .is_some_and(|at| now >= at && (now - at).is_multiple_of(CONFIG.renew_ms));
         if !turn || self.donor.capture.is_some() {
             return;
         }

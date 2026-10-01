@@ -503,16 +503,15 @@ async fn read_loop(
     // The dial-back path: a dialer that told us where it listens is in the
     // book before its first frame surfaces, so replies can flow even to a
     // peer nobody registered here (a joiner reaching a seed).
-    if !intro.is_empty() {
-        if let Ok(addr) = intro.parse::<SocketAddr>() {
-            if let Some(inner) = inner.upgrade() {
-                inner
-                    .peers
-                    .write()
-                    .expect("peers lock poisoned")
-                    .insert(from.clone(), addr);
-            }
-        }
+    if !intro.is_empty()
+        && let Ok(addr) = intro.parse::<SocketAddr>()
+        && let Some(inner) = inner.upgrade()
+    {
+        inner
+            .peers
+            .write()
+            .expect("peers lock poisoned")
+            .insert(from.clone(), addr);
     }
     loop {
         let Ok(read) = timeout(read_idle, read_frame(&mut sock)).await else {

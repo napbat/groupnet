@@ -297,10 +297,10 @@ impl<K> PeerWrites<K> {
             if *node == me {
                 continue;
             }
-            if let Some(bytes) = entries.get(&key) {
-                if let Some(frame) = Frame::decode(bytes) {
-                    cursors.insert(node.clone(), Cursor::attached(&frame));
-                }
+            if let Some(bytes) = entries.get(&key)
+                && let Some(frame) = Frame::decode(bytes)
+            {
+                cursors.insert(node.clone(), Cursor::attached(&frame));
             }
         }
         Self {

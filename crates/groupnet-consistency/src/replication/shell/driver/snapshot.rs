@@ -762,16 +762,15 @@ where
         }
         let hold = self.snapshot_hold.take();
         self.discard_snapshot_local(attempt, disposition);
-        if let Some(hold) = hold {
-            if let Some(deadline) = self.started.checked_add(Duration::from_millis(due.0)) {
-                if let Some(_permits) = Self::snapshot_op_permits(&self.manager, deadline).await {
-                    let _ = tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(deadline),
-                        M::release(&self.manager.source, hold),
-                    )
-                    .await;
-                }
-            }
+        if let Some(hold) = hold
+            && let Some(deadline) = self.started.checked_add(Duration::from_millis(due.0))
+            && let Some(_permits) = Self::snapshot_op_permits(&self.manager, deadline).await
+        {
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                M::release(&self.manager.source, hold),
+            )
+            .await;
         }
         self.tick();
         self.step(Event::SnapshotCleaned { op });

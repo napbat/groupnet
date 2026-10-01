@@ -484,10 +484,11 @@ impl GroupEngine {
         // has lost the anchor lapses however well-connected its peers are —
         // which is what makes anchor connectivity, rather than reachability of
         // peers, the availability axis.
-        if self.is_coordinator() && self.is_settle() {
-            if let Some(el) = self.election.as_mut() {
-                el.lease_until = now.saturating_add(lease_ms);
-            }
+        if self.is_coordinator()
+            && self.is_settle()
+            && let Some(el) = self.election.as_mut()
+        {
+            el.lease_until = now.saturating_add(lease_ms);
         }
         // Row 6: the lease lapsed (we have not been top-ranked for a whole
         // `lease_ms`). Step down before anyone else can step up.
@@ -668,10 +669,8 @@ impl GroupEngine {
             .as_ref()
             .is_some_and(|el| epoch < el.epoch || (epoch == el.epoch && el.host.is_some()))
             && !self.claim_is_renewal(epoch, claimant);
-        if stale {
-            if let Some(body) = self.state_body() {
-                effects.push(self.send_lead(from.clone(), body));
-            }
+        if stale && let Some(body) = self.state_body() {
+            effects.push(self.send_lead(from.clone(), body));
         }
 
         // Rows Q1–Q3: the voter's answer. Silent unless this node is in the

@@ -407,19 +407,18 @@ fn reservation_of(request: &DonorRequest) -> Option<&ReservationId> {
 }
 
 fn validate_request(request: &DonorRequest, correlation: &Correlation) -> Result<(), WireError> {
-    if let Some(capture) = capture_of(request) {
-        if capture.scope != correlation.scope
+    if let Some(capture) = capture_of(request)
+        && (capture.scope != correlation.scope
             || capture.donor != correlation.donor
             || capture.serial == 0
-            || capture.recovery_generation == 0
-        {
-            return Err(WireError::Invalid);
-        }
+            || capture.recovery_generation == 0)
+    {
+        return Err(WireError::Invalid);
     }
-    if let Some(reservation) = reservation_of(request) {
-        if reservation.follower != correlation.follower || reservation.serial == 0 {
-            return Err(WireError::Invalid);
-        }
+    if let Some(reservation) = reservation_of(request)
+        && (reservation.follower != correlation.follower || reservation.serial == 0)
+    {
+        return Err(WireError::Invalid);
     }
     match request {
         DonorRequest::Offer { max_metadata_bytes } if *max_metadata_bytes == 0 => {

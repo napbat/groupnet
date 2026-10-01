@@ -595,16 +595,16 @@ impl Transport for Sniffer {
     type Error = <MemTransport as Transport>::Error;
 
     async fn send(&self, to: &NodeId, msg: &[u8]) -> Result<(), Self::Error> {
-        if let Some(frame) = wire::decode(msg) {
-            if matches!(
+        if let Some(frame) = wire::decode(msg)
+            && matches!(
                 frame.kind,
                 wire::Kind::LeadClaim | wire::Kind::LeadGrant | wire::Kind::LeadState
-            ) {
-                self.electing
-                    .lock()
-                    .expect("sniffer mutex poisoned")
-                    .insert(frame.group.to_string());
-            }
+            )
+        {
+            self.electing
+                .lock()
+                .expect("sniffer mutex poisoned")
+                .insert(frame.group.to_string());
         }
         self.inner.send(to, msg).await
     }

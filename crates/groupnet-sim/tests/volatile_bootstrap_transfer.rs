@@ -567,13 +567,13 @@ fn enqueue(
                 if matches!(effect.as_ref(), TransferEffect::DiscardStage { .. }) {
                     coverage.cleanup += 1;
                 }
-                reply(*effect, fixture, now, !healthy && seed % 7 == 0)
+                reply(*effect, fixture, now, !healthy && seed.is_multiple_of(7))
             }
             BootstrapEffect::ObserveSelectedClaim { op, selected } => {
                 assert_eq!(selected, fixture.donor);
                 fixture.renewal += 1;
                 coverage.refreshes += 1;
-                let claim = if !healthy && seed % 17 == 0 {
+                let claim = if !healthy && seed.is_multiple_of(17) {
                     None
                 } else {
                     Some(BootstrapClaim {
@@ -607,7 +607,7 @@ fn enqueue(
         let Some(event) = event else { continue };
         let is_ack = matches!(&event, BootstrapEvent::Transfer(inner)
             if matches!(inner.as_ref(), TransferEvent::BatchAcknowledged { .. }));
-        if !healthy && ((is_ack && seed % 5 == 0) || rng.below(9) == 0) {
+        if !healthy && ((is_ack && seed.is_multiple_of(5)) || rng.below(9) == 0) {
             coverage.dropped += 1;
             coverage.ack_drops += usize::from(is_ack);
             continue;
@@ -644,7 +644,7 @@ fn run(seed: u64, healthy: bool, renews: bool, coverage: &mut Coverage) {
         &mut rng,
         coverage,
     );
-    let restarted = !healthy && seed % 11 == 0;
+    let restarted = !healthy && seed.is_multiple_of(11);
     if restarted {
         coverage.restarts += 1;
         let superseded = engine.step(BootstrapEvent::Start);

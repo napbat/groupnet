@@ -155,14 +155,14 @@ struct TestChunks {
 
 impl SnapshotChunks for TestChunks {
     async fn next(&mut self) -> io::Result<Option<Bytes>> {
-        if let Some((after, gate)) = &mut self.gate {
-            if self.handed == *after {
-                // The borrow of the watch ends with the condition, so nothing is
-                // held across the await — `hosted_migration.rs`'s gate, verbatim.
-                while !*gate.borrow_and_update() {
-                    if gate.changed().await.is_err() {
-                        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gate dropped"));
-                    }
+        if let Some((after, gate)) = &mut self.gate
+            && self.handed == *after
+        {
+            // The borrow of the watch ends with the condition, so nothing is
+            // held across the await — `hosted_migration.rs`'s gate, verbatim.
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gate dropped"));
                 }
             }
         }

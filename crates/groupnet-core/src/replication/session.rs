@@ -436,10 +436,11 @@ impl SessionEngine {
         self.ready = true;
         self.retries = 0;
         let mut ready = self.finish_snapshot();
-        if self.config.idle.is_some() && self.freshness_due < self.tail_due {
-            if let Some(due) = self.next_deadline() {
-                ready.effects.push(Effect::ArmTimer(due));
-            }
+        if self.config.idle.is_some()
+            && self.freshness_due < self.tail_due
+            && let Some(due) = self.next_deadline()
+        {
+            ready.effects.push(Effect::ArmTimer(due));
         }
         ready
     }

@@ -360,7 +360,7 @@ impl World {
         if self
             .donor
             .ready_at
-            .is_some_and(|at| now >= at && (now - at) % CONFIG.renew_ms == 0)
+            .is_some_and(|at| now >= at && (now - at).is_multiple_of(CONFIG.renew_ms))
             && self.donor.suspended_until.is_none_or(|until| now >= until)
             && self.donor.capture.is_none()
             && self.engines[DONOR].as_ref().unwrap().ready_recapture_due()

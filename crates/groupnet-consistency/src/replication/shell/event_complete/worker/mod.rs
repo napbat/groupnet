@@ -116,10 +116,10 @@ where
     fn step(&mut self, event: Event) -> bool {
         let result = self.engine.step(event);
         let accepted = result.rejection.is_none();
-        if let Some(rejection) = result.rejection {
-            if matches!(rejection, Reject::Exhausted) {
-                self.failure = Some(FailureClass::Terminal);
-            }
+        if let Some(rejection) = result.rejection
+            && matches!(rejection, Reject::Exhausted)
+        {
+            self.failure = Some(FailureClass::Terminal);
         }
         for effect in result.effects {
             if !matches!(effect, Effect::ArmTimer(_)) {

@@ -600,10 +600,10 @@ fn rank_donors(
     let weighted: Vec<(NodeId, u32)> = members.iter().map(|id| (id.clone(), 1)).collect();
     let ranked = placement::owners(group, &weighted, weighted.len());
     let mut ordered = Vec::with_capacity(ranked.len());
-    if let Some(host) = host {
-        if ranked.iter().any(|member| member == host) {
-            ordered.push(host.clone());
-        }
+    if let Some(host) = host
+        && ranked.iter().any(|member| member == host)
+    {
+        ordered.push(host.clone());
     }
     ordered.extend(ranked.into_iter().filter(|member| Some(member) != host));
     // `me` goes with the short members: the caller is never its own donor, and

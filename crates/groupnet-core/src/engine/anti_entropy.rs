@@ -69,7 +69,7 @@ impl GroupEngine {
             // stays divergent only until this peer's next full digest.
             let every = self.config.full_digest_every.max(1);
             let visit = self.digest_visits.entry(to.clone()).or_insert(0);
-            let full = *visit % every == 0;
+            let full = (*visit).is_multiple_of(every);
             *visit += 1;
             let since = if full {
                 None

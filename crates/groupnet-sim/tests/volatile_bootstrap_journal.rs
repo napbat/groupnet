@@ -451,7 +451,7 @@ fn append(
     native_sequence: &mut u64,
     effect: Vec<u8>,
 ) {
-    let identity = if index % 2 == 0 {
+    let identity = if index.is_multiple_of(2) {
         DeltaIdentity::Local(vec![index])
     } else {
         *native_sequence += 1;
