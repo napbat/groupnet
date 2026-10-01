@@ -73,6 +73,7 @@ fn transient_full_scan_failures_retry_without_reviving_old_operations() {
                     | RecoveryEffect::ObservePeerHeads { .. }
                     | RecoveryEffect::CancelBaseline { .. }
                     | RecoveryEffect::SuspendLocalBaseline { .. }
+                    | RecoveryEffect::AdoptLocalBaseline { .. }
                     | RecoveryEffect::ResumeLocalBaseline { .. }
                     | RecoveryEffect::ObservePeers { .. }
                     | RecoveryEffect::WaitFrontiers { .. } => {

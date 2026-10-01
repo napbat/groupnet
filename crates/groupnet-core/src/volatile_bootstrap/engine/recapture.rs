@@ -119,6 +119,29 @@ impl ClaimEngine {
         self.ok(vec![BootstrapEffect::WithdrawClaim(selected)])
     }
 
+    /// Hold a retired candidate's installed peer image, now backing a Ready
+    /// local recovery, as a completed local image: a donor like an origin
+    /// build's. No claim is published and nothing is captured now; the
+    /// builder that donated it is still there. As after a closed claim
+    /// window, the Ready recapture starts only under a cut binding a
+    /// membership other than the one the transfer was verified under, so a
+    /// later joiner, or a restarted peer, finds this node's image whichever
+    /// node built it.
+    pub(super) fn adopt_installed(&mut self) -> BootstrapStep {
+        if !self.installed_image || self.stage != BootstrapStage::Participating {
+            return Self::reject(BootstrapError::Stage);
+        }
+        self.installed_image = false;
+        self.stage = BootstrapStage::DonorAvailable;
+        self.local_phase = ClaimPhase::Building;
+        self.selected = Some(self.identity());
+        self.recapture_due = None;
+        self.recapture_retry_due = None;
+        self.recapture_failures = 0;
+        self.renew_due = None;
+        self.ok(Vec::new())
+    }
+
     /// Start one bounded recapture of the completed local image under the
     /// complete participation cut the worker just verified. That cut is
     /// consumed here. Nothing starts before the backoff after a failed

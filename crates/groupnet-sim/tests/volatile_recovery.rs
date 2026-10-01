@@ -38,6 +38,7 @@ fn op(step: &RecoveryStep) -> RecoveryOperation {
             RecoveryEffect::CloseGate { .. }
             | RecoveryEffect::CancelBaseline { .. }
             | RecoveryEffect::SuspendLocalBaseline { .. }
+            | RecoveryEffect::AdoptLocalBaseline { .. }
             | RecoveryEffect::ResumeLocalBaseline { .. }
             | RecoveryEffect::FellBack { .. }
             | RecoveryEffect::ArmTimer(_) => None,
@@ -219,6 +220,7 @@ fn volatile_recovery_reaches_applied_heads_or_fences_full_fallback() {
                     | RecoveryEffect::ObservePeerHeads { .. }
                     | RecoveryEffect::CancelBaseline { .. }
                     | RecoveryEffect::SuspendLocalBaseline { .. }
+                    | RecoveryEffect::AdoptLocalBaseline { .. }
                     | RecoveryEffect::ResumeLocalBaseline { .. } => {
                         panic!("seed {seed}: default recovery attempted peer bootstrap")
                     }

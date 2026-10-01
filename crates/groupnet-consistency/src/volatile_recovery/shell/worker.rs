@@ -179,6 +179,22 @@ pub(super) async fn run<A: RecoveryAdapter>(
                         }
                     }
                 }
+                RecoveryEffect::AdoptLocalBaseline { op } => {
+                    if let Some(child) = bootstrap.as_mut() {
+                        let ready = Instant::now()
+                            .checked_add(Duration::from_millis(config.total_ms))
+                            .and_then(|deadline| shared.ready_capture(deadline));
+                        if ready
+                            .as_ref()
+                            .and_then(|guard| guard.capture(|generation| generation))
+                            == Some(op.generation)
+                            && child.adopt_local(op)
+                        {
+                            active_baseline = Some(op);
+                            maintain_child(&shared, &config, child).await;
+                        }
+                    }
+                }
                 RecoveryEffect::AcquireBaseline { op } => {
                     if !engine.accepts_operation(op) {
                         continue;

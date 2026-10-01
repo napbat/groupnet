@@ -346,6 +346,13 @@ pub enum RecoveryEffect {
         /// Fresh unique binding in the affirmed recovery generation.
         current: RecoveryOperation,
     },
+    /// A recovery Ready on a peer's installed image binds that image to the
+    /// child as its local baseline, which may then donate it like an origin
+    /// build, with no origin IO.
+    AdoptLocalBaseline {
+        /// Fresh unique binding in the affirmed recovery generation.
+        op: RecoveryOperation,
+    },
     /// Observe complete bounded peer/granter/head facts for this stage.
     ObservePeers {
         /// Exact bounded membership observation operation.

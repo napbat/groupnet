@@ -31,6 +31,7 @@ fn operation(step: &RecoveryStep) -> RecoveryOperation {
             RecoveryEffect::CloseGate { .. }
             | RecoveryEffect::CancelBaseline { .. }
             | RecoveryEffect::SuspendLocalBaseline { .. }
+            | RecoveryEffect::AdoptLocalBaseline { .. }
             | RecoveryEffect::ResumeLocalBaseline { .. }
             | RecoveryEffect::FellBack { .. }
             | RecoveryEffect::ArmTimer(_) => None,

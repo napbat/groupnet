@@ -195,6 +195,99 @@ impl Donor {
     }
 }
 
+impl Donor {
+    /// A node that installed a peer's image under the current cut, retired
+    /// its candidate, and adopted the image once its recovery went Ready.
+    fn installed() -> Self {
+        let mut donor = Self::pending();
+        let (members, roster, participants, claims) = donor.cut();
+        let op = donor.engine.begin_roster_observation().unwrap();
+        donor
+            .engine
+            .verify_participant_roster(op, &members, &roster, &participants, &claims)
+            .unwrap();
+        // As after a completed transfer: the image was installed under the
+        // verified cut, and no capture of this node's own is running.
+        donor.engine.stage = BootstrapStage::Transferred;
+        donor.engine.ready_capture = None;
+        let retired = donor.engine.step(BootstrapEvent::RetireCandidate);
+        assert_eq!(retired.rejection, None);
+        assert!(withdraws(&retired.effects));
+        assert_eq!(donor.engine.stage(), BootstrapStage::Participating);
+        let adopted = donor.engine.step(BootstrapEvent::AdoptInstalled);
+        assert_eq!(adopted.rejection, None);
+        assert!(!publishes(&adopted.effects), "adoption publishes nothing");
+        donor
+    }
+}
+
+/// A node Ready on a peer's installed image is a donor too. It publishes no
+/// claim and captures nothing while the membership it installed under holds,
+/// so the builder stays the only donor; a restarted peer is a membership
+/// change, and this node starts one Ready recapture under a fresh Building
+/// claim that the joiner follows, whichever node built the index.
+#[test]
+fn a_peer_installed_image_offers_a_ready_recapture_to_a_joiner() {
+    let mut donor = Donor::installed();
+    assert_eq!(donor.engine.stage(), BootstrapStage::DonorAvailable);
+    assert!(donor.engine.ready_recapture_due());
+    assert_eq!(
+        donor.start(),
+        None,
+        "an unchanged membership starts nothing"
+    );
+    let _ = donor.advance(CONFIG.donor_wait_ms);
+    assert_eq!(donor.start(), None, "however long it holds");
+
+    donor.peer_boot += 1;
+    donor.verify().unwrap();
+    let step = donor.engine.step(BootstrapEvent::StartReadyRecapture);
+    assert_eq!(step.rejection, None);
+    assert!(step.effects.iter().any(|effect| matches!(
+        effect,
+        BootstrapEffect::PublishClaim(claim) if claim.phase == ClaimPhase::Building
+    )));
+    let op = step
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::RecaptureCurrent { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the restarted peer starts a recapture");
+    donor.verify().unwrap();
+    let selected = donor.engine.selected().unwrap().clone();
+    let built = donor.engine.step(BootstrapEvent::Built { op, selected });
+    assert_eq!(built.rejection, None);
+    assert!(built.effects.iter().any(|effect| matches!(
+        effect,
+        BootstrapEffect::PublishClaim(claim) if claim.phase == ClaimPhase::Ready
+    )));
+}
+
+/// Only an installed image is adopted: a retired origin builder, or a node
+/// never selected, has nothing to adopt.
+#[test]
+fn only_an_installed_candidate_is_adopted() {
+    let mut builder = Donor::pending();
+    assert_eq!(
+        builder
+            .engine
+            .step(BootstrapEvent::AdoptInstalled)
+            .rejection,
+        Some(BootstrapError::Stage)
+    );
+    let _ = builder.engine.step(BootstrapEvent::RetireCandidate);
+    assert_eq!(builder.engine.stage(), BootstrapStage::Participating);
+    assert_eq!(
+        builder
+            .engine
+            .step(BootstrapEvent::AdoptInstalled)
+            .rejection,
+        Some(BootstrapError::Stage)
+    );
+}
+
 fn withdraws(effects: &[BootstrapEffect]) -> bool {
     effects
         .iter()

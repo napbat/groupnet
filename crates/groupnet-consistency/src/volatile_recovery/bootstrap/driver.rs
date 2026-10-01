@@ -113,6 +113,12 @@ pub trait BootstrapDriver: Send + 'static {
     /// No old publication permission or donor capture becomes valid again.
     fn resume_local(&mut self, previous: RecoveryOperation, current: RecoveryOperation) -> bool;
 
+    /// Bind the peer image this child installed, now backing the affirmed
+    /// Ready generation of `current`, as its local image: it may then offer a
+    /// Ready recapture to a later joiner, like an origin build. Returns
+    /// whether the child holds such an image.
+    fn adopt_local(&mut self, current: RecoveryOperation) -> bool;
+
     /// One complete native participation roster for the recovery core's
     /// post-handoff peer check; `None` if participation is not required or
     /// the cut is incomplete, stale, or malformed. A hint, never authority:

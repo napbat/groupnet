@@ -470,6 +470,18 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
         true
     }
 
+    fn adopt_local(&mut self, current: RecoveryOperation) -> bool {
+        if self.recovery.is_some()
+            || self.suspended_recovery.is_some()
+            || self.engine.stage() != BootstrapStage::Participating
+            || !self.accept(BootstrapEvent::AdoptInstalled)
+        {
+            return false;
+        }
+        self.recovery = Some(current);
+        true
+    }
+
     fn peer_roster(
         &mut self,
         due: Instant,

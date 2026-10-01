@@ -205,6 +205,18 @@ and `donor_wait_ms` = 30 s, starts are at least 1, 2, 4, 7.5, 7.5 and 7.5 s
 apart after each failure, so one window's backoff holds at most seven
 attempts, and after it each membership change grants one attempt at most
 every 7.5 s.
+
+A node Ready on a peer's installed image is a donor as well. When its outer
+recovery affirms Ready, the core binds the retired candidate's installed image
+to the child as its local baseline (`AdoptLocalBaseline`), held as a completed
+local image with a closed claim window: no claim is published and nothing is
+captured while the cut its transfer was verified under holds, so the builder
+stays the only donor. A cut binding any other membership, such as a joiner or
+a restarted peer, starts one Ready recapture under a fresh Building claim,
+exactly as for an origin build, and a lease lapse suspends and resumes the
+adopted baseline as it does a built one. A fleet therefore keeps a donor
+whichever node built the index first, including after that builder restarts.
+
 Each attempt's cut at C is taken under the publication fence and the index
 write lock, and C must stay one atomic cut with its journal ingress and native
 cuts. A runtime task needing either waits meanwhile, so a node on one runtime

@@ -256,7 +256,9 @@ impl RecoveryEngine {
         if self.rearm_exhausted {
             return Self::reject(RecoveryError::Exhausted);
         }
-        let cancel = if plan == Plan::Lapse && self.baseline == Baseline::Origin {
+        // A lapse keeps a local image the child still holds, whether an origin
+        // build or an adopted peer install, for one recapture once affirmed.
+        let cancel = if plan == Plan::Lapse {
             if let Some(op) = self.baseline_op.take() {
                 self.suspended_local = Some(op);
                 vec![RecoveryEffect::SuspendLocalBaseline { op }]
@@ -773,6 +775,18 @@ impl RecoveryEngine {
                             previous,
                             current,
                         }])
+                    } else if self.baseline == Baseline::Peer && self.baseline_op.is_none() {
+                        if self.next_token == 0 {
+                            return Self::step_ok(Vec::new());
+                        }
+                        let op = RecoveryOperation {
+                            session: self.session,
+                            generation: self.state.generation,
+                            token: self.next_token,
+                        };
+                        self.next_token = self.next_token.checked_add(1).unwrap_or(0);
+                        self.baseline_op = Some(op);
+                        Self::step_ok(vec![RecoveryEffect::AdoptLocalBaseline { op }])
                     } else {
                         Self::step_ok(Vec::new())
                     }

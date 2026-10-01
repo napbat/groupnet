@@ -123,6 +123,7 @@ fn operation(step: &RecoveryStep) -> RecoveryOperation {
             RecoveryEffect::CloseGate { .. }
             | RecoveryEffect::CancelBaseline { .. }
             | RecoveryEffect::SuspendLocalBaseline { .. }
+            | RecoveryEffect::AdoptLocalBaseline { .. }
             | RecoveryEffect::ResumeLocalBaseline { .. }
             | RecoveryEffect::FellBack { .. }
             | RecoveryEffect::ArmTimer(_) => None,
@@ -315,11 +316,28 @@ fn empty_native_feed_handoff_waits_peer_barrier_then_affirms() {
     });
     assert_eq!(engine.state().stage, RecoveryStage::Affirming);
     assert!(!engine.state().recovered);
-    engine.step(RecoveryEvent::Affirmed {
+    let ready = engine.step(RecoveryEvent::Affirmed {
         op: operation(&affirm),
         accepted: true,
     });
     assert_eq!(engine.state().stage, RecoveryStage::Ready);
+    // The installed image becomes the child's local baseline, a donor like
+    // an origin build, and a lease lapse keeps it for one recapture.
+    let adopted = ready
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            RecoveryEffect::AdoptLocalBaseline { op } => Some(*op),
+            _ => None,
+        })
+        .expect("the installed image is adopted");
+    assert_eq!(adopted.generation, engine.state().generation);
+    assert!(adopted.token > acquire.token);
+    let lapse = engine.step(RecoveryEvent::LeaseLapse { count: 1 });
+    assert!(lapse.effects.iter().any(|effect| matches!(
+        effect,
+        RecoveryEffect::SuspendLocalBaseline { op } if *op == adopted
+    )));
 }
 
 #[test]

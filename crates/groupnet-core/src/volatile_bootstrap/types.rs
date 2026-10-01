@@ -296,6 +296,10 @@ pub enum BootstrapError {
 pub enum BootstrapEvent {
     /// Retire one recovery candidate without withdrawing process presence.
     RetireCandidate,
+    /// The retired candidate's installed peer image now backs a Ready local
+    /// recovery: hold it as a completed local image whose Ready recapture
+    /// starts on a membership change, as a donor for later joiners.
+    AdoptInstalled,
     /// Publish a fresh local claim and start one finite selection episode.
     Start,
     /// One source-certified complete bounded member and claim snapshot.

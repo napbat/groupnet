@@ -70,6 +70,10 @@ pub struct ClaimEngine {
     /// Consecutive failed Ready recaptures since a capture last stayed Ready
     /// for a whole claim window.
     recapture_failures: u32,
+    /// This candidate retired holding a peer's installed image: once its
+    /// recovery is Ready, the image may be adopted as a donor-capable local
+    /// image, as an origin build's is.
+    installed_image: bool,
     /// The Ready capture this node donates, while it does.
     ready_capture: Option<recapture::ReadyCapture>,
     observed_presence: BTreeMap<PresenceIdentity, ObservedPresence>,
@@ -144,6 +148,7 @@ impl ClaimEngine {
             recapture_due: None,
             recapture_retry_due: None,
             recapture_failures: 0,
+            installed_image: false,
             ready_capture: None,
             observed_presence: BTreeMap::new(),
             settle_due: None,
@@ -475,6 +480,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.installed_image = false;
         self.ready_capture = None;
         self.roster_poll = None;
         self.roster_poll_due = None;
@@ -709,6 +715,15 @@ impl ClaimEngine {
         ) {
             return self.ok(Vec::new());
         }
+        // An installed image keeps the cut its transfer was verified under:
+        // once adopted, only a membership change from it asks for a capture.
+        self.installed_image =
+            self.participation_required && self.stage == BootstrapStage::Transferred;
+        self.failed_recapture = if self.installed_image {
+            self.participant_roster.take()
+        } else {
+            None
+        };
         let identity = (self.generation > 0).then(|| self.identity());
         let previous_operation = self.operation.take();
         let roster_poll = self.roster_poll.take();
@@ -896,6 +911,7 @@ impl ClaimEngine {
             }
             BootstrapEvent::Cancel => self.cancel(),
             BootstrapEvent::RetireCandidate => self.retire_candidate(),
+            BootstrapEvent::AdoptInstalled => self.adopt_installed(),
         }
     }
 }
