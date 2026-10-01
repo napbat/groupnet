@@ -573,6 +573,18 @@ impl Leases {
         lock(&self.shared.core).confirmed()
     }
 
+    /// Every granter this node's serve-lease counts: the set
+    /// [`confirmed`](Self::confirmed) is a min over. It only grows while those
+    /// granters live, die or are reaped; a granter leaves it once it has
+    /// departed ([`leave`](Self::leave)) and membership no longer lists it. A
+    /// member here that membership does not report alive is one this node
+    /// cannot be confirmed by until it returns — the reason a survivor of a
+    /// crash serves from its origin rather than locally.
+    #[must_use]
+    pub fn roster(&self) -> Vec<NodeId> {
+        lock(&self.shared.core).roster().cloned().collect()
+    }
+
     /// The newest renewal of **this** node's that `granter` advertises having
     /// adopted, read straight from the group. The first thing to look at when
     /// a reader is not serving: the granter that lags (or that is missing
