@@ -259,8 +259,8 @@ impl Shared {
             applied_by(&self.group, reader, writer)
         });
         let mut core = lock(&self.core);
-        for reader in grants.keys() {
-            core.pin(reader);
+        for (reader, renewal) in &grants {
+            core.pin(reader, renewal.epoch);
         }
         grants
     }
@@ -575,11 +575,11 @@ impl Leases {
 
     /// Every granter this node's serve-lease counts: the set
     /// [`confirmed`](Self::confirmed) is a min over. It only grows while those
-    /// granters live, die or are reaped; a granter leaves it once it has
-    /// departed ([`leave`](Self::leave)) and membership no longer lists it. A
-    /// member here that membership does not report alive is one this node
-    /// cannot be confirmed by until it returns — the reason a survivor of a
-    /// crash serves from its origin rather than locally.
+    /// granters live, die or are reaped; a granter leaves it once its map says
+    /// it departed ([`leave`](Self::leave)). A member here that membership does
+    /// not report alive is one this node cannot be confirmed by until it
+    /// returns — the reason a survivor of a crash serves from its origin rather
+    /// than locally.
     #[must_use]
     pub fn roster(&self) -> Vec<NodeId> {
         lock(&self.shared.core).roster().cloned().collect()
@@ -607,8 +607,8 @@ impl Leases {
     /// out a lapse for a reader that is leaving on purpose.
     ///
     /// The departure is what lets the rest of the group stop counting this
-    /// node: a reader drops a granter only once that granter's map says it has
-    /// departed *and* membership no longer lists it
+    /// node: a reader drops a granter as soon as that granter's map says it
+    /// has departed, even while membership still lists it
     /// ([`LeaseCore::set_roster`]). In exchange this life excuses no reader by
     /// lapse from here on — any write it still completes, draining, completes
     /// on acknowledgements ([`GrantLedger::depart`]) — and no affirmation can

@@ -338,8 +338,8 @@ impl Harness {
             }
             let clock = node.clock(now);
             let grants = node.ledger.fold(clock, visible, applied);
-            for reader in grants.keys() {
-                node.lease.pin(reader);
+            for (reader, renewal) in &grants {
+                node.lease.pin(reader, renewal.epoch);
             }
             let encoded = encode_grants(&grants);
             let mut acks: Vec<(NodeId, WriteToken)> = Vec::new();

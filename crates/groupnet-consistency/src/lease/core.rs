@@ -116,11 +116,13 @@ pub struct LeaseCore {
     granters: BTreeMap<NodeId, u64>,
     /// The granters that must confirm. It only grows — every advertiser this
     /// node has learned and every reader it has granted joins it — and a
-    /// granter leaves it only once it has departed and membership no longer
-    /// lists it (see [`set_roster`](Self::set_roster)). Never this node itself.
+    /// granter leaves it only once its map says its life departed (see
+    /// [`set_roster`](Self::set_roster)). Never this node itself.
     roster: BTreeSet<NodeId>,
     /// The last [`GranterLife`] each granter's map carried — the departure
-    /// flag [`set_roster`](Self::set_roster) needs.
+    /// flag [`set_roster`](Self::set_roster) needs. A departed life is kept
+    /// while membership still advertises it, so the advertisement cannot
+    /// re-admit it.
     lives: BTreeMap<NodeId, GranterLife>,
     /// Whether the consumer has affirmed catch-up since the last lapse.
     caught_up: bool,
@@ -227,15 +229,19 @@ impl LeaseCore {
     /// happening. A silent granter therefore freezes confirmation until it
     /// grants again — after a heal, or in its next life after a restart.
     ///
-    /// The one way out is **departure**. A granter absent from `roster` whose
-    /// last map declared its life departed
-    /// ([`Leases::leave`](super::Leases::leave)) is dropped: that life excuses
-    /// no reader by lapse, so no write of its can complete without this node's
-    /// acknowledgement. Dropping one is reported as a lapse — the edge
-    /// [`poll`](Self::poll) would have produced, and the alarm counter bumps —
-    /// because a catch-up affirmed while the granter still froze confirmation
-    /// may predate writes it completed on this node's earlier lapse, so the
-    /// consumer must re-synchronize after the drop, not reuse that affirmation.
+    /// The one way out is **departure**. A granter whose last map declared
+    /// its life departed ([`Leases::leave`](super::Leases::leave)) is dropped
+    /// at once, even while membership still lists it: that life excuses no
+    /// reader by lapse, so no write of its — drained or not — can complete
+    /// without this node's acknowledgement, and counting it longer would only
+    /// freeze confirmation until the reap. Its advertisement does not
+    /// re-admit it; its next life does, by publishing a live map or by this
+    /// node granting it ([`pin`](Self::pin)). Dropping one is reported as a
+    /// lapse — the edge [`poll`](Self::poll) would have produced, and the
+    /// alarm counter bumps — because a catch-up affirmed while the granter
+    /// still froze confirmation may predate writes it completed on this
+    /// node's earlier lapse, so the consumer must re-synchronize after the
+    /// drop, not reuse that affirmation.
     ///
     /// An **empty** roster confirms vacuously: with nobody to wait on, the
     /// newest published renewal is the confirmed one. That is the right answer
@@ -247,23 +253,25 @@ impl LeaseCore {
     pub fn set_roster(&mut self, roster: impl IntoIterator<Item = NodeId>) {
         let advertised: BTreeSet<NodeId> =
             roster.into_iter().filter(|node| *node != self.me).collect();
-        let departed: Vec<NodeId> = self
+        let lives = &self.lives;
+        let departed = |granter: &NodeId| lives.get(granter).is_some_and(|life| life.departed);
+        self.roster
+            .extend(advertised.iter().filter(|node| !departed(node)).cloned());
+        let dropped: Vec<NodeId> = self
             .roster
             .iter()
-            .filter(|granter| {
-                !advertised.contains(*granter)
-                    && self.lives.get(*granter).is_some_and(|life| life.departed)
-            })
+            .filter(|granter| departed(granter))
             .cloned()
             .collect();
-        self.roster.extend(advertised);
-        if departed.is_empty() {
-            return;
-        }
-        for granter in &departed {
+        for granter in &dropped {
             self.roster.remove(granter);
             self.granters.remove(granter);
-            self.lives.remove(granter);
+        }
+        let roster = &self.roster;
+        self.lives
+            .retain(|node, _| roster.contains(node) || advertised.contains(node));
+        if dropped.is_empty() {
+            return;
         }
         self.caught_up = false;
         self.lapses += 1;
@@ -271,12 +279,23 @@ impl LeaseCore {
 
     /// Counts `granter` from now on, as [`set_roster`](Self::set_roster) would —
     /// called by this node's granter **before** it publishes a map granting
-    /// `granter`'s renewal, because that grant is what a writer reads as proof
-    /// that this node counts it.
-    pub fn pin(&mut self, granter: &NodeId) {
-        if *granter != self.me {
-            self.roster.insert(granter.clone());
+    /// `granter`'s renewal of lease life `life`, because that grant is what a
+    /// writer reads as proof that this node counts it.
+    ///
+    /// A grant to a life whose map already declared it departed counts nothing:
+    /// that life excuses no reader by lapse. A grant to any other life of a
+    /// departed granter is its next life, which is counted from here on.
+    pub fn pin(&mut self, granter: &NodeId, life: u64) {
+        if *granter == self.me {
+            return;
         }
+        if let Some(known) = self.lives.get(granter).filter(|known| known.departed) {
+            if known.epoch == life {
+                return;
+            }
+            self.lives.remove(granter);
+        }
+        self.roster.insert(granter.clone());
     }
 
     /// The granters that must confirm, in id order.
@@ -593,8 +612,8 @@ mod tests {
         assert_eq!(core.confirmed(), Some(id), "an empty roster is vacuous");
         // This node granted `w`'s renewal, which `w` reads as proof that it is
         // counted here: from now on its grants are required.
-        core.pin(&node("w"));
-        core.pin(&node("reader"));
+        core.pin(&node("w"), 1);
+        core.pin(&node("reader"), 1);
         assert_eq!(core.confirmed(), None, "pinned, and it has granted nothing");
         assert!(
             core.roster().all(|granter| *granter != node("reader")),
@@ -609,31 +628,41 @@ mod tests {
     }
 
     #[test]
-    fn only_a_departed_granter_that_membership_forgot_leaves_and_that_is_a_lapse() {
+    fn a_departed_granter_leaves_at_its_farewell_and_that_is_a_lapse() {
         let mut core = reader(&["a", "gone"]);
         let id = serve_from(&mut core, ClockMs(0), &["a", "gone"]);
-        let mut farewell = grant("reader", id);
-        GranterLife {
-            epoch: 3,
-            departed: true,
-        }
-        .stamp(&node("gone"), &mut farewell);
-        core.observe_grant_map(&node("gone"), &farewell);
+        let life = |departed| {
+            let mut map = grant("reader", id);
+            GranterLife { epoch: 3, departed }.stamp(&node("gone"), &mut map);
+            map
+        };
+        core.observe_grant_map(&node("gone"), &life(true));
 
-        // Departed but still listed (draining its last writes): still counted.
+        // Departed, though membership still lists it (draining its last
+        // writes, which end on acknowledgements): it leaves now, and the
+        // consumer must re-synchronize after the drop rather than keep
+        // serving on it.
         core.set_roster([node("a"), node("gone")]);
-        assert!(core.roster().any(|granter| *granter == node("gone")));
-        assert_eq!(core.lapses(), 0);
-
-        // Departed and no longer listed: it leaves, and the consumer must
-        // re-synchronize after the drop rather than keep serving on it.
-        core.set_roster([node("a")]);
         assert!(core.roster().all(|granter| *granter != node("gone")));
         assert_eq!(core.confirmed(), Some(id));
         assert_eq!(core.lapses(), 1, "the drop is an alarm like a lapse");
         assert_eq!(core.poll(ClockMs(100)), LeaseState::NeedsResync);
         assert!(core.mark_caught_up(ClockMs(100)));
         assert_eq!(core.poll(ClockMs(100)), LeaseState::Serving);
+
+        // Its advertisement, and a grant to the departed life, re-admit
+        // nothing — and the drop is reported once.
+        core.set_roster([node("a"), node("gone")]);
+        core.pin(&node("gone"), 3);
+        core.set_roster([node("a"), node("gone")]);
+        assert!(core.roster().all(|granter| *granter != node("gone")));
+        assert_eq!(core.lapses(), 1);
+
+        // Its next life is counted from the first grant this node gives it.
+        core.pin(&node("gone"), 4);
+        core.set_roster([node("a"), node("gone")]);
+        assert!(core.roster().any(|granter| *granter == node("gone")));
+        assert_eq!(core.confirmed(), None, "the next life has granted nothing");
 
         // A live life's row, or none at all, never lets a forgotten granter go.
         let mut core = reader(&["a", "crashed"]);
@@ -647,6 +676,31 @@ mod tests {
         core.set_roster([node("a")]);
         assert!(core.roster().any(|granter| *granter == node("crashed")));
         assert_eq!(core.lapses(), 0);
+    }
+
+    #[test]
+    fn a_departed_granters_next_life_is_counted_once_its_map_is_live() {
+        let mut core = reader(&["a", "gone"]);
+        let id = serve_from(&mut core, ClockMs(0), &["a", "gone"]);
+        let mut farewell = grant("reader", id);
+        GranterLife {
+            epoch: 3,
+            departed: true,
+        }
+        .stamp(&node("gone"), &mut farewell);
+        core.observe_grant_map(&node("gone"), &farewell);
+        core.set_roster([node("a"), node("gone")]);
+        assert!(core.roster().all(|granter| *granter != node("gone")));
+
+        let mut next = GrantMap::new();
+        GranterLife {
+            epoch: 4,
+            departed: false,
+        }
+        .stamp(&node("gone"), &mut next);
+        core.observe_grant_map(&node("gone"), &next);
+        core.set_roster([node("a"), node("gone")]);
+        assert!(core.roster().any(|granter| *granter == node("gone")));
     }
 
     #[test]

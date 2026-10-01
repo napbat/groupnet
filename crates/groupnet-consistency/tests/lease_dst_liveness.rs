@@ -421,8 +421,8 @@ impl Harness {
             };
             let node = self.nodes.get_mut(&id).expect("a live node");
             let grants = node.ledger.fold(ClockMs(now), visible, applied);
-            for reader in grants.keys() {
-                node.lease.pin(reader);
+            for (reader, renewal) in &grants {
+                node.lease.pin(reader, renewal.epoch);
             }
 
             let encoded = encode_grants(&grants);

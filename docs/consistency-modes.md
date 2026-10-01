@@ -308,9 +308,10 @@ protocol refines the sketch above in ways that are now contract:
   has known and every reader it has granted stays in its confirmation
   min-set through suspicion, death and reap: an asymmetric partition that
   outlives the reap horizon would otherwise let a reader serve while a live
-  writer stops waiting for it. A granter leaves only after its map declared
+  writer stops waiting for it. A granter leaves as soon as its map declares
   its life departed (`Leases::leave`, after which it excuses nobody by lapse
-  and never serves again) and membership no longer lists it, and the drop is
+  and never serves again), even while membership still lists it — its
+  advertisement does not re-admit it, its next life does — and the drop is
   reported as a lapse so the reader re-synchronizes after it. Boot guards
   cover a node still learning its group, and both are **enforced in the
   shell** rather than asked of the deployment: for its first
