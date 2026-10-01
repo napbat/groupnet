@@ -206,6 +206,17 @@ Two consumers of the crossing sit outside the feed and honor it the same way:
   the head now names. Then the move is a progression and the barrier simply
   waits for the new head. A renewal the observer did not deliver, a seal that
   precedes the sampled head, or a renewal into another life all still fall back.
+  Before the next life is crossed into, `Peer::sealed` reports the delivered
+  seal itself: that life is wholly applied, so its head disappearing — the
+  member reaped, relearned by a seed resolver with no state, or its next life
+  not written yet — loses nothing, a head in a later life is a frontier target
+  the observer crosses (by renewal, or by a gap that restarts recovery) before
+  reaching it, and the writer leaving the roster is not a membership change.
+  This is what lets a rolling update stop a donor seconds after its peer
+  installed the donor's image: the survivor's lease lapses with the donor's
+  grant, and its lapse proof spans the donor's reap and seed relearn. An
+  undelivered or earlier seal, or a sealed writer whose unrenewed next life
+  then leaves the roster, still falls back.
 
 ### T2 — Write-coherence tier (`consistency-acks` feature; today)
 

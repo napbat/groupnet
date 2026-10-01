@@ -78,11 +78,14 @@ advertised feed head contributes no frontier target; this does not prove it
 made no unpublished origin mutation. An unreadable feed observation is a
 failure, not an empty head. A head observed earlier in the same recovery turn
 cannot disappear into an empty feed or leave its life and erase its barrier
-obligation; that forces the full fallback. The one exception is a sealed
-restart the observer crossed (`Peer::renewal`: it delivered the old life's seal
-after the sampled head and renewed into the life the head names now), which is
-a progression the barrier follows; see "Sealed restarts" in
-`consistency-modes.md`. A frozen grant, vanished writer, failed
+obligation; that forces the full fallback. The exceptions are a writer's life
+the observer delivered through its seal: a sealed restart it crossed
+(`Peer::renewal`: it delivered the old life's seal after the sampled head and
+renewed into the life the head names now), which is a progression the barrier
+follows, and a seal it delivered before any next life (`Peer::sealed`), which
+lets the writer's head disappear, name a later life, or the writer leave the
+roster without losing a write; see "Sealed restarts" in
+`consistency-modes.md`. A frozen grant, vanished unsealed writer, failed
 barrier, capacity error, or deadline takes the full gap-style fallback.
 
 The adapter reports a stable local `ObservedLapse` counter and must bind its

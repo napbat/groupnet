@@ -79,6 +79,7 @@ impl RecoveryEngine {
         self.seen.clear();
         self.exempt.clear();
         self.known_heads.clear();
+        self.seals.clear();
         self.heads.clear();
         self.barrier_rounds = 0;
         self.peer_members.clear();

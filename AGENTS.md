@@ -60,15 +60,17 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `groupnet-runtime`'s `src/driver.rs` ~960 and `src/group.rs` ~960. The
    band under them, with ~60–150 lines of room: `groupnet-core`'s
    `src/volatile_recovery/tests.rs` ~930 (the next lapse-arm test goes in a
-   sibling file, as `tests_peer.rs` did), `tests/election.rs` ~909,
+   sibling file, as `tests_peer.rs` and `tests_seal.rs` did),
+   `tests/election.rs` ~909,
    `src/volatile_bootstrap/transfer/tests.rs` ~904,
    `src/volatile_bootstrap/engine.rs` ~907,
    `src/volatile_bootstrap/engine/participation.rs` ~883,
    `src/engine/election/mod.rs` ~873,
    `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861,
    `src/engine/election/quorum.rs` ~859 and
-   `src/volatile_recovery/engine.rs` ~878 (its fallback paths moved to
-   `engine/fallback.rs`); `groupnet-sim`'s
+   `src/volatile_recovery/engine.rs` ~865 (its fallback paths moved to
+   `engine/fallback.rs`, its head evidence to `engine/evidence.rs`);
+   `groupnet-sim`'s
    `tests/election_external_skew.rs` ~910, `tests/election_quorum.rs` ~896
    and `src/simulation.rs` ~894; `groupnet-consistency`'s
    `src/replication/shell.rs` ~914, `src/lease/shell.rs` ~889,

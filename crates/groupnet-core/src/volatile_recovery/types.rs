@@ -133,6 +133,15 @@ pub struct Peer {
     /// sealed renewal into the writer's current life. Report `None` once any
     /// later crossing of the same writer was a gap.
     pub renewal: Option<Renewal>,
+    /// The observer's delivered seal of this writer's life it is still in:
+    /// the position after that life's last write. Report it from the
+    /// delivered `groupnet_consistency::PeerWrite::Sealed` until the observer
+    /// crosses into a later life of the writer (`renewal` then covers the
+    /// crossing) or takes a gap. Every write of that life is applied and the
+    /// writer promised none after it, so its advertised head leaving the
+    /// roster — the member reaped, relearned with no state yet, or replaced
+    /// by its next life — is not lost evidence.
+    pub sealed: Option<Mark>,
 }
 
 /// Exact operation correlation; no token is reused within an engine session.

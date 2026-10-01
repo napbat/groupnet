@@ -17,3 +17,5 @@ pub use types::{
 mod tests;
 #[cfg(test)]
 mod tests_peer;
+#[cfg(test)]
+mod tests_seal;

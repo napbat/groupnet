@@ -589,6 +589,7 @@ impl RecoveryAdapter for ReadAdapter {
                         grant: None,
                         head: None,
                         renewal: None,
+                        sealed: None,
                     }],
                     None,
                 ));
@@ -614,6 +615,7 @@ impl RecoveryAdapter for ReadAdapter {
                         sequence: 1,
                     }),
                     renewal: None,
+                    sealed: None,
                 }],
                 Some(mark),
             ))

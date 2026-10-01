@@ -33,6 +33,7 @@ fn peer(sequence: u64) -> Peer {
             sequence: 1,
         }),
         renewal: None,
+        sealed: None,
     }
 }
 

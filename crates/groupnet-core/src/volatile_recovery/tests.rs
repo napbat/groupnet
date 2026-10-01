@@ -54,6 +54,7 @@ fn peer(name: &str, grant: u64, head: u64) -> Peer {
             sequence: head,
         }),
         renewal: None,
+        sealed: None,
     }
 }
 

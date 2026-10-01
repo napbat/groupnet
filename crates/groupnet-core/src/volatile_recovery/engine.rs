@@ -10,8 +10,11 @@ use super::types::{
     RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryStage, RecoveryState, RecoveryStep,
 };
 
+mod evidence;
 mod fallback;
 mod peer;
+
+use evidence::{crossed, regressed};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Plan {
@@ -55,6 +58,7 @@ pub struct RecoveryEngine {
     grants: BTreeMap<NodeId, Option<Mark>>,
     confirmed_before: Option<Mark>,
     known_heads: BTreeMap<NodeId, Mark>,
+    seals: BTreeMap<NodeId, Mark>,
     heads: BTreeMap<NodeId, Mark>,
     barrier_rounds: u32,
     peer_members: Vec<BootstrapMemberIdentity>,
@@ -108,6 +112,7 @@ impl RecoveryEngine {
             grants: BTreeMap::new(),
             confirmed_before: None,
             known_heads: BTreeMap::new(),
+            seals: BTreeMap::new(),
             heads: BTreeMap::new(),
             barrier_rounds: 0,
             peer_members: Vec::new(),
@@ -196,6 +201,7 @@ impl RecoveryEngine {
         self.grants.clear();
         self.confirmed_before = None;
         self.known_heads.clear();
+        self.seals.clear();
         self.heads.clear();
         self.barrier_rounds = 0;
         self.peer_members.clear();
@@ -410,32 +416,11 @@ impl RecoveryEngine {
                 || peer.renewal.is_some_and(|renewal| {
                     renewal.sealed.sequence == 0 || renewal.epoch <= renewal.sealed.epoch
                 })
+                || peer.sealed.is_some_and(|sealed| sealed.sequence == 0)
                 || !unique.insert(&peer.node)
             {
                 return Err(RecoveryError::InvalidEvidence);
             }
-        }
-        Ok(())
-    }
-
-    fn record_known_heads(&mut self, peers: &[Peer]) -> Result<(), RecoveryError> {
-        for peer in peers {
-            match (self.known_heads.get(&peer.node).copied(), peer.head) {
-                (Some(before), None) if crossed(before, peer) => {
-                    self.known_heads.remove(&peer.node);
-                }
-                (Some(_), None) => return Err(RecoveryError::InvalidEvidence),
-                (Some(before), Some(now)) if regressed(before, now) && !crossed(before, peer) => {
-                    return Err(RecoveryError::InvalidEvidence);
-                }
-                (_, Some(now)) => {
-                    self.known_heads.insert(peer.node.clone(), now);
-                }
-                (None, None) => {}
-            }
-        }
-        if self.known_heads.len() > self.config.max_members {
-            return Err(RecoveryError::Capacity);
         }
         Ok(())
     }
@@ -509,7 +494,13 @@ impl RecoveryEngine {
             return self.fallback_or_origin(RecoveryFallback::MembershipChanged);
         }
         let present: BTreeSet<&NodeId> = peers.iter().map(|peer| &peer.node).collect();
-        if self.seen.iter().any(|node| !present.contains(node)) {
+        // A writer that left after the observer delivered its seal took no
+        // unapplied write with it; any other vanished writer may have.
+        if self
+            .seen
+            .iter()
+            .any(|node| !present.contains(node) && !self.departed_sealed(node))
+        {
             return self.fallback_or_origin(RecoveryFallback::MembershipChanged);
         }
         let mut heads = BTreeMap::new();
@@ -871,22 +862,4 @@ impl RecoveryEngine {
             }
         }
     }
-}
-
-/// A head that left its life or moved backwards within it: evidence the
-/// engine cannot account for unless the observer [`crossed`] a sealed renewal.
-fn regressed(before: Mark, now: Mark) -> bool {
-    now.epoch != before.epoch || now.sequence < before.sequence
-}
-
-/// The observer delivered the life `before` belongs to through its seal —
-/// which lies after `before`, so no write of that life is unaccounted for —
-/// and renewed into the life `peer` advertises now. Such a head change is a
-/// progression: the frontier barrier on the new head covers the rest.
-fn crossed(before: Mark, peer: &Peer) -> bool {
-    peer.renewal.is_some_and(|renewal| {
-        renewal.sealed.epoch == before.epoch
-            && renewal.sealed.sequence > before.sequence
-            && peer.head.is_none_or(|now| now.epoch == renewal.epoch)
-    })
 }

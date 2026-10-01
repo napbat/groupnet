@@ -110,6 +110,7 @@ fn peer(sequence: Option<u64>) -> Peer {
         grant: None,
         head: sequence.map(|sequence| Mark { epoch: 1, sequence }),
         renewal: None,
+        sealed: None,
     }
 }
 

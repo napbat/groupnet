@@ -154,6 +154,7 @@ fn quiet_peer() -> Peer {
         grant: None,
         head: None,
         renewal: None,
+        sealed: None,
     }
 }
 
@@ -169,6 +170,7 @@ fn renewing_peer(sequence: u64) -> Peer {
             sequence: 1,
         }),
         renewal: None,
+        sealed: None,
     }
 }
 
