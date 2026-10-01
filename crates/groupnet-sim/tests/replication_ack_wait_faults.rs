@@ -219,7 +219,10 @@ fn expired_polls_and_old_sessions_cannot_steal_healed_acknowledgements() {
                     } => {
                         assert_ne!(op, wait_op);
                         assert!(due <= request.due);
-                        assert!(!waiting.is_empty());
+                        assert_ne!(
+                            waiting,
+                            [] as [groupnet_core::replication::RequiredSubscriber; 0]
+                        );
                         last_poll = Some(op);
                         if time < 15 {
                             if time == 0 || rng.below(3) == 0 {

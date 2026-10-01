@@ -171,7 +171,7 @@ mod tests {
     fn empty_set_round_trips() {
         let bytes = encode(Vec::<&str>::new());
         assert!(bytes.is_empty(), "an empty set is an empty advertisement");
-        assert!(decode(&bytes).is_empty());
+        assert_eq!(decode(&bytes), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -217,15 +217,21 @@ mod tests {
     #[test]
     fn unparseable_bytes_decode_to_the_empty_set() {
         // A length that runs off the end.
-        assert!(decode(b"garbage").is_empty());
-        assert!(decode(&[0xff, 0xff, 0xff, 0xff, 0x01]).is_empty());
+        assert_eq!(decode(b"garbage"), [] as [std::string::String; 0]);
+        assert_eq!(
+            decode(&[0xff, 0xff, 0xff, 0xff, 0x01]),
+            [] as [std::string::String; 0]
+        );
         // A header shorter than the length prefix itself.
-        assert!(decode(&[0x01, 0x00]).is_empty());
+        assert_eq!(decode(&[0x01, 0x00]), [] as [std::string::String; 0]);
         // A well-framed name that is not utf-8.
-        assert!(decode(&[0x01, 0x00, 0x00, 0x00, 0xff]).is_empty());
+        assert_eq!(
+            decode(&[0x01, 0x00, 0x00, 0x00, 0xff]),
+            [] as [std::string::String; 0]
+        );
         // A valid record followed by trailing garbage: all-or-nothing.
         let mut mixed = encode(["acks"]);
         mixed.extend_from_slice(&[0x09, 0x00, 0x00, 0x00, 0x01]);
-        assert!(decode(&mixed).is_empty());
+        assert_eq!(decode(&mixed), [] as [std::string::String; 0]);
     }
 }

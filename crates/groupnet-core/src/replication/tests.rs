@@ -184,12 +184,18 @@ fn pending_work_coalesces_and_late_operations_are_rejected() {
     let first = e.step(Event::Resume { cursor: cursor(1) });
     let p = proof(3, 1);
     let scan = e.step(tail(p.clone(), 1, tail_op(&first)));
-    assert!(e.step(Event::Hint).effects.is_empty());
+    assert_eq!(
+        e.step(Event::Hint).effects,
+        [] as [crate::replication::Effect; 0]
+    );
     let apply = e.step(Event::Scanned {
         op: scan_op(&scan),
         batch: Box::new(batch(&p, 1, 3)),
     });
-    assert!(e.step(Event::Tick(Time(5000))).effects.is_empty());
+    assert_eq!(
+        e.step(Event::Tick(Time(5000))).effects,
+        [] as [crate::replication::Effect; 0]
+    );
     assert_eq!(
         e.step(Event::Applied {
             op: apply_op(&apply),
@@ -215,7 +221,10 @@ fn pending_work_coalesces_and_late_operations_are_rejected() {
     );
     e.step(Event::Cancel);
     assert_eq!(e.state().stage, Stage::Cancelled);
-    assert!(e.step(Event::Tick(Time(100_000))).effects.is_empty());
+    assert_eq!(
+        e.step(Event::Tick(Time(100_000))).effects,
+        [] as [crate::replication::Effect; 0]
+    );
     assert_ne!(e.state().stage, Stage::Ready);
 }
 
@@ -251,7 +260,10 @@ fn same_or_backward_batch_cannot_advance_and_retry_is_bounded() {
         op: tail_op(&retry),
     });
     assert_eq!(e.state().stage, Stage::RetryExhausted);
-    assert!(e.step(Event::Tick(Time(2000))).effects.is_empty());
+    assert_eq!(
+        e.step(Event::Tick(Time(2000))).effects,
+        [] as [crate::replication::Effect; 0]
+    );
 }
 
 #[test]
@@ -297,7 +309,10 @@ fn retry_wait_holds_back_hints_until_due_and_revocation_needs_its_token() {
         op: tail_op(&refresh),
     });
     assert_eq!(e.state().stage, Stage::RetryWait);
-    assert!(e.step(Event::Tick(Time(999))).effects.is_empty());
+    assert_eq!(
+        e.step(Event::Tick(Time(999))).effects,
+        [] as [crate::replication::Effect; 0]
+    );
     assert_eq!(e.step(Event::Hint).rejection, Some(Reject::Stage));
     assert!(
         e.step(Event::Tick(Time(1000)))
@@ -397,10 +412,16 @@ fn native_floor_coalesces_without_skipping_an_unseen_source_commit() {
 fn terminal_states_and_active_tail_check_ignore_unrelated_wakeups() {
     let mut e = SessionEngine::new(scope(), Mode::EventComplete, Config::default(), 1).unwrap();
     let first = e.step(Event::Resume { cursor: cursor(1) });
-    assert!(e.step(Event::Tick(Time(5))).effects.is_empty());
+    assert_eq!(
+        e.step(Event::Tick(Time(5))).effects,
+        [] as [crate::replication::Effect; 0]
+    );
     e.step(tail(proof(3, 2), 1, tail_op(&first)));
     assert_eq!(e.state().stage, Stage::IrrecoverableGap);
-    assert!(e.step(Event::Tick(Time(5000))).effects.is_empty());
+    assert_eq!(
+        e.step(Event::Tick(Time(5000))).effects,
+        [] as [crate::replication::Effect; 0]
+    );
     assert_eq!(e.step(Event::Hint).rejection, Some(Reject::Stage));
     assert_eq!(
         e.step(Event::Demand {
@@ -410,7 +431,10 @@ fn terminal_states_and_active_tail_check_ignore_unrelated_wakeups() {
         .rejection,
         Some(Reject::Stage)
     );
-    assert!(e.step(Event::Authority(true)).effects.is_empty());
+    assert_eq!(
+        e.step(Event::Authority(true)).effects,
+        [] as [crate::replication::Effect; 0]
+    );
     assert_eq!(e.state().stage, Stage::IrrecoverableGap);
 }
 
@@ -463,7 +487,10 @@ fn cancel_fences_old_work_and_accepts_only_new_generation_revocation_once() {
         Some(Reject::StaleOperation)
     );
     assert_eq!(engine.state().stage, Stage::Cancelled);
-    assert!(engine.step(Event::Tick(Time(50_000))).effects.is_empty());
+    assert_eq!(
+        engine.step(Event::Tick(Time(50_000))).effects,
+        [] as [crate::replication::Effect; 0]
+    );
 }
 
 #[test]

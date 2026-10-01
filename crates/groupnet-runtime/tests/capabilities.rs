@@ -55,13 +55,16 @@ async fn an_advertisement_reaches_peers_and_scopes_the_member_set() {
     // A node that never advertised makes no claim — and that is not the same
     // as a claim of absence, which is why the reads are simply empty/false.
     assert!(!b.node_has_capability(&c_id, CAP));
-    assert!(b.node_capabilities(&c_id).is_empty());
+    assert_eq!(b.node_capabilities(&c_id), [] as [std::string::String; 0]);
 
     // The advertiser's own view agrees with its peers'.
     assert!(a.node_has_capability(&a_id, CAP));
 
     // An unadvertised capability name never matches.
-    assert!(b.members_with_capability("nobody:has-this").is_empty());
+    assert_eq!(
+        b.members_with_capability("nobody:has-this"),
+        [] as [groupnet_core::NodeId; 0]
+    );
 }
 
 /// Replace semantics: the set is rewritten wholesale, so re-advertising an
@@ -96,7 +99,10 @@ async fn re_advertising_replaces_the_whole_set() {
         b.node_capabilities(&a_id).is_empty()
     })
     .await;
-    assert!(b.members_with_capability("mycrate:thing").is_empty());
+    assert_eq!(
+        b.members_with_capability("mycrate:thing"),
+        [] as [groupnet_core::NodeId; 0]
+    );
 }
 
 /// The case the wholesale-entry design exists for: a node restarts under the
@@ -140,7 +146,10 @@ async fn a_restart_retires_the_previous_lifes_advertisement() {
     })
     .await;
     assert!(!b_group.node_has_capability(&a_id, CAP));
-    assert!(b_group.members_with_capability(CAP).is_empty());
+    assert_eq!(
+        b_group.members_with_capability(CAP),
+        [] as [groupnet_core::NodeId; 0]
+    );
     assert!(
         reborn.node_capabilities(&a_id).is_empty(),
         "the reborn node does not re-adopt its own dead advertisement either"

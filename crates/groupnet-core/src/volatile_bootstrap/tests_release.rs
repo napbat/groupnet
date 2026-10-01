@@ -147,7 +147,13 @@ fn failed_sample_inside_the_grace_keeps_following_the_builder() {
     assert_eq!(failed.rejection, None);
     assert!(follows(&failed, &follower.builder.identity));
     assert!(!builds(&failed));
-    assert!(released(&failed).is_empty());
+    assert_eq!(
+        released(&failed),
+        [] as [(
+            crate::volatile_bootstrap::types::ClaimIdentity,
+            crate::volatile_bootstrap::types::ReleaseReason
+        ); 0]
+    );
     assert_eq!(follower.engine.stage(), BootstrapStage::Following);
     // A duplicate or late failure for the replaced operation changes nothing.
     assert_eq!(
@@ -170,7 +176,13 @@ fn failed_sample_before_any_selection_falls_back_without_release() {
     let failed = follower.step(BootstrapEvent::ObservationFailed { op });
     assert_eq!(failed.rejection, None);
     assert_eq!(follower.engine.stage(), BootstrapStage::Fallback);
-    assert!(released(&failed).is_empty());
+    assert_eq!(
+        released(&failed),
+        [] as [(
+            crate::volatile_bootstrap::types::ClaimIdentity,
+            crate::volatile_bootstrap::types::ReleaseReason
+        ); 0]
+    );
 }
 
 #[test]
@@ -181,7 +193,13 @@ fn suspected_builder_is_resampled_not_replaced() {
     assert_eq!(unseen.rejection, None);
     assert!(follows(&unseen, &follower.builder.identity));
     assert!(!builds(&unseen));
-    assert!(released(&unseen).is_empty());
+    assert_eq!(
+        released(&unseen),
+        [] as [(
+            crate::volatile_bootstrap::types::ClaimIdentity,
+            crate::volatile_bootstrap::types::ReleaseReason
+        ); 0]
+    );
 }
 
 #[test]
@@ -225,7 +243,13 @@ fn stalled_builder_is_released_once() {
     let op = follower.op.expect("resampled after the release");
     let ended = follower.step(BootstrapEvent::ObservationFailed { op });
     assert_eq!(follower.engine.stage(), BootstrapStage::Fallback);
-    assert!(released(&ended).is_empty());
+    assert_eq!(
+        released(&ended),
+        [] as [(
+            crate::volatile_bootstrap::types::ClaimIdentity,
+            crate::volatile_bootstrap::types::ReleaseReason
+        ); 0]
+    );
 }
 
 #[test]

@@ -318,7 +318,10 @@ fn adopts_a_better_pair_and_teaches_back_a_worse_one() {
         vec![(rank[1].clone(), state_of(3, &rank[0]))],
         "a worse pair is repaired, not adopted"
     );
-    assert!(leadership_changes(&taught).is_empty());
+    assert_eq!(
+        leadership_changes(&taught),
+        [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+    );
     assert_eq!(e.leadership(), (3, Some(&rank[0])));
 
     let quiet = e.on_message(
@@ -585,7 +588,10 @@ fn a_host_serves_out_its_lease_after_losing_rank_then_steps_down() {
     better(&mut recovers, Status::Alive, Time(1_100));
     better(&mut recovers, Status::Dead, Time(2_000));
     let renewed = recovers.on_tick(Time(2_500));
-    assert!(leadership_changes(&renewed).is_empty());
+    assert_eq!(
+        leadership_changes(&renewed),
+        [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+    );
     assert_eq!(recovers.role(), Role::Host);
     assert_eq!(
         recovers.host_lease_until(),
@@ -621,7 +627,10 @@ fn a_stale_claim_is_answered_with_the_pair_we_hold() {
             vec![(rank[1].clone(), state_of(3, &rank[0]))],
             "a claim at epoch {epoch} is behind the pair we hold"
         );
-        assert!(leadership_changes(&taught).is_empty());
+        assert_eq!(
+            leadership_changes(&taught),
+            [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+        );
     }
     assert_eq!(e.observed_epoch(), 3);
 
@@ -672,7 +681,10 @@ fn a_hostless_fence_answers_a_claim_from_below_and_kills_it() {
         vec![(rank[2].clone(), hostless_state_of(5))],
         "a claim below the fence must be answered, host or no host"
     );
-    assert!(leadership_changes(&taught).is_empty());
+    assert_eq!(
+        leadership_changes(&taught),
+        [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+    );
     assert_eq!(
         fence.leadership(),
         (5, None),
@@ -784,7 +796,10 @@ fn leaving_gives_up_hostship_before_the_leave_disseminates() {
     claiming.on_tick(Time(500));
     assert_eq!(claiming.role(), Role::Claimant);
     let left = claiming.apply(Command::Leave);
-    assert!(leadership_changes(&left).is_empty());
+    assert_eq!(
+        leadership_changes(&left),
+        [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+    );
     assert_eq!(claiming.role(), Role::Follower);
     assert!(
         lead_bodies(&claiming.on_tick(Time(1_000))).is_empty(),
@@ -840,7 +855,10 @@ fn an_eventual_group_runs_no_election() {
             lead_bodies(&effects).is_empty(),
             "an Eventual group emitted an election frame at {at}"
         );
-        assert!(leadership_changes(&effects).is_empty());
+        assert_eq!(
+            leadership_changes(&effects),
+            [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+        );
     }
 }
 

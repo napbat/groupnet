@@ -444,7 +444,7 @@ mod tests {
             epoch: 7,
             lease_until: Time(99_000),
         });
-        assert!(!effects.is_empty());
+        assert_ne!(effects, [] as [crate::engine::effect::Effect; 0]);
         assert_eq!(engine.role(), Role::Host);
     }
 
@@ -479,7 +479,7 @@ mod tests {
             epoch: 8,
             lease_until: Time(99_000),
         });
-        assert!(!won.is_empty());
+        assert_ne!(won, [] as [crate::engine::effect::Effect; 0]);
         assert_eq!(engine.leadership(), (8, Some(&n("a"))));
     }
 
@@ -563,7 +563,7 @@ mod tests {
             epoch: 3,
             lease_until: Time(11_000),
         });
-        assert!(stale.is_empty());
+        assert_eq!(stale, [] as [crate::engine::effect::Effect; 0]);
         assert_eq!(
             engine.host_lease_until(),
             Some(Time(14_000)),

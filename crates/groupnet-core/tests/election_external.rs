@@ -163,8 +163,14 @@ fn the_top_ranked_node_prompts_once_past_its_boot_guard() {
     assert_eq!(run.engine.role(), Role::Follower);
     assert_eq!(run.engine.observed_epoch(), 0);
     assert_eq!(run.engine.leadership(), (0, None));
-    assert!(leadership_changes(&opened).is_empty());
-    assert!(election_frames(&opened).is_empty());
+    assert_eq!(
+        leadership_changes(&opened),
+        [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+    );
+    assert_eq!(
+        election_frames(&opened),
+        [] as [(groupnet_core::NodeId, groupnet_core::wire::LeadBody); 0]
+    );
     run.assert_pure();
 }
 
@@ -283,7 +289,7 @@ fn a_repeat_activation_at_the_same_epoch_only_extends_the_lease() {
         epoch: 1,
         lease_until: Time(9_000),
     });
-    assert!(late.is_empty());
+    assert_eq!(late, [] as [groupnet_core::Effect; 0]);
     assert_eq!(run.engine.host_lease_until(), Some(Time(12_000)));
     assert_eq!(run.engine.leadership(), (1, Some(&rank[0])));
     run.assert_pure();
@@ -344,12 +350,12 @@ fn a_record_naming_this_node_is_learned_as_an_epoch_never_as_a_hostship() {
 
     // The same record read again is the fixed point this rule leaves behind:
     // inert, so a driver polling the anchor cannot churn the effect stream.
-    assert!(
+    assert_eq!(
         run.apply(Command::AnchorObserved {
             epoch: 5,
             host: rank[0].clone(),
-        })
-        .is_empty()
+        }),
+        [] as [groupnet_core::Effect; 0]
     );
     assert_eq!(run.engine.leadership(), (5, None));
 
@@ -383,7 +389,10 @@ fn a_host_that_stops_winning_anchor_rounds_demotes_at_its_exact_lease() {
     // of nothing — only a fresh anchor round (row X3) extends the lease.
     let held = run.tick(9_999);
     assert!(run.engine.is_coordinator(), "still top-ranked");
-    assert!(leadership_changes(&held).is_empty());
+    assert_eq!(
+        leadership_changes(&held),
+        [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+    );
     assert_eq!(run.engine.role(), Role::Host);
     assert_eq!(
         run.engine.host_lease_until(),

@@ -100,7 +100,10 @@ fn a_promise_blocked_claimant_retries_its_self_grant_until_the_promise_lapses() 
         persisted_grants(&early).is_empty(),
         "the retry granted inside a live promise"
     );
-    assert!(leadership_changes(&early).is_empty());
+    assert_eq!(
+        leadership_changes(&early),
+        [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+    );
     assert_eq!(e.role(), Role::Claimant);
     assert_eq!(e.voter_grant(), Some((5, &rank[1])), "the ledger is intact");
 

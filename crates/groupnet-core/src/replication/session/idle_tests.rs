@@ -175,7 +175,10 @@ fn first_activity_restores_hot_cadence_without_per_read_checks() {
     );
     assert_eq!(engine.next_deadline(), Some(Time(20)));
     for _ in 0..20 {
-        assert!(engine.step(Event::Activity).effects.is_empty());
+        assert_eq!(
+            engine.step(Event::Activity).effects,
+            [] as [crate::replication::Effect; 0]
+        );
     }
     let due = engine.step(Event::Tick(Time(20)));
     assert_eq!(
@@ -230,7 +233,7 @@ fn activity_cannot_bypass_retry_or_terminal_recovery_stage() {
     engine.retry_due = Some(Time(50));
     let retry = engine.step(Event::Activity);
     assert!(retry.rejection.is_none());
-    assert!(retry.effects.is_empty());
+    assert_eq!(retry.effects, [] as [crate::replication::Effect; 0]);
     assert_eq!(engine.state.stage, Stage::RetryWait);
     assert_eq!(engine.retry_due, Some(Time(50)));
 
@@ -238,7 +241,7 @@ fn activity_cannot_bypass_retry_or_terminal_recovery_stage() {
     engine.retry_due = None;
     let gap = engine.step(Event::Activity);
     assert!(gap.rejection.is_none());
-    assert!(gap.effects.is_empty());
+    assert_eq!(gap.effects, [] as [crate::replication::Effect; 0]);
     assert_eq!(engine.state.stage, Stage::NeedsSnapshot);
 }
 
@@ -249,7 +252,7 @@ fn activity_during_due_tail_does_not_queue_duplicate_source_check() {
     let op = tail_op(&due);
     let activity = engine.step(Event::Activity);
     assert!(activity.rejection.is_none());
-    assert!(activity.effects.is_empty());
+    assert_eq!(activity.effects, [] as [crate::replication::Effect; 0]);
     assert!(!engine.pending_tail);
     let completed = respond_tail(&mut engine, op, 1);
     assert!(

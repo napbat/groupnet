@@ -691,7 +691,7 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::ArmTimer(_)))
         );
         let early = engine.step(Event::Tick(Time(999)));
-        assert!(early.effects.is_empty());
+        assert_eq!(early.effects, [] as [crate::replication::Effect; 0]);
         let read = engine.step(Event::Tick(Time(1000)));
         let (read_op, key, request_id) = read
             .effects
@@ -857,7 +857,7 @@ mod tests {
             Some(Reject::Subscription(SubscriptionError::HistoryUnavailable))
         );
         assert_eq!(engine.state.stage, Stage::IrrecoverableGap);
-        assert!(stopped.effects.is_empty());
+        assert_eq!(stopped.effects, [] as [crate::replication::Effect; 0]);
         assert!(engine.subscription_terminal().is_none());
     }
 }

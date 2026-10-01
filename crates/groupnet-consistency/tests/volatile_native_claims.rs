@@ -314,7 +314,10 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
         .await
         .unwrap();
     assert_eq!(cut.get().participants.len(), 2);
-    assert!(cut.get().claims.is_empty());
+    assert_eq!(
+        cut.get().claims,
+        [] as [groupnet_core::volatile_bootstrap::BootstrapClaim; 0]
+    );
     drop(cut);
     let queued = budget.reserve(AdmissionClass::Inflight, 128).unwrap();
     cluster.groups[0]

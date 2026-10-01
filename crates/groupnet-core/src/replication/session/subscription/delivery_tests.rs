@@ -358,7 +358,7 @@ fn registration_and_resume_reject_another_native_scope_before_source_effect() {
             )
         ))
     );
-    assert!(start.effects.is_empty());
+    assert_eq!(start.effects, [] as [crate::replication::Effect; 0]);
     let resume = engine.step(Event::ResumeSubscription {
         request: Box::new(crate::replication::ResumeSubscriber {
             key: requested.key,
@@ -369,6 +369,6 @@ fn registration_and_resume_reject_another_native_scope_before_source_effect() {
         limits: SubscriptionLimits::default(),
     });
     assert_eq!(resume.rejection, start.rejection);
-    assert!(resume.effects.is_empty());
+    assert_eq!(resume.effects, [] as [crate::replication::Effect; 0]);
     assert_eq!(engine.state().stage, Stage::Unready);
 }

@@ -41,7 +41,10 @@ async fn floors_disseminate_and_list_their_publishers() {
 
     // Nothing claimed yet: absence, not zero.
     assert_eq!(reader.floor_of(&a_id, "shard-7"), None);
-    assert!(reader.floors_for("shard-7").is_empty());
+    assert_eq!(
+        reader.floors_for("shard-7"),
+        [] as [(groupnet_core::NodeId, u64); 0]
+    );
 
     writer.publish("shard-7", 4_210).expect("entry accepted");
 

@@ -127,7 +127,10 @@ fn cancel_is_terminal_for_all_restart_signals() {
     ] {
         let rejected = recovery.step(event);
         assert_eq!(rejected.rejection, Some(RecoveryError::Stage));
-        assert!(rejected.effects.is_empty());
+        assert_eq!(
+            rejected.effects,
+            [] as [crate::volatile_recovery::types::RecoveryEffect; 0]
+        );
         assert_eq!(recovery.state().stage, RecoveryStage::Cancelled);
         assert_eq!(recovery.next_deadline(), None);
     }
@@ -203,11 +206,9 @@ fn exhausted_episodes_rearm_at_capped_intervals_and_coalesce_signals() {
         assert_eq!(recovery.next_deadline(), Some(Time(105)));
     }
     assert_eq!(recovery.state().covered_lapses, 8);
-    assert!(
-        recovery
-            .step(RecoveryEvent::Tick(Time(104)))
-            .effects
-            .is_empty()
+    assert_eq!(
+        recovery.step(RecoveryEvent::Tick(Time(104))).effects,
+        [] as [crate::volatile_recovery::types::RecoveryEffect; 0]
     );
     let second = recovery.step(RecoveryEvent::Tick(Time(105)));
     assert_eq!(recovery.state().generation, generation + 1);
@@ -501,7 +502,10 @@ fn vanished_member_and_cancel_fail_closed() {
     );
     let explicit = recovery.step(RecoveryEvent::Start);
     assert_eq!(explicit.rejection, Some(RecoveryError::Stage));
-    assert!(explicit.effects.is_empty());
+    assert_eq!(
+        explicit.effects,
+        [] as [crate::volatile_recovery::types::RecoveryEffect; 0]
+    );
 }
 
 #[test]

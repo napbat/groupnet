@@ -305,7 +305,10 @@ fn a_non_voter_and_a_settle_engine_never_grant() {
         Time(LEASE),
     );
     assert!(grant_frames(&effects).is_empty(), "a non-voter granted");
-    assert!(persisted_grants(&effects).is_empty());
+    assert_eq!(
+        persisted_grants(&effects),
+        [] as [(u64, groupnet_core::NodeId); 0]
+    );
     assert_eq!(non_voter.voter_grant(), None);
 
     let mut settle = hosted_engine(rank[0].as_str(), &[], 500, LEASE);
@@ -317,7 +320,10 @@ fn a_non_voter_and_a_settle_engine_never_grant() {
         Time(LEASE),
     );
     assert!(grant_frames(&effects).is_empty(), "a Settle engine granted");
-    assert!(persisted_grants(&effects).is_empty());
+    assert_eq!(
+        persisted_grants(&effects),
+        [] as [(u64, groupnet_core::NodeId); 0]
+    );
     assert_eq!(settle.voter_grant(), None);
 }
 
@@ -334,8 +340,19 @@ fn a_leaving_voter_refuses() {
         &lead_claim_frame(4, rank[1].as_str()),
         Time(LEASE),
     );
-    assert!(grant_frames(&effects).is_empty());
-    assert!(persisted_grants(&effects).is_empty());
+    assert_eq!(
+        grant_frames(&effects),
+        [] as [(
+            groupnet_core::NodeId,
+            u64,
+            groupnet_core::NodeId,
+            groupnet_core::NodeId
+        ); 0]
+    );
+    assert_eq!(
+        persisted_grants(&effects),
+        [] as [(u64, groupnet_core::NodeId); 0]
+    );
     assert_eq!(e.voter_grant(), None);
 }
 
@@ -467,7 +484,7 @@ fn a_grant_to_a_follower_is_dropped() {
         &lead_grant_frame(1, rank[0].as_str(), rank[1].as_str()),
         Time(10),
     );
-    assert!(effects.is_empty());
+    assert_eq!(effects, [] as [groupnet_core::Effect; 0]);
     assert_eq!(e.role(), Role::Follower);
     assert_eq!(e.leadership(), (0, None));
 }
@@ -488,7 +505,10 @@ fn a_window_that_shuts_without_a_majority_abandons_and_re_bids_one_higher() {
         election_frames(&shut).is_empty(),
         "an abandoned claim announces nothing"
     );
-    assert!(leadership_changes(&shut).is_empty());
+    assert_eq!(
+        leadership_changes(&shut),
+        [] as [(u64, std::option::Option<groupnet_core::NodeId>); 0]
+    );
     assert_eq!(e.role(), Role::Follower);
     assert_eq!(e.leadership(), (0, None), "no host was ever entered");
     assert_eq!(e.host_lease_until(), None);
@@ -576,7 +596,7 @@ fn an_empty_roster_never_activates() {
         &lead_grant_frame(e.observed_epoch(), rank[0].as_str(), rank[1].as_str()),
         Time(20 * LEASE),
     );
-    assert!(effects.is_empty());
+    assert_eq!(effects, [] as [groupnet_core::Effect; 0]);
     assert_ne!(e.role(), Role::Host);
     assert_eq!(e.leadership(), (0, None));
 }

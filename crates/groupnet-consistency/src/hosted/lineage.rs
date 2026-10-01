@@ -479,7 +479,10 @@ mod tests {
         // The initial belief is already `(0, None)`, so re-adopting it is silent
         // — a subscriber in an unelected group emits nothing at all.
         lineage.adopt(0, None);
-        assert!(drain(&mut lineage).is_empty());
+        assert_eq!(
+            drain(&mut lineage),
+            [] as [crate::hosted::lineage::HostedRead<std::string::String>; 0]
+        );
 
         lineage.adopt(5, Some(node("h1")));
         assert_eq!(drain(&mut lineage), vec![migrated(5, Some("h1"))]);
@@ -529,7 +532,10 @@ mod tests {
             peer: node("h1"),
             token: WriteToken { epoch: 5, seq: 1 },
         });
-        assert!(drain(&mut lineage).is_empty());
+        assert_eq!(
+            drain(&mut lineage),
+            [] as [crate::hosted::lineage::HostedRead<std::string::String>; 0]
+        );
         lineage.admit(PeerWrite::Renewed {
             peer: node("h1"),
             sealed: WriteToken { epoch: 4, seq: 3 },
@@ -664,7 +670,10 @@ mod tests {
         // alike, however late they arrive.
         lineage.admit(wrote("h1", 5, 4));
         lineage.admit(inner_gap("h1", 5, 9));
-        assert!(drain(&mut lineage).is_empty());
+        assert_eq!(
+            drain(&mut lineage),
+            [] as [crate::hosted::lineage::HostedRead<std::string::String>; 0]
+        );
         assert!(lineage.held.is_empty(), "dropped, not held");
     }
 
@@ -684,7 +693,10 @@ mod tests {
         // behind the service it has already been admitted to. An epoch-5 write
         // must not open a lineage under it.
         lineage.admit(wrote("h1", 5, 1));
-        assert!(drain(&mut lineage).is_empty());
+        assert_eq!(
+            drain(&mut lineage),
+            [] as [crate::hosted::lineage::HostedRead<std::string::String>; 0]
+        );
         // A held write at or above the floor survives the cut and is replayed
         // when its pair is adopted, exactly as an uncut one would be.
         lineage.admit(wrote("h2", 8, 1));
@@ -724,7 +736,10 @@ mod tests {
         lineage.adopt(7, Some(node("h3")));
         drain(&mut lineage);
         lineage.admit(wrote("h2", 6, 1));
-        assert!(drain(&mut lineage).is_empty());
+        assert_eq!(
+            drain(&mut lineage),
+            [] as [crate::hosted::lineage::HostedRead<std::string::String>; 0]
+        );
         assert!(lineage.held.is_empty(), "dropped, not held");
     }
 
@@ -759,7 +774,10 @@ mod tests {
         assert_eq!(drain(&mut lineage), vec![gap(5, 9), read("h1", 5, 10)]);
         // A gap already covered by what was delivered changes nothing.
         lineage.admit(inner_gap("h1", 5, 5));
-        assert!(drain(&mut lineage).is_empty());
+        assert_eq!(
+            drain(&mut lineage),
+            [] as [crate::hosted::lineage::HostedRead<std::string::String>; 0]
+        );
         assert_eq!(lineage.gaps, 2);
     }
 

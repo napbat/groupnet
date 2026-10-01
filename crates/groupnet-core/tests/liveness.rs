@@ -363,7 +363,7 @@ fn a_frame_with_an_unknown_status_code_is_dropped_whole() {
         &digest_frame(vec![ndigest("b", 0, Status::Alive, 0), digest], vec![]),
         Time(1),
     );
-    assert!(effects.is_empty());
+    assert_eq!(effects, [] as [groupnet_core::Effect; 0]);
     assert_eq!(a.member_status(&NodeId::new("b")), None);
     assert_eq!(a.member_status(&NodeId::new("c")), None);
 
@@ -377,7 +377,7 @@ fn a_frame_with_an_unknown_status_code_is_dropped_whole() {
         ]),
         Time(2),
     );
-    assert!(effects.is_empty());
+    assert_eq!(effects, [] as [groupnet_core::Effect; 0]);
     assert_eq!(a.member_status(&NodeId::new("b")), None);
     assert_eq!(a.member_status(&NodeId::new("c")), None);
 }

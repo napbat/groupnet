@@ -687,7 +687,10 @@ mod tests {
         assert!(!order.contains(&me), "{:?}", names(&order));
         assert_eq!(order.len(), members.len() - 1);
         // A group of one, where the one is the caller, is nobody.
-        assert!(rank_donors(GROUP, &members[..1], &members[0], None, |_| true).is_empty());
+        assert_eq!(
+            rank_donors(GROUP, &members[..1], &members[0], None, |_| true),
+            [] as [groupnet_core::NodeId; 0]
+        );
     }
 
     /// The load-bearing half of the rule, and the one a live cluster cannot
@@ -732,8 +735,14 @@ mod tests {
     fn nothing_covering_is_an_empty_list_and_not_a_guess() {
         let members = nodes(&["d-a", "d-b", "d-c"]);
         let host = members[0].clone();
-        assert!(rank_donors(GROUP, &members, &outsider(), Some(&host), |_| false).is_empty());
-        assert!(rank_donors(GROUP, &[], &outsider(), None, |_| true).is_empty());
+        assert_eq!(
+            rank_donors(GROUP, &members, &outsider(), Some(&host), |_| false),
+            [] as [groupnet_core::NodeId; 0]
+        );
+        assert_eq!(
+            rank_donors(GROUP, &[], &outsider(), None, |_| true),
+            [] as [groupnet_core::NodeId; 0]
+        );
     }
 
     #[test]

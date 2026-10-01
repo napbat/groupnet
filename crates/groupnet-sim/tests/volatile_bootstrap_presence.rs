@@ -137,7 +137,10 @@ fn reject_old(engine: &mut ClaimEngine, old: &ClaimIdentity) {
         selected: old.clone(),
     });
     assert!(stale.rejection.is_some());
-    assert!(stale.effects.is_empty());
+    assert_eq!(
+        stale.effects,
+        [] as [groupnet_core::volatile_bootstrap::BootstrapEffect; 0]
+    );
 }
 
 #[test]

@@ -648,7 +648,10 @@ fn capacity_and_time_expiry_release_all_followers_without_truncating_shared_suff
     journal.tick(Time(15)).unwrap();
     assert_eq!(journal.inflight_bytes(), held_bytes);
     assert_eq!(journal.take_aborted(), vec![a.clone(), b.clone()]);
-    assert!(journal.take_aborted().is_empty());
+    assert_eq!(
+        journal.take_aborted(),
+        [] as [crate::volatile_bootstrap::journal::types::ReservationId; 0]
+    );
     assert_eq!(journal.retire_aborted(&b, None), Err(JournalError::Stale));
     journal.retire_aborted(&a, None).unwrap();
     drop(held_b);
