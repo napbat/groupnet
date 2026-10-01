@@ -64,12 +64,18 @@ pub struct ClaimEngine {
     /// failed attempt does not extend it. It only acts while the recapture is
     /// pending: a running attempt holds its own operation bound instead.
     recapture_due: Option<Time>,
-    /// No Ready recapture starts before this: the backoff after the last
-    /// failed one. Cleared once it passes.
+    /// No Ready recapture under the participants of [`Self::failed_participants`]
+    /// starts before this: the backoff after the last failed one. Cleared
+    /// once it passes.
     recapture_retry_due: Option<Time>,
     /// Consecutive failed Ready recaptures since a capture last stayed Ready
-    /// for a whole claim window.
+    /// for a whole claim window, or since a new participant reset them.
     recapture_failures: u32,
+    /// The presence identities the failed attempts since a capture last
+    /// proved itself were taken under, at most one per listed node. A cut
+    /// naming any other participant, a joiner or a restarted peer, ends the
+    /// backoff: no failure so far was an attempt to serve it.
+    failed_participants: Vec<PresenceIdentity>,
     /// This candidate retired holding a peer's installed image: once its
     /// recovery is Ready, the image may be adopted as a donor-capable local
     /// image, as an origin build's is.
@@ -148,6 +154,7 @@ impl ClaimEngine {
             recapture_due: None,
             recapture_retry_due: None,
             recapture_failures: 0,
+            failed_participants: Vec::new(),
             installed_image: false,
             ready_capture: None,
             observed_presence: BTreeMap::new(),
@@ -235,7 +242,11 @@ impl ClaimEngine {
         self.participant_roster.as_deref()
     }
 
-    /// A completed local origin image needs one fresh Ready donor recapture.
+    /// A completed local image awaits one fresh Ready donor recapture. The
+    /// worker samples a complete cut on each maintenance turn and offers it
+    /// with [`BootstrapEvent::StartReadyRecapture`]; the core starts the
+    /// attempt or, while a failure's backoff or a closed claim window holds
+    /// for that cut, nothing.
     #[must_use]
     pub fn ready_recapture_pending(&self) -> bool {
         self.participation_required
@@ -244,13 +255,11 @@ impl ClaimEngine {
             && self.selected.as_ref() == Some(&self.identity())
     }
 
-    /// A pending Ready recapture may start now: the backoff after its last
-    /// failed attempt has passed. The worker samples a cut for it only then,
-    /// so failures cost at most one capture per backoff, however often the
-    /// membership changes.
+    /// A failed Ready recapture's backoff holds: a cut naming only the
+    /// participants it failed under starts nothing yet.
     #[must_use]
-    pub fn ready_recapture_due(&self) -> bool {
-        self.ready_recapture_pending() && self.recapture_retry_due.is_none()
+    pub fn ready_recapture_backing_off(&self) -> bool {
+        self.ready_recapture_pending() && self.recapture_retry_due.is_some()
     }
 
     /// Earliest finite local deadline; the runtime must drive `Tick` at it.
@@ -376,6 +385,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.failed_participants.clear();
         self.ready_capture = None;
         effects.push(BootstrapEffect::WithdrawClaim(self.identity()));
         effects.push(BootstrapEffect::FallbackOrigin);
@@ -480,6 +490,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.failed_participants.clear();
         self.installed_image = false;
         self.ready_capture = None;
         self.roster_poll = None;
@@ -715,15 +726,10 @@ impl ClaimEngine {
         ) {
             return self.ok(Vec::new());
         }
-        // An installed image keeps the cut its transfer was verified under:
-        // once adopted, only a membership change from it asks for a capture.
+        // An installed image may be adopted once its recovery is Ready.
         self.installed_image =
             self.participation_required && self.stage == BootstrapStage::Transferred;
-        self.failed_recapture = if self.installed_image {
-            self.participant_roster.take()
-        } else {
-            None
-        };
+        self.failed_recapture = None;
         let identity = (self.generation > 0).then(|| self.identity());
         let previous_operation = self.operation.take();
         let roster_poll = self.roster_poll.take();
@@ -749,6 +755,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.failed_participants.clear();
         self.ready_capture = None;
         self.selected = None;
         self.participant_roster = None;
@@ -773,6 +780,7 @@ impl ClaimEngine {
         self.recapture_due = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.failed_participants.clear();
         self.ready_capture = None;
         self.operation = None;
         self.selected = None;

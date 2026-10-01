@@ -363,7 +363,10 @@ impl World {
             .is_some_and(|at| now >= at && (now - at).is_multiple_of(CONFIG.renew_ms))
             && self.donor.suspended_until.is_none_or(|until| now >= until)
             && self.donor.capture.is_none()
-            && self.engines[DONOR].as_ref().unwrap().ready_recapture_due()
+            && self.engines[DONOR]
+                .as_ref()
+                .unwrap()
+                .ready_recapture_pending()
             && self.verify(DONOR, now)
         {
             let engine = self.engines[DONOR].as_mut().unwrap();

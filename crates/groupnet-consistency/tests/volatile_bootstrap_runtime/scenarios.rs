@@ -859,8 +859,10 @@ async fn completed_peer_keeps_presence_through_lapse_for_a_third_join() {
         .clone()
         .expect("presence survives transfer");
     assert!(
-        claims.local.lock().unwrap().is_none(),
-        "candidate claim retired"
+        claims.local.lock().unwrap().as_ref().is_none_or(
+            |claim| claim.phase != groupnet_core::volatile_bootstrap::ClaimPhase::Willing
+        ),
+        "candidate claim retired; only the adopted image's own claim may follow it"
     );
     handle.lease_lapse(1).unwrap();
     eventually_within(

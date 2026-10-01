@@ -181,17 +181,31 @@ participation cut, the worker publishes every renewal the engine has
 scheduled, including one that came due while the capture held the worker:
 that cut is verified against the worker's own claim sequence. A recapture that
 fails or outlives its donor-wait bound is pending again, never an origin
-fallback. Its retry waits a backoff of one observation interval after the
+fallback. While a recapture is pending, every maintenance turn samples a
+complete cut and offers it to the core, which starts the attempt or nothing.
+A failed attempt's retry waits a backoff of one observation interval after the
 first failure, doubling, capped at a quarter of `donor_wait_ms` but never
-under one interval; the worker does not even sample a cut for it before then.
+under one interval. The backoff paces only the participants the failures were
+taken under. The core keeps the presence identities (process boot and worker
+session) the failed attempts' cuts named, at most one per listed node, and a
+cut naming any other participant, a joiner or a restarted peer's new life,
+ends the backoff and starts the failures over: its first capture starts at
+once. A follower must be in its donor's roster, so no failed attempt could
+have served it, and most failures it would otherwise wait out are its own
+arrival's: its predecessor's leave lapses the donor's lease and fails a running
+attempt, the reap changes the roster, and the join itself lapses the donor's
+lease and retires its capture, each within a claim window of the last. No stall
+of this node can mint a participant: a member whose presence lapses and
+returns is the same one, so a capture that costs its own lapse cannot reset
+its own backoff.
 The claim window opened when the image became pending (the local-only build,
-or a retired capture) is not extended by failures: inside it the claim stays
-renewed and a retry runs under any complete cut, so a transient failure or a
-join that interrupts a recapture is retried once its backoff has passed. When
-the window closes the claim is withdrawn, and only a cut binding a different
-membership than the one the last attempt failed under starts another attempt,
-which opens a fresh window; a failure the membership did not cause never
-loops, and no joiner waits on it.
+the adoption of an installed image, or a retired capture) is not extended by
+failures: inside it the claim stays renewed and a retry runs under any
+complete cut, so a transient failure or a join that interrupts a recapture is
+retried once its backoff has passed. When the window closes the claim is
+withdrawn, and only a cut binding a different membership than the one the
+last attempt failed under starts another attempt, which opens a fresh window;
+a failure the membership did not cause never loops, and no joiner waits on it.
 A Ready capture proves itself by staying Ready for one whole claim window.
 One retired sooner, by a lapse, an expiry or a membership change, is one more
 failed attempt: failures accumulate and the backoff keeps doubling until a
@@ -203,19 +217,22 @@ stalls its own node into a lease lapse therefore costs at most one window's
 worth of attempts per membership, not one per lapse. With `observe_ms` = 1 s
 and `donor_wait_ms` = 30 s, starts are at least 1, 2, 4, 7.5, 7.5 and 7.5 s
 apart after each failure, so one window's backoff holds at most seven
-attempts, and after it each membership change grants one attempt at most
-every 7.5 s.
+attempts, and after it each membership change among the same participants
+grants one attempt at most every 7.5 s. A new participant grants one
+immediate attempt and starts its own such series; participants come only from
+process boots and worker sessions elsewhere, so this adds no loop.
 
 A node Ready on a peer's installed image is a donor as well. When its outer
 recovery affirms Ready, the core binds the retired candidate's installed image
 to the child as its local baseline (`AdoptLocalBaseline`), held as a completed
-local image with a closed claim window: no claim is published and nothing is
-captured while the cut its transfer was verified under holds, so the builder
-stays the only donor. A cut binding any other membership, such as a joiner or
-a restarted peer, starts one Ready recapture under a fresh Building claim,
-exactly as for an origin build, and a lease lapse suspends and resumes the
-adopted baseline as it does a built one. A fleet therefore keeps a donor
-whichever node built the index first, including after that builder restarts.
+local image whose Ready recapture is pending at once: the core opens a fresh
+claim window and publishes a fresh attempt's Building claim for it, and the
+next verified complete cut captures it, unchanged membership and all, exactly
+as for an origin build. Every lapse or membership change after that retires
+and replaces the capture as it does a built one. A rejoiner is so a donor
+within one capture of its own Ready, whichever node built the index first: the
+next pod a rolling update stops leaves behind a node whose image is Ready or
+advertised, not one waiting for a membership change to capture it.
 
 Each attempt's cut at C is taken under the publication fence and the index
 write lock, and C must stay one atomic cut with its journal ingress and native
@@ -243,16 +260,22 @@ A gap, lapse, or join closes the gate and invalidates that guard; no donor
 recapture occurs until the new recovery episode reaffirms and its exact child
 generation matches the new guard. Every attempt keeps a fresh finite
 donor-wait deadline and never repeats the completed origin LIST.
-For a lease lapse that retains a locally built baseline, the sans-IO recovery
-engine suspends the child first: its old capture is retired, its origin
-publication permit is discarded, and a Ready claim is superseded by a fresh
-attempt's Building claim, renewed under the same bound as above while presence
-renewal continues. A join commonly causes exactly such a lapse, so withdrawing
-the claim here would let the joiner, sampling during the lapse, scan the
+For a lease lapse that retains a locally built or adopted baseline, the
+sans-IO recovery engine suspends the child first: its Ready capture, if it
+holds one, is retired, its origin publication permit is discarded, and its
+claim, a Ready one or the Building claim of a recapture still pending, is
+superseded by a fresh attempt's Building claim, renewed for a fresh window
+under the same bound as above while presence renewal continues. A pending
+recapture's claim is renewed even if its window had closed and the claim was
+withdrawn. A join commonly causes exactly such a lapse, so leaving the claim
+withdrawn here would let the joiner, sampling during the lapse, scan the
 origin. The retirement also grants the next verified cut one recapture, even
 one equal to a cut a recapture failed under, because that failure belonged to
 the suspended Ready generation, unless the retired capture is itself a failed
-attempt (above) whose retries are spent. The engine issues a new child
+attempt (above) whose retries are spent. A lapse during a running attempt
+retires nothing: that attempt fails at its guarded finish and counts as a
+failure, so a capture that costs its own lapse earns no extra attempt from it.
+The engine issues a new child
 binding only after that same lapse episode passes renewal, head, frontier,
 and final affirmation checks. The child then uses the new Ready guard and a new
 claim/capture identity. A feed

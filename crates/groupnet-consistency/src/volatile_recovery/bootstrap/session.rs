@@ -446,11 +446,12 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             {
                 return;
             }
-            // An adopted installed image may hold no capture yet: nothing is
-            // retired, and its recapture still waits for a membership change.
-            if self.capture.is_some() {
-                self.retire_donor_capture();
-            }
+            // A Ready capture is retired. A pending one holds none, but its
+            // claim, withdrawn once a whole window passed without a capture,
+            // is renewed for a fresh one too: a join commonly causes the
+            // lapse, and the joiner sampling during it must wait for this
+            // image instead of scanning the origin.
+            self.retire_donor_capture();
             self.permit = None;
             self.ready_guard = None;
             self.suspended_recovery = Some(recovery);
@@ -548,9 +549,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
             }
             self.drain_maintenance().await;
             self.ready_guard = None;
-            // A failed recapture waits out its backoff before the next cut
-            // is even sampled for it: each attempt clones the whole index.
-            if self.engine.ready_recapture_due()
+            // Every turn of a pending recapture samples its cut: a joiner
+            // or a restarted peer starts it at once, and only a cut naming
+            // the participants a failed attempt was taken under waits out
+            // that attempt's backoff, which the core decides.
+            if self.engine.ready_recapture_pending()
                 && let Some(deadline) = Instant::now()
                     .checked_add(Duration::from_millis(self.config.claim.donor_wait_ms))
                 && let Some(guard) = ready.map(|guard| guard.restricted_to(deadline))
@@ -562,7 +565,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
                     self.ready_guard = Some(guard);
                     let _ = self.accept(BootstrapEvent::StartReadyRecapture);
                     if self.engine.stage() != BootstrapStage::Building {
-                        self.report_recapture(RecaptureDecline::SameCut);
+                        self.report_recapture(if self.engine.ready_recapture_backing_off() {
+                            RecaptureDecline::BackingOff
+                        } else {
+                            RecaptureDecline::SameCut
+                        });
                     }
                 } else {
                     self.report_recapture(RecaptureDecline::NoCompleteCut);

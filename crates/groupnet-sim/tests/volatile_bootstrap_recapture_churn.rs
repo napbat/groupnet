@@ -457,7 +457,7 @@ impl World {
             return;
         }
         let engine = self.engines[DONOR].as_ref().unwrap();
-        if engine.ready_recapture_due() {
+        if engine.ready_recapture_pending() {
             if self.verify(DONOR, now).is_some() {
                 let engine = self.engines[DONOR].as_mut().unwrap();
                 let step = engine.step(BootstrapEvent::StartReadyRecapture);

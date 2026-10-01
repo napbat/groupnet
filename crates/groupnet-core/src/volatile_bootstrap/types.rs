@@ -297,8 +297,9 @@ pub enum BootstrapEvent {
     /// Retire one recovery candidate without withdrawing process presence.
     RetireCandidate,
     /// The retired candidate's installed peer image now backs a Ready local
-    /// recovery: hold it as a completed local image whose Ready recapture
-    /// starts on a membership change, as a donor for later joiners.
+    /// recovery: hold it as a completed local image, a donor like an origin
+    /// build's, whose Ready recapture is pending at once under a fresh
+    /// Building claim.
     AdoptInstalled,
     /// Publish a fresh local claim and start one finite selection episode.
     Start,
@@ -365,11 +366,13 @@ pub enum BootstrapEvent {
     },
     /// Local origin is serving, so attempt one fresh bounded donor recapture
     /// under the complete participation cut just verified. This is separate
-    /// from the completed origin build and cannot rescan it. It is refused
-    /// until the backoff after a failed attempt has passed
-    /// ([`ClaimEngine::ready_recapture_due`](crate::volatile_bootstrap::ClaimEngine::ready_recapture_due)).
-    /// Once the claim window has closed, a cut binding the same membership as
-    /// the one the last attempt failed under starts nothing.
+    /// from the completed origin build and cannot rescan it. A cut naming
+    /// only the participants a failed attempt was taken under starts nothing
+    /// until its backoff has passed
+    /// ([`ClaimEngine::ready_recapture_backing_off`](crate::volatile_bootstrap::ClaimEngine::ready_recapture_backing_off));
+    /// one naming a new participant, a joiner or a restarted peer, starts at
+    /// once. Once the claim window has closed, a cut binding the same
+    /// membership as the one the last attempt failed under starts nothing.
     StartReadyRecapture,
     /// Peer transfer cannot represent the required roster format. Retire the
     /// transient local claim while leaving participation renewal active and

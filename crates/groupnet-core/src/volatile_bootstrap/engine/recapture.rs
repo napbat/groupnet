@@ -1,16 +1,15 @@
 //! A completed local image's Ready donor recapture.
 //!
-//! From a local build until its Ready claim, across a recapture that a
-//! membership change interrupts, and from a retired Ready capture until its
-//! replacement, the builder keeps a renewed Building claim visible. A follower
-//! that samples in any of those windows waits for this image instead of
-//! scanning the origin itself. A pending recapture makes no progress, so the
-//! claim is renewed for at most the builder's own stall bound from when the
-//! image became pending; a failed attempt does not extend that window.
+//! From a local build or the adoption of a peer's installed image until its
+//! Ready claim, across a recapture that a membership change interrupts, and
+//! from a retired Ready capture until its replacement, the node keeps a
+//! renewed Building claim visible. A follower that samples in any of those
+//! windows waits for this image instead of scanning the origin itself. A
+//! pending recapture makes no progress, so the claim is renewed for at most
+//! the builder's own stall bound from when the image became pending; a failed
+//! attempt does not extend that window.
 //!
-//! Attempts are paced. Each captures the whole index, which on a loaded
-//! one-CPU node can itself make the membership layer suspect this node or
-//! lapse its lease. A failed attempt is retried only after a backoff: one
+//! Attempts are paced. A failed attempt is retried only after a backoff: one
 //! observation interval, doubling, capped at a quarter of the stall bound.
 //! Inside the claim window the retry runs under any complete cut; after it,
 //! only under a cut binding a different membership, and that attempt opens a
@@ -25,6 +24,20 @@
 //! closed window, only a membership change starts another attempt. So a
 //! capture that keeps costing its own lapse is retried a bounded few times,
 //! not once per lapse.
+//!
+//! The backoff paces retries for the participants the failures were taken
+//! under, never the first capture for a new one. A follower must be in its
+//! donor's roster, so no capture taken without a joiner, or without a
+//! restarted peer's new life, can serve it, and no failure so far was an
+//! attempt to: a cut naming a participant that none of the failed attempts
+//! named starts at once, and the failures start over. Most failures a joiner
+//! would otherwise wait out are its own arrival's: the departing peer's lease
+//! lapse fails a running attempt, its reap changes the roster, and the join
+//! itself lapses the donor's lease and retires its capture, each within a
+//! claim window of the last. A participant is one process boot and worker
+//! session, which no stall of this node can mint: a member whose presence
+//! lapses and returns is the same participant, so a capture that costs its own
+//! lapse still cannot reset its own backoff.
 
 use super::ClaimEngine;
 use crate::Time;
@@ -104,6 +117,7 @@ impl ClaimEngine {
         self.failed_recapture = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
+        self.failed_participants.clear();
         self.stage = BootstrapStage::DonorAvailable;
         self.local_phase = ClaimPhase::Building;
         if self.participation_required {
@@ -121,30 +135,35 @@ impl ClaimEngine {
 
     /// Hold a retired candidate's installed peer image, now backing a Ready
     /// local recovery, as a completed local image: a donor like an origin
-    /// build's. No claim is published and nothing is captured now; the
-    /// builder that donated it is still there. As after a closed claim
-    /// window, the Ready recapture starts only under a cut binding a
-    /// membership other than the one the transfer was verified under, so a
-    /// later joiner, or a restarted peer, finds this node's image whichever
-    /// node built it.
+    /// build's. Its Ready recapture is pending at once, under a fresh claim
+    /// window whose Building claim advertises it, and starts under the next
+    /// complete verified cut. The node so offers a Ready capture of its own,
+    /// whichever node built the index, and every lapse or membership change
+    /// after it retires and replaces that capture as an origin build's.
     pub(super) fn adopt_installed(&mut self) -> BootstrapStep {
         if !self.installed_image || self.stage != BootstrapStage::Participating {
             return Self::reject(BootstrapError::Stage);
         }
         self.installed_image = false;
         self.stage = BootstrapStage::DonorAvailable;
-        self.local_phase = ClaimPhase::Building;
-        self.selected = Some(self.identity());
-        self.recapture_due = None;
+        self.failed_recapture = None;
         self.recapture_retry_due = None;
         self.recapture_failures = 0;
-        self.renew_due = None;
-        self.ok(Vec::new())
+        self.failed_participants.clear();
+        let Ok(claim) = self.pending_claim() else {
+            return self.terminate();
+        };
+        if self.await_recapture().is_err() {
+            return self.terminate();
+        }
+        self.ok(vec![claim])
     }
 
     /// Start one bounded recapture of the completed local image under the
     /// complete participation cut the worker just verified. That cut is
-    /// consumed here. Nothing starts before the backoff after a failed
+    /// consumed here. A cut naming a participant that no failed attempt since
+    /// the last proved capture named ends their backoff and starts over the
+    /// failures. Otherwise nothing starts before the backoff after a failed
     /// attempt has passed. Once the claim window has closed, or the failures
     /// have backed off for a whole window, a cut binding the same membership
     /// as the one the last attempt failed under starts nothing either: only a
@@ -153,12 +172,19 @@ impl ClaimEngine {
     /// and no joiner waits on it. A membership change opens a fresh claim
     /// window if none is open.
     pub(super) fn start_ready_recapture(&mut self) -> BootstrapStep {
-        if !self.ready_recapture_due() {
+        if !self.ready_recapture_pending() {
             return Self::reject(BootstrapError::Stage);
         }
         let Some(roster) = self.participant_roster.take() else {
             return Self::reject(BootstrapError::Stage);
         };
+        if self.names_new_participant(&roster) {
+            self.recapture_failures = 0;
+            self.recapture_retry_due = None;
+        }
+        if self.recapture_retry_due.is_some() {
+            return self.ok(Vec::new());
+        }
         if self.recapture_due.is_none() || self.retries_spent() {
             let changed = self
                 .failed_recapture
@@ -194,6 +220,54 @@ impl ClaimEngine {
         ])
     }
 
+    /// Whether `roster` names a participant, one process boot and worker
+    /// session, that none of the failed attempts since the last proved
+    /// capture named, while those failures hold a backoff or a count.
+    fn names_new_participant(&self, roster: &[BootstrapMemberIdentity]) -> bool {
+        (self.recapture_failures > 0 || self.recapture_retry_due.is_some())
+            && roster
+                .iter()
+                .filter_map(|member| member.presence.as_ref())
+                .any(|presence| !self.failed_participants.contains(presence))
+    }
+
+    /// Count one failed attempt, taken under `roster`, and back off from it.
+    /// Its participants are remembered while their node stays listed, with
+    /// that presence or with none, so a presence that lapses and returns is
+    /// still a known participant. A node's earlier life never returns, and a
+    /// reaped node's return is a membership event that SWIM paces, not this
+    /// node's: both are forgotten, so at most one participant is kept per
+    /// listed node.
+    fn count_failure(
+        &mut self,
+        roster: Option<&[BootstrapMemberIdentity]>,
+    ) -> Result<(), BootstrapError> {
+        self.recapture_failures = self.recapture_failures.saturating_add(1);
+        if let Some(roster) = roster {
+            self.failed_participants.retain(|known| {
+                roster.iter().any(|member| {
+                    member.node == known.node
+                        && member
+                            .presence
+                            .as_ref()
+                            .is_none_or(|presence| presence == known)
+                })
+            });
+            for presence in roster.iter().filter_map(|member| member.presence.as_ref()) {
+                if !self.failed_participants.contains(presence) {
+                    self.failed_participants.push(presence.clone());
+                }
+            }
+        }
+        let retry = self
+            .now
+            .0
+            .checked_add(self.recapture_backoff())
+            .ok_or(BootstrapError::Exhausted)?;
+        self.recapture_retry_due = Some(Time(retry));
+        Ok(())
+    }
+
     /// Whether the running Building operation is a Ready recapture rather
     /// than an origin build.
     pub(super) fn recapturing(&self) -> bool {
@@ -210,18 +284,15 @@ impl ClaimEngine {
         if let Some(op) = self.operation.take() {
             effects.push(BootstrapEffect::CancelWork { op });
         }
-        self.failed_recapture = self.recapture_roster.take();
+        let failed = self.recapture_roster.take();
         self.operation_due = None;
         self.participant_roster = None;
         self.stage = BootstrapStage::DonorAvailable;
-        self.recapture_failures = self.recapture_failures.saturating_add(1);
-        let (Some(retry), Some(renew)) = (
-            self.now.0.checked_add(self.recapture_backoff()),
-            self.now.0.checked_add(self.config.renew_ms),
-        ) else {
+        let counted = self.count_failure(failed.as_deref());
+        self.failed_recapture = failed;
+        let (Ok(()), Some(renew)) = (counted, self.now.0.checked_add(self.config.renew_ms)) else {
             return self.terminate();
         };
-        self.recapture_retry_due = Some(Time(retry));
         if self.recapture_due.is_some_and(|due| self.now < due) {
             self.renew_due.get_or_insert(Time(renew));
             return self.ok(effects);
@@ -292,29 +363,19 @@ impl ClaimEngine {
                 .checked_add(self.config.donor_wait_ms)
                 .is_some_and(|proved| self.now.0 < proved)
             {
-                self.failed_recapture = ready.roster;
-                self.recapture_failures = self.recapture_failures.saturating_add(1);
-                let Some(retry) = self.now.0.checked_add(self.recapture_backoff()) else {
+                if self.count_failure(ready.roster.as_deref()).is_err() {
                     return self.terminate();
-                };
-                self.recapture_retry_due = Some(Time(retry));
+                }
+                self.failed_recapture = ready.roster;
             } else {
                 self.recapture_failures = 0;
                 self.recapture_retry_due = None;
+                self.failed_participants.clear();
             }
         }
         let mut effects = Vec::new();
         if self.local_phase == ClaimPhase::Ready || self.recapture_due.is_none() {
-            let Some(generation) = self.generation.checked_add(1) else {
-                return self.terminate();
-            };
-            self.generation = generation;
-            self.local_phase = ClaimPhase::Building;
-            self.local_renewal = 0;
-            self.local_progress = 0;
-            self.observed.retain(|identity, _| identity.node != self.me);
-            self.selected = Some(self.identity());
-            let Ok(claim) = self.publish_renewal() else {
+            let Ok(claim) = self.pending_claim() else {
                 return self.terminate();
             };
             effects.push(claim);
@@ -323,6 +384,21 @@ impl ClaimEngine {
             return self.terminate();
         }
         self.ok(effects)
+    }
+
+    /// Advertise this node's pending recapture under a fresh attempt's
+    /// Building claim, superseding any earlier claim of this node.
+    fn pending_claim(&mut self) -> Result<BootstrapEffect, BootstrapError> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(BootstrapError::Exhausted)?;
+        self.local_phase = ClaimPhase::Building;
+        self.local_renewal = 0;
+        self.local_progress = 0;
+        self.observed.retain(|identity, _| identity.node != self.me);
+        self.selected = Some(self.identity());
+        self.publish_renewal()
     }
 
     /// Keep this node's claim renewed while its completed local image awaits

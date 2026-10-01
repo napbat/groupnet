@@ -6,7 +6,9 @@
 //! every presence unchanged: the capture must still complete. A failed
 //! attempt is retried only after a doubling backoff, and only inside the
 //! claim window unless the membership changes. A Ready capture retired before
-//! it has stayed Ready for a claim window is such a failed attempt.
+//! it has stayed Ready for a claim window is such a failed attempt. The
+//! backoff paces only the participants the failures were taken under: a
+//! joiner or a restarted peer starts its capture at once.
 
 use super::*;
 use crate::Status;
@@ -25,11 +27,16 @@ const CONFIG: BootstrapConfig = BootstrapConfig {
 };
 
 /// One donor engine and the native view it samples: itself, and one peer
-/// whose presence, status and incarnation the test moves.
+/// whose membership, presence, status and incarnation the test moves.
 struct Donor {
     engine: ClaimEngine,
     now: u64,
     me_incarnation: u64,
+    /// The peer is a member at all; a reaped one is not.
+    peer_listed: bool,
+    /// The peer's presence is live. Without it the peer is listed only as a
+    /// suspected member, as a peer whose presence lapsed is.
+    peer_present: bool,
     peer_boot: u128,
     peer_status: Status,
     peer_incarnation: u64,
@@ -56,6 +63,8 @@ impl Donor {
             engine,
             now: 0,
             me_incarnation: 1,
+            peer_listed: true,
+            peer_present: true,
             peer_boot: 9,
             peer_status: Status::Alive,
             peer_incarnation: 1,
@@ -92,7 +101,8 @@ impl Donor {
             selected,
         });
         assert_eq!(local_only.rejection, None);
-        assert!(donor.engine.ready_recapture_due());
+        assert!(donor.engine.ready_recapture_pending());
+        assert!(!donor.engine.ready_recapture_backing_off());
         donor
     }
 
@@ -127,40 +137,49 @@ impl Donor {
             member_incarnation: self.me_incarnation,
             status: Status::Alive,
         };
-        let peer = BootstrapMemberIdentity {
-            node: NodeId::from("peer"),
-            presence: Some(PresenceIdentity {
+        let mut roster = vec![me];
+        if self.peer_listed {
+            roster.push(BootstrapMemberIdentity {
                 node: NodeId::from("peer"),
-                boot: BootId(self.peer_boot),
-                session: 2,
-            }),
-            member_incarnation: self.peer_incarnation,
-            status: self.peer_status,
-        };
-        let members = [&me, &peer]
+                presence: self.peer_present.then(|| PresenceIdentity {
+                    node: NodeId::from("peer"),
+                    boot: BootId(self.peer_boot),
+                    session: 2,
+                }),
+                member_incarnation: self.peer_incarnation,
+                status: if self.peer_present {
+                    self.peer_status
+                } else {
+                    Status::Suspect
+                },
+            });
+        }
+        let members = roster
+            .iter()
             .map(|member| BootstrapMember {
                 node: member.node.clone(),
                 eligible: member.eligible(),
             })
-            .to_vec();
-        let participants = vec![
-            BootstrapParticipant {
-                member: me.clone(),
-                renewal: self.engine.presence_renewal,
+            .collect();
+        let participants = roster
+            .iter()
+            .filter(|member| member.presence.is_some())
+            .map(|member| BootstrapParticipant {
+                member: member.clone(),
+                renewal: if member.node == self.engine.me {
+                    self.engine.presence_renewal
+                } else {
+                    self.peer_renewal
+                },
                 remaining_ms: CONFIG.claim_ttl_ms,
-            },
-            BootstrapParticipant {
-                member: peer.clone(),
-                renewal: self.peer_renewal,
-                remaining_ms: CONFIG.claim_ttl_ms,
-            },
-        ];
+            })
+            .collect();
         let claims = if self.engine.local_renewal > 0 && self.engine.renew_due.is_some() {
             vec![self.engine.claim()]
         } else {
             Vec::new()
         };
-        (members, vec![me, peer], participants, claims)
+        (members, roster, participants, claims)
     }
 
     /// Sample and verify one cut, as the worker's `current_participation`.
@@ -171,8 +190,9 @@ impl Donor {
             .verify_participant_roster(op, &members, &roster, &participants, &claims)
     }
 
-    /// Start one recapture under a freshly verified cut, verify its cut at
-    /// C, and return its operation, or `None` if nothing started.
+    /// Offer one freshly verified cut to the pending recapture, as every
+    /// maintenance turn does, and verify the cut at C of an attempt that
+    /// started. Returns its operation, or `None` if nothing started.
     fn start(&mut self) -> Option<BootstrapOperation> {
         self.verify().unwrap();
         let step = self.engine.step(BootstrapEvent::StartReadyRecapture);
@@ -193,9 +213,7 @@ impl Donor {
         assert_eq!(step.rejection, None);
         step.effects
     }
-}
 
-impl Donor {
     /// A node that installed a peer's image under the current cut, retired
     /// its candidate, and adopted the image once its recovery went Ready.
     fn installed() -> Self {
@@ -216,53 +234,76 @@ impl Donor {
         assert_eq!(donor.engine.stage(), BootstrapStage::Participating);
         let adopted = donor.engine.step(BootstrapEvent::AdoptInstalled);
         assert_eq!(adopted.rejection, None);
-        assert!(!publishes(&adopted.effects), "adoption publishes nothing");
+        assert!(
+            publishes_phase(&adopted.effects, ClaimPhase::Building),
+            "adoption advertises the pending recapture"
+        );
         donor
     }
 }
 
-/// A node Ready on a peer's installed image is a donor too. It publishes no
-/// claim and captures nothing while the membership it installed under holds,
-/// so the builder stays the only donor; a restarted peer is a membership
-/// change, and this node starts one Ready recapture under a fresh Building
-/// claim that the joiner follows, whichever node built the index.
-#[test]
-fn a_peer_installed_image_offers_a_ready_recapture_to_a_joiner() {
-    let mut donor = Donor::installed();
-    assert_eq!(donor.engine.stage(), BootstrapStage::DonorAvailable);
-    assert!(donor.engine.ready_recapture_due());
-    assert_eq!(
-        donor.start(),
-        None,
-        "an unchanged membership starts nothing"
-    );
-    let _ = donor.advance(CONFIG.donor_wait_ms);
-    assert_eq!(donor.start(), None, "however long it holds");
-
-    donor.peer_boot += 1;
-    donor.verify().unwrap();
-    let step = donor.engine.step(BootstrapEvent::StartReadyRecapture);
-    assert_eq!(step.rejection, None);
-    assert!(step.effects.iter().any(|effect| matches!(
-        effect,
-        BootstrapEffect::PublishClaim(claim) if claim.phase == ClaimPhase::Building
-    )));
-    let op = step
-        .effects
+fn withdraws(effects: &[BootstrapEffect]) -> bool {
+    effects
         .iter()
-        .find_map(|effect| match effect {
-            BootstrapEffect::RecaptureCurrent { op, .. } => Some(*op),
-            _ => None,
-        })
-        .expect("the restarted peer starts a recapture");
-    donor.verify().unwrap();
+        .any(|effect| matches!(effect, BootstrapEffect::WithdrawClaim(_)))
+}
+
+fn publishes(effects: &[BootstrapEffect]) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, BootstrapEffect::PublishClaim(_)))
+}
+
+fn publishes_phase(effects: &[BootstrapEffect], phase: ClaimPhase) -> bool {
+    effects.iter().any(
+        |effect| matches!(effect, BootstrapEffect::PublishClaim(claim) if claim.phase == phase),
+    )
+}
+
+/// Build a Ready capture for the running recapture `op`.
+fn build(donor: &mut Donor, op: BootstrapOperation) -> Vec<BootstrapEffect> {
     let selected = donor.engine.selected().unwrap().clone();
     let built = donor.engine.step(BootstrapEvent::Built { op, selected });
     assert_eq!(built.rejection, None);
-    assert!(built.effects.iter().any(|effect| matches!(
-        effect,
-        BootstrapEffect::PublishClaim(claim) if claim.phase == ClaimPhase::Ready
-    )));
+    built.effects
+}
+
+/// Retire the Ready capture, as a lapse, an expiry or a changed roster does.
+fn retire(donor: &mut Donor) -> Vec<BootstrapEffect> {
+    let selected = donor.engine.selected().unwrap().clone();
+    let retired = donor
+        .engine
+        .step(BootstrapEvent::CaptureRetired { selected });
+    assert_eq!(retired.rejection, None);
+    retired.effects
+}
+
+/// A node Ready on a peer's installed image is a donor like an origin
+/// build's: adoption advertises a pending recapture, the very next verified
+/// cut captures the image, unchanged membership and all, and the Ready capture
+/// is retired and replaced on a membership change like any other.
+#[test]
+fn an_adopted_image_offers_its_own_ready_capture_at_once() {
+    let mut donor = Donor::installed();
+    assert_eq!(donor.engine.stage(), BootstrapStage::DonorAvailable);
+    assert!(donor.engine.ready_recapture_pending());
+    let op = donor
+        .start()
+        .expect("the membership it installed under captures it");
+    assert!(publishes_phase(&build(&mut donor, op), ClaimPhase::Ready));
+
+    donor.peer_boot += 1;
+    let _ = donor.advance(CONFIG.renew_ms);
+    assert_eq!(
+        donor.verify(),
+        Err(BootstrapError::InvalidObservation),
+        "a restarted peer changes the roster"
+    );
+    assert!(publishes_phase(&retire(&mut donor), ClaimPhase::Building));
+    assert!(
+        donor.start().is_some(),
+        "the restarted peer's capture starts at once"
+    );
 }
 
 /// Only an installed image is adopted: a retired origin builder, or a node
@@ -288,18 +329,6 @@ fn only_an_installed_candidate_is_adopted() {
     );
 }
 
-fn withdraws(effects: &[BootstrapEffect]) -> bool {
-    effects
-        .iter()
-        .any(|effect| matches!(effect, BootstrapEffect::WithdrawClaim(_)))
-}
-
-fn publishes(effects: &[BootstrapEffect]) -> bool {
-    effects
-        .iter()
-        .any(|effect| matches!(effect, BootstrapEffect::PublishClaim(_)))
-}
-
 /// While C is encoded, this node refutes a suspicion of itself and the peer
 /// is suspected and then declared Dead, all with unchanged presence: the
 /// post-encode cut still verifies against C and the image goes Ready. The
@@ -316,13 +345,7 @@ fn swim_churn_while_encoding_keeps_the_ready_capture() {
     donor.peer_status = Status::Dead;
     let _ = donor.advance(1);
     assert_eq!(donor.verify(), Ok(()), "the post-encode cut binds C");
-    let selected = donor.engine.selected().unwrap().clone();
-    let built = donor.engine.step(BootstrapEvent::Built { op, selected });
-    assert_eq!(built.rejection, None);
-    assert!(built.effects.iter().any(|effect| matches!(
-        effect,
-        BootstrapEffect::PublishClaim(claim) if claim.phase == ClaimPhase::Ready
-    )));
+    assert!(publishes_phase(&build(&mut donor, op), ClaimPhase::Ready));
 
     donor.peer_status = Status::Alive;
     donor.peer_incarnation += 1;
@@ -343,11 +366,12 @@ fn swim_churn_while_encoding_keeps_the_ready_capture() {
 }
 
 /// Every attempt fails. Retries wait one observation interval, doubling to a
-/// cap of a quarter of the stall bound; the claim is renewed only until the
-/// window that opened with the pending image closes, which no failure
-/// extends; after it an unchanged membership starts nothing, however many
-/// maintenance turns sample it, and a restarted peer starts exactly one
-/// attempt under a fresh claim window.
+/// cap of a quarter of the stall bound, however many maintenance turns offer
+/// the unchanged cut meanwhile; the claim is renewed only until the window
+/// that opened with the pending image closes, which no failure extends; after
+/// it an unchanged membership starts nothing. A restarted peer is a new
+/// participant: it starts its attempt at once, under a fresh claim window,
+/// and its failure backs off from one interval again.
 #[test]
 fn failed_recaptures_back_off_inside_the_claim_window() {
     let mut donor = Donor::pending();
@@ -355,8 +379,10 @@ fn failed_recaptures_back_off_inside_the_claim_window() {
     let mut starts = Vec::new();
     let mut withdrawn = None;
     while donor.now < window + 3 * CONFIG.donor_wait_ms {
-        if donor.engine.ready_recapture_due() {
+        if donor.engine.ready_recapture_pending() {
+            let backing_off = donor.engine.ready_recapture_backing_off();
             if let Some(op) = donor.start() {
+                assert!(!backing_off, "started at {} inside a backoff", donor.now);
                 starts.push(donor.now);
                 let _ = donor.advance(1);
                 let failed = donor.fail(op);
@@ -364,7 +390,10 @@ fn failed_recaptures_back_off_inside_the_claim_window() {
                     withdrawn.get_or_insert(donor.now);
                 }
             } else {
-                assert!(donor.now >= window, "an attempt is refused in the window");
+                assert!(
+                    backing_off || donor.now >= window,
+                    "an attempt is refused in the window"
+                );
             }
         }
         let effects = donor.advance(1);
@@ -391,75 +420,41 @@ fn failed_recaptures_back_off_inside_the_claim_window() {
     assert!((window..=window + 1).contains(&withdrawn), "{withdrawn}");
 
     donor.peer_boot += 1;
-    let limit = donor.now + CONFIG.donor_wait_ms;
-    let mut after = None;
-    while after.is_none() && donor.now < limit {
-        let _ = donor.advance(1);
-        if donor.engine.ready_recapture_due() {
-            after = donor.start();
-        }
-    }
-    let op = after.expect("a membership change retries");
+    let op = donor
+        .start()
+        .expect("a restarted peer starts its attempt at once");
     assert!(donor.engine.recapture_due.is_some(), "a fresh claim window");
     let failed = donor.fail(op);
     assert!(
         !withdraws(&failed),
         "its claim is renewed for the new window"
     );
-    assert!(
-        donor.engine.recapture_retry_due.unwrap().0 >= donor.now + CONFIG.donor_wait_ms / 4,
-        "the backoff carries on across the membership change"
+    assert_eq!(
+        donor.engine.recapture_retry_due,
+        Some(Time(donor.now + CONFIG.observe_ms)),
+        "the failures started over for the new participant"
     );
 }
 
-/// Build a Ready capture for the running recapture `op`.
-fn build(donor: &mut Donor, op: BootstrapOperation) -> Vec<BootstrapEffect> {
-    let selected = donor.engine.selected().unwrap().clone();
-    let built = donor.engine.step(BootstrapEvent::Built { op, selected });
-    assert_eq!(built.rejection, None);
-    built.effects
-}
-
-/// Retire the Ready capture, as a lapse or an expiry does.
-fn retire(donor: &mut Donor) -> Vec<BootstrapEffect> {
-    let selected = donor.engine.selected().unwrap().clone();
-    let retired = donor
-        .engine
-        .step(BootstrapEvent::CaptureRetired { selected });
-    assert_eq!(retired.rejection, None);
-    retired.effects
-}
-
-/// Every capture stalls the node past its lease, so each Ready capture is
-/// retired by a lapse moments after it is built. Each retirement supersedes
-/// the Ready claim with a Building one for a fresh window, so a joiner waits
-/// through the lapse, but each such capture is also a failed attempt: retries
-/// back off as failures do, and once the backoffs add up to a claim window
-/// the unchanged membership starts nothing more, however long the node runs.
-/// The last window then runs out. A restarted peer still starts one attempt,
-/// with the backoff carried on, and a lapse of that capture starts nothing.
-#[test]
-fn a_capture_that_costs_its_own_lapse_cannot_cycle() {
-    let mut donor = Donor::pending();
+/// Run a donor whose every capture goes Ready and is retired by a lapse
+/// moments later, for `ms`. Returns when each attempt started, and when the
+/// claim was withdrawn, if it was.
+fn self_lapsing(donor: &mut Donor, ms: u64) -> (Vec<u64>, Option<u64>, u64) {
     let mut starts = Vec::new();
     let mut last_retired = 0;
     let mut withdrawn = None;
-    let limit = donor.now + 6 * CONFIG.donor_wait_ms;
+    let limit = donor.now + ms;
     while donor.now < limit {
-        if donor.engine.ready_recapture_due()
+        if donor.engine.ready_recapture_pending()
             && let Some(op) = donor.start()
         {
             assert_eq!(withdrawn, None, "{starts:?}");
             starts.push(donor.now);
             let _ = donor.advance(1);
-            assert!(publishes(&build(&mut donor, op)), "the capture goes Ready");
+            assert!(publishes(&build(donor, op)), "the capture goes Ready");
             let _ = donor.advance(2);
-            let retired = retire(&mut donor);
             assert!(
-                retired.iter().any(|effect| matches!(
-                    effect,
-                    BootstrapEffect::PublishClaim(claim) if claim.phase == ClaimPhase::Building
-                )),
+                publishes_phase(&retire(donor), ClaimPhase::Building),
                 "a Building claim keeps a joiner waiting through the lapse"
             );
             last_retired = donor.now;
@@ -472,6 +467,22 @@ fn a_capture_that_costs_its_own_lapse_cannot_cycle() {
             assert!(!publishes(&effects), "a withdrawn claim stays withdrawn");
         }
     }
+    (starts, withdrawn, last_retired)
+}
+
+/// Every capture stalls the node past its lease, so each Ready capture is
+/// retired by a lapse moments after it is built. Each retirement supersedes
+/// the Ready claim with a Building one for a fresh window, so a joiner waits
+/// through the lapse, but each such capture is also a failed attempt: retries
+/// back off as failures do, and once the backoffs add up to a claim window
+/// the unchanged membership starts nothing more, however long the node runs
+/// and however many turns offer it. The last window then runs out. A
+/// restarted peer starts its own capture at once, and its own lapses are
+/// bounded the same way.
+#[test]
+fn a_capture_that_costs_its_own_lapse_cannot_cycle() {
+    let mut donor = Donor::pending();
+    let (starts, withdrawn, last_retired) = self_lapsing(&mut donor, 6 * CONFIG.donor_wait_ms);
     let gaps: Vec<_> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
     for (failures, gap) in (1_u32..).zip(&gaps) {
         let backoff = (CONFIG.observe_ms << (failures - 1)).min(CONFIG.donor_wait_ms / 4);
@@ -494,32 +505,18 @@ fn a_capture_that_costs_its_own_lapse_cannot_cycle() {
     );
 
     donor.peer_boot += 1;
-    let limit = donor.now + CONFIG.donor_wait_ms;
-    let mut after = None;
-    while after.is_none() && donor.now < limit {
-        let _ = donor.advance(1);
-        if donor.engine.ready_recapture_due() {
-            after = donor.start();
-        }
-    }
-    let op = after.expect("a membership change retries");
-    let _ = build(&mut donor, op);
-    let _ = retire(&mut donor);
-    assert!(
-        donor.engine.recapture_retry_due.unwrap().0 >= donor.now + CONFIG.donor_wait_ms / 4,
-        "the backoff carries on across the membership change"
+    let restarted = donor.now;
+    let (starts, _, _) = self_lapsing(&mut donor, 6 * CONFIG.donor_wait_ms);
+    assert_eq!(
+        starts.first(),
+        Some(&restarted),
+        "the restarted peer's capture starts at once"
     );
-    let limit = donor.now + CONFIG.donor_wait_ms;
-    while donor.now < limit {
-        let _ = donor.advance(1);
-        if donor.engine.ready_recapture_due() {
-            assert_eq!(
-                donor.start(),
-                None,
-                "an unchanged membership retries nothing"
-            );
-        }
-    }
+    assert_eq!(
+        starts.len(),
+        6,
+        "the restarted peer's lapses are bounded alike: {starts:?}"
+    );
 }
 
 /// A capture that stays Ready for a whole claim window proves the attempts
@@ -534,7 +531,7 @@ fn a_capture_that_survives_its_claim_window_clears_the_backoff() {
     let _ = short.advance(CONFIG.donor_wait_ms - 1);
     let _ = retire(&mut short);
     assert!(
-        !short.engine.ready_recapture_due(),
+        short.engine.ready_recapture_backing_off(),
         "retired one millisecond short of its window, the capture failed"
     );
     assert_eq!(short.engine.recapture_failures, 1);
@@ -551,7 +548,7 @@ fn a_capture_that_survives_its_claim_window_clears_the_backoff() {
     let _ = donor.advance(CONFIG.donor_wait_ms);
     let retired = retire(&mut donor);
     assert!(publishes(&retired), "a Building claim for the next attempt");
-    assert!(donor.engine.ready_recapture_due());
+    assert!(!donor.engine.ready_recapture_backing_off());
     let op = donor.start().expect("recaptured without waiting");
     let _ = donor.fail(op);
     assert_eq!(
@@ -559,4 +556,84 @@ fn a_capture_that_survives_its_claim_window_clears_the_backoff() {
         Some(Time(donor.now + CONFIG.observe_ms)),
         "the backoff starts over"
     );
+}
+
+/// A planned restart of the peer, as a rolling update makes it. Its leave
+/// lapses this node's lease and fails the running attempt; its reap and its
+/// seed re-registration each change the roster and retire the capture taken
+/// in between, each a failure, so the backoff doubles. None of them names a
+/// new participant, so each waits out its backoff. The replacement's presence
+/// does: its capture starts on the first cut that names it, through the
+/// backoff, which starts over.
+#[test]
+fn a_joiner_starts_its_capture_through_the_backoff_its_arrival_caused() {
+    let mut donor = Donor::pending();
+    let op = donor.start().unwrap();
+    let _ = donor.fail(op);
+    donor.peer_listed = false;
+    assert_eq!(donor.start(), None, "the reap names no new participant");
+    assert!(donor.engine.ready_recapture_backing_off());
+    let _ = donor.advance(CONFIG.observe_ms);
+    let op = donor
+        .start()
+        .expect("the changed membership starts once the backoff passed");
+    let _ = build(&mut donor, op);
+    let _ = donor.advance(1);
+    donor.peer_listed = true;
+    donor.peer_present = false;
+    assert_eq!(donor.verify(), Err(BootstrapError::InvalidObservation));
+    let _ = retire(&mut donor);
+    assert_eq!(donor.engine.recapture_failures, 2);
+    let backoff = donor.engine.recapture_retry_due.unwrap();
+    assert_eq!(backoff, Time(donor.now + 2 * CONFIG.observe_ms));
+    assert_eq!(
+        donor.start(),
+        None,
+        "the re-registered peer without presence is no new participant"
+    );
+
+    donor.peer_present = true;
+    donor.peer_boot += 1;
+    let op = donor
+        .start()
+        .expect("the replacement's presence starts its capture at once");
+    assert!(donor.now < backoff.0, "inside the backoff");
+    assert_eq!(donor.engine.recapture_failures, 0);
+    let selected = donor.engine.selected().unwrap().clone();
+    let built = donor.engine.step(BootstrapEvent::Built { op, selected });
+    assert!(publishes_phase(&built.effects, ClaimPhase::Ready));
+}
+
+/// A capture that stalls this node can make a suspected peer's presence
+/// lapse in its view and return. That peer stays the participant it was, so
+/// neither the lapse nor the return resets the backoff: only a new boot or
+/// session does. The participants kept are at most one per listed node,
+/// however often the peer restarts.
+#[test]
+fn a_presence_that_lapses_and_returns_names_no_new_participant() {
+    let mut donor = Donor::pending();
+    let op = donor.start().unwrap();
+    let _ = donor.fail(op);
+    donor.peer_present = false;
+    assert_eq!(donor.start(), None);
+    let _ = donor.advance(CONFIG.observe_ms);
+    let op = donor
+        .start()
+        .expect("the lapsed presence changed the membership");
+    let _ = donor.fail(op);
+    assert_eq!(donor.engine.recapture_failures, 2);
+    donor.peer_present = true;
+    assert_eq!(
+        donor.start(),
+        None,
+        "the returning presence is no new participant"
+    );
+    assert!(donor.engine.ready_recapture_backing_off());
+
+    for _ in 0..5 {
+        donor.peer_boot += 1;
+        let op = donor.start().expect("a restarted peer starts at once");
+        let _ = donor.fail(op);
+        assert!(donor.engine.failed_participants.len() <= 2);
+    }
 }

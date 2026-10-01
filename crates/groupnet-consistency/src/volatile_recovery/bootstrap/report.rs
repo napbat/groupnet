@@ -85,6 +85,10 @@ pub enum RecaptureDecline {
     /// the one the last recapture failed under; only a membership change or
     /// a retired capture retries.
     SameCut,
+    /// A recent attempt failed under the participants this cut names, and
+    /// the next one waits out its backoff. A cut naming a new participant, a
+    /// joiner or a restarted peer, starts at once.
+    BackingOff,
     /// The consumer refused or failed the capture; its own log names why.
     CaptureFailed,
     /// The recapture outlived its donor-wait bound, or could not keep its

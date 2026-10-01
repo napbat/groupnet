@@ -53,7 +53,7 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    limit, so the next addition to them splits them *first*:
    `groupnet-consistency`'s `src/replication/shell/driver.rs` ~967,
    `tests/lease_dst.rs` ~948, `tests/replication.rs` ~944 and
-   `tests/volatile_bootstrap_runtime/scenarios.rs` ~949 (new runtime
+   `tests/volatile_bootstrap_runtime/scenarios.rs` ~951 (new runtime
    scenarios go in their own `volatile_bootstrap_runtime/` children, as
    `follower_progress.rs` does; the parent, ~711 since `PeerDonor` moved to
    `peer_donor.rs`, keeps the shared fakes);
@@ -63,7 +63,8 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    sibling file, as `tests_peer.rs` and `tests_seal.rs` did),
    `tests/election.rs` ~909,
    `src/volatile_bootstrap/transfer/tests.rs` ~904,
-   `src/volatile_bootstrap/engine.rs` ~907,
+   `src/volatile_bootstrap/engine.rs` ~931 (the next recapture state goes in
+   `engine/recapture.rs`, ~426),
    `src/volatile_bootstrap/engine/participation.rs` ~883,
    `src/engine/election/mod.rs` ~873,
    `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861,
