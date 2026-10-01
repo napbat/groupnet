@@ -1,8 +1,8 @@
 //! Deterministic Simulation Testing for the **coherence-lease tier** (T3),
-//! liveness half: the sans-IO cores ([`LeaseCore`], [`CoherenceCore`]) driven
-//! from real [`GroupEngine`] state, in virtual time, on a fabric that is healthy
-//! — then cut, then healed. A failing seed is a reproducible counterexample, not
-//! a flake.
+//! liveness half: the sans-IO cores ([`LeaseCore`], [`GrantLedger`],
+//! [`CoherenceCore`]) driven from real [`GroupEngine`] state, in virtual time,
+//! on a fabric that is healthy — then cut, then healed. A failing seed is a
+//! reproducible counterexample, not a flake.
 //!
 //! The safety half (**L-P1**, **L-P2**, **L-P3**) is next door in
 //! `lease_dst.rs`, under a randomized fault schedule. The harness below is a
@@ -17,22 +17,20 @@
 //! Real, and the whole point: **the engines**. Every renewal is an actual
 //! `~lease` entry written into a real [`GroupEngine`] under a TTL of one lease
 //! duration, gossiped over a lossy, jittered, partitionable network to real
-//! peers, each of which arms its own expiry at its own adoption instant. A
-//! granter's `~lease:g` map is folded from the renewals *its* engine can see; a
-//! reader's roster and confirmations come out of *its* engine; a writer's wait
-//! set is the members holding an unexpired `~lease` entry **in that writer's
-//! engine**, read in exact virtual time through
-//! [`Simulation::entry_expires_at_of`]. Nothing about the timing is faked: the
-//! lapse a writer waits out is a TTL a different node armed.
+//! peers. A granter's `~lease:g` map is folded by its [`GrantLedger`] from the
+//! renewals *its* engine can see; a reader's roster and confirmations come out
+//! of *its* engine; a writer's wait set is the members holding an unexpired
+//! `~lease` entry **in that writer's engine** plus the readers its ledger
+//! granted within one lease duration, and a silent one is excused at the
+//! instant its ledger proves the reader's window closed. Nothing about the
+//! timing is faked.
 //!
 //! Modelled, deliberately and named so nobody mistakes it for tested:
 //!
-//! * **The roster is every not-reaped member.** The suite does not gossip
-//!   `~caps`; it treats every node as advertising [`CAP_LEASE`]. That is the
-//!   *maximal* min-set — the conservative direction, and the only one where the
-//!   roster rule bites: a `Suspect` or `Dead`-but-not-reaped granter stays in it
-//!   and freezes confirmation, and only the engine's own reap horizon removes
-//!   one. Modelling capability entries could only ever shrink the set.
+//! * **The advertised roster is every not-reaped member.** The suite does not
+//!   gossip `~caps`; it treats every node as advertising [`CAP_LEASE`]. That is
+//!   the *maximal* min-set — the conservative direction — and the core keeps
+//!   every granter it has once counted on top of it, reaped or not.
 //! * **Applied-watermark acks are a two-entry stand-in for the T2 ledger.** A
 //!   writer publishes its newest [`WriteToken`] under `~dst-write`; a peer that
 //!   can *see* that entry in its own engine publishes the token back under
@@ -70,9 +68,9 @@ use std::time::Duration;
 
 use groupnet_consistency::WriteToken;
 use groupnet_consistency::lease::{
-    ClockMs, CoherenceCore, CoherenceStep, GrantMap, LeaseConfig, LeaseCore, LeaseState, RenewalId,
-    WaitMember, decode_grants, decode_renewal, encode_grants, encode_renewal, grant_entry_key,
-    renewal_entry_key,
+    ClockMs, CoherenceCore, CoherenceStep, GrantLedger, GrantMap, LeaseConfig, LeaseCore,
+    LeaseState, RenewalId, WaitMember, decode_grants, decode_renewal, encode_grants,
+    encode_renewal, grant_entry_key, renewal_entry_key,
 };
 use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Time};
 use groupnet_sim::{Simulation, SplitMix64};
@@ -178,12 +176,10 @@ struct Tag {
 
 /// What a whole run observed. Summed across seeds and asserted on at the end,
 /// so a suite that stops exercising its own property fails loudly instead of
-/// passing vacuously. Three counters name the lapse-path resolutions L-P1 is
+/// passing vacuously. Two counters name the lapse-path resolutions L-P1 is
 /// *not* held against, each for a reason the tier documents: `reader_gone` (the
-/// straggler had crashed, so it serves nothing at all), `diverged` (the writer
-/// had left the straggler's roster — membership divergence) and `vanished` (the
-/// entry left the writer's view without expiring, its member record having been
-/// reaped, so no TTL bound applies).
+/// straggler had crashed, so it serves nothing at all) and `diverged` (the
+/// straggler's current life never learned the writer).
 #[derive(Debug, Default, Clone)]
 struct Stats {
     /// Lapse-path resolutions whose L-P1 contract was actually checked.
@@ -193,7 +189,6 @@ struct Stats {
     timed_out: u64,
     reader_gone: u64,
     diverged: u64,
-    vanished: u64,
     /// Grant maps advertising a renewal from a reader's *previous* lease life.
     ghost_grants: u64,
     /// Observations of a reader in [`LeaseState::Serving`], and of a return to
@@ -210,7 +205,6 @@ impl Stats {
         self.timed_out += other.timed_out;
         self.reader_gone += other.reader_gone;
         self.diverged += other.diverged;
-        self.vanished += other.vanished;
         self.ghost_grants += other.ghost_grants;
         self.serving += other.serving;
         self.resync_after_lapse += other.resync_after_lapse;
@@ -224,22 +218,19 @@ struct InFlight {
     started: u64,
 }
 
-/// One member the harness saw drop out of a writer's wait set — the lapse
-/// event L-P1 is asserted at, recorded at the instant it happened rather than
-/// at the instant the verdict fired (a straggler leaves the wait set possibly
-/// several polls before the last waiter clears).
+/// One member the harness saw a writer excuse by lapse — the event L-P1 is
+/// asserted at, recorded at the poll it happened on rather than at the instant
+/// the verdict fired (a straggler leaves the wait set possibly several polls
+/// before the last waiter clears).
 #[derive(Debug)]
 struct Lapse {
     writer: NodeId,
     straggler: NodeId,
     at: u64,
-    /// The writer's own expiry stamp for the straggler's `~lease`, if the
-    /// entry expired rather than vanishing with its member.
-    expiry: Option<u64>,
 }
 
-/// One node's whole harness state: both sans-IO cores, the ground truth the
-/// assertions are read against, and the bookkeeping the two roles need.
+/// One node's whole harness state: all three sans-IO cores, the ground truth
+/// the assertions are read against, and the bookkeeping the two roles need.
 #[derive(Debug)]
 struct Node {
     id: NodeId,
@@ -248,11 +239,12 @@ struct Node {
     /// renewals and writes both out-rank its previous life's.
     boot: u64,
     lease: LeaseCore,
+    ledger: GrantLedger,
     coherence: CoherenceCore,
     /// The harness's own record of `seq -> s_i`, kept independently of the
     /// core so L-P2 checks the core's arithmetic against ground truth.
     published: BTreeMap<u64, u64>,
-    /// The granters last handed to [`LeaseCore::set_roster`].
+    /// The core's roster as of the last ingest.
     roster: BTreeSet<NodeId>,
     next_renew: u64,
     /// The instant this node has been in the group long enough to affirm
@@ -274,14 +266,10 @@ struct Node {
     write_seq: u64,
     inflight: Option<InFlight>,
     /// The wait set as of the last poll — the harness's mirror of the core's,
-    /// used to spot the exact step a member drops out — and the members already
-    /// excused by lapse for the write in flight.
+    /// used to spot the exact step a member is excused — and the members
+    /// already excused by lapse for the write in flight.
     waiting: BTreeSet<NodeId>,
     lapsed_out: BTreeSet<NodeId>,
-    /// The last `~lease` expiry instant this node saw for each member, so a
-    /// member that leaves the wait set can be classified even once the engine
-    /// has reaped the expired entry.
-    seen_expiry: BTreeMap<NodeId, u64>,
 }
 
 impl Node {
@@ -291,6 +279,7 @@ impl Node {
             id: id.clone(),
             boot,
             lease: LeaseCore::new(id.clone(), &lease_cfg(), boot),
+            ledger: GrantLedger::new(id.clone(), &lease_cfg(), boot, ClockMs(joined)),
             coherence: CoherenceCore::new(id.clone()),
             published: BTreeMap::new(),
             roster: BTreeSet::new(),
@@ -306,7 +295,6 @@ impl Node {
             inflight: None,
             waiting: BTreeSet::new(),
             lapsed_out: BTreeSet::new(),
-            seen_expiry: BTreeMap::new(),
         }
     }
 }
@@ -395,14 +383,15 @@ impl Harness {
     }
 
     /// Everything a node writes each round, all off one snapshot of its own
-    /// engine: its wholesale `~lease:g` grant map, its own renewal when one is
-    /// due (`s_i` recorded *first*, which is the inequality the whole tier
-    /// rests on), and an applied-watermark ack for every write it can now see.
+    /// engine: its wholesale `~lease:g` grant map (folded by its ledger, every
+    /// granted reader pinned first), its own renewal when one is due (`s_i`
+    /// recorded *first*, which is the inequality the whole tier rests on), and
+    /// an applied-watermark ack for every write it can now see.
     fn publish(&mut self) {
         let now = self.now;
         for id in self.live_ids() {
             let view = self.sim.entries_snapshot(&id);
-            let mut grants = GrantMap::new();
+            let mut visible: Vec<(NodeId, RenewalId)> = Vec::new();
             let mut acks: Vec<(NodeId, WriteToken)> = Vec::new();
             for (peer, entries) in &view {
                 if *peer == id {
@@ -413,7 +402,7 @@ impl Harness {
                     .and_then(|bytes| decode_renewal(bytes))
                     .filter(|_| self.lease_live(&id, peer))
                 {
-                    grants.insert(peer.clone(), renewal);
+                    visible.push((peer.clone(), renewal));
                 }
                 let seen = entries.get(WRITE_KEY).and_then(|bytes| decode_token(bytes));
                 if let Some(token) = seen.filter(|seen| {
@@ -424,6 +413,16 @@ impl Harness {
                 }) {
                     acks.push((peer.clone(), token));
                 }
+            }
+            let applied = |reader: &NodeId, writer: &NodeId| {
+                view.get(reader)
+                    .and_then(|entries| entries.get(&ack_key(writer)))
+                    .and_then(|bytes| decode_token(bytes))
+            };
+            let node = self.nodes.get_mut(&id).expect("a live node");
+            let grants = node.ledger.fold(ClockMs(now), visible, applied);
+            for reader in grants.keys() {
+                node.lease.pin(reader);
             }
 
             let encoded = encode_grants(&grants);
@@ -459,37 +458,46 @@ impl Harness {
             .command(node, Command::SetLocalEntry { key, value, ttl_ms });
     }
 
-    /// The reader's ingest — roster, then every granter's advertised map — the
-    /// consumer's resync policy, and L-P2/L-P3's per-observation invariants.
+    /// The reader's ingest — roster, then every counted granter's advertised
+    /// map, and every map its ledger reads for proof — the consumer's resync
+    /// policy, and L-P2/L-P3's per-observation invariants.
     fn ingest_and_serve(&mut self) {
         let (now, lag, tag) = (self.now, self.resync_lag, self.tag);
         for id in self.live_ids() {
             let view = self.sim.entries_snapshot(&id);
             // Every member this node still knows about — `Suspect` and
-            // `Dead`-but-not-reaped included; only a reap removes one.
-            let roster: BTreeSet<NodeId> = self
+            // `Dead`-but-not-reaped included; the core keeps the rest it counted.
+            let advertised: BTreeSet<NodeId> = self
                 .all
                 .iter()
                 .filter(|peer| **peer != id && self.sim.status_of(&id, peer).is_some())
                 .cloned()
                 .collect();
-            let maps: BTreeMap<NodeId, GrantMap> = roster
-                .iter()
-                .map(|granter| {
-                    let map = view
-                        .get(granter)
-                        .and_then(|entries| entries.get(&self.grant_key))
-                        .map(|bytes| decode_grants(bytes))
-                        .unwrap_or_default();
-                    (granter.clone(), map)
-                })
-                .collect();
+            let map_of = |node: &NodeId| -> GrantMap {
+                view.get(node)
+                    .and_then(|entries| entries.get(&self.grant_key))
+                    .map(|bytes| decode_grants(bytes))
+                    .unwrap_or_default()
+            };
 
             let node = self.nodes.get_mut(&id).expect("a live node");
-            node.roster = roster;
-            node.lease.set_roster(node.roster.iter().cloned());
+            node.lease.set_roster(advertised.iter().cloned());
+            node.roster = node.lease.roster().cloned().collect();
+            let maps: BTreeMap<NodeId, GrantMap> = node
+                .roster
+                .iter()
+                .map(|granter| (granter.clone(), map_of(granter)))
+                .collect();
             for (granter, map) in &maps {
                 node.lease.observe_grant_map(granter, map);
+            }
+            for (reader, entries) in &view {
+                if *reader != id && entries.contains_key(&self.renewal_key) {
+                    node.ledger.observe_reader_map(reader, &map_of(reader));
+                }
+            }
+            for (granter, map) in &maps {
+                node.ledger.observe_reader_map(granter, map);
             }
 
             let state = node.lease.poll(ClockMs(now));
@@ -507,8 +515,9 @@ impl Harness {
         }
     }
 
-    /// One poll of every in-flight coherent write, against the live
-    /// lease-holders in that writer's *own* engine.
+    /// One poll of every in-flight coherent write, against the readers that
+    /// may be serving in that writer's *own* view: live lease-holders in its
+    /// engine plus the readers its ledger granted within one lease duration.
     fn step_writers(&mut self) -> Vec<Lapse> {
         let now = self.now;
         let mut lapses = Vec::new();
@@ -517,44 +526,61 @@ impl Harness {
                 continue;
             };
             let view = self.sim.entries_snapshot(&id);
-            let mut snapshot: Vec<WaitMember> = Vec::new();
-            let mut expiries: Vec<(NodeId, u64)> = Vec::new();
-            for (holder, entries) in &view {
-                if *holder == id || !entries.contains_key(&self.renewal_key) {
-                    continue;
-                }
-                let Some(expiry) = self.lease_expiry(&id, holder).filter(|at| now < *at) else {
-                    continue;
-                };
-                expiries.push((holder.clone(), expiry));
-                snapshot.push(WaitMember {
-                    member: holder.clone(),
-                    applied: entries.get(&ack_key(&id)).and_then(|b| decode_token(b)),
-                });
-            }
-            let present: BTreeSet<NodeId> =
-                snapshot.iter().map(|held| held.member.clone()).collect();
-
-            let (verdict, dropped) = {
-                let node = self.nodes.get_mut(&id).expect("a live node");
-                for (holder, expiry) in expiries {
-                    node.seen_expiry.insert(holder, expiry);
-                }
-                let dropped: Vec<NodeId> = node.waiting.difference(&present).cloned().collect();
-                for straggler in &dropped {
-                    node.lapsed_out.insert(straggler.clone());
-                }
-                (node.coherence.step(inflight.token, &snapshot), dropped)
+            let mut members: BTreeSet<NodeId> = view
+                .iter()
+                .filter(|(holder, entries)| {
+                    **holder != id
+                        && entries.contains_key(&self.renewal_key)
+                        && self.lease_live(&id, holder)
+                })
+                .map(|(holder, _)| holder.clone())
+                .collect();
+            let applied_of = |member: &NodeId| {
+                view.get(member)
+                    .and_then(|entries| entries.get(&ack_key(&id)))
+                    .and_then(|bytes| decode_token(bytes))
             };
-            for straggler in dropped {
-                let expiry = self
-                    .lease_expiry(&id, &straggler)
-                    .or_else(|| self.nodes[&id].seen_expiry.get(&straggler).copied());
+            let node = self.nodes.get_mut(&id).expect("a live node");
+            members.extend(node.ledger.open_grants(ClockMs(now)).cloned());
+            members.remove(&id);
+            let snapshot: Vec<WaitMember> = members
+                .into_iter()
+                .map(|member| WaitMember {
+                    applied: applied_of(&member),
+                    excusable_at: node.ledger.excusable_at(&member),
+                    member,
+                })
+                .collect();
+            let verdict = node.coherence.step(inflight.token, ClockMs(now), &snapshot);
+            // Who left the wait set this poll without acknowledging in it:
+            // excused. (An acknowledgement only counts from a member in the
+            // snapshot, exactly as the core counts it.)
+            let still: BTreeSet<NodeId> = match &verdict {
+                CoherenceStep::Waiting { on } => on.iter().cloned().collect(),
+                _ => BTreeSet::new(),
+            };
+            let acked: BTreeSet<&NodeId> = snapshot
+                .iter()
+                .filter(|held| held.applied.is_some_and(|done| done >= inflight.token))
+                .map(|held| &held.member)
+                .collect();
+            let excused: BTreeSet<NodeId> = node
+                .waiting
+                .iter()
+                .chain(snapshot.iter().map(|held| &held.member))
+                .filter(|member| {
+                    !still.contains(*member)
+                        && !node.lapsed_out.contains(*member)
+                        && !acked.contains(member)
+                })
+                .cloned()
+                .collect();
+            for straggler in excused {
+                node.lapsed_out.insert(straggler.clone());
                 lapses.push(Lapse {
                     writer: id.clone(),
                     straggler,
                     at: now,
-                    expiry,
                 });
             }
             self.settle_write(&id, inflight, verdict);
@@ -597,14 +623,15 @@ impl Harness {
             }
         }
         let node = self.nodes.get_mut(id).expect("a live node");
+        node.ledger.end(id, inflight.token);
         node.inflight = None;
         node.waiting.clear();
         node.lapsed_out.clear();
     }
 
     /// **L-P1.** For every member a writer excused by lapse: the reader's own
-    /// window had provably closed at least `rate_margin` before the writer's
-    /// engine expired its copy, and the reader is not serving at that instant.
+    /// window had provably closed at least `rate_margin` before the excusal,
+    /// and the reader is not serving at that instant.
     fn check_lapse_contract(&mut self, lapses: &[Lapse]) {
         let tag = self.tag;
         for lapse in lapses {
@@ -612,27 +639,22 @@ impl Harness {
                 writer,
                 straggler,
                 at,
-                expiry,
             } = lapse;
             let Some(reader) = self.nodes.get(straggler) else {
                 self.stats.reader_gone += 1; // crashed: it serves nothing at all
                 continue;
             };
             if !reader.roster.contains(writer) {
-                self.stats.diverged += 1; // the writer is outside its min-set
+                self.stats.diverged += 1; // this life never learned the writer
                 continue;
             }
-            let Some(expiry) = expiry.filter(|at_expiry| at_expiry <= at) else {
-                self.stats.vanished += 1; // the member record went, not the TTL
-                continue;
-            };
             let (suite, seed) = (tag.suite, tag.seed);
             let until = reader.lease.serve_until().map(|at_until| at_until.0);
             assert!(
-                until.is_none_or(|at_until| at_until + MARGIN_MS <= expiry),
-                "{suite} seed {seed}: {writer} expired {straggler}'s lease at {expiry} \
-                 (seen at {at}) while {straggler} still claimed a window to {until:?} — a \
-                 reader's window must close a {MARGIN_MS}ms margin before its granters' copies"
+                until.is_none_or(|at_until| at_until + MARGIN_MS <= *at),
+                "{suite} seed {seed}: {writer} excused {straggler} at {at} while \
+                 {straggler} still claimed a window to {until:?} — a reader's window must \
+                 close a {MARGIN_MS}ms margin before its writer excuses it"
             );
             assert_ne!(
                 reader.lease.peek(ClockMs(*at)),
@@ -665,6 +687,7 @@ impl Harness {
             token,
             started: now,
         });
+        node.ledger.begin(writer, token, ClockMs(now));
         node.waiting.clear();
         node.lapsed_out.clear();
         self.set(writer, WRITE_KEY.to_owned(), encode_token(token), None);

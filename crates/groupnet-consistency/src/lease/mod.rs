@@ -26,87 +26,108 @@
 //!   instant `s_i` *before* each write is enqueued.
 //! * **Grant.** Every member folds the renewals it has adopted into one
 //!   wholesale `~lease:g` entry: `(reader, epoch, seq)` per reader, replace
-//!   semantics, no TTL. That is a granter saying "I have seen this reader's
-//!   lease and I will wait for it".
+//!   semantics, no TTL, plus a row under its own id naming the life that
+//!   authored it ([`GranterLife`]). That is a granter saying "I have seen this
+//!   reader's lease and I will wait for it". A granter grants a reader that
+//!   has not applied one of its outstanding writes no renewal it first saw
+//!   after that write began.
 //! * **Serve.** The reader may serve iff `now < s_i + duration - rate_margin`
 //!   for the newest renewal `i` confirmed by *every* granter in its roster —
-//!   and it is not in [`LeaseState::NeedsResync`]. Each granter's own copy of
-//!   renewal `i` expires no earlier than `s_i + duration`, because the engine
-//!   arms the TTL when it *adopts* the entry, which is after `s_i`.
-//! * **Invalidate.** A writer's coherent write waits, per member holding a
-//!   live `~lease` entry, for either an applied ack at or past the write's
-//!   [`WriteToken`](crate::WriteToken) (the T2 fast path) or for its own
-//!   engine to expire that member's `~lease` entry (the lapse).
+//!   and it is not in [`LeaseState::NeedsResync`]. The roster only grows: a
+//!   granter leaves it only after it has departed and membership has
+//!   forgotten it.
+//! * **Invalidate.** A writer's coherent write waits, per reader that may be
+//!   serving (a live `~lease` entry, or a grant from this writer within the
+//!   last `duration`), for either an applied ack at or past the write's
+//!   [`WriteToken`](crate::WriteToken) (the T2 fast path) or a **proven
+//!   lapse**: the reader's current life has shown it counts this writer, and
+//!   one `duration` has passed on the writer's clock since it first saw the
+//!   renewal behind its newest grant to that reader (the slow path).
 //! * **Resync.** A reader that lapsed enters [`LeaseState::NeedsResync`] and
 //!   stays there — a freshly confirmed lease is *not* enough — until its
 //!   consumer has re-synchronized and affirmed it. This is the correctness
 //!   rule of the whole tier: a lapsed reader missed exactly the invalidations
 //!   whose writers proceeded *because* it had lapsed.
 //!
-//! The sans-IO halves are [`LeaseCore`] (reader) and [`CoherenceCore`]
-//! (writer); the tokio shell around them is [`Leases`] / [`LeaseView`].
+//! The sans-IO halves are [`LeaseCore`] (reader), [`GrantLedger`] (granter)
+//! and [`CoherenceCore`] (writer); the tokio shell around them is [`Leases`] /
+//! [`LeaseView`].
 //!
 //! # Honesty box: what this guarantees, and where it stops
 //!
 //! **The guarantee.** While a reader's [`LeaseView::valid`] answers `true`, no
-//! completed write of a participating writer is invisible to it: the writer
-//! either waited for this node to apply the invalidation, or it waited for
-//! this node's serve-lease to lapse — and a lapsed node serves nothing cached
-//! until its consumer re-synchronizes. Write-wait under failure is therefore
-//! `min(acks, lease remainder)` with a real guarantee at the end, instead of a
-//! timeout with a hope at the end — *for the two failure shapes those two terms
-//! cover*. There is a third, and it belongs in the same breath: a holder that
-//! keeps **renewing** while it stops **applying** offers neither an ack nor a
-//! lapse, so the write ends at the caller's own deadline as
-//! [`CoherenceOutcome::TimedOut`], with no guarantee at all. That is an
-//! availability failure and never a silent stale serve (the writer knows, and
-//! says so in `waiting_on`) — see the fail-slow reader below.
+//! completed write of a participating writer that the reader has ever counted
+//! is invisible to it: the writer either waited for this node to apply the
+//! invalidation, or it waited until this node's serve-lease had provably run
+//! out — and a lapsed node serves nothing cached until its consumer
+//! re-synchronizes.
+//!
+//! *Why the lapse is proven.* Let `w` begin at `T` on writer `W`, and let `R`
+//! never acknowledge it. Every grant `W` publishes to `R` while `w` is in
+//! flight confirms a renewal `W` first saw no later than `T` (the cap), and
+//! every earlier grant confirms one first seen before `T`; a renewal is first
+//! seen after its reader recorded `s_i`. `R` counts `W` (its current life's map
+//! granted `W`'s current renewal, and a roster only grows), so `R`'s window is
+//! bounded by `W`'s grants: it closes by `s_i + D - rate_margin` on `R`'s clock,
+//! which is no later than first-seen `+ D` on `W`'s clock within the rate bound
+//! below. `W` excuses `R` only once its own clock passes that instant, so `R`
+//! has lapsed into `NeedsResync`, and it serves again only on a grant `W` makes
+//! after `w` is no longer in flight. Membership does not enter the argument:
+//! a reap, a deleted entry or a suspicion changes who `W` *sees*, never when
+//! `R`'s window closes.
+//!
+//! Write-wait under failure is therefore `min(acks, one lease duration)` with a
+//! real guarantee at the end — including for a holder that keeps **renewing**
+//! while it stops **applying**, which the cap turns into a lapse. What remains
+//! for [`CoherenceOutcome::TimedOut`] is a reader whose current life has not
+//! shown it counts the writer, a writer still inside its warm-up window, and a
+//! writer that has departed: none of them can be excused by lapse, so only
+//! acknowledgements end their waits, and the writer knows (and says so in
+//! `waiting_on`).
 //!
 //! It rests on four assumptions, each of which is a failure mode you should
 //! know by name:
 //!
 //! * **Bounded clock *rate* skew — not bounded connectivity.** The reader's
-//!   window is computed on its own clock and the granters' expiries on theirs.
-//!   If a reader's clock runs slow relative to a granter's by more than
+//!   window is computed on its own clock and the writer's excuse on its own.
+//!   If a reader's clock runs slow relative to a writer's by more than
 //!   [`LeaseConfig::rate_margin`] over one lease duration, the reader can
-//!   still believe it holds a lease the granter has already expired. This is
+//!   still believe it holds a lease the writer has already excused. This is
 //!   an assumption about *rates* (a few hundred ppm on any healthy host), not
 //!   about steps: a wall-clock jump cannot affect it, because every instant
 //!   here comes from a monotonic clock. Size `rate_margin` for the worst
 //!   drift you accept, not for the typical one.
-//! * **Membership divergence, bounded by the reap horizon.** A reader waits
-//!   for confirmations from every not-reaped member advertising
-//!   [`CAP_LEASE`]. If it *reaps* a granter that is in fact still writing —
-//!   an asymmetric partition outliving the reap horizon — that granter leaves
-//!   the reader's min-set and the reader keeps serving while a live writer no
-//!   longer waits for it. Three guards narrow the residual and none closes it:
+//! * **A reader counts every writer it has learned.** Its roster is every
+//!   [`CAP_LEASE`] advertiser it has known and every reader it has granted,
+//!   and a granter leaves it only after declaring its life departed
+//!   ([`Leases::leave`]) and being forgotten by membership. An asymmetric
+//!   partition that outlives the reap horizon therefore freezes the reader
+//!   instead of letting it serve while a live writer stops waiting for it,
+//!   and a writer excuses by lapse only readers that showed, in their own map,
+//!   that they count it. Two guards cover a node that is still learning:
 //!
-//!   1. a `Suspect` or `Dead`-but-not-reaped granter stays in the min-set (only
-//!      a full reap removes it) — the guard with a bill attached, priced below;
-//!   2. a booting **writer** refuses to resolve on an empty wait set, or to
+//!   1. a booting **writer** refuses to resolve on an empty wait set, or to
 //!      excuse an unseen [`CAP_LEASE`] advertiser
 //!      ([`Leases::invalidated_coherently`]);
-//!   3. a booting **reader** cannot reach [`LeaseState::Serving`] at all —
+//!   2. a booting **reader** cannot reach [`LeaseState::Serving`] at all —
 //!      [`LeaseView::mark_caught_up`] declines to take and no serve deadline is
 //!      published — which closes the vacuous-confirmation hole an unlearned
 //!      roster would otherwise open ([`LeaseCore::set_roster`]).
 //!
-//!   Both boot guards are **enforced in the shell**, not asked of the
-//!   deployment, and both run for the node's first `detection_window_ms +
-//!   2 × anti_entropy_interval` of participation. That is a convergence bound,
-//!   not a lease-duration one: a live reader republishes every
-//!   [`LeaseConfig::renew_every`], so the question is only how long membership
-//!   and anti-entropy need to deliver an entry that already exists. A booting
-//!   reader starts in [`LeaseState::NeedsResync`] for the symmetric reason.
+//!   Both run for the node's first `detection_window_ms + 2 ×
+//!   anti_entropy_interval` of participation. The residual is a reader that
+//!   boots into a *full* partition from a writer and stays there past that
+//!   window: it never learns the writer, the writer never sees its lease, and
+//!   nothing ties the two together. A deployment with a fixed membership closes
+//!   it by not serving locally until its known peers have granted.
 //! * **Ghost echoes over-wait.** The engine's restart recovery re-adopts
 //!   un-authored entries from peer echoes, so a departed reader's `~lease`
 //!   entry can outlive it in a writer's view, and writers wait for a lease
-//!   nobody holds. That costs latency, never correctness — the entry carries a
-//!   TTL, so the ghost expires, and the wait ends at the lapse. The grant map
-//!   is immune to the mirror-image hazard by construction: it is one wholesale
-//!   entry, so a granter's first republish after a restart authors over its
-//!   whole previous life rather than leaving retired grants to haunt the
-//!   group.
+//!   nobody holds. That costs latency, never correctness — the ghost is
+//!   excused like any silent reader. The grant map is immune to the
+//!   mirror-image hazard by construction: it is one wholesale entry, so a
+//!   granter's first republish after a restart authors over its whole
+//!   previous life rather than leaving retired grants to haunt the group.
 //! * **Every failure degrades to origin-serving, never to stale-serving.** A
 //!   lost renewal, an undecodable entry, a granter that goes silent, a
 //!   confirmation older than the reader tracks, a partition, a clock that
@@ -123,32 +144,23 @@
 //! * **The fail-slow reader: renewing but behind.** A node whose renewal ticker
 //!   runs while its apply loop does not — a stuck consumer, an
 //!   [`AckLedger`](crate::AckLedger) that was never wired up, a partition that
-//!   carries gossip but not writes — is the participant this tier cannot bound.
-//!   Its lease never lapses (it is renewing it) and its watermark never reaches
-//!   the write, so *every* coherent write that overlaps it waits out the
-//!   caller's whole `timeout` and returns [`CoherenceOutcome::TimedOut`] naming
-//!   it in `waiting_on`. Raising the deadline cannot help: there is no instant
-//!   at which either excuse arrives. The remedy is operational — stop its
-//!   renewals. Drop its [`Leases`] and every blocked write resolves on the lapse
-//!   path one lease duration later, or call [`Leases::leave`] for the immediate
-//!   retraction. `waiting_on` names the node to do it to.
-//! * **One unreaped granter freezes every reader.** Confirmation is a min over
-//!   the *whole* roster and only a **reap** removes a member from it, so a
-//!   single `CAP_LEASE` member that stops publishing grants (crashed, hung,
-//!   partitioned) freezes every other reader's confirmation cluster-wide. At the
-//!   defaults that is: every reader's window closes within one `D` (2 s) of the
-//!   freeze, and no reader can reopen one until membership reaps the silent
-//!   member at the **reap horizon**, `2 × dead_timeout_ms` (20 s) past the
-//!   instant it was declared `Dead` — itself up to `detection_window_ms`
-//!   (0.9 s in a group of three) past the silence. One dead member therefore
-//!   costs on the order of
-//!   `detection_window_ms + 2 × dead_timeout_ms − D` ≈ **19 s of cluster-wide
-//!   origin-serving**, and the reads are correct throughout. The default
-//!   `dead_timeout_ms` is the *safe* number, not the available one: a
-//!   lease deployment wants it on the order of its own `D` (with `D = 2 s`, a
-//!   2 s `dead_timeout_ms` turns that 19 s into ≈ 3 s), bounded below by the
-//!   longest partition the deployment must survive and still reconcile — the
-//!   reap horizon is also what makes a returning node's entries recoverable.
+//!   carries gossip but not writes — acknowledges nothing, so every coherent
+//!   write that overlaps it holds its grant back and ends on its lapse one
+//!   lease duration after the write began. The writes stay coherent and slow
+//!   by `D`, and the node spends its time out of service, re-synchronizing.
+//!   The remedy is operational — fix its apply loop, or call
+//!   [`Leases::leave`] on it.
+//! * **A silent granter freezes every reader until it grants again.**
+//!   Confirmation is a min over the *whole* roster, and a granter that stops
+//!   publishing grants (crashed, hung, partitioned) stays in it — membership's
+//!   reap no longer removes it. Every other reader's window closes within one
+//!   `D` of the freeze and stays closed until the granter grants again: after a
+//!   heal, or in its next life after a restart (a restarted granter grants
+//!   under the same id). A granter that dies without departing and never
+//!   returns leaves every reader origin-serving until the reader itself
+//!   restarts, because only a fresh life learns a roster without it. Reads stay
+//!   correct throughout; the remedy is to bring the granter back, or to stop it
+//!   with [`Leases::leave`] rather than letting it die.
 //!
 //! ## What it costs to run
 //!
@@ -158,12 +170,13 @@
 //!   16-byte entry per reader per [`LeaseConfig::renew_every`], riding the
 //!   gossip cadence that already exists.
 //! * **Grants are not.** A granter re-folds and republishes its *whole*
-//!   `~lease:g` map on every peer renewal it adopts, so each member authors up
-//!   to `N − 1` rewrites of an `O(N)`-entry value per renewal interval —
-//!   `O(N²)` bytes per member per interval, before dissemination charges its own
-//!   fanout. The granter's byte-equality check suppresses only genuinely
-//!   identical re-folds (membership churn, backstop ticks); it cannot suppress
-//!   the renewal-driven ones, because a peer's sequence number has moved.
+//!   `~lease:g` map on every peer renewal it adopts (and when one of its
+//!   writes ends), so each member authors up to `N − 1` rewrites of an
+//!   `O(N)`-entry value per renewal interval — `O(N²)` bytes per member per
+//!   interval, before dissemination charges its own fanout. The granter's
+//!   byte-equality check suppresses only genuinely identical re-folds
+//!   (membership churn, backstop ticks); it cannot suppress the renewal-driven
+//!   ones, because a peer's sequence number has moved.
 //! * **The view fold is charged to write traffic, not lease traffic.** It runs
 //!   on *every* `NodeStateChanged` this node observes — deliberately unfiltered
 //!   by key, because the roster derives from a capability entry this crate does
@@ -178,16 +191,17 @@
 //!
 //! # How the pieces fit
 //!
-//! [`LeaseCore`], [`CoherenceCore`] and the codecs are the sans-IO rules;
-//! [`Leases`] is the tokio shell that gives them a clock, group entries and
-//! three background tasks (renew, grant, ingest), and [`LeaseView`] is the
-//! cheap read handle a request path holds. A node participates by constructing
-//! one [`Leases`] per lease set, advertising [`CAP_LEASE`], and calling
-//! [`Leases::invalidated_coherently`] after each write it must not be stale
-//! behind.
+//! [`LeaseCore`], [`GrantLedger`], [`CoherenceCore`] and the codecs are the
+//! sans-IO rules; [`Leases`] is the tokio shell that gives them a clock, group
+//! entries and three background tasks (renew, grant, ingest), and
+//! [`LeaseView`] is the cheap read handle a request path holds. A node
+//! participates by constructing one [`Leases`] per lease set, advertising
+//! [`CAP_LEASE`], and calling [`Leases::invalidated_coherently`] after each
+//! write it must not be stale behind.
 
 mod coherence;
 mod core;
+mod grants;
 mod shell;
 mod tasks;
 mod wire;
@@ -199,9 +213,10 @@ use groupnet_core::NodeId;
 
 pub use self::coherence::{CoherenceCore, CoherenceStep, WaitMember};
 pub use self::core::{ClockMs, LeaseCore};
+pub use self::grants::GrantLedger;
 pub use self::shell::{LeaseView, Leases};
 pub use self::wire::{
-    GrantMap, RenewalId, decode_grants, decode_renewal, encode_grants, encode_renewal,
+    GrantMap, GranterLife, RenewalId, decode_grants, decode_renewal, encode_grants, encode_renewal,
     grant_entry_key, renewal_entry_key,
 };
 
@@ -364,20 +379,24 @@ pub enum LeaseState {
 /// (and only a caller's own deadline can produce it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoherenceOutcome {
-    /// Every lease-holder applied the write — the fast path.
+    /// Every reader that may have been serving applied the write — the fast
+    /// path.
     AllApplied,
-    /// Some members never acknowledged, but the writer's engine has expired
-    /// their serve-leases: they are out of service until they re-synchronize,
-    /// so they cannot serve state this write invalidated.
+    /// Some readers never acknowledged, but each had provably lost its right
+    /// to serve — its lease ran out on the writer's clock while it counted the
+    /// writer, or its life departed: they are out of service until they
+    /// re-synchronize, so they cannot serve state this write invalidated.
     LeaseLapsed {
         /// The members excused by lapse rather than acknowledgement.
         stragglers: Vec<NodeId>,
     },
-    /// The caller's deadline passed while lease-holders were still live and
+    /// The caller's deadline passed while readers that may be serving were
     /// still behind. **No coherence guarantee holds**: these members may be
-    /// serving state this write invalidated. Either the deadline was shorter
-    /// than the lease duration (raise it past `duration` and this outcome
-    /// cannot occur) or something is badly wrong.
+    /// serving state this write invalidated, and the write must not be
+    /// reported to its client as coherent. With a deadline past `duration`
+    /// this is a reader that has not shown it counts the writer, a writer in
+    /// its warm-up window, or a writer that has departed — see
+    /// [`Leases::invalidated_coherently`].
     TimedOut {
         /// The members still being waited on when the deadline passed.
         waiting_on: Vec<NodeId>,

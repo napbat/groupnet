@@ -280,21 +280,99 @@ async fn a_silent_readers_lease_lapses_and_it_must_resync_before_serving_again()
     );
     assert_ne!(b_view.state(), LeaseState::Serving);
 
-    // Re-acquisition. A fresh lease life, a fresh apply loop — and a confirmed
-    // lease is deliberately *not* enough on its own: this node missed exactly
-    // the invalidations whose writers proceeded because it had lapsed.
+    // Re-acquisition. A fresh lease life, a fresh apply loop — and two things
+    // stand between it and service. A grant from the writer is a certificate:
+    // it is not issued while the reader is behind the write it was excused
+    // from, so the restarted reader is confirmed only once it has applied the
+    // writer's feed past it. Its fresh apply loop attached past `k1`, so it is
+    // the writer's next write that carries it there.
     let (b_leases, _b_apply) = participate(&b_group, &b_id);
     let b_view = b_leases.view();
     assert!(!b_view.valid(), "a fresh lease life starts out of service");
+    let caught_up = feed.publish(&"k2".to_owned()).await;
+    eventually_within(
+        "the restarted reader applies the writer's feed",
+        SETTLE,
+        || applied_by(&a_group, &b_id, &a_id).is_some_and(|applied| applied >= caught_up),
+    )
+    .await;
     eventually_within("the restarted reader is confirmed again", SETTLE, || {
         b_leases.confirmed().is_some()
     })
     .await;
+    // …and a confirmed lease is deliberately *not* enough on its own: this
+    // node missed exactly the invalidations whose writers proceeded because it
+    // had lapsed.
     assert!(
         !b_view.valid(),
         "a confirmed lease alone does not put a lapsed reader back into service"
     );
     serving("the resynced reader", &b_view).await;
+}
+
+/// A reader that keeps renewing but never applies — a stalled apply loop, or a
+/// partition that carries its renewals but not the writer's feed — is the
+/// stalled acknowledgement. Its lease never expired in the writer's view and it
+/// never acknowledged, so the write ran to the caller's deadline and ended
+/// `TimedOut`: no guarantee, while the reader went on serving on the grant it
+/// held. The writer now grants that reader nothing first seen after the write
+/// began, so the reader lapses and the write ends on a proven lapse within one
+/// lease duration — and the reader is granted nothing new until it has applied
+/// the write.
+#[tokio::test]
+async fn a_reader_that_renews_but_never_applies_lapses_under_a_write() {
+    let cluster = MemCluster::builder(&["stall-a", "stall-b"])
+        .group("stores")
+        .gossip_interval_ms(10)
+        .anti_entropy_interval_ms(25)
+        .spawn();
+    let groups: Vec<&Group> = cluster.groups.iter().collect();
+    converged_within(&groups, SETTLE).await;
+
+    let (a_id, b_id) = (cluster.ids[0].clone(), cluster.ids[1].clone());
+    let (a_group, b_group) = (cluster.groups[0].clone(), cluster.groups[1].clone());
+    let (a_leases, _a_apply) = participate(&a_group, &a_id);
+    // B renews and grants, and advertises an ack ledger it never feeds.
+    b_group
+        .advertise_capabilities([CAP_ACKS, CAP_LEASE])
+        .expect("the advertisement is enqueued");
+    let b_leases = Leases::new(b_group.clone(), b_id.clone(), lease_cfg());
+    let b_view = b_leases.view();
+    serving("the reader that will stall", &b_view).await;
+    eventually_within("the writer sees the reader's lease", SETTLE, || {
+        a_leases.holders() == vec![b_id.clone()]
+    })
+    .await;
+
+    let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
+        key.clone().into_bytes()
+    });
+    let token = feed.publish(&"k1".to_owned()).await;
+    let started = Instant::now();
+    let outcome = a_leases
+        .invalidated_coherently(&a_id, token, LEASE * 4)
+        .await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome,
+        CoherenceOutcome::LeaseLapsed {
+            stragglers: vec![b_id.clone()],
+        },
+        "a renewing reader that never applies is excused by a proven lapse"
+    );
+    assert!(
+        elapsed <= LEASE * 2,
+        "the write ends one lease duration in, not at the caller's deadline (took {elapsed:?})"
+    );
+    assert!(!b_view.valid(), "the excused reader is out of service");
+    // Still renewing, still behind: no grant can put it back.
+    tokio::time::sleep(LEASE).await;
+    assert!(
+        !b_view.mark_caught_up(),
+        "a reader behind the write it was excused from is granted nothing new"
+    );
+    assert_ne!(applied_by(&a_group, &b_id, &a_id), Some(token));
 }
 
 /// A mixed deployment: two nodes run the whole tier, one runs the ack tier

@@ -83,25 +83,21 @@ use std::time::{Duration, Instant};
 
 use groupnet_core::{Config, NodeId};
 use groupnet_runtime::{CommandRejected, Group};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::applied_by;
-use crate::token::WriteToken;
 
-use super::coherence::{CoherenceCore, CoherenceStep, WaitMember};
 use super::core::{ClockMs, LeaseCore};
+use super::grants::GrantLedger;
 use super::tasks;
 use super::wire::{
-    GrantMap, RenewalId, decode_grants, decode_renewal, encode_renewal, grant_entry_key,
-    renewal_entry_key, validate_name,
+    GrantMap, RenewalId, decode_grants, decode_renewal, encode_grants, encode_renewal,
+    grant_entry_key, renewal_entry_key, validate_name,
 };
-use super::{CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseState, wall_clock_epoch};
+use super::{CAP_LEASE, LeaseConfig, LeaseState, wall_clock_epoch};
 
-/// How often a coherent write re-examines its wait set — the same cadence
-/// [`applied_by_selected`](crate::applied_by_selected) polls at, so the healthy
-/// path costs exactly a T2 ack round and not a beat more.
-const COHERENCE_POLL: Duration = Duration::from_millis(2);
+mod writes;
 
 /// The state the three background tasks and both handles share.
 ///
@@ -129,6 +125,13 @@ pub(super) struct Shared {
     /// published under.
     warmed: Arc<AtomicBool>,
     core: Arc<Mutex<LeaseCore>>,
+    /// What this node has granted each reader, and the coherent writes whose
+    /// readers' grants it holds still — shared by the granter and every write.
+    ledger: Mutex<GrantLedger>,
+    /// Woken when a coherent write ends, so the granter re-folds at once and a
+    /// reader whose grant that write held back is granted its newest renewal
+    /// without waiting for its next one.
+    pub(super) refold: Notify,
     /// The published serve deadline: `Some(until)` when this node may serve up
     /// to `until`, `None` when it may not serve at all. Shared with every
     /// [`LeaseView`], which is why it is an [`Arc`] inside an [`Arc`] — a view
@@ -139,10 +142,10 @@ pub(super) struct Shared {
     pub(super) left: AtomicBool,
 }
 
-/// The core behind the mutex. Poisoning is irrelevant: every mutation is a
-/// whole-value update, so a panicking holder leaves it consistent.
-fn lock(core: &Mutex<LeaseCore>) -> MutexGuard<'_, LeaseCore> {
-    core.lock().unwrap_or_else(PoisonError::into_inner)
+/// The value behind one of the shell's mutexes. Poisoning is irrelevant: every
+/// mutation is a whole-value update, so a panicking holder leaves it consistent.
+fn lock<T>(guarded: &Mutex<T>) -> MutexGuard<'_, T> {
+    guarded.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Recomputes the serve deadline at `now` and publishes it — the **one** place
@@ -229,10 +232,18 @@ impl Shared {
         )
     }
 
-    /// Every renewal this node can currently see, folded into one grant map:
-    /// "I have seen these readers' leases and I will wait for them".
+    /// The map this node publishes now: every renewal it can see, capped by
+    /// its coherent writes in flight, stamped with its own life
+    /// ([`GrantLedger::fold`]) — "I have seen these readers' leases and I will
+    /// wait for them".
+    ///
+    /// Every reader granted here is [`pin`](LeaseCore::pin)ned into this
+    /// node's own roster **before** the map is returned for publishing: a
+    /// writer reads this node's grant of its renewal as proof that this node
+    /// counts it, so the counting has to be true by the time anyone can see
+    /// the grant.
     pub(super) fn grant_map(&self) -> GrantMap {
-        let mut grants = GrantMap::new();
+        let mut visible: Vec<(NodeId, RenewalId)> = Vec::new();
         for (node, entries) in self.group.all_entries().iter() {
             if *node == self.me {
                 continue;
@@ -241,8 +252,15 @@ impl Shared {
                 .get(&self.renewal_key)
                 .and_then(|bytes| decode_renewal(bytes))
             {
-                grants.insert(node.clone(), id);
+                visible.push((node.clone(), id));
             }
+        }
+        let grants = lock(&self.ledger).fold(self.now(), visible, |reader, writer| {
+            applied_by(&self.group, reader, writer)
+        });
+        let mut core = lock(&self.core);
+        for reader in grants.keys() {
+            core.pin(reader);
         }
         grants
     }
@@ -255,32 +273,56 @@ impl Shared {
     }
 
     /// One turn of the reader's ingest: refresh the roster of granters that
-    /// must confirm, then fold in what each of them advertises.
+    /// must confirm, then fold in what each of them advertises — and hand every
+    /// map this node can see to the [`GrantLedger`], which reads a reader's
+    /// map as proof that the reader counts this node.
     ///
-    /// The roster is every member this node still *knows about* — `Suspect` and
-    /// `Dead`-but-not-reaped included, because either may still be writing —
-    /// that advertises [`CAP_LEASE`]. Only a reap removes a granter, which is
-    /// why [`Group::statuses`] (which lists tombstones) is the right source and
+    /// The advertised roster is every member this node still *knows about* —
+    /// `Suspect` and `Dead`-but-not-reaped included, because either may still
+    /// be writing — that advertises [`CAP_LEASE`]. That is why
+    /// [`Group::statuses`] (which lists tombstones) is the right source and
     /// [`Group::members_with_capability`] (which is built on the not-`Dead`
-    /// set) is not: it would drop a dead-but-unreaped granter out of the
-    /// min-set while a writer behind it may still be waiting on this node.
+    /// set) is not. The core keeps every granter it has counted beyond that
+    /// ([`LeaseCore::set_roster`]), so its maps are read for the core's whole
+    /// roster: a reaped granter's entries are gone, and the empty map is what
+    /// freezes confirmation on it.
     fn ingest_grants(&self) {
-        let roster: Vec<NodeId> = self
+        let advertised: Vec<NodeId> = self
             .group
             .statuses()
             .into_iter()
             .map(|(node, _)| node)
             .filter(|node| *node != self.me && self.group.node_has_capability(node, CAP_LEASE))
             .collect();
-        let mut core = lock(&self.core);
-        core.set_roster(roster.iter().cloned());
-        for granter in &roster {
-            let grants = self
-                .group
-                .node_entry(granter, &self.grant_key)
+        let map_of = |node: &NodeId| {
+            self.group
+                .node_entry(node, &self.grant_key)
                 .map(|bytes| decode_grants(&bytes))
-                .unwrap_or_default();
-            core.observe_grant_map(granter, &grants);
+                .unwrap_or_default()
+        };
+        let roster: Vec<NodeId> = {
+            let mut core = lock(&self.core);
+            core.set_roster(advertised);
+            let roster: Vec<NodeId> = core.roster().cloned().collect();
+            for granter in &roster {
+                core.observe_grant_map(granter, &map_of(granter));
+            }
+            roster
+        };
+        let mut readers: Vec<NodeId> = self.holders();
+        readers.extend(roster);
+        readers.sort_unstable();
+        readers.dedup();
+        let maps: Vec<(NodeId, GrantMap)> = readers
+            .into_iter()
+            .map(|reader| {
+                let map = map_of(&reader);
+                (reader, map)
+            })
+            .collect();
+        let mut ledger = lock(&self.ledger);
+        for (reader, map) in &maps {
+            ledger.observe_reader_map(reader, map);
         }
     }
 
@@ -297,34 +339,6 @@ impl Shared {
         lock(&self.core).poll(now);
         self.ingest_grants();
         publish_serve(&self.core, &self.serve, now, &self.warmed);
-    }
-
-    /// Every **other** node holding a live renewal entry in this node's view.
-    fn holders(&self) -> Vec<NodeId> {
-        let mut holders: Vec<NodeId> = self
-            .group
-            .all_entries()
-            .iter()
-            .filter(|(node, _)| **node != self.me)
-            .filter_map(|(node, entries)| {
-                decode_renewal(entries.get(&self.renewal_key)?).map(|_| node.clone())
-            })
-            .collect();
-        holders.sort_unstable();
-        holders
-    }
-
-    /// The [`WaitMember`] snapshot [`CoherenceCore::step`] consumes: every live
-    /// lease-holder in this node's view, paired with how far it advertises
-    /// having applied `writer`'s feed.
-    fn wait_snapshot(&self, writer: &NodeId) -> Vec<WaitMember> {
-        self.holders()
-            .into_iter()
-            .map(|member| {
-                let applied = applied_by(&self.group, &member, writer);
-                WaitMember { member, applied }
-            })
-            .collect()
     }
 
     /// Whether this node has participated long enough for the absence of a
@@ -345,48 +359,12 @@ impl Shared {
         }
         warm
     }
-
-    /// The warm-up guard: `None` to let the wait resolve normally, or
-    /// `Some(unseen)` to hold it — naming the [`CAP_LEASE`] advertisers whose
-    /// lease this node has not seen yet (possibly empty, when what is missing
-    /// is the whole landscape rather than one member of it).
-    ///
-    /// A booting node is a *writer* before it is a converged *observer*. For
-    /// its first moments it knows few members and fewer entries, so "my wait
-    /// set is empty" is indistinguishable from "I have not looked long
-    /// enough" — and resolving on that would complete a coherent write while a
-    /// reader it has never heard of is serving the state the write
-    /// invalidated. Until the window closes, this refuses two fast paths: an
-    /// empty wait set, and excusing an advertiser whose `~lease` entry has not
-    /// arrived. Both then wait for the caller's deadline, so a warm-up-era
-    /// write either finds its holders or reports
-    /// [`CoherenceOutcome::TimedOut`] honestly.
-    ///
-    /// What it does **not** close is the residual the module's honesty box
-    /// names: a granter that this node *reaps* while it is in fact still
-    /// writing. The guard bounds divergence at boot, not divergence that
-    /// outlives the reap horizon.
-    fn warmup_hold(&self, writer: &NodeId, snapshot: &[WaitMember]) -> Option<Vec<NodeId>> {
-        if self.warmed_up() {
-            return None;
-        }
-        let unseen: Vec<NodeId> = self
-            .group
-            .members_with_capability(CAP_LEASE)
-            .into_iter()
-            .filter(|node| *node != self.me && node != writer)
-            .filter(|node| !snapshot.iter().any(|held| held.member == *node))
-            .collect();
-        if unseen.is_empty() && !snapshot.is_empty() {
-            return None;
-        }
-        Some(unseen)
-    }
 }
 
 /// This node's participation in one lease set: it renews its own right to
 /// serve, it grants every other reader's, and it holds coherent writes until
-/// every lease-holder has either applied them or lapsed.
+/// every reader that may be serving has either applied them or provably lost
+/// its lease.
 ///
 /// One handle is both halves, like [`SeqFloors`](crate::SeqFloors). Hand
 /// [`view`](Self::view) to whatever answers reads; keep this one wherever the
@@ -399,15 +377,13 @@ impl Shared {
 /// [`AckLedger`](crate::AckLedger) fed by its apply loop (so a writer's fast
 /// path can resolve on an acknowledgement instead of on a lapse).
 ///
-/// Advertising **without the ledger** is safe for the reader and expensive for
-/// everyone else, and not in the way a first reading suggests: this node keeps
-/// renewing, so its `~lease` entry never expires in any writer's engine and the
-/// *lapse* path never fires either. A coherent write behind it gets neither
-/// excuse and runs to the caller's own deadline —
-/// [`CoherenceOutcome::TimedOut`], the one outcome carrying no guarantee — for
-/// as long as the node keeps renewing. That is the fail-slow reader the module's
-/// honesty box names; the remedy is to stop the renewals (drop this handle) or
-/// [`leave`](Self::leave), not to wait longer.
+/// Advertising **without the ledger** is safe for the reader and slow for
+/// everyone else: no write it overlaps is ever acknowledged, so each one holds
+/// that node's grant back and ends on its lapse, one lease duration after the
+/// write began ([`GrantLedger`](super::GrantLedger)) — and that node lapses out
+/// of service under every write. That is the fail-slow reader the module's
+/// honesty box names; the remedy is to wire the ledger, or
+/// [`leave`](Self::leave).
 ///
 /// Advertising **without the granter** is worse still: readers put this node in
 /// their min-sets and their confirmations freeze against a map that never
@@ -483,7 +459,9 @@ impl Leases {
             "lease config outside its own envelope: {:?}",
             cfg.validate()
         );
-        let core = LeaseCore::new(me.clone(), &cfg, wall_clock_epoch());
+        let epoch = wall_clock_epoch();
+        let core = LeaseCore::new(me.clone(), &cfg, epoch);
+        let ledger = GrantLedger::new(me.clone(), &cfg, epoch, ClockMs::ZERO);
         let (serve, _) = watch::channel(None);
         let shared = Arc::new(Shared {
             group,
@@ -494,6 +472,8 @@ impl Leases {
             started: Instant::now(),
             warmed: Arc::new(AtomicBool::new(false)),
             core: Arc::new(Mutex::new(core)),
+            ledger: Mutex::new(ledger),
+            refold: Notify::new(),
             serve: Arc::new(serve),
             left: AtomicBool::new(false),
         });
@@ -508,14 +488,21 @@ impl Leases {
     ///
     /// Chain it directly onto the constructor. The renewal ticker's first turn
     /// fires at construction, so one renewal of the boot epoch may already be
-    /// on the wire; this re-seeds the core and immediately publishes a renewal
-    /// of the new epoch over it. Both directions are safe — grants against the
-    /// abandoned epoch never confirm ([`LeaseCore::observe_grant_map`]) — so
-    /// the worst case is a few milliseconds of frozen confirmation, never a
-    /// window nobody granted.
+    /// on the wire; this re-seeds the core and the grant ledger and immediately
+    /// publishes a renewal of the new epoch over it. Both directions are safe —
+    /// grants against the abandoned epoch never confirm
+    /// ([`LeaseCore::observe_grant_map`]), and the re-seeded ledger presumes
+    /// everything was granted at its birth — so the worst case is a few
+    /// milliseconds of frozen confirmation, never a window nobody granted.
     #[must_use]
     pub fn with_epoch(self, epoch: u64) -> Self {
         *lock(&self.shared.core) = LeaseCore::new(self.shared.me.clone(), &self.shared.cfg, epoch);
+        *lock(&self.shared.ledger) = GrantLedger::new(
+            self.shared.me.clone(),
+            &self.shared.cfg,
+            epoch,
+            self.shared.now(),
+        );
         let _ = self.shared.renew();
         publish_serve(
             &self.shared.core,
@@ -602,112 +589,24 @@ impl Leases {
         .copied()
     }
 
-    /// Every **other** node holding a live renewal entry in this node's view —
-    /// the wait set of a coherent write, as this writer sees it.
+    /// Departs the lease set gracefully: stops the tasks, ends this node's own
+    /// right to serve for good, publishes a final grant map declaring the
+    /// departure, and retracts this node's `~lease` entry so no writer waits
+    /// out a lapse for a reader that is leaving on purpose.
     ///
-    /// A node drops out of this list when its entry expires *here*, which **is**
-    /// the lapse [`invalidated_coherently`](Self::invalidated_coherently) waits
-    /// for.
-    #[must_use]
-    pub fn holders(&self) -> Vec<NodeId> {
-        self.shared.holders()
-    }
-
-    /// Waits until every lease-holder in this node's view has either applied
-    /// `writer`'s write through `token` or had its serve-lease expire here.
+    /// The departure is what lets the rest of the group stop counting this
+    /// node: a reader drops a granter only once that granter's map says it has
+    /// departed *and* membership no longer lists it
+    /// ([`LeaseCore::set_roster`]). In exchange this life excuses no reader by
+    /// lapse from here on — any write it still completes, draining, completes
+    /// on acknowledgements ([`GrantLedger::depart`]) — and no affirmation can
+    /// reopen its own serve window ([`LeaseCore::depart`]), which is what lets
+    /// a writer excuse it at once.
     ///
-    /// This is the whole point of the tier. Call it after the local durable
-    /// write and after [`WriteFeed::publish`](crate::WriteFeed::publish) has
-    /// handed back `token`; when it returns
-    /// [`CoherenceOutcome::is_coherent`], no participating node can still be
-    /// serving state this write invalidated — the responsive ones applied it,
-    /// and the silent ones are out of service until they re-synchronize.
-    ///
-    /// The wait set is re-read on every poll rather than snapshotted, so a
-    /// reader that takes a lease mid-write joins it (the conservative
-    /// direction) and one whose lease lapses leaves it permanently — see
-    /// [`CoherenceCore::step`] for the rules and why a re-acquired lease does
-    /// not re-enter a wait it already lapsed out of.
-    ///
-    /// `timeout` is the caller's own deadline and the only way to get
-    /// [`CoherenceOutcome::TimedOut`], which is the one outcome that carries no
-    /// guarantee. Set it comfortably past [`LeaseConfig::duration`] and it
-    /// covers the two failure shapes this tier *bounds*: a responsive holder
-    /// (one ack round) and a silent one (one lease remainder). Setting it
-    /// shorter is a deliberate choice to abandon the guarantee rather than wait
-    /// for it.
-    ///
-    /// What no deadline covers is the third shape: a holder that keeps
-    /// **renewing** while it stops **applying**. Its lease never lapses and its
-    /// watermark never advances, so the wait ends at the deadline whatever the
-    /// deadline is — the fail-slow reader in the module's honesty box, whose
-    /// remedy is operational (kill its renewals, or have it
-    /// [`leave`](Self::leave)) rather than a longer `timeout`. The warm-up
-    /// window below is a *fourth* way to see this outcome, and the only one that
-    /// clears on its own.
-    ///
-    /// # Warm-up
-    ///
-    /// For the first [`Config::detection_window_ms`] plus two anti-entropy
-    /// rounds of this node's participation, an empty wait set — and an unseen
-    /// [`CAP_LEASE`] advertiser — will not resolve the write; both wait for the
-    /// caller's deadline instead, so a warm-up-era write either finds its
-    /// holders or reports [`CoherenceOutcome::TimedOut`] honestly.
-    ///
-    /// A booting node is a **writer** before it is a converged observer: for its
-    /// first moments "my wait set is empty" is indistinguishable from "I have
-    /// not looked long enough", and resolving on that would complete a coherent
-    /// write while a reader this node has never heard of serves the state the
-    /// write invalidated. What the guard does *not* close is the residual the
-    /// module's honesty box names — a granter this node **reaps** while it is in
-    /// fact still writing. It bounds divergence at boot, not divergence that
-    /// outlives the reap horizon.
-    ///
-    /// Each call gets its own [`CoherenceCore`]: one write's wait shares no
-    /// state with another's, so nothing is held across an await and a
-    /// cancelled call leaks nothing.
-    pub async fn invalidated_coherently(
-        &self,
-        writer: &NodeId,
-        token: WriteToken,
-        timeout: Duration,
-    ) -> CoherenceOutcome {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut core = CoherenceCore::new(writer.clone());
-        loop {
-            let snapshot = self.shared.wait_snapshot(writer);
-            let held = self.shared.warmup_hold(writer, &snapshot);
-            if held.is_none() {
-                match core.step(token, &snapshot) {
-                    CoherenceStep::AllApplied => return CoherenceOutcome::AllApplied,
-                    CoherenceStep::LeaseLapsed { stragglers } => {
-                        return CoherenceOutcome::LeaseLapsed { stragglers };
-                    }
-                    CoherenceStep::Waiting { .. } => {}
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let mut waiting_on = core.abandon(token).unwrap_or_default();
-                waiting_on.extend(held.unwrap_or_default());
-                waiting_on.sort_unstable();
-                waiting_on.dedup();
-                return CoherenceOutcome::TimedOut { waiting_on };
-            }
-            tokio::time::sleep(COHERENCE_POLL).await;
-        }
-    }
-
-    /// Departs the lease set gracefully: stops the tasks, retracts this node's
-    /// `~lease` entry so no writer waits out a lapse for a reader that is
-    /// leaving on purpose, and closes this node's own serve window immediately.
-    ///
-    /// The **grant** entry is left behind on purpose. It carries no TTL and is
-    /// harmless: it says only "here is the newest renewal I had adopted from
-    /// each reader", which can never *extend* anyone's window (a reader's
-    /// confirmation is capped at what it published, and this node leaves every
-    /// reader's roster the moment membership reaps it). Retracting it would
-    /// buy nothing and would briefly freeze every reader that still counts this
-    /// node as a granter.
+    /// The grant map is otherwise unchanged: it can never *extend* anyone's
+    /// window (a reader's confirmation is capped at what it published), and
+    /// retracting it would freeze every reader that counts this node a moment
+    /// sooner for no gain.
     ///
     /// One residual, in the safe direction: a renewal already in flight on
     /// another thread can out-version the retraction, in which case the entry
@@ -716,23 +615,29 @@ impl Leases {
     ///
     /// # Errors
     /// [`CommandRejected`] if the group actor's bounded inbox is full or the
-    /// actor has shut down; the retraction was not enqueued and the entry will
-    /// lapse by TTL instead.
+    /// actor has shut down: the departure or the retraction was not enqueued,
+    /// so readers keep counting this node (it stays in their min-sets until it
+    /// grants again in a later life) and its entry lapses by TTL instead.
     pub fn leave(&self) -> Result<(), CommandRejected> {
         self.shared.left.store(true, Ordering::Relaxed);
         for task in &self.tasks {
             task.abort();
         }
-        lock(&self.shared.core).require_resync();
+        lock(&self.shared.core).depart();
         publish_serve(
             &self.shared.core,
             &self.shared.serve,
             self.shared.now(),
             &self.shared.warmed,
         );
-        self.shared
+        lock(&self.shared.ledger).depart();
+        let farewell = encode_grants(&self.shared.grant_map());
+        let published = self.shared.publish_grants(farewell);
+        let retracted = self
+            .shared
             .group
-            .delete_entry(self.shared.renewal_key.clone())
+            .delete_entry(self.shared.renewal_key.clone());
+        published.and(retracted)
     }
 }
 

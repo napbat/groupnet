@@ -34,6 +34,25 @@
 //! the same way: fewer confirmations reach the reader, its confirmed renewal
 //! freezes or vanishes, and it stops serving. A codec accident can shorten a
 //! serve window; it cannot invent one.
+//!
+//! # The granter's own row
+//!
+//! A granter never grants itself, so its own id is free to carry something
+//! else: the [`GranterLife`] that authored the map — the granter's lease epoch,
+//! and whether that life has departed. It is an ordinary record in the same
+//! shape, so a decoder that predates it reads it as a grant to a reader that
+//! is not itself and ignores it. Two things rest on it:
+//!
+//! * a **writer** reads it off a reader's map as proof that the map came from
+//!   the reader's *current* life, so that the reader's grants of the writer's
+//!   renewals prove the reader counts the writer as a granter
+//!   ([`GrantLedger`](super::GrantLedger));
+//! * a **reader** reads the departure flag as the one signal that lets it stop
+//!   counting a granter that membership has forgotten
+//!   ([`LeaseCore::set_roster`](super::LeaseCore::set_roster)).
+//!
+//! A map without the row (an older build) proves neither, which is the
+//! conservative reading of both.
 
 use std::collections::BTreeMap;
 
@@ -75,6 +94,60 @@ impl RenewalId {
 /// Ordered by reader id so a re-advertisement of an unchanged map is a
 /// byte-identical write (and so a simulation replays deterministically).
 pub type GrantMap = BTreeMap<NodeId, RenewalId>;
+
+/// The sequence number a granter's own row carries while its life is live.
+/// Renewals start at 1, so no real grant ever carries it.
+const LIFE_LIVE: u64 = 0;
+
+/// The sequence number a granter's own row carries once its life has departed
+/// ([`Leases::leave`](super::Leases::leave)).
+const LIFE_DEPARTED: u64 = u64::MAX;
+
+/// Which lease life authored a grant map, and whether it has departed — the
+/// granter's own row in its map (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GranterLife {
+    /// The granter's lease epoch.
+    pub epoch: u64,
+    /// Whether this life has left the lease set for good: it grants nothing
+    /// more, serves nothing more, and excuses no reader by lapse.
+    pub departed: bool,
+}
+
+impl GranterLife {
+    /// Writes this life into `granter`'s own row of `grants`.
+    pub fn stamp(self, granter: &NodeId, grants: &mut GrantMap) {
+        let seq = if self.departed {
+            LIFE_DEPARTED
+        } else {
+            LIFE_LIVE
+        };
+        grants.insert(
+            granter.clone(),
+            RenewalId {
+                epoch: self.epoch,
+                seq,
+            },
+        );
+    }
+
+    /// The life `granter`'s map says authored it, or `None` when the map has no
+    /// such row (an older build) or the row carries neither marker — both read
+    /// as "nothing proven".
+    #[must_use]
+    pub fn of(granter: &NodeId, grants: &GrantMap) -> Option<Self> {
+        let row = grants.get(granter)?;
+        let departed = match row.seq {
+            LIFE_LIVE => false,
+            LIFE_DEPARTED => true,
+            _ => return None,
+        };
+        Some(Self {
+            epoch: row.epoch,
+            departed,
+        })
+    }
+}
 
 /// The entry key a reader's renewal occupies: `~lease` for the default set,
 /// `~lease:<name>` for a named one.
@@ -198,8 +271,8 @@ fn decode_grants_checked(bytes: &[u8]) -> Option<GrantMap> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GrantMap, RenewalId, decode_grants, decode_renewal, encode_grants, encode_renewal,
-        grant_entry_key, renewal_entry_key, validate_name,
+        GrantMap, GranterLife, RenewalId, decode_grants, decode_renewal, encode_grants,
+        encode_renewal, grant_entry_key, renewal_entry_key, validate_name,
     };
     use groupnet_core::NodeId;
 
@@ -356,5 +429,41 @@ mod tests {
         let mut mixed = encode_grants(&grants(&[("node-a", 1, 1)]));
         mixed.extend_from_slice(&[0x09, 0x00, 0x00, 0x00, 0x01]);
         assert!(decode_grants(&mixed).is_empty());
+    }
+
+    #[test]
+    fn a_granter_life_rides_its_own_row_and_round_trips() {
+        let me = NodeId::new("granter");
+        let mut map = grants(&[("reader", 4, 12)]);
+        let live = GranterLife {
+            epoch: 9,
+            departed: false,
+        };
+        live.stamp(&me, &mut map);
+        let decoded = decode_grants(&encode_grants(&map));
+        assert_eq!(GranterLife::of(&me, &decoded), Some(live));
+        // The reader's own row is untouched: a reader looks up only itself.
+        assert_eq!(
+            decoded.get(&NodeId::new("reader")),
+            Some(&RenewalId { epoch: 4, seq: 12 })
+        );
+        let departed = GranterLife {
+            departed: true,
+            ..live
+        };
+        departed.stamp(&me, &mut map);
+        assert_eq!(
+            GranterLife::of(&me, &decode_grants(&encode_grants(&map))),
+            Some(departed)
+        );
+    }
+
+    #[test]
+    fn a_map_without_a_life_row_or_with_a_real_grant_there_proves_no_life() {
+        let me = NodeId::new("granter");
+        assert_eq!(GranterLife::of(&me, &grants(&[("reader", 4, 12)])), None);
+        // A row under the granter's id that carries a real renewal sequence is
+        // neither marker, so it proves nothing rather than being guessed at.
+        assert_eq!(GranterLife::of(&me, &grants(&[("granter", 4, 12)])), None);
     }
 }

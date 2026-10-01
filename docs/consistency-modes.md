@@ -274,51 +274,74 @@ protocol refines the sketch above in ways that are now contract:
   only from renewals that came back: every member folds the renewals it has
   *adopted* into a wholesale grant-map entry (`~lease:g`), and the reader
   serves until `D − rate_margin` after the publish instant of the newest
-  renewal confirmed by **every** not-reaped `CAP_LEASE` member. A reader
-  that merely re-publishes cannot extend its own lease — the unilateral-
-  extension hole a naive TTL-entry lease would have.
-* **The writer's countdown starts at adoption.** A silent reader's lapse
-  instant on the writer's side is the writer's *own engine's* TTL expiry of
-  that reader's `~lease` entry — armed at adoption, so propagation delay is
-  free safety margin in the safe direction. Zero wire changes: the whole
-  tier rides existing TTL'd entries.
+  renewal confirmed by **every** granter it counts. A reader that merely
+  re-publishes cannot extend its own lease — the unilateral-extension hole a
+  naive TTL-entry lease would have.
+* **The writer's countdown is its own grant, on its own clock.** A writer's
+  `GrantLedger` stamps each renewal with the instant it first saw it (after
+  the reader recorded `s_i`). A silent reader is excused once the writer's
+  clock passes that instant `+ D` for the newest renewal it granted that
+  reader — not when the reader's entry leaves the writer's view, which a reap
+  or a deletion can do while the window it granted is still open. Readers
+  the writer granted within the last `D` stay in the wait set even out of
+  view.
+* **A grant does not grow past a write the reader has not applied.** While a
+  coherent write is in flight, a reader that has not applied it is granted no
+  renewal first seen after the write began, so a reader that renews but
+  never applies lapses one `D` into the write and the write ends on that
+  lapse instead of at the caller's deadline. Once a write has ended, a reader
+  behind it is granted nothing new until it has applied it — a grant
+  certifies the reader has applied every write of the granter that ended
+  before it, whatever order gossip delivered the two in.
+* **A lapse excuses only a reader that counts the writer.** Each grant map
+  carries a row under its author's own id naming the lease life that wrote
+  it (`GranterLife`, an ordinary record older decoders ignore). A writer
+  excuses a reader by lapse only once that reader's *current* life has
+  granted the writer's current renewal — a reader's roster only grows, so
+  from then on that reader serves only on the writer's grants. Any other
+  reader is excused by acknowledgement alone; a departed reader at once.
 * **Lapse ⇒ NeedsResync ⇒ affirmation.** A lapsed (or booting) reader stays
   invalid even with a fresh confirmed lease until it affirms catch-up
   (`mark_caught_up`, accepted only while a lease is live) — a lapsed reader
   missed exactly the invalidations whose writers proceeded at its lapse.
-* **Roster rule:** Suspect and Dead-but-unreaped granters stay in the
-  confirmation min-set (either may still be writing); only a reap removes
-  one. Boot guards narrow membership divergence, and both are **enforced in
-  the shell** rather than asked of the deployment: for its first
+* **Roster rule:** the roster only grows. Every `CAP_LEASE` member a reader
+  has known and every reader it has granted stays in its confirmation
+  min-set through suspicion, death and reap: an asymmetric partition that
+  outlives the reap horizon would otherwise let a reader serve while a live
+  writer stops waiting for it. A granter leaves only after its map declared
+  its life departed (`Leases::leave`, after which it excuses nobody by lapse
+  and never serves again) and membership no longer lists it, and the drop is
+  reported as a lapse so the reader re-synchronizes after it. Boot guards
+  cover a node still learning its group, and both are **enforced in the
+  shell** rather than asked of the deployment: for its first
   `detection_window_ms + 2 × anti_entropy_interval` of participation a reader
   cannot reach `Serving` at all (`mark_caught_up` declines and no serve
   deadline is published — without that gate the empty roster a booting node
   holds confirms vacuously, and it can serve under a window no granter gave),
   and a writer refuses the no-known-holders fast path over the same window.
-* **What the roster rule costs, stated as an outage:** one unreaped
-  `CAP_LEASE` member that stops granting freezes *every* reader's
-  confirmation cluster-wide. Each reader's window closes within one `D` of
-  the freeze and cannot reopen until membership reaps the silent member — at
-  the reap horizon, `2 × dead_timeout_ms` past the `Dead` verdict, itself up
-  to `detection_window_ms` past the silence. At the defaults (`D = 2s`,
-  `dead_timeout_ms = 10s`, three members) that is `0.9 + 20 − 2` ≈ **19s of
-  cluster-wide origin-serving** — correct reads throughout, none of them
-  cached. Sizing: a lease deployment wants a short `dead_timeout_ms`, on the
-  order of `D` (at `D = 2s`, `dead_timeout_ms = 2s` turns those 19s into
-  ≈ 3s), bounded below by the longest partition it must survive and still
-  reconcile — the reap horizon is also the window past which a returning
-  node's entries can no longer be recovered by a digest.
+  The residual is a reader that boots into a full partition from a writer
+  and never learns it.
+* **What the roster rule costs, stated as an outage:** a `CAP_LEASE` member
+  that stops granting freezes *every* reader's confirmation cluster-wide.
+  Each reader's window closes within one `D` of the freeze and reopens only
+  when that member grants again — after a heal, or in its next life after a
+  restart under the same id — or departs. A member that dies without
+  departing and never returns leaves the survivors origin-serving until they
+  restart themselves. Correct reads throughout, none of them cached; stop
+  members with `leave` rather than letting them die.
 * **Honesty:** production safety rests on bounded clock-*rate* error over
   one lease duration (`rate_margin`, reader-side, default
   `max(D/100, 5ms)`); every failure inside the assumptions degrades to
-  origin-serving or writer over-waiting, never a stale serve. The two ways it
-  costs availability instead — the fail-slow reader (renewing but not
-  applying: no ack, no lapse, so the writer waits to its own deadline) and
-  the unreaped-granter outage above — are named in the tier's honesty box.
-  Proven in virtual time by `tests/lease_dst.rs` (224 chaos seeds: the
-  Gray–Cheriton lapse contract, no-unconfirmed-extension, previous-life
-  ghosts never serve) and `tests/lease_dst_liveness.rs` (64 liveness seeds);
-  mutation-tested for falsifiability.
+  origin-serving or writer over-waiting, never a stale serve. A coherent
+  write still reports `TimedOut` — no guarantee, and a consumer must not
+  report it to its client as coherent — when a reader that may serve has not
+  shown it counts the writer, inside the writer's warm-up window, and after
+  the writer departed. Proven in virtual time by `tests/lease_dst.rs` (224
+  chaos seeds: the Gray–Cheriton lapse contract, no-unconfirmed-extension,
+  previous-life ghosts never serve), `tests/lease_dst_liveness.rs` (64
+  liveness seeds) and `tests/lease_dst_divergence.rs` (96 seeds of
+  partitions past the reap horizon, departures and clock-rate skew within the
+  margin: no serving reader ever misses a write any node completed).
 
 ### M3 — Hosted mode (new)
 

@@ -52,7 +52,7 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    there. (Largest today, and the only ones still within ~50 lines of the
    limit, so the next addition to them splits them *first*:
    `groupnet-consistency`'s `src/replication/shell/driver.rs` ~967,
-   `tests/lease_dst.rs` ~948, `tests/replication.rs` ~944 and
+   `tests/lease_dst.rs` ~971, `tests/replication.rs` ~944 and
    `tests/volatile_bootstrap_runtime/scenarios.rs` ~951 (new runtime
    scenarios go in their own `volatile_bootstrap_runtime/` children, as
    `follower_progress.rs` does; the parent, ~711 since `PeerDonor` moved to
@@ -74,16 +74,18 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `groupnet-sim`'s
    `tests/election_external_skew.rs` ~910, `tests/election_quorum.rs` ~896
    and `src/simulation.rs` ~894; `groupnet-consistency`'s
-   `src/replication/shell.rs` ~914, `src/lease/shell.rs` ~889,
+   `src/replication/shell.rs` ~914,
    `tests/hosted_dst_liveness.rs` ~875, `tests/volatile_bootstrap_bulk_adapter.rs`
    ~864, `src/volatile_recovery/bootstrap/session/run.rs` ~862,
-   `tests/lease_dst_liveness.rs` ~853,
+   `tests/lease_dst_liveness.rs` ~876,
    `src/replication/shell/driver/snapshot.rs` ~844 and
    `tests/replication_snapshot.rs` ~840.
    With room still: `groupnet-runtime`'s `src/node.rs` ~803,
    `tests/external_faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
    ~754 and `tests/external.rs` ~706; `groupnet-consistency`'s
    `src/hosted/writes/mod.rs` ~795, `src/hosted/handoff/stream.rs` ~775,
+   `src/lease/core.rs` ~827, `src/lease/shell.rs` ~794 (a coherent write's
+   wait lives in `lease/shell/writes.rs`),
    `tests/handoff_fence.rs` ~761, `src/hosted/lineage.rs` ~800,
    `tests/handoff_migration.rs` ~757, `tests/hosted_migration.rs` ~752,
    `src/hosted/ledger.rs` ~725, `src/hosted/handoff/wire.rs` ~717 and

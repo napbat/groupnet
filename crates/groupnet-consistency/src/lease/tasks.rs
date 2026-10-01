@@ -92,7 +92,9 @@ async fn granter_task(shared: Arc<Shared>) {
     }
 }
 
-/// Blocks until something that could change this node's grant map happens.
+/// Blocks until something that could change this node's grant map happens: a
+/// peer's renewal, membership churn, the backstop tick, or a coherent write
+/// ending (which may lift the cap it held on a lagging reader's grant).
 /// `false` once the group is gone.
 async fn await_grant_trigger(
     shared: &Shared,
@@ -102,6 +104,7 @@ async fn await_grant_trigger(
     loop {
         tokio::select! {
             _ = ticker.tick() => return true,
+            () = shared.refold.notified() => return true,
             event = events.recv() => match event {
                 Ok(GroupEvent::NodeStateChanged { node, key }) => {
                     if key == shared.renewal_key && node != shared.me {

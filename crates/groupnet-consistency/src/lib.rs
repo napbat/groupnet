@@ -269,8 +269,8 @@ pub use hosted::{
 };
 #[cfg(feature = "leases")]
 pub use lease::{
-    CAP_LEASE, ClockMs, CoherenceCore, CoherenceOutcome, CoherenceStep, LeaseConfig,
-    LeaseConfigError, LeaseCore, LeaseState, LeaseView, Leases, RenewalId, WaitMember,
+    CAP_LEASE, ClockMs, CoherenceCore, CoherenceOutcome, CoherenceStep, GrantLedger, GranterLife,
+    LeaseConfig, LeaseConfigError, LeaseCore, LeaseState, LeaseView, Leases, RenewalId, WaitMember,
 };
 pub use peers::{
     InvalidFeedHead, PeerWrite, PeerWrites, advertised_head, advertised_head_named,

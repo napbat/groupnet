@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use groupnet_core::NodeId;
 
-use super::wire::{GrantMap, RenewalId};
+use super::wire::{GrantMap, GranterLife, RenewalId};
 use super::{LeaseConfig, LeaseState};
 
 /// How many publish instants one reader remembers. Renewals are `duration/3`
@@ -114,11 +114,19 @@ pub struct LeaseCore {
     /// `granter -> newest seq of *this* epoch that granter has adopted`.
     /// Absent means "confirms nothing", which freezes confirmation entirely.
     granters: BTreeMap<NodeId, u64>,
-    /// The granters that must confirm — every known not-reaped member
-    /// advertising [`CAP_LEASE`](super::CAP_LEASE), never this node itself.
+    /// The granters that must confirm. It only grows — every advertiser this
+    /// node has learned and every reader it has granted joins it — and a
+    /// granter leaves it only once it has departed and membership no longer
+    /// lists it (see [`set_roster`](Self::set_roster)). Never this node itself.
     roster: BTreeSet<NodeId>,
+    /// The last [`GranterLife`] each granter's map carried — the departure
+    /// flag [`set_roster`](Self::set_roster) needs.
+    lives: BTreeMap<NodeId, GranterLife>,
     /// Whether the consumer has affirmed catch-up since the last lapse.
     caught_up: bool,
+    /// Whether this life has departed the lease set ([`depart`](Self::depart)):
+    /// it never serves again.
+    departed: bool,
     /// How many times this core has lapsed — an alarm counter.
     lapses: u64,
 }
@@ -145,7 +153,9 @@ impl LeaseCore {
             published: BTreeMap::new(),
             granters: BTreeMap::new(),
             roster: BTreeSet::new(),
+            lives: BTreeMap::new(),
             caught_up: false,
+            departed: false,
             lapses: 0,
         }
     }
@@ -198,36 +208,80 @@ impl LeaseCore {
         })
     }
 
-    /// Replaces the set of granters that must confirm before this node may
-    /// serve: every known not-reaped member advertising
+    /// Folds in the granters that must confirm before this node may serve:
+    /// every known not-reaped member advertising
     /// [`CAP_LEASE`](super::CAP_LEASE). This node is filtered out — a reader
     /// never waits on itself, because a *local* write invalidates local state
     /// before it returns.
     ///
     /// # Roster rules (the safety hinge)
     ///
-    /// * A **`Suspect`** granter stays in the set. Suspicion is a rumour about
-    ///   reachability, and a member that is merely suspected may still be
-    ///   writing; dropping it would let this node keep serving while a live
-    ///   writer no longer waits for it.
-    /// * A **`Dead`-but-not-reaped** granter stays too, for the same reason —
-    ///   the tombstone is one observer's verdict.
-    /// * A **reaped** granter leaves, because it is gone from membership
-    ///   entirely (the engine has dropped the record) and no writer behind it
-    ///   can be waiting on this node's lease. This is the only way a silent
-    ///   granter stops freezing confirmation, and it is bounded by the reap
-    ///   horizon rather than by anyone's patience.
+    /// The roster **only grows**. A granter that this core has once counted —
+    /// passed here, or [`pin`](Self::pin)ned because this node granted it —
+    /// stays in the min-set when membership suspects it, declares it `Dead`,
+    /// or reaps it. A reap is one observer's verdict after a silence, and an
+    /// asymmetric partition that outlives the reap horizon reaps a granter that
+    /// is still writing: dropping it would let this node serve while a live
+    /// writer no longer waits for it, and a writer that has seen this node
+    /// count it ([`GrantLedger`](super::GrantLedger)) relies on that never
+    /// happening. A silent granter therefore freezes confirmation until it
+    /// grants again — after a heal, or in its next life after a restart.
     ///
-    /// An **empty** roster confirms vacuously: with nobody advertising the
-    /// capability there is no participating writer to be coherent with, so the
-    /// newest published renewal is the confirmed one. That is a real, if weak,
-    /// answer — the same posture
-    /// [`applied_by_selected`](crate::applied_by_selected) takes for an empty
-    /// selection — and it carries the same advertisement-lag footgun: a writer
-    /// whose [`CAP_LEASE`](super::CAP_LEASE) advertisement has not landed yet
-    /// is invisible here and is not waited for.
+    /// The one way out is **departure**. A granter absent from `roster` whose
+    /// last map declared its life departed
+    /// ([`Leases::leave`](super::Leases::leave)) is dropped: that life excuses
+    /// no reader by lapse, so no write of its can complete without this node's
+    /// acknowledgement. Dropping one is reported as a lapse — the edge
+    /// [`poll`](Self::poll) would have produced, and the alarm counter bumps —
+    /// because a catch-up affirmed while the granter still froze confirmation
+    /// may predate writes it completed on this node's earlier lapse, so the
+    /// consumer must re-synchronize after the drop, not reuse that affirmation.
+    ///
+    /// An **empty** roster confirms vacuously: with nobody to wait on, the
+    /// newest published renewal is the confirmed one. That is the right answer
+    /// for a node alone in its lease set and the shell refuses it to a node
+    /// that has not finished learning its group (the boot guard), but a roster
+    /// that never learned a writer at all — a node that booted into a full
+    /// partition from it — confirms without it. The honesty box names that
+    /// residual.
     pub fn set_roster(&mut self, roster: impl IntoIterator<Item = NodeId>) {
-        self.roster = roster.into_iter().filter(|node| *node != self.me).collect();
+        let advertised: BTreeSet<NodeId> =
+            roster.into_iter().filter(|node| *node != self.me).collect();
+        let departed: Vec<NodeId> = self
+            .roster
+            .iter()
+            .filter(|granter| {
+                !advertised.contains(*granter)
+                    && self.lives.get(*granter).is_some_and(|life| life.departed)
+            })
+            .cloned()
+            .collect();
+        self.roster.extend(advertised);
+        if departed.is_empty() {
+            return;
+        }
+        for granter in &departed {
+            self.roster.remove(granter);
+            self.granters.remove(granter);
+            self.lives.remove(granter);
+        }
+        self.caught_up = false;
+        self.lapses += 1;
+    }
+
+    /// Counts `granter` from now on, as [`set_roster`](Self::set_roster) would —
+    /// called by this node's granter **before** it publishes a map granting
+    /// `granter`'s renewal, because that grant is what a writer reads as proof
+    /// that this node counts it.
+    pub fn pin(&mut self, granter: &NodeId) {
+        if *granter != self.me {
+            self.roster.insert(granter.clone());
+        }
+    }
+
+    /// The granters that must confirm, in id order.
+    pub fn roster(&self) -> impl Iterator<Item = &NodeId> {
+        self.roster.iter()
     }
 
     /// Folds one granter's advertised grant map into this core.
@@ -247,13 +301,15 @@ impl LeaseCore {
                 self.granters.remove(granter);
             }
         }
+        match GranterLife::of(granter, grants) {
+            Some(life) => self.lives.insert(granter.clone(), life),
+            None => self.lives.remove(granter),
+        };
     }
 
-    /// Drops what `granter` had confirmed — for a member that has been reaped
-    /// from membership. Purely a memory reclaim: a granter absent from the
-    /// roster is already outside the min-set. Grants of members still present
-    /// linger harmlessly, exactly like a [`Frontier`](crate::Frontier)'s
-    /// per-writer watermarks.
+    /// Drops what `granter` had confirmed. Purely a memory reclaim, and **not**
+    /// a way out of the roster: a counted granter whose confirmation is
+    /// forgotten stays in the min-set and freezes it until it grants again.
     pub fn forget_granter(&mut self, granter: &NodeId) {
         self.granters.remove(granter);
     }
@@ -297,7 +353,7 @@ impl LeaseCore {
     /// [`valid`](Self::valid).
     #[must_use]
     pub fn peek(&self, now: ClockMs) -> LeaseState {
-        if !self.caught_up {
+        if !self.caught_up || self.departed {
             LeaseState::NeedsResync
         } else if self.live_at(now) {
             LeaseState::Serving
@@ -347,7 +403,7 @@ impl LeaseCore {
     /// A flush is the remediation that is trivially catch-up-complete: nothing
     /// cached, nothing stale, and the next fill happens under a live lease.
     pub fn mark_caught_up(&mut self, now: ClockMs) -> bool {
-        let live = self.live_at(now);
+        let live = !self.departed && self.live_at(now);
         if live {
             self.caught_up = true;
         }
@@ -359,6 +415,16 @@ impl LeaseCore {
     /// [`PeerWrite::Gap`](crate::PeerWrite::Gap), a failed apply, a cache
     /// rebuild. Serving stops until the consumer affirms catch-up again.
     pub fn require_resync(&mut self) {
+        self.caught_up = false;
+    }
+
+    /// Ends this life's right to serve for good —
+    /// [`Leases::leave`](super::Leases::leave). Unlike
+    /// [`require_resync`](Self::require_resync)
+    /// no affirmation reopens it, which is what lets a writer excuse a departed
+    /// reader at once rather than waiting out its lease.
+    pub fn depart(&mut self) {
+        self.departed = true;
         self.caught_up = false;
     }
 
@@ -385,7 +451,7 @@ mod tests {
     use groupnet_core::NodeId;
 
     use super::{ClockMs, LeaseCore};
-    use crate::lease::wire::{GrantMap, RenewalId};
+    use crate::lease::wire::{GrantMap, GranterLife, RenewalId};
     use crate::lease::{LeaseConfig, LeaseState};
 
     /// D = 1000 ms, margin = 10 ms — round numbers for readable arithmetic.
@@ -498,21 +564,103 @@ mod tests {
     }
 
     #[test]
-    fn a_reaped_granter_leaves_the_min_set_and_a_suspect_one_does_not() {
+    fn a_reaped_granter_stays_in_the_min_set_until_it_grants_again() {
         let mut core = reader(&["a", "quiet"]);
-        let id = core.on_renew(ClockMs(0));
-        core.observe_grant_map(&node("a"), &grant("reader", id));
-        assert_eq!(core.confirmed(), None, "the quiet granter freezes it");
+        let id = serve_from(&mut core, ClockMs(0), &["a", "quiet"]);
+        let renewed = core.on_renew(ClockMs(300));
+        core.observe_grant_map(&node("a"), &grant("reader", renewed));
+        assert_eq!(core.confirmed(), Some(id), "the quiet granter freezes it");
 
-        // Suspect (and Dead-but-not-reaped) members stay in the roster the
-        // shell passes, so nothing changes: they may still be writing.
-        core.set_roster([node("a"), node("quiet")]);
-        assert_eq!(core.confirmed(), None);
-
-        // Reaped: gone from membership entirely, so it leaves the min-set and
-        // confirmation unfreezes.
+        // Reaped by membership — an asymmetric partition that outlived the reap
+        // horizon looks exactly like this, while `quiet` may still be writing.
         core.set_roster([node("a")]);
+        core.observe_grant_map(&node("quiet"), &GrantMap::new());
+        assert_eq!(core.confirmed(), None, "a reap is not a way out");
+        assert!(core.roster().any(|granter| *granter == node("quiet")));
+        assert_eq!(core.poll(ClockMs(990)), LeaseState::Lapsed);
+        assert!(!core.mark_caught_up(ClockMs(1_000)), "frozen, not vacuous");
+
+        // The partition heals and `quiet` grants again: the lease comes back.
+        core.observe_grant_map(&node("quiet"), &grant("reader", renewed));
+        assert_eq!(core.confirmed(), Some(renewed));
+        assert!(core.mark_caught_up(ClockMs(1_000)));
+    }
+
+    #[test]
+    fn a_granted_reader_is_counted_before_its_advertisement_lands() {
+        let mut core = reader(&[]);
+        let id = core.on_renew(ClockMs(0));
+        assert_eq!(core.confirmed(), Some(id), "an empty roster is vacuous");
+        // This node granted `w`'s renewal, which `w` reads as proof that it is
+        // counted here: from now on its grants are required.
+        core.pin(&node("w"));
+        core.pin(&node("reader"));
+        assert_eq!(core.confirmed(), None, "pinned, and it has granted nothing");
+        assert!(
+            core.roster().all(|granter| *granter != node("reader")),
+            "a reader never waits on itself"
+        );
+        core.set_roster(Vec::new());
+        assert_eq!(
+            core.confirmed(),
+            None,
+            "still counted with no advertisement"
+        );
+    }
+
+    #[test]
+    fn only_a_departed_granter_that_membership_forgot_leaves_and_that_is_a_lapse() {
+        let mut core = reader(&["a", "gone"]);
+        let id = serve_from(&mut core, ClockMs(0), &["a", "gone"]);
+        let mut farewell = grant("reader", id);
+        GranterLife {
+            epoch: 3,
+            departed: true,
+        }
+        .stamp(&node("gone"), &mut farewell);
+        core.observe_grant_map(&node("gone"), &farewell);
+
+        // Departed but still listed (draining its last writes): still counted.
+        core.set_roster([node("a"), node("gone")]);
+        assert!(core.roster().any(|granter| *granter == node("gone")));
+        assert_eq!(core.lapses(), 0);
+
+        // Departed and no longer listed: it leaves, and the consumer must
+        // re-synchronize after the drop rather than keep serving on it.
+        core.set_roster([node("a")]);
+        assert!(core.roster().all(|granter| *granter != node("gone")));
         assert_eq!(core.confirmed(), Some(id));
+        assert_eq!(core.lapses(), 1, "the drop is an alarm like a lapse");
+        assert_eq!(core.poll(ClockMs(100)), LeaseState::NeedsResync);
+        assert!(core.mark_caught_up(ClockMs(100)));
+        assert_eq!(core.poll(ClockMs(100)), LeaseState::Serving);
+
+        // A live life's row, or none at all, never lets a forgotten granter go.
+        let mut core = reader(&["a", "crashed"]);
+        let mut alive = grant("reader", id);
+        GranterLife {
+            epoch: 3,
+            departed: false,
+        }
+        .stamp(&node("crashed"), &mut alive);
+        core.observe_grant_map(&node("crashed"), &alive);
+        core.set_roster([node("a")]);
+        assert!(core.roster().any(|granter| *granter == node("crashed")));
+        assert_eq!(core.lapses(), 0);
+    }
+
+    #[test]
+    fn a_departed_life_never_serves_again() {
+        let mut core = reader(&["a"]);
+        let id = serve_from(&mut core, ClockMs(0), &["a"]);
+        core.depart();
+        assert_eq!(core.poll(ClockMs(10)), LeaseState::NeedsResync);
+        core.observe_grant_map(&node("a"), &grant("reader", id));
+        assert!(
+            !core.mark_caught_up(ClockMs(10)),
+            "a live lease cannot reopen a departed life"
+        );
+        assert!(!core.valid(ClockMs(10)));
     }
 
     #[test]
