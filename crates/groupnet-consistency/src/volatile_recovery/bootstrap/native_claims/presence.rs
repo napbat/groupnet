@@ -117,10 +117,19 @@ impl NativeClaimSource {
                     self.max_value_bytes,
                 )
                 .map_err(|_| AdapterError)?;
-                if existing.identity != presence.identity || existing.renewal > presence.renewal {
+                if existing.identity != presence.identity {
+                    // The same boot token is another live session of this
+                    // process, or this session already confirmed its own. A
+                    // different boot token is a previous process life under
+                    // this member name, which peers still gossip back until
+                    // its TTL lapses; this life supersedes it at the observed
+                    // revision.
+                    if existing.identity.boot == presence.identity.boot || published.is_some() {
+                        return Err(AdapterError);
+                    }
+                } else if existing.renewal > presence.renewal {
                     return Err(AdapterError);
-                }
-                if existing.renewal == presence.renewal {
+                } else if existing.renewal == presence.renewal {
                     if local.first_remaining_ttl_ms.is_none_or(|ttl| ttl == 0) {
                         return Err(AdapterError);
                     }

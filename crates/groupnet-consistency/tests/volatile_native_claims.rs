@@ -84,6 +84,42 @@ fn presence(node: groupnet_core::NodeId, boot: u128, session: u64) -> BootstrapP
     }
 }
 
+/// A process restarted under the same member name publishes its new life's
+/// presence while the survivor still holds the previous life's unexpired one.
+#[tokio::test]
+async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_presence() {
+    let opts = groupnet_testkit::cluster::NodeOpts::new("g")
+        .gossip_interval_ms(10)
+        .anti_entropy_interval_ms(25);
+    let net = groupnet_transport_mem::Network::new();
+    let spawn =
+        |id: &str, seed: &str| groupnet_testkit::cluster::spawn_mem_node(&net, id, &[seed], &opts);
+    let (_a_id, _a_node, a_group) = spawn("re-a", "re-b");
+    let (b_id, b_node, b_group) = spawn("re-b", "re-a");
+    groupnet_testkit::cluster::converged(&[&a_group, &b_group]).await;
+    let budget = admission();
+    let source =
+        |group| NativeClaimSource::new(group, scope(), policy(), 128, 256, budget.clone()).unwrap();
+    let old = source(b_group.clone());
+    old.publish_presence(presence(b_id.clone(), 7, 8))
+        .await
+        .unwrap();
+    let key = presence_entry_key(&scope(), 128).unwrap();
+    eventually("the survivor holds the old life's presence", || {
+        a_group.node_entry(&b_id, &key).is_some()
+    })
+    .await;
+    drop(old);
+    drop(b_group);
+    drop(b_node);
+    let (_b_id, _reborn_node, reborn) = spawn("re-b", "re-a");
+    groupnet_testkit::cluster::converged(&[&a_group, &reborn]).await;
+    source(reborn)
+        .publish_presence(presence(b_id, 9, 10))
+        .await
+        .expect("the new life publishes its presence");
+}
+
 #[tokio::test]
 async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_replacement() {
     let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();

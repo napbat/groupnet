@@ -52,6 +52,13 @@ check, a bounded number of times inside the caller's operation deadline; a
 retained key revision or newer presence still refuses. The queued request
 and exact response own admission through actor completion.
 
+A process restarted under the same member name finds its previous life's
+presence gossiped back by peers until that entry's TTL lapses. A local
+presence with a different boot token is that previous life, and a source that
+has not yet confirmed a presence of its own supersedes it at the observed key
+revision. The same boot token under another session of this process still
+refuses, as does any foreign identity once this source has published.
+
 The source exposes one **complete, bounded actor cut** of native membership
 status/incarnation, participation entries, and builder claims for a bootstrap
 scope. Limits on member count, NodeId bytes, entry bytes, and total owned
