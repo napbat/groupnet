@@ -16,6 +16,10 @@ default = ["runtime", "mem"]
 runtime = ["dep:groupnet-runtime"]
 mem = ["dep:groupnet-transport-mem"]
 udp = ["dep:groupnet-transport-udp"]
+# Named seeds resolved through the operating system's resolver
+# (`runtime::SystemResolver`): a seed addressed as `host:port` and re-resolved
+# for the life of the node.
+dns = ["runtime", "groupnet-runtime/dns"]
 # Data plane: `bulk` is the stream trait + framing (in groupnet-transport);
 # `tcp` is the TCP binding.
 bulk = ["groupnet-transport/bulk"]

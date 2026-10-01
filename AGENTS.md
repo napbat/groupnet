@@ -156,6 +156,8 @@ cargo fmt --all --check
 cargo check -p groupnet --no-default-features --all-targets
 cargo check -p groupnet-transport --no-default-features
 cargo test -p groupnet --features tcp-msg
+cargo test -p groupnet-runtime --features dns
+cargo clippy -p groupnet-runtime -p groupnet --all-targets --features groupnet-runtime/dns,groupnet/dns,groupnet/udp -- -D warnings
 cargo test -p groupnet-consistency --features acks
 cargo test -p groupnet-consistency --features leases
 cargo test -p groupnet-consistency --features hosted

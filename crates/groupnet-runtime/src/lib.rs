@@ -44,6 +44,7 @@ mod driver;
 mod group;
 mod node;
 mod routing;
+mod seeds;
 mod store;
 
 pub use anchor::{Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf};
@@ -56,4 +57,10 @@ pub use group::{
 pub use groupnet_core::{RecoveredGrant, Role, Status};
 pub use node::{GroupProfile, Node, NodeBuilder};
 pub use routing::Routing;
+#[cfg(feature = "dns")]
+pub use seeds::SystemResolver;
+pub use seeds::{
+    DEFAULT_REFRESH_INTERVAL, DEFAULT_RETRY_INTERVAL, DEFAULT_STARTUP_ATTEMPTS, NamedSeeds,
+    ResolveFuture, SeedEvent, SeedResolver,
+};
 pub use store::GrantStore;

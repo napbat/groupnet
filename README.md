@@ -151,6 +151,22 @@ transport.register_peer(NodeId::new("node-b"), "10.0.0.2:7000".parse()?);
 let node = Node::builder(NodeId::new("node-a"), transport).seed(NodeId::new("node-b")).spawn();
 ```
 
+In an orchestrated deployment a seed's address moves (a `StatefulSet` peer's DNS
+record appears after its pod starts; a rolling restart hands it a new IP). Name
+the seed instead and let the node keep it current: it is resolved off the
+startup path, retried until it first resolves, re-resolved for the life of the
+node, and every new address reaches the transport through
+`Transport::learn_peer` (feature `dns` for the operating system resolver; any
+`SeedResolver` works):
+
+```rust
+use groupnet::runtime::{NamedSeeds, SystemResolver}; // enable feature "dns"
+
+let node = Node::builder(NodeId::new("node-a"), transport)
+    .named_seeds(NamedSeeds::new(SystemResolver).seed(NodeId::new("node-b"), "node-b.peers:7000"))
+    .spawn();
+```
+
 Binding your own transport is one trait — implement it and the runtime works
 unchanged:
 

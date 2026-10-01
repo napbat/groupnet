@@ -15,6 +15,7 @@ use crate::driver::{
 };
 use crate::group::{Group, Leadership};
 use crate::routing::Routing;
+use crate::seeds::{NamedSeeds, resolve_named_seeds};
 use crate::store::{GrantStore, VoterStorage};
 use tokio::sync::broadcast;
 
@@ -317,6 +318,7 @@ impl<T: Transport> Node<T> {
             seeds: Vec::new(),
             config: Config::default(),
             advertise_addr: None,
+            named_seeds: None,
         }
     }
 
@@ -607,6 +609,7 @@ pub struct NodeBuilder<T: Transport> {
     seeds: Vec<NodeId>,
     config: Config,
     advertise_addr: Option<String>,
+    named_seeds: Option<NamedSeeds>,
 }
 
 impl<T: Transport> std::fmt::Debug for NodeBuilder<T> {
@@ -614,6 +617,7 @@ impl<T: Transport> std::fmt::Debug for NodeBuilder<T> {
         f.debug_struct("NodeBuilder")
             .field("id", &self.id)
             .field("seeds", &self.seeds)
+            .field("named_seeds", &self.named_seeds)
             .finish_non_exhaustive()
     }
 }
@@ -623,6 +627,17 @@ impl<T: Transport> NodeBuilder<T> {
     #[must_use]
     pub fn seed(mut self, id: NodeId) -> Self {
         self.seeds.push(id);
+        self
+    }
+
+    /// Adds seeds addressed by `host:port` name, resolved and kept current by
+    /// the node itself (see [`NamedSeeds`]): every seed joins the seed set
+    /// now, its address reaches the transport through
+    /// [`Transport::learn_peer`] once it resolves, and it is re-resolved for
+    /// the life of the node. A later call replaces an earlier one.
+    #[must_use]
+    pub fn named_seeds(mut self, seeds: NamedSeeds) -> Self {
+        self.named_seeds = Some(seeds);
         self
     }
 
@@ -708,10 +723,14 @@ impl<T: Transport> NodeBuilder<T> {
     /// Spawns the node: starts the transport receive loop and returns a handle.
     /// Must be called from within a Tokio runtime.
     pub fn spawn(self) -> Node<T> {
+        let mut seeds = self.seeds;
+        if let Some(named) = &self.named_seeds {
+            seeds.extend(named.nodes().cloned());
+        }
         let inner = Arc::new(Inner {
             id: self.id,
             transport: Arc::new(self.transport),
-            seeds: self.seeds,
+            seeds,
             config: self.config,
             routes: Mutex::new(HashMap::new()),
             start: Instant::now(),
@@ -719,6 +738,13 @@ impl<T: Transport> NodeBuilder<T> {
         });
         let advertise = self.advertise_addr;
         tokio::spawn(recv_loop(inner.clone()));
+        if let Some(named) = self.named_seeds {
+            tokio::spawn(resolve_named_seeds(
+                Arc::downgrade(&inner.transport),
+                inner.id.clone(),
+                named,
+            ));
+        }
         let node = Node { inner };
         // Join the reserved routing group (no coordinator publisher of its
         // own). `spawn_group` pins it Eventual whatever this asks for.
