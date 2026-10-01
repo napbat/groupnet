@@ -378,16 +378,25 @@ enum Happening {
     Gap,
 }
 
-/// What one run cost `me` and what its lapse proof saw of `a`.
+/// What one run cost `me`, and what its lapse proof saw of `a`.
 #[derive(Debug, Default)]
 struct Run {
     fallbacks: usize,
     origin_builds: usize,
     acquisitions: usize,
     distrusted_after_stop: bool,
-    relearned_seen: bool,
-    vanished_seen: bool,
-    next_life_seen: bool,
+    seen: Seen,
+}
+
+/// The departure shapes a lapse proof observed.
+#[derive(Debug, Default)]
+struct Seen {
+    /// `a` relearned with no state, behind a delivered seal.
+    relearned: bool,
+    /// `a` gone from the roster.
+    vanished: bool,
+    /// `a`'s next life.
+    next_life: bool,
 }
 
 /// `me`'s view of the world and its pending happenings.
@@ -647,14 +656,14 @@ impl World {
 
     fn note_lapse_observation(&mut self, peers: &[Peer]) {
         match peers.first() {
-            None => self.run.vanished_seen = true,
+            None => self.run.seen.vanished = true,
             Some(peer)
                 if peer.renewal.is_some() || peer.head.is_some_and(|head| head.epoch == 2) =>
             {
-                self.run.next_life_seen = true;
+                self.run.seen.next_life = true;
             }
             Some(peer) if peer.head.is_none() && peer.sealed.is_some() => {
-                self.run.relearned_seen = true;
+                self.run.seen.relearned = true;
             }
             Some(_) => {}
         }
@@ -707,9 +716,9 @@ fn a_sealed_second_stop_anywhere_in_the_rejoiners_recovery_costs_no_fallback() {
             assert!(!run.distrusted_after_stop, "{context}");
             assert_eq!(engine.state().stage, RecoveryStage::Ready, "{context}");
             assert!(engine.state().recovered, "{context}");
-            relearned += usize::from(run.relearned_seen);
-            vanished += usize::from(run.vanished_seen);
-            next_life += usize::from(run.next_life_seen);
+            relearned += usize::from(run.seen.relearned);
+            vanished += usize::from(run.seen.vanished);
+            next_life += usize::from(run.seen.next_life);
         }
     }
     // The schedule earns every departure shape inside the lapse proof: the
