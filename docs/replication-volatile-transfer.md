@@ -37,9 +37,15 @@ refresh for the exact selected donor. An absent, expired, or contradictory
 claim aborts transfer without replacing the parent operation with
 `ObserveClaims`; a refresh read that fails or times out is sampled again, and
 the donor's last observed claim expiry still bounds the transfer. Transfer
-success completes the candidate handoff; failure excludes that exact donor,
-reports `Released { reason: TransferAborted(error) }`, and resumes bounded
-observation/takeover. A later ready advertisement alone extends no deadline.
+success completes the candidate handoff. A failure reports
+`Released { reason: TransferAborted(error) }` and resumes bounded
+observation/takeover; it excludes that exact donor attempt unless the error
+is `Unavailable`, an operation that failed or timed out without a verdict on
+the image, and the first Ready selection's donor-wait deadline still holds.
+Then the follower samples a fresh cut one observation interval later and may
+transfer from the same live attempt again
+(`replication-volatile-membership.md`). A later ready advertisement alone
+extends no deadline.
 A self-built `Ready` donor may remain
 available to others, but its own claim grants no serving authority.
 

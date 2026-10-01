@@ -290,10 +290,26 @@ never reuses an old capture or authorizes reads
 while the outer gate is closed.
 
 A follower may select a Ready claim just as that donor loses its outer lease.
-An unavailable Offer or retired transfer excludes that exact claim attempt; it
-does not grant another use of its C. The sans-IO selection engine may sample
-fresh complete source cuts at the configured finite observation interval,
-waiting for a new eligible claim identity only until the first Ready attempt's
+A transfer the donor refuses or that fails verification (`Continuity`,
+`Stale`, a schema or capacity refusal) excludes that exact claim attempt; it
+does not grant another use of its C. A transfer operation that only failed
+or timed out (`Unavailable`) is no verdict on the image: the request may
+never have reached the donor. On 2026-10-01 a rolling update's follower lost
+one of about 1,750 per-chunk connections to the donor, because its Windows
+host reused a local port still in `TIME_WAIT` toward the same donor
+endpoint (Tcpip event 4227), and the healthy donor, never seeing the
+request, kept advertising the attempt the follower had excluded: the
+follower waited out the donor wait and scanned the origin. Such an attempt
+therefore stays eligible while the first Ready selection's donor-wait
+deadline holds. The follower samples a fresh complete cut one observation
+interval later and transfers from that attempt again if it is still live
+there; a donor that did retire its capture has superseded the attempt with
+a new claim by then. Neither the deadline nor the episode budget is
+renewed, so a donor that keeps failing ends the wait at that deadline like
+any other, and every new transfer starts from an Offer the donor serves only
+after rechecking its roster. The sans-IO selection engine may sample fresh
+complete source cuts at the configured finite observation interval, waiting
+for a new eligible claim identity only until the first Ready attempt's
 original donor-wait deadline, capped by the episode's total deadline. It does
 not extend either budget on subsequent refusals. If no independently valid
 replacement arrives, the ordinary origin fallback proceeds. Origin reads

@@ -4,7 +4,8 @@ use super::journal::{
     AttachToken, BarrierReceipt, CaptureId, JournalCursor, NativeCut, ReservationId,
 };
 use super::transfer::{
-    NativeCoverageReceipt, NativeHandoffReceipt, TransferConfig, TransferEffect, TransferEvent,
+    NativeCoverageReceipt, NativeHandoffReceipt, TransferConfig, TransferEffect, TransferError,
+    TransferEvent,
 };
 use super::*;
 use crate::volatile_recovery::RecoveryOperation;
@@ -193,6 +194,94 @@ fn stale_transfer_reply_after_supersession_cannot_reopen_candidate() {
     })));
     assert_eq!(stale.rejection, Some(BootstrapError::Stage));
     assert_eq!(engine.stage(), BootstrapStage::Settling);
+}
+
+/// A transfer whose operation fails without a verdict on the image, such as
+/// a connection the follower's own host refuses, does not exclude a donor
+/// whose Ready attempt stays live: one observation interval later the
+/// follower selects that attempt again instead of scanning the origin.
+#[test]
+fn a_failed_transfer_operation_returns_to_the_live_ready_donor() {
+    let (mut engine, parent, selected) = ready_follower();
+    let begin = engine.step(BootstrapEvent::StartTransfer {
+        op: parent,
+        selected: selected.clone(),
+    });
+    let fetch = begin
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::Transfer(effect) => match effect.as_ref() {
+                TransferEffect::FetchOffer { op, .. } => Some(*op),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap();
+    let failed = engine.step(BootstrapEvent::Transfer(Box::new(TransferEvent::Failed {
+        op: fetch,
+    })));
+    assert_eq!(failed.rejection, None);
+    assert!(failed.effects.iter().any(|effect| matches!(effect,
+        BootstrapEffect::Released { builder, reason: ReleaseReason::TransferAborted(TransferError::Unavailable) }
+            if *builder == selected)));
+    assert!(
+        !failed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BootstrapEffect::ObserveClaims { .. })),
+        "the next cut is sampled one observation interval later"
+    );
+    assert_eq!(engine.stage(), BootstrapStage::Settling);
+    let tick = engine.step(BootstrapEvent::Tick(Time(6)));
+    let observe = tick
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::ObserveClaims { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the settle interval ends with a fresh observation");
+    let local = tick
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::PublishClaim(claim) => Some(claim.clone()),
+            _ => None,
+        })
+        .expect("the follower renews its own claim");
+    let decision = engine.step(BootstrapEvent::ClaimsObserved {
+        op: observe,
+        members: ["a", "b"]
+            .into_iter()
+            .map(|name| BootstrapMember {
+                node: NodeId::from(name),
+                eligible: true,
+            })
+            .collect(),
+        claims: vec![
+            local,
+            BootstrapClaim {
+                identity: selected.clone(),
+                renewal: 3,
+                phase: ClaimPhase::Ready,
+                progress: 0,
+                remaining_ms: 9,
+            },
+        ],
+    });
+    assert_eq!(decision.rejection, None);
+    assert!(
+        decision.effects.iter().any(|effect| matches!(effect,
+            BootstrapEffect::DonorAvailable { selected: again, .. } if *again == selected)),
+        "the same live Ready attempt is selected again: {decision:?}"
+    );
+    assert!(
+        !decision
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BootstrapEffect::BuildOrigin { .. }))
+    );
 }
 
 #[test]

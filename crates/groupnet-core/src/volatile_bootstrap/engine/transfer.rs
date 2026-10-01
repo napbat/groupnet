@@ -332,15 +332,17 @@ impl ClaimEngine {
                 self.claim_refresh_due = None;
                 self.claim_poll = None;
                 self.claim_poll_due = None;
+                let reason = step.rejection.unwrap_or(TransferError::Stage);
                 if let Some(selected) = self.selected.clone() {
-                    self.observed.remove(&selected);
-                    self.excluded.insert(selected.clone());
                     effects.push(BootstrapEffect::Released {
-                        builder: selected,
-                        reason: ReleaseReason::TransferAborted(
-                            step.rejection.unwrap_or(TransferError::Stage),
-                        ),
+                        builder: selected.clone(),
+                        reason: ReleaseReason::TransferAborted(reason),
                     });
+                    if reason == TransferError::Unavailable && self.settle_on_ready_donor() {
+                        return self.ok(effects);
+                    }
+                    self.observed.remove(&selected);
+                    self.excluded.insert(selected);
                 }
                 if self.total_due.is_some_and(|due| self.now >= due)
                     || self.excluded.len() > self.config.max_members
@@ -378,6 +380,34 @@ impl ClaimEngine {
                 self.ok(effects)
             }
         }
+    }
+
+    /// A transfer operation that failed or timed out (`Unavailable`) is no
+    /// verdict on the donor's image: the request may never have reached it,
+    /// as when the follower's own host refuses a connection, and a donor that
+    /// does retire its capture supersedes the attempt with a new claim. So
+    /// that attempt is not excluded while the first Ready selection's
+    /// donor-wait deadline holds: the follower samples a fresh complete cut
+    /// one observation interval later and, if the same Ready attempt is still
+    /// live there, transfers from it again. Neither the deadline nor the
+    /// episode budget is renewed: a donor that keeps failing ends the wait at
+    /// that deadline, as any Ready selection past it does, with the ordinary
+    /// origin fallback, and a failure past it excludes the attempt as before.
+    /// False once the deadline passed.
+    fn settle_on_ready_donor(&mut self) -> bool {
+        let Some(due) = self.ready_retry_due.filter(|due| self.now < *due) else {
+            return false;
+        };
+        let Some(next) = self.now.0.checked_add(self.config.observe_ms).map(Time) else {
+            return false;
+        };
+        if self.total_due.is_some_and(|total| self.now >= total) {
+            return false;
+        }
+        self.selected = None;
+        self.stage = BootstrapStage::Settling;
+        self.settle_due = Some(next.min(due));
+        true
     }
 
     pub(super) fn tick_transfer(&mut self, now: Time) -> BootstrapStep {
