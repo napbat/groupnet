@@ -63,4 +63,4 @@ pub use seeds::{
     DEFAULT_REFRESH_INTERVAL, DEFAULT_RETRY_INTERVAL, DEFAULT_STARTUP_ATTEMPTS, NamedSeeds,
     ResolveFuture, SeedEvent, SeedResolver,
 };
-pub use store::GrantStore;
+pub use store::{FileGrantStore, GrantStore};

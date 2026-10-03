@@ -492,7 +492,9 @@ CP path.
 Status: **delivered (pending review)** — `Activation::Quorum { voters }` +
 `VoterRoster`, the voter ledger and grant rounds in
 `engine/election/quorum.rs`, `Effect::PersistGrant`, `RecoveredGrant` +
-`GroupEngine::with_recovered` in `groupnet-core`; the `GrantStore` trait and
+`GroupEngine::with_recovered` in `groupnet-core`; the `GrantStore` trait,
+its bundled durable implementation `FileGrantStore` (one checksummed record,
+replaced by temp-file + `fsync` + rename) and
 `GroupProfile::with_voter_storage` in `groupnet-runtime`. The as-built rules
 refine the sketch above and are now contract:
 
@@ -981,7 +983,8 @@ epoch uniqueness across restarts. The commit predicate compares a stamp to
 a hostship (the storage-free blackout posture's one gap) would let a reading
 stamped by a *different* hostship of the same integer count toward a commit.
 Storage-free Quorum keeps S4c; it does not keep S5. A deployment choosing
-`Commit::QuorumApplied` should run a `GrantStore`.
+`Commit::QuorumApplied` should run a `GrantStore` — `FileGrantStore` unless it
+has its own durable storage to write through.
 
 ##### The ring is the substrate, and it is bounded
 
