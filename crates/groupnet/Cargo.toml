@@ -29,6 +29,12 @@ tcp = ["bulk", "dep:groupnet-transport-tcp", "groupnet-transport-tcp/bulk"]
 # that want frames delivered at network latency over reliable links. Gossip
 # deployments keep `udp`; nothing forces a socket per member.
 tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
+# Request/response RPC over the data plane: concurrent calls multiplexed onto
+# one stream per peer, with deadlines, bounded frames and per-connection
+# handler limits. Rides `bulk`, so bring a binding (`tcp`, or your own). The
+# weak `groupnet-transport-mem?/bulk` is the same edge `consistency-handoff`
+# carries: if `mem` is on, its `MemBulkNet` comes too, and nothing otherwise.
+rpc = ["bulk", "dep:groupnet-rpc", "groupnet-transport-mem?/bulk"]
 # Session-consistency layer: per-writer sequenced write feeds with loss
 # detection, and applied-write frontiers for read-your-writes barriers.
 # Built on the runtime's Group handle.
@@ -86,6 +92,7 @@ groupnet-transport-mem = { workspace = true, optional = true }
 groupnet-transport-udp = { workspace = true, optional = true }
 groupnet-transport-tcp = { workspace = true, optional = true }
 groupnet-runtime = { workspace = true, optional = true }
+groupnet-rpc = { workspace = true, optional = true }
 groupnet-consistency = { workspace = true, optional = true }
 groupnet-sim = { workspace = true, optional = true }
 

@@ -185,6 +185,10 @@ cargo test -p groupnet --features consistency-volatile-bootstrap-bulk
 cargo clippy -p groupnet-consistency -p groupnet-transport -p groupnet-transport-mem -p groupnet --all-targets --features groupnet-consistency/volatile-bootstrap-bulk,groupnet/consistency-volatile-bootstrap-bulk,groupnet-transport-mem/bulk -- -D warnings
 cargo check -p groupnet --no-default-features --features consistency-volatile-bootstrap-bulk --all-targets
 RUSTDOCFLAGS='-D warnings' cargo doc -p groupnet-consistency --features volatile-bootstrap-bulk --no-deps
+cargo test -p groupnet --features rpc,tcp
+cargo clippy -p groupnet --all-targets --features rpc,tcp -- -D warnings
+cargo check -p groupnet --no-default-features --features rpc --all-targets
+RUSTDOCFLAGS='-D warnings' cargo doc -p groupnet-rpc --no-deps
 ```
 
 The feature-specific Clippy runs are not redundant: no crate in the workspace turns `leases`,
@@ -192,6 +196,9 @@ The feature-specific Clippy runs are not redundant: no crate in the workspace tu
 those tiers' code, their tests, or their DST at all. `handoff` is not covered by
 the `hosted` runs either. `Handoff` and `volatile-bootstrap-bulk` each pull in
 the data plane, so both have distinct feature graphs that need explicit gates.
+`groupnet-rpc` itself is a plain workspace member (the workspace runs cover
+it); the facade's `rpc` feature is off by default, so its re-export and the
+real-TCP facade test need the `rpc,tcp` runs.
 
 Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`) — the
 optional performance command; it is not a correctness gate.

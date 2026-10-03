@@ -9,6 +9,7 @@
 //! | [`core`] | sans-IO state machine, identity, weighted [`placement`](core::placement) (HA-hash), and the [`wire`](core::wire) protocol — pure, deterministic, dep-free |
 //! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) (persistent control-plane connections *and* bulk streams) |
 //! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
+//! | [`rpc`] | request/response calls over the data plane: an [`RpcClient`](rpc::RpcClient) multiplexing concurrent calls onto one stream per peer, and an [`RpcServer`](rpc::RpcServer) answering them under deadlines and per-connection limits *(feature `rpc`)* |
 //! | [`consistency`] | session-consistency layer: per-writer sequenced [`WriteFeed`](consistency::WriteFeed)s with loss detection, and [`Frontier`](consistency::Frontier) read-your-writes barriers *(feature `consistency`)* |
 //! | `consistency::hosted` | the Hosted write path: fenced, epoch-scoped writes through the group's elected host, priced by a commit level (`Local` / `QuorumApplied` / `AllApplied`) *(feature `consistency-hosted`)* |
 //! | `consistency::hosted::handoff` | snapshot handoff: a recovering host pulls a covering snapshot from a donor over the data plane, verified at three points, instead of waiting on a ring it has overrun *(feature `consistency-handoff`)* |
@@ -81,6 +82,17 @@ pub mod transport {
 /// table.
 #[cfg(feature = "runtime")]
 pub use groupnet_runtime as runtime;
+
+/// Request/response RPC over the data plane: an
+/// [`RpcClient`](rpc::RpcClient) multiplexes concurrent calls onto one
+/// [`DataStream`](transport::bulk::DataStream) per peer (lazily connected,
+/// replaced after a failure), and an [`RpcServer`](rpc::RpcServer) answers
+/// them with an async handler, bounded per connection and by each request's
+/// deadline. The server **owns `accept`** of the plane it serves, so give it
+/// its own bulk transport unless nothing else accepts streams; peer addresses
+/// are registered on the transport by the caller *(feature `rpc`)*.
+#[cfg(feature = "rpc")]
+pub use groupnet_rpc as rpc;
 
 /// Session-consistency layer over groups: per-writer sequenced write feeds
 /// ([`WriteFeed`](consistency::WriteFeed) / [`PeerWrites`](consistency::PeerWrites),

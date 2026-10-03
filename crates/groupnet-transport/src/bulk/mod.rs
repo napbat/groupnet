@@ -87,6 +87,14 @@ impl<B: BulkTransport> DataPlane<B> {
         }
     }
 
+    /// The bound transport, shared by every clone of this plane — for the
+    /// binding's own API after the plane is built, such as teaching a TCP
+    /// endpoint a peer's address that arrived later.
+    #[must_use]
+    pub fn transport(&self) -> &B {
+        &self.transport
+    }
+
     /// Opens a framed stream to `to`.
     ///
     /// # Errors

@@ -176,6 +176,7 @@ dependencies = [
  "bytes",
  "groupnet-consistency",
  "groupnet-core",
+ "groupnet-rpc",
  "groupnet-runtime",
  "groupnet-sim",
  "groupnet-testkit",
@@ -207,6 +208,19 @@ version = "0.1.0"
 dependencies = [
  "divan",
  "groupnet-testkit",
+]
+
+[[package]]
+name = "groupnet-rpc"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "groupnet-core",
+ "groupnet-testkit",
+ "groupnet-transport",
+ "groupnet-transport-mem",
+ "tokio",
 ]
 
 [[package]]

@@ -81,9 +81,10 @@ requirements, so they're separate traits bound to separate physical connections.
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
 | [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | data | transport(bulk), core, tokio(net) | TCP stream binding |
 | [`groupnet-runtime`](crates/groupnet-runtime) | — | core, transport, tokio | **transport-agnostic** async `Node`/`Group` driver + routing table, and `FileGrantStore` (a Quorum voter's durable grant ledger) |
+| [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff`)* | core, runtime, tokio(sync) *(+handoff feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; the opt-in `handoff` tier is the one piece that reaches the data plane, to pull a covering snapshot a gap cannot replay |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
-| [`groupnet`](crates/groupnet) | — | facade | umbrella re-export; `runtime`+`mem` default, `udp`/`tcp`/`sim` opt-in |
+| [`groupnet`](crates/groupnet) | — | facade | umbrella re-export; `runtime`+`mem` default, `udp`/`tcp`/`rpc`/`sim` opt-in |
 | [`groupnet-testkit`](crates/groupnet-testkit) | — | core *(+cluster feature: runtime, transport-mem, tokio)* | shared test support: sans-IO frame fixtures + an async multi-node harness. Internal, `publish = false`, dev-dependency only |
 
 The runtime is generic over `T: Transport` and never depends on a concrete
@@ -98,8 +99,9 @@ tests.
 
 Most consumers pull the single `groupnet` facade, which mirrors each layer as a
 module — `groupnet::core`, `groupnet::transport` (with the `mem` / `udp` / `tcp` /
-`bulk` bindings nested under it), `groupnet::runtime`, and `groupnet::sim` — so
-you write `groupnet::transport::Transport`, never the underlying crate name.
+`bulk` bindings nested under it), `groupnet::runtime`, `groupnet::rpc`, and
+`groupnet::sim` — so you write `groupnet::transport::Transport`, never the
+underlying crate name.
 
 ## Example
 
@@ -211,6 +213,36 @@ The data plane is a separate handle from `Node`, bound to its own socket — so 
 gossip over UDP and replicate over TCP, independently. The control-plane
 coordination core is untouched by any of it.
 
+### Request/response RPC (feature `rpc`)
+
+For calls rather than streams — "read this key from its owner", "apply this
+write on that replica" — `groupnet::rpc` multiplexes any number of concurrent
+calls onto **one** data-plane stream per peer, opened lazily, reused, and
+replaced after it breaks:
+
+```rust
+use groupnet::rpc::{RpcClient, RpcConfig, RpcError, RpcServer, RpcStatus};
+
+// Serving node: the server owns this plane's `accept`.
+let server = RpcServer::spawn(rpc_plane, |from: NodeId, request: Bytes| async move {
+    lookup(&request).ok_or_else(|| RpcStatus::new(404, "no such key"))
+});
+
+// Calling node: one cloneable client; every call carries its own deadline.
+let client = RpcClient::new(client_plane, RpcConfig::default());
+match client.call(&owner, Bytes::from(key), Duration::from_millis(200)).await {
+    Ok(value) => { /* ... */ }
+    Err(RpcError::ConnectionLost | RpcError::Timeout) => { /* outcome unknown */ }
+    Err(other) => { /* not sent (Unreachable, TooLarge), or Remote(status) */ }
+}
+```
+
+The deadline travels with the request and the server drops the work once it
+passes; each connection runs a bounded number of handlers and answers through a
+single writer. The server takes over `accept` of its plane, so give RPC its own
+bulk transport (its own TCP port) unless nothing else accepts streams, and
+register peer addresses on the transports (`DataPlane::transport`) yourself.
+
 ## Inter-group routing
 
 Any node can resolve a resource to the node that owns it, without global
@@ -316,9 +348,10 @@ What's done, and what's honestly still stubbed:
   `BulkTransport` (its own crate, `futures-io` + `bytes` + `zerocopy`), off the
   datagram hot path, for replication and bulk state transfer. Verified streaming
   multi-MB payloads over real TCP.
-- **Data-plane maturity.** The stream transport moves opaque `Bytes`; a store on
-  top still needs replication protocol, snapshot/anti-entropy over it, and its
-  own `zerocopy` record layouts.
+- **Data-plane maturity.** The stream transport moves opaque `Bytes`, and
+  `groupnet-rpc` adds multiplexed request/response on top; a store still
+  needs its replication protocol, snapshot/anti-entropy over it, and its own
+  `zerocopy` record layouts.
 - **Dynamic address discovery.** Both socket bindings use a static
   `NodeId → addr` book; production would gossip or resolve addresses.
 
