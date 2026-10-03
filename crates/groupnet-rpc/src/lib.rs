@@ -46,6 +46,11 @@
 //! [`RpcError::Unreachable`]; a re-registered address is dialed by the next
 //! call that needs a new connection.
 //!
+//! A process that only calls (a client of a cluster, not a member) builds
+//! its plane on a transport that does not listen, for TCP
+//! `TcpBulkTransport::dial_only`, and runs no server: every response comes
+//! back on the stream that the client opened.
+//!
 //! ## Wire format
 //!
 //! Each RPC frame is one data-plane frame (so it inherits the data plane's

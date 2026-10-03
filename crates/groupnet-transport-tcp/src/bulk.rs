@@ -23,10 +23,14 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 use crate::handshake::{read_id, write_id};
 
 /// A TCP-backed data-plane transport endpoint.
+///
+/// [`bind`](Self::bind) makes an endpoint that listens and dials.
+/// [`dial_only`](Self::dial_only) makes one that only dials: a client that
+/// calls the nodes of a cluster without being reachable itself.
 #[derive(Debug)]
 pub struct TcpBulkTransport {
     local: NodeId,
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     peers: RwLock<HashMap<NodeId, PeerEndpoint>>,
 }
 
@@ -49,9 +53,23 @@ impl TcpBulkTransport {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             local,
-            listener,
+            listener: Some(listener),
             peers: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// An endpoint for `local` that opens no socket until it dials: it
+    /// connects to registered peers, and its
+    /// [`accept`](BulkTransport::accept) never completes. A client process
+    /// uses it to call servers (for example a `groupnet-rpc` server, which
+    /// answers on the stream the client opened) without a listening port.
+    #[must_use]
+    pub fn dial_only(local: NodeId) -> Self {
+        Self {
+            local,
+            listener: None,
+            peers: RwLock::new(HashMap::new()),
+        }
     }
 
     /// This endpoint's local node id.
@@ -63,9 +81,12 @@ impl TcpBulkTransport {
     /// The address the listener is bound to (useful with an ephemeral `:0`).
     ///
     /// # Errors
-    /// Propagates any socket error.
+    /// Propagates any socket error. A [`dial_only`](Self::dial_only)
+    /// endpoint has no listener and returns [`io::ErrorKind::NotConnected`].
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listener
+            .as_ref()
+            .map_or_else(|| Err(no_listener()), TcpListener::local_addr)
     }
 
     /// Teaches this endpoint that `node` listens at `addr`.
@@ -165,8 +186,19 @@ impl BulkTransport for TcpBulkTransport {
     }
 
     async fn accept(&self) -> io::Result<(NodeId, Self::Stream)> {
-        let (mut sock, _addr) = self.listener.accept().await?;
+        let Some(listener) = &self.listener else {
+            // A dial-only endpoint has nothing to accept.
+            return std::future::pending().await;
+        };
+        let (mut sock, _addr) = listener.accept().await?;
         let from = read_id(&mut sock).await?;
         Ok((from, sock.compat()))
     }
+}
+
+fn no_listener() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "a dial-only endpoint has no listener",
+    )
 }

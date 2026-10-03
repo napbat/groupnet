@@ -77,3 +77,41 @@ async fn hostname_book_resolves_each_connect_under_caller_deadline() {
         .expect("resolved host");
     assert_eq!(receiver.await.unwrap(), NodeId::new("host-a"));
 }
+
+#[tokio::test]
+async fn a_dial_only_endpoint_calls_out_and_never_accepts() {
+    let client = TcpBulkTransport::dial_only(NodeId::new("client-a"));
+    assert_eq!(
+        client.local_addr().expect_err("no listener").kind(),
+        std::io::ErrorKind::NotConnected
+    );
+    let server = TcpBulkTransport::bind(NodeId::new("server-b"), "127.0.0.1:0")
+        .await
+        .expect("bind server");
+    client.register_peer(NodeId::new("server-b"), server.local_addr().unwrap());
+    let client = DataPlane::new(client);
+    let server = DataPlane::new(server);
+
+    // The server answers on the stream that the client opened.
+    let echo = tokio::spawn(async move {
+        let (from, mut stream) = server.accept().await.expect("accept");
+        let request = stream.recv().await.expect("recv").expect("a frame");
+        stream.send(request).await.expect("reply");
+        from
+    });
+    let mut stream = client
+        .connect(&NodeId::new("server-b"))
+        .await
+        .expect("connect");
+    stream
+        .send(Bytes::from_static(b"ping"))
+        .await
+        .expect("send");
+    let reply = stream.recv().await.expect("recv").expect("a reply");
+    assert_eq!(reply, Bytes::from_static(b"ping"));
+    assert_eq!(echo.await.unwrap(), NodeId::new("client-a"));
+
+    // Nothing can reach the client, so accept stays pending.
+    let accepted = tokio::time::timeout(Duration::from_millis(50), client.accept()).await;
+    assert!(accepted.is_err(), "a dial-only endpoint accepted a stream");
+}
