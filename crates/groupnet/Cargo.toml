@@ -29,6 +29,8 @@ tcp = ["bulk", "dep:groupnet-transport-tcp", "groupnet-transport-tcp/bulk"]
 # that want frames delivered at network latency over reliable links. Gossip
 # deployments keep `udp`; nothing forces a socket per member.
 tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
+# Heterogeneous, multi-hop packet routing and reliable end-to-end TLS tunnels.
+router = ["runtime", "bulk", "dep:groupnet-transport-router", "groupnet-runtime/router"]
 # Request/response RPC over the data plane: concurrent calls multiplexed onto
 # one stream per peer, with deadlines, bounded frames and per-connection
 # handler limits. Rides `bulk`, so bring a binding (`tcp`, or your own). The
@@ -91,6 +93,7 @@ groupnet-transport = { workspace = true }
 groupnet-transport-mem = { workspace = true, optional = true }
 groupnet-transport-udp = { workspace = true, optional = true }
 groupnet-transport-tcp = { workspace = true, optional = true }
+groupnet-transport-router = { workspace = true, optional = true }
 groupnet-runtime = { workspace = true, optional = true }
 groupnet-rpc = { workspace = true, optional = true }
 groupnet-consistency = { workspace = true, optional = true }

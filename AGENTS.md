@@ -138,9 +138,17 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 
 ## Testing conventions
 
+- Follow [Cargo's project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html):
+  libraries in `src/lib.rs`, binaries in `src/main.rs` or `src/bin/`,
+  and targets in `examples/`, `benches/`, and `tests/`. Multi-file targets use
+  `<target-name>/main.rs` plus target-local modules. New target names use
+  kebab-case; Rust module names use snake_case.
 - Unit tests: inline `#[cfg(test)] mod tests` at the bottom of the file they
-  test. Integration tests: `tests/*.rs`, noun-named by behavior. Shared
-  helpers: `groupnet-testkit` (never `tests/common/mod.rs`).
+  test. Integration tests are noun-named by behavior. Reusable cross-suite
+  helpers belong in `groupnet-testkit` (never `tests/common/mod.rs`).
+- Keep public configuration and lifecycle APIs separate from adapter workers,
+  routing state transitions, and wire codecs. Split by responsibility rather
+  than adding wrappers or weakening lints to accommodate oversized functions.
 - Workspace lints also enforce `unsafe_code = "forbid"`, `missing_docs`,
   `missing_debug_implementations` — document every public item.
 - Bounded polling via `groupnet_testkit::cluster::eventually` /
@@ -158,6 +166,8 @@ cargo check -p groupnet-transport --no-default-features
 cargo test -p groupnet --features tcp-msg
 cargo test -p groupnet-runtime --features dns
 cargo clippy -p groupnet-runtime -p groupnet --all-targets --features groupnet-runtime/dns,groupnet/dns,groupnet/udp -- -D warnings
+cargo test -p groupnet-transport-router -p groupnet-runtime --features groupnet-runtime/router
+cargo clippy -p groupnet-transport-router -p groupnet-runtime -p groupnet --all-targets --features groupnet/router,groupnet-runtime/router -- -D warnings
 cargo test -p groupnet-consistency --features acks
 cargo test -p groupnet-consistency --features leases
 cargo test -p groupnet-consistency --features hosted

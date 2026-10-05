@@ -114,3 +114,86 @@ Operations run inside a *synchronization context*:
 group.sync(|ctx| {
     ctx.update_metadata("routing", "v3");
 });
+```
+
+## **5. Multi-transport routing and tunnels**
+
+`groupnet-transport-router` composes any number of existing `Transport`
+implementations. A peer may attach only IPC, another only network transports,
+and a bridge both. Link adapters establish one-hop communication; the router
+learns bounded path-vector routes and forwards packets across those links.
+Forwarding is explicit opt-in. Hop limits, loop rejection, route expiry, bounded
+queues, replay suppression, and bounded fragment reassembly constrain failures.
+Neighbor configuration grants link-level trust; gossip is not authorization.
+
+The router preserves the control-plane `Transport` contract. Its separate tunnel
+endpoint implements `BulkTransport`: bounded reliable packet streams run above
+routing, with end-to-end mutual TLS and pinned peer certificates. Bridges can
+observe routing metadata and deny service but cannot decrypt tunnel contents.
+Application bytes are not replayed when retransmissions take another route.
+Admission and cryptographic identity are separate from advertised reachability.
+
+Native adapters supply local IPC and authenticated UDP discovery, simultaneous
+hole-punch probes, and self-hosted relay fallback. The UDP fabric is provisioned
+with a random shared network key: participants are mutually trusted for routing,
+not Byzantine-safe. End-to-end tunnel certificates enforce endpoint identity
+even across a trusted forwarding fabric. No public third-party relay is needed.
+Not every NAT supports a direct path; relay fallback remains part of the design.
+
+USB permissions and exclusive device ownership remain application policy.
+Membership/route availability never authorizes attachment to a security key.
+
+### Initialization and ownership
+
+The facade and runtime expose this path behind feature `router`.
+`Node::network(id, NetworkConfig)` binds configured `TransportOption` values,
+seeds membership from their explicit neighbors, and returns a `NetworkNode`
+which owns the network alongside the ordinary node. `Node::network_with` also
+accepts a typed `NodeBuilder<Router>` configuration closure. Initialization
+failure rolls back started adapters; explicit close drains their tasks. Clones
+share one lifetime, and dropping the last network owner initiates cancellation.
+
+`NetworkConfig` supports any configured mix of TCP, UDP, IPC, and native
+hole-punching adapters, within `RouterConfig` bounds. Custom transports are
+registered generically through `with_transport`; only initialization erases
+the attachment closure. Packet forwarding uses bounded channels, not boxed
+per-packet futures. `TransportId`, `NodeId`, `Route`, `PeerEndpoint`, `LinkConfig`,
+and `PathPolicy` retain their types throughout the public API.
+
+The implementation separates public routing/lifecycle state (`router.rs`),
+adapter I/O (`router/adapters.rs`), path learning and forwarding
+(`router/routing.rs`), and bounded codecs (`wire.rs`). Native adapters and
+the tunnel layer have their own modules. Targets follow
+[Cargo's project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html);
+the multi-file tunnel suite is `tests/tunnels/main.rs` with suite-local fixtures.
+
+### Reliable streams and security boundaries
+
+The tunnel layer uses bounded ordered segments, cumulative acknowledgements,
+receive credit, RTT-based retransmission deadlines, duplicate-ACK gap repair,
+and additive-increase/multiplicative-decrease congestion control. Retries use
+fresh router packet IDs but retain tunnel sequence numbers, so router replay
+suppression cannot discard legitimate retransmissions. FIN closes one direction;
+the opposite direction remains usable until independently closed.
+
+The UDP rendezvous is a separate explicitly started `Rendezvous`, not a
+third-party service. Registrations require an authenticated challenge response
+from the observed source address. Allowlists, leases, replay checks, packet
+bounds, and per-identity rate limits constrain discovery and relay traffic.
+The shared network key authorizes a trusted routing fabric: its holders can
+impersonate routing aliases. Raw membership messages are not end-to-end private.
+Only pinned mutual-TLS tunnels independently authenticate endpoints and conceal
+application bytes from transit peers. IP addresses and traffic metadata remain
+visible. Revoking a tunnel peer closes its sessions; it does not revoke a shared
+network key or revoke application-level USB ownership.
+
+No QUIC/P2P stack is wrapped. Tokio supplies I/O; rustls and ring supply standard
+TLS and cryptographic primitives. Public-Internet NAT combinations, Unix runtime
+behavior, and physical USB drivers still require deployment-specific validation.
+
+Windows loopback verification includes real named-pipe/TCP bridging, typed
+node-owned membership and device-metadata propagation, native UDP direct and
+relay-only paths carrying pinned TLS with half-close, and a live TLS stream
+which survives direct-link removal and continues through a TCP bridge. An
+impaired-router regression drops, reorders, and duplicates packets during a
+1 MiB transfer; duplicate-ACK gap repair avoids waiting for an RTO on every loss.

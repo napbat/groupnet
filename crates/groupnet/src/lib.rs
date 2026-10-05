@@ -75,6 +75,11 @@ pub mod transport {
     /// (`TcpBulkTransport`, feature `tcp`).
     #[cfg(any(feature = "tcp", feature = "tcp-msg"))]
     pub use groupnet_transport_tcp as tcp;
+
+    /// Multi-transport routing, native IPC/UDP discovery, and encrypted tunnels
+    /// *(feature `router`)*.
+    #[cfg(feature = "router")]
+    pub use groupnet_transport_router as router;
 }
 
 /// Async runtime: the group-per-task [`Node`](runtime::Node) /

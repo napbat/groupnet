@@ -80,18 +80,18 @@ requirements, so they're separate traits bound to separate physical connections.
 | [`groupnet-transport-mem`](crates/groupnet-transport-mem) | both | transport, core, tokio(sync) *(+bulk feature: transport(bulk), tokio(io-util), tokio-util(compat))* | in-process bindings (tests, examples, single-process): datagrams always, `MemBulkNet` byte streams under feature `bulk` |
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
 | [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | data | transport(bulk), core, tokio(net) | TCP stream binding |
-| [`groupnet-runtime`](crates/groupnet-runtime) | — | core, transport, tokio | **transport-agnostic** async `Node`/`Group` driver + routing table, and `FileGrantStore` (a Quorum voter's durable grant ledger) |
+| [`groupnet-transport-router`](crates/groupnet-transport-router) | both | transport(bulk), TCP/UDP adapters, tokio, rustls, ring | typed multi-adapter routing, native IPC, UDP discovery/hole-punching/relay, and pinned end-to-end TLS tunnels |
+| [`groupnet-runtime`](crates/groupnet-runtime) | — | core, transport, tokio *(+router feature: transport-router)* | generic async `Node`/`Group` driver, opt-in node-owned connection initialization, and `FileGrantStore` |
 | [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff`)* | core, runtime, tokio(sync) *(+handoff feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; the opt-in `handoff` tier is the one piece that reaches the data plane, to pull a covering snapshot a gap cannot replay |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
-| [`groupnet`](crates/groupnet) | — | facade | umbrella re-export; `runtime`+`mem` default, `udp`/`tcp`/`rpc`/`sim` opt-in |
+| [`groupnet`](crates/groupnet) | — | facade | umbrella re-export; `runtime`+`mem` default, `udp`/`tcp`/`router`/`rpc`/`sim` opt-in |
 | [`groupnet-testkit`](crates/groupnet-testkit) | — | core *(+cluster feature: runtime, transport-mem, tokio)* | shared test support: sans-IO frame fixtures + an async multi-node harness. Internal, `publish = false`, dev-dependency only |
 
-The runtime is generic over `T: Transport` and never depends on a concrete
-binding — you pick a transport crate (or write your own impl) and the driver is
-none the wiser. Every concrete transport lives in its own `groupnet-transport-*`
-crate so each pulls only the I/O deps it needs, and the control plane stays
-dependency-free.
+The default runtime is generic over `T: Transport` and has no concrete transport
+dependency. The optional `router` feature adds `Node::network(...)`, which starts
+typed adapters and owns their routing and shutdown lifecycle. Concrete transports
+remain outside the sans-IO core; the default/core dependency graphs are unchanged.
 
 The same core runs under both drivers: `groupnet-runtime` across threads in
 production, `groupnet-sim` in a single-threaded, reproducible event loop for
@@ -99,9 +99,9 @@ tests.
 
 Most consumers pull the single `groupnet` facade, which mirrors each layer as a
 module — `groupnet::core`, `groupnet::transport` (with the `mem` / `udp` / `tcp` /
-`bulk` bindings nested under it), `groupnet::runtime`, `groupnet::rpc`, and
-`groupnet::sim` — so you write `groupnet::transport::Transport`, never the
-underlying crate name.
+`bulk` bindings nested under it), `groupnet::router`, `groupnet::runtime`,
+`groupnet::rpc`, and `groupnet::sim` — so you write
+`groupnet::transport::Transport`, never the underlying crate name.
 
 ## Example
 
@@ -152,6 +152,62 @@ let transport = UdpTransport::bind(NodeId::new("node-a"), "0.0.0.0:7000").await?
 transport.register_peer(NodeId::new("node-b"), "10.0.0.2:7000".parse()?);
 let node = Node::builder(NodeId::new("node-a"), transport).seed(NodeId::new("node-b")).spawn();
 ```
+
+### Node-owned heterogeneous connections
+
+Enable the facade's `router` feature to configure connections during node
+initialization instead of running a separate transport loop:
+
+```rust
+use groupnet::core::NodeId;
+use groupnet::router::{NetworkConfig, PeerEndpoint, TransportOption};
+use groupnet::runtime::Node;
+
+let mut connections = NetworkConfig::default();
+connections.transports.push(TransportOption::Tcp {
+    bind: "127.0.0.1:7000".parse()?,
+    peers: vec![PeerEndpoint {
+        node: NodeId::new("bridge"),
+        address: "127.0.0.1:7001".parse()?,
+    }],
+    cost: 1,
+});
+let node = Node::network(NodeId::new("node-a"), connections).await?;
+let devices = node.join_group("devices");
+// Use devices and node.connections().router(); close drains owned I/O tasks.
+node.close().await;
+```
+
+`TransportOption` supports `Tcp`, `Udp`, local `Ipc`, and native `Punch`.
+`with_transport` accepts a custom `Transport` with a typed `LinkConfig`.
+Set `connections.router.forwarding = true` only on intended bridge nodes:
+
+```text
+IPC-only node ── IPC ── bridge ── TCP or authenticated UDP ── network-only node
+```
+
+Plain TCP/UDP adapters require a trusted private network. `PunchConfig` supplies
+a self-hosted rendezvous address, provisioned `NetworkKey`, explicit peers, and
+`PathPolicy`. Direct-preferred mode probes peers simultaneously; relay-only mode
+never sends direct probes. Not every NAT supports direct connectivity.
+
+For confidential streams, set `NetworkConfig::tunnels` with a `TlsIdentity` and
+explicit `PeerIdentity` certificate pins. `node.connections().tunnels()` exposes
+the `BulkTransport` endpoint. TLS 1.3 remains end to end across bridge nodes;
+route changes do not restart the application stream. Certificates must include
+the `groupnet.peer` DNS SAN and client/server authentication usages.
+
+Windows IPC addresses are local `\\.\pipe\name` paths. Unix IPC requires a
+caller-owned private directory with no group/other permissions. No adapters
+install drivers, change firewall rules, or authorize USB access.
+
+Real-socket smoke on Windows exercised node-owned IPC-to-TCP bridging,
+three-member discovery and metadata propagation, an exact 1 MiB pinned-TLS
+transfer with a reverse response after half-close, native UDP direct discovery,
+and relay-only delivery. This is not public-Internet NAT, Unix runtime, or
+physical USB/YubiKey qualification. See [routing design](docs/technical.md#5-multi-transport-routing-and-tunnels).
+
+### Named seeds
 
 In an orchestrated deployment a seed's address moves (a `StatefulSet` peer's DNS
 record appears after its pod starts; a rolling restart hands it a new IP). Name
@@ -342,8 +398,8 @@ What's done, and what's honestly still stubbed:
 - ~~**Inter-group routing map.**~~ *Done.* Cluster-wide `resource → owning group`
   and `group → coordinator`, resolvable from any node via `Node::routing()`.
 - ~~**Real transports.**~~ *Done.* Concrete bindings are their own
-  `groupnet-transport-*` crates; control-plane `-mem`/`-udp` and data-plane
-  `-tcp` ship. IPC/shmem/QUIC are the same one-trait exercise.
+  `groupnet-transport-*` crates. The opt-in `-router` adds native IPC,
+  authenticated UDP discovery/hole-punching/relay, and multi-hop TLS tunnels.
 - ~~**Bulk / data-plane transport.**~~ *Done.* A separate stream-shaped
   `BulkTransport` (its own crate, `futures-io` + `bytes` + `zerocopy`), off the
   datagram hot path, for replication and bulk state transfer. Verified streaming

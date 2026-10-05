@@ -7,19 +7,21 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Transport-agnostic: this crate depends only on the trait, never on a concrete
-# binding. It's the only layer that needs an async runtime, so it's the only
-# crate here that pulls in tokio — and only a narrow slice of it.
+# The default runtime depends only on the transport trait. The opt-in `router`
+# initialization path owns typed adapter configuration and network lifecycle.
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+groupnet-transport-router = { workspace = true, optional = true }
 
 [features]
 # The operating system resolver for named seeds (`SystemResolver`): Tokio's
 # `net` slice for `lookup_host`. Named seeds themselves need no feature — a
 # deployment with its own `SeedResolver` keeps the runtime socket-free.
 dns = ["tokio/net"]
+# Initialize and own heterogeneous connections through Node::network.
+router = ["dep:groupnet-transport-router"]
 
 # Concrete transports are pulled in only to exercise the tests.
 [dev-dependencies]
