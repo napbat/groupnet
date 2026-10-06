@@ -13,7 +13,7 @@ use tokio::net::windows::named_pipe::{
 use super::super::{IpcAddress, MAX_SESSIONS};
 
 #[derive(Debug)]
-pub(crate) enum Stream {
+pub(in crate::ipc) enum Stream {
     Client(NamedPipeClient),
     Server(NamedPipeServer),
 }
@@ -59,13 +59,13 @@ impl AsyncWrite for Stream {
 }
 
 #[derive(Debug)]
-pub(crate) struct Listener {
+pub(in crate::ipc) struct Listener {
     name: String,
     pending: NamedPipeServer,
 }
 
 impl Listener {
-    pub(crate) fn bind(address: &IpcAddress) -> io::Result<Self> {
+    pub(in crate::ipc) fn bind(address: &IpcAddress) -> io::Result<Self> {
         validate_address(address)?;
         let IpcAddress::NamedPipe(name) = address;
         Ok(Self {
@@ -74,7 +74,7 @@ impl Listener {
         })
     }
 
-    pub(crate) async fn accept(&mut self) -> io::Result<Stream> {
+    pub(in crate::ipc) async fn accept(&mut self) -> io::Result<Stream> {
         self.pending.connect().await?;
         // Reserve the next instance before releasing the connected instance,
         // leaving no namespace gap in which a second listener can take over.
@@ -95,7 +95,7 @@ fn create(name: &str, first: bool) -> io::Result<NamedPipeServer> {
         .create(name)
 }
 
-pub(crate) fn validate_address(address: &IpcAddress) -> io::Result<()> {
+pub(in crate::ipc) fn validate_address(address: &IpcAddress) -> io::Result<()> {
     let IpcAddress::NamedPipe(name) = address;
     let suffix = name.strip_prefix(r"\\.\pipe\");
     if name.len() > 256
@@ -114,7 +114,7 @@ pub(crate) fn validate_address(address: &IpcAddress) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn connect(address: &IpcAddress) -> io::Result<Stream> {
+pub(in crate::ipc) async fn connect(address: &IpcAddress) -> io::Result<Stream> {
     validate_address(address)?;
     let IpcAddress::NamedPipe(name) = address;
     loop {

@@ -15,11 +15,10 @@ use groupnet_transport_tcp::TcpMsgTransport;
 const WAIT: Duration = Duration::from_secs(10);
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
-fn router(name: &str, forwarding: bool) -> io::Result<Router> {
+fn router(name: &str) -> io::Result<Router> {
     Router::new(
         NodeId::new(name),
         RouterConfig {
-            forwarding,
             announce_interval: Duration::from_millis(30),
             route_ttl: Duration::from_millis(600),
             ..RouterConfig::default()
@@ -55,9 +54,9 @@ fn connect(
 
 #[tokio::test]
 async fn fragmented_packets_cross_a_bridge_and_preserve_origin() -> io::Result<()> {
-    let a = router("a", false)?;
-    let b = router("b", true)?;
-    let c = router("c", false)?;
+    let a = router("a")?;
+    let b = router("b")?;
+    let c = router("c")?;
     connect(&a, &b, 1, 256)?;
     connect(&b, &c, 1, 512)?;
     eventually_within("two-hop path", WAIT, || a.route_to(c.local_id()).is_some()).await;
@@ -79,10 +78,10 @@ async fn fragmented_packets_cross_a_bridge_and_preserve_origin() -> io::Result<(
 #[tokio::test]
 async fn route_failover_and_stale_transport_handles_do_not_disconnect_replacements()
 -> io::Result<()> {
-    let a = router("a", false)?;
-    let b = router("b", true)?;
-    let c = router("c", false)?;
-    let d = router("d", true)?;
+    let a = router("a")?;
+    let b = router("b")?;
+    let c = router("c")?;
+    let d = router("d")?;
     let (ab, ba) = connect(&a, &b, 1, 1200)?;
     connect(&b, &c, 1, 1200)?;
     connect(&a, &d, 5, 1200)?;
@@ -126,10 +125,17 @@ async fn route_failover_and_stale_transport_handles_do_not_disconnect_replacemen
 }
 
 #[tokio::test]
-async fn forwarding_is_explicit_and_shutdown_wakes_receivers() -> io::Result<()> {
-    let a = router("a", false)?;
-    let b = router("b", false)?;
-    let c = router("c", false)?;
+async fn endpoint_only_mode_blocks_transit_and_shutdown_wakes_receivers() -> io::Result<()> {
+    let a = router("a")?;
+    let b = Router::new(
+        NodeId::new("b"),
+        RouterConfig {
+            forwarding: false,
+            announce_interval: Duration::from_millis(30),
+            ..RouterConfig::default()
+        },
+    )?;
+    let c = router("c")?;
     connect(&a, &b, 1, 1200)?;
     connect(&b, &c, 1, 1200)?;
     eventually_within("adjacent routes", WAIT, || {
@@ -189,9 +195,9 @@ fn ipc_addresses() -> (IpcAddress, IpcAddress, Option<std::path::PathBuf>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ipc_only_peer_reaches_tcp_only_peer_through_a_two_adapter_bridge() -> io::Result<()> {
-    let a = router("ipc-only", false)?;
-    let b = router("bridge", true)?;
-    let c = router("tcp-only", false)?;
+    let a = router("ipc-only")?;
+    let b = router("bridge")?;
+    let c = router("tcp-only")?;
     let (a_addr, b_addr, directory) = ipc_addresses();
     let ipc_a = IpcTransport::bind(a.local_id().clone(), &a_addr)?;
     let ipc_b = IpcTransport::bind(b.local_id().clone(), &b_addr)?;
@@ -224,6 +230,45 @@ async fn ipc_only_peer_reaches_tcp_only_peer_through_a_two_adapter_bridge() -> i
     ipc_b.close().await;
     if let Some(directory) = directory {
         std::fs::remove_dir(directory)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_router_forwards_between_neighbors_on_the_same_adapter() -> io::Result<()> {
+    let network = Network::new();
+    let a = router("a")?;
+    let b = router("b")?;
+    let c = router("c")?;
+    a.add_transport(
+        network.endpoint(a.local_id().clone()),
+        LinkConfig::new(vec![b.local_id().clone()]),
+    )?;
+    b.add_transport(
+        network.endpoint(b.local_id().clone()),
+        LinkConfig::new(vec![a.local_id().clone(), c.local_id().clone()]),
+    )?;
+    c.add_transport(
+        network.endpoint(c.local_id().clone()),
+        LinkConfig::new(vec![b.local_id().clone()]),
+    )?;
+    eventually_within("same-adapter transit routes", WAIT, || {
+        a.route_to(c.local_id())
+            .is_some_and(|route| route.next_hop == *b.local_id())
+            && c.route_to(a.local_id())
+                .is_some_and(|route| route.next_hop == *b.local_id())
+    })
+    .await;
+    c.send(a.local_id(), b"same-adapter transit").await?;
+    let packet = tokio::time::timeout(WAIT, a.recv()).await??;
+    assert_eq!(packet.from, *c.local_id());
+    assert_eq!(packet.msg, b"same-adapter transit");
+    a.send(c.local_id(), b"return transit").await?;
+    let packet = tokio::time::timeout(WAIT, c.recv()).await??;
+    assert_eq!(packet.from, *a.local_id());
+    assert_eq!(packet.msg, b"return transit");
+    for node in [&a, &b, &c] {
+        node.close().await;
     }
     Ok(())
 }

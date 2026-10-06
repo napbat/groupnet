@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const MAX_FRAME: usize = 65_000;
 pub(crate) const MAX_HOPS: usize = 16;
-pub(crate) const FRAGMENT: usize = 28;
+const FRAGMENT: usize = 28;
 
 pub(crate) fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -16,12 +16,12 @@ pub(crate) fn id_valid(id: &NodeId) -> bool {
     !id.as_str().is_empty() && id.as_str().len() <= 255
 }
 
-pub(crate) fn put_id(bytes: &mut Vec<u8>, id: &NodeId) {
+fn put_id(bytes: &mut Vec<u8>, id: &NodeId) {
     bytes.push(u8::try_from(id.as_str().len()).expect("validated node id"));
     bytes.extend_from_slice(id.as_str().as_bytes());
 }
 
-pub(crate) fn take<const N: usize>(bytes: &mut &[u8]) -> io::Result<[u8; N]> {
+fn take<const N: usize>(bytes: &mut &[u8]) -> io::Result<[u8; N]> {
     let (part, rest) = bytes
         .split_at_checked(N)
         .ok_or_else(|| invalid("truncated frame"))?;
@@ -30,7 +30,7 @@ pub(crate) fn take<const N: usize>(bytes: &mut &[u8]) -> io::Result<[u8; N]> {
         .map_err(|_| invalid("truncated fixed field"))
 }
 
-pub(crate) fn take_id(bytes: &mut &[u8]) -> io::Result<NodeId> {
+fn take_id(bytes: &mut &[u8]) -> io::Result<NodeId> {
     let [length] = take(bytes)?;
     if length == 0 {
         return Err(invalid("empty node id"));

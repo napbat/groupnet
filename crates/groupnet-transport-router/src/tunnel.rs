@@ -148,7 +148,7 @@ impl TunnelTransport {
     ///
     /// # Errors
     /// Returns an error if closed, the state lock was poisoned, or admission is full.
-    pub fn trust_peer(&self, peer: PeerIdentity) -> io::Result<()> {
+    pub fn admit_peer(&self, peer: PeerIdentity) -> io::Result<()> {
         let mut state = self.inner.state.lock().map_err(|_| poisoned())?;
         if self.inner.cancel.is_cancelled() {
             return Err(closed());
@@ -175,7 +175,7 @@ impl TunnelTransport {
 
     /// Revokes the current admission and immediately invalidates active and queued streams.
     #[must_use]
-    pub fn remove_peer(&self, node: &NodeId) -> bool {
+    pub fn revoke_peer(&self, node: &NodeId) -> bool {
         let Ok(mut state) = self.inner.state.lock() else {
             return false;
         };

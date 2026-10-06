@@ -6,7 +6,7 @@ use groupnet_runtime::Node;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport_mem::Network;
-use groupnet_transport_router::{LinkConfig, NetworkConfig};
+use groupnet_transport_router::{LinkConfig, NetworkConfig, RouterConfig, TransportConfig};
 use std::io;
 use std::time::Duration;
 
@@ -17,20 +17,30 @@ async fn initialized_nodes_route_membership_and_entries_across_a_bridge() -> io:
     let a = NodeId::new("a");
     let b = NodeId::new("bridge");
     let c = NodeId::new("c");
-    let configure = |forwarding| {
-        let mut config = NetworkConfig::default();
-        config.router.forwarding = forwarding;
-        config.router.announce_interval = Duration::from_millis(30);
-        config.router.route_ttl = Duration::from_millis(600);
-        config
+    let configure = || {
+        NetworkConfig::default().with_router(RouterConfig {
+            announce_interval: Duration::from_millis(30),
+            route_ttl: Duration::from_millis(600),
+            ..RouterConfig::default()
+        })
     };
-    let a_config =
-        configure(false).with_transport(left.endpoint(a.clone()), LinkConfig::new(vec![b.clone()]));
-    let b_config = configure(true)
-        .with_transport(left.endpoint(b.clone()), LinkConfig::new(vec![a.clone()]))
-        .with_transport(right.endpoint(b.clone()), LinkConfig::new(vec![c.clone()]));
-    let c_config = configure(false)
-        .with_transport(right.endpoint(c.clone()), LinkConfig::new(vec![b.clone()]));
+    let a_config = configure().with_transport(TransportConfig::custom(
+        left.endpoint(a.clone()),
+        LinkConfig::new(vec![b.clone()]),
+    ));
+    let b_config = configure()
+        .with_transport(TransportConfig::custom(
+            left.endpoint(b.clone()),
+            LinkConfig::new(vec![a.clone()]),
+        ))
+        .with_transport(TransportConfig::custom(
+            right.endpoint(b.clone()),
+            LinkConfig::new(vec![c.clone()]),
+        ));
+    let c_config = configure().with_transport(TransportConfig::custom(
+        right.endpoint(c.clone()),
+        LinkConfig::new(vec![b.clone()]),
+    ));
     let node_a = Node::network_with(a.clone(), a_config, |builder| {
         builder.gossip_interval_ms(30)
     })
@@ -66,12 +76,7 @@ async fn initialized_nodes_route_membership_and_entries_across_a_bridge() -> io:
     )
     .await;
     assert_eq!(
-        node_a
-            .connections()
-            .router()
-            .route_to(&c)
-            .expect("route")
-            .path,
+        node_a.router().route_to(&c).expect("route").path,
         vec![a, b, c]
     );
     node_a.close().await;
@@ -84,8 +89,8 @@ async fn initialized_nodes_route_membership_and_entries_across_a_bridge() -> io:
 async fn final_network_owner_drop_closes_connections_even_with_a_borrowed_router_clone()
 -> io::Result<()> {
     let node = Node::network(NodeId::new("owned"), NetworkConfig::default()).await?;
-    let remaining = node.clone();
-    let router = node.connections().router().clone();
+    let remaining = Node::clone(&node);
+    let router = node.router().clone();
     drop(node);
     router.send(router.local_id(), b"still owned").await?;
     drop(remaining);

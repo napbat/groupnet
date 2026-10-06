@@ -166,8 +166,8 @@ async fn revocation_discards_queued_accepts_and_readmission_never_revives_old_st
         .await
         .unwrap()
         .unwrap();
-    assert!(receiver.remove_peer(fabric.a.local_id()));
-    receiver.trust_peer(client_pin).unwrap();
+    assert!(receiver.revoke_peer(fabric.a.local_id()));
+    receiver.admit_peer(client_pin).unwrap();
     let (new, accepted) = timeout(DEADLINE, async {
         tokio::join!(sender.connect(fabric.c.local_id()), receiver.accept())
     })
@@ -191,7 +191,7 @@ async fn revocation_discards_queued_accepts_and_readmission_never_revives_old_st
             .unwrap()
             .is_err()
     );
-    assert!(receiver.remove_peer(fabric.a.local_id()));
+    assert!(receiver.revoke_peer(fabric.a.local_id()));
     assert!(accepted.read(&mut byte).await.is_err());
     sender.close().await;
     receiver.close().await;

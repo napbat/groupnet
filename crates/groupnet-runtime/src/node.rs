@@ -290,12 +290,18 @@ struct Inner<T: Transport> {
 /// memberships. Cheap to clone (it's an `Arc` inside).
 pub struct Node<T: Transport> {
     inner: Arc<Inner<T>>,
+    // Kept on public handles, not Inner: the receive task retains Inner while
+    // awaiting packets and must not keep its own network alive indefinitely.
+    #[cfg(feature = "router")]
+    pub(super) network: Option<groupnet_transport_router::Network>,
 }
 
 impl<T: Transport> Clone for Node<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            #[cfg(feature = "router")]
+            network: self.network.clone(),
         }
     }
 }
@@ -320,6 +326,11 @@ impl<T: Transport> Node<T> {
             advertise_addr: None,
             named_seeds: None,
         }
+    }
+
+    #[cfg(feature = "router")]
+    pub(super) fn transport(&self) -> &T {
+        &self.inner.transport
     }
 
     /// This node's id.
@@ -745,7 +756,11 @@ impl<T: Transport> NodeBuilder<T> {
                 named,
             ));
         }
-        let node = Node { inner };
+        let node = Node {
+            inner,
+            #[cfg(feature = "router")]
+            network: None,
+        };
         // Join the reserved routing group (no coordinator publisher of its
         // own). `spawn_group` pins it Eventual whatever this asks for.
         let routing_group = node.get_or_spawn(

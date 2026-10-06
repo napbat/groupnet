@@ -1,40 +1,31 @@
 //! Node-owned typed multi-transport initialization (feature `router`).
 
 use std::io;
-use std::ops::Deref;
 
 use groupnet_core::NodeId;
-use groupnet_transport_router::{Network, NetworkConfig, Router};
+use groupnet_transport::bulk::BulkTransport;
+use groupnet_transport_router::tunnel::{TunnelTransport, TunneledStream};
+use groupnet_transport_router::{NetworkConfig, Router};
 
 use crate::{Node, NodeBuilder};
 
-/// A Groupnet node which owns its configured connections and routing layer.
-///
-/// The ordinary Node API is available through dereferencing. Keep this owner (or
-/// a clone) alive while using the node; a separately cloned low-level `Node`
-/// handle does not extend network ownership. Dropping the final owner initiates
-/// connection shutdown; [`close`](Self::close) waits for network tasks to drain.
-#[derive(Clone, Debug)]
-pub struct NetworkNode {
-    node: Node<Router>,
-    connections: Network,
-}
-
 impl Node<Router> {
-    /// Initializes configured adapters, routing, optional tunnels, and membership.
-    /// Adjacent peers are automatically used as initial membership seeds.
+    /// Initializes adapters, routing, optional TLS tunnels, and membership.
+    /// Adjacent peers become initial membership seeds. Every ordinary [`Node`]
+    /// clone retains network ownership; dropping the last initiates shutdown.
+    /// With tunnels configured, the node is also a secure [`BulkTransport`].
     ///
     /// # Errors
     /// Rejects invalid configuration, failed binds, or failed security setup.
     /// # Panics
     /// Requires a Tokio runtime; propagates an earlier poisoned adapter lock.
-    pub async fn network(id: NodeId, connections: NetworkConfig) -> io::Result<NetworkNode> {
-        Self::network_with(id, connections, |builder| builder).await
+    pub async fn network(id: NodeId, config: NetworkConfig) -> io::Result<Self> {
+        Self::network_with(id, config, |builder| builder).await
     }
 
     /// Initializes a network-backed node with custom membership builder settings.
-    /// This preserves the complete typed [`NodeBuilder`] API without duplicating its
-    /// configuration fields in the transport layer.
+    /// Reuses the complete typed [`NodeBuilder`] API instead of duplicating settings
+    /// in the transport layer. Clones retain the same lifetime as [`Self::network`].
     ///
     /// # Errors
     /// Rejects invalid configuration, failed binds, or failed security setup.
@@ -44,35 +35,59 @@ impl Node<Router> {
         id: NodeId,
         config: NetworkConfig,
         configure: impl FnOnce(NodeBuilder<Router>) -> NodeBuilder<Router>,
-    ) -> io::Result<NetworkNode> {
+    ) -> io::Result<Self> {
         let peers = config.peers();
-        let connections = config.bind(id.clone()).await?;
-        let mut builder = Self::builder(id, connections.router().clone());
+        let network = config.bind(id.clone()).await?;
+        let mut builder = Self::builder(id, network.router().clone());
         for peer in peers {
             builder = builder.seed(peer);
         }
-        let node = configure(builder).spawn();
-        Ok(NetworkNode { node, connections })
+        let mut node = configure(builder).spawn();
+        node.network = Some(network);
+        Ok(node)
     }
-}
 
-impl NetworkNode {
-    /// The node-owned router and optional encrypted stream endpoint.
+    /// The node's router, including route inspection and typed adapter registration.
+    /// A router clone alone does not retain the managed network's lifetime.
     #[must_use]
-    pub fn connections(&self) -> &Network {
-        &self.connections
+    pub fn router(&self) -> &Router {
+        self.transport()
     }
 
-    /// Closes this node's connections across all owner clones and drains tasks.
+    /// Accesses tunnel peer admission and revocation; use [`BulkTransport`] to stream.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` for a node without configured, managed TLS tunnels.
+    pub fn tunnels(&self) -> io::Result<&TunnelTransport> {
+        self.network
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Unsupported, "node has no managed network")
+            })?
+            .tunnels()
+    }
+
+    /// Closes connections across all node clones and drains owned network tasks.
     /// Group handles may remain readable, but cannot exchange further messages.
+    /// A low-level node built from a bare router closes that router instead.
     pub async fn close(&self) {
-        self.connections.close().await;
+        if let Some(network) = &self.network {
+            network.close().await;
+        } else {
+            self.router().close().await;
+        }
     }
 }
 
-impl Deref for NetworkNode {
-    type Target = Node<Router>;
-    fn deref(&self) -> &Self::Target {
-        &self.node
+impl BulkTransport for Node<Router> {
+    type Error = io::Error;
+    type Stream = TunneledStream;
+
+    async fn connect(&self, to: &NodeId) -> io::Result<Self::Stream> {
+        self.tunnels()?.connect(to).await
+    }
+
+    async fn accept(&self) -> io::Result<(NodeId, Self::Stream)> {
+        self.tunnels()?.accept().await
     }
 }

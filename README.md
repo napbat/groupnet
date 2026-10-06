@@ -160,42 +160,73 @@ initialization instead of running a separate transport loop:
 
 ```rust
 use groupnet::core::NodeId;
-use groupnet::router::{NetworkConfig, PeerEndpoint, TransportOption};
+use groupnet::transport::router::{NetworkConfig, PeerEndpoint, TransportConfig};
 use groupnet::runtime::Node;
 
-let mut connections = NetworkConfig::default();
-connections.transports.push(TransportOption::Tcp {
-    bind: "127.0.0.1:7000".parse()?,
-    peers: vec![PeerEndpoint {
-        node: NodeId::new("bridge"),
-        address: "127.0.0.1:7001".parse()?,
-    }],
-    cost: 1,
-});
+let connections = NetworkConfig::default()
+    .with_transport(TransportConfig::tcp(
+        "127.0.0.1:7000".parse()?,
+        [PeerEndpoint::new(
+            NodeId::new("bridge"),
+            "127.0.0.1:7001".parse()?,
+        )],
+    ));
 let node = Node::network(NodeId::new("node-a"), connections).await?;
 let devices = node.join_group("devices");
-// Use devices and node.connections().router(); close drains owned I/O tasks.
+// Use devices and node.router(); close drains owned network I/O tasks.
 node.close().await;
 ```
 
-`TransportOption` supports `Tcp`, `Udp`, local `Ipc`, and native `Punch`.
-`with_transport` accepts a custom `Transport` with a typed `LinkConfig`.
-Set `connections.router.forwarding = true` only on intended bridge nodes:
+`TransportConfig::{tcp, udp, ipc, punch, custom}` all use the same
+`with_transport` entry point. Built-ins default to route cost 1; use
+`with_cost` to override it. `custom(adapter, link_config)` accepts a statically
+typed `Transport` with a `LinkConfig`; no boxed packet futures are required.
+`punch(punch_config)` handles its own storage, without caller-visible boxing.
+
+Initialization returns an ordinary `Node<Router>`. Every node clone retains
+network ownership; a raw router clone or group handle does not. Closing any
+node clone closes connections for all of them; dropping the last node clone
+initiates shutdown. `Node::network_with` accepts a `NodeBuilder<Router>` closure
+for membership settings without duplicating that builder's API.
+Initialization binds listeners and starts discovery; route convergence remains
+asynchronous and can be inspected with `node.router().route_to(&peer)`.
+
+Forwarding between configured peers is automatic, including between neighbors
+on the same adapter. No special bridge flag is required:
 
 ```text
 IPC-only node ── IPC ── bridge ── TCP or authenticated UDP ── network-only node
 ```
+
+Use `with_router(RouterConfig { forwarding: false, ..RouterConfig::default() })`
+for an endpoint-only node which must not advertise or forward transit routes.
+This is a routing-role setting, not an access-control policy for peers or groups.
 
 Plain TCP/UDP adapters require a trusted private network. `PunchConfig` supplies
 a self-hosted rendezvous address, provisioned `NetworkKey`, explicit peers, and
 `PathPolicy`. Direct-preferred mode probes peers simultaneously; relay-only mode
 never sends direct probes. Not every NAT supports direct connectivity.
 
-For confidential streams, set `NetworkConfig::tunnels` with a `TlsIdentity` and
-explicit `PeerIdentity` certificate pins. `node.connections().tunnels()` exposes
-the `BulkTransport` endpoint. TLS 1.3 remains end to end across bridge nodes;
-route changes do not restart the application stream. Certificates must include
-the `groupnet.peer` DNS SAN and client/server authentication usages.
+For confidential streams, call
+`with_tunnels(TunnelConfig::new(identity, [peer_pin]))` with a `TlsIdentity` and
+explicit `PeerIdentity` certificate pins. Import
+`groupnet::transport::bulk::BulkTransport`, then use `node.connect(&peer).await?`
+to initiate a stream or `node.accept().await?` to accept one. A node without
+configured tunnels returns `Unsupported`; it never falls back to plaintext.
+`NetworkConfig::bind` also returns a standalone `Network` implementing the same
+stream trait when membership is not needed.
+
+`node.tunnels()?` exposes `admit_peer` and `revoke_peer` for bidirectional tunnel
+admission. Replacing a pin or revoking a peer invalidates its existing and queued
+streams; re-admitting the same pin preserves its current sessions.
+TLS 1.3 remains end to end across bridge nodes; route changes do not restart the
+application stream. Certificates must include the `groupnet.peer` DNS SAN and
+client/server authentication usages.
+
+Coordination groups are not permission groups. Private-peer route visibility
+and group-based connection policies are not implemented. The shared network
+key establishes a trusted fabric; it does not securely distinguish its members.
+Use pinned tunnel identities and application authorization for protected resources.
 
 Windows IPC addresses are local `\\.\pipe\name` paths. Unix IPC requires a
 caller-owned private directory with no group/other permissions. No adapters

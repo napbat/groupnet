@@ -9,7 +9,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use super::super::IpcAddress;
 
-pub(crate) type Stream = UnixStream;
+pub(in crate::ipc) type Stream = UnixStream;
 
 #[derive(Debug)]
 struct OwnedPath {
@@ -34,13 +34,13 @@ impl Drop for OwnedPath {
 }
 
 #[derive(Debug)]
-pub(crate) struct Listener {
+pub(in crate::ipc) struct Listener {
     socket: UnixListener,
     _path: OwnedPath,
 }
 
 impl Listener {
-    pub(crate) fn bind(address: &IpcAddress) -> io::Result<Self> {
+    pub(in crate::ipc) fn bind(address: &IpcAddress) -> io::Result<Self> {
         let IpcAddress::Unix(path) = address;
         let (path, parent) = private_path(path)?;
         // UnixListener::bind refuses every existing path; deliberately never
@@ -65,17 +65,17 @@ impl Listener {
         })
     }
 
-    pub(crate) async fn accept(&mut self) -> io::Result<Stream> {
+    pub(in crate::ipc) async fn accept(&mut self) -> io::Result<Stream> {
         self.socket.accept().await.map(|(stream, _)| stream)
     }
 }
 
-pub(crate) fn validate_address(address: &IpcAddress) -> io::Result<()> {
+pub(in crate::ipc) fn validate_address(address: &IpcAddress) -> io::Result<()> {
     let IpcAddress::Unix(path) = address;
     private_path(path).map(|_| ())
 }
 
-pub(crate) async fn connect(address: &IpcAddress) -> io::Result<Stream> {
+pub(in crate::ipc) async fn connect(address: &IpcAddress) -> io::Result<Stream> {
     let IpcAddress::Unix(path) = address;
     let (path, parent) = private_path(path)?;
     let metadata = fs::symlink_metadata(&path)?;

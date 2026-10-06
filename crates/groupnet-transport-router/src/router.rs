@@ -30,7 +30,8 @@ pub struct TransportId(usize);
 /// Routing and resource policy for one node.
 #[derive(Clone, Debug)]
 pub struct RouterConfig {
-    /// Whether this node may forward other nodes' traffic. Disabled by default.
+    /// Whether this node forwards transit traffic between admitted peers.
+    /// Enabled by default; set to `false` for an endpoint-only node.
     pub forwarding: bool,
     /// Maximum learned destinations and configured neighbors per transport.
     pub max_routes: usize,
@@ -45,7 +46,7 @@ pub struct RouterConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
-            forwarding: false,
+            forwarding: true,
             max_routes: 128,
             max_transports: 16,
             route_ttl: Duration::from_secs(6),

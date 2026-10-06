@@ -130,14 +130,7 @@ impl Fabric {
             ..RouterConfig::default()
         };
         let ar = Router::new(a.clone(), config.clone()).unwrap();
-        let br = Router::new(
-            b.clone(),
-            RouterConfig {
-                forwarding: true,
-                ..config.clone()
-            },
-        )
-        .unwrap();
+        let br = Router::new(b.clone(), config.clone()).unwrap();
         let cr = Router::new(c.clone(), config).unwrap();
         let first = Network::new();
         let faults = Arc::new(Faults::default());

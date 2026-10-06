@@ -122,9 +122,12 @@ group.sync(|ctx| {
 implementations. A peer may attach only IPC, another only network transports,
 and a bridge both. Link adapters establish one-hop communication; the router
 learns bounded path-vector routes and forwards packets across those links.
-Forwarding is explicit opt-in. Hop limits, loop rejection, route expiry, bounded
-queues, replay suppression, and bounded fragment reassembly constrain failures.
-Neighbor configuration grants link-level trust; gossip is not authorization.
+Forwarding is enabled by default between configured peers, across adapters and
+within one adapter. Set `RouterConfig::forwarding = false` for an endpoint-only
+node: it neither advertises learned transit routes nor forwards transit packets.
+Hop limits, loop rejection, route expiry, bounded queues, replay suppression,
+and bounded fragment reassembly constrain failures. Neighbor configuration
+grants link-level trust; gossip is not authorization.
 
 The router preserves the control-plane `Transport` contract. Its separate tunnel
 endpoint implements `BulkTransport`: bounded reliable packet streams run above
@@ -146,24 +149,46 @@ Membership/route availability never authorizes attachment to a security key.
 ### Initialization and ownership
 
 The facade and runtime expose this path behind feature `router`.
-`Node::network(id, NetworkConfig)` binds configured `TransportOption` values,
-seeds membership from their explicit neighbors, and returns a `NetworkNode`
-which owns the network alongside the ordinary node. `Node::network_with` also
-accepts a typed `NodeBuilder<Router>` configuration closure. Initialization
-failure rolls back started adapters; explicit close drains their tasks. Clones
-share one lifetime, and dropping the last network owner initiates cancellation.
+`Node::network(id, NetworkConfig)` binds configured `TransportConfig` values,
+seeds membership from their explicit neighbors, and returns an ordinary
+`Node<Router>`. `Node::network_with` accepts a typed `NodeBuilder<Router>`
+configuration closure rather than duplicating membership settings.
+Every ordinary node clone retains the managed network. Ownership lives on the
+public handles, not in the receive loop's shared state: a background task must
+not keep its own network alive forever. A raw router clone or group handle alone
+does not extend that lifetime. Dropping the last node owner initiates cancellation;
+closing any clone drains network tasks and closes connections for all clones.
 
-`NetworkConfig` supports any configured mix of TCP, UDP, IPC, and native
-hole-punching adapters, within `RouterConfig` bounds. Custom transports are
-registered generically through `with_transport`; only initialization erases
-the attachment closure. Packet forwarding uses bounded channels, not boxed
-per-packet futures. `TransportId`, `NodeId`, `Route`, `PeerEndpoint`, `LinkConfig`,
-and `PathPolicy` retain their types throughout the public API.
+`NetworkConfig` uses `with_router`, `with_transport`, and `with_tunnels`.
+`TransportConfig::{tcp, udp, ipc, punch, custom}` provides typed constructors;
+all adapters start in insertion order within `RouterConfig` bounds.
+Built-ins default to cost 1, overridable with `with_cost`; custom adapters retain
+their `LinkConfig` cost unless overridden. No public enum exposes allocation
+details. Custom registration erases only the initialization closure, not
+per-packet futures, and transfers the adapter to router workers. Independently
+retained custom-adapter handles and their resources remain caller-owned.
+`TransportId`, `NodeId`, `Route`, `PeerEndpoint`, `LinkConfig`, and `PathPolicy`
+retain their types throughout the public API.
 
-The implementation separates public routing/lifecycle state (`router.rs`),
-adapter I/O (`router/adapters.rs`), path learning and forwarding
-(`router/routing.rs`), and bounded codecs (`wire.rs`). Native adapters and
-the tunnel layer have their own modules. Targets follow
+Initialization failure and explicit close share one shutdown path, including
+draining a native listener when its peer registration fails. Dropping an
+initialization future initiates cleanup through the same ownership guard.
+Initialization starts route discovery; it does not wait for remote peers or
+route convergence.
+
+Both a managed `Node<Router>` and the standalone `Network` returned by
+`NetworkConfig::bind` implement `BulkTransport`. Missing tunnel configuration
+returns `Unsupported`, never plaintext. `tunnels()?` exposes per-peer admission:
+`admit_peer` installs/replaces a certificate pin and `revoke_peer` invalidates
+its active and queued streams. This is bidirectional admission, not directional
+permission-group policy or application-resource authorization.
+
+The implementation separates network configuration/lifetime (`config.rs`),
+adapter preparation (`config/transport.rs`), public routing state (`router.rs`),
+adapter I/O (`router/adapters.rs`), path learning/forwarding (`router/routing.rs`),
+and bounded codecs (`wire.rs`). Wire-only helpers are private; native OS handles
+are visible only within `ipc`. Native adapters and tunnels have their own modules.
+Targets follow
 [Cargo's project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html);
 the multi-file tunnel suite is `tests/tunnels/main.rs` with suite-local fixtures.
 
@@ -186,6 +211,13 @@ Only pinned mutual-TLS tunnels independently authenticate endpoints and conceal
 application bytes from transit peers. IP addresses and traffic metadata remain
 visible. Revoking a tunnel peer closes its sessions; it does not revoke a shared
 network key or revoke application-level USB ownership.
+
+Coordination groups are not security groups. Private-peer discovery controls,
+permission-group policies, and stateful connection ACLs are not implemented.
+Such policies must bind trusted grants to authenticated identities rather than
+to self-advertised group membership or shared-key routing aliases. Transit
+eligibility, permission to initiate a connection, and application resource
+authorization are separate decisions.
 
 No QUIC/P2P stack is wrapped. Tokio supplies I/O; rustls and ring supply standard
 TLS and cryptographic primitives. Public-Internet NAT combinations, Unix runtime
