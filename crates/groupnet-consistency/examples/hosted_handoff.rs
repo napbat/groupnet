@@ -48,9 +48,10 @@ use groupnet_consistency::{
     advertised_head_named,
 };
 use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster, placement};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{Group, GroupProfile, Node, Role};
 use groupnet_transport::bulk::DataPlane;
-use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, MemTransport, Network};
+use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, MemLink, Network};
 use tokio::sync::mpsc;
 
 /// The hosted group: one shard's worth of records.
@@ -201,7 +202,7 @@ impl SnapshotSink for ReplicaSink {
 /// One participant.
 struct Member {
     id: NodeId,
-    _node: Node<MemTransport>,
+    _node: Node,
     group: Group,
     ledger: Arc<CommitLedger>,
     writes: HostedWrites<String>,
@@ -215,14 +216,24 @@ struct Member {
 impl Member {
     /// Brings one node up on both planes, joined to [`GROUP`] under the Quorum
     /// profile over `voters`, following and serving.
-    fn spawn(net: &Network, bulk: &MemBulkNet, id: &str, voters: &[&str]) -> Self {
+    async fn spawn(net: &Network, bulk: &MemBulkNet, id: &str, voters: &[&str]) -> Self {
         let me = NodeId::new(id);
-        let mut builder =
-            Node::builder(me.clone(), net.endpoint(me.clone())).gossip_interval_ms(GOSSIP_MS);
+        let peers = IDS
+            .iter()
+            .filter(|other| **other != id)
+            .map(|peer| NodeId::new(*peer))
+            .collect();
+        let mut builder = Node::builder(me.clone())
+            .link(MemLink::new(net.endpoint(me.clone()), peers))
+            .routing(RouterConfig {
+                announce_interval: Duration::from_millis(GOSSIP_MS),
+                ..RouterConfig::default()
+            })
+            .gossip_interval_ms(GOSSIP_MS);
         for seed in IDS.iter().filter(|other| **other != id) {
             builder = builder.seed(NodeId::new(*seed));
         }
-        let node = builder.spawn();
+        let node = builder.start().await.expect("the memory link binds");
         let roster = VoterRoster::new(voters.iter().map(|v| NodeId::new(*v)));
         let group = node.join_group_with(
             GROUP,
@@ -363,10 +374,10 @@ async fn main() {
     let order: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
     let (voters, joiner_id) = (&order[..3], order[3]);
 
-    let members: Vec<Member> = voters
-        .iter()
-        .map(|id| Member::spawn(&net, &bulk, id, voters))
-        .collect();
+    let mut members = Vec::with_capacity(voters.len());
+    for id in voters {
+        members.push(Member::spawn(&net, &bulk, id, voters).await);
+    }
     let (served_tx, mut served_rx) = mpsc::unbounded_channel();
     for member in &members {
         member.serve(served_tx.clone());
@@ -431,7 +442,7 @@ async fn act3_late(
     head: WriteToken,
 ) -> Member {
     println!("\n== act 2: a fourth node joins, late ==");
-    let joiner = Member::spawn(net, bulk, id, voters);
+    let joiner = Member::spawn(net, bulk, id, voters).await;
     let gap = settle("the joiner to be told what it missed", || {
         joiner.gaps().first().copied()
     })

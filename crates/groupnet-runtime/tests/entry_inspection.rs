@@ -55,7 +55,8 @@ async fn actor_cut_has_bounded_complete_roster_and_aging_native_ttl() {
     let cluster = MemCluster::builder(&["node-a", "node-b"])
         .group("g")
         .gossip_interval_ms(20)
-        .spawn();
+        .spawn()
+        .await;
     let a = &cluster.groups[0];
     let b = &cluster.groups[1];
     a.set_entry("~claim:test", b"owner-1", Some(3_000)).unwrap();
@@ -125,7 +126,8 @@ async fn pair_cut_keeps_membership_and_both_native_ttls_together() {
     let cluster = MemCluster::builder(&["node-a", "node-b"])
         .group("g")
         .gossip_interval_ms(20)
-        .spawn();
+        .spawn()
+        .await;
     let a = &cluster.groups[0];
     let b = &cluster.groups[1];
     a.set_entry("~presence:test", b"boot-a", Some(3_000))
@@ -186,7 +188,7 @@ async fn pair_cut_keeps_membership_and_both_native_ttls_together() {
 async fn cancelled_pair_reply_keeps_owned_budget_until_actor_retirement() {
     use std::future::Future;
 
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let group = &cluster.groups[0];
     let (owner, dropped) = budget(2_048);
     let mut query =
@@ -225,7 +227,7 @@ async fn revision_write(group: &Group, key: &str, value: &[u8], expected: EntryR
 
 #[tokio::test]
 async fn scoped_revision_fences_old_create_after_new_withdraw_and_ignores_unrelated_writes() {
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let group = &cluster.groups[0];
     let key = "~presence:test";
     let inspect = || async {
@@ -295,7 +297,8 @@ async fn overflow_refuses_whole_actor_cut_and_releases_its_budget() {
     let cluster = MemCluster::builder(&["node-a", "node-b"])
         .group("g")
         .gossip_interval_ms(20)
-        .spawn();
+        .spawn()
+        .await;
     let group = &cluster.groups[0];
     group
         .set_entry("~claim:test", b"claim-value", Some(800))
@@ -357,7 +360,7 @@ async fn overflow_refuses_whole_actor_cut_and_releases_its_budget() {
 
 #[tokio::test]
 async fn confirmed_local_claim_and_exact_withdrawal_fence_a_newer_renewal() {
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let group = &cluster.groups[0];
     let key = "~claim:test";
     let (write_budget, _) = budget(1_024);
@@ -401,7 +404,7 @@ async fn confirmed_local_claim_and_exact_withdrawal_fence_a_newer_renewal() {
 async fn cancelled_after_actor_enqueue_keeps_budget_until_queued_work_retires() {
     use std::future::Future;
 
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let group = &cluster.groups[0];
     let (owner, dropped) = budget(1_024);
     let mut query = Box::pin(group.inspect_scoped_entry("~claim:test", limits(), owner));
@@ -424,7 +427,7 @@ async fn cancelled_after_actor_enqueue_keeps_budget_until_queued_work_retires() 
 async fn cancelled_confirmed_write_keeps_queue_charge_until_actor_publication() {
     use std::future::Future;
 
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let group = &cluster.groups[0];
     let (owner, dropped) = budget(1_024);
     let mut write = Box::pin(group.set_entry_confirmed(
@@ -454,7 +457,7 @@ async fn cancelled_confirmed_write_keeps_queue_charge_until_actor_publication() 
 
 #[tokio::test]
 async fn mutation_rejects_unreserved_bytes_before_enqueue() {
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let group = &cluster.groups[0];
     let (small, dropped) = budget(1);
     let error = group
@@ -473,7 +476,7 @@ async fn short_owned_values_with_large_capacity_never_enter_the_actor_queue() {
         value.push(b'x');
         value
     }
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let group = &cluster.groups[0];
     let (first_budget, dropped) = budget(1_024);
     assert_eq!(

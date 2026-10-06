@@ -41,8 +41,9 @@ use groupnet_consistency::{
     Commit, CommitLedger, Completeness, Fence, HostedError, HostedRead, HostedReads, HostedWrites,
 };
 use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{Group, GroupProfile, Node, Role};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_transport_mem::{MemLink, Network};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -140,8 +141,7 @@ impl CasStore {
 /// them away — a process death, not a graceful leave.
 struct Member {
     id: NodeId,
-    net: Network,
-    node: Option<Node<MemTransport>>,
+    node: Option<Node>,
     group: Option<Group>,
     ledger: Option<Arc<CommitLedger>>,
     writes: Option<HostedWrites<String>>,
@@ -155,14 +155,24 @@ struct Member {
 
 impl Member {
     /// Brings one node up, joined to [`GROUP`] under the Quorum profile.
-    fn spawn(net: &Network, id: &str) -> Self {
+    async fn spawn(net: &Network, id: &str) -> Self {
         let me = NodeId::new(id);
-        let mut builder =
-            Node::builder(me.clone(), net.endpoint(me.clone())).gossip_interval_ms(GOSSIP_MS);
+        let peers = IDS
+            .iter()
+            .filter(|other| **other != id)
+            .map(|peer| NodeId::new(*peer))
+            .collect();
+        let mut builder = Node::builder(me.clone())
+            .link(MemLink::new(net.endpoint(me.clone()), peers))
+            .routing(RouterConfig {
+                announce_interval: Duration::from_millis(GOSSIP_MS),
+                ..RouterConfig::default()
+            })
+            .gossip_interval_ms(GOSSIP_MS);
         for seed in IDS.iter().filter(|other| **other != id) {
             builder = builder.seed(NodeId::new(*seed));
         }
-        let node = builder.spawn();
+        let node = builder.start().await.expect("the memory link binds");
         let voters = VoterRoster::new(IDS.iter().map(|id| NodeId::new(*id)));
         let group = node.join_group_with(
             GROUP,
@@ -187,7 +197,6 @@ impl Member {
         .expect("a Quorum group supports the committed regime");
         Self {
             id: me,
-            net: net.clone(),
             node: Some(node),
             group: Some(group),
             ledger: Some(ledger),
@@ -296,10 +305,7 @@ impl Member {
         self.index.lock().expect("lock").len()
     }
 
-    /// Kills the node outright. Dropping the handles is not enough on its own:
-    /// the receive loop holds an `Arc` of the same inner state, so the actors
-    /// keep ticking until the endpoint is evicted from the `Network`
-    /// (registering the id again replaces the sender and closes the old inbox).
+    /// Kills the node outright and closes every managed link.
     async fn kill(&mut self) {
         if let Some(apply) = self.apply.take() {
             apply.abort();
@@ -308,8 +314,9 @@ impl Member {
         self.writes = None;
         self.ledger = None;
         self.group = None;
-        self.node = None;
-        drop(self.net.endpoint(self.id.clone()));
+        if let Some(node) = self.node.take() {
+            node.close().await;
+        }
     }
 }
 
@@ -319,7 +326,10 @@ impl Member {
 async fn main() {
     let net = Network::new();
     let store = Arc::new(CasStore::default());
-    let mut members: Vec<Member> = IDS.iter().map(|id| Member::spawn(&net, id)).collect();
+    let mut members = Vec::with_capacity(IDS.len());
+    for id in IDS {
+        members.push(Member::spawn(&net, id).await);
+    }
     for member in &mut members {
         member.follow(&store);
     }
@@ -417,7 +427,7 @@ async fn act3_zombie(members: &mut [Member], host: usize, store: &CasStore) {
         member.hold(false);
     }
     members[host].kill().await;
-    println!("  {zombie_id} dies: handles dropped, endpoint evicted");
+    println!("  {zombie_id} dies: managed links closed");
 
     let next = settle("a successor to activate", || {
         members.iter().position(Member::is_host)

@@ -112,6 +112,7 @@ futures-util = { workspace = true, features = ["io"], optional = true }
 # conditional on `handoff` for a dev-dependency. Dev-only, so neither the extra
 # tokio slice nor the compat shim reaches the published graph.
 groupnet-transport-mem = { workspace = true, features = ["bulk"] }
+groupnet-network = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 # The deterministic simulator, for the lease tier's DST (slice S3): the sans-IO
 # cores are driven in virtual time, with no runtime and no transport. Dev-only,

@@ -1,8 +1,8 @@
 //! A 3-node cluster over the in-memory transport: watch it converge on a derived
 //! coordinator, then have that coordinator publish metadata the others read.
 //!
-//! The in-memory transport stands in for real sockets — swap it for
-//! `groupnet::transport::udp` and nothing else changes.
+//! Every node uses the same builder. Replace `MemLink` with a socket link, or
+//! register several links, without changing the node type or group operations.
 //!
 //! ```text
 //! cargo run --example cluster
@@ -12,48 +12,51 @@ use std::time::Duration;
 
 use groupnet::core::NodeId;
 use groupnet::runtime::{Group, Node};
-use groupnet::transport::mem::{MemTransport, Network};
+use groupnet::transport::mem::{MemLink, Network};
 
 const GROUP: &str = "shard-42";
 const NODE_IDS: [&str; 3] = ["node-a", "node-b", "node-c"];
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     // One shared in-memory fabric; every endpoint created from it can reach the
     // others.
     let net = Network::new();
 
-    // Bring up each node seeded with its peers, and join the shared group. The
-    // `Node`s are kept alive for the run; all state lives in their actor tasks.
-    let cluster: Vec<(NodeId, Node<MemTransport>, Group)> = NODE_IDS
-        .iter()
-        .map(|id| {
-            let me = NodeId::new(*id);
-            let mut builder = Node::builder(me.clone(), net.endpoint(me.clone()));
-            for peer in NODE_IDS.iter().filter(|p| *p != id) {
-                builder = builder.seed(NodeId::new(*peer));
-            }
-            let node = builder.spawn();
-            let group = node.join_group(GROUP);
-            (me, node, group)
-        })
-        .collect();
+    // Adjacent peers also seed membership. Keep each node alive for the run.
+    let mut cluster: Vec<(NodeId, Node, Group)> = Vec::with_capacity(NODE_IDS.len());
+    for id in NODE_IDS {
+        let me = NodeId::new(id);
+        let peers = NODE_IDS
+            .iter()
+            .filter(|peer| **peer != id)
+            .map(|peer| NodeId::new(*peer))
+            .collect();
+        let node = Node::builder(me.clone())
+            .link(MemLink::new(net.endpoint(me.clone()), peers))
+            .start()
+            .await?;
+        let group = node.join_group(GROUP);
+        cluster.push((me, node, group));
+    }
 
     // Gossip converges the membership and the derived coordinator. Every node
     // computes the same coordinator from the same live-member set.
-    let converged = wait_until(|| {
-        let coords: Vec<_> = cluster.iter().map(|(_, _, g)| g.coordinator()).collect();
-        coords.iter().all(Option::is_some) && coords.windows(2).all(|w| w[0] == w[1])
+    if !wait_until(|| {
+        let coordinator = cluster[0].2.coordinator();
+        coordinator.is_some()
+            && cluster.iter().all(|(_, _, group)| {
+                group.members().len() == NODE_IDS.len() && group.coordinator() == coordinator
+            })
     })
-    .await;
-    println!(
-        "== membership {} ==",
-        if converged {
-            "converged"
-        } else {
-            "did not converge in time"
-        }
-    );
+    .await
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "membership did not converge",
+        ));
+    }
+    println!("== membership converged ==");
     for (id, _, group) in &cluster {
         let coord = group
             .coordinator()
@@ -70,12 +73,18 @@ async fn main() {
         group.sync(|ctx| ctx.update_metadata("leader", id.to_string()));
     }
 
-    wait_until(|| {
+    if !wait_until(|| {
         cluster
             .iter()
             .all(|(_, _, g)| g.metadata("leader").is_some())
     })
-    .await;
+    .await
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "metadata did not converge",
+        ));
+    }
     println!("\n== metadata converged ==");
     for (id, _, group) in &cluster {
         println!(
@@ -83,6 +92,7 @@ async fn main() {
             group.metadata("leader")
         );
     }
+    Ok(())
 }
 
 /// Polls `cond` until it holds or a generous deadline elapses. Gossip is

@@ -393,7 +393,10 @@ fn limits() -> Limits {
 
 #[tokio::test]
 async fn missed_notification_replays_from_source_timer_and_native_floor_waits_for_head() {
-    let cluster = MemCluster::builder(&["reader-a"]).group("stores").spawn();
+    let cluster = MemCluster::builder(&["reader-a"])
+        .group("stores")
+        .spawn()
+        .await;
     let source = MemSource::new();
     let app = MemApp::new(true);
     let manager = Replication::new(
@@ -427,7 +430,10 @@ async fn missed_notification_replays_from_source_timer_and_native_floor_waits_fo
 
 #[tokio::test]
 async fn volatile_materialization_is_not_a_restart_checkpoint() {
-    let cluster = MemCluster::builder(&["reader-b"]).group("stores").spawn();
+    let cluster = MemCluster::builder(&["reader-b"])
+        .group("stores")
+        .spawn()
+        .await;
     let source = MemSource::new();
     source.commit(1);
     let app = MemApp::new(false);
@@ -482,7 +488,8 @@ async fn volatile_materialization_is_not_a_restart_checkpoint() {
 async fn recovered_checkpoint_at_head_installs_live_state_before_serving() {
     let cluster = MemCluster::builder(&["reader-recovered"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::new();
     source.commit(2);
     let app = MemApp::new(true);
@@ -510,7 +517,8 @@ async fn recovered_checkpoint_at_head_installs_live_state_before_serving() {
 async fn absent_checkpoint_reports_snapshot_needed_after_source_proof() {
     let cluster = MemCluster::builder(&["reader-missing"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let app = MemApp::new(true);
     app.checkpoint_available.store(false, Ordering::Release);
     let manager = Replication::new(cluster.groups[0].clone(), MemSource::new(), app, limits())
@@ -527,7 +535,10 @@ async fn absent_checkpoint_reports_snapshot_needed_after_source_proof() {
 
 #[tokio::test]
 async fn authority_revocation_closes_ready_read_gate_synchronously() {
-    let cluster = MemCluster::builder(&["reader-c"]).group("stores").spawn();
+    let cluster = MemCluster::builder(&["reader-c"])
+        .group("stores")
+        .spawn()
+        .await;
     let manager = Replication::new(
         cluster.groups[0].clone(),
         MemSource::new(),
@@ -554,7 +565,8 @@ async fn authority_revocation_closes_ready_read_gate_synchronously() {
 async fn manager_drop_closes_a_ready_handle() {
     let cluster = MemCluster::builder(&["reader-drop"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let manager = Replication::new(
         cluster.groups[0].clone(),
         MemSource::new(),
@@ -581,7 +593,8 @@ async fn manager_drop_closes_a_ready_handle() {
 async fn materialized_floor_respects_application_read_policy() {
     let cluster = MemCluster::builder(&["reader-policy"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::new();
     let app = MemApp::new(true);
     let manager = Replication::new(cluster.groups[0].clone(), source, app.clone(), limits())
@@ -607,7 +620,10 @@ async fn materialized_floor_respects_application_read_policy() {
 
 #[tokio::test]
 async fn read_gate_expires_while_tail_driver_is_stalled() {
-    let cluster = MemCluster::builder(&["reader-e"]).group("stores").spawn();
+    let cluster = MemCluster::builder(&["reader-e"])
+        .group("stores")
+        .spawn()
+        .await;
     let source = MemSource::new();
     let manager = Replication::new(
         cluster.groups[0].clone(),
@@ -653,7 +669,10 @@ async fn read_gate_expires_while_tail_driver_is_stalled() {
 
 #[tokio::test]
 async fn cancellation_fences_a_blocked_native_install() {
-    let cluster = MemCluster::builder(&["reader-d"]).group("stores").spawn();
+    let cluster = MemCluster::builder(&["reader-d"])
+        .group("stores")
+        .spawn()
+        .await;
     let source = MemSource::new();
     source.commit(1);
     let inner = MemApp::new(true);
@@ -695,7 +714,8 @@ async fn cancellation_fences_a_blocked_native_install() {
 async fn expired_operation_permit_cannot_publish_a_detached_late_install() {
     let cluster = MemCluster::builder(&["reader-deadline"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::new();
     source.commit(1);
     let inner = MemApp::new(true);
@@ -745,7 +765,10 @@ async fn expired_operation_permit_cannot_publish_a_detached_late_install() {
 
 #[tokio::test]
 async fn slow_scope_cannot_hold_global_admission_forever() {
-    let cluster = MemCluster::builder(&["reader-f"]).group("stores").spawn();
+    let cluster = MemCluster::builder(&["reader-f"])
+        .group("stores")
+        .spawn()
+        .await;
     let source = MemSource::new();
     *source.held_partition.lock().expect("partition lock") = Some("slow".into());
     let mut bounded = limits();
@@ -781,7 +804,8 @@ async fn slow_scope_cannot_hold_global_admission_forever() {
 async fn concurrent_native_floors_keep_the_highest_target_across_replay_windows() {
     let cluster = MemCluster::builder(&["reader-floors"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::new();
     source.hold_tails.store(true, Ordering::Release);
     let manager = Replication::new(
@@ -821,7 +845,8 @@ async fn concurrent_native_floors_keep_the_highest_target_across_replay_windows(
 async fn bounded_scope_registry_reports_backpressure_and_reclaims_capacity() {
     let cluster = MemCluster::builder(&["reader-capacity"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let mut bounded = limits();
     bounded.max_scopes = 1;
     let manager = Replication::new(
@@ -853,7 +878,8 @@ async fn bounded_scope_registry_reports_backpressure_and_reclaims_capacity() {
 async fn closed_sessions_delayed_revoke_cannot_disable_a_reopened_scope() {
     let cluster = MemCluster::builder(&["reader-reopen"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let app = DetachedRevokeApp {
         inner: MemApp::new(true),
         delayed: Arc::new(Mutex::new(None)),
@@ -915,7 +941,8 @@ async fn closed_sessions_delayed_revoke_cannot_disable_a_reopened_scope() {
 async fn delayed_old_close_cannot_remove_reopened_scope() {
     let cluster = MemCluster::builder(&["reader-conditional-close"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let manager = Replication::new(
         cluster.groups[0].clone(),
         MemSource::new(),

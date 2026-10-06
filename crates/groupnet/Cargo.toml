@@ -8,12 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# `runtime` (the async Node/Group API + tokio) and `mem` (the in-memory
-# transport) are on by default so the basic example works out of the box. `udp`
-# (real sockets) and `sim` (the deterministic simulator) are opt-in. Depend with
-# `default-features = false` for just the sans-IO core + transport trait.
+# Every runtime node owns a routed network. Protocol bindings remain selectable;
+# memory supports the default examples without opening OS sockets.
+# Disable defaults for the dependency-free coordination core and transport trait.
 default = ["runtime", "mem"]
-runtime = ["dep:groupnet-runtime"]
+runtime = [
+    "dep:groupnet-runtime", "bulk", "dep:groupnet-network",
+    "groupnet-transport/link", "groupnet-transport-mem?/link",
+    "groupnet-transport-tcp?/link", "groupnet-transport-udp?/link",
+]
 mem = ["dep:groupnet-transport-mem"]
 udp = ["dep:groupnet-transport-udp"]
 # Named seeds resolved through the operating system's resolver
@@ -29,6 +32,15 @@ tcp = ["bulk", "dep:groupnet-transport-tcp", "groupnet-transport-tcp/bulk"]
 # that want frames delivered at network latency over reliable links. Gossip
 # deployments keep `udp`; nothing forces a socket per member.
 tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
+# Native link implementations are independent crates, not router built-ins.
+ipc = ["dep:groupnet-transport-ipc"]
+punch = ["dep:groupnet-transport-punch"]
+# Request/response RPC over the data plane: concurrent calls multiplexed onto
+# one stream per peer, with deadlines, bounded frames and per-connection
+# handler limits. Rides `bulk`, so bring a binding (`tcp`, or your own). The
+# weak `groupnet-transport-mem?/bulk` is the same edge `consistency-handoff`
+# carries: if `mem` is on, its `MemBulkNet` comes too, and nothing otherwise.
+rpc = ["bulk", "dep:groupnet-rpc", "groupnet-transport-mem?/bulk"]
 # Session-consistency layer: per-writer sequenced write feeds with loss
 # detection, and applied-write frontiers for read-your-writes barriers.
 # Built on the runtime's Group handle.
@@ -85,7 +97,11 @@ groupnet-transport = { workspace = true }
 groupnet-transport-mem = { workspace = true, optional = true }
 groupnet-transport-udp = { workspace = true, optional = true }
 groupnet-transport-tcp = { workspace = true, optional = true }
+groupnet-network = { workspace = true, optional = true }
+groupnet-transport-ipc = { workspace = true, optional = true }
+groupnet-transport-punch = { workspace = true, optional = true }
 groupnet-runtime = { workspace = true, optional = true }
+groupnet-rpc = { workspace = true, optional = true }
 groupnet-consistency = { workspace = true, optional = true }
 groupnet-sim = { workspace = true, optional = true }
 
@@ -111,6 +127,14 @@ required-features = ["runtime", "mem"]
 [[example]]
 name = "routing"
 required-features = ["runtime", "mem"]
+
+[[example]]
+name = "dynamic-admission"
+required-features = ["runtime", "tcp-msg"]
+
+[[example]]
+name = "dynamic-relay"
+required-features = ["runtime", "punch"]
 
 [lints]
 workspace = true

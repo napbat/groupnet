@@ -85,6 +85,8 @@ pub struct GroupEngine {
     pub(super) members: BTreeMap<NodeId, Member>,
     /// Bootstrap contacts to disseminate toward before membership is learned.
     pub(super) seeds: BTreeSet<NodeId>,
+    /// Replaceable, bounded discovery contacts; these do not assert membership.
+    pub(super) bootstrap_contacts: BTreeSet<NodeId>,
     pub(super) metadata: BTreeMap<String, VersionedValue>,
     pub(super) coordinator: Option<NodeId>,
     pub(super) config: Config,
@@ -162,6 +164,7 @@ impl GroupEngine {
             leaving: false,
             members,
             seeds,
+            bootstrap_contacts: BTreeSet::new(),
             metadata: BTreeMap::new(),
             coordinator: None,
             config,

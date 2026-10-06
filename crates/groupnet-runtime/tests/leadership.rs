@@ -30,10 +30,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_core::{Activation, Config, GroupMode, HostedConfig, NodeId, wire};
+use groupnet_network::{RouterConfig, testing::message_payload};
 use groupnet_runtime::{Group, GroupEvent, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{MemCluster, converged_within, eventually_within};
+use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_transport_mem::{MemLink, MemTransport, Network};
 use tokio::sync::broadcast::error::RecvError;
 
 /// The poll budget for every assertion here.
@@ -151,7 +153,8 @@ async fn three_hosted_nodes_converge_on_one_epoch_fenced_host() {
         .group("hosted-shard")
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(hosted())
-        .spawn();
+        .spawn()
+        .await;
 
     // Subscribed before anything can have been elected: the engine's boot
     // guard withholds every claim for one settle window, which is orders of
@@ -231,7 +234,8 @@ async fn killing_the_host_promotes_a_successor_at_a_higher_epoch() {
         .group("hosted-failover")
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(hosted())
-        .spawn();
+        .spawn()
+        .await;
 
     let first = {
         let groups: Vec<&Group> = cluster.groups.iter().collect();
@@ -251,20 +255,14 @@ async fn killing_the_host_promotes_a_successor_at_a_higher_epoch() {
 
     // --- Kill the host. ---
     //
-    // Dropping the `Node` and `Group` handles is *not* on its own enough to
-    // stop a node: the node's receive loop owns an `Arc` of the same inner
-    // state that owns the transport, so the group actors keep ticking (and
-    // gossiping) even with no handle left. Evicting the endpoint from the
-    // `Network` — registering the id again, which replaces the sender — closes
-    // the old inbox, ends that receive loop, breaks the cycle and tears the
-    // actors down. Together they are a faithful process death: the node stops
-    // sending, and nothing is delivered to it again.
+    // Closing the managed network stops receive and group actors without
+    // replacing a fabric endpoint or allowing a zombie to keep gossiping.
     let dead_group = cluster.groups.remove(index);
     let dead_node = cluster.nodes.remove(index);
     cluster.ids.remove(index);
     drop(dead_group);
+    dead_node.close().await;
     drop(dead_node);
-    let _evicted = cluster.net.endpoint(dead_id.clone());
 
     let survivors: Vec<&Group> = cluster.groups.iter().collect();
     eventually_within("the survivors to elect a successor", SETTLE, || {
@@ -315,7 +313,8 @@ async fn an_eventual_group_on_hosting_nodes_never_elects() {
         .group("hosted-sibling")
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(hosted())
-        .spawn();
+        .spawn()
+        .await;
 
     // The same nodes, a second group, joined with no profile at all.
     let quiet: Vec<Group> = cluster.nodes.iter().map(|n| n.join_group(QUIET)).collect();
@@ -375,7 +374,8 @@ async fn a_repeat_join_keeps_the_first_profile() {
         .group(GROUP)
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(hosted())
-        .spawn();
+        .spawn()
+        .await;
 
     let groups: Vec<&Group> = cluster.groups.iter().collect();
     converged_within(&groups, SETTLE).await;
@@ -441,7 +441,7 @@ async fn a_repeat_join_keeps_the_first_profile() {
 
 /// Races two joins of `group` on `node` — one asking for Hosted, one for
 /// Eventual — from two tasks released together, and hands back both handles.
-async fn race_join(node: &Node<MemTransport>, group: &str) -> (Group, Group) {
+async fn race_join(node: &Node, group: &str) -> (Group, Group) {
     let gate = Arc::new(tokio::sync::Barrier::new(2));
     let racers: Vec<_> = [hosted(), GroupProfile::eventual()]
         .into_iter()
@@ -482,7 +482,11 @@ async fn concurrent_joins_of_one_group_never_spawn_two_engines() {
 
     let net = Network::new();
     let id = NodeId::new("race-a");
-    let node = Node::builder(id.clone(), net.endpoint(id.clone())).spawn();
+    let node = Node::builder(id.clone())
+        .link(MemLink::new(net.endpoint(id.clone()), Vec::new()))
+        .start()
+        .await
+        .expect("memory link binds");
 
     for round in 0..ROUNDS {
         let group = format!("raced-{round}");
@@ -547,11 +551,18 @@ async fn the_reserved_routing_group_never_elects() {
             inner: net.endpoint(id.clone()),
             electing: electing.clone(),
         };
-        let mut builder = Node::builder(id.clone(), transport).config(config.clone());
+        let peers = ids.iter().filter(|other| *other != id).cloned().collect();
+        let mut builder = Node::builder(id.clone())
+            .link(BoundLink::new(transport, LinkConfig::new(peers)))
+            .routing(RouterConfig {
+                announce_interval: Duration::from_millis(GOSSIP_MS),
+                ..RouterConfig::default()
+            })
+            .config(config.clone());
         for seed in ids.iter().filter(|other| *other != id) {
             builder = builder.seed(seed.clone());
         }
-        nodes.push(builder.spawn());
+        nodes.push(builder.start().await.expect("sniffer link binds"));
         sniffers.push(electing);
     }
 
@@ -595,7 +606,7 @@ impl Transport for Sniffer {
     type Error = <MemTransport as Transport>::Error;
 
     async fn send(&self, to: &NodeId, msg: &[u8]) -> Result<(), Self::Error> {
-        if let Some(frame) = wire::decode(msg)
+        if let Some(frame) = message_payload(msg).and_then(wire::decode)
             && matches!(
                 frame.kind,
                 wire::Kind::LeadClaim | wire::Kind::LeadGrant | wire::Kind::LeadState

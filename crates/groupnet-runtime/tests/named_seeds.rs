@@ -5,12 +5,16 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{NamedSeeds, Node, ResolveFuture, SeedEvent, SeedResolver};
 use groupnet_testkit::cluster::eventually_within;
+use groupnet_transport::link::{BoundLink, LinkConfig};
+use groupnet_transport_mem::{MemLink, Network};
 use groupnet_transport_udp::UdpTransport;
 
 /// The re-resolution cadence under test: short, so healing is quick.
@@ -58,7 +62,13 @@ async fn a_seed_whose_name_moves_is_rejoined_without_its_help() {
     let answer = Arc::new(Mutex::new(dead_addr()));
     let moves = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&moves);
-    let a = Node::builder(a_id, a_udp)
+    let routing = RouterConfig {
+        announce_interval: Duration::from_millis(GOSSIP_MS),
+        ..RouterConfig::default()
+    };
+    let a = Node::builder(a_id.clone())
+        .link(BoundLink::new(a_udp, LinkConfig::new(vec![b_id.clone()])))
+        .routing(routing.clone())
         .gossip_interval_ms(GOSSIP_MS)
         .named_seeds(
             NamedSeeds::new(Moving(Arc::clone(&answer)))
@@ -70,10 +80,16 @@ async fn a_seed_whose_name_moves_is_rejoined_without_its_help() {
                     }
                 }),
         )
-        .spawn();
-    let b = Node::builder(b_id, b_udp)
+        .start()
+        .await
+        .expect("a UDP link binds");
+    let b = Node::builder(b_id)
+        .link(BoundLink::new(b_udp, LinkConfig::new(vec![a_id])))
+        .routing(routing)
         .gossip_interval_ms(GOSSIP_MS)
-        .spawn();
+        .start()
+        .await
+        .expect("b UDP link binds");
     let groups = [a.join_group("shard-1"), b.join_group("shard-1")];
 
     // Wedged: A gossips at a dead address and B knows nobody.
@@ -90,6 +106,83 @@ async fn a_seed_whose_name_moves_is_rejoined_without_its_help() {
         vec![(stale, None), (b_addr, Some(stale))],
         "first resolution, then exactly one move"
     );
+}
+
+/// Resolves forever, recording both first poll and cancellation of the future.
+#[derive(Clone)]
+struct PendingResolver {
+    started: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicUsize>,
+}
+
+struct PendingResolution(Arc<AtomicUsize>);
+
+impl Drop for PendingResolution {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl SeedResolver for PendingResolver {
+    fn resolve<'a>(&'a self, _name: &'a str) -> ResolveFuture<'a> {
+        Box::pin(async move {
+            let _resolution = PendingResolution(Arc::clone(&self.cancelled));
+            self.started.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn closing_a_managed_node_cancels_a_pending_seed_lookup() {
+    pending_lookup_stops(true).await;
+}
+
+#[tokio::test]
+async fn dropping_the_final_node_owner_cancels_a_pending_seed_lookup() {
+    pending_lookup_stops(false).await;
+}
+
+async fn pending_lookup_stops(explicit_close: bool) {
+    let started = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let resolver = PendingResolver {
+        started: Arc::clone(&started),
+        cancelled: Arc::clone(&cancelled),
+    };
+    let net = Network::new();
+    let local = NodeId::new("pending-local");
+    let peer = NodeId::new("pending-peer");
+    let node = Node::builder(local.clone())
+        .link(MemLink::new(net.endpoint(local), vec![peer.clone()]))
+        .named_seeds(NamedSeeds::new(resolver).seed(peer, SEED_NAME))
+        .start()
+        .await
+        .expect("memory link binds");
+    // A borrowed router handle must not retain network ownership.
+    let router = node.router().clone();
+    let remaining = node.clone();
+    drop(node);
+    eventually_within("the seed lookup to begin", SETTLE, || {
+        started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        cancelled.load(Ordering::SeqCst),
+        0,
+        "a node clone owns the lookup"
+    );
+    if explicit_close {
+        remaining.close().await;
+    }
+    drop(remaining);
+    eventually_within("the pending seed lookup to be cancelled", SETTLE, || {
+        cancelled.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    tokio::time::timeout(SETTLE, router.cancelled())
+        .await
+        .expect("router cancellation accompanies resolver shutdown");
 }
 
 /// The operating system resolver resolves a literal `host:port` and a

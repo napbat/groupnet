@@ -5,8 +5,8 @@ Instructions for any coding agent working in this repository.
 ## Orientation
 
 groupnet is a deterministic, leaderless-by-default coordination fabric for
-sharded distributed systems. Read `README.md` for the architecture,
-`docs/technical.md` for pinned design contracts, and
+sharded distributed systems. Read `README.md` for usage,
+`docs/README.md` for the architecture and network-lifecycle guides, and
 `docs/consistency-modes.md` for the consistency-modes design — that document
 is the **contract of record** for the Hosted-mode/consistency work and its
 Section 6 is the build order.
@@ -136,11 +136,28 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    - wire changes: codec round-trip tests;
    - untested code is unfinished code.
 
+4. **Separate functions with a blank line**, including methods and trait method
+   declarations. Put the separator before the next function's doc comments and
+   attributes, not between those comments/attributes and the function.
+
 ## Testing conventions
 
+- Follow [Cargo's project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html):
+  libraries in `src/lib.rs`, binaries in `src/main.rs` or `src/bin/`,
+  and targets in `examples/`, `benches/`, and `tests/`. Multi-file targets use
+  `<target-name>/main.rs` plus target-local modules. New target names use
+  kebab-case; Rust module names use snake_case.
 - Unit tests: inline `#[cfg(test)] mod tests` at the bottom of the file they
-  test. Integration tests: `tests/*.rs`, noun-named by behavior. Shared
-  helpers: `groupnet-testkit` (never `tests/common/mod.rs`).
+  test. Integration tests are noun-named by behavior. Reusable cross-suite
+  helpers belong in `groupnet-testkit` (never `tests/common/mod.rs`).
+- Keep public configuration and lifecycle APIs separate from adapter workers,
+  routing state transitions, and wire codecs. Split by responsibility rather
+  than adding wrappers or weakening lints to accommodate oversized functions.
+- Routing is intrinsic to managed networks, not a selectable link implementation.
+  Keep `LinkProvider`/`BoundLink`/`LinkLifecycle` in `groupnet-transport::link`.
+  Protocol crates own their typed configuration and binding and must not depend on
+  the concrete router in production. Never add protocol-kind or shutdown enums to
+  the router; all links register through the shared contract.
 - Workspace lints also enforce `unsafe_code = "forbid"`, `missing_docs`,
   `missing_debug_implementations` — document every public item.
 - Bounded polling via `groupnet_testkit::cluster::eventually` /
@@ -149,8 +166,20 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 
 ## Verification (all must be green before a change is done)
 
+Install the test runner with `cargo install cargo-nextest --locked` if
+`cargo nextest --version` is unavailable. Repository settings are in
+`.config/nextest.toml`: retries are disabled; profile `ci` runs all tests even
+after failures. Use `cargo nextest run --profile ci --workspace --all-features`
+for a complete binary-test run in automation.
+
+Nextest does not run doctests; keep the separate `cargo test --doc` gates.
+The feature-isolated `cargo test` commands below also retain their doctests.
+
 ```bash
-cargo test --workspace
+cargo nextest run --workspace
+cargo test --workspace --doc
+cargo nextest run --workspace --all-features
+cargo test --workspace --all-features --doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo check -p groupnet --no-default-features --all-targets
@@ -158,6 +187,10 @@ cargo check -p groupnet-transport --no-default-features
 cargo test -p groupnet --features tcp-msg
 cargo test -p groupnet-runtime --features dns
 cargo clippy -p groupnet-runtime -p groupnet --all-targets --features groupnet-runtime/dns,groupnet/dns,groupnet/udp -- -D warnings
+cargo test -p groupnet-network -p groupnet-runtime
+cargo clippy -p groupnet-network -p groupnet-runtime -p groupnet --all-targets -- -D warnings
+cargo test --workspace --features groupnet/ipc,groupnet/punch,groupnet/udp,groupnet/tcp-msg
+cargo clippy --workspace --all-targets --features groupnet/ipc,groupnet/punch,groupnet/udp,groupnet/tcp-msg -- -D warnings
 cargo test -p groupnet-consistency --features acks
 cargo test -p groupnet-consistency --features leases
 cargo test -p groupnet-consistency --features hosted
@@ -185,6 +218,10 @@ cargo test -p groupnet --features consistency-volatile-bootstrap-bulk
 cargo clippy -p groupnet-consistency -p groupnet-transport -p groupnet-transport-mem -p groupnet --all-targets --features groupnet-consistency/volatile-bootstrap-bulk,groupnet/consistency-volatile-bootstrap-bulk,groupnet-transport-mem/bulk -- -D warnings
 cargo check -p groupnet --no-default-features --features consistency-volatile-bootstrap-bulk --all-targets
 RUSTDOCFLAGS='-D warnings' cargo doc -p groupnet-consistency --features volatile-bootstrap-bulk --no-deps
+cargo test -p groupnet --features rpc,tcp
+cargo clippy -p groupnet --all-targets --features rpc,tcp -- -D warnings
+cargo check -p groupnet --no-default-features --features rpc --all-targets
+RUSTDOCFLAGS='-D warnings' cargo doc -p groupnet-rpc --no-deps
 ```
 
 The feature-specific Clippy runs are not redundant: no crate in the workspace turns `leases`,
@@ -192,6 +229,9 @@ The feature-specific Clippy runs are not redundant: no crate in the workspace tu
 those tiers' code, their tests, or their DST at all. `handoff` is not covered by
 the `hosted` runs either. `Handoff` and `volatile-bootstrap-bulk` each pull in
 the data plane, so both have distinct feature graphs that need explicit gates.
+`groupnet-rpc` itself is a plain workspace member (the workspace runs cover
+it); the facade's `rpc` feature is off by default, so its re-export and the
+real-TCP facade test need the `rpc,tcp` runs.
 
 Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`) — the
 optional performance command; it is not a correctness gate.

@@ -17,7 +17,8 @@ async fn three_nodes_converge_over_mem_transport() {
     let cluster = MemCluster::builder(&["node-a", "node-b", "node-c"])
         .group("shard-42")
         .gossip_interval_ms(20)
-        .spawn();
+        .spawn()
+        .await;
     let ids = &cluster.ids;
     let groups = &cluster.groups;
 

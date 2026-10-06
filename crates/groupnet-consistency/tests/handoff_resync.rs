@@ -61,7 +61,7 @@ use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster, placement};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport::bulk::DataPlane;
-use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, MemTransport, Network};
+use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, Network};
 use tokio::task::JoinHandle;
 
 /// The poll budget for every assertion here: a storage-free first election plus
@@ -255,7 +255,7 @@ struct Trace {
 /// follower loop, its write path, and its data-plane endpoint.
 struct Voter {
     id: NodeId,
-    _node: Node<MemTransport>,
+    _node: Node,
     group: Group,
     ledger: Arc<CommitLedger>,
     writes: HostedWrites<String>,
@@ -271,11 +271,11 @@ struct Voter {
 impl Voter {
     /// Brings one node up, joined to `group` under the Quorum profile over
     /// `voters`, advertising [`CAP_HOSTED`] — but not yet following.
-    fn spawn(net: &Network, group: &str, id: &str, seeds: &[&str], voters: &[&str]) -> Self {
+    async fn spawn(net: &Network, group: &str, id: &str, seeds: &[&str], voters: &[&str]) -> Self {
         let opts = NodeOpts::new(group)
             .gossip_interval_ms(GOSSIP_MS)
             .group_profile(quorum_profile(voters));
-        let (id, node, handle) = spawn_mem_node(net, id, seeds, &opts);
+        let (id, node, handle) = spawn_mem_node(net, id, seeds, &opts).await;
         handle
             .advertise_capabilities([CAP_HOSTED])
             .expect("the advertisement is enqueued");
@@ -453,13 +453,23 @@ impl Voter {
 
 /// Brings `ids` up as an all-to-all cluster on `net`, each under the Quorum
 /// profile over `voters`, none of them following yet.
-fn spawn_roster(net: &Network, group: &str, ids: &[&str], voters: &[&str]) -> Vec<Voter> {
-    ids.iter()
-        .map(|id| {
-            let seeds: Vec<&str> = ids.iter().copied().filter(|other| other != id).collect();
-            Voter::spawn(net, group, id, &seeds, voters)
-        })
-        .collect()
+async fn spawn_roster(
+    net: &Network,
+    group: &str,
+    ids: &[&str],
+    voters: &[&str],
+    admitted: &[&str],
+) -> Vec<Voter> {
+    let mut roster = Vec::with_capacity(ids.len());
+    for id in ids {
+        let seeds: Vec<&str> = admitted
+            .iter()
+            .copied()
+            .filter(|other| other != id)
+            .collect();
+        roster.push(Voter::spawn(net, group, id, &seeds, voters).await);
+    }
+    roster
 }
 
 /// The leadership every node agrees on, or `None` while it is still settling —
@@ -539,7 +549,7 @@ async fn a_laggard_beyond_the_ring_resumes_after_a_handoff() {
     let rank = ranked(GROUP, &IDS);
     let order: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
     let (voter_ids, joiner_id) = (&order[..3], order[3]);
-    let mut voters = spawn_roster(&net, GROUP, voter_ids, voter_ids);
+    let mut voters = spawn_roster(&net, GROUP, voter_ids, voter_ids, &order).await;
     let (lead, host) = elected(&mut voters).await;
     assert_eq!(
         host, 0,
@@ -555,7 +565,7 @@ async fn a_laggard_beyond_the_ring_resumes_after_a_handoff() {
     }
 
     // --- the late joiner, and the honest Gap it is met with ---
-    let mut joiner = Voter::spawn(&net, GROUP, joiner_id, voter_ids, voter_ids);
+    let mut joiner = Voter::spawn(&net, GROUP, joiner_id, voter_ids, voter_ids).await;
     joiner.follow();
     joiner.join_data_plane(&bulk);
     arrive_late(&joiner, &host_id, lead.epoch, head, BURST).await;

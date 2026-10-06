@@ -1,6 +1,9 @@
-# Source-backed snapshot recovery: first native slice
+# Source-backed snapshot recovery
 
-Status: **accepted implementation contract for the first native slice**. This refines the snapshot protocol in
+[Documentation index](README.md) · [Replication contract](replication.md)
+
+Status: **implemented native snapshot core/runtime contract; real storage and
+consumer adapters remain integration obligations**. This refines the protocol in
 [replication.md](replication.md#4-session-state-machine-and-race-closure). It
 does not change the replay-only public API or require every source to support
 snapshots. Groupnet owns the order, bounds, operation correlation, and read
@@ -59,7 +62,7 @@ certificate, total encoded bytes, chunk count, and digest.
 retention-continuity certificate. The shell reserves its global byte permits
 **before** each source read. The source must enforce
 `max_bytes` while producing a chunk; the shell checks the returned size again
-before delivering it to the private stage. The first slice transfers chunks
+before delivering it to the private stage. The runtime transfers chunks
 sequentially and in exact offset order. It checks nonzero progress, each
 offset, count, size, total, checksum receipt, and final digest; an empty or
 truncated transfer cannot install. The application stage may spool to bounded
@@ -80,8 +83,8 @@ alone do not bound a decoded `ReplicaFork` or adapter heap allocation.
 
 1. Close the local read gate and sample the monotonic total-recovery deadline
    **before requesting** a source retention/capture hold. Obtain that hold
-   **before** choosing `C0`. For this first slice, a source qualifies only
-   when that hold guarantees every committed record after `C0` through the
+   **before** choosing `C0`. A source qualifies only when that hold guarantees
+   every committed record after `C0` through the
    configured total recovery deadline. A finite hold must cover the entire
    transfer, staged replay, install, attach, and final tail check; otherwise
    the source is ineligible. Its guarantee is measured conservatively from
@@ -89,7 +92,7 @@ alone do not bound a decoded `ReplicaFork` or adapter heap allocation.
    clock-rate/latency margin; no node compares unsynchronized wall timestamps.
    A lost or late hold response may leave a finite source-side reservation,
    but it must expire under the same proven bound rather than leak forever.
-   Renewal of shorter holds is a later extension.
+   Renewal of shorter holds is not supported by this native snapshot contract.
    The source must prove that the snapshot represents a consistent cut while
    writes continue. A peer's snapshot bytes or matching gossip heads alone
    are not source authority.
@@ -126,11 +129,13 @@ private handlers and stages, but must not create a second token allocator or
 readiness state machine. The core validates bounded metadata and proof-bound
 cursor relations without parsing native cursor bytes or hashing source data.
 Trusted adapters verify source-specific coverage and digest algorithms.
-The first native adapter may read an existing CAS checkpoint through bounded
-range chunks and decode it into a private `ReplicaFork`; no new mandatory
-log or peer data-plane wire format is needed. `BulkTransport` framing can be
-bound later for peer transfer. Hosted handoff's opaque coverage logic does
-not prove this source's committed cut or retained suffix.
+A native CAS adapter may read an existing checkpoint through bounded range
+chunks and decode it into a private `ReplicaFork`; no new mandatory log or
+peer data-plane wire format is needed. That adapter still has to prove its real
+storage retention/cut contract. `BulkTransport` framing is an optional peer
+transfer binding, not a transport automatically supplied by `NativeSnapshot`.
+Hosted handoff's opaque coverage logic does not prove this source's committed
+cut or retained suffix.
 
 ## Cancellation, cleanup, and failure
 
@@ -176,3 +181,18 @@ Ready under the declared hold/deadline bounds. An in-memory runtime adapter
 test checks byte permits, one per-scope stage, bounded cleanup, and exact
 guarded install. The native CAS adapter then proves the same cut/retention
 contract against its real checkpoint and log APIs before claiming authority.
+
+Implementation and evidence references:
+
+- [public source/application capabilities](../crates/groupnet-consistency/src/replication/snapshot_api.rs),
+  [snapshot runtime driver](../crates/groupnet-consistency/src/replication/shell/driver/snapshot.rs),
+  and [core transitions](../crates/groupnet-core/src/replication/session/snapshot.rs);
+- [core recovery scenarios](../crates/groupnet-core/src/replication/snapshot_tests.rs),
+  [seeded snapshot schedules](../crates/groupnet-sim/tests/replication_snapshot.rs),
+  and [runtime adapter scenarios](../crates/groupnet-consistency/tests/replication_snapshot.rs).
+
+These references cover the generic implementation and its test adapters.
+They do not certify a real native checkpoint store, origin LIST scan, or
+consumer application transaction. Enabling a production adapter still requires
+the cut, suffix retention, memory charging, cancellation/cleanup interlock,
+and atomic fenced install proofs described above.

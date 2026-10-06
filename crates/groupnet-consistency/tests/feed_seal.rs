@@ -57,8 +57,8 @@ fn advertised_epoch(group: &Group, peer: &NodeId) -> Option<u64> {
 #[tokio::test]
 async fn a_sealed_restart_renews_without_a_gap() {
     let net = Network::new();
-    let (a_id, a_node, a_group) = spawn_mem_node(&net, "seal-a", &["seal-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "seal-b", &["seal-a"], &opts());
+    let (a_id, a_node, a_group) = spawn_mem_node(&net, "seal-a", &["seal-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "seal-b", &["seal-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
     let mut peers = PeerWrites::new(b_group, NodeId::new("seal-b"), decode);
     let (frontier, view) = Frontier::new();
@@ -91,9 +91,9 @@ async fn a_sealed_restart_renews_without_a_gap() {
 
     drop(old);
     drop(a_group);
-    drop(a_node);
+    a_node.close().await;
     let (_reborn, _reborn_node, reborn_group) =
-        spawn_mem_node(&net, "seal-a", &["seal-b"], &opts());
+        spawn_mem_node(&net, "seal-a", &["seal-b"], &opts()).await;
     let new = feed(reborn_group, 9);
     new.republish().await;
     assert_eq!(
@@ -129,8 +129,8 @@ async fn a_sealed_restart_renews_without_a_gap() {
 #[tokio::test]
 async fn an_unsealed_restart_gaps_as_soon_as_the_new_life_is_announced() {
     let net = Network::new();
-    let (a_id, a_node, a_group) = spawn_mem_node(&net, "crash-a", &["crash-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "crash-b", &["crash-a"], &opts());
+    let (a_id, a_node, a_group) = spawn_mem_node(&net, "crash-a", &["crash-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "crash-b", &["crash-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
     let mut peers = PeerWrites::new(b_group, NodeId::new("crash-b"), decode);
 
@@ -143,9 +143,9 @@ async fn an_unsealed_restart_gaps_as_soon_as_the_new_life_is_announced() {
 
     drop(old);
     drop(a_group);
-    drop(a_node);
+    a_node.close().await;
     let (_reborn, _reborn_node, reborn_group) =
-        spawn_mem_node(&net, "crash-a", &["crash-b"], &opts());
+        spawn_mem_node(&net, "crash-a", &["crash-b"], &opts()).await;
     feed(reborn_group, 9).republish().await;
     assert_eq!(
         next_event(&mut peers).await,
@@ -164,8 +164,8 @@ async fn an_unsealed_restart_gaps_as_soon_as_the_new_life_is_announced() {
 #[tokio::test]
 async fn a_seal_the_subscriber_never_saw_still_gaps() {
     let net = Network::new();
-    let (a_id, a_node, a_group) = spawn_mem_node(&net, "lost-a", &["lost-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "lost-b", &["lost-a"], &opts());
+    let (a_id, a_node, a_group) = spawn_mem_node(&net, "lost-a", &["lost-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "lost-b", &["lost-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
     let mut peers = PeerWrites::new(b_group.clone(), NodeId::new("lost-b"), decode);
 
@@ -179,9 +179,9 @@ async fn a_seal_the_subscriber_never_saw_still_gaps() {
     old.seal().await;
     drop(old);
     drop(a_group);
-    drop(a_node);
+    a_node.close().await;
     let (_reborn, _reborn_node, reborn_group) =
-        spawn_mem_node(&net, "lost-a", &["lost-b"], &opts());
+        spawn_mem_node(&net, "lost-a", &["lost-b"], &opts()).await;
     let new = feed(reborn_group, 9);
     new.republish().await;
     eventually_within(
@@ -205,7 +205,7 @@ async fn a_seal_the_subscriber_never_saw_still_gaps() {
 #[should_panic(expected = "WriteFeed::publish after the feed was sealed")]
 async fn publishing_after_the_seal_panics() {
     let net = Network::new();
-    let (_a_id, _a_node, a_group) = spawn_mem_node(&net, "late-a", &[], &opts());
+    let (_a_id, _a_node, a_group) = spawn_mem_node(&net, "late-a", &[], &opts()).await;
     let old = feed(a_group, 7);
     old.seal().await;
     drop(old.publish(&"late".to_owned()));

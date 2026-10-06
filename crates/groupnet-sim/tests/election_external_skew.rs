@@ -86,6 +86,7 @@ const GOSSIP_INTERVAL_MS: u64 = 100;
 const STEAL_MARGIN_MS: u64 = 300;
 /// One store round trip.
 const ANCHOR_LATENCY_MS: u64 = 20;
+
 /// The per-node offset bound the within-margin family draws inside. Two nodes
 /// at opposite ends of ±this disagree by **exactly** the steal margin, which is
 /// the boundary the assumption is stated at — and the reason the bound is half

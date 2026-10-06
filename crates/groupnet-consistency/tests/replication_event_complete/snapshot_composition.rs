@@ -128,7 +128,8 @@ impl SnapshotApplicationAdapter<u64, Vec<u64>> for StubApp {
 async fn native_snapshot_state_sync_and_named_events_compose_without_snapshot_delivery() {
     let cluster = MemCluster::builder(&["event-snapshot-composition"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let mut bounds = limits();
     bounds.core.snapshot = Some(SnapshotConfig {
         max_metadata_bytes: 512,

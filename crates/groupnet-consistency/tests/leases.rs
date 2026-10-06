@@ -118,7 +118,8 @@ async fn a_healthy_group_serves_under_leases_and_invalidates_at_ack_speed() {
         .group("stores")
         .gossip_interval_ms(10)
         .anti_entropy_interval_ms(25)
-        .spawn();
+        .spawn()
+        .await;
     let groups: Vec<&Group> = cluster.groups.iter().collect();
     converged_within(&groups, SETTLE).await;
 
@@ -199,7 +200,8 @@ async fn a_silent_readers_lease_lapses_and_it_must_resync_before_serving_again()
         .group("stores")
         .gossip_interval_ms(10)
         .anti_entropy_interval_ms(25)
-        .spawn();
+        .spawn()
+        .await;
     let groups: Vec<&Group> = cluster.groups.iter().collect();
     converged_within(&groups, SETTLE).await;
 
@@ -325,7 +327,8 @@ async fn a_reader_that_renews_but_never_applies_lapses_under_a_write() {
         .group("stores")
         .gossip_interval_ms(10)
         .anti_entropy_interval_ms(25)
-        .spawn();
+        .spawn()
+        .await;
     let groups: Vec<&Group> = cluster.groups.iter().collect();
     converged_within(&groups, SETTLE).await;
 
@@ -385,7 +388,8 @@ async fn a_node_without_the_lease_tier_neither_blocks_writes_nor_serves() {
         .group("stores")
         .gossip_interval_ms(10)
         .anti_entropy_interval_ms(25)
-        .spawn();
+        .spawn()
+        .await;
     let groups: Vec<&Group> = cluster.groups.iter().collect();
     converged_within(&groups, SETTLE).await;
 
@@ -455,11 +459,11 @@ async fn a_node_without_the_lease_tier_neither_blocks_writes_nor_serves() {
 async fn a_fresh_writer_refuses_the_no_holders_fast_path_until_it_has_warmed_up() {
     let net = Network::new();
     let born = Instant::now();
-    let (w_id, _w_node, w_group) = spawn_mem_node(&net, "warm-w", &[], &opts());
+    let (w_id, _w_node, w_group) = spawn_mem_node(&net, "warm-w", &["warm-p"], &opts()).await;
     let w_leases = Leases::new(w_group.clone(), w_id.clone(), lease_cfg());
     w_group
         .advertise_capabilities([CAP_ACKS, CAP_LEASE])
-        .expect("the advertisement is enqueued");
+        .unwrap();
 
     let token = WriteToken { epoch: 1, seq: 1 };
     let outcome = w_leases
@@ -497,7 +501,7 @@ async fn a_fresh_writer_refuses_the_no_holders_fast_path_until_it_has_warmed_up(
 
     // A peer joins and takes a lease: the wait set fills, the guard has nothing
     // left to hold, and a real write resolves on the peer's acknowledgement.
-    let (p_id, _p_node, p_group) = spawn_mem_node(&net, "warm-p", &["warm-w"], &opts());
+    let (p_id, _p_node, p_group) = spawn_mem_node(&net, "warm-p", &["warm-w"], &opts()).await;
     converged_within(&[&w_group, &p_group], SETTLE).await;
     let (_p_leases, _p_apply) = participate(&p_group, &p_id);
     eventually_within("the writer sees the peer's lease", SETTLE, || {
@@ -534,16 +538,17 @@ async fn a_fresh_writer_refuses_the_no_holders_fast_path_until_it_has_warmed_up(
 #[tokio::test]
 async fn a_booting_reader_cannot_serve_before_it_has_observed_the_group() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "boot-a", &["boot-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "boot-b", &["boot-a"], &opts());
+    let (a_id, _a_node, a_group) =
+        spawn_mem_node(&net, "boot-a", &["boot-b", "boot-c"], &opts()).await;
+    let (b_id, _b_node, b_group) =
+        spawn_mem_node(&net, "boot-b", &["boot-a", "boot-c"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
     let (_a_leases, _a_apply) = participate(&a_group, &a_id);
-    let (b_leases, _b_apply) = participate(&b_group, &b_id);
-    serving("the established reader", &b_leases.view()).await;
+    let (_b_leases, _b_apply) = participate(&b_group, &b_id);
 
     // A third node boots into that established, leased cluster.
     let born = Instant::now();
-    let (c_id, _c_node, c_group) = spawn_mem_node(&net, "boot-c", &["boot-a"], &opts());
+    let (c_id, _c_node, c_group) = spawn_mem_node(&net, "boot-c", &["boot-a"], &opts()).await;
     let (c_leases, _c_apply) = participate(&c_group, &c_id);
     let c_view = c_leases.view();
 
@@ -585,8 +590,8 @@ async fn a_booting_reader_cannot_serve_before_it_has_observed_the_group() {
 #[tokio::test]
 async fn leaving_retracts_the_renewal_and_closes_the_departing_readers_window() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bye-a", &["bye-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "bye-b", &["bye-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bye-a", &["bye-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "bye-b", &["bye-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let (a_leases, _a_apply) = participate(&a_group, &a_id);

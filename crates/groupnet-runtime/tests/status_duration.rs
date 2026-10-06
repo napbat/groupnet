@@ -26,8 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use groupnet_core::{Config, NodeId, Status};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{BoundedRosterError, Group, Node};
 use groupnet_testkit::cluster::{MemCluster, converged_within, eventually_within};
+use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
 use groupnet_transport_mem::{MemTransport, Network};
 
@@ -44,7 +46,8 @@ async fn effective_config_and_alive_duration_are_readable_from_a_group() {
     let cluster = MemCluster::builder(&["node-a", "node-b", "node-c"])
         .group("shard-7")
         .gossip_interval_ms(OVERRIDDEN_GOSSIP_MS)
-        .spawn();
+        .spawn()
+        .await;
     let groups = &cluster.groups;
     let ids = &cluster.ids;
 
@@ -170,7 +173,8 @@ async fn bounded_roster_refuses_overflow_without_truncating_a_coherent_view() {
     let cluster = MemCluster::builder(&["node-a", "node-b", "node-c"])
         .group("bounded-roster")
         .gossip_interval_ms(OVERRIDDEN_GOSSIP_MS)
-        .spawn();
+        .spawn()
+        .await;
     converged_within(&cluster.groups.iter().collect::<Vec<_>>(), SETTLE).await;
     let observer = &cluster.groups[0];
     let bounded = observer
@@ -204,7 +208,7 @@ async fn bounded_roster_refuses_overflow_without_truncating_a_coherent_view() {
 async fn a_silent_node_is_eventually_held_dead_with_a_fresh_stamp() {
     // A reap horizon (2 × 4s) far beyond the test, so the Dead reading is
     // stable to assert against.
-    let cluster = CrashCluster::spawn(&["a", "b", "c"], &detector_config(4_000));
+    let cluster = CrashCluster::spawn(&["a", "b", "c"], &detector_config(4_000)).await;
     cluster.converge().await;
 
     let victim = cluster.ids[2].clone();
@@ -238,7 +242,7 @@ async fn a_silent_node_is_eventually_held_dead_with_a_fresh_stamp() {
 #[tokio::test]
 async fn a_reaped_tombstone_stops_reporting_a_duration() {
     const DEAD_TIMEOUT_MS: u64 = 150; // reaped 300ms after death
-    let cluster = CrashCluster::spawn(&["a", "b", "c"], &detector_config(DEAD_TIMEOUT_MS));
+    let cluster = CrashCluster::spawn(&["a", "b", "c"], &detector_config(DEAD_TIMEOUT_MS)).await;
     cluster.converge().await;
 
     let victim = cluster.ids[2].clone();
@@ -322,13 +326,13 @@ struct CrashCluster {
     groups: Vec<Group>,
     plugs: Vec<Arc<AtomicBool>>,
     /// Kept alive for the duration of the test; dropping it stops the nodes.
-    _nodes: Vec<Node<Unpluggable>>,
+    _nodes: Vec<Node>,
 }
 
 impl CrashCluster {
     const GROUP: &'static str = "crash";
 
-    fn spawn(names: &[&str], config: &Config) -> Self {
+    async fn spawn(names: &[&str], config: &Config) -> Self {
         let net = Network::new();
         let ids: Vec<NodeId> = names.iter().map(|n| NodeId::new(*n)).collect();
         let mut nodes = Vec::with_capacity(ids.len());
@@ -339,11 +343,18 @@ impl CrashCluster {
                 inner: net.endpoint(id.clone()),
                 plugged: plugged.clone(),
             };
-            let mut builder = Node::builder(id.clone(), transport).config(config.clone());
+            let peers = ids.iter().filter(|other| *other != id).cloned().collect();
+            let mut builder = Node::builder(id.clone())
+                .link(BoundLink::new(transport, LinkConfig::new(peers)))
+                .routing(RouterConfig {
+                    announce_interval: Duration::from_millis(config.gossip_interval_ms),
+                    ..RouterConfig::default()
+                })
+                .config(config.clone());
             for seed in ids.iter().filter(|o| *o != id) {
                 builder = builder.seed(seed.clone());
             }
-            nodes.push(builder.spawn());
+            nodes.push(builder.start().await.expect("crash fixture link binds"));
             plugs.push(plugged);
         }
         let groups = nodes.iter().map(|n| n.join_group(Self::GROUP)).collect();

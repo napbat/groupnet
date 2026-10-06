@@ -92,10 +92,10 @@ async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_prese
         .gossip_interval_ms(10)
         .anti_entropy_interval_ms(25);
     let net = groupnet_transport_mem::Network::new();
-    let spawn =
-        |id: &str, seed: &str| groupnet_testkit::cluster::spawn_mem_node(&net, id, &[seed], &opts);
-    let (_a_id, _a_node, a_group) = spawn("re-a", "re-b");
-    let (b_id, b_node, b_group) = spawn("re-b", "re-a");
+    let (_a_id, _a_node, a_group) =
+        groupnet_testkit::cluster::spawn_mem_node(&net, "re-a", &["re-b"], &opts).await;
+    let (b_id, b_node, b_group) =
+        groupnet_testkit::cluster::spawn_mem_node(&net, "re-b", &["re-a"], &opts).await;
     groupnet_testkit::cluster::converged(&[&a_group, &b_group]).await;
     let budget = admission();
     let source =
@@ -111,8 +111,9 @@ async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_prese
     .await;
     drop(old);
     drop(b_group);
-    drop(b_node);
-    let (_b_id, _reborn_node, reborn) = spawn("re-b", "re-a");
+    b_node.close().await;
+    let (_b_id, _reborn_node, reborn) =
+        groupnet_testkit::cluster::spawn_mem_node(&net, "re-b", &["re-a"], &opts).await;
     groupnet_testkit::cluster::converged(&[&a_group, &reborn]).await;
     source(reborn)
         .publish_presence(presence(b_id, 9, 10))
@@ -122,7 +123,7 @@ async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_prese
 
 #[tokio::test]
 async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_replacement() {
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let budget = admission();
     let old = NativeClaimSource::new(
         cluster.groups[0].clone(),
@@ -186,7 +187,7 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
 /// fail publication (and with it the process's whole bootstrap episode).
 #[tokio::test]
 async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_apply() {
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let budget = admission();
     let source = NativeClaimSource::new(
         cluster.groups[0].clone(),
@@ -244,7 +245,8 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
     let cluster = MemCluster::builder(&["node-a", "node-b"])
         .group("g")
         .gossip_interval_ms(20)
-        .spawn();
+        .spawn()
+        .await;
     let budget = admission();
     let first = NativeClaimSource::new(
         cluster.groups[0].clone(),
@@ -353,7 +355,8 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
     let cluster = MemCluster::builder(&["node-a", "node-b"])
         .group("g")
         .gossip_interval_ms(20)
-        .spawn();
+        .spawn()
+        .await;
     let budget = admission();
     let source_a = NativeClaimSource::new(
         cluster.groups[0].clone(),
@@ -438,7 +441,7 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
 
 #[tokio::test]
 async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let budget = admission();
     let old = NativeClaimSource::new(
         cluster.groups[0].clone(),
@@ -490,7 +493,7 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
 
 #[tokio::test]
 async fn failed_converted_admission_retires_raw_actor_response_first() {
-    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn();
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let raw_charge = 2_048 + claim_entry_key(&scope(), 128).unwrap().len();
     let budget = ByteAdmission::new(AdmissionLimits {
         max_total_bytes: raw_charge + 1,

@@ -39,8 +39,8 @@ fn decode(bytes: &[u8]) -> Option<String> {
 #[tokio::test]
 async fn applied_acknowledgements_round_trip() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ack-a", &["ack-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ack-b", &["ack-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ack-a", &["ack-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ack-b", &["ack-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     // B: apply loop that records into a ledger after each application.
@@ -93,8 +93,10 @@ async fn applied_acknowledgements_round_trip() {
 #[tokio::test]
 async fn a_seal_is_acknowledged_like_a_write() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "seal-ack-a", &["seal-ack-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "seal-ack-b", &["seal-ack-a"], &opts());
+    let (a_id, _a_node, a_group) =
+        spawn_mem_node(&net, "seal-ack-a", &["seal-ack-b"], &opts()).await;
+    let (b_id, _b_node, b_group) =
+        spawn_mem_node(&net, "seal-ack-b", &["seal-ack-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
     let mut peers = PeerWrites::new(b_group.clone(), b_id.clone(), decode);
     let ledger = AckLedger::new(b_group);
@@ -136,9 +138,12 @@ async fn a_seal_is_acknowledged_like_a_write() {
 #[tokio::test]
 async fn selected_waits_skip_members_that_do_not_participate() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "sel-a", &["sel-b", "sel-c"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "sel-b", &["sel-a", "sel-c"], &opts());
-    let (c_id, _c_node, c_group) = spawn_mem_node(&net, "sel-c", &["sel-a", "sel-b"], &opts());
+    let (a_id, _a_node, a_group) =
+        spawn_mem_node(&net, "sel-a", &["sel-b", "sel-c"], &opts()).await;
+    let (b_id, _b_node, b_group) =
+        spawn_mem_node(&net, "sel-b", &["sel-a", "sel-c"], &opts()).await;
+    let (c_id, _c_node, c_group) =
+        spawn_mem_node(&net, "sel-c", &["sel-a", "sel-b"], &opts()).await;
     converged_within(&[&a_group, &b_group, &c_group], SETTLE).await;
 
     // B participates: an apply loop feeding a ledger — and it says so.

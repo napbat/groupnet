@@ -1,0 +1,23 @@
+[package]
+name = "groupnet-transport-punch"
+description = "Authenticated UDP rendezvous, hole punching and router link providers for Groupnet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+groupnet-core.workspace = true
+groupnet-transport = { workspace = true, features = ["link"] }
+ring.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+groupnet-network.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
+
+[lints]
+workspace = true

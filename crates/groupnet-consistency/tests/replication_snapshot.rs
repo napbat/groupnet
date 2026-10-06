@@ -90,11 +90,13 @@ impl Pause {
         self.enabled.store(true, Ordering::Release);
         self.released.store(false, Ordering::Release);
     }
+
     fn release(&self) {
         self.enabled.store(false, Ordering::Release);
         self.released.store(true, Ordering::Release);
         self.wake.notify_one();
     }
+
     async fn wait(&self) {
         if self.enabled.load(Ordering::Acquire) {
             self.entered.store(true, Ordering::Release);
@@ -174,6 +176,7 @@ impl SourceAdapter for Source {
     fn cursor(&self, scope: &Scope, position: &u64) -> Result<Cursor, AdapterFailure<io::Error>> {
         Ok(cursor(scope, *position))
     }
+
     fn position(&self, cursor: &Cursor) -> Result<u64, AdapterFailure<io::Error>> {
         let raw: [u8; 8] = cursor
             .position
@@ -182,6 +185,7 @@ impl SourceAdapter for Source {
             .map_err(|_| AdapterFailure::Terminal(io::Error::other("cursor")))?;
         Ok(u64::from_le_bytes(raw))
     }
+
     fn compare(
         &self,
         left: &Cursor,
@@ -204,6 +208,7 @@ impl SourceAdapter for Source {
             order,
         })
     }
+
     async fn tail(
         &self,
         scope: Scope,
@@ -212,6 +217,7 @@ impl SourceAdapter for Source {
     ) -> Result<SourceProof, AdapterFailure<io::Error>> {
         Ok(self.proof(&scope))
     }
+
     async fn scan_after(
         &self,
         scope: Scope,
@@ -289,6 +295,7 @@ impl SnapshotSourceAdapter for Source {
             },
         })
     }
+
     async fn offer(
         &self,
         hold: &mut Hold,
@@ -319,6 +326,7 @@ impl SnapshotSourceAdapter for Source {
         self.offer_pause.wait().await;
         Ok(SnapshotImage { offer, read: bytes })
     }
+
     async fn read_chunk(
         &self,
         read: &mut Vec<u8>,
@@ -329,6 +337,7 @@ impl SnapshotSourceAdapter for Source {
         let start = usize::try_from(offset).expect("small offset");
         Ok(read[start..read.len().min(start + max_bytes)].to_vec())
     }
+
     async fn barrier(
         &self,
         hold: &mut Hold,
@@ -340,6 +349,7 @@ impl SnapshotSourceAdapter for Source {
         }
         Ok(self.proof(&hold.scope))
     }
+
     async fn attach(
         &self,
         hold: &mut Hold,
@@ -354,6 +364,7 @@ impl SnapshotSourceAdapter for Source {
             handle: Attachment(Arc::clone(&self.attachments)),
         })
     }
+
     async fn release_hold(&self, _hold: Hold) -> Result<(), AdapterFailure<io::Error>> {
         self.release_inflight.fetch_add(1, Ordering::AcqRel);
         let _flight = ReleaseFlight(Arc::clone(&self.release_inflight));
@@ -411,6 +422,7 @@ impl ApplicationAdapter<u64, Vec<Mutation>> for App {
             bytes: 1,
         }))
     }
+
     async fn install_checkpoint(
         &self,
         _scope: Scope,
@@ -429,6 +441,7 @@ impl ApplicationAdapter<u64, Vec<Mutation>> for App {
             .map_err(AdapterFailure::Terminal)?
             .ok_or_else(|| AdapterFailure::Retryable(io::Error::other("stale install")))
     }
+
     async fn revoke_serving(
         &self,
         _scope: Scope,
@@ -439,6 +452,7 @@ impl ApplicationAdapter<u64, Vec<Mutation>> for App {
             .map_err(AdapterFailure::Terminal)?
             .ok_or_else(|| AdapterFailure::Retryable(io::Error::other("stale revoke")))
     }
+
     async fn apply(
         &self,
         _scope: Scope,
@@ -459,6 +473,7 @@ impl ApplicationAdapter<u64, Vec<Mutation>> for App {
             .map_err(AdapterFailure::Terminal)?
             .ok_or_else(|| AdapterFailure::Retryable(io::Error::other("stale apply")))
     }
+
     fn may_serve(&self, _scope: &Scope, through: &u64) -> bool {
         self.live.lock().expect("live lock").position >= *through
     }
@@ -489,6 +504,7 @@ impl SnapshotApplicationAdapter<u64, Vec<Mutation>> for App {
             charged_bytes: 0,
         })
     }
+
     async fn write_chunk(
         &self,
         stage: &mut StageData,
@@ -502,6 +518,7 @@ impl SnapshotApplicationAdapter<u64, Vec<Mutation>> for App {
         stage.charged = stage.charged.max(stage.raw.len());
         Ok(stage.charged)
     }
+
     async fn verify_image(
         &self,
         stage: &mut StageData,
@@ -531,6 +548,7 @@ impl SnapshotApplicationAdapter<u64, Vec<Mutation>> for App {
         stage.charged = stage.charged.max(needed);
         Ok(stage.charged)
     }
+
     async fn apply_private(
         &self,
         stage: &mut StageData,
@@ -557,6 +575,7 @@ impl SnapshotApplicationAdapter<u64, Vec<Mutation>> for App {
         }
         Ok(stage.charged)
     }
+
     async fn seal_stage(
         &self,
         mut stage: StageData,
@@ -593,7 +612,10 @@ fn limits() -> Limits {
 
 #[tokio::test]
 async fn concurrent_delete_and_put_replay_after_the_snapshot_cut_before_local_reads() {
-    let cluster = MemCluster::builder(&["reader"]).group("snapshots").spawn();
+    let cluster = MemCluster::builder(&["reader"])
+        .group("snapshots")
+        .spawn()
+        .await;
     let source = Source::default();
     let app = App::default();
     source.commit(Mutation::Put("old".into(), "v1".into()));
@@ -654,7 +676,10 @@ async fn concurrent_delete_and_put_replay_after_the_snapshot_cut_before_local_re
 
 #[tokio::test]
 async fn cancelled_snapshot_install_cannot_publish_or_hold_capacity_after_reopen() {
-    let cluster = MemCluster::builder(&["reader"]).group("snapshots").spawn();
+    let cluster = MemCluster::builder(&["reader"])
+        .group("snapshots")
+        .spawn()
+        .await;
     let source = Source::default();
     let app = App::default();
     source.commit(Mutation::Put("one".into(), "v1".into()));
@@ -725,7 +750,10 @@ async fn cancelled_snapshot_install_cannot_publish_or_hold_capacity_after_reopen
 
 #[tokio::test]
 async fn retention_gap_after_cut_discards_stage_without_installing_or_serving() {
-    let cluster = MemCluster::builder(&["reader"]).group("snapshots").spawn();
+    let cluster = MemCluster::builder(&["reader"])
+        .group("snapshots")
+        .spawn()
+        .await;
     let source = Source::default();
     let app = App::default();
     source.commit(Mutation::Put("old".into(), "v1".into()));
@@ -787,7 +815,10 @@ async fn retention_gap_after_cut_discards_stage_without_installing_or_serving() 
 
 #[tokio::test]
 async fn stalled_snapshot_stage_and_scan_leave_operation_bytes_and_checkpoint_room_for_replay() {
-    let cluster = MemCluster::builder(&["reader"]).group("snapshots").spawn();
+    let cluster = MemCluster::builder(&["reader"])
+        .group("snapshots")
+        .spawn()
+        .await;
     let source = Source::default();
     let app = App::default();
     source.commit(Mutation::Put("old".into(), "v1".into()));

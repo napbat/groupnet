@@ -33,7 +33,7 @@
 //! automatically), which resolves third parties. Between them, a cluster
 //! bootstraps from seed addresses alone.
 //!
-//! ## Scaffold simplifications
+//! ## Trusted low-level endpoint
 //!
 //! A connection's claimed id and listener address are trusted as-is — the
 //! same trust model as UDP source-address attribution. Inbound and outbound
@@ -41,6 +41,11 @@
 //! not one full-duplex one. A failed dial drops the frames queued behind it
 //! and the next send re-dials, which self-limits to one connect attempt per
 //! burst of sends.
+//!
+//! With `link`, `bind_admitted` instead uses bounded application admission and
+//! a full-duplex socket for each live identity. Managed sockets are not subject
+//! to raw idle/oldest-first eviction: dropping an idle writer must not withdraw
+//! an admitted neighbor or prevent a server from reaching a joiner behind NAT.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -57,6 +62,20 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::handshake::{read_id, read_str, write_id, write_str};
+use crate::tasks::Tasks;
+
+#[cfg(feature = "link")]
+#[path = "admitted.rs"]
+mod admitted;
+#[cfg(feature = "link")]
+pub use admitted::TcpAdmissionConfig;
+
+#[derive(Debug)]
+struct QueuedInbound {
+    packet: Inbound,
+    #[cfg(feature = "link")]
+    session: Option<groupnet_transport::admission::SessionId>,
+}
 
 /// Hard upper bound on a single frame. Engine frames are soft-capped far
 /// below this (`Config::max_delta_frame_bytes`); the guard only stops a
@@ -162,7 +181,16 @@ struct Inner {
     /// registered after binding (e.g. once ephemeral ports are known).
     peers: RwLock<HashMap<NodeId, SocketAddr>>,
     pool: Mutex<Pool>,
-    inbox: AsyncMutex<mpsc::Receiver<Inbound>>,
+    inbox: AsyncMutex<mpsc::Receiver<QueuedInbound>>,
+    #[cfg(feature = "link")]
+    admission: Option<Arc<admitted::Managed>>,
+    tasks: Arc<Tasks>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.tasks.shutdown();
+    }
 }
 
 /// A persistent-connection TCP endpoint for the control plane.
@@ -170,6 +198,8 @@ struct Inner {
 /// Cheap to [`Clone`]: clones share the listener, the address book, and the
 /// connection pool, so a [`register_peer`](Self::register_peer) through any
 /// handle is visible to all.
+/// Dropping the last handle cancels every owned task. Call [`close`](Self::close)
+/// when the listener and session sockets must be fully released before continuing.
 #[derive(Clone, Debug)]
 pub struct TcpMsgTransport {
     inner: Arc<Inner>,
@@ -194,7 +224,23 @@ impl TcpMsgTransport {
     pub async fn bind_with(
         local: NodeId,
         addr: impl ToSocketAddrs,
+        config: TcpMsgConfig,
+    ) -> io::Result<Self> {
+        Self::bind_inner(
+            local,
+            addr,
+            config,
+            #[cfg(feature = "link")]
+            None,
+        )
+        .await
+    }
+
+    async fn bind_inner(
+        local: NodeId,
+        addr: impl ToSocketAddrs,
         mut config: TcpMsgConfig,
+        #[cfg(feature = "link")] admission: Option<Arc<admitted::Managed>>,
     ) -> io::Result<Self> {
         config.max_outbound = config.max_outbound.max(1);
         config.outbound_queue = config.outbound_queue.max(1);
@@ -215,8 +261,15 @@ impl TcpMsgTransport {
             peers: RwLock::new(HashMap::new()),
             pool: Mutex::new(Pool::default()),
             inbox: AsyncMutex::new(inbound_rx),
+            tasks: Arc::new(Tasks::default()),
+            #[cfg(feature = "link")]
+            admission,
         });
-        tokio::spawn(accept_loop(
+        #[cfg(feature = "link")]
+        if let Some(managed) = &inner.admission {
+            managed.set_inbound(inbound_tx.clone());
+        }
+        inner.tasks.spawn(accept_loop(
             listener,
             inbound_tx,
             read_idle,
@@ -235,6 +288,37 @@ impl TcpMsgTransport {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
+    }
+
+    /// Initiates cancellation of the listener and every inbound/outbound session.
+    /// All clones share this shutdown state; no new tasks can be started afterward.
+    ///
+    /// # Panics
+    /// If the task registry or connection pool was poisoned.
+    pub fn shutdown(&self) {
+        self.inner.tasks.shutdown();
+        #[cfg(feature = "link")]
+        if let Some(managed) = &self.inner.admission {
+            managed.shutdown();
+        }
+        let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
+        pool.conns.clear();
+        pool.order.clear();
+    }
+
+    /// Cancels and drains every owned task, releasing listener/session sockets.
+    /// Safe to call repeatedly or concurrently through different clones.
+    ///
+    /// # Panics
+    /// If the task registry or connection pool was poisoned.
+    pub async fn close(&self) {
+        self.shutdown();
+        self.inner.tasks.close().await;
+    }
+
+    #[cfg(feature = "link")]
+    pub(crate) fn lifecycle(&self) -> Arc<dyn groupnet_transport::link::LinkLifecycle> {
+        Arc::new(self.clone())
     }
 
     /// Teaches this endpoint that `node` listens at `addr`, replacing any
@@ -268,19 +352,33 @@ impl TcpMsgTransport {
     }
 
     /// Outbound connections currently pooled (established or still dialing).
-    /// Observability for the bounded-pool promise: on a large cluster this
-    /// tracks the active fanout, not the membership size.
+    /// For admitted endpoints this counts initiated full-duplex sessions,
+    /// including pending handshakes; accepted sockets are not outbound entries.
     ///
     /// # Panics
     /// If the connection pool was poisoned by a panic in another thread.
     #[must_use]
     pub fn outbound_connections(&self) -> usize {
+        #[cfg(feature = "link")]
+        if let Some(managed) = &self.inner.admission {
+            return managed.outbound_connections();
+        }
         self.inner
             .pool
             .lock()
             .expect("pool lock poisoned")
             .conns
             .len()
+    }
+
+    #[cfg(feature = "link")]
+    /// Returns the live admitted-session registry, if admission is configured.
+    #[must_use]
+    pub fn sessions(&self) -> Option<groupnet_transport::admission::SessionRegistry> {
+        self.inner
+            .admission
+            .as_ref()
+            .map(|managed| managed.sessions.clone())
     }
 }
 
@@ -294,12 +392,18 @@ impl Transport for TcpMsgTransport {
         }
     }
 
-    fn send(
-        &self,
-        to: &NodeId,
-        msg: &[u8],
-    ) -> impl std::future::Future<Output = io::Result<()>> + Send {
+    fn send(&self, to: &NodeId, msg: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
+        #[cfg(feature = "link")]
+        if let Some(managed) = &self.inner.admission {
+            return std::future::ready(managed.send(&self.inner, to, Some(msg)));
+        }
         let result: io::Result<()> = (|| {
+            if self.inner.tasks.stopped() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "tcp msg transport shut down",
+                ));
+            }
             if msg.len() > MAX_FRAME {
                 return Ok(()); // oversized frame = drop, never poison the link
             }
@@ -374,7 +478,7 @@ impl Transport for TcpMsgTransport {
             // Concurrent sends to the same peer can race past the fast path; the
             // loser's insert replaces the winner's entry and the winner's task
             // exits once its now-unreferenced queue drains. Rare and harmless.
-            tokio::spawn(write_loop(Outbound {
+            if !self.inner.tasks.spawn(write_loop(Outbound {
                 inner: Arc::downgrade(&self.inner),
                 peer: to.clone(),
                 generation,
@@ -383,19 +487,64 @@ impl Transport for TcpMsgTransport {
                 idle: self.inner.config.idle_timeout,
                 local: self.inner.local.clone(),
                 intro: self.inner.intro.clone(),
-            }));
+            })) {
+                self.inner
+                    .pool
+                    .lock()
+                    .expect("pool lock poisoned")
+                    .remove_generation(to, generation);
+            }
             Ok(())
         })();
         std::future::ready(result)
     }
 
+    #[cfg(feature = "link")]
+    async fn send_admitted(
+        &self,
+        to: &NodeId,
+        msg: &[u8],
+        session: Option<groupnet_transport::admission::SessionId>,
+    ) -> io::Result<()> {
+        if let Some(managed) = &self.inner.admission {
+            return managed.send_admitted(&self.inner, to, msg, session);
+        }
+        self.send(to, msg).await
+    }
+
     async fn recv(&self) -> io::Result<Inbound> {
         // The tokio mutex is held across the await intentionally; only the
         // single receive loop ever calls this.
+        if self.inner.tasks.stopped() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tcp msg transport shut down",
+            ));
+        }
         let mut inbox = self.inner.inbox.lock().await;
         inbox
             .recv()
             .await
+            .map(|queued| queued.packet)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "tcp msg transport shut down"))
+    }
+
+    #[cfg(feature = "link")]
+    async fn recv_admitted(&self) -> io::Result<groupnet_transport::link::AdmittedInbound> {
+        if self.inner.tasks.stopped() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tcp msg transport shut down",
+            ));
+        }
+        let mut inbox = self.inner.inbox.lock().await;
+        inbox
+            .recv()
+            .await
+            .map(|queued| groupnet_transport::link::AdmittedInbound {
+                packet: queued.packet,
+                session: queued.session,
+            })
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "tcp msg transport shut down"))
     }
 }
@@ -471,7 +620,7 @@ async fn write_loop(mut out: Outbound) {
 /// listener fails or every transport handle is dropped.
 async fn accept_loop(
     listener: TcpListener,
-    inbound: mpsc::Sender<Inbound>,
+    inbound: mpsc::Sender<QueuedInbound>,
     read_idle: Duration,
     inner: Weak<Inner>,
 ) {
@@ -482,7 +631,20 @@ async fn accept_loop(
                     return; // listener failure ends intake; readers drain on their own
                 };
                 let _ = sock.set_nodelay(true);
-                tokio::spawn(read_loop(sock, inbound.clone(), read_idle, inner.clone()));
+                let Some(endpoint) = inner.upgrade() else {
+                    return;
+                };
+                #[cfg(feature = "link")]
+                if let Some(managed) = &endpoint.admission {
+                    managed.accept(&endpoint, sock);
+                    continue;
+                }
+                endpoint.tasks.spawn(read_loop(
+                    sock,
+                    inbound.clone(),
+                    read_idle,
+                    inner.clone(),
+                ));
             }
             () = inbound.closed() => return, // transport dropped
         }
@@ -493,7 +655,7 @@ async fn accept_loop(
 /// frame to the introduced peer id.
 async fn read_loop(
     mut sock: TcpStream,
-    inbound: mpsc::Sender<Inbound>,
+    inbound: mpsc::Sender<QueuedInbound>,
     read_idle: Duration,
     inner: Weak<Inner>,
 ) {
@@ -525,7 +687,15 @@ async fn read_loop(
             msg,
         };
         // recv() backpressure propagates here, and from here to the socket.
-        if inbound.send(event).await.is_err() {
+        if inbound
+            .send(QueuedInbound {
+                packet: event,
+                #[cfg(feature = "link")]
+                session: None,
+            })
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -541,7 +711,7 @@ async fn read_intro(sock: &mut TcpStream) -> io::Result<(NodeId, String)> {
 
 /// Reads one length-prefixed frame. `Ok(None)` is a clean close between
 /// frames; an oversized length is an error (the connection is torn down).
-async fn read_frame(sock: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+async fn read_frame(sock: &mut (impl tokio::io::AsyncRead + Unpin)) -> io::Result<Option<Vec<u8>>> {
     let mut len_bytes = [0u8; 4];
     if let Err(err) = sock.read_exact(&mut len_bytes).await {
         return if err.kind() == io::ErrorKind::UnexpectedEof {
@@ -743,5 +913,45 @@ mod tests {
         a.send(&NodeId::new("cap-c"), b"two").await.expect("send");
         assert_eq!(recv_one(&c).await.msg, b"two".to_vec());
         assert_eq!(a.outbound_connections(), 1, "cap held: oldest was closed");
+    }
+
+    #[tokio::test]
+    async fn close_drains_listener_incomplete_handshakes_and_sessions() {
+        use tokio::io::AsyncReadExt;
+
+        let a = bind_as("close-a").await;
+        let b = bind_as("close-b").await;
+        let address = a.local_addr();
+        a.register_peer(NodeId::new("close-b"), b.local_addr());
+        a.send(&NodeId::new("close-b"), b"outbound")
+            .await
+            .expect("send");
+        assert_eq!(recv_one(&b).await.msg, b"outbound");
+        b.send(&NodeId::new("close-a"), b"inbound")
+            .await
+            .expect("send");
+        assert_eq!(recv_one(&a).await.msg, b"inbound");
+
+        // A client that never finishes the introduction must not keep close
+        // waiting for the handshake's idle timeout.
+        let mut stalled = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        tokio::time::timeout(Duration::from_secs(5), a.close())
+            .await
+            .expect("close must drain promptly");
+        assert_eq!(a.outbound_connections(), 0);
+        let _replacement = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("close released listener");
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(5), stalled.read(&mut byte))
+            .await
+            .expect("session socket released");
+        assert!(matches!(read, Ok(0) | Err(_)), "session remained open");
+        assert!(a.send(&NodeId::new("close-b"), b"late").await.is_err());
+        assert!(a.recv().await.is_err());
+        a.close().await;
+        b.close().await;
     }
 }

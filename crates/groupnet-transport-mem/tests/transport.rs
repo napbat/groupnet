@@ -55,8 +55,8 @@ async fn unknown_peer_is_a_silent_drop() {
     );
 }
 
-/// A registered peer whose endpoint has been dropped is likewise a drop, not
-/// an error: the send half outlives the receiver and the failure is swallowed.
+/// A peer whose endpoint has been dropped is likewise a drop, not an error:
+/// dropping the endpoint unregisters it from the fabric.
 #[tokio::test]
 async fn send_to_a_dropped_endpoint_still_succeeds() {
     let net = Network::new();
@@ -91,4 +91,26 @@ async fn clones_share_one_routing_table() {
     let back = a.recv().await.expect("recv");
     assert_eq!(back.from, NodeId::new("clone-b"));
     assert_eq!(back.msg, b"back".to_vec());
+}
+
+/// An old endpoint's cleanup must not remove a new endpoint at the same id.
+#[tokio::test]
+async fn dropping_replaced_endpoint_keeps_replacement_reachable() {
+    let net = Network::new();
+    let sender = net.endpoint(NodeId::new("sender"));
+    let old = net.endpoint(NodeId::new("replaced"));
+    let replacement = net.endpoint(NodeId::new("replaced"));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), old.recv())
+            .await
+            .expect("replacement must close the displaced receiver")
+            .is_err()
+    );
+    drop(old);
+
+    sender
+        .send(&NodeId::new("replaced"), b"replacement")
+        .await
+        .expect("send");
+    assert_eq!(replacement.recv().await.expect("recv").msg, b"replacement");
 }

@@ -35,10 +35,12 @@ use std::time::{Duration, Instant};
 use groupnet_core::{
     Activation, HostedConfig, NodeId, RecoveredGrant, VoterRoster, placement, wire,
 };
+use groupnet_network::{RouterConfig, testing::message_payload};
 use groupnet_runtime::{GrantStore, Group, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{
     MemCluster, NodeOpts, converged_within, eventually_within, spawn_mem_node,
 };
+use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
 use groupnet_transport_mem::{MemTransport, Network};
 
@@ -202,12 +204,12 @@ fn agreed(groups: &[&Group]) -> Option<Leadership> {
 
 /// Brings `ids` up as an all-to-all Quorum cluster on `net`, each node with its
 /// own store and its own store's recovered ledger.
-fn spawn_roster(
+async fn spawn_roster(
     net: &Network,
     group: &str,
     ids: &[&str],
     stores: &[Arc<RecordingStore>],
-) -> (Vec<NodeId>, Vec<Node<MemTransport>>, Vec<Group>) {
+) -> (Vec<NodeId>, Vec<Node>, Vec<Group>) {
     let mut spawned = (Vec::new(), Vec::new(), Vec::new());
     for (id, store) in ids.iter().zip(stores) {
         let seeds: Vec<&str> = ids.iter().copied().filter(|other| other != id).collect();
@@ -215,7 +217,7 @@ fn spawn_roster(
         let opts = NodeOpts::new(group)
             .gossip_interval_ms(GOSSIP_MS)
             .group_profile(quorum_profile(ids, store.clone(), recovered));
-        let (node_id, node, joined) = spawn_mem_node(net, id, &seeds, &opts);
+        let (node_id, node, joined) = spawn_mem_node(net, id, &seeds, &opts).await;
         spawned.0.push(node_id);
         spawned.1.push(node);
         spawned.2.push(joined);
@@ -234,7 +236,7 @@ async fn three_voters_close_one_epoch_and_a_majority_wrote_the_grant_down() {
 
     let net = Network::new();
     let stores: Vec<Arc<RecordingStore>> = IDS.iter().map(|_| RecordingStore::healthy()).collect();
-    let (ids, _nodes, groups) = spawn_roster(&net, GROUP, &IDS, &stores);
+    let (ids, _nodes, groups) = spawn_roster(&net, GROUP, &IDS, &stores).await;
 
     let refs: Vec<&Group> = groups.iter().collect();
     converged_within(&refs, SETTLE).await;
@@ -327,10 +329,10 @@ async fn a_voter_whose_store_fails_puts_no_grant_on_the_wire() {
     let net = Network::new();
     // Built first, joined second: no engine gossips toward a peer that has not
     // bound its endpoint yet.
-    let wired: Vec<(Node<LeadWire>, Arc<WireCounts>)> = ordered
-        .iter()
-        .map(|id| build_wired(&net, id, &ordered))
-        .collect();
+    let mut wired = Vec::with_capacity(ordered.len());
+    for id in &ordered {
+        wired.push(build_wired(&net, id, &ordered).await);
+    }
     let groups: Vec<Group> = wired
         .iter()
         .zip(&stores)
@@ -422,10 +424,10 @@ async fn a_failing_store_on_the_candidate_stalls_the_group_hostless() {
     ];
 
     let net = Network::new();
-    let wired: Vec<(Node<LeadWire>, Arc<WireCounts>)> = ordered
-        .iter()
-        .map(|id| build_wired(&net, id, &ordered))
-        .collect();
+    let mut wired = Vec::with_capacity(ordered.len());
+    for id in &ordered {
+        wired.push(build_wired(&net, id, &ordered).await);
+    }
     let groups: Vec<Group> = wired
         .iter()
         .zip(&stores)
@@ -531,7 +533,7 @@ async fn a_recovered_voter_re_grants_the_incumbent_without_a_blackout() {
 
     let net = Network::new();
     let stores: Vec<Arc<RecordingStore>> = IDS.iter().map(|_| RecordingStore::healthy()).collect();
-    let (ids, nodes, groups) = spawn_roster(&net, GROUP, &IDS, &stores);
+    let (ids, nodes, groups) = spawn_roster(&net, GROUP, &IDS, &stores).await;
 
     let first = {
         let refs: Vec<&Group> = groups.iter().collect();
@@ -552,18 +554,13 @@ async fn a_recovered_voter_re_grants_the_incumbent_without_a_blackout() {
 
     // --- Kill both non-hosts. ---
     //
-    // Dropping the handles is not enough on its own: the node's receive loop
-    // owns an `Arc` of the same inner state, so the actors keep ticking until
-    // the endpoint is evicted from the `Network` (registering the id again
-    // replaces the sender and closes the old inbox).
-    let mut nodes: Vec<Option<Node<MemTransport>>> = nodes.into_iter().map(Some).collect();
+    // Closing each managed network stops the actors without fabric eviction.
+    let mut nodes: Vec<Option<Node>> = nodes.into_iter().map(Some).collect();
     let mut groups: Vec<Option<Group>> = groups.into_iter().map(Some).collect();
     for index in [restart, gone] {
         groups[index] = None;
-        nodes[index] = None;
+        nodes[index].take().expect("live voter").close().await;
     }
-    let _evicted_restart = net.endpoint(ids[restart].clone());
-    let _evicted_gone = net.endpoint(ids[gone].clone());
     let host_group = groups[host_index].as_ref().expect("the host survives");
 
     // Starved of a majority, the incumbent cannot renew: it lapses and steps
@@ -590,7 +587,8 @@ async fn a_recovered_voter_re_grants_the_incumbent_without_a_blackout() {
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(quorum_profile(&IDS, stores[restart].clone(), recovered));
     let restart_at = Instant::now();
-    let (_, _restarted_node, restarted_group) = spawn_mem_node(&net, IDS[restart], &seeds, &opts);
+    let (_, _restarted_node, restarted_group) =
+        spawn_mem_node(&net, IDS[restart], &seeds, &opts).await;
 
     eventually_within("the incumbent to regain the group", SETTLE, || {
         let now = host_group.leadership();
@@ -642,7 +640,8 @@ async fn an_eventual_group_never_touches_its_voter_store() {
         .group_profile(
             GroupProfile::eventual().with_voter_storage(RecoveredGrant::none(), store.clone()),
         )
-        .spawn();
+        .spawn()
+        .await;
 
     let refs: Vec<&Group> = cluster.groups.iter().collect();
     converged_within(&refs, SETTLE).await;
@@ -700,7 +699,7 @@ impl WireCounts {
         self.grants.load(Ordering::Relaxed)
     }
 
-    /// Every frame sent, of any kind: proof the transport is live and counting.
+    /// Every engine frame sent: proof gossip is live, not just router adverts.
     fn frames(&self) -> usize {
         self.frames.load(Ordering::Relaxed)
     }
@@ -719,8 +718,11 @@ impl Transport for LeadWire {
     type Error = <MemTransport as Transport>::Error;
 
     async fn send(&self, to: &NodeId, msg: &[u8]) -> Result<(), Self::Error> {
-        self.counts.frames.fetch_add(1, Ordering::Relaxed);
-        match wire::decode(msg).map(|frame| frame.kind) {
+        let frame = message_payload(msg).and_then(wire::decode);
+        if frame.is_some() {
+            self.counts.frames.fetch_add(1, Ordering::Relaxed);
+        }
+        match frame.map(|frame| frame.kind) {
             Some(wire::Kind::LeadClaim) => {
                 self.counts.claims.fetch_add(1, Ordering::Relaxed);
             }
@@ -739,16 +741,30 @@ impl Transport for LeadWire {
 
 /// Builds (but does not join) a node on `net` whose outbound frames are
 /// counted, seeded with every other id in `all`.
-fn build_wired(net: &Network, id: &str, all: &[&str]) -> (Node<LeadWire>, Arc<WireCounts>) {
+async fn build_wired(net: &Network, id: &str, all: &[&str]) -> (Node, Arc<WireCounts>) {
     let me = NodeId::new(id);
     let counts = Arc::new(WireCounts::default());
     let transport = LeadWire {
         inner: net.endpoint(me.clone()),
         counts: counts.clone(),
     };
-    let mut builder = Node::builder(me, transport).gossip_interval_ms(GOSSIP_MS);
+    let peers = all
+        .iter()
+        .filter(|other| **other != id)
+        .map(|peer| NodeId::new(*peer))
+        .collect();
+    let mut builder = Node::builder(me)
+        .link(BoundLink::new(transport, LinkConfig::new(peers)))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(GOSSIP_MS),
+            ..RouterConfig::default()
+        })
+        .gossip_interval_ms(GOSSIP_MS);
     for seed in all.iter().filter(|other| **other != id) {
         builder = builder.seed(NodeId::new(*seed));
     }
-    (builder.spawn(), counts)
+    (
+        builder.start().await.expect("wire-counting link binds"),
+        counts,
+    )
 }

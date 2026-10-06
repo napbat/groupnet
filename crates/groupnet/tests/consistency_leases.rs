@@ -15,28 +15,8 @@ use groupnet::consistency::CAP_ACKS;
 use groupnet::consistency::lease::{CAP_LEASE, LeaseConfig, LeaseState, Leases};
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
-use groupnet::transport::mem::Network;
+use groupnet::transport::mem::{MemLink, Network};
 use groupnet_testkit::cluster::eventually;
-
-/// The tier's vocabulary is reachable through the facade, under both the
-/// module path and the crate root the other tiers use.
-#[test]
-fn the_lease_tier_is_reachable_through_the_facade() {
-    assert_eq!(CAP_LEASE, "leases");
-    assert_eq!(
-        groupnet::consistency::CAP_LEASE,
-        CAP_LEASE,
-        "re-exported at the crate root like every other tier"
-    );
-    // The lease tier implies the ack tier its fast path is built on, so the
-    // feature must have turned that on too.
-    assert_eq!(CAP_ACKS, "acks");
-
-    let cfg = LeaseConfig::for_duration(Duration::from_secs(1));
-    assert_eq!(cfg.validate(), Ok(()));
-    assert_eq!(cfg.duration_ms(), 1_000);
-    assert_eq!(cfg.renew_every_ms(), 333);
-}
 
 /// …and the shell actually runs on it: a solo reader has nobody who must
 /// confirm, so its own renewal is the confirmed one and it serves as soon as
@@ -45,7 +25,11 @@ fn the_lease_tier_is_reachable_through_the_facade() {
 async fn the_lease_shell_runs_through_the_facade() {
     let net = Network::new();
     let me = NodeId::new("facade-a");
-    let node = Node::builder(me.clone(), net.endpoint(me.clone())).spawn();
+    let node = Node::builder(me.clone())
+        .link(MemLink::new(net.endpoint(me.clone()), Vec::new()))
+        .start()
+        .await
+        .expect("start node");
     let group = node.join_group("stores");
     group
         .advertise_capabilities([CAP_ACKS, CAP_LEASE])

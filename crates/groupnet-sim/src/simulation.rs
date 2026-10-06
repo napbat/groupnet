@@ -57,16 +57,19 @@ impl Ord for Event {
             .then_with(|| other.seq.cmp(&self.seq))
     }
 }
+
 impl PartialOrd for Event {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+
 impl PartialEq for Event {
     fn eq(&self, other: &Self) -> bool {
         self.at == other.at && self.seq == other.seq
     }
 }
+
 impl Eq for Event {}
 
 /// A deterministic in-memory cluster of engines.

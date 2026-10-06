@@ -1,0 +1,30 @@
+[package]
+name = "groupnet-rpc"
+description = "Request/response RPC for Groupnet: concurrent calls multiplexed over one data-plane stream per peer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A runtime-layer crate: it spawns connection and handler tasks, so it takes
+# tokio's task, sync, timer and select! slice. Transport-agnostic — it depends
+# on the `BulkTransport` trait only, never on a binding.
+[dependencies]
+groupnet-core = { workspace = true }
+groupnet-transport = { workspace = true, features = ["bulk"] }
+bytes = { workspace = true }
+# `io` for splitting a stream into halves (and `std`, which it implies, for
+# catching a handler's panic).
+futures-util = { workspace = true, features = ["io"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+groupnet-transport-mem = { workspace = true, features = ["bulk"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# Path-only and publish = false: cargo strips path-only dev-deps at publish,
+# so this never enters the published dependency graph. Do NOT add `version`.
+groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
+
+[lints]
+workspace = true

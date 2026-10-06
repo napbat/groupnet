@@ -59,8 +59,8 @@ fn advertised_first_seq(group: &Group, peer: &NodeId) -> Option<u64> {
 #[tokio::test]
 async fn peer_writes_arrive_in_order_and_apply_locally() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "node-a", &["node-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "node-b", &["node-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "node-a", &["node-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "node-b", &["node-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     // Node B: local state holding a soon-stale copy, and a subscription.
@@ -110,8 +110,8 @@ async fn peer_writes_arrive_in_order_and_apply_locally() {
 #[tokio::test]
 async fn ring_overflow_degrades_to_an_explicit_gap() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ov-a", &["ov-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ov-b", &["ov-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ov-a", &["ov-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ov-b", &["ov-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let mut peers = PeerWrites::new(b_group, b_id, decode);
@@ -166,8 +166,8 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
 #[tokio::test]
 async fn retired_prefix_gaps_then_delivers_the_anchor_and_tail() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "rt-a", &["rt-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "rt-b", &["rt-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "rt-a", &["rt-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "rt-b", &["rt-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let mut peers = PeerWrites::new(b_group.clone(), b_id, decode);
@@ -257,8 +257,8 @@ async fn retired_prefix_gaps_then_delivers_the_anchor_and_tail() {
 async fn encoded_feed_budget_degrades_to_an_explicit_gap() {
     let net = Network::new();
     let opts = opts().max_delta_frame_bytes(1_024);
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bytes-a", &["bytes-b"], &opts);
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "bytes-b", &["bytes-a"], &opts);
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bytes-a", &["bytes-b"], &opts).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "bytes-b", &["bytes-a"], &opts).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let mut peers = PeerWrites::new(b_group.clone(), b_id, decode);
@@ -316,8 +316,8 @@ async fn encoded_feed_budget_degrades_to_an_explicit_gap() {
 #[tokio::test]
 async fn advertised_head_tracks_the_feed() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "hd-a", &["hd-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "hd-b", &["hd-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "hd-a", &["hd-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "hd-b", &["hd-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     assert_eq!(advertised_head(&b_group, &a_id), None, "no feed yet");
@@ -348,8 +348,8 @@ async fn advertised_head_tracks_the_feed() {
 #[tokio::test]
 async fn checked_head_rejects_present_malformed_feed() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bad-a", &["bad-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "bad-b", &["bad-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bad-a", &["bad-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "bad-b", &["bad-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
     assert_eq!(checked_advertised_head(&b_group, &a_id), Ok(None));
     a_group
@@ -369,8 +369,8 @@ async fn checked_head_rejects_present_malformed_feed() {
 #[tokio::test]
 async fn own_writes_are_ignored() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "self-a", &["self-b"], &opts());
-    let (_b_id, _b_node, _b_group) = spawn_mem_node(&net, "self-b", &["self-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "self-a", &["self-b"], &opts()).await;
+    let (_b_id, _b_node, _b_group) = spawn_mem_node(&net, "self-b", &["self-a"], &opts()).await;
 
     // Feed and subscription on the SAME node.
     let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
@@ -387,8 +387,8 @@ async fn own_writes_are_ignored() {
 #[tokio::test]
 async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ryw-a", &["ryw-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ryw-b", &["ryw-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "ryw-a", &["ryw-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "ryw-b", &["ryw-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     // Node B: stale local state, an apply loop, and a frontier.
@@ -444,8 +444,8 @@ async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
 #[tokio::test]
 async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
     let net = Network::new();
-    let (a_id, a_node, a_group) = spawn_mem_node(&net, "rs-a", &["rs-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "rs-b", &["rs-a"], &opts());
+    let (a_id, a_node, a_group) = spawn_mem_node(&net, "rs-a", &["rs-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "rs-b", &["rs-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let mut peers = PeerWrites::new(b_group, b_id, decode);
@@ -472,8 +472,9 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
     // under the same id (fresh engine, fresh ring — the amnesia case).
     drop(feed);
     drop(a_group);
-    drop(a_node);
-    let (_reborn_id, _reborn_node, reborn_group) = spawn_mem_node(&net, "rs-a", &["rs-b"], &opts());
+    a_node.close().await;
+    let (_reborn_id, _reborn_node, reborn_group) =
+        spawn_mem_node(&net, "rs-a", &["rs-b"], &opts()).await;
     let feed2 = WriteFeed::new(reborn_group, cap(8), |key: &String| {
         key.clone().into_bytes()
     })
@@ -526,8 +527,8 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
 #[tokio::test]
 async fn named_feeds_do_not_cross_talk() {
     let net = Network::new();
-    let (_a_id, _a_node, a_group) = spawn_mem_node(&net, "nm-a", &["nm-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "nm-b", &["nm-a"], &opts());
+    let (_a_id, _a_node, a_group) = spawn_mem_node(&net, "nm-a", &["nm-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "nm-b", &["nm-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let docs_feed = WriteFeed::named("docs", a_group.clone(), cap(8), |key: &String| {

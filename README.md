@@ -9,6 +9,9 @@ profile, epoch-fenced and majority-committed — while the general replicated-lo
 machine (log repair, compaction, reconfiguration) is deliberately absent. You
 bring the storage and the wire.
 
+Start with the [architecture diagram guides](docs/README.md) for Mermaid maps of
+the crate boundaries, link registration, routing, lifecycle, and security model.
+
 That opt-in is a dial, set per group: eventual metadata for free at one end, an
 elected epoch-fenced host paying a majority round-trip per write at the other,
 and the session and coherence tiers in between. Each rung, its price, and what
@@ -36,9 +39,10 @@ Production source adapters and consumer migrations remain in development.
 Contracts and implementation status are in
 [`docs/replication.md`](docs/replication.md).
 
-> Status: early scaffold. The architecture and public API are in place with a
-> working gossip/coordinator core; several protocol pieces are stubbed and
-> marked `TODO` (see [Roadmap](#roadmap)).
+> Status: the coordination core, routed-network stack, and opt-in consistency
+> layers are implemented. Production source adapters and consumer migrations
+> have separate status notes in the [documentation index](docs/README.md).
+> Loopback networking verification is not public-Internet or USB qualification.
 
 ## Design in one breath
 
@@ -76,21 +80,32 @@ requirements, so they're separate traits bound to separate physical connections.
 | Crate | Plane | Deps | Role |
 |-------|-------|------|------|
 | [`groupnet-core`](crates/groupnet-core) | — | none | sans-IO state machine: engine, ids, wire codec, coordinator selection |
-| [`groupnet-transport`](crates/groupnet-transport) | both | core *(+bulk feature: futures-io, bytes, zerocopy)* | the transport **traits**: `Transport` (datagram, always, dep-free) + `bulk::BulkTransport` (stream, feature `bulk`) |
+| [`groupnet-transport`](crates/groupnet-transport) | both | core *(+bulk: futures-io, bytes, zerocopy; +link: tokio, tokio-util, futures-util)* | dependency-free `Transport`, optional `BulkTransport`, and shared object-safe link registration/lifecycle |
 | [`groupnet-transport-mem`](crates/groupnet-transport-mem) | both | transport, core, tokio(sync) *(+bulk feature: transport(bulk), tokio(io-util), tokio-util(compat))* | in-process bindings (tests, examples, single-process): datagrams always, `MemBulkNet` byte streams under feature `bulk` |
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
-| [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | data | transport(bulk), core, tokio(net) | TCP stream binding |
-| [`groupnet-runtime`](crates/groupnet-runtime) | — | core, transport, tokio | **transport-agnostic** async `Node`/`Group` driver + routing table |
+| [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) | persistent TCP messages, TCP streams, and `TcpLink` registration |
+| [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | control | transport(link), core, tokio | native named pipes/Unix sockets and `IpcLink` registration |
+| [`groupnet-transport-punch`](crates/groupnet-transport-punch) | control | transport(link), core, tokio, ring | authenticated UDP discovery/punching/relay and `PunchLink` registration |
+| [`groupnet-network`](crates/groupnet-network) | both | transport(bulk, link), tokio, rustls, ring | protocol-independent group-network routing and pinned end-to-end TLS streams |
+| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), network, tokio | non-generic managed `Node`, group actors, and `FileGrantStore` |
+| [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff`)* | core, runtime, tokio(sync) *(+handoff feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; the opt-in `handoff` tier is the one piece that reaches the data plane, to pull a covering snapshot a gap cannot replay |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
-| [`groupnet`](crates/groupnet) | — | facade | umbrella re-export; `runtime`+`mem` default, `udp`/`tcp`/`sim` opt-in |
+| [`groupnet`](crates/groupnet) | — | facade | `runtime`+`mem` default; routing is intrinsic to runtime; socket protocols, RPC, and simulator selectable by feature |
 | [`groupnet-testkit`](crates/groupnet-testkit) | — | core *(+cluster feature: runtime, transport-mem, tokio)* | shared test support: sans-IO frame fixtures + an async multi-node harness. Internal, `publish = false`, dev-dependency only |
 
-The runtime is generic over `T: Transport` and never depends on a concrete
-binding — you pick a transport crate (or write your own impl) and the driver is
-none the wiser. Every concrete transport lives in its own `groupnet-transport-*`
-crate so each pulls only the I/O deps it needs, and the control plane stays
-dependency-free.
+Every runtime node owns a routed network. Use
+`Node::builder(id).link(provider).start().await` for memory, sockets, or a mixture:
+protocol choices do not change the `Node` type or its coordination API. Links and
+membership settings share one builder; startup binds all links before spawning
+coordination. `groupnet-transport` without features and `groupnet` with
+`default-features = false` retain their dependency-free core surface. Protocol
+implementations never enter `groupnet-core`.
+
+`groupnet-network` implements routed networks independently of the transport
+contracts and protocol implementations. The facade exposes it as
+`groupnet::network`; `groupnet::transport` keeps the shared contracts and protocol
+bindings.
 
 The same core runs under both drivers: `groupnet-runtime` across threads in
 production, `groupnet-sim` in a single-threaded, reproducible event loop for
@@ -98,8 +113,9 @@ tests.
 
 Most consumers pull the single `groupnet` facade, which mirrors each layer as a
 module — `groupnet::core`, `groupnet::transport` (with the `mem` / `udp` / `tcp` /
-`bulk` bindings nested under it), `groupnet::runtime`, and `groupnet::sim` — so
-you write `groupnet::transport::Transport`, never the underlying crate name.
+`bulk` bindings nested under it), `groupnet::network`, `groupnet::runtime`,
+`groupnet::rpc`, and `groupnet::sim` — so you write
+`groupnet::transport::Transport`, never the underlying crate name.
 
 ## Example
 
@@ -109,6 +125,10 @@ Runnable examples live in [`crates/groupnet/examples`](crates/groupnet/examples)
 cargo run --example placement   # weighted HA-hash placement (sync, no I/O)
 cargo run --example cluster     # 3-node convergence, derived coordinator, metadata
 cargo run --example routing     # resolve a resource to its owner from any node
+cargo run --example dynamic-admission --features tcp-msg  # unknown clients, open admission
+cargo run --example dynamic-admission --features tcp-msg -- --invite  # custom credential policy
+cargo run --example dynamic-relay --features punch  # discovery through a keyless relay
+cargo run --example dynamic-relay --features punch -- --direct  # prefer direct paths; relay fallback
 ```
 
 Five more live with the layers they exercise:
@@ -124,12 +144,14 @@ cargo run -p groupnet-consistency --example hosted_handoff --features handoff   
 ```rust
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
-use groupnet::transport::mem::Network;
+use groupnet::transport::mem::{MemLink, Network};
 
-let net = Network::new(); // any Transport impl works here
-let node = Node::builder(NodeId::new("node-a"), net.endpoint(NodeId::new("node-a")))
-    .seed(NodeId::new("node-b"))
-    .spawn();
+let net = Network::new();
+let id = NodeId::new("node-a");
+let node = Node::builder(id.clone())
+    .link(MemLink::new(net.endpoint(id), vec![NodeId::new("node-b")]))
+    .start()
+    .await?;
 
 let group = node.join_group("shard-42");
 
@@ -138,37 +160,246 @@ if group.is_coordinator() {
 }
 ```
 
-Swap the in-memory transport for real UDP sockets without touching anything else
-— just bind a different `Transport`:
+Use the same node and group APIs with UDP sockets — select feature `udp` and
+register a `UdpLink` instead:
 
 ```rust
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
-use groupnet::transport::udp::UdpTransport; // enable feature "udp"
+use groupnet::transport::{link::PeerEndpoint, udp::UdpLink};
 
-let transport = UdpTransport::bind(NodeId::new("node-a"), "0.0.0.0:7000").await?;
-transport.register_peer(NodeId::new("node-b"), "10.0.0.2:7000".parse()?);
-let node = Node::builder(NodeId::new("node-a"), transport).seed(NodeId::new("node-b")).spawn();
+let node = Node::builder(NodeId::new("node-a"))
+    .link(UdpLink::new(
+        "0.0.0.0:7000".parse()?,
+        vec![PeerEndpoint::new(NodeId::new("node-b"), "10.0.0.2:7000".parse()?)],
+    ))
+    .start()
+    .await?;
 ```
+
+### Node-owned heterogeneous connections
+
+Select the protocol features you need (`tcp-msg` for this example; also `udp`,
+`ipc`, and `punch`). Add several links to the same builder to bridge protocols:
+
+```rust
+use groupnet::core::NodeId;
+use groupnet::runtime::Node;
+use groupnet::transport::{link::PeerEndpoint, tcp::TcpLink};
+
+let node = Node::builder(NodeId::new("node-a"))
+    .link(TcpLink::new(
+        "127.0.0.1:7000".parse()?,
+        vec![PeerEndpoint::new(
+            NodeId::new("bridge"),
+            "127.0.0.1:7001".parse()?,
+        )],
+    ))
+    .gossip_interval_ms(100)
+    .start()
+    .await?;
+let devices = node.join_group("devices");
+// Use devices and node.router(); close drains owned network I/O tasks.
+node.close().await;
+```
+
+`TcpLink`, `UdpLink`, `MemLink`, `IpcLink`, and `PunchLink` belong to their
+implementation crates. All implement `groupnet::transport::link::LinkProvider`;
+there is no protocol enum or special custom-adapter path. To add a protocol,
+implement that shared contract outside the router. Binding returns a `BoundLink`
+with adjacent-peer admission, cost/MTU, and an owned worker/lifecycle handle.
+Provider `with_cost` methods override the default route cost of one.
+
+Already configured providers can be registered as a heterogeneous collection:
+
+```rust
+use groupnet::transport::link::LinkProvider;
+
+let links: Vec<Box<dyn LinkProvider>> = vec![Box::new(tcp), Box::new(ipc)];
+let node = Node::builder(local_id).links(links).start().await?;
+```
+
+`NetworkConfig::with_link` / `with_links` configure a standalone routed network
+through `config.bind(id)` when no coordination groups are needed. Nodes always
+use `Node::builder`. The router depends only on the shared link contract, not
+TCP, UDP, IPC, or punching implementations. Registration erases provider and
+worker lifetimes once; packet send/receive futures remain statically dispatched.
+Existing bounded scheduling queues are reused.
+
+Initialization returns a non-generic `Node`. Every node clone retains network
+ownership; a raw router clone or group handle does not. Closing any node clone
+closes connections for all of them; dropping the last node clone initiates
+shutdown. Configure membership with `.config(...)`, `.seed(...)`,
+`.named_seeds(...)`, and the timing setters directly on the same builder.
+Initialization binds listeners and starts discovery; route convergence remains
+asynchronous and can be inspected with `node.router().route_to(&peer)`.
+
+Configured adjacent identities are initial membership seeds. Dynamic-capable
+links can instead admit previously unknown identities through an application
+policy. Additional membership seeds, DNS answers, and gossiped addresses do
+**not** grant link admission; only configured or successfully admitted neighbors
+can supply router traffic.
+
+For an open TCP listener, select feature `tcp-msg` and explicitly choose the
+unauthenticated policy:
+
+```rust
+use std::sync::Arc;
+use groupnet::core::NodeId;
+use groupnet::runtime::Node;
+use groupnet::transport::{admission::OpenAdmission, tcp::TcpLink};
+
+let node = Node::builder(NodeId::new("game-server"))
+    .link(
+        TcpLink::new("0.0.0.0:7000".parse()?, Vec::new())
+            .with_admission(Arc::new(OpenAdmission)),
+    )
+    .start()
+    .await?;
+let room = node.join_group("game-room");
+```
+
+Clients configure the server as a bootstrap `PeerEndpoint` and use their own
+`NodeId`, such as a generated UUID string. The server need not know those IDs
+before they connect. Membership converges asynchronously after admission.
+The [dynamic admission example](crates/groupnet/examples/dynamic-admission.rs)
+starts an ephemeral listener and two initially unknown clients; its `--invite`
+mode implements a custom `Admission` policy and passes credentials through
+`TcpLink::with_credentials`.
+
+`Admission::admit` receives a claimed identity, bounded opaque credential bytes,
+and the remote address when available. Return `AcceptedPeer` or an error.
+The accepted identity must match the client's configured routing identity:
+account policies should reject mismatched claims, not silently rename a live
+node. Open admission proves no ownership of the name. Duplicate active sessions
+are rejected; after disconnection, the same unauthenticated name can be claimed
+again. Admission is independent of TLS and resource authorization.
+
+Forwarding between configured peers is automatic, including between neighbors
+on the same adapter. No special bridge flag is required:
+
+```text
+IPC-only node ── IPC ── bridge ── TCP or authenticated UDP ── network-only node
+```
+
+Use `.routing(RouterConfig { forwarding: false, ..RouterConfig::default() })`
+for an endpoint-only node which must not advertise or forward transit routes.
+This is a routing-role setting, not an access-control policy for peers or groups.
+
+Plain TCP/UDP does not provide endpoint authentication or encryption. Static
+links assume trusted peers; explicitly open admission accepts untrusted identity
+claims and does not make their routing advertisements trustworthy.
+Keyed `PunchConfig` supplies a self-hosted rendezvous address, provisioned
+`NetworkKey`, explicit peers, and `PathPolicy`. Direct-preferred mode probes
+peers simultaneously; relay-only mode never sends direct probes. Not every NAT
+supports direct connectivity.
+
+For dynamic keyless discovery, start `Rendezvous::bind_open(address)` and give
+each node `PunchLink::new(PunchConfig::open(local_id, rendezvous_address))`.
+No participant list, public/private key pair, or pre-shared transport key is
+required. Here **keyless** means `PunchConfig.key == None`, not an absence of
+application admission or all cryptography. `PunchConfig::open` conservatively
+defaults to `RelayOnly`; select direct punching explicitly:
+
+```rust
+use groupnet::transport::punch::{PathPolicy, PunchConfig, PunchLink};
+
+let mut config = PunchConfig::open(local_id, rendezvous_address);
+config.policy = PathPolicy::DirectPreferred;
+// Register with Node::builder(...).link(PunchLink::new(config)).start().await?
+```
+
+Admission, transport authentication, and path policy are independent choices:
+
+| Choice | Configuration |
+|---|---|
+| Accept a claimed `NodeId` without ownership proof | Explicit `OpenAdmission` / `Rendezvous::bind_open` |
+| Apply application-defined admission rules | `Rendezvous::bind_with_admission`; supply credentials through `PunchConfig::dynamic` |
+| Authenticate datagrams as members of a trusted fabric | Configure the same `NetworkKey`; keyed endpoints never downgrade |
+| Prefer verified direct UDP, falling back to relay | `PathPolicy::DirectPreferred`, with or without a configured key |
+| Use relay only; do not exchange peer socket addresses or send direct probes | `PathPolicy::RelayOnly`; applies to a pair if either endpoint selects it |
+| Authenticate and encrypt application streams | Separately configure pinned TLS tunnels |
+
+These choices are workload-neutral: database engines and general applications
+use the same APIs. Open admission is opt-in, not a recommendation for a database
+trust boundary. Coordination groups do not authorize access to application data.
+
+The rendezvous checks source-address reachability, applies admission, and leases
+registrations; it is not itself a coordination-group member. Fresh private session
+proofs and direct-path challenges bind packets to current sessions; a public
+`NodeId` or advertised session ID alone cannot authorize direct data. These
+mechanisms do not provide identity ownership or confidentiality. Never send
+reusable credentials over an unencrypted admission exchange.
+See the runnable [dynamic relay/direct example](crates/groupnet/examples/dynamic-relay.rs)
+and [security boundaries](docs/tunnels-and-security.md#3-native-discovery-direct-paths-and-relay).
+
+The native UDP wire format is now `GNP3`. Upgrade the rendezvous and all endpoints
+together; earlier formats are rejected, not negotiated or silently downgraded.
+
+For confidential streams, call
+`.tunnels(TunnelConfig::new(identity, [peer_pin]))` on the node builder with a `TlsIdentity` and
+explicit `PeerIdentity` certificate pins. Import
+`groupnet::transport::bulk::BulkTransport`, then use `node.connect(&peer).await?`
+to initiate a stream or `node.accept().await?` to accept one. A node without
+configured tunnels returns `Unsupported`; it never falls back to plaintext.
+`NetworkConfig::bind` also returns a standalone `Network` implementing the same
+stream trait when membership is not needed.
+
+`node.tunnels()?` exposes `admit_peer` and `revoke_peer` for bidirectional tunnel
+admission. Replacing a pin or revoking a peer invalidates its existing and queued
+streams; re-admitting the same pin preserves its current sessions.
+TLS 1.3 remains end to end across bridge nodes; route changes do not restart the
+application stream. Certificates must include the `groupnet.peer` DNS SAN and
+client/server authentication usages.
+
+Coordination groups are not permission groups. Private-peer route visibility
+and group-based connection policies are not implemented. Open admission accepts
+claimed identities without proving who owns them. A shared network key
+establishes a trusted fabric but does not securely distinguish its members.
+Use pinned tunnel identities and application authorization for protected resources.
+
+Windows IPC addresses are local `\\.\pipe\name` paths. Unix IPC requires a
+caller-owned private directory with no group/other permissions. No adapters
+install drivers, change firewall rules, or authorize USB access.
+
+An external Windows smoke consumer registered its own provider without router
+implementation knowledge. Four nodes carried membership, metadata, and an exact
+1 MiB pinned-TLS stream across IPC, TCP, and memory links, with a half-close reply.
+Separate runs exercised UDP, punching/relay configurations, revocation/readmission,
+and failed-initialization cleanup. This is not public-Internet NAT, Unix runtime, or
+physical USB/YubiKey qualification. See the [routing guide](docs/routing.md) and
+[tunnel security boundaries](docs/tunnels-and-security.md).
+
+### Named seeds
 
 In an orchestrated deployment a seed's address moves (a `StatefulSet` peer's DNS
 record appears after its pod starts; a rolling restart hands it a new IP). Name
 the seed instead and let the node keep it current: it is resolved off the
 startup path, retried until it first resolves, re-resolved for the life of the
-node, and every new address reaches the transport through
-`Transport::learn_peer` (feature `dns` for the operating system resolver; any
-`SeedResolver` works):
+node, and every new address reaches links that already admit that identity through
+`Transport::learn_peer`. Feature `dns` supplies the operating-system resolver;
+any `SeedResolver` works. Address learning never widens the admitted peer set:
 
 ```rust
-use groupnet::runtime::{NamedSeeds, SystemResolver}; // enable feature "dns"
+use groupnet::core::NodeId;
+use groupnet::runtime::{NamedSeeds, Node, SystemResolver}; // feature "dns"
+use groupnet::transport::{link::{BoundLink, LinkConfig}, udp::UdpTransport}; // feature "udp"
 
-let node = Node::builder(NodeId::new("node-a"), transport)
-    .named_seeds(NamedSeeds::new(SystemResolver).seed(NodeId::new("node-b"), "node-b.peers:7000"))
-    .spawn();
+let id = NodeId::new("node-a");
+let peer = NodeId::new("node-b");
+let udp = UdpTransport::bind(id.clone(), "0.0.0.0:7000").await?;
+let node = Node::builder(id)
+    .link(BoundLink::new(udp, LinkConfig::new(vec![peer.clone()])))
+    .named_seeds(NamedSeeds::new(SystemResolver).seed(peer, "node-b.peers:7000"))
+    .start()
+    .await?;
 ```
 
-Binding your own transport is one trait — implement it and the runtime works
-unchanged:
+Custom protocols implement `Transport` for concrete packet I/O and `LinkProvider`
+for configuration/binding. Already-bound transports register through
+`BoundLink::new(transport, LinkConfig::new(peers))`, which itself implements
+`LinkProvider`. Supply `with_lifecycle` when the endpoint owns independent tasks
+that must be cancelled and drained; no separate node construction path is needed:
 
 ```rust
 pub trait Transport: Send + Sync + 'static {
@@ -210,6 +441,36 @@ while let Some(frame) = s.recv().await? { /* apply */ }
 The data plane is a separate handle from `Node`, bound to its own socket — so you
 gossip over UDP and replicate over TCP, independently. The control-plane
 coordination core is untouched by any of it.
+
+### Request/response RPC (feature `rpc`)
+
+For calls rather than streams — "read this key from its owner", "apply this
+write on that replica" — `groupnet::rpc` multiplexes any number of concurrent
+calls onto **one** data-plane stream per peer, opened lazily, reused, and
+replaced after it breaks:
+
+```rust
+use groupnet::rpc::{RpcClient, RpcConfig, RpcError, RpcServer, RpcStatus};
+
+// Serving node: the server owns this plane's `accept`.
+let server = RpcServer::spawn(rpc_plane, |from: NodeId, request: Bytes| async move {
+    lookup(&request).ok_or_else(|| RpcStatus::new(404, "no such key"))
+});
+
+// Calling node: one cloneable client; every call carries its own deadline.
+let client = RpcClient::new(client_plane, RpcConfig::default());
+match client.call(&owner, Bytes::from(key), Duration::from_millis(200)).await {
+    Ok(value) => { /* ... */ }
+    Err(RpcError::ConnectionLost | RpcError::Timeout) => { /* outcome unknown */ }
+    Err(other) => { /* not sent (Unreachable, TooLarge), or Remote(status) */ }
+}
+```
+
+The deadline travels with the request and the server drops the work once it
+passes; each connection runs a bounded number of handlers and answers through a
+single writer. The server takes over `accept` of its plane, so give RPC its own
+bulk transport (its own TCP port) unless nothing else accepts streams, and
+register peer addresses on the transports (`DataPlane::transport`) yourself.
 
 ## Inter-group routing
 
@@ -293,34 +554,29 @@ cargo build -p groupnet --no-default-features   # core + transport trait only, n
 
 ## Roadmap
 
-What's done, and what's honestly still stubbed:
+Implemented capabilities and their contracts:
 
-- ~~**Metadata dissemination.**~~ *Done.* Per-key last-writer-wins register
-  (`(version, writer)` tiebreak), so `sync`/`update_metadata` converges
-  cluster-wide. Reads: lock-free snapshot via `Group::metadata`.
-- ~~**Real membership.**~~ *Done.* SWIM-style: per-node incarnation numbers, an
-  `Alive`/`Suspect`/`Dead` state machine, a suspicion window with
-  self-refutation, and a real `leave` that sticks. Read via `Group::members()`.
-- ~~**Indirect probes (`ping-req`).**~~ *Done.* A direct-probe miss enlists *k*
-  indirect probers before suspecting, so a dropped packet or one-way link no
-  longer falsely kills a healthy node.
-- ~~**Dead-node reaping.**~~ *Done.* Tombstones are gossiped for `dead_timeout`,
-  then stop being re-advertised, then reaped at `2×` — so removal converges
-  without peers re-teaching each other.
-- ~~**Inter-group routing map.**~~ *Done.* Cluster-wide `resource → owning group`
-  and `group → coordinator`, resolvable from any node via `Node::routing()`.
-- ~~**Real transports.**~~ *Done.* Concrete bindings are their own
-  `groupnet-transport-*` crates; control-plane `-mem`/`-udp` and data-plane
-  `-tcp` ship. IPC/shmem/QUIC are the same one-trait exercise.
-- ~~**Bulk / data-plane transport.**~~ *Done.* A separate stream-shaped
-  `BulkTransport` (its own crate, `futures-io` + `bytes` + `zerocopy`), off the
-  datagram hot path, for replication and bulk state transfer. Verified streaming
-  multi-MB payloads over real TCP.
-- **Data-plane maturity.** The stream transport moves opaque `Bytes`; a store on
-  top still needs replication protocol, snapshot/anti-entropy over it, and its
-  own `zerocopy` record layouts.
-- **Dynamic address discovery.** Both socket bindings use a static
-  `NodeId → addr` book; production would gossip or resolve addresses.
+| Area | Current behavior | Details |
+|---|---|---|
+| Coordination | SWIM membership, indirect probes, refutation, tombstone reaping, and digest/delta anti-entropy | [Coordination model](docs/architecture.md#coordination-model) |
+| Metadata | LWW registers, TTL'd node entries, and eventually consistent resource/group/coordinator lookup | [Metadata versus packet routing](docs/architecture.md#metadata-routing-versus-packet-routing) |
+| Networking | Independent protocol providers, intrinsic managed routing, direct/relay discovery, pinned TLS streams | [Diagram guides](docs/README.md#architecture-diagram-guides) |
+| Consistency | Session, acknowledgement, lease, and Hosted tiers selected explicitly | [Consistency contract](docs/consistency-modes.md) |
+| Source-backed replication | Replay, checkpoints, native snapshots, and named subscriptions through application adapters | [Implementation status](docs/replication.md#9-implementation-status) |
+
+Remaining work and deployment boundaries:
+
+- Production source adapters and downstream consumer migrations have their own
+  status in the replication contracts; a byte-stream transport does not supply
+  durable application history or storage semantics.
+- Named DNS seeds and native rendezvous discovery are implemented. Plain
+  TCP/UDP addressing still requires a trusted deployment; discovery is not an
+  authorization or private-peer visibility policy.
+- Permission-group connection policies and VPN interfaces are not implemented.
+- Public-Internet NAT, Unix runtime behavior, and USB/YubiKey hardware require
+  deployment-specific qualification beyond the Windows loopback scenarios.
+- Merkle-style full-state comparison remains an unbuilt scaling option; current
+  full-membership fabrics should stay within the envelope described above.
 
 ## License
 

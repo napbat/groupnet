@@ -17,6 +17,9 @@
 //!   `MemBulkTransport` endpoints implementing `BulkTransport` — reliable,
 //!   ordered byte streams over `tokio::io::duplex`. Being connection-oriented,
 //!   it reports an unknown peer as an error rather than dropping.
+//! * **Router registration** (feature `link`): `MemLink` consumes an existing
+//!   endpoint and declares its directly reachable peers. Binding checks that
+//!   the router's local identity matches the endpoint; no I/O tasks are spawned.
 //!
 //! ```
 //! use groupnet_transport_mem::Network;
@@ -36,3 +39,8 @@ mod mem;
 #[cfg(feature = "bulk")]
 pub use bulk::{MemBulkNet, MemBulkTransport};
 pub use mem::{Closed, MemTransport, Network};
+
+#[cfg(feature = "link")]
+mod link;
+#[cfg(feature = "link")]
+pub use link::MemLink;

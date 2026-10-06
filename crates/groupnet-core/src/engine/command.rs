@@ -46,6 +46,12 @@ pub enum Command {
     ///
     /// [`seed`]: crate::GroupEngine
     AddPeer(NodeId),
+    /// Replace dynamic bootstrap contacts without asserting group membership.
+    /// Contacts receive periodic, bounded anti-entropy attempts even while a
+    /// previous membership tombstone says Dead. Actual group protocol exchange
+    /// establishes membership. This leaves configured static seeds unchanged.
+    /// Inputs longer than 4096 contacts are rejected without changing the set.
+    SetBootstrapContacts(Vec<NodeId>),
     /// **The driver won an external-anchor round:** this node now holds
     /// `epoch` at the anchor, and its authority should lapse at `lease_until`.
     ///
@@ -184,6 +190,10 @@ impl GroupEngine {
                 effects.extend(self.recompute_coordinator());
                 self.nudge_anti_entropy();
                 effects
+            }
+            Command::SetBootstrapContacts(contacts) => {
+                self.set_bootstrap_contacts(contacts);
+                Vec::new()
             }
             Command::AddPeer(node) => {
                 // Learn a peer out-of-band so we start probing it even before any

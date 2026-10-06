@@ -32,8 +32,8 @@ fn opts() -> NodeOpts {
 #[tokio::test]
 async fn floors_disseminate_and_list_their_publishers() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "fl-a", &["fl-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "fl-b", &["fl-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "fl-a", &["fl-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "fl-b", &["fl-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let writer = SeqFloors::new(a_group, LONG_TTL);
@@ -73,8 +73,8 @@ async fn floors_disseminate_and_list_their_publishers() {
 #[tokio::test]
 async fn floors_never_regress_within_a_publisher_life() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "mo-a", &["mo-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "mo-b", &["mo-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "mo-a", &["mo-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "mo-b", &["mo-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let writer = SeqFloors::new(a_group, LONG_TTL);
@@ -116,8 +116,8 @@ async fn floors_never_regress_within_a_publisher_life() {
 #[tokio::test]
 async fn ttl_expiry_is_the_idle_signal() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "tt-a", &["tt-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "tt-b", &["tt-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "tt-a", &["tt-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "tt-b", &["tt-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let writer = SeqFloors::new(a_group, Duration::from_millis(300));
@@ -157,8 +157,8 @@ async fn ttl_expiry_is_the_idle_signal() {
 #[tokio::test]
 async fn unknown_and_undecodable_floors_read_as_no_claim() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "un-a", &["un-b"], &opts());
-    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "un-b", &["un-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "un-a", &["un-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "un-b", &["un-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let reader = SeqFloors::new(b_group.clone(), LONG_TTL);
@@ -201,8 +201,8 @@ async fn unknown_and_undecodable_floors_read_as_no_claim() {
 #[tokio::test]
 async fn named_sets_do_not_cross_read() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "nm-a", &["nm-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "nm-b", &["nm-a"], &opts());
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "nm-a", &["nm-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "nm-b", &["nm-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     let lsn = SeqFloors::named("lsn", a_group.clone(), LONG_TTL);

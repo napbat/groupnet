@@ -11,6 +11,8 @@ repository.workspace = true
 # Default is the control-plane trait only — dependency-free (just groupnet-core).
 # `bulk` adds the data-plane stream trait + framing and pulls its deps.
 bulk = ["dep:bytes", "dep:futures-util", "dep:zerocopy"]
+# Object-safe link initialization with statically dispatched, bounded I/O workers.
+link = ["dep:tokio", "dep:tokio-util", "dep:futures-util", "futures-util/sink", "futures-util/async-await"]
 
 [dependencies]
 groupnet-core = { workspace = true }
@@ -18,6 +20,8 @@ groupnet-core = { workspace = true }
 bytes = { workspace = true, optional = true }
 futures-util = { workspace = true, features = ["io"], optional = true }
 zerocopy = { workspace = true, features = ["derive"], optional = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }
+tokio-util = { workspace = true, features = ["rt"], optional = true }
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }

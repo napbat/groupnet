@@ -14,8 +14,9 @@ use std::fmt;
 use std::time::Duration;
 
 use groupnet_core::{GroupId, NodeId};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{Group, GroupProfile, Node};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_transport_mem::{MemLink, Network};
 
 /// [`POLL_INTERVAL`] in milliseconds — the single literal both the interval and
 /// the default budget are built from, so neither can drift from the other.
@@ -156,36 +157,37 @@ impl NodeOpts {
     }
 }
 
-/// Spawns one node on `net` under `id`, seeded with `seeds`, and joins the
-/// group named by `opts`. Returns the node's id, the node (drop it and the
-/// node dies), and its group handle.
+/// Starts one managed node on `net` under `id`, seeded with `seeds`, and joins
+/// the group named by `opts`. Returns the node's id, its owning handle (the
+/// final clone's drop closes the network), and its group handle.
 ///
-/// The standalone form: for clusters, prefer [`MemCluster`]. This one exists
-/// for tests that re-spawn a node under an id that already lived on the same
-/// [`Network`] — the writer-restart case.
+/// Seeds also explicitly admit the adjacent peers on the memory link. Include
+/// an intended later peer before it starts; discovery never grants admission.
+/// For clusters, prefer [`MemCluster`]. This standalone form also supports
+/// restarting an identity on the same [`Network`].
 #[must_use]
-pub fn spawn_mem_node(
+pub async fn spawn_mem_node(
     net: &Network,
     id: &str,
     seeds: &[&str],
     opts: &NodeOpts,
-) -> (NodeId, Node<MemTransport>, Group) {
+) -> (NodeId, Node, Group) {
     let me = NodeId::new(id);
     let seeds = seeds.iter().map(|s| NodeId::new(*s)).collect();
-    let (node, group) = spawn_one(net, me.clone(), seeds, opts);
+    let (node, group) = spawn_one(net, me.clone(), seeds, opts).await;
     (me, node, group)
 }
 
 /// Spawns the node and joins its group in one motion — the shape
 /// [`spawn_mem_node`] needs for a node added to (or restarted on) a cluster
 /// that is already running.
-fn spawn_one(
+async fn spawn_one(
     net: &Network,
     id: NodeId,
     seeds: Vec<NodeId>,
     opts: &NodeOpts,
-) -> (Node<MemTransport>, Group) {
-    let node = build_node(net, id, seeds, opts);
+) -> (Node, Group) {
+    let node = build_node(net, id, seeds, opts).await;
     let group = join(&node, opts);
     (node, group)
 }
@@ -193,7 +195,7 @@ fn spawn_one(
 /// The one place a fixture joins its group, so the profile-carrying and the
 /// plain path can never drift: an unset [`NodeOpts::group_profile`] is a bare
 /// `join_group` (the node config's own mode), exactly as before.
-fn join(node: &Node<MemTransport>, opts: &NodeOpts) -> Group {
+fn join(node: &Node, opts: &NodeOpts) -> Group {
     match &opts.group_profile {
         Some(profile) => node.join_group_with(opts.group.clone(), profile.clone()),
         None => node.join_group(opts.group.clone()),
@@ -203,13 +205,17 @@ fn join(node: &Node<MemTransport>, opts: &NodeOpts) -> Group {
 /// The one place a `Node` is actually built, so every fixture applies the same
 /// knobs in the same order (`anti_entropy_interval_ms` must land *after*
 /// `gossip_interval_ms`, which sets both cadences).
-fn build_node(
-    net: &Network,
-    id: NodeId,
-    seeds: Vec<NodeId>,
-    opts: &NodeOpts,
-) -> Node<MemTransport> {
-    let mut builder = Node::builder(id.clone(), net.endpoint(id));
+async fn build_node(net: &Network, id: NodeId, seeds: Vec<NodeId>, opts: &NodeOpts) -> Node {
+    let announce_interval = Duration::from_millis(opts.gossip_interval_ms.unwrap_or(20));
+    let mut builder = Node::builder(id.clone())
+        .link(MemLink::new(net.endpoint(id), seeds.clone()))
+        .routing(RouterConfig {
+            announce_interval,
+            route_ttl: RouterConfig::default()
+                .route_ttl
+                .max(announce_interval.saturating_mul(6)),
+            ..RouterConfig::default()
+        });
     for seed in seeds {
         builder = builder.seed(seed);
     }
@@ -225,7 +231,7 @@ fn build_node(
     if let Some(addr) = &opts.advertise_addr {
         builder = builder.advertise_addr(addr.clone());
     }
-    builder.spawn()
+    builder.start().await.expect("memory node links bind")
 }
 
 /// A running all-to-all cluster on one in-memory [`Network`]: every node is
@@ -242,7 +248,7 @@ pub struct MemCluster {
     /// Node ids, in the order they were named to the builder.
     pub ids: Vec<NodeId>,
     /// The running nodes, index-aligned with [`ids`](Self::ids).
-    pub nodes: Vec<Node<MemTransport>>,
+    pub nodes: Vec<Node>,
     /// Each node's handle to the joined group, index-aligned with
     /// [`ids`](Self::ids).
     pub groups: Vec<Group>,
@@ -329,7 +335,7 @@ impl MemClusterBuilder {
     ///
     /// Must be called from within a Tokio runtime.
     #[must_use]
-    pub fn spawn(self) -> MemCluster {
+    pub async fn spawn(self) -> MemCluster {
         let net = Network::new();
         // Every node exists before any joins its group — the bring-up order
         // of the tests this harness consolidated, so no engine starts
@@ -339,7 +345,7 @@ impl MemClusterBuilder {
             let seeds = self.ids.iter().filter(|o| *o != id).cloned().collect();
             let mut opts = self.opts.clone();
             opts.advertise_addr = self.advertise.as_ref().and_then(|f| f(id));
-            nodes.push(build_node(&net, id.clone(), seeds, &opts));
+            nodes.push(build_node(&net, id.clone(), seeds, &opts).await);
         }
         let groups = nodes.iter().map(|node| join(node, &self.opts)).collect();
         MemCluster {

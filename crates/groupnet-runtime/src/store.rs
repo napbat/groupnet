@@ -14,6 +14,10 @@ use std::sync::Arc;
 
 use groupnet_core::{NodeId, RecoveredGrant};
 
+mod file;
+
+pub use file::FileGrantStore;
+
 /// Durable storage for one group's voter ledger: the `(epoch, claimant)` pair
 /// this node last granted.
 ///
@@ -84,6 +88,10 @@ use groupnet_core::{NodeId, RecoveredGrant};
 /// [`GroupProfile::with_voter_storage`](crate::GroupProfile::with_voter_storage)
 /// as a [`RecoveredGrant`]. Read it *before* joining: the join path is
 /// synchronous and holds a lock, so it can perform no I/O of its own.
+///
+/// [`FileGrantStore`] is the bundled implementation: one checksummed record
+/// per group, replaced atomically, read back with
+/// [`FileGrantStore::load`].
 ///
 /// [`NetStats`]: groupnet_core::NetStats
 pub trait GrantStore: Send + Sync + 'static {

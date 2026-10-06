@@ -9,7 +9,8 @@ use groupnet_core::replication::{Stage, TerminalReason, TerminalReceipt, Termina
 async fn unknown_terminal_write_is_read_back_before_retention_is_released() {
     let cluster = MemCluster::builder(&["event-terminal"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     source.unknown_terminal_once.store(true, Ordering::Release);
     let manager = Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, limits())
@@ -59,7 +60,10 @@ async fn unknown_terminal_write_is_read_back_before_retention_is_released() {
 
 #[tokio::test]
 async fn dropping_unsubscribe_caller_preserves_exact_source_readback() {
-    let cluster = MemCluster::builder(&["event-drop"]).group("stores").spawn();
+    let cluster = MemCluster::builder(&["event-drop"])
+        .group("stores")
+        .spawn()
+        .await;
     let source = MemSource::default();
     source.unknown_terminal_once.store(true, Ordering::Release);
     let manager = Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, limits())
@@ -120,7 +124,8 @@ async fn dropping_unsubscribe_caller_preserves_exact_source_readback() {
 async fn reset_requires_exact_tombstone_and_advances_persistent_name_fence() {
     let cluster = MemCluster::builder(&["event-reset"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     let manager = Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, limits())
         .expect("manager")
@@ -248,7 +253,8 @@ async fn reset_requires_exact_tombstone_and_advances_persistent_name_fence() {
 async fn source_expiry_stops_delivery_and_tombstone_is_separately_inspectable() {
     let cluster = MemCluster::builder(&["event-expiry"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     let manager = Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, limits())
         .expect("manager")
@@ -316,7 +322,8 @@ async fn source_expiry_stops_delivery_and_tombstone_is_separately_inspectable() 
 async fn detached_unsubscribe_releases_retention_without_rebinding_sink() {
     let cluster = MemCluster::builder(&["event-detached"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     source.unknown_terminal_once.store(true, Ordering::Release);
     let sink = MemSink::default();
@@ -380,7 +387,8 @@ async fn detached_unsubscribe_releases_retention_without_rebinding_sink() {
 async fn detached_unsubscribe_releases_known_gap_without_sink_or_event_bytes() {
     let cluster = MemCluster::builder(&["event-detached-gap"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     let sink = MemSink::default();
     let manager = Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, limits())
@@ -445,7 +453,8 @@ async fn classified_failures_after_commit_require_exact_terminal_readback() {
     {
         let cluster = MemCluster::builder(&["event-class"])
             .group("stores")
-            .spawn();
+            .spawn()
+            .await;
         let source = MemSource::default();
         *source.terminal_failure_once.lock().expect("failure lock") = Some(class);
         let manager =
@@ -494,7 +503,8 @@ async fn detached_classified_failures_after_commit_read_back_exact_tombstone() {
     {
         let cluster = MemCluster::builder(&["event-detached-class"])
             .group("stores")
-            .spawn();
+            .spawn()
+            .await;
         let source = MemSource::default();
         let manager =
             Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, limits())
@@ -546,7 +556,8 @@ async fn detached_classified_failures_after_commit_read_back_exact_tombstone() {
 async fn cancelled_detached_caller_can_inspect_committed_request_and_releases_admission() {
     let cluster = MemCluster::builder(&["event-detached-drop"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     let manager = Arc::new(
         Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, limits())

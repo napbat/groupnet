@@ -32,8 +32,9 @@ use std::time::Duration;
 
 use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed};
 use groupnet_core::NodeId;
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{Group, Node};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_transport_mem::{MemLink, Network};
 
 const GROUP: &str = "stores";
 
@@ -53,8 +54,8 @@ type Key = String;
 #[tokio::main]
 async fn main() {
     let net = Network::new();
-    let (writer_id, _writer_node, writer_group) = spawn(&net, "node-a", "node-b");
-    let (reader_id, _reader_node, reader_group) = spawn(&net, "node-b", "node-a");
+    let (writer_id, _writer_node, writer_group) = spawn(&net, "node-a", "node-b").await;
+    let (reader_id, _reader_node, reader_group) = spawn(&net, "node-b", "node-a").await;
     wait_until(|| writer_group.members().len() == 2 && reader_group.members().len() == 2).await;
     println!("== two nodes, one group \"{GROUP}\" ==");
     println!("  {writer_id} owns the records; {reader_id} serves reads from a cache");
@@ -177,13 +178,23 @@ async fn main() {
 
 /// Brings up one node on `net` seeded with `seed`, joined to [`GROUP`]. The
 /// returned [`Node`] must be kept alive: dropping it stops the node.
-fn spawn(net: &Network, id: &str, seed: &str) -> (NodeId, Node<MemTransport>, Group) {
+async fn spawn(net: &Network, id: &str, seed: &str) -> (NodeId, Node, Group) {
     let me = NodeId::new(id);
-    let node = Node::builder(me.clone(), net.endpoint(me.clone()))
+    let node = Node::builder(me.clone())
+        .link(MemLink::new(
+            net.endpoint(me.clone()),
+            vec![NodeId::new(seed)],
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .seed(NodeId::new(seed))
         // Brisk cadences so a demo does not spend its life waiting for gossip.
         .gossip_interval_ms(10)
-        .spawn();
+        .start()
+        .await
+        .expect("the memory link binds");
     let group = node.join_group(GROUP);
     (me, node, group)
 }

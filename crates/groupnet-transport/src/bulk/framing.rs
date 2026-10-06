@@ -90,21 +90,43 @@ impl<S: AsyncWrite + Unpin> DataStream<S> {
     /// # Errors
     /// Rejects invalid limits or oversized payloads and propagates write errors.
     pub async fn send_bounded_ref(&mut self, payload: &[u8], max_bytes: usize) -> io::Result<()> {
-        if max_bytes == 0 || max_bytes > MAX_FRAME || payload.len() > max_bytes {
+        self.send_bounded_parts(&[], payload, max_bytes).await
+    }
+
+    /// Sends one frame whose payload is `head` followed by `body`, written
+    /// from the two buffers without joining them — so a protocol header in
+    /// front of a large body costs no copy. The receiver sees one ordinary
+    /// frame. The limit applies to the combined length and is checked before
+    /// anything is written. A cancelled write leaves the stream unusable.
+    ///
+    /// # Errors
+    /// Rejects invalid limits or oversized payloads and propagates write errors.
+    pub async fn send_bounded_parts(
+        &mut self,
+        head: &[u8],
+        body: &[u8],
+        max_bytes: usize,
+    ) -> io::Result<()> {
+        let total = head.len().checked_add(body.len());
+        if max_bytes == 0 || max_bytes > MAX_FRAME || total.is_none_or(|total| total > max_bytes) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "frame exceeds caller's bounded send limit",
             ));
         }
-        let len = u32::try_from(payload.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame length exceeds u32"))?;
+        let len = total
+            .and_then(|total| u32::try_from(total).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "frame length exceeds u32")
+            })?;
         let header = FrameHeader {
             len: U32::new(len),
             kind: FRAME_KIND_DATA,
             reserved: [0; 3],
         };
         self.inner.write_all(header.as_bytes()).await?;
-        self.inner.write_all(payload).await?;
+        self.inner.write_all(head).await?;
+        self.inner.write_all(body).await?;
         self.inner.flush().await?;
         Ok(())
     }
@@ -299,6 +321,37 @@ mod tests {
                 reader.recv_bounded(5).await.unwrap().unwrap(),
                 &b"five!"[..]
             );
+        });
+    }
+
+    #[test]
+    fn a_two_part_frame_is_one_frame_bounded_by_its_total() {
+        futures::executor::block_on(async {
+            let mut bytes = Vec::new();
+            {
+                let mut stream = DataStream::new(futures::io::Cursor::new(&mut bytes));
+                assert_eq!(
+                    stream
+                        .send_bounded_parts(b"head", b"body", 7)
+                        .await
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput
+                );
+                stream
+                    .send_bounded_parts(b"head", b"body", 8)
+                    .await
+                    .unwrap();
+                stream.send_bounded_parts(b"", b"", 1).await.unwrap();
+            }
+            assert_eq!(bytes.len(), 2 * HEADER_SIZE + 8);
+            let mut reader = DataStream::new(futures::io::Cursor::new(bytes));
+            assert_eq!(
+                reader.recv_bounded(8).await.unwrap().unwrap(),
+                &b"headbody"[..]
+            );
+            assert!(reader.recv_bounded(8).await.unwrap().unwrap().is_empty());
+            assert!(reader.recv_bounded(8).await.unwrap().is_none());
         });
     }
 }

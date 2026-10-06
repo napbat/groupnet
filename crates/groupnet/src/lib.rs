@@ -8,7 +8,9 @@
 //! |--------|------|
 //! | [`core`] | sans-IO state machine, identity, weighted [`placement`](core::placement) (HA-hash), and the [`wire`](core::wire) protocol — pure, deterministic, dep-free |
 //! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) (persistent control-plane connections *and* bulk streams) |
+//! | [`network`] | protocol-independent routing and pinned end-to-end TLS streams *(feature `runtime`, default)* |
 //! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
+//! | [`rpc`] | request/response calls over the data plane: an [`RpcClient`](rpc::RpcClient) multiplexing concurrent calls onto one stream per peer, and an [`RpcServer`](rpc::RpcServer) answering them under deadlines and per-connection limits *(feature `rpc`)* |
 //! | [`consistency`] | session-consistency layer: per-writer sequenced [`WriteFeed`](consistency::WriteFeed)s with loss detection, and [`Frontier`](consistency::Frontier) read-your-writes barriers *(feature `consistency`)* |
 //! | `consistency::hosted` | the Hosted write path: fenced, epoch-scoped writes through the group's elected host, priced by a commit level (`Local` / `QuorumApplied` / `AllApplied`) *(feature `consistency-hosted`)* |
 //! | `consistency::hosted::handoff` | snapshot handoff: a recovering host pulls a covering snapshot from a donor over the data plane, verified at three points, instead of waiting on a ring it has overrun *(feature `consistency-handoff`)* |
@@ -23,19 +25,23 @@
 //! # #[cfg(all(feature = "runtime", feature = "mem"))]
 //! # mod example {
 //! use groupnet::core::NodeId;
+//! use groupnet::network::RouterConfig;
 //! use groupnet::runtime::Node;
-//! use groupnet::transport::mem::Network;
+//! use groupnet::transport::mem::{MemLink, Network};
 //!
-//! # async fn demo() {
+//! # async fn demo() -> std::io::Result<()> {
 //! let net = Network::new();
-//! let node = Node::builder(NodeId::new("node-a"), net.endpoint(NodeId::new("node-a")))
-//!     .seed(NodeId::new("node-b"))
-//!     .spawn();
+//! let id = NodeId::new("node-a");
+//! let node = Node::builder(id.clone())
+//!     .link(MemLink::new(net.endpoint(id), vec![NodeId::new("node-b")]))
+//!     .routing(RouterConfig::default())
+//!     .start().await?;
 //!
 //! let group = node.join_group("shard-42");
 //! if group.is_coordinator() {
 //!     group.sync(|ctx| ctx.update_metadata("routing", "v3"));
 //! }
+//! # Ok(())
 //! # }
 //! # }
 //! ```
@@ -74,13 +80,45 @@ pub mod transport {
     /// (`TcpBulkTransport`, feature `tcp`).
     #[cfg(any(feature = "tcp", feature = "tcp-msg"))]
     pub use groupnet_transport_tcp as tcp;
+
+    /// Object-safe link registration and owned worker lifecycle (feature `runtime`).
+    #[cfg(feature = "runtime")]
+    pub use groupnet_transport::link;
+
+    /// Application admission and live adjacent-peer sessions (feature `runtime`).
+    #[cfg(feature = "runtime")]
+    pub use groupnet_transport::admission;
+
+    /// Native local IPC links (feature `ipc`).
+    #[cfg(feature = "ipc")]
+    pub use groupnet_transport_ipc as ipc;
+
+    /// UDP discovery, punching, and relay links with explicit admission (feature `punch`).
+    #[cfg(feature = "punch")]
+    pub use groupnet_transport_punch as punch;
 }
+
+/// Managed networks: protocol-independent routing and encrypted streams
+/// *(feature `runtime`)*. Link implementations remain in [`transport`].
+#[cfg(feature = "runtime")]
+pub use groupnet_network as network;
 
 /// Async runtime: the group-per-task [`Node`](runtime::Node) /
 /// [`Group`](runtime::Group) driver and the cluster [`Routing`](runtime::Routing)
 /// table.
 #[cfg(feature = "runtime")]
 pub use groupnet_runtime as runtime;
+
+/// Request/response RPC over the data plane: an
+/// [`RpcClient`](rpc::RpcClient) multiplexes concurrent calls onto one
+/// [`DataStream`](transport::bulk::DataStream) per peer (lazily connected,
+/// replaced after a failure), and an [`RpcServer`](rpc::RpcServer) answers
+/// them with an async handler, bounded per connection and by each request's
+/// deadline. The server **owns `accept`** of the plane it serves, so give it
+/// its own bulk transport unless nothing else accepts streams; peer addresses
+/// are registered on the transport by the caller *(feature `rpc`)*.
+#[cfg(feature = "rpc")]
+pub use groupnet_rpc as rpc;
 
 /// Session-consistency layer over groups: per-writer sequenced write feeds
 /// ([`WriteFeed`](consistency::WriteFeed) / [`PeerWrites`](consistency::PeerWrites),

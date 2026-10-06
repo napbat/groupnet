@@ -4,7 +4,7 @@
 //! built on Groupnet needs — replicating writes to replicas, bootstrapping a
 //! fresh replica from a snapshot, bulk state transfer on rebalance.
 //!
-//! This is deliberately separate from the control-plane [`Transport`](crate::Transport)
+//! This is deliberately separate from the control-plane [`Transport`]
 //! (small, best-effort *datagrams* for gossip). The two planes have opposite
 //! requirements and are bound to their own physical connections — gossip over
 //! UDP, data over TCP/QUIC.
@@ -85,6 +85,14 @@ impl<B: BulkTransport> DataPlane<B> {
         Self {
             transport: Arc::new(transport),
         }
+    }
+
+    /// The bound transport, shared by every clone of this plane — for the
+    /// binding's own API after the plane is built, such as teaching a TCP
+    /// endpoint a peer's address that arrived later.
+    #[must_use]
+    pub fn transport(&self) -> &B {
+        &self.transport
     }
 
     /// Opens a framed stream to `to`.
