@@ -26,13 +26,14 @@ connectivity = ["dep:groupnet-transport-punch", "link"]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
 groupnet-transport-punch = { workspace = true, optional = true }
+bytes = { workspace = true }
+zerocopy = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["net", "io-util"] }
 tokio-util = { workspace = true, features = ["compat"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
-bytes = { workspace = true }
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
 
 [lints]

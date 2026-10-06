@@ -19,6 +19,7 @@ link = ["groupnet-transport/link"]
 # A concrete Transport binding depends only on the trait and the id type — never
 # on the runtime. It pulls just tokio's channel/sync slice.
 [dependencies]
+bytes = { workspace = true }
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
@@ -29,7 +30,6 @@ tokio-util = { workspace = true, features = ["compat"], optional = true }
 # wider test-only tokio slice (rt + macros + time) on top of `sync`.
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
-bytes = { workspace = true }
 
 [lints]
 workspace = true

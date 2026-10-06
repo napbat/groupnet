@@ -3,6 +3,7 @@
 use groupnet_transport::link::LinkFuture;
 use tokio::time::timeout;
 
+use super::super::DEFAULT_MAX_PEERS;
 use super::*;
 
 fn loopback() -> SocketAddr {
@@ -92,10 +93,11 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
         challenges: Challenges::default(),
         decisions: JoinSet::new(),
         pre_admission: Entry::new(now),
+        limits: RendezvousLimits::default(),
     };
     for sequence in [1, 2] {
         let issued = now + Duration::from_secs(sequence - 1);
-        for index in 0..MAX_PEERS {
+        for index in 0..DEFAULT_MAX_PEERS {
             let name = format!("unproved-{index}");
             let packet = Packet {
                 sender: &name,
@@ -111,7 +113,7 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
                     .is_some()
             );
         }
-        assert_eq!(state.challenges.pending.len(), MAX_PEERS);
+        assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS);
         assert!(state.entries.is_empty());
     }
     let issued = now + Duration::from_secs(2);
@@ -129,7 +131,7 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
     else {
         panic!("expected challenge");
     };
-    assert_eq!(state.challenges.pending.len(), MAX_PEERS);
+    assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS);
     let proven = state
         .challenges
         .prove(
@@ -149,7 +151,7 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
         .unwrap();
     assert_eq!(proven.session, [3; 16]);
     assert!(state.entries.is_empty());
-    assert_eq!(state.challenges.pending.len(), MAX_PEERS - 1);
+    assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS - 1);
 }
 
 #[tokio::test]
@@ -391,5 +393,80 @@ async fn discovery_only_discloses_addresses_when_both_participants_allow_direct_
                 (!(requester_relay || peer_relay)).then_some(peer_address)
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn configured_peer_and_pending_policy_limits_independently_reject_overflow() {
+    for (max_peers, max_pending_admissions) in [(1, 2), (2, 1)] {
+        let socket = UdpSocket::bind(loopback()).await.unwrap();
+        let recipient = UdpSocket::bind(loopback()).await.unwrap();
+        let now = Instant::now();
+        let limits = RendezvousLimits {
+            max_peers,
+            max_pending_admissions,
+            max_challenges: 3,
+        };
+        let mut state = ServerState {
+            entries: HashMap::new(),
+            challenges: Challenges {
+                pending: HashMap::new(),
+                capacity: limits.max_challenges,
+            },
+            decisions: JoinSet::new(),
+            pre_admission: Entry::new(now),
+            limits,
+        };
+        let policy: Arc<dyn Admission> = Arc::new(Block);
+        let registration = registration(now, recipient.local_addr().unwrap());
+        let packet = Packet {
+            sender: "first",
+            session: registration.session,
+            sequence: 1,
+            body: Body::Register {
+                nonce: [1; 16],
+                cookie: [2; 16],
+                relay_only: true,
+                credential: &[],
+            },
+        };
+        register(
+            &socket,
+            None,
+            &policy,
+            false,
+            &mut state,
+            packet,
+            registration,
+        )
+        .await;
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.decisions.len(), 1);
+        register(
+            &socket,
+            None,
+            &policy,
+            false,
+            &mut state,
+            Packet {
+                sender: "overflow",
+                ..packet
+            },
+            registration,
+        )
+        .await;
+        let mut bytes = [0; MAX_PACKET];
+        let (length, _) = timeout(Duration::from_secs(1), recipient.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            wire::decode_mode(&bytes[..length], None).unwrap().body,
+            Body::Denied { .. }
+        ));
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.decisions.len(), 1);
+        state.decisions.abort_all();
+        while state.decisions.join_next().await.is_some() {}
     }
 }

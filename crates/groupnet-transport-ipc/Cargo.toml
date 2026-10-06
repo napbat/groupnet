@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes.workspace = true
+zerocopy.workspace = true
 groupnet-core.workspace = true
 groupnet-transport = { workspace = true, features = ["link"] }
 tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time", "macros"] }

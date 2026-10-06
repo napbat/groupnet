@@ -5,6 +5,7 @@ pub(super) use candidates::CandidateList;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use ring::hmac;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::NetworkKey;
 use super::candidates::{Candidates, MAX_CANDIDATES, valid};
@@ -13,6 +14,23 @@ pub(super) const MAX_PACKET: usize = 1200;
 const TAG: usize = 32;
 const MAGIC: &[u8; 4] = b"GNP4";
 pub(super) type Session = [u8; 16];
+
+/// The fixed prefix before the variable-length sender in the GNP4 envelope.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct EnvelopeHeader {
+    magic: [u8; 4],
+    kind: u8,
+    sender_len: u8,
+}
+
+/// The fixed session suffix after the sender; byte arrays preserve network order.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SessionHeader {
+    session: Session,
+    sequence: [u8; 8],
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum Body<'a> {
@@ -304,7 +322,9 @@ pub(super) fn encode_mode(
         bytes: &mut buffer[..MAX_PACKET - if key.is_some() { TAG } else { 0 }],
         position: 0,
     };
-    writer.put(MAGIC)?;
+    if packet.sender.is_empty() || packet.sender.len() > 64 {
+        return None;
+    }
     let kind = match packet.body {
         Body::Hello { .. } => 1,
         Body::Challenge { .. } => 2,
@@ -325,10 +345,22 @@ pub(super) fn encode_mode(
         Body::Candidates { .. } => 17,
         Body::Observed { .. } => 18,
     };
-    writer.put(&[kind])?;
-    writer.name(packet.sender)?;
-    writer.put(&packet.session)?;
-    writer.put(&packet.sequence.to_be_bytes())?;
+    writer.put(
+        EnvelopeHeader {
+            magic: *MAGIC,
+            kind,
+            sender_len: u8::try_from(packet.sender.len()).ok()?,
+        }
+        .as_bytes(),
+    )?;
+    writer.put(packet.sender.as_bytes())?;
+    writer.put(
+        SessionHeader {
+            session: packet.session,
+            sequence: packet.sequence.to_be_bytes(),
+        }
+        .as_bytes(),
+    )?;
     encode_body(packet.body, &mut writer)?;
     let length = writer.position;
     if let Some(key) = key {
@@ -494,21 +526,24 @@ pub(super) fn decode_mode<'a>(bytes: &'a [u8], key: Option<&NetworkKey>) -> Opti
     } else {
         bytes.len()
     };
-    let mut reader = Reader {
-        bytes: &bytes[..length],
-        position: 0,
-    };
-    if reader.take(4)? != MAGIC {
+    let (header, remaining) = EnvelopeHeader::ref_from_prefix(&bytes[..length]).ok()?;
+    if header.magic != *MAGIC || header.sender_len == 0 || header.sender_len > 64 {
         return None;
     }
-    let kind = reader.byte()?;
-    let sender = reader.name()?;
-    let session = reader.token()?;
-    let sequence = u64::from_be_bytes(reader.take(8)?.try_into().ok()?);
+    let sender_len = usize::from(header.sender_len);
+    let sender = std::str::from_utf8(remaining.get(..sender_len)?).ok()?;
+    let (session_header, body_bytes) =
+        SessionHeader::ref_from_prefix(remaining.get(sender_len..)?).ok()?;
+    let session = session_header.session;
+    let sequence = u64::from_be_bytes(session_header.sequence);
+    let mut reader = Reader {
+        bytes: body_bytes,
+        position: 0,
+    };
     if sequence == 0 {
         return None;
     }
-    let body = decode_body(kind, &mut reader)?;
+    let body = decode_body(header.kind, &mut reader)?;
     if reader.position != reader.bytes.len() {
         return None;
     }

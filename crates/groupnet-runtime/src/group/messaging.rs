@@ -11,11 +11,9 @@ use crate::messaging::{
     SendOptions,
 };
 
-const FANOUT_CONCURRENCY: usize = 32;
-
 impl Group {
     /// Sends a borrowed opaque buffer to a snapshot of the live members,
-    /// excluding this node, with best-effort delivery and one payload copy.
+    /// excluding this node, with best-effort delivery and shared fanout plaintext.
     /// This never becomes a Hosted/quorum commit or a metadata operation.
     ///
     /// # Errors
@@ -24,13 +22,15 @@ impl Group {
     pub async fn send(&self, payload: impl AsRef<[u8]>) -> io::Result<GroupSendReport> {
         let payload = payload.as_ref();
         let options = SendOptions::default();
-        options.validate(payload.len())?;
+        self.messaging
+            .sender
+            .validate_send(options, payload.len())?;
         self.send_frame(Bytes::copy_from_slice(payload), options)
             .await
     }
 
     /// Sends a shared buffer to a frozen local membership snapshot, excluding
-    /// this node, with at most 32 concurrent recipient sends.
+    /// this node, within the configured recipient-send concurrency.
     ///
     /// Departures do not remove selected recipients; late joiners are not added.
     /// Every selected peer has a result, including rejection and timeout (whose
@@ -46,7 +46,9 @@ impl Group {
         payload: Bytes,
         options: SendOptions,
     ) -> io::Result<GroupSendReport> {
-        options.validate(payload.len())?;
+        self.messaging
+            .sender
+            .validate_send(options, payload.len())?;
         self.messaging.ensure_open()?;
         let snapshot = self.members_rx.borrow().clone();
         if !snapshot.contains(&self.local) {
@@ -154,13 +156,14 @@ async fn fanout(
     options: SendOptions,
 ) -> GroupSendReport {
     let mut tasks = JoinSet::new();
-    let mut active = HashMap::with_capacity(FANOUT_CONCURRENCY.min(recipients.len()));
+    let concurrency = sender.config().fanout_concurrency;
+    let mut active = HashMap::with_capacity(concurrency.min(recipients.len()));
     let mut results: Vec<Option<io::Result<MessageId>>> = std::iter::repeat_with(|| None)
         .take(recipients.len())
         .collect();
     let mut next = 0;
     loop {
-        while next < recipients.len() && tasks.len() < FANOUT_CONCURRENCY {
+        while next < recipients.len() && tasks.len() < concurrency {
             let sender = sender.clone();
             let to = recipients[next].clone();
             let group = group.clone();

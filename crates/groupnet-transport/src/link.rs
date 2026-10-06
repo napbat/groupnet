@@ -89,12 +89,6 @@ pub trait LinkLifecycle: Send + Sync + fmt::Debug + 'static {
     fn close(&self) -> LinkFuture<'_, ()>;
 }
 
-#[derive(Debug)]
-enum Buffer {
-    Shared(Arc<[u8]>),
-    Owned(Vec<u8>),
-}
-
 /// One physical frame, preserving shared or uniquely owned bytes without copying.
 #[derive(Debug)]
 pub struct Outbound {
@@ -104,16 +98,16 @@ pub struct Outbound {
     pub deadline: Instant,
     /// Expected live generation, captured before router queueing or fragmentation.
     pub session: Option<SessionId>,
-    bytes: Buffer,
+    bytes: bytes::Bytes,
 }
 
 impl Outbound {
     /// Queues a shared frame without copying its bytes.
     #[must_use]
-    pub fn shared(peer: NodeId, bytes: Arc<[u8]>, deadline: Instant) -> Self {
+    pub fn shared(peer: NodeId, bytes: bytes::Bytes, deadline: Instant) -> Self {
         Self {
             peer,
-            bytes: Buffer::Shared(bytes),
+            bytes,
             deadline,
             session: None,
         }
@@ -121,10 +115,10 @@ impl Outbound {
 
     /// Queues a uniquely owned frame without converting/copying its allocation.
     #[must_use]
-    pub fn owned(peer: NodeId, bytes: Vec<u8>, deadline: Instant) -> Self {
+    pub fn owned(peer: NodeId, bytes: impl Into<bytes::Bytes>, deadline: Instant) -> Self {
         Self {
             peer,
-            bytes: Buffer::Owned(bytes),
+            bytes: bytes.into(),
             deadline,
             session: None,
         }
@@ -140,10 +134,13 @@ impl Outbound {
     /// The frame payload.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        match &self.bytes {
-            Buffer::Shared(bytes) => bytes,
-            Buffer::Owned(bytes) => bytes,
-        }
+        &self.bytes
+    }
+
+    /// Transfers the frame allocation without copying payload bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.bytes
     }
 }
 

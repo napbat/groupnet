@@ -18,6 +18,8 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use zerocopy::byteorder::network_endian::U32;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::{
     UnorderedConfig, UnorderedDelivery, UnorderedOptions, UnorderedProtocol, UnorderedSession,
@@ -26,9 +28,33 @@ use super::{
     wire::{self, SessionId},
 };
 
-const PREAMBLE: &[u8; 8] = b"GNUORD01";
-const REQUEST: usize = 29;
-const REPLY: usize = 30;
+const PREAMBLE: [u8; 8] = *b"GNUORD01";
+const REQUEST: usize = size_of::<SetupRequest>();
+const REPLY: usize = size_of::<SetupReply>();
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(C)]
+struct SetupIdentity {
+    preamble: [u8; 8],
+    delivery: u8,
+    session: SessionId,
+}
+
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SetupRequest {
+    identity: SetupIdentity,
+    max_payload: U32,
+}
+
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SetupReply {
+    request: SetupRequest,
+    status: u8,
+}
 const READY: u8 = 0xa5;
 type Key = (NodeId, SessionId);
 
@@ -208,17 +234,25 @@ pub(super) async fn connect(
         .fill(&mut id)
         .map_err(|_| io::Error::other("session randomness unavailable"))?;
     let lease = reserve(inner, to.clone(), Some(id))?;
-    let request = request(id, options.delivery, inner.config.max_payload)?;
+    let maximum = inner.config.max_payload.min(
+        inner
+            .io
+            .max_payload(to)
+            .saturating_sub(wire::HEADER + wire::TAG),
+    );
+    let request = request(id, options.delivery, maximum)?;
     let operation = async {
         let mut control = inner.tunnels.connect_control(to).await?;
-        control.write_all(&request).await?;
+        control.write_all(request.as_bytes()).await?;
         control.flush().await?;
         let mut reply = [0; REPLY];
         control.read_exact(&mut reply).await?;
-        if reply[..25] != request[..25] {
+        let reply = SetupReply::read_from_bytes(&reply)
+            .map_err(|_| invalid("invalid unordered setup reply"))?;
+        if reply.request.identity != request.identity {
             return Err(invalid("unordered peer changed session identity or policy"));
         }
-        match reply[29] {
+        match reply.status {
             0 => {}
             1 => {
                 return Err(io::Error::new(
@@ -228,8 +262,8 @@ pub(super) async fn connect(
             }
             _ => return Err(invalid("invalid unordered setup status")),
         }
-        let maximum = payload_bound(&reply[25..29])?;
-        if maximum > inner.config.max_payload {
+        let maximum = payload_bound(reply.request.max_payload)?;
+        if maximum > payload_bound(request.max_payload)? {
             return Err(invalid("invalid peer message bound"));
         }
         let (state, session) = establish(
@@ -325,7 +359,7 @@ async fn dispatch(owner: Weak<Inner>, io: ProtocolIo, cancel: CancellationToken)
                 .upgrade()
         });
         if let Some(state) = state {
-            let _accepted = state.receive_packet(&packet.payload);
+            let _accepted = state.receive_packet(packet.payload);
         }
     }
     cancel.cancel();
@@ -369,27 +403,35 @@ async fn receive_control(
 ) -> io::Result<()> {
     let mut request = [0; REQUEST];
     control.read_exact(&mut request).await?;
-    if &request[..8] != PREAMBLE {
+    let request = SetupRequest::read_from_bytes(&request)
+        .map_err(|_| invalid("invalid unordered setup request"))?;
+    if request.identity.preamble != PREAMBLE {
         return Err(invalid("invalid unordered control version"));
     }
-    let delivery = wire::delivery(request[8])?;
-    let id = request[9..25]
-        .try_into()
-        .map_err(|_| invalid("invalid unordered session identity"))?;
-    let remote_max = payload_bound(&request[25..29])?;
+    let delivery = wire::delivery(request.identity.delivery)?;
+    let id = request.identity.session;
+    let remote_max = payload_bound(request.max_payload)?;
     let inner = owner.upgrade().ok_or_else(aborted)?;
-    let maximum = remote_max.min(inner.config.max_payload);
-    let mut reply = [0; REPLY];
-    reply[..25].copy_from_slice(&request[..25]);
-    reply[25..29].copy_from_slice(
-        &u32::try_from(maximum)
-            .map_err(|_| invalid("payload bound overflow"))?
-            .to_be_bytes(),
+    let maximum = remote_max.min(inner.config.max_payload).min(
+        inner
+            .io
+            .max_payload(&peer)
+            .saturating_sub(wire::HEADER + wire::TAG),
     );
+    let mut reply = SetupReply {
+        request: SetupRequest {
+            identity: request.identity,
+            max_payload: U32::new(
+                u32::try_from(maximum).map_err(|_| invalid("payload bound overflow"))?,
+            ),
+        },
+        status: 0,
+    };
+    payload_bound(reply.request.max_payload)?;
     if !inner.config.allows(delivery) {
-        reply[29] = 1;
+        reply.status = 1;
         drop(inner);
-        control.write_all(&reply).await?;
+        control.write_all(reply.as_bytes()).await?;
         control.flush().await?;
         let _closed = control.close().await;
         return Err(io::Error::new(
@@ -411,7 +453,7 @@ async fn receive_control(
     )?;
     register(&inner, &state)?;
     drop(inner);
-    control.write_all(&reply).await?;
+    control.write_all(reply.as_bytes()).await?;
     control.flush().await?;
     let mut ready = [0];
     control.read_exact(&mut ready).await?;
@@ -447,14 +489,14 @@ fn establish(
     max_payload: usize,
     lease: Lease,
     control: &TunneledStream,
-    request: &[u8; REQUEST],
+    request: &SetupRequest,
     initiator: bool,
 ) -> io::Result<(Arc<State>, UnorderedSession)> {
     let mut keys = [0; 64];
     control.export_keying_material(
         &mut keys,
         b"EXPORTER-groupnet-unordered-v1",
-        Some(&request[..25]),
+        Some(request.identity.as_bytes()),
     )?;
     let result = session::create(
         Parameters {
@@ -479,29 +521,25 @@ fn request(
     id: SessionId,
     delivery: super::UnorderedDelivery,
     maximum: usize,
-) -> io::Result<[u8; REQUEST]> {
-    let mut bytes = [0; REQUEST];
-    bytes[..8].copy_from_slice(PREAMBLE);
-    bytes[8] = wire::policy(delivery);
-    bytes[9..25].copy_from_slice(&id);
-    bytes[25..].copy_from_slice(
-        &u32::try_from(maximum)
-            .map_err(|_| invalid("payload bound overflow"))?
-            .to_be_bytes(),
-    );
-    Ok(bytes)
+) -> io::Result<SetupRequest> {
+    let max_payload =
+        U32::new(u32::try_from(maximum).map_err(|_| invalid("payload bound overflow"))?);
+    payload_bound(max_payload)?;
+    Ok(SetupRequest {
+        identity: SetupIdentity {
+            preamble: PREAMBLE,
+            delivery: wire::policy(delivery),
+            session: id,
+        },
+        max_payload,
+    })
 }
 
-fn payload_bound(bytes: &[u8]) -> io::Result<usize> {
-    let bound = u32::from_be_bytes(
-        bytes
-            .try_into()
-            .map_err(|_| invalid("invalid payload bound"))?,
-    );
-    if !(1..=48 * 1024).contains(&bound) {
+fn payload_bound(bound: U32) -> io::Result<usize> {
+    if bound.get() == 0 {
         return Err(invalid("invalid payload bound"));
     }
-    usize::try_from(bound).map_err(|_| invalid("payload bound overflow"))
+    usize::try_from(bound.get()).map_err(|_| invalid("payload bound overflow"))
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -514,4 +552,28 @@ fn poisoned() -> io::Error {
 
 fn endpoint_closed() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "unordered endpoint closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_layout_preserves_identity_policy_and_network_order_bounds() {
+        let request = request([9; 16], UnorderedDelivery::Reliable, 96 * 1024).unwrap();
+        assert_eq!(REQUEST, 29);
+        assert_eq!(REPLY, 30);
+        assert_eq!(request.identity.as_bytes().len(), 25);
+        let decoded = SetupRequest::read_from_bytes(request.as_bytes()).unwrap();
+        assert_eq!(decoded.identity, request.identity);
+        assert_eq!(payload_bound(decoded.max_payload).unwrap(), 96 * 1024);
+        let reply = SetupReply { request, status: 1 };
+        let decoded = SetupReply::read_from_bytes(reply.as_bytes()).unwrap();
+        assert_eq!(decoded.status, 1);
+        assert_eq!(decoded.request.identity, reply.request.identity);
+        assert!(payload_bound(U32::new(0)).is_err());
+        for end in 0..REQUEST {
+            assert!(SetupRequest::read_from_bytes(&request.as_bytes()[..end]).is_err());
+        }
+    }
 }

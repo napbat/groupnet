@@ -1,8 +1,12 @@
 //! Router lifecycle, typed links, path-vector learning, and packet forwarding.
 
 mod adapters;
+mod packet;
 mod protocol;
 mod routing;
+
+pub use crate::wire::ReassemblyConfig;
+pub use packet::PacketBuffer;
 
 pub use protocol::{ProtocolId, ProtocolIo};
 
@@ -55,6 +59,28 @@ pub struct RouterConfig {
     pub route_ttl: Duration,
     /// Interval between bounded path-vector announcements.
     pub announce_interval: Duration,
+    /// Largest complete routing envelope; must fit the fragment u32 total.
+    pub max_frame: usize,
+    /// Maximum path length and data hop budget; must fit u8.
+    pub max_hops: usize,
+    /// Retained incomplete-fragment bounds.
+    pub reassembly: ReassemblyConfig,
+    /// Maximum exclusive application namespaces; must fit u16 IDs.
+    pub max_protocols: usize,
+    /// Bounded inbox capacity for each application namespace.
+    pub protocol_queue: usize,
+    /// Bounded router event queue capacity.
+    pub event_queue: usize,
+    /// Bounded coordination inbox capacity.
+    pub message_queue: usize,
+    /// Bounded tunnel inbox capacity.
+    pub tunnel_queue: usize,
+    /// Bounded outbound queue capacity for each link.
+    pub link_queue: usize,
+    /// Number of recent routed identities retained for loop/replay suppression.
+    pub replay_capacity: usize,
+    /// Physical-send deadline shared by all fragments of a frame.
+    pub send_timeout: Duration,
 }
 
 impl Default for RouterConfig {
@@ -65,7 +91,66 @@ impl Default for RouterConfig {
             max_transports: 16,
             route_ttl: Duration::from_secs(6),
             announce_interval: Duration::from_secs(1),
+            max_frame: wire::MAX_FRAME,
+            max_hops: wire::MAX_HOPS,
+            reassembly: ReassemblyConfig::default(),
+            max_protocols: 32,
+            protocol_queue: 128,
+            event_queue: 256,
+            message_queue: 64,
+            tunnel_queue: 256,
+            link_queue: 64,
+            replay_capacity: 4096,
+            send_timeout: Duration::from_secs(5),
         }
+    }
+}
+
+impl RouterConfig {
+    /// Validates wire representability and bounded channel/resource policy.
+    /// # Errors
+    /// Rejects zero capacities, impossible wire bounds, or invalid timers.
+    pub fn validate(&self) -> io::Result<()> {
+        let queues = [
+            self.protocol_queue,
+            self.event_queue,
+            self.message_queue,
+            self.tunnel_queue,
+            self.link_queue,
+        ];
+        let now = tokio::time::Instant::now();
+        let timers = [
+            self.reassembly.timeout,
+            self.send_timeout,
+            self.announce_interval,
+            self.route_ttl,
+        ];
+        if self.max_routes == 0
+            || self.max_transports == 0
+            || self.max_frame < wire::MAX_DATA_HEADER
+            || u32::try_from(self.max_frame).is_err()
+            || self.max_frame > isize::MAX as usize
+            || !(2..=usize::from(u8::MAX)).contains(&self.max_hops)
+            || self.max_protocols == 0
+            || self.max_protocols > usize::from(u16::MAX) + 1
+            || queues
+                .iter()
+                .any(|capacity| *capacity == 0 || *capacity > tokio::sync::Semaphore::MAX_PERMITS)
+            || self.replay_capacity == 0
+            || self.reassembly.max_pending == 0
+            || self.reassembly.max_fragments == 0
+            || self.reassembly.max_fragments > usize::from(u16::MAX)
+            || self.reassembly.timeout.is_zero()
+            || self.send_timeout.is_zero()
+            || self.announce_interval.is_zero()
+            || self.route_ttl <= self.announce_interval
+            || timers
+                .iter()
+                .any(|duration| now.checked_add(*duration).is_none())
+        {
+            return Err(wire::invalid("invalid router configuration"));
+        }
+        Ok(())
     }
 }
 
@@ -86,7 +171,7 @@ pub struct Route {
 
 struct Queued {
     peer: NodeId,
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     session: Option<SessionId>,
 }
 
@@ -170,7 +255,7 @@ enum Event {
 
 struct AdvertisedRoute {
     path: Vec<NodeId>,
-    frame: Arc<[u8]>,
+    frame: Bytes,
 }
 
 /// Opaque application-plane packet, separate from coordination and tunnel traffic.
@@ -241,23 +326,17 @@ impl Router {
     /// # Panics
     /// Panics if called outside a Tokio runtime.
     pub fn new(local: NodeId, config: RouterConfig) -> io::Result<Self> {
-        if !wire::id_valid(&local)
-            || config.max_routes == 0
-            || config.max_routes > 4096
-            || config.max_transports == 0
-            || config.max_transports > 256
-            || config.announce_interval.is_zero()
-            || config.route_ttl <= config.announce_interval
-        {
-            return Err(wire::invalid("invalid router configuration"));
+        config.validate()?;
+        if !wire::id_valid(&local) {
+            return Err(wire::invalid("invalid router identity"));
         }
         let mut nonce = [0; 8];
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| io::Error::other("OS randomness unavailable"))?;
-        let (events, receive) = mpsc::channel(256);
-        let (messages, message_rx) = mpsc::channel(64);
-        let (tunnels, tunnel_rx) = mpsc::channel(256);
+        let (events, receive) = mpsc::channel(config.event_queue);
+        let (messages, message_rx) = mpsc::channel(config.message_queue);
+        let (tunnels, tunnel_rx) = mpsc::channel(config.tunnel_queue);
         let (advertisements, _) = watch::channel(Arc::new(Vec::new()));
         let (reachable, _) = watch::channel(Arc::new(Vec::new()));
         let shared = Arc::new(Shared {
@@ -334,7 +413,12 @@ impl Router {
                 .peers
                 .iter()
                 .any(|peer| !wire::id_valid(peer) || peer == &shared.local)
-            || !(128..=wire::MAX_FRAME).contains(&config.mtu)
+            || !(wire::FRAGMENT + 1..=shared.config.max_frame).contains(&config.mtu)
+            || shared
+                .config
+                .max_frame
+                .div_ceil(config.mtu.saturating_sub(wire::FRAGMENT).max(1))
+                > shared.config.reassembly.max_fragments
         {
             return Err((wire::invalid("invalid link configuration"), link));
         }
@@ -350,7 +434,7 @@ impl Router {
         };
         let id = TransportId(table.next_link);
         table.next_link = next;
-        let (send, outgoing) = mpsc::channel(64);
+        let (send, outgoing) = mpsc::channel(shared.config.link_queue);
         let cancel = shared.cancel.child_token();
         let BoundLink {
             config,
@@ -492,8 +576,56 @@ impl Router {
         self.inner.shared.tasks.wait().await;
     }
 
-    pub(crate) fn send_tunnel(&self, to: &NodeId, payload: &[u8]) -> io::Result<()> {
-        self.inner.shared.send(to, payload, PayloadKind::Tunnel)
+    pub(crate) fn tunnel_packet_buffer(
+        &self,
+        to: &NodeId,
+        capacity: usize,
+    ) -> io::Result<PacketBuffer> {
+        PacketBuffer::new(&self.inner.shared, to, capacity, PayloadKind::Tunnel)
+    }
+
+    pub(crate) fn send_tunnel_packet(&self, to: &NodeId, packet: PacketBuffer) -> io::Result<()> {
+        self.inner
+            .shared
+            .send_packet(to, packet, PayloadKind::Tunnel)
+    }
+
+    pub(crate) fn send_tunnel_retained(
+        &self,
+        to: &NodeId,
+        packet: PacketBuffer,
+    ) -> io::Result<Bytes> {
+        let shared = &self.inner.shared;
+        if shared.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        let (bytes, offset) = packet.finish(shared, to, PayloadKind::Tunnel)?;
+        let retained = bytes.slice(offset..);
+        if to == self.local_id() {
+            shared.deliver_owned(
+                PayloadKind::Tunnel,
+                self.local_id().clone(),
+                retained.clone(),
+            )?;
+        } else {
+            shared.forward(to, bytes);
+        }
+        Ok(retained)
+    }
+
+    pub(crate) fn validate_tunnel_payload(&self, to: &NodeId, payload: usize) -> io::Result<()> {
+        if !wire::id_valid(to)
+            || payload
+                > self
+                    .inner
+                    .shared
+                    .config
+                    .max_frame
+                    .saturating_sub(PayloadKind::Tunnel.header_len(self.local_id(), to))
+        {
+            return Err(wire::invalid("tunnel payload exceeds router bound"));
+        }
+        Ok(())
     }
 
     pub(crate) async fn recv_tunnel(&self) -> io::Result<Inbound> {
@@ -544,6 +676,18 @@ impl Transport for Router {
 
     fn send(&self, to: &NodeId, msg: &[u8]) -> impl Future<Output = io::Result<()>> {
         std::future::ready(self.inner.shared.send(to, msg, PayloadKind::Message))
+    }
+
+    fn send_owned_admitted(
+        &self,
+        to: &NodeId,
+        msg: Bytes,
+        session: Option<SessionId>,
+    ) -> impl Future<Output = io::Result<()>> {
+        if session.is_some() {
+            return std::future::ready(Ok(()));
+        }
+        std::future::ready(self.inner.shared.send_owned(to, msg, PayloadKind::Message))
     }
 
     async fn recv(&self) -> io::Result<Inbound> {

@@ -69,7 +69,7 @@ async fn fragmented_packets_cross_a_bridge_and_preserve_origin() -> io::Result<(
     a.send(c.local_id(), &payload).await?;
     let received = tokio::time::timeout(WAIT, c.recv()).await??;
     assert_eq!(received.from, *a.local_id());
-    assert_eq!(received.msg, payload);
+    assert_eq!(received.msg.as_ref(), payload);
     a.close().await;
     b.close().await;
     c.close().await;
@@ -102,7 +102,7 @@ async fn route_failover_and_stale_transport_handles_do_not_disconnect_replacemen
     a.send(c.local_id(), b"rerouted without changing destination")
         .await?;
     assert_eq!(
-        tokio::time::timeout(WAIT, c.recv()).await??.msg,
+        tokio::time::timeout(WAIT, c.recv()).await??.msg.as_ref(),
         b"rerouted without changing destination"
     );
     let (replacement, _) = connect(&a, &b, 1, 1200)?;
@@ -116,7 +116,7 @@ async fn route_failover_and_stale_transport_handles_do_not_disconnect_replacemen
     a.send(b.local_id(), b"replacement survives stale handle")
         .await?;
     assert_eq!(
-        tokio::time::timeout(WAIT, b.recv()).await??.msg,
+        tokio::time::timeout(WAIT, b.recv()).await??.msg.as_ref(),
         b"replacement survives stale handle"
     );
     for node in [&a, &b, &c, &d] {
@@ -219,11 +219,11 @@ async fn ipc_only_peer_reaches_tcp_only_peer_through_a_two_adapter_bridge() -> i
     a.send(c.local_id(), b"IPC -> bridge -> TCP").await?;
     let received = tokio::time::timeout(WAIT, c.recv()).await??;
     assert_eq!(received.from, *a.local_id());
-    assert_eq!(received.msg, b"IPC -> bridge -> TCP");
+    assert_eq!(received.msg.as_ref(), b"IPC -> bridge -> TCP");
     c.send(a.local_id(), b"TCP -> bridge -> IPC").await?;
     let received = tokio::time::timeout(WAIT, a.recv()).await??;
     assert_eq!(received.from, *c.local_id());
-    assert_eq!(received.msg, b"TCP -> bridge -> IPC");
+    assert_eq!(received.msg.as_ref(), b"TCP -> bridge -> IPC");
     for node in [&a, &b, &c] {
         node.close().await;
     }
@@ -263,11 +263,11 @@ async fn default_router_forwards_between_neighbors_on_the_same_adapter() -> io::
     c.send(a.local_id(), b"same-adapter transit").await?;
     let packet = tokio::time::timeout(WAIT, a.recv()).await??;
     assert_eq!(packet.from, *c.local_id());
-    assert_eq!(packet.msg, b"same-adapter transit");
+    assert_eq!(packet.msg.as_ref(), b"same-adapter transit");
     a.send(c.local_id(), b"return transit").await?;
     let packet = tokio::time::timeout(WAIT, c.recv()).await??;
     assert_eq!(packet.from, *a.local_id());
-    assert_eq!(packet.msg, b"return transit");
+    assert_eq!(packet.msg.as_ref(), b"return transit");
     for node in [&a, &b, &c] {
         node.close().await;
     }

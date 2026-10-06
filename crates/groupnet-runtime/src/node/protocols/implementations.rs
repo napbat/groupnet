@@ -49,8 +49,9 @@ impl PeerImplementation for Messages {
     type Options = SendOptions;
 
     fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
-        self.options.validate(0)?;
-        Ok((node.cached_messages(), self.options))
+        let protocol = node.cached_messages();
+        protocol.validate_send(self.options, 0)?;
+        Ok((protocol, self.options))
     }
 }
 

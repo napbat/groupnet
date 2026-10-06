@@ -4,10 +4,10 @@
 //!
 //! * **Control plane** — the [`Transport`] trait below: best-effort,
 //!   message-oriented datagrams (gossip, membership, routing). Always available,
-//!   and this crate is **dependency-free** at the default feature set.
+//!   with `bytes` as the shared ownership buffer dependency.
 //! * **Data plane** — the [`bulk`] module (feature `bulk`): reliable, ordered
-//!   byte *streams* for replication and bulk transfer. Opt-in, because it pulls
-//!   `futures-io` / `bytes` / `zerocopy` — none of which the control plane needs.
+//!   byte *streams* for replication and bulk transfer. Opt-in, because it adds
+//!   `futures-io` / `zerocopy` — neither of which the control plane needs.
 //!
 //! Bindings for either live in their own `groupnet-transport-*` crates.
 //!

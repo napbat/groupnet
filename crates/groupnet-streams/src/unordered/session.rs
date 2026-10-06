@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     UnorderedConfig, UnorderedDelivery, aborted,
     endpoint::Lease,
-    wire::{Crypto, Kind, SessionId, Window},
+    wire::{self, Kind, RxCrypto, SessionId, TxCrypto, Window},
 };
 
 #[derive(Debug)]
@@ -45,7 +45,8 @@ pub(super) struct State {
     pub(super) cancel: CancellationToken,
     pub(super) endpoint_cancel: CancellationToken,
     stopped: CancellationToken,
-    crypto: Mutex<Crypto>,
+    tx: Mutex<TxCrypto>,
+    rx: Mutex<RxCrypto>,
     receive: Mutex<ReceiveState>,
     inbox: mpsc::Sender<Bytes>,
     send: Mutex<SendState>,
@@ -221,6 +222,7 @@ pub(super) fn create(
 ) -> io::Result<(Arc<State>, UnorderedSession)> {
     let (inbox, receiver) = mpsc::channel(params.config.inbox_capacity);
     let slots = Arc::new(Semaphore::new(params.config.pending_sends));
+    let (tx, rx) = wire::crypto(keys, initiator)?;
     let state = Arc::new(State {
         peer: params.peer,
         id: params.id,
@@ -231,7 +233,8 @@ pub(super) fn create(
         cancel: stream.cancellation(),
         endpoint_cancel: params.endpoint_cancel,
         stopped: CancellationToken::new(),
-        crypto: Mutex::new(Crypto::new(keys, initiator)?),
+        tx: Mutex::new(tx),
+        rx: Mutex::new(rx),
         receive: Mutex::new(ReceiveState {
             accepted: Window::default(),
             last_seen: Instant::now(),
@@ -262,28 +265,41 @@ impl State {
 
     pub(super) fn transmit(&self, kind: Kind, message: u64, body: &[u8]) -> io::Result<()> {
         self.ensure_open()?;
-        let packet = self
-            .crypto
-            .lock()
-            .map_err(|_| poisoned())?
-            .seal(self.id, kind, message, body)?;
+        let packet = self.seal(kind, message, body)?;
         self.ensure_open()?;
-        self.io.send(&self.peer, &packet)
+        self.io.send_packet(&self.peer, packet)
+    }
+
+    fn seal(
+        &self,
+        kind: Kind,
+        message: u64,
+        body: &[u8],
+    ) -> io::Result<groupnet_network::PacketBuffer> {
+        let mut packet = self
+            .io
+            .packet_buffer(&self.peer, wire::HEADER + body.len() + wire::TAG)?;
+        packet.extend_from_slice(&[0; wire::HEADER]);
+        packet.extend_from_slice(body);
+        packet.extend_from_slice(&[0; wire::TAG]);
+        self.tx.lock().map_err(|_| poisoned())?.seal(
+            self.id,
+            kind,
+            message,
+            packet.payload_mut(),
+        )?;
+        Ok(packet)
     }
 
     fn transmit_close(&self) -> io::Result<()> {
-        let packet =
-            self.crypto
-                .lock()
-                .map_err(|_| poisoned())?
-                .seal(self.id, Kind::Close, 0, &[])?;
-        self.io.send(&self.peer, &packet)
+        let packet = self.seal(Kind::Close, 0, &[])?;
+        self.io.send_packet(&self.peer, packet)
     }
 
-    pub(super) fn receive_packet(&self, packet: &[u8]) -> io::Result<()> {
+    pub(super) fn receive_packet(&self, packet: Bytes) -> io::Result<()> {
         self.ensure_open()?;
         let (kind, message, body) = self
-            .crypto
+            .rx
             .lock()
             .map_err(|_| poisoned())?
             .open(packet, self.max_payload)?;

@@ -73,12 +73,12 @@ async fn unknown_keyless_joiner_receives_server_traffic_without_reverse_dial() {
         .send(client.local_id(), b"server initiated")
         .await
         .expect("send");
-    assert_eq!(receive(&client).await.msg, b"server initiated");
+    assert_eq!(receive(&client).await.msg.as_ref(), b"server initiated");
     client
         .send(server.local_id(), b"reply")
         .await
         .expect("send");
-    assert_eq!(receive(&server).await.msg, b"reply");
+    assert_eq!(receive(&server).await.msg.as_ref(), b"reply");
     client.close().await;
     eventually(|| peers(&server) == 0).await;
     server.close().await;
@@ -143,7 +143,7 @@ async fn custom_policy_rejects_wrong_credentials_and_claims_without_leaking_secr
         .send(client.local_id(), b"authorized")
         .await
         .expect("send");
-    assert_eq!(receive(&client).await.msg, b"authorized");
+    assert_eq!(receive(&client).await.msg.as_ref(), b"authorized");
     client.close().await;
     server.close().await;
 }
@@ -182,7 +182,7 @@ async fn duplicate_identity_cannot_evict_incumbent_and_clean_reconnect_works() {
         .send(incumbent.local_id(), b"incumbent")
         .await
         .expect("send");
-    assert_eq!(receive(&incumbent).await.msg, b"incumbent");
+    assert_eq!(receive(&incumbent).await.msg.as_ref(), b"incumbent");
     incumbent.close().await;
     eventually(|| peers(&server) == 0).await;
     connect(&duplicate, &server);
@@ -199,7 +199,7 @@ async fn duplicate_identity_cannot_evict_incumbent_and_clean_reconnect_works() {
         .send(duplicate.local_id(), b"replacement")
         .await
         .expect("send");
-    assert_eq!(receive(&duplicate).await.msg, b"replacement");
+    assert_eq!(receive(&duplicate).await.msg.as_ref(), b"replacement");
     duplicate.close().await;
     server.close().await;
 }
@@ -216,8 +216,8 @@ async fn simultaneous_dials_converge_to_one_full_duplex_session() {
     eventually(|| peers(&a) == 1 && peers(&b) == 1).await;
     a.send(b.local_id(), b"a to b").await.expect("send");
     b.send(a.local_id(), b"b to a").await.expect("send");
-    assert_eq!(receive(&a).await.msg, b"b to a");
-    assert_eq!(receive(&b).await.msg, b"a to b");
+    assert_eq!(receive(&a).await.msg.as_ref(), b"b to a");
+    assert_eq!(receive(&b).await.msg.as_ref(), b"a to b");
     a.close().await;
     b.close().await;
 }
@@ -496,8 +496,8 @@ async fn idle_pool_settings_do_not_expire_admitted_sessions() {
     assert_eq!(peers(&server), 2);
     server.send(a.local_id(), b"still a").await.expect("send");
     server.send(b.local_id(), b"still b").await.expect("send");
-    assert_eq!(receive(&a).await.msg, b"still a");
-    assert_eq!(receive(&b).await.msg, b"still b");
+    assert_eq!(receive(&a).await.msg.as_ref(), b"still a");
+    assert_eq!(receive(&b).await.msg.as_ref(), b"still b");
     a.close().await;
     b.close().await;
     server.close().await;
@@ -647,7 +647,8 @@ async fn blocked_old_generation_send_cannot_cross_same_identity_reconnect() {
     let delayed = tokio::spawn(async move {
         // Capture the original route-selected generation before blocking this
         // worker. Polling its send later must not bind the replacement socket.
-        let send = sending.send_admitted(&target, b"stale outbound", Some(old));
+        let send =
+            sending.send_owned_admitted(&target, Bytes::from_static(b"stale outbound"), Some(old));
         started.send(()).expect("worker ready");
         blocked.await.expect("release worker");
         send.await.expect("stale send is best-effort drop");
@@ -666,16 +667,114 @@ async fn blocked_old_generation_send_cannot_cross_same_identity_reconnect() {
         .expect("worker completes")
         .expect("worker task");
     server
-        .send_admitted(replacement.local_id(), b"missing generation", None)
+        .send_owned_admitted(
+            replacement.local_id(),
+            Bytes::from_static(b"missing generation"),
+            None,
+        )
         .await
         .expect("untagged managed send drops");
     server
-        .send_admitted(replacement.local_id(), b"fresh outbound", Some(new))
+        .send_owned_admitted(
+            replacement.local_id(),
+            Bytes::from_static(b"fresh outbound"),
+            Some(new),
+        )
         .await
         .expect("current session send");
     // One ordered socket proves neither stale nor untagged payload entered the
     // replacement's queue ahead of the valid current-generation marker.
-    assert_eq!(receive(&replacement).await.msg, b"fresh outbound");
+    assert_eq!(receive(&replacement).await.msg.as_ref(), b"fresh outbound");
     replacement.close().await;
+    server.close().await;
+}
+
+#[tokio::test]
+async fn owned_queue_retains_payload_storage_and_drops_at_capacity() {
+    let server = endpoint("owned-server", Arc::new(OpenAdmission), &[]).await;
+    let client = endpoint("owned-client", Arc::new(OpenAdmission), &[]).await;
+    connect(&client, &server);
+    eventually(|| peers(&server) == 1 && peers(&client) == 1).await;
+    let inner = server.direct().expect("direct");
+    let managed = inner.admission.as_ref().expect("managed");
+    let session = managed.sessions.subscribe().borrow()[0].id;
+    let (frames, mut queued) = mpsc::channel(1);
+    // Keep the original sender alive so the real socket writer remains parked.
+    let original = {
+        let mut connections = managed.connections.lock().expect("connections");
+        let connection = connections
+            .peers
+            .get_mut(client.local_id())
+            .expect("client");
+        std::mem::replace(&mut connection.frames, frames)
+    };
+    let payload = Bytes::from(vec![0xAB; 1024]);
+    let storage = payload.as_ptr();
+    server
+        .send_owned_admitted(client.local_id(), payload, Some(session))
+        .await
+        .expect("owned send");
+    server
+        .send_owned_admitted(
+            client.local_id(),
+            Bytes::from_static(b"dropped"),
+            Some(session),
+        )
+        .await
+        .expect("full queue drops");
+    let received = queued.try_recv().expect("queued payload");
+    assert_eq!(
+        received.as_ptr(),
+        storage,
+        "owned payload must not be copied"
+    );
+    assert_eq!(received.len(), 1024);
+    assert!(matches!(
+        queued.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    drop(original);
+    client.close().await;
+    server.close().await;
+}
+
+#[tokio::test]
+async fn admitted_reader_applies_configured_frame_cap() {
+    let server = TcpMsgTransport::bind_admitted(
+        NodeId::new("capped-server"),
+        "127.0.0.1:0",
+        TcpMsgConfig {
+            max_frame_bytes: 4,
+            ..TcpMsgConfig::default()
+        },
+        Arc::new(OpenAdmission),
+        Vec::new(),
+        TcpAdmissionConfig::default(),
+    )
+    .await
+    .expect("server");
+    let client = endpoint("capped-client", Arc::new(OpenAdmission), &[]).await;
+    connect(&client, &server);
+    eventually(|| peers(&server) == 1 && peers(&client) == 1).await;
+    client
+        .send(server.local_id(), b"four")
+        .await
+        .expect("at cap");
+    assert_eq!(receive(&server).await.msg.as_ref(), b"four");
+    client
+        .send(server.local_id(), b"too large")
+        .await
+        .expect("send");
+    eventually(|| peers(&server) == 0 && peers(&client) == 0).await;
+    assert!(
+        server
+            .direct()
+            .expect("direct")
+            .inbox
+            .lock()
+            .await
+            .is_empty()
+    );
+    client.close().await;
     server.close().await;
 }

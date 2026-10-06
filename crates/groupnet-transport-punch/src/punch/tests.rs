@@ -455,7 +455,7 @@ async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive
         .await
         .unwrap();
     assert_eq!(
-        timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg,
+        (timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg).as_ref(),
         b"authenticated"
     );
     b.socket

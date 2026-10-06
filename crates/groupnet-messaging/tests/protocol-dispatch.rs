@@ -27,7 +27,7 @@ impl MessageProtocol for CustomProtocol {
     ) -> impl Future<Output = io::Result<MessageId>> + Send {
         let id = MessageId([options; 16]);
         std::future::ready(
-            codec::data(id, Delivery::BestEffort, group, &payload)
+            codec::data(id, Delivery::BestEffort, 0, group, &payload)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "custom payload bound"))
                 .and_then(|packet| self.0.send(to, &packet))
                 .map(|()| id),

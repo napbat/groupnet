@@ -4,12 +4,16 @@ mod direct;
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod pacing_tests;
 use super::{
-    DEADLINE, IDLE, Inner, MAX_CANDIDATES, MAX_PEERS, Outgoing, QUEUE, TcpConnection,
-    TcpPunchConfig, View, closed, invalid, lock, random, server, sockets,
+    DEADLINE, IDLE, Inner, MAX_CANDIDATES, MAX_PEERS, Outgoing, TcpConnection, TcpPunchConfig,
+    View, closed, invalid, lock, random, server, sockets,
     wire::{self, Auth, Duplex, Message, Token},
 };
 use crate::PathPolicy;
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{
     Inbound,
@@ -74,7 +78,7 @@ enum Event {
         node: NodeId,
         session: Token,
         rank: Rank,
-        data: Vec<u8>,
+        data: Bytes,
     },
     Closed {
         node: NodeId,
@@ -90,6 +94,7 @@ enum Event {
 
 pub(super) async fn bind(config: TcpPunchConfig) -> io::Result<TcpConnection> {
     validate(&config)?;
+    let sessions = SessionRegistry::new(config.max_peers)?;
     let auth = wire::auth(config.key.as_ref());
     let session = random()?;
     let (mut stream, reusable) = tokio::time::timeout(DEADLINE, registration_socket(&config))
@@ -132,10 +137,9 @@ pub(super) async fn bind(config: TcpPunchConfig) -> io::Result<TcpConnection> {
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP admission timed out"))??;
     let peers = Arc::new(Mutex::new(HashMap::new()));
-    let sessions = SessionRegistry::new(MAX_PEERS)?;
     let cancel = CancellationToken::new();
-    let (outbound, outgoing) = mpsc::channel(QUEUE);
-    let (incoming, inbound) = mpsc::channel(QUEUE);
+    let (outbound, outgoing) = mpsc::channel(config.queue_capacity);
+    let (incoming, inbound) = mpsc::channel(config.queue_capacity);
     let addresses = if sources.is_empty() {
         vec![address]
     } else {
@@ -175,6 +179,11 @@ pub(super) async fn bind(config: TcpPunchConfig) -> io::Result<TcpConnection> {
 }
 
 fn validate(config: &TcpPunchConfig) -> io::Result<()> {
+    super::validate_capacity(config.queue_capacity)?;
+    super::validate_capacity(config.max_peers)?;
+    if config.peers.len() > config.max_peers || config.peers.len() > MAX_PEERS {
+        return Err(invalid("TCP static peers exceed configured peer capacity"));
+    }
     server::validate_peers(&config.peers)?;
     server::validate_peers(std::slice::from_ref(&config.local))?;
     if config.peers.contains(&config.local)
@@ -272,8 +281,8 @@ impl Runtime {
         listeners: Vec<TcpListener>,
         mut outgoing: mpsc::Receiver<Outgoing>,
     ) {
-        let (events, mut pending) = mpsc::channel(QUEUE);
-        let (control, control_outgoing) = mpsc::channel(QUEUE);
+        let (events, mut pending) = mpsc::channel(self.config.queue_capacity);
+        let (control, control_outgoing) = mpsc::channel(self.config.queue_capacity);
         let dials = Arc::new(Semaphore::new(16));
         let accepts = Arc::new(Semaphore::new(16));
         let mut tasks = JoinSet::new();
@@ -308,8 +317,14 @@ impl Runtime {
                 Some(message) = outgoing.recv() => self.send(message, &control),
                 _ = tick.tick() => {
                     if self.control_live {
-                        if control.try_send(Message::Ping).is_err() { self.control_closed(); }
-                        else { self.check(&events, &dials, &mut tasks); }
+                        match control.try_send(Message::Ping) {
+                            Ok(()) => self.check(&events, &dials, &mut tasks),
+                            Err(mpsc::error::TrySendError::Closed(_)) => self.control_closed(),
+                            // A paced writer can legitimately fill its bounded
+                            // queue. Server heartbeats independently keep the
+                            // admitted read leg live; a redundant Ping may drop.
+                            Err(mpsc::error::TrySendError::Full(_)) => {}
+                        }
                     }
                 }
             }
@@ -537,7 +552,7 @@ impl Runtime {
         );
     }
 
-    fn deliver(&self, node: &NodeId, session: Token, data: Vec<u8>) {
+    fn deliver(&self, node: &NodeId, session: Token, data: Bytes) {
         let Some(peer) = self.peers.get(node) else {
             return;
         };
@@ -611,7 +626,7 @@ impl Runtime {
         let Ok(address) = stream.peer_addr() else {
             return;
         };
-        let (writer, outgoing) = mpsc::channel(QUEUE);
+        let (writer, outgoing) = mpsc::channel(self.config.queue_capacity);
         let cancel = self.cancel.child_token();
         if let Some(old) = peer.direct.take() {
             old.cancel.cancel();
@@ -644,20 +659,28 @@ async fn control_io(
 ) {
     let (mut reader, mut writer) = stream.into_split();
     let reading = read_control(&mut reader, &auth.rx, &events);
-    let writing = async {
-        while let Some(message) = outgoing.recv().await {
-            tokio::time::timeout(DEADLINE, wire::write(&mut writer, &auth.tx, &message))
-                .await
-                .map_err(|_| closed())??;
-        }
-        Ok::<(), io::Error>(())
-    };
+    let writing = write_control(&mut writer, &auth.tx, &mut outgoing);
     tokio::select! { () = cancel.cancelled() => {}, _ = reading => {}, _ = writing => {} }
     let _ = events.send(Event::ControlClosed).await;
 }
 
-async fn read_control(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+pub(super) async fn write_control<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    auth: &Auth,
+    outgoing: &mut mpsc::Receiver<Message>,
+) -> io::Result<()> {
+    let mut scratch = Vec::new();
+    while let Some(message) = outgoing.recv().await {
+        // An admitted reader may deliberately pace data for longer than the
+        // admission deadline. Bound queued work rather than cancelling it;
+        // authenticated server heartbeats/read expiry still detect blackholes.
+        wire::write_buffered(writer, auth, &message, &mut scratch).await?;
+    }
+    Ok(())
+}
+
+async fn read_control<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
     auth: &Auth,
     events: &mpsc::Sender<Event>,
 ) -> io::Result<()> {
@@ -772,9 +795,13 @@ mod tests {
         runtime.event(event, &events, &mut tasks);
         assert!(lock(&views).get(&node).unwrap().direct.is_none());
         assert!(runtime.sessions.is_active(&node, generation));
-        runtime.deliver(&node, session, b"relay after direct failure".to_vec());
+        runtime.deliver(
+            &node,
+            session,
+            Bytes::from_static(b"relay after direct failure"),
+        );
         assert_eq!(
-            delivered.recv().await.unwrap().packet.msg,
+            &(delivered.recv().await.unwrap().packet.msg)[..],
             b"relay after direct failure"
         );
         let (stream, _remote) = streams().await;

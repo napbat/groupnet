@@ -26,6 +26,21 @@ async fn named_pair(
     a_name: &str,
     b_name: &str,
 ) -> io::Result<(Router, Router, Messaging, Messaging)> {
+    configured_pair(
+        a_name,
+        b_name,
+        MessagingConfig::default(),
+        MessagingConfig::default(),
+    )
+    .await
+}
+
+async fn configured_pair(
+    a_name: &str,
+    b_name: &str,
+    a_config: MessagingConfig,
+    b_config: MessagingConfig,
+) -> io::Result<(Router, Router, Messaging, Messaging)> {
     let a = router(a_name)?;
     let b = router(b_name)?;
     let net = Network::new();
@@ -45,8 +60,8 @@ async fn named_pair(
         }
     })
     .await?;
-    let am = Messaging::new(&a)?;
-    let bm = Messaging::new(&b)?;
+    let am = Messaging::with_config(&a, a_config)?;
+    let bm = Messaging::with_config(&b, b_config)?;
     Ok((a, b, am, bm))
 }
 
@@ -86,7 +101,7 @@ async fn application_isolation_and_delivered_requires_explicit_queue_acceptance(
         "decoding data must not acknowledge queue reservation"
     );
     assert_eq!(
-        tokio::time::timeout(WAIT, b.recv()).await??.msg,
+        tokio::time::timeout(WAIT, b.recv()).await??.msg.as_ref(),
         b"coordination only"
     );
     frame.receipt().accepted()?;
@@ -123,7 +138,9 @@ async fn applied_retries_deduplicate_without_reenqueue_and_rejection_is_terminal
     assert_eq!(frame.payload.len(), 12_000);
     frame.receipt().accepted()?;
     assert!(
-        tokio::time::timeout(RETRY * 3, bm.recv()).await.is_err(),
+        tokio::time::timeout(bm.config().retry_interval * 3, bm.recv())
+            .await
+            .is_err(),
         "retries may replay receipts but must not re-enqueue"
     );
     assert!(!sent.is_finished(), "accepted is not applied");
@@ -210,7 +227,7 @@ async fn ack_requires_exact_source_and_identity_and_ignores_malformed_data() -> 
         &messages.inner,
         ApplicationPacket {
             from: target.clone(),
-            payload: Bytes::from_static(b"GNA1\xffmalformed"),
+            payload: Bytes::from_static(b"GNA2\xffmalformed"),
         },
     );
     assert!(messages.inner.receiver.lock().await.try_recv().is_err());
@@ -231,10 +248,17 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
     let messages = Messaging::new(&router)?;
     let source = NodeId::new("source");
     let first = MessageId([0; 16]);
-    for n in 0..MAX_RECEIVED {
+    for n in 0..messages.config().received_records {
         let mut id = [0; 16];
         id[8..].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
-        let packet = codec::data(MessageId(id), Delivery::Applied, None, b"original").unwrap();
+        let packet = codec::data(
+            MessageId(id),
+            Delivery::Applied,
+            DEFAULT_MAX_TIMEOUT_MS,
+            None,
+            b"original",
+        )
+        .unwrap();
         worker::process(
             &messages.inner,
             ApplicationPacket {
@@ -251,7 +275,7 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
             .map_err(|_| poisoned())?
             .received
             .len(),
-        MAX_RECEIVED
+        messages.config().received_records
     );
     let mut rejected_id = [0; 16];
     rejected_id[8..].copy_from_slice(&64_u64.to_be_bytes());
@@ -287,7 +311,9 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
             &messages.inner,
             ApplicationPacket {
                 from: source.clone(),
-                payload: Bytes::from(codec::data(id, Delivery::Applied, None, body).unwrap()),
+                payload: Bytes::from(
+                    codec::data(id, Delivery::Applied, DEFAULT_MAX_TIMEOUT_MS, None, body).unwrap(),
+                ),
             },
         );
     }
@@ -299,7 +325,7 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
             .map_err(|_| poisoned())?
             .received
             .len(),
-        MAX_RECEIVED
+        messages.config().received_records
     );
     assert!(
         messages.inner.receiver.lock().await.try_recv().is_err(),
@@ -381,7 +407,7 @@ async fn invalid_bounds_no_route_and_outstanding_limit_fail_before_dispatch() ->
             .send(
                 router.local_id(),
                 None,
-                Bytes::from(vec![0; MAX_MESSAGE_BYTES + 1]),
+                Bytes::from(vec![0; DEFAULT_MAX_MESSAGE_BYTES + 1]),
                 SendOptions::default()
             )
             .await
@@ -407,7 +433,7 @@ async fn invalid_bounds_no_route_and_outstanding_limit_fail_before_dispatch() ->
             io::ErrorKind::InvalidInput
         );
     }
-    for n in 0..MAX_PENDING {
+    for n in 0..messages.config().pending_sends {
         let mut id = [0; 16];
         id[..8].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
         let (result, _) = oneshot::channel();
@@ -460,7 +486,9 @@ async fn receipt_records_success_when_ack_route_is_missing_and_shutdown_wakes_re
         &messages.inner,
         ApplicationPacket {
             from: source.clone(),
-            payload: Bytes::from(codec::data(id, Delivery::Applied, None, b"work").unwrap()),
+            payload: Bytes::from(
+                codec::data(id, Delivery::Applied, DEFAULT_MAX_TIMEOUT_MS, None, b"work").unwrap(),
+            ),
         },
     );
     let frame = messages.recv().await?;
@@ -507,7 +535,7 @@ async fn maximal_identifiers_and_buffer_fit_real_routing_envelope() -> io::Resul
             .send(
                 &target,
                 Some(&group),
-                Bytes::from(vec![7; MAX_MESSAGE_BYTES]),
+                Bytes::from(vec![7; DEFAULT_MAX_MESSAGE_BYTES]),
                 options(Delivery::Applied),
             )
             .await
@@ -515,7 +543,7 @@ async fn maximal_identifiers_and_buffer_fit_real_routing_envelope() -> io::Resul
     let frame = tokio::time::timeout(WAIT, bm.recv()).await??;
     assert_eq!(frame.from, *a.local_id());
     assert_eq!(frame.group, Some(expected_group));
-    assert_eq!(frame.payload.len(), MAX_MESSAGE_BYTES);
+    assert_eq!(frame.payload.len(), DEFAULT_MAX_MESSAGE_BYTES);
     assert!(frame.payload.iter().all(|byte| *byte == 7));
     frame.applied()?;
     assert_eq!(tokio::time::timeout(WAIT, sent).await???, frame.id);
@@ -550,6 +578,117 @@ async fn local_raw_application_enqueue_reports_backpressure() -> io::Result<()> 
             .kind(),
         io::ErrorKind::WouldBlock
     );
+    messages.close().await;
+    router.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn asymmetric_retry_bounds_fail_closed_without_execution_and_admit_safe_horizons()
+-> io::Result<()> {
+    let sender_config = MessagingConfig {
+        retry_interval: Duration::from_millis(10),
+        max_timeout: Duration::from_millis(200),
+        dedup_retention: Duration::from_millis(300),
+        ..MessagingConfig::default()
+    };
+    let receiver_config = MessagingConfig {
+        retry_interval: Duration::from_millis(10),
+        max_timeout: Duration::from_millis(50),
+        dedup_retention: Duration::from_millis(60),
+        ..MessagingConfig::default()
+    };
+    let (a, b, sender, receiver) =
+        configured_pair("a", "b", sender_config, receiver_config).await?;
+    let unsupported = SendOptions {
+        delivery: Delivery::Delivered,
+        timeout: Duration::from_millis(150),
+    };
+    let result = tokio::time::timeout(
+        WAIT,
+        sender.send(
+            b.local_id(),
+            None,
+            Bytes::from_static(b"must not execute"),
+            unsupported,
+        ),
+    )
+    .await?;
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(receiver.inner.receiver.lock().await.try_recv().is_err());
+    assert!(
+        receiver
+            .inner
+            .state
+            .lock()
+            .map_err(|_| poisoned())?
+            .received
+            .is_empty()
+    );
+    let supported = SendOptions {
+        delivery: Delivery::Delivered,
+        timeout: Duration::from_millis(40),
+    };
+    let (sent, incoming) = tokio::join!(
+        sender.send(b.local_id(), None, Bytes::from_static(b"safe"), supported),
+        async {
+            let frame = tokio::time::timeout(WAIT, receiver.recv()).await??;
+            frame.receipt.accepted()?;
+            Ok::<_, io::Error>(frame)
+        }
+    );
+    let frame = incoming?;
+    assert_eq!(sent?, frame.id);
+    {
+        let now = receiver.inner.now();
+        let mut state = frame.receipt.record.state.lock().map_err(|_| poisoned())?;
+        assert_eq!(state.act(Outcome::Applied, now), Some(Outcome::Accepted));
+        assert!(!state.expired(now + 59));
+        assert!(state.expired(now + 60));
+    }
+    sender.close().await;
+    receiver.close().await;
+    a.close().await;
+    b.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn message_payload_slices_share_storage_without_mutating_unique_or_shared_packets()
+-> io::Result<()> {
+    let router = router("owned")?;
+    let messages = Messaging::new(&router)?;
+    for shared in [false, true] {
+        let encoded = Bytes::from(
+            codec::data(
+                MessageId([u8::from(shared); 16]),
+                Delivery::BestEffort,
+                0,
+                None,
+                b"payload",
+            )
+            .unwrap(),
+        );
+        let expected_pointer = encoded
+            .as_ptr()
+            .wrapping_add(codec::data_len(None, 0).unwrap());
+        let alias = shared.then(|| encoded.clone());
+        worker::process(
+            &messages.inner,
+            ApplicationPacket {
+                from: NodeId::new("source"),
+                payload: encoded,
+            },
+        );
+        let frame = messages.recv().await?;
+        assert_eq!(frame.payload.as_ref(), b"payload");
+        assert_eq!(frame.payload.as_ptr(), expected_pointer);
+        if let Some(alias) = alias {
+            assert!(
+                matches!(codec::decode(&alias), Ok(Packet::Data { payload, .. }) if payload == b"payload")
+            );
+        }
+    }
     messages.close().await;
     router.close().await;
     Ok(())

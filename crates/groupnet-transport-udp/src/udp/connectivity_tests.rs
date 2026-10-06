@@ -8,7 +8,8 @@ use groupnet_transport::Transport;
 use groupnet_transport::admission::{SessionId, SessionRegistry};
 use groupnet_transport_punch::{PunchConfig, Rendezvous};
 
-use super::{UdpTransport, frame};
+use super::UdpTransport;
+use super::framing::SendBuffer;
 
 async fn admitted(registry: &SessionRegistry, peer: &NodeId) -> SessionId {
     let mut neighbors = registry.subscribe();
@@ -74,7 +75,11 @@ async fn managed_connection_preserves_socket_sessions_and_tagged_io() {
             .is_err()
     );
     sender
-        .send_admitted(&receiver_id, b"native payload", Some(sender_generation))
+        .send_owned_admitted(
+            &receiver_id,
+            bytes::Bytes::from_static(b"native payload"),
+            Some(sender_generation),
+        )
         .await
         .expect("admitted send");
     let inbound = tokio::time::timeout(Duration::from_secs(2), observer.recv_admitted())
@@ -82,7 +87,7 @@ async fn managed_connection_preserves_socket_sessions_and_tagged_io() {
         .expect("receive deadline")
         .expect("receive");
     assert_eq!(inbound.packet.from, sender_id);
-    assert_eq!(inbound.packet.msg, b"native payload");
+    assert_eq!(inbound.packet.msg.as_ref(), b"native payload");
     assert_eq!(inbound.session, Some(receiver_generation));
 
     bound.driver.close().await;
@@ -113,8 +118,9 @@ async fn connected_mode_ignores_address_hints_and_raw_self_attribution() {
     assert!(!receiver.known_peers().contains(&attacker_id));
     assert!(receiver.direct_addr_to(&attacker_id).is_none());
     assert!(receiver.path_to(&attacker_id).is_none());
+    let mut buffer = SendBuffer::new(&attacker_id).expect("raw sender prefix");
     raw.send_to(
-        &frame(&attacker_id, b"forged raw payload"),
+        buffer.frame(b"forged raw payload").expect("raw payload"),
         receiver.local_addr().expect("socket"),
     )
     .await

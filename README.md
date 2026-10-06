@@ -292,12 +292,17 @@ Cancellation cannot undo side effects and does not acknowledge unfinished work.
 Use `close().await` to drain before switching back to manual receives.
 Network shutdown cancels blocked receives and callbacks.
 
-Bounds: 60,000 payload bytes, 64 queued frames per runtime inbox, at most 32
-concurrent sends per group fanout, and 256 outstanding acknowledged sends per
-node. Acknowledged deadlines must be nonzero and at most 30 seconds. Retries
-retain message identity and use bounded duplicate suppression; timeout means
-**unknown outcome**, not proof of nonexecution. There is no ordering, durability,
-crash recovery, or exactly-once guarantee.
+`NodeBuilder::messaging(MessagingConfig { .. })` configures application payload,
+inbox, fanout, pending-send and receipt-record capacities plus retry/deadline
+and duplicate-retention timers. Defaults remain 60,000 payload bytes, 64 inbox
+frames, 32 concurrent fanout sends, 256 outstanding acknowledged sends, and a
+30-second maximum acknowledged deadline. The router's configured frame bound
+also applies; raising the application limit alone does not raise the route limit.
+Retention must exceed the maximum retry horizon. A receiver rejects a message
+whose advertised retry horizon exceeds its configured bound without executing or
+acknowledging it. Retries retain message identity; timeout means **unknown
+outcome**, not proof of nonexecution. There is no ordering, durability, crash
+recovery, or exactly-once guarantee.
 
 These are **trusted-fabric messages, not encrypted/authenticated application
 channels**. Sender attribution and membership checks trust transit peers.
@@ -305,8 +310,9 @@ Use the existing pinned TLS stream API for confidential/authenticated traffic.
 Metadata still converges as replicated state; Hosted/quorum commits, feeds,
 frontiers, and coherence leases retain their existing separate contracts.
 Sending to a Hosted group does not turn a frame into a quorum commit.
-The routed wire guard is now `GNR3`, and the authenticated tunnel preamble is
-`GN-TUNNEL-2`; upgrade communicating nodes together.
+The routed wire guard is `GNR3`, messaging is `GNA2` (including an explicit
+retry horizon), and the authenticated tunnel preamble is `GN-TUNNEL-2`;
+upgrade communicating nodes together.
 
 Executable memory A → TCP bridge B → TCP C demonstration:
 
@@ -397,6 +403,40 @@ unresolved send beyond the bounded deduplication horizon, even when a concurrent
 send slot is free. This protects pending retries without imposing receive order.
 TCP paths retain TCP's own ordering/retransmission even for unreliable sessions:
 this policy does not constrain route selection to UDP.
+
+### Packet-path performance and configuration
+
+Routing, fragmentation, tunnel, application-message and unordered AEAD headers
+use typed `zerocopy` layouts with explicit network byte order. Owned packet
+buffers reserve routing headroom before encoding/encryption, so the router can
+queue and deliver slices without repeatedly copying whole payloads. Unordered
+receive decrypts uniquely owned storage in place; shared storage requires one
+copy. Transmit and receive encryption have independent locks.
+
+Operational limits live in `RouterConfig`, `MessagingConfig`, `TunnelLimits`,
+`UnorderedConfig` and each transport's configuration. Wire field widths,
+authentication, bounded memory admission and the unordered 1024-entry security
+window remain enforced. TCP relay data uses bounded backpressure by default;
+`TcpRendezvousConfig` exposes separate control protection and optional
+`RelayPacing::Bytes` bandwidth/burst policy instead of a hardcoded packet-rate cap.
+
+This is not end-to-end zero-copy: fragmentation, shared-buffer mutation, TLS
+buffering and OS socket I/O can still copy. TCP routes retain head-of-line blocking.
+
+Run the integrity-checked packet benchmark in release mode:
+
+```bash
+cargo run --release -p groupnet --example packet-path --features udp,tcp-msg,connectivity
+cargo run --release -p groupnet --example packet-path --features udp,tcp-msg,connectivity -- --path udp --mode unreliable --messages 20000 --warmup 256 --batch 16
+```
+
+It measures memory, direct UDP, direct TCP and relayed TCP with reliable and
+unreliable sessions and 64/1200-byte packets. CSV output reports actual delivered
+packets/bytes, local errors, missing packets, elapsed throughput and completed
+roundtrip p50/p99 latency. Setup and warmup are excluded; always interpret latency
+alongside losses. Loopback measurements do not qualify Internet/NAT performance.
+
+### Endpoint ownership
 
 `Node` owns and caches the distinct underlying protocol engines; `Endpoint<P>`
 and `Peer<P>` are handles over that shared state, not new workers. Node-wide

@@ -10,7 +10,7 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 
-use super::super::{IpcAddress, MAX_SESSIONS};
+use super::super::IpcAddress;
 
 #[derive(Debug)]
 pub(in crate::ipc) enum Stream {
@@ -62,15 +62,20 @@ impl AsyncWrite for Stream {
 pub(in crate::ipc) struct Listener {
     name: String,
     pending: NamedPipeServer,
+    max_instances: usize,
 }
 
 impl Listener {
-    pub(in crate::ipc) fn bind(address: &IpcAddress) -> io::Result<Self> {
+    pub(in crate::ipc) fn bind(address: &IpcAddress, max_sessions: usize) -> io::Result<Self> {
         validate_address(address)?;
         let IpcAddress::NamedPipe(name) = address;
+        // Configuration reserves two finite listener instances and rejects the
+        // Windows sentinel 255, which would make the native backlog unbounded.
+        let max_instances = max_sessions + 2;
         Ok(Self {
             name: name.clone(),
-            pending: create(name, true)?,
+            pending: create(name, true, max_instances)?,
+            max_instances,
         })
     }
 
@@ -78,18 +83,18 @@ impl Listener {
         self.pending.connect().await?;
         // Reserve the next instance before releasing the connected instance,
         // leaving no namespace gap in which a second listener can take over.
-        let next = create(&self.name, false)?;
+        let next = create(&self.name, false, self.max_instances)?;
         Ok(Stream::Server(std::mem::replace(&mut self.pending, next)))
     }
 }
 
-fn create(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+fn create(name: &str, first: bool, max_instances: usize) -> io::Result<NamedPipeServer> {
     ServerOptions::new()
         .first_pipe_instance(first)
         .reject_remote_clients(true)
         // One pending instance and one transient replacement in addition to
         // the session cap. Buffers and the total number of handles are bounded.
-        .max_instances(MAX_SESSIONS + 2)
+        .max_instances(max_instances)
         .in_buffer_size(65_000)
         .out_buffer_size(65_000)
         .create(name)

@@ -22,8 +22,8 @@ use groupnet_network::Router;
 use tokio::task::JoinHandle;
 
 pub use groupnet_messaging::{
-    Bytes, Delivery, Frame, MAX_MESSAGE_BYTES, MessageContext, MessageId, MessageProtocol,
-    Messaging, Receipt, SendOptions,
+    Bytes, DEFAULT_MAX_MESSAGE_BYTES, Delivery, Frame, MessageContext, MessageId, MessageProtocol,
+    Messaging, MessagingConfig, Receipt, SendOptions,
 };
 pub use inbox::ReceiveHandle;
 
@@ -67,10 +67,10 @@ pub(crate) struct Hub {
 use inbox::Inbox;
 
 impl Hub {
-    pub(crate) fn new(router: &Router) -> io::Result<Self> {
-        let sender = Messaging::new(router)?;
+    pub(crate) fn new(router: &Router, config: MessagingConfig) -> io::Result<Self> {
+        let sender = Messaging::with_config(router, config)?;
         Ok(Self {
-            node: Inbox::new(sender.cancellation()),
+            node: Inbox::new(sender.cancellation(), sender.config().inbox_capacity),
             sender,
             dispatcher: Mutex::new(None),
         })
@@ -87,7 +87,10 @@ impl Hub {
     pub(crate) fn group(&self) -> GroupMessaging {
         GroupMessaging {
             sender: self.sender.clone(),
-            inbox: Inbox::new(self.sender.cancellation()),
+            inbox: Inbox::new(
+                self.sender.cancellation(),
+                self.sender.config().inbox_capacity,
+            ),
         }
     }
 

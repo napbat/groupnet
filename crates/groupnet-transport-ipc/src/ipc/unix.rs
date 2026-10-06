@@ -40,7 +40,7 @@ pub(in crate::ipc) struct Listener {
 }
 
 impl Listener {
-    pub(in crate::ipc) fn bind(address: &IpcAddress) -> io::Result<Self> {
+    pub(in crate::ipc) fn bind(address: &IpcAddress, _max_sessions: usize) -> io::Result<Self> {
         let IpcAddress::Unix(path) = address;
         let (path, parent) = private_path(path)?;
         // UnixListener::bind refuses every existing path; deliberately never

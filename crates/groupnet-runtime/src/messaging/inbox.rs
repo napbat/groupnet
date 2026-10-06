@@ -9,8 +9,6 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const CAPACITY: usize = 64;
-
 #[derive(Debug)]
 struct Shared {
     cancel: CancellationToken,
@@ -26,8 +24,8 @@ pub(super) struct Inbox {
 }
 
 impl Inbox {
-    pub(super) fn new(cancel: CancellationToken) -> Self {
-        let (sender, receiver) = mpsc::channel(CAPACITY);
+    pub(super) fn new(cancel: CancellationToken, capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity);
         Self {
             shared: Arc::new(Shared {
                 cancel,

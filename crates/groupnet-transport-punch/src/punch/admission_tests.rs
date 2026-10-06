@@ -353,9 +353,13 @@ async fn selected_outbound_generation_cannot_send_to_a_replacement_lease() {
     let old = lock(&a.inner.peers).get("b").unwrap().lease.clone();
     // The future is immediately ready: the datagram remains queued until this
     // current-thread test yields, so replacement happens before socket dequeue.
-    a.send_admitted(&"b".into(), b"queued old session", Some(old.id()))
-        .await
-        .unwrap();
+    a.send_owned_admitted(
+        &"b".into(),
+        Bytes::from_static(b"queued old session"),
+        Some(old.id()),
+    )
+    .await
+    .unwrap();
     old.revoke();
     let replacement = a
         .inner
@@ -363,22 +367,30 @@ async fn selected_outbound_generation_cannot_send_to_a_replacement_lease() {
         .try_admit(AcceptedPeer { node: "b".into() })
         .unwrap();
     lock(&a.inner.peers).get_mut("b").unwrap().lease = replacement.clone();
-    a.send_admitted(&"b".into(), b"stale route selection", Some(old.id()))
-        .await
-        .unwrap();
+    a.send_owned_admitted(
+        &"b".into(),
+        Bytes::from_static(b"stale route selection"),
+        Some(old.id()),
+    )
+    .await
+    .unwrap();
     assert!(timeout(SILENCE, b.recv()).await.is_err());
     assert_eq!(
-        a.send_admitted(&"b".into(), b"untagged", None)
+        a.send_owned_admitted(&"b".into(), Bytes::from_static(b"untagged"), None)
             .await
             .unwrap_err()
             .kind(),
         io::ErrorKind::NotConnected
     );
-    a.send_admitted(&"b".into(), b"current selection", Some(replacement.id()))
-        .await
-        .unwrap();
+    a.send_owned_admitted(
+        &"b".into(),
+        Bytes::from_static(b"current selection"),
+        Some(replacement.id()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg,
+        (timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg).as_ref(),
         b"current selection"
     );
     drop(old);
@@ -461,7 +473,7 @@ async fn unproved_challenge_saturation_does_not_reserve_established_peer_capacit
             .unwrap();
     let address = relay.local_addr().unwrap();
     let mut attacker = Raw::new("unproved-0".into()).await;
-    for index in 0..MAX_PEERS {
+    for index in 0..DEFAULT_MAX_PEERS {
         attacker.node = format!("unproved-{index}");
         attacker.challenge(address).await;
     }

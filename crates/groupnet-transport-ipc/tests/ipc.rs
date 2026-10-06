@@ -8,7 +8,7 @@ use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::link::{LinkLifecycle, LinkProvider, PeerEndpoint};
-use groupnet_transport_ipc::{IpcAddress, IpcLink, IpcTransport, MAX_FRAME};
+use groupnet_transport_ipc::{IpcAddress, IpcConfig, IpcLink, IpcTransport, MAX_FRAME};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -83,13 +83,13 @@ async fn persistent_messages_and_reverse_without_address_registration() {
         left.send(&NodeId::new("right"), &msg).await.unwrap();
         let inbound = receive(&right).await;
         assert_eq!(inbound.from, NodeId::new("left"));
-        assert_eq!(inbound.msg, msg);
+        assert_eq!(inbound.msg.as_ref(), msg);
         // The accepting side has no address for left. This can only work by
         // reusing the established full-duplex connection.
         right.send(&inbound.from, &inbound.msg).await.unwrap();
         let reply = receive(&left).await;
         assert_eq!(reply.from, NodeId::new("right"));
-        assert_eq!(reply.msg, msg);
+        assert_eq!(reply.msg.as_ref(), msg);
     }
     let error = left
         .send(&NodeId::new("right"), &vec![0; MAX_FRAME + 1])
@@ -99,7 +99,7 @@ async fn persistent_messages_and_reverse_without_address_registration() {
     left.send(&NodeId::new("right"), b"still alive")
         .await
         .unwrap();
-    assert_eq!(receive(&right).await.msg, b"still alive");
+    assert_eq!(receive(&right).await.msg.as_ref(), b"still alive");
     timeout(DEADLINE, left.close()).await.unwrap();
     timeout(DEADLINE, right.close()).await.unwrap();
 }
@@ -265,7 +265,7 @@ async fn malformed_introductions_and_oversize_lengths_are_closed() {
     healthy.write_all(b"ok").await.unwrap();
     let inbound = receive(&transport).await;
     assert_eq!(inbound.from, NodeId::new("raw"));
-    assert_eq!(inbound.msg, b"ok");
+    assert_eq!(inbound.msg.as_ref(), b"ok");
     transport.send(&inbound.from, b"back").await.unwrap();
     assert_eq!(
         timeout(DEADLINE, healthy.read_u32_le())
@@ -449,7 +449,7 @@ async fn provider_routes_bounded_frames_and_router_drains_listener() {
     left.send(right.local_id(), &payload).await.unwrap();
     let received = timeout(DEADLINE, right.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, *left.local_id());
-    assert_eq!(received.msg, payload);
+    assert_eq!(received.msg.as_ref(), payload);
     left.close().await;
     right.close().await;
     let replacement = IpcTransport::bind(NodeId::new("replacement"), &left_address.ipc).unwrap();
@@ -524,4 +524,82 @@ async fn lifecycle_shutdown_synchronously_cancels_all_handles_then_close_drains(
         .unwrap();
     let replacement = IpcTransport::bind(NodeId::new("replacement"), &address.ipc).unwrap();
     replacement.close().await;
+}
+
+#[tokio::test]
+async fn configured_peer_limit_allows_replacement_but_rejects_growth() {
+    let address = Address::new();
+    let peer_address = Address::new();
+    let another_address = Address::new();
+    let config = IpcConfig {
+        max_peers: 1,
+        ..IpcConfig::default()
+    };
+    let transport =
+        IpcTransport::bind_with_config(NodeId::new("local"), &address.ipc, config).unwrap();
+    transport
+        .register_peer(NodeId::new("peer"), peer_address.ipc.clone())
+        .unwrap();
+    transport
+        .register_peer(NodeId::new("peer"), another_address.ipc.clone())
+        .unwrap();
+    assert!(
+        transport
+            .register_peer(NodeId::new("other"), peer_address.ipc.clone())
+            .is_err()
+    );
+    transport.close().await;
+}
+
+#[tokio::test]
+async fn invalid_limits_do_not_reserve_native_listener() {
+    let address = Address::new();
+    let config = IpcConfig {
+        session_queue: 0,
+        ..IpcConfig::default()
+    };
+    assert_eq!(
+        IpcTransport::bind_with_config(NodeId::new("local"), &address.ipc, config)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let transport = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap();
+    transport.close().await;
+    let provider = IpcLink::new(address.ipc.clone(), Vec::new()).with_config(config);
+    assert_eq!(
+        Box::new(provider)
+            .bind(NodeId::new("local"))
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let replacement = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap();
+    replacement.close().await;
+}
+
+#[tokio::test]
+async fn owned_packets_cross_native_ipc_with_small_configured_queues() {
+    let left_address = Address::new();
+    let right_address = Address::new();
+    let config = IpcConfig {
+        max_peers: 1,
+        max_sessions: 1,
+        session_queue: 1,
+        inbound_queue: 1,
+    };
+    let left =
+        IpcTransport::bind_with_config(NodeId::new("left"), &left_address.ipc, config).unwrap();
+    let right =
+        IpcTransport::bind_with_config(NodeId::new("right"), &right_address.ipc, config).unwrap();
+    left.register_peer(NodeId::new("right"), right_address.ipc.clone())
+        .unwrap();
+    let payload = bytes::Bytes::from(vec![0x5a; MAX_FRAME]);
+    left.send_owned_admitted(&NodeId::new("right"), payload.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(receive(&right).await.msg, payload);
+    left.close().await;
+    right.close().await;
 }

@@ -53,7 +53,7 @@ async fn exchange(a: &UdpTransport, b: &UdpTransport) {
             .unwrap();
         let packet = timeout(SETTLE, to.recv()).await.unwrap().unwrap();
         assert_eq!(packet.from.as_str(), sender);
-        assert_eq!(packet.msg, b"native candidates");
+        assert_eq!(packet.msg.as_ref(), b"native candidates");
     }
 }
 

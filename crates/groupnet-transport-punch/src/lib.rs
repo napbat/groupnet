@@ -35,6 +35,10 @@ mod punch;
 mod tcp;
 
 pub use punch::{
-    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous, UdpConnection,
+    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous, RendezvousConfig,
+    RendezvousLimits, UdpConnection,
 };
-pub use tcp::{MAX_TCP_MESSAGE, TcpConnection, TcpPunchConfig, TcpRendezvous};
+pub use tcp::{
+    ControlRateLimit, MAX_TCP_MESSAGE, RelayPacing, TcpConnection, TcpPunchConfig, TcpRendezvous,
+    TcpRendezvousConfig,
+};

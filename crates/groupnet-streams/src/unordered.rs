@@ -28,7 +28,7 @@ pub enum UnorderedDelivery {
 }
 
 /// Endpoint bounds and policy admission. All buffers and retry lifetimes are finite.
-/// Configured timers must be at most one hour.
+/// Timers must fit the platform's monotonic clock; queue capacities must fit Tokio.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnorderedConfig {
     /// Whether to accept reliable sessions.
@@ -39,7 +39,7 @@ pub struct UnorderedConfig {
     pub max_payload: usize,
     /// Maximum queued messages per session.
     pub inbox_capacity: usize,
-    /// Maximum simultaneous reliable sends per session.
+    /// Maximum simultaneous reliable sends, at most the fixed 1024-ID dedup horizon.
     pub pending_sends: usize,
     /// Maximum sessions, including setup and queued accepts.
     pub max_sessions: usize,
@@ -86,12 +86,17 @@ impl UnorderedConfig {
     /// Returns `InvalidInput` for unsupported sizes, capacities or timers.
     pub fn validate(&self) -> io::Result<()> {
         if (!self.allow_reliable && !self.allow_unreliable)
-            || !(1..=48 * 1024).contains(&self.max_payload)
-            || !(1..=1024).contains(&self.inbox_capacity)
-            || !(1..=1024).contains(&self.pending_sends)
-            || !(1..=1024).contains(&self.max_sessions)
+            || self.max_payload == 0
+            || u32::try_from(self.max_payload).is_err()
+            || self
+                .max_payload
+                .checked_add(wire::HEADER + wire::TAG)
+                .is_none()
+            || !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.inbox_capacity)
+            || !(1..=wire::WINDOW).contains(&self.pending_sends)
+            || !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_sessions)
             || !(1..=self.max_sessions).contains(&self.sessions_per_peer)
-            || !(1..=1000).contains(&self.max_attempts)
+            || self.max_attempts == 0
             || self.retry_interval.is_zero()
             || self.send_timeout < self.retry_interval
             || self.heartbeat_interval.is_zero()
@@ -105,7 +110,7 @@ impl UnorderedConfig {
                 self.setup_timeout,
             ]
             .iter()
-            .any(|timer| *timer > Duration::from_secs(3600))
+            .any(|timer| std::time::Instant::now().checked_add(*timer).is_none())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

@@ -112,8 +112,8 @@ pub use groupnet_network as network;
 #[cfg(feature = "runtime")]
 pub mod messaging {
     pub use groupnet_messaging::{
-        Bytes, Delivery, Frame, MAX_MESSAGE_BYTES, MessageContext, MessageId, MessageProtocol,
-        Messaging, Receipt, SendOptions,
+        Bytes, DEFAULT_MAX_MESSAGE_BYTES, Delivery, Frame, MessageContext, MessageId,
+        MessageProtocol, Messaging, MessagingConfig, Receipt, SendOptions,
     };
     pub use groupnet_runtime::messaging::{GroupSendReport, ReceiveHandle, RecipientOutcome};
 }

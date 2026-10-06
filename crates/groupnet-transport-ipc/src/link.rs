@@ -6,7 +6,7 @@ use std::sync::Arc;
 use groupnet_core::NodeId;
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider, PeerEndpoint};
 
-use crate::{IpcAddress, IpcTransport, MAX_FRAME};
+use crate::{IpcAddress, IpcConfig, IpcTransport, MAX_FRAME};
 
 /// A native IPC listener and explicitly configured peer addresses.
 ///
@@ -18,6 +18,7 @@ pub struct IpcLink {
     peers: Vec<NodeId>,
     addresses: Vec<IpcAddress>,
     cost: u32,
+    config: IpcConfig,
 }
 
 impl IpcLink {
@@ -33,7 +34,15 @@ impl IpcLink {
             peers,
             addresses,
             cost: 1,
+            config: IpcConfig::default(),
         }
+    }
+
+    /// Selects listener resource budgets, validated before binding.
+    #[must_use]
+    pub const fn with_config(mut self, config: IpcConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Sets the routing cost advertised for this link (one by default).
@@ -56,8 +65,9 @@ impl LinkProvider for IpcLink {
                 peers,
                 addresses,
                 cost,
+                config,
             } = *self;
-            let transport = IpcTransport::bind(local, &bind)?;
+            let transport = IpcTransport::bind_with_config(local, &bind, config)?;
             for (peer, address) in peers.iter().zip(addresses) {
                 if let Err(error) = transport.register_peer(peer.clone(), address) {
                     transport.close().await;

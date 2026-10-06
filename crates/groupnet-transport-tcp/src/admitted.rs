@@ -6,6 +6,7 @@ use std::io;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{
     Admission, JoinRequest, MAX_CREDENTIAL_BYTES, SessionLease, SessionRegistry,
@@ -16,7 +17,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::timeout;
 
-use super::{Inner, MAX_FRAME, QueuedInbound, TcpMsgConfig, TcpMsgTransport};
+use super::{Inner, QueuedInbound, TcpMsgConfig, TcpMsgTransport};
 use crate::handshake::{read_id, read_str, write_id, write_str};
 
 const MAGIC: &[u8; 8] = b"GNJOIN01";
@@ -48,7 +49,7 @@ struct Connection {
     session: Option<groupnet_transport::admission::SessionId>,
     pending: bool,
     outbound: bool,
-    frames: mpsc::Sender<Vec<u8>>,
+    frames: mpsc::Sender<Bytes>,
     cancel: watch::Sender<bool>,
 }
 
@@ -97,7 +98,8 @@ impl TcpMsgTransport {
         admission: TcpAdmissionConfig,
     ) -> io::Result<Self> {
         if credential.len() > MAX_CREDENTIAL_BYTES
-            || !(1..=4096).contains(&admission.max_pending)
+            || admission.max_pending == 0
+            || admission.max_pending > Semaphore::MAX_PERMITS
             || admission.max_peers == 0
             || admission.handshake_timeout.is_zero()
             || local.as_str().is_empty()
@@ -157,6 +159,9 @@ impl TcpMsgTransport {
     pub fn into_bound_link(self, cost: u32) -> BoundLink {
         let mut config = LinkConfig::new(Vec::new());
         config.cost = cost;
+        if let Some(inner) = self.direct() {
+            config.mtu = config.mtu.min(inner.config.max_frame_bytes);
+        }
         #[cfg(feature = "connectivity")]
         if matches!(&self.backend, super::Backend::Connectivity { .. }) {
             config.mtu = groupnet_transport_punch::MAX_TCP_MESSAGE;
@@ -244,7 +249,7 @@ impl Managed {
         &self,
         inner: &Arc<Inner>,
         peer: &NodeId,
-        msg: &[u8],
+        msg: Bytes,
         expected: Option<groupnet_transport::admission::SessionId>,
     ) -> io::Result<()> {
         if inner.tasks.stopped() {
@@ -256,7 +261,7 @@ impl Managed {
         let Some(expected) = expected else {
             return Ok(());
         };
-        if msg.len() > MAX_FRAME {
+        if msg.len() > inner.config.max_frame_bytes {
             return Ok(());
         }
         let connections = self.connections.lock().expect("connections lock poisoned");
@@ -268,7 +273,7 @@ impl Managed {
         }
         // This queue belongs permanently to this socket owner. No capacity
         // await or later NodeId lookup can migrate its frames to a replacement.
-        let _ = connection.frames.try_send(frame(msg));
+        let _ = connection.frames.try_send(msg);
         Ok(())
     }
 
@@ -276,7 +281,7 @@ impl Managed {
         self: &Arc<Self>,
         inner: &Arc<Inner>,
         peer: &NodeId,
-        msg: Option<&[u8]>,
+        msg: Option<Bytes>,
     ) -> io::Result<()> {
         if inner.tasks.stopped() {
             return Err(io::Error::new(
@@ -284,7 +289,11 @@ impl Managed {
                 "tcp msg transport shut down",
             ));
         }
-        if peer == &inner.local || msg.is_some_and(|msg| msg.len() > MAX_FRAME) {
+        if peer == &inner.local
+            || msg
+                .as_ref()
+                .is_some_and(|msg| msg.len() > inner.config.max_frame_bytes)
+        {
             return Ok(());
         }
         let mut connections = self.connections.lock().expect("connections lock poisoned");
@@ -296,7 +305,7 @@ impl Managed {
                 return Ok(());
             }
             if let Some(msg) = msg {
-                let _ = connection.frames.try_send(frame(msg));
+                let _ = connection.frames.try_send(msg);
             }
             return Ok(());
         }
@@ -314,7 +323,7 @@ impl Managed {
         };
         let (frames, receiver) = mpsc::channel(inner.config.outbound_queue);
         if let Some(msg) = msg {
-            let _ = frames.try_send(frame(msg));
+            let _ = frames.try_send(msg);
         }
         let (cancel, cancelled) = watch::channel(false);
         let generation = connections.next_generation;
@@ -343,6 +352,7 @@ impl Managed {
         let intro = inner.intro.clone();
         let managed = self.clone();
         let peer = peer.clone();
+        let max_frame_bytes = inner.config.max_frame_bytes;
         inner.tasks.spawn(async move {
             let work = async move {
                 let mut socket = TcpStream::connect(addr).await?;
@@ -352,7 +362,16 @@ impl Managed {
                     .await?;
                 Ok::<_, io::Error>((socket, lease))
             };
-            run_pending(owned, weak, work, receiver, cancelled, permit).await;
+            run_pending(
+                owned,
+                weak,
+                work,
+                receiver,
+                cancelled,
+                permit,
+                max_frame_bytes,
+            )
+            .await;
         });
         Ok(())
     }
@@ -366,6 +385,7 @@ impl Managed {
         let local = inner.local.clone();
         let intro = inner.intro.clone();
         let queue = inner.config.outbound_queue;
+        let max_frame_bytes = inner.config.max_frame_bytes;
         inner.tasks.spawn(async move {
             let result = timeout(managed.config.handshake_timeout, async {
                 let mut socket = socket;
@@ -389,7 +409,7 @@ impl Managed {
             .await;
             drop(permit);
             if let Ok(Ok((socket, lease, owner, receiver, cancelled))) = result {
-                run_session(socket, lease, owner, receiver, cancelled).await;
+                run_session(socket, lease, owner, receiver, cancelled, max_frame_bytes).await;
             }
         });
     }
@@ -452,7 +472,7 @@ impl Managed {
         local: &NodeId,
         peer: &NodeId,
         queue: usize,
-    ) -> io::Result<(Owner, mpsc::Receiver<Vec<u8>>, watch::Receiver<bool>)> {
+    ) -> io::Result<(Owner, mpsc::Receiver<Bytes>, watch::Receiver<bool>)> {
         let mut connections = self.connections.lock().expect("connections lock poisoned");
         if let Some(existing) = connections.peers.get(peer) {
             // Only a provisional simultaneous outbound dial is replaceable. The
@@ -542,9 +562,10 @@ async fn run_pending(
     owner: Owner,
     inner: Weak<Inner>,
     handshake: impl Future<Output = io::Result<(TcpStream, SessionLease)>>,
-    receiver: mpsc::Receiver<Vec<u8>>,
+    receiver: mpsc::Receiver<Bytes>,
     mut cancelled: watch::Receiver<bool>,
     permit: OwnedSemaphorePermit,
+    max_frame_bytes: usize,
 ) {
     let result = tokio::select! {
         result = timeout(owner.managed.config.handshake_timeout, handshake) => result,
@@ -555,7 +576,7 @@ async fn run_pending(
         if inner.upgrade().is_none() {
             return;
         }
-        run_session(socket, lease, owner, receiver, cancelled).await;
+        run_session(socket, lease, owner, receiver, cancelled, max_frame_bytes).await;
     }
 }
 
@@ -563,8 +584,9 @@ async fn run_session(
     socket: TcpStream,
     lease: SessionLease,
     owner: Owner,
-    mut frames: mpsc::Receiver<Vec<u8>>,
+    mut frames: mpsc::Receiver<Bytes>,
     mut cancelled: watch::Receiver<bool>,
+    max_frame_bytes: usize,
 ) {
     let Some(inbound) = owner
         .managed
@@ -578,7 +600,7 @@ async fn run_session(
     let mut sessions = owner.managed.sessions.subscribe();
     let (mut reader, mut writer) = socket.into_split();
     let reading = async {
-        while let Ok(Some(msg)) = super::read_frame(&mut reader).await {
+        while let Ok(Some(msg)) = super::read_frame(&mut reader, max_frame_bytes).await {
             if !lease.is_active() {
                 break;
             }
@@ -596,7 +618,7 @@ async fn run_session(
     };
     let writing = async {
         while let Some(frame) = frames.recv().await {
-            if !lease.is_active() || writer.write_all(&frame).await.is_err() {
+            if !lease.is_active() || super::write_frame(&mut writer, &frame).await.is_err() {
                 break;
             }
         }
@@ -672,17 +694,6 @@ fn learn_intro(inner: &Weak<Inner>, node: &NodeId, intro: &str) {
             .expect("peers lock poisoned")
             .insert(node.clone(), address);
     }
-}
-
-fn frame(msg: &[u8]) -> Vec<u8> {
-    let mut framed = Vec::with_capacity(4 + msg.len());
-    framed.extend_from_slice(
-        &u32::try_from(msg.len())
-            .expect("bounded frame")
-            .to_be_bytes(),
-    );
-    framed.extend_from_slice(msg);
-    framed
 }
 
 fn denied() -> io::Error {

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 
-use crate::tunnel::{PeerIdentity, TlsIdentity, TunnelTransport, TunneledStream};
+use crate::tunnel::{PeerIdentity, TlsIdentity, TunnelLimits, TunnelTransport, TunneledStream};
 use crate::{Router, RouterConfig};
 use groupnet_core::NodeId;
 use groupnet_transport::{bulk::BulkTransport, link::LinkProvider};
@@ -16,6 +16,7 @@ use groupnet_transport::{bulk::BulkTransport, link::LinkProvider};
 pub struct TunnelConfig {
     identity: TlsIdentity,
     peers: Vec<PeerIdentity>,
+    limits: TunnelLimits,
 }
 
 impl TunnelConfig {
@@ -25,7 +26,15 @@ impl TunnelConfig {
         Self {
             identity,
             peers: peers.into_iter().collect(),
+            limits: TunnelLimits::default(),
         }
+    }
+
+    /// Sets node-wide tunnel capacities and reliability policy.
+    #[must_use]
+    pub fn with_limits(mut self, limits: TunnelLimits) -> Self {
+        self.limits = limits;
+        self
     }
 }
 
@@ -103,7 +112,12 @@ impl NetworkConfig {
             network.tunnels = self
                 .tunnels
                 .map(|config| {
-                    TunnelTransport::new(network.router.clone(), config.identity, config.peers)
+                    TunnelTransport::with_limits(
+                        network.router.clone(),
+                        config.identity,
+                        config.peers,
+                        config.limits,
+                    )
                 })
                 .transpose()?;
             Ok::<_, io::Error>(())

@@ -6,20 +6,17 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
 use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::sync::Mutex;
+
+mod framing;
+use framing::{MAX_DATAGRAM, SendBuffer, unframe};
 
 #[cfg(feature = "connectivity")]
 use groupnet_transport_punch::{PeerPath, PunchConfig, UdpConnection};
-
-/// Receive-buffer size: the largest possible UDP payload (the length field is
-/// 16 bits), so any single datagram is read in one `recv_from` with no
-/// truncation.
-const MAX_DATAGRAM: usize = 65_535;
-
-/// Longest accepted sender id in a datagram's self-attribution prefix.
-const MAX_ID_LEN: usize = 1024;
 
 /// Whether a receive error is a transient ICMP response rather than a socket
 /// failure.
@@ -36,34 +33,6 @@ fn retryable_recv_error(error: &io::Error) -> bool {
     )
 }
 
-/// Every datagram carries `[u32 sender-id length][sender id][frame]`, so a
-/// receiver can attribute — and learn the address of — a peer it has never
-/// been told about. Without it, UDP attribution is address-only: a restarted
-/// peer at a new address can dial out but nobody will accept its datagrams,
-/// and the cluster wedges into one-way visibility.
-///
-/// The claimed id is trusted exactly as much as a source address was: this
-/// is a cluster-internal fabric behind its own network boundary.
-fn frame(local: &NodeId, msg: &[u8]) -> Vec<u8> {
-    let id = local.as_str().as_bytes();
-    let mut out = Vec::with_capacity(4 + id.len() + msg.len());
-    out.extend_from_slice(&u32::try_from(id.len()).unwrap_or(u32::MAX).to_le_bytes());
-    out.extend_from_slice(id);
-    out.extend_from_slice(msg);
-    out
-}
-
-/// Splits a datagram into `(sender, frame)`, or `None` when the prefix is
-/// absent/garbled (a pre-prefix peer, or noise).
-fn unframe(datagram: &[u8]) -> Option<(NodeId, &[u8])> {
-    let len = usize::try_from(u32::from_le_bytes(datagram.get(0..4)?.try_into().ok()?)).ok()?;
-    if len > MAX_ID_LEN {
-        return None;
-    }
-    let id = std::str::from_utf8(datagram.get(4..4 + len)?).ok()?;
-    Some((NodeId::new(id), datagram.get(4 + len..)?))
-}
-
 /// Shared endpoint state behind a single [`Arc`], so every clone of a
 /// [`UdpTransport`] observes and performs registrations against the SAME
 /// address book. This is what lets one handle be consumed by the node builder
@@ -76,8 +45,10 @@ struct Inner {
     /// `NodeId` -> where to send. Interior mutability so peers can be registered
     /// after binding (e.g. once ephemeral ports are known).
     peers: RwLock<HashMap<NodeId, SocketAddr>>,
-    /// The reverse map, to attribute inbound datagrams to a sender.
-    by_addr: RwLock<HashMap<SocketAddr, NodeId>>,
+    /// The prefix and payload storage shared by all sending clones.
+    send_buffer: Mutex<SendBuffer>,
+    /// One reusable datagram scratch buffer for the endpoint's receive owner.
+    receive_buffer: Mutex<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,15 +72,17 @@ impl UdpTransport {
     /// [`register_peer`](Self::register_peer) before use.
     ///
     /// # Errors
-    /// Propagates any socket bind error.
+    /// Propagates any socket bind error or rejects an oversized local identity.
     pub async fn bind(local: NodeId, bind_addr: impl ToSocketAddrs) -> io::Result<Self> {
+        let send_buffer = SendBuffer::new(&local)?;
         let socket = UdpSocket::bind(bind_addr).await?;
         Ok(Self {
             backend: Backend::Direct(Arc::new(Inner {
                 socket,
                 local,
                 peers: RwLock::new(HashMap::new()),
-                by_addr: RwLock::new(HashMap::new()),
+                send_buffer: Mutex::new(send_buffer),
+                receive_buffer: Mutex::new(vec![0; MAX_DATAGRAM]),
             })),
         })
     }
@@ -276,38 +249,27 @@ impl UdpTransport {
     }
 
     /// Teaches this endpoint that `node` is reachable at `addr`, replacing any
-    /// previous binding for `node`.
-    ///
-    /// When `node` was previously registered at a *different* address, that
-    /// stale reverse (`by_addr`) entry is removed before the new one is
-    /// inserted. The reverse map must never retain a dead address: a lingering
-    /// entry grows the map without bound and can mis-attribute an inbound
-    /// datagram once that address is reused by another node. Callable through
-    /// any clone — all clones share one book.
+    /// previous binding for `node`. Callable through any clone — all clones
+    /// share one book.
     ///
     /// Has no effect in connectivity mode: only native admission and validated
     /// candidate checks may establish or change a connected peer's path.
     ///
     /// # Panics
-    /// If either half of the address book was poisoned by a panic in another
-    /// thread.
+    /// If the address book was poisoned by a panic in another thread.
     pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
+        #[cfg(not(feature = "connectivity"))]
+        let Backend::Direct(inner) = &self.backend;
+        #[cfg(feature = "connectivity")]
         let inner = match &self.backend {
             Backend::Direct(inner) => inner,
-            #[cfg(feature = "connectivity")]
             Backend::Connectivity(_) => return,
         };
-        // Take both locks (peers before by_addr — the only site that holds
-        // both) so the forward and reverse maps update atomically.
-        let mut peers = inner.peers.write().expect("peers lock poisoned");
-        let mut by_addr = inner.by_addr.write().expect("by_addr lock poisoned");
-        let stale = peers
-            .insert(node.clone(), addr)
-            .filter(|prev| *prev != addr);
-        if let Some(prev) = stale {
-            by_addr.remove(&prev);
-        }
-        by_addr.insert(addr, node);
+        inner
+            .peers
+            .write()
+            .expect("peers lock poisoned")
+            .insert(node, addr);
     }
 
     /// Returns the owned native connection when connectivity is enabled.
@@ -342,9 +304,11 @@ impl Transport for UdpTransport {
     }
 
     async fn send(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
+        #[cfg(not(feature = "connectivity"))]
+        let Backend::Direct(inner) = &self.backend;
+        #[cfg(feature = "connectivity")]
         let inner = match &self.backend {
             Backend::Direct(inner) => inner,
-            #[cfg(feature = "connectivity")]
             Backend::Connectivity(connection) => return connection.send(to, msg).await,
         };
         // Resolve the address without holding the lock across the await.
@@ -355,8 +319,12 @@ impl Transport for UdpTransport {
             .get(to)
             .copied();
         if let Some(addr) = addr {
-            // Best-effort: a send error is a drop, which the protocol tolerates.
-            let _ = inner.socket.send_to(&frame(&inner.local, msg), addr).await;
+            // Hold exclusive buffer ownership through send completion. Reuse
+            // its allocation and immutable identity prefix across datagrams.
+            let mut buffer = inner.send_buffer.lock().await;
+            let datagram = buffer.frame(msg)?;
+            // Best-effort: a socket error is a drop, which the protocol tolerates.
+            let _ = inner.socket.send_to(datagram, addr).await;
         }
         Ok(())
     }
@@ -380,15 +348,38 @@ impl Transport for UdpTransport {
         }
     }
 
+    #[cfg(feature = "link")]
+    async fn send_owned_admitted(
+        &self,
+        to: &NodeId,
+        msg: Bytes,
+        session: Option<groupnet_transport::admission::SessionId>,
+    ) -> io::Result<()> {
+        match &self.backend {
+            Backend::Direct(_) => {
+                if session.is_none() {
+                    self.send(to, &msg).await?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => {
+                connection.send_owned_admitted(to, msg, session).await
+            }
+        }
+    }
+
     async fn recv(&self) -> io::Result<Inbound> {
+        #[cfg(not(feature = "connectivity"))]
+        let Backend::Direct(inner) = &self.backend;
+        #[cfg(feature = "connectivity")]
         let inner = match &self.backend {
             Backend::Direct(inner) => inner,
-            #[cfg(feature = "connectivity")]
             Backend::Connectivity(connection) => return connection.recv().await,
         };
-        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut buf = inner.receive_buffer.lock().await;
         loop {
-            let (n, addr) = match inner.socket.recv_from(&mut buf).await {
+            let (n, addr) = match inner.socket.recv_from(buf.as_mut_slice()).await {
                 Ok(received) => received,
                 Err(error) if retryable_recv_error(&error) => continue,
                 Err(error) => return Err(error),
@@ -407,22 +398,10 @@ impl Transport for UdpTransport {
                 if known != Some(addr) {
                     self.register_peer(from.clone(), addr);
                 }
-                let msg = msg.to_vec();
+                let msg = Bytes::copy_from_slice(msg);
                 return Ok(Inbound { from, msg });
             }
-            // No usable prefix: fall back to address attribution, so a peer
-            // still running a pre-prefix build is understood during a roll.
-            let from = inner
-                .by_addr
-                .read()
-                .expect("by_addr lock poisoned")
-                .get(&addr)
-                .cloned();
-            if let Some(from) = from {
-                let msg = buf[..n].to_vec();
-                return Ok(Inbound { from, msg });
-            }
-            // Unattributable datagram — ignore and keep receiving.
+            // Malformed or unattributable datagram — ignore and keep receiving.
         }
     }
 
@@ -540,7 +519,7 @@ mod tests {
             .expect("receive task panicked")
             .expect("receiver stopped after transient ICMP error");
         assert_eq!(inbound.from, sender_id);
-        assert_eq!(inbound.msg, b"peer is now live");
+        assert_eq!(inbound.msg.as_ref(), b"peer is now live");
     }
 
     /// A clone shares the address book: a peer registered through the clone is
@@ -606,7 +585,7 @@ mod tests {
     }
 
     /// A moved peer (restart at a fresh address) re-teaches the book on its
-    /// first datagram, and the stale reverse entry does not linger.
+    /// first datagram, replacing the stale address.
     #[tokio::test]
     async fn a_moved_sender_rebinds_the_book() {
         let receiver = bind_as("move-receiver").await;
@@ -663,10 +642,10 @@ mod tests {
         assert_eq!(inbound.msg, b"via-gossip".to_vec());
     }
 
-    /// Re-registering a node at a new address updates BOTH maps and drops the
-    /// stale reverse entry.
+    /// Re-registering a node replaces the previous address without retaining
+    /// an additional peer entry.
     #[tokio::test]
-    async fn reregister_updates_both_maps_and_drops_stale_reverse() {
+    async fn reregister_replaces_stale_address() {
         let t = bind_as("local").await;
         let peer = NodeId::new("peer");
         let old: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
@@ -679,16 +658,11 @@ mod tests {
             raw_inner(&t).peers.read().expect("peers").get(&peer),
             Some(&new)
         );
-        let by_addr = raw_inner(&t).by_addr.read().expect("by_addr");
-        assert_eq!(by_addr.get(&new), Some(&peer));
-        assert!(
-            !by_addr.contains_key(&old),
-            "stale reverse entry lingered after re-registration"
-        );
+        assert_eq!(raw_inner(&t).peers.read().expect("peers").len(), 1);
     }
 
-    /// An inbound datagram from a RE-REGISTERED (new) address attributes to the
-    /// node — the fresh reverse entry resolves, the stale one no longer can.
+    /// An inbound datagram from a re-registered address still attributes to the
+    /// sender identified by its prefix.
     #[tokio::test]
     async fn inbound_from_new_address_attributes() {
         let receiver = bind_as("receiver").await;
@@ -713,3 +687,6 @@ mod tests {
         assert_eq!(inbound.msg, b"ping".to_vec());
     }
 }
+
+#[cfg(test)]
+mod packet_tests;

@@ -12,7 +12,7 @@ pub struct Inbound {
     /// The node that sent it (as the transport resolved the source).
     pub from: NodeId,
     /// The opaque frame; hand it to `GroupEngine::on_message`.
-    pub msg: Vec<u8>,
+    pub msg: bytes::Bytes,
 }
 
 /// A pluggable, best-effort, message-oriented transport.
@@ -49,6 +49,19 @@ pub trait Transport: Send + Sync + 'static {
             }
             self.send(to, msg).await
         }
+    }
+
+    /// Transfers an owned frame to the admission generation selected by the router.
+    /// Adapters with queued writes override this to retain the allocation; the
+    /// default borrows it for the duration of the existing admitted send.
+    #[cfg(feature = "link")]
+    fn send_owned_admitted(
+        &self,
+        to: &NodeId,
+        msg: bytes::Bytes,
+        session: Option<crate::admission::SessionId>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move { self.send_admitted(to, &msg, session).await }
     }
 
     /// Awaits the next inbound datagram. Returning `Err` ends the receive loop.

@@ -181,6 +181,14 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
   isolated, and unordered accepts must respect the selected policy.
   Keep the lossless buffer/context and frame APIs equivalent, with explicit
   `BestEffort` (default), `Delivered`, and `Applied` boundaries.
+- Packet hot paths use typed `zerocopy` headers with explicit byte order, not
+  manual field offsets or serialization of native Rust layout. Preserve owned
+  `Bytes`/`PacketBuffer` storage through routing and adapters; borrowed APIs may
+  copy at their ownership boundary, but do not add repeated whole-payload copies.
+  Operational capacities and timers belong to validated typed configuration;
+  wire representability, replay protection and finite memory admission remain
+  invariants. Control-rate protection must not impose a fixed packet-rate ceiling
+  on admitted relay data.
 - Workspace lints also enforce `unsafe_code = "forbid"`, `missing_docs`,
   `missing_debug_implementations` — document every public item.
 - Bounded polling via `groupnet_testkit::cluster::eventually` /

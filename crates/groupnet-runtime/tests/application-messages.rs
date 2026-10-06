@@ -7,7 +7,7 @@ use std::time::Duration;
 use groupnet_core::{GroupId, NodeId};
 use groupnet_messaging::Messaging;
 use groupnet_network::NetworkConfig;
-use groupnet_runtime::messaging::{Bytes, Delivery, MAX_MESSAGE_BYTES, SendOptions};
+use groupnet_runtime::messaging::{Bytes, DEFAULT_MAX_MESSAGE_BYTES, Delivery, SendOptions};
 use groupnet_runtime::{Group, Node};
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use groupnet_transport_mem::MemLink;
@@ -250,7 +250,7 @@ async fn payload_boundaries_and_empty_fanout_validate_before_dispatch() {
         .spawn()
         .await;
     converge(&cluster.groups.iter().collect::<Vec<_>>(), 2).await;
-    let maximum = Bytes::from(vec![0xa5; MAX_MESSAGE_BYTES]);
+    let maximum = Bytes::from(vec![0xa5; DEFAULT_MAX_MESSAGE_BYTES]);
     let id = cluster.nodes[0]
         .send_frame(&cluster.ids[1], maximum.clone(), delivered())
         .await
@@ -277,7 +277,7 @@ async fn payload_boundaries_and_empty_fanout_validate_before_dispatch() {
             .is_empty()
     );
 
-    let oversized = vec![0; MAX_MESSAGE_BYTES + 1];
+    let oversized = vec![0; DEFAULT_MAX_MESSAGE_BYTES + 1];
     assert_eq!(
         cluster.nodes[0]
             .send(&cluster.ids[1], &oversized)

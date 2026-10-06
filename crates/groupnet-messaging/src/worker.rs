@@ -1,8 +1,9 @@
 //! Adapter worker for the pure codec/receipt state, with bounded reservations.
 
-use super::{Delivery, Frame, Inner, MAX_RECEIVED, Receipt, Record, error};
+use super::{Delivery, Frame, Inner, Receipt, Record, error};
 use crate::codec::{self, MessageId, Outcome, Packet, ReceiptState, Rejection};
-use groupnet_core::NodeId;
+use bytes::Buf;
+use groupnet_core::{GroupId, NodeId};
 use groupnet_network::{ApplicationPacket, ProtocolIo};
 use ring::digest;
 use std::{
@@ -79,9 +80,15 @@ pub(super) fn process(inner: &Arc<Inner>, packet: ApplicationPacket) {
         Packet::Data {
             id,
             delivery,
+            retry_horizon_ms,
             group,
             payload,
         } => {
+            // A peer may not extend this receiver's finite retry/retention bound.
+            // Fail closed without queueing or acknowledging application work.
+            if payload.len() > inner.config.max_payload || retry_horizon_ms > inner.max_timeout_ms {
+                return;
+            }
             let offset = packet.payload.len() - payload.len();
             let fingerprint: [u8; 32] = if delivery == Delivery::BestEffort {
                 [0; 32]
@@ -96,9 +103,14 @@ pub(super) fn process(inner: &Arc<Inner>, packet: ApplicationPacket) {
                     from: packet.from.clone(),
                     id,
                     delivery,
+                    retry_horizon_ms,
                     group: None,
                     fingerprint,
-                    state: std::sync::Mutex::new(ReceiptState::new(delivery, inner.now())),
+                    state: std::sync::Mutex::new(ReceiptState::new(
+                        delivery,
+                        inner.now(),
+                        inner.retention_ms,
+                    )),
                 })
             } else {
                 let key = (packet.from.clone(), id);
@@ -116,6 +128,7 @@ pub(super) fn process(inner: &Arc<Inner>, packet: ApplicationPacket) {
                     // Same identity with a different body is malformed, not a
                     // new operation and not eligible for a success receipt.
                     if record.delivery != delivery
+                        || record.retry_horizon_ms != retry_horizon_ms
                         || record.group != group
                         || record.fingerprint != fingerprint
                     {
@@ -128,46 +141,62 @@ pub(super) fn process(inner: &Arc<Inner>, packet: ApplicationPacket) {
                         .and_then(|mut receipt| receipt.replay(now));
                     drop(state);
                     if let Some(outcome) = outcome {
-                        let _ = inner.io.send(&packet.from, &codec::ack(id, outcome));
+                        let _ = inner.acknowledge(&packet.from, id, outcome);
                     }
                     return;
                 }
                 // Never evict a live identity to admit more work. Without room
                 // for a rejection record, fail closed rather than emit a
                 // terminal receipt that could later be contradicted by a retry.
-                if state.received.len() >= MAX_RECEIVED {
+                if state.received.len() >= inner.config.received_records {
                     return;
                 }
                 let record = Arc::new(Record {
                     from: packet.from.clone(),
                     id,
                     delivery,
+                    retry_horizon_ms,
                     group: group.clone(),
                     fingerprint,
-                    state: std::sync::Mutex::new(ReceiptState::new(delivery, now)),
+                    state: std::sync::Mutex::new(ReceiptState::new(
+                        delivery,
+                        now,
+                        inner.retention_ms,
+                    )),
                 });
                 state.received.insert(key, record.clone());
                 record
             };
-            let receipt = Receipt {
-                owner: Arc::downgrade(inner),
-                record,
-            };
-            let frame = Frame {
-                id,
-                from: packet.from,
-                group,
-                payload: packet.payload.slice(offset..),
-                receipt,
-            };
-            if let Err(error) = inner.incoming.try_send(frame) {
-                let kind = if matches!(&error, mpsc::error::TrySendError::Full(_)) {
-                    io::ErrorKind::WouldBlock
-                } else {
-                    io::ErrorKind::NotConnected
-                };
-                let _ = error.into_inner().receipt.reject(kind);
-            }
+            enqueue(inner, packet, group, id, record, offset);
         }
+    }
+}
+
+fn enqueue(
+    inner: &Arc<Inner>,
+    mut packet: ApplicationPacket,
+    group: Option<GroupId>,
+    id: MessageId,
+    record: Arc<Record>,
+    offset: usize,
+) {
+    packet.payload.advance(offset);
+    let frame = Frame {
+        id,
+        from: packet.from,
+        group,
+        payload: packet.payload,
+        receipt: Receipt {
+            owner: Arc::downgrade(inner),
+            record,
+        },
+    };
+    if let Err(error) = inner.incoming.try_send(frame) {
+        let kind = if matches!(&error, mpsc::error::TrySendError::Full(_)) {
+            io::ErrorKind::WouldBlock
+        } else {
+            io::ErrorKind::NotConnected
+        };
+        let _ = error.into_inner().receipt.reject(kind);
     }
 }

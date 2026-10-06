@@ -321,11 +321,12 @@ mod tests {
             .await
             .expect("send");
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), a.recv())
+            (tokio::time::timeout(Duration::from_secs(5), a.recv())
                 .await
                 .expect("receive")
                 .expect("frame")
-                .msg,
+                .msg)
+                .as_ref(),
             b"static topology"
         );
         let unknown = TcpMsgTransport::bind_admitted(

@@ -318,3 +318,31 @@ fn maximum_identity_and_payload_fit_all_data_paths_in_both_modes() {
         }
     }
 }
+
+#[test]
+fn typed_envelope_preserves_gnp4_bytes_and_decodes_unaligned_storage() {
+    assert_eq!(std::mem::size_of::<EnvelopeHeader>(), 6);
+    assert_eq!(std::mem::size_of::<SessionHeader>(), 24);
+    let mut storage = [0; MAX_PACKET + 1];
+    let mut buffer = [0; MAX_PACKET];
+    let length = encode_mode(packet(Body::Hello { nonce: [3; 16] }), None, &mut buffer).unwrap();
+    let mut expected = Vec::from(&b"GNP4\x01\x05alpha"[..]);
+    expected.extend_from_slice(&[2; 16]);
+    expected.extend_from_slice(&7_u64.to_be_bytes());
+    expected.extend_from_slice(&[3; 16]);
+    assert_eq!(&buffer[..length], expected);
+    storage[1..=length].copy_from_slice(&buffer[..length]);
+    let decoded = decode_mode(&storage[1..=length], None).unwrap();
+    assert_eq!(decoded.sender, "alpha");
+    assert_eq!(decoded.session, [2; 16]);
+    assert_eq!(decoded.sequence, 7);
+    assert!(matches!(decoded.body, Body::Hello { nonce } if nonce == [3; 16]));
+
+    // Reuse the same buffer for a shorter name without retaining the old header.
+    let shorter = Packet {
+        sender: "x",
+        ..packet(Body::Hello { nonce: [4; 16] })
+    };
+    let length = encode_mode(shorter, None, &mut buffer).unwrap();
+    assert_eq!(decode_mode(&buffer[..length], None).unwrap().sender, "x");
+}

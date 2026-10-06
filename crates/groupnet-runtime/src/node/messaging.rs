@@ -8,19 +8,22 @@ use crate::messaging::{Bytes, Frame, MessageContext, MessageId, ReceiveHandle, S
 
 impl Node {
     /// Sends an opaque borrowed buffer to one node, using best-effort delivery.
-    /// The buffer is copied once; use [`send_frame`](Self::send_frame) for `Bytes`.
+    /// Copies into owned bytes before routed packet encoding; `send_frame` accepts `Bytes`.
     ///
     /// # Errors
     /// Rejects oversized payloads, shutdown, or local routing enqueue failures.
     pub async fn send(&self, to: &NodeId, payload: impl AsRef<[u8]>) -> io::Result<MessageId> {
         let payload = payload.as_ref();
         let options = SendOptions::default();
-        options.validate(payload.len())?;
+        self.inner
+            .messaging
+            .sender()
+            .validate_send(options, payload.len())?;
         self.send_frame(to, Bytes::copy_from_slice(payload), options)
             .await
     }
 
-    /// Sends an owned/shared buffer without copying its payload.
+    /// Sends an owned/shared buffer, copying once into the routed packet allocation.
     /// `Delivered` means queue acceptance; `Applied` requires receiver completion.
     /// A timeout is an unknown outcome, not proof that the receiver did not act.
     ///

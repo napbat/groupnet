@@ -22,10 +22,15 @@ impl<T: Transport> Worker for Typed<T> {
         Box::pin(async move {
             let send = async {
                 while let Some(packet) = io.outgoing.next().await {
+                    let super::Outbound {
+                        peer,
+                        bytes,
+                        deadline,
+                        session,
+                    } = packet;
                     let _ = tokio::time::timeout_at(
-                        packet.deadline,
-                        self.0
-                            .send_admitted(&packet.peer, packet.bytes(), packet.session),
+                        deadline,
+                        self.0.send_owned_admitted(&peer, bytes, session),
                     )
                     .await;
                 }

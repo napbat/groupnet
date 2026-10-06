@@ -30,5 +30,6 @@ pub mod tunnel;
 
 pub use config::{Network, NetworkConfig, TunnelConfig};
 pub use router::{
-    ApplicationPacket, ProtocolId, ProtocolIo, Route, Router, RouterConfig, TransportId,
+    ApplicationPacket, PacketBuffer, ProtocolId, ProtocolIo, ReassemblyConfig, Route, Router,
+    RouterConfig, TransportId,
 };

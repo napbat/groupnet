@@ -53,7 +53,7 @@ async fn candidate_checks_use_independent_nonces_and_additional_socket_then_fail
         to: "remote".into(),
         session: lease,
         target: [3; 16],
-        message: b"extra socket".to_vec(),
+        message: Bytes::from_static(b"extra socket"),
     });
     let mut bytes = [0; MAX_PACKET + 1];
     timeout(Duration::from_secs(1), async {

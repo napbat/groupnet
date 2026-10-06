@@ -5,18 +5,22 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 
-type Peers = Arc<Mutex<HashMap<NodeId, mpsc::UnboundedSender<Inbound>>>>;
+use crate::NetworkConfig;
+
+type Peers = Arc<Mutex<HashMap<NodeId, mpsc::Sender<Inbound>>>>;
 
 /// A shared in-process network fabric. Clone it freely; every endpoint created
 /// from clones shares one routing table.
 #[derive(Clone, Default, Debug)]
 pub struct Network {
     peers: Peers,
+    config: NetworkConfig,
 }
 
 impl Network {
@@ -26,13 +30,25 @@ impl Network {
         Self::default()
     }
 
+    /// Creates a network with bounded endpoint queues.
+    ///
+    /// # Errors
+    /// Rejects zero or unsupported queue capacities.
+    pub fn with_config(config: NetworkConfig) -> std::io::Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            peers: Peers::default(),
+            config,
+        })
+    }
+
     /// Creates and registers a transport endpoint for `id`.
     ///
     /// # Panics
     /// If the fabric's routing table was poisoned by a panic in another thread.
     #[must_use]
     pub fn endpoint(&self, id: NodeId) -> MemTransport {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(self.config.inbound_queue);
         let registration = tx.downgrade();
         self.peers
             .lock()
@@ -52,9 +68,9 @@ impl Network {
 pub struct MemTransport {
     id: NodeId,
     peers: Peers,
-    inbox: AsyncMutex<mpsc::UnboundedReceiver<Inbound>>,
+    inbox: AsyncMutex<mpsc::Receiver<Inbound>>,
     // A strong sender here would prevent a displaced endpoint from observing EOF.
-    registration: mpsc::WeakUnboundedSender<Inbound>,
+    registration: mpsc::WeakSender<Inbound>,
 }
 
 impl MemTransport {
@@ -62,6 +78,14 @@ impl MemTransport {
     #[must_use]
     pub fn local_id(&self) -> &NodeId {
         &self.id
+    }
+
+    fn target(&self, to: &NodeId) -> Option<mpsc::Sender<Inbound>> {
+        self.peers
+            .lock()
+            .expect("network mutex poisoned")
+            .get(to)
+            .cloned()
     }
 }
 
@@ -95,23 +119,38 @@ impl std::error::Error for Closed {}
 impl Transport for MemTransport {
     type Error = Closed;
 
-    fn send(
+    async fn send(&self, to: &NodeId, msg: &[u8]) -> Result<(), Closed> {
+        if let Some(tx) = self.target(to) {
+            // Wait before allocating the borrowed packet. Dead peers still drop.
+            if let Ok(permit) = tx.reserve().await {
+                permit.send(Inbound {
+                    from: self.id.clone(),
+                    msg: Bytes::copy_from_slice(msg),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "link")]
+    async fn send_owned_admitted(
         &self,
         to: &NodeId,
-        msg: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), Closed>> + Send {
-        let target = {
-            let peers = self.peers.lock().expect("network mutex poisoned");
-            peers.get(to).cloned()
-        };
-        if let Some(tx) = target {
-            // Dead peer == drop; a best-effort transport never errors on send.
-            let _ = tx.send(Inbound {
-                from: self.id.clone(),
-                msg: msg.to_vec(),
-            });
+        msg: Bytes,
+        session: Option<groupnet_transport::admission::SessionId>,
+    ) -> Result<(), Closed> {
+        if session.is_some() {
+            return Ok(());
         }
-        std::future::ready(Ok(()))
+        if let Some(tx) = self.target(to) {
+            let _ = tx
+                .send(Inbound {
+                    from: self.id.clone(),
+                    msg,
+                })
+                .await;
+        }
+        Ok(())
     }
 
     async fn recv(&self) -> Result<Inbound, Closed> {

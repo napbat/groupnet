@@ -362,14 +362,18 @@ async fn write_direct(
 ) -> io::Result<()> {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut scratch = Vec::new();
     loop {
         let message = tokio::select! {
             message = outgoing.recv() => message.ok_or_else(closed)?,
             _ = heartbeat.tick() => Message::Ping,
         };
-        tokio::time::timeout(DEADLINE, wire::write(writer, auth, &message))
-            .await
-            .map_err(|_| closed())??;
+        tokio::time::timeout(
+            DEADLINE,
+            wire::write_buffered(writer, auth, &message, &mut scratch),
+        )
+        .await
+        .map_err(|_| closed())??;
     }
 }
 
@@ -451,13 +455,17 @@ mod tests {
         assert_eq!(a.local_addr().unwrap(), source_a);
         assert_eq!(b.local_addr().unwrap(), source_b);
         assert!(rank_a == rank_b);
-        wire::write(&mut a, &key_a.tx, &Message::Data(b"active open".to_vec()))
-            .await
-            .unwrap();
+        wire::write(
+            &mut a,
+            &key_a.tx,
+            &Message::Data(bytes::Bytes::from_static(b"active open")),
+        )
+        .await
+        .unwrap();
         let Message::Data(data) = wire::read(&mut b, &key_b.rx).await.unwrap() else {
             panic!("missing payload");
         };
-        assert_eq!(data, b"active open");
+        assert_eq!(&(data)[..], b"active open");
     }
 
     #[test]
@@ -572,7 +580,9 @@ mod directional_tests {
         wire::directional_tests::rejects_reflection_and_replay(
             &sender,
             &recipient,
-            &Message::Data(b"cannot reflect as authenticated peer data".to_vec()),
+            &Message::Data(bytes::Bytes::from_static(
+                b"cannot reflect as authenticated peer data",
+            )),
         )
         .await;
     }

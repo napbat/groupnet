@@ -231,7 +231,7 @@ mod tests {
             .expect("receive deadline")
             .expect("receive");
         assert_eq!(received.packet.from, a_id);
-        assert_eq!(received.packet.msg, b"still relayed");
+        assert_eq!(received.packet.msg.as_ref(), b"still relayed");
         assert!(received.session.is_some());
         tokio::time::timeout(SETTLE, bound.driver.close())
             .await

@@ -107,7 +107,10 @@ async fn forwarding_a_genuine_probe_cannot_authorize_third_party_confirm_data_or
         ),
         relay.local_addr().unwrap(),
     );
-    assert_eq!(incoming.try_recv().unwrap().packet.msg, b"legitimate relay");
+    assert_eq!(
+        incoming.try_recv().unwrap().packet.msg.as_ref(),
+        b"legitimate relay"
+    );
     // A's own address obtains its own capability and authenticates complete data.
     inject(
         &mut b,
@@ -139,7 +142,7 @@ async fn forwarding_a_genuine_probe_cannot_authorize_third_party_confirm_data_or
     )
     .await;
     assert_eq!(
-        incoming.try_recv().unwrap().packet.msg,
+        (incoming.try_recv().unwrap().packet.msg).as_ref(),
         b"legitimate direct"
     );
 }
@@ -287,7 +290,10 @@ async fn full_table_adopts_authenticated_new_nat_tuple_without_evicting_healthy_
         ),
     )
     .await;
-    assert_eq!(incoming.try_recv().unwrap().packet.msg, b"new NAT tuple");
+    assert_eq!(
+        incoming.try_recv().unwrap().packet.msg.as_ref(),
+        b"new NAT tuple"
+    );
 }
 
 async fn reject_forwarded_credentials(

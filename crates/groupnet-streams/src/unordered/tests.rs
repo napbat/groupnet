@@ -10,40 +10,110 @@ use tokio::time::timeout;
 use super::{
     UnorderedDelivery::{Reliable, Unreliable},
     UnorderedOptions,
-    wire::{Crypto, Kind, Window},
+    wire::{self, Kind, TxCrypto, Window},
 };
 use fabric::{DROP_ALL, DROP_FIRST, Fabric, HOLD_FIRST, PASS, TAMPER_FIRST, config};
 
 const BOUND: Duration = Duration::from_secs(5);
 
+fn sealed(sender: &mut TxCrypto, body: &[u8]) -> Bytes {
+    let mut packet = bytes::BytesMut::with_capacity(wire::HEADER + body.len() + wire::TAG);
+    packet.extend_from_slice(&[0; wire::HEADER]);
+    packet.extend_from_slice(body);
+    packet.extend_from_slice(&[0; wire::TAG]);
+    sender.seal([3; 16], Kind::Data, 1, &mut packet).unwrap();
+    packet.freeze()
+}
+
 #[test]
 fn directional_aead_authenticates_identity_and_never_commits_tampering() {
     let keys = [7; 64];
-    let mut sender = Crypto::new(&keys, true).unwrap();
-    let mut receiver = Crypto::new(&keys, false).unwrap();
-    let original = sender.seal([3; 16], Kind::Data, 1, b"secret").unwrap();
-    let mut tampered = original.clone();
+    let (mut sender, _) = wire::crypto(&keys, true).unwrap();
+    let (_, mut receiver) = wire::crypto(&keys, false).unwrap();
+    let original = sealed(&mut sender, b"secret");
+    let mut tampered = original.to_vec();
     *tampered.last_mut().unwrap() ^= 1;
-    assert!(receiver.open(&tampered, 1024).is_err());
-    let (_, id, body) = receiver.open(&original, 1024).unwrap();
+    assert!(receiver.open(tampered.into(), 1024).is_err());
+    let (_, id, body) = receiver.open(original.clone(), 1024).unwrap();
     assert_eq!(id, 1);
     assert_eq!(body, Bytes::from_static(b"secret"));
     assert!(
-        receiver.open(&original, 1024).is_err(),
+        receiver.open(original.clone(), 1024).is_err(),
         "replayed nonce must fail"
     );
-    let mut wrong_session = Crypto::new(&[8; 64], false).unwrap();
-    assert!(wrong_session.open(&original, 1024).is_err());
-    // Use truly distinct directional material to prove reflection isolation.
+    let (_, mut wrong_session) = wire::crypto(&[8; 64], false).unwrap();
+    assert!(wrong_session.open(original.clone(), 1024).is_err());
     let mut directional = [1; 64];
     directional[32..].fill(2);
-    let mut client = Crypto::new(&directional, true).unwrap();
-    let reflected = client.seal([3; 16], Kind::Data, 1, b"reflection").unwrap();
-    assert!(client.open(&reflected, 1024).is_err());
-    let mut fresh = Crypto::new(&keys, false).unwrap();
-    let mut changed_identity = original.clone();
+    let (mut client, mut client_rx) = wire::crypto(&directional, true).unwrap();
+    let reflected = sealed(&mut client, b"reflection");
+    assert!(client_rx.open(reflected, 1024).is_err());
+    let (_, mut fresh) = wire::crypto(&keys, false).unwrap();
+    let mut changed_identity = original.to_vec();
     changed_identity[4] ^= 1;
-    assert!(fresh.open(&changed_identity, 1024).is_err());
+    assert!(fresh.open(changed_identity.into(), 1024).is_err());
+}
+
+#[test]
+fn owned_decryption_reuses_unique_storage_and_preserves_shared_aliases() {
+    let (mut sender, _) = wire::crypto(&[7; 64], true).unwrap();
+    let (_, mut receiver) = wire::crypto(&[7; 64], false).unwrap();
+    let unique = sealed(&mut sender, b"unique");
+    let body_pointer = unique.as_ptr().wrapping_add(wire::HEADER);
+    let (_, _, body) = receiver.open(unique, 6).unwrap();
+    assert_eq!(body.as_ptr(), body_pointer);
+    assert_eq!(body.as_ref(), b"unique");
+
+    let shared = sealed(&mut sender, b"shared");
+    let alias = shared.clone();
+    let ciphertext = shared.to_vec();
+    let (_, _, body) = receiver.open(shared, 6).unwrap();
+    assert_eq!(body.as_ref(), b"shared");
+    assert_eq!(alias.as_ref(), ciphertext);
+    assert_ne!(body.as_ptr(), alias.as_ptr().wrapping_add(wire::HEADER));
+
+    let mut tampered = sealed(&mut sender, b"failure").to_vec();
+    *tampered.last_mut().unwrap() ^= 1;
+    let tampered = Bytes::from(tampered);
+    let alias = tampered.clone();
+    let ciphertext = alias.to_vec();
+    assert!(receiver.open(tampered, 7).is_err());
+    assert_eq!(alias.as_ref(), ciphertext);
+}
+
+#[test]
+fn size_failure_does_not_consume_nonce_and_retry_plaintext_stays_intact() {
+    let (mut sender, _) = wire::crypto(&[7; 64], true).unwrap();
+    let (_, mut receiver) = wire::crypto(&[7; 64], false).unwrap();
+    let plaintext = Bytes::from_static(b"retry");
+    let first = sealed(&mut sender, &plaintext);
+    assert!(receiver.open(first.clone(), 4).is_err());
+    assert_eq!(receiver.open(first.clone(), 5).unwrap().2, plaintext);
+    let retry = sealed(&mut sender, &plaintext);
+    assert_ne!(first, retry);
+    assert_eq!(receiver.open(retry, 5).unwrap().2, plaintext);
+    for length in 0..wire::HEADER + wire::TAG {
+        assert!(receiver.open(Bytes::from(vec![0; length]), 5).is_err());
+    }
+}
+
+#[test]
+fn operational_capacities_do_not_override_the_security_horizon() {
+    let mut bounds = config();
+    bounds.max_payload = 96 * 1024;
+    bounds.inbox_capacity = 2048;
+    bounds.max_sessions = 2048;
+    bounds.sessions_per_peer = 1025;
+    bounds.max_attempts = 2000;
+    bounds.setup_timeout = Duration::from_secs(7200);
+    bounds.validate().unwrap();
+    bounds.pending_sends = wire::WINDOW;
+    bounds.validate().unwrap();
+    bounds.pending_sends += 1;
+    assert!(bounds.validate().is_err());
+    bounds.pending_sends = 1;
+    bounds.inbox_capacity = 0;
+    assert!(bounds.validate().is_err());
 }
 
 #[test]

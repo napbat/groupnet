@@ -1,5 +1,7 @@
 //! Session-authenticated candidate checks; public addresses never authorize data.
 
+use bytes::Bytes;
+
 use super::super::{PathCheck, Peer, PendingCapability, candidates::valid};
 use super::{
     AdmittedInbound, Body, Capability, Endpoint, Inbound, Instant, Packet, PathPolicy, Session,
@@ -130,7 +132,7 @@ impl Endpoint {
             permit.send(AdmittedInbound {
                 packet: Inbound {
                     from: peer.node.clone(),
-                    msg: message.to_vec(),
+                    msg: Bytes::copy_from_slice(message),
                 },
                 session: Some(peer.lease.id()),
             });

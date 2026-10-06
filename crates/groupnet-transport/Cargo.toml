@@ -1,6 +1,6 @@
 [package]
 name = "groupnet-transport"
-description = "Groupnet transport traits: the dep-free control-plane Transport, and an opt-in data-plane BulkTransport (feature `bulk`)."
+description = "Groupnet transport traits: an owned-buffer control plane and opt-in bulk streams and link workers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Default is the control-plane trait only — dependency-free (just groupnet-core).
+# Default is the control-plane trait and its shared byte buffer.
 # `bulk` adds the data-plane stream trait + framing and pulls its deps.
-bulk = ["dep:bytes", "dep:futures-util", "dep:zerocopy"]
+bulk = ["dep:futures-util", "dep:zerocopy"]
 # Object-safe link initialization with statically dispatched, bounded I/O workers.
 link = ["dep:tokio", "dep:tokio-util", "dep:futures-util", "futures-util/sink", "futures-util/async-await"]
 
 [dependencies]
 groupnet-core = { workspace = true }
-# Data-plane only — inert unless the `bulk` feature is enabled.
-bytes = { workspace = true, optional = true }
+# Shared payload ownership also serves the default control-plane contract.
+bytes.workspace = true
 futures-util = { workspace = true, features = ["io"], optional = true }
 zerocopy = { workspace = true, features = ["derive"], optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }

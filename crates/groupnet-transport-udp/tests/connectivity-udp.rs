@@ -70,11 +70,11 @@ async fn simultaneous_punching_establishes_direct_paths_and_preserves_boundaries
         a.send(&"b".into(), &message).await.unwrap();
         let received = timeout(SETTLE, b.recv()).await.unwrap().unwrap();
         assert_eq!(received.from, NodeId::from("a"));
-        assert_eq!(received.msg, message);
+        assert_eq!(received.msg.as_ref(), message);
     }
     b.send(&"a".into(), b"reverse").await.unwrap();
     assert_eq!(
-        timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg,
+        &(timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg)[..],
         b"reverse"
     );
     let oversized = vec![0; MAX_MESSAGE + 1];
@@ -87,7 +87,7 @@ async fn simultaneous_punching_establishes_direct_paths_and_preserves_boundaries
     for _ in 0..7 {
         a.send(&"b".into(), b"without relay").await.unwrap();
         assert_eq!(
-            timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg,
+            &(timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg)[..],
             b"without relay"
         );
         let started = tokio::time::Instant::now();
@@ -125,7 +125,7 @@ async fn relay_only_paths_deliver_both_directions_and_keep_idle_registrations_li
     }
     b.send(&"a".into(), b"back").await.unwrap();
     assert_eq!(
-        timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg,
+        (timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg).as_ref(),
         b"back"
     );
     b.connection().unwrap().close().await;
@@ -154,7 +154,7 @@ async fn one_relay_only_peer_forces_relay_fallback() {
     .await;
     a.send(&"b".into(), b"fallback").await.unwrap();
     assert_eq!(
-        timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg,
+        (timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg).as_ref(),
         b"fallback"
     );
     a.connection().unwrap().close().await;
@@ -314,7 +314,7 @@ async fn provider_binds_identity_cost_and_native_mtu_and_router_closes_socket() 
     a.send(b.local_id(), &payload).await.unwrap();
     let received = timeout(SETTLE, b.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, *a.local_id());
-    assert_eq!(received.msg, payload);
+    assert_eq!(received.msg.as_ref(), payload);
     a.close().await;
     b.close().await;
     let rebound = UdpSocket::bind(a_address).await.unwrap();

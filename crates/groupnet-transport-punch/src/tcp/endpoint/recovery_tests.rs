@@ -69,7 +69,7 @@ async fn authenticated_accept(
     (stream, auth)
 }
 
-async fn read_data(stream: &mut TcpStream, auth: &wire::Duplex) -> Vec<u8> {
+async fn read_data(stream: &mut TcpStream, auth: &wire::Duplex) -> bytes::Bytes {
     loop {
         match wire::read(stream, &auth.rx).await.unwrap() {
             Message::Data(data) => return data,
@@ -185,19 +185,19 @@ async fn exhausted_burst_and_winner_loss_recover_without_replacing_admission() {
         .await
         .unwrap();
     assert_eq!(
-        tokio::time::timeout(RECOVER, read_data(&mut stream, &auth))
+        &(tokio::time::timeout(RECOVER, read_data(&mut stream, &auth))
             .await
-            .unwrap(),
+            .unwrap())[..],
         b"recovered after cooldown"
     );
     wire::write(
         &mut stream,
         &auth.tx,
-        &Message::Data(b"first reply".to_vec()),
+        &Message::Data(bytes::Bytes::from_static(b"first reply")),
     )
     .await
     .unwrap();
-    assert_eq!(client.recv().await.unwrap().msg, b"first reply");
+    assert_eq!(client.recv().await.unwrap().msg.as_ref(), b"first reply");
     drop(stream);
     eventually_within("failed winning TCP stream falls back", RECOVER, || {
         client.path_to(&NodeId::from("peer")) == Some(PeerPath::Relay)
@@ -215,9 +215,9 @@ async fn exhausted_burst_and_winner_loss_recover_without_replacing_admission() {
         .await
         .unwrap();
     assert_eq!(
-        tokio::time::timeout(RECOVER, read_data(&mut stream, &auth))
+        &(tokio::time::timeout(RECOVER, read_data(&mut stream, &auth))
             .await
-            .unwrap(),
+            .unwrap())[..],
         b"same admission, new direct stream"
     );
     drop(stream);
@@ -273,7 +273,7 @@ async fn disconnected_peer(replace_before_close: bool) {
         wire::write(
             &mut stream,
             &auth.tx,
-            &Message::Data(b"direct reply".to_vec()),
+            &Message::Data(bytes::Bytes::from_static(b"direct reply")),
         )
         .await
         .unwrap();
@@ -282,7 +282,7 @@ async fn disconnected_peer(replace_before_close: bool) {
             .unwrap()
             .unwrap();
         assert_eq!(received.packet.from, peer);
-        assert_eq!(received.packet.msg, b"direct reply");
+        assert_eq!(received.packet.msg.as_ref(), b"direct reply");
         assert_eq!(received.session, Some(generation));
         let started = tokio::time::Instant::now();
         eventually_within("control-disruption observation window", RECOVER, || {
@@ -296,7 +296,7 @@ async fn disconnected_peer(replace_before_close: bool) {
         wire::write(
             old_stream.as_mut().unwrap(),
             &auth.tx,
-            &Message::Data(b"obsolete queued generation".to_vec()),
+            &Message::Data(bytes::Bytes::from_static(b"obsolete queued generation")),
         )
         .await
         .unwrap();
@@ -332,7 +332,7 @@ async fn disconnected_peer(replace_before_close: bool) {
         .unwrap()
         .unwrap();
     assert_eq!(received.packet.from, peer);
-    assert_eq!(received.packet.msg, b"fresh generation");
+    assert_eq!(received.packet.msg.as_ref(), b"fresh generation");
     assert_ne!(received.session, Some(generation));
     replacement.close().await;
     client.close().await;
@@ -350,9 +350,10 @@ async fn direct_request(
         .await
         .unwrap();
     assert_eq!(
-        tokio::time::timeout(RECOVER, read_data(stream, auth))
+        (tokio::time::timeout(RECOVER, read_data(stream, auth))
             .await
-            .unwrap(),
+            .unwrap())
+        .as_ref(),
         b"direct after registration loss"
     );
 }

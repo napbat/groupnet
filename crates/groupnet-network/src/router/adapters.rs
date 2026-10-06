@@ -6,7 +6,7 @@ use futures_util::{SinkExt, stream};
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{SessionId, SessionPeer, SessionRegistry};
 use groupnet_transport::link::{AdmittedInbound, LinkIo, Outbound};
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::Arc};
 use tokio::{
     sync::{mpsc, watch},
     time::Instant,
@@ -153,7 +153,7 @@ impl Outgoing {
             if !self.admitted(&peer, session) {
                 continue;
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + self.shared.config.send_timeout;
             if bytes.len() <= self.mtu {
                 return Some(Outbound::shared(peer, bytes, deadline).with_session(session));
             }

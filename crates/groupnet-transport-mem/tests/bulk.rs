@@ -175,3 +175,161 @@ async fn two_streams_between_one_pair_do_not_interleave() {
         assert_eq!(got, expected, "stream two carries only its own frames");
     }
 }
+
+#[test]
+fn bulk_configuration_rejects_invalid_queue_and_pipe_capacities() {
+    use groupnet_transport_mem::MemBulkConfig;
+
+    for config in [
+        MemBulkConfig {
+            accept_queue: 0,
+            ..MemBulkConfig::default()
+        },
+        MemBulkConfig {
+            accept_queue: usize::MAX,
+            ..MemBulkConfig::default()
+        },
+        MemBulkConfig {
+            pipe_buffer: 0,
+            ..MemBulkConfig::default()
+        },
+        MemBulkConfig {
+            pipe_buffer: usize::MAX,
+            ..MemBulkConfig::default()
+        },
+    ] {
+        assert_eq!(
+            MemBulkNet::with_config(config).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_accept_queue_backpressures_connectors() {
+    use groupnet_transport_mem::MemBulkConfig;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let net = MemBulkNet::with_config(MemBulkConfig {
+        accept_queue: 1,
+        pipe_buffer: 8,
+    })
+    .unwrap();
+    let a = net.endpoint(NodeId::new("sender"));
+    let b = net.endpoint(NodeId::new("receiver"));
+    let target = b.local_id().clone();
+    let _first = a.connect(&target).await.unwrap();
+    let mut pending = std::pin::pin!(a.connect(&target));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let _first_inbound = b.accept().await.unwrap();
+    let _second = pending.await.unwrap();
+    let (from, _second_inbound) = b.accept().await.unwrap();
+    assert_eq!(from, *a.local_id());
+}
+
+#[tokio::test]
+async fn dropped_full_acceptor_unblocks_connect_with_refusal() {
+    use groupnet_transport_mem::MemBulkConfig;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let net = MemBulkNet::with_config(MemBulkConfig {
+        accept_queue: 1,
+        ..MemBulkConfig::default()
+    })
+    .unwrap();
+    let a = net.endpoint(NodeId::new("sender"));
+    let b = net.endpoint(NodeId::new("receiver"));
+    let target = b.local_id().clone();
+    let _first = a.connect(&target).await.unwrap();
+    let mut pending = std::pin::pin!(a.connect(&target));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(b);
+    assert_eq!(
+        pending.await.unwrap_err().kind(),
+        io::ErrorKind::ConnectionRefused
+    );
+}
+
+#[tokio::test]
+async fn replacement_preserves_waiting_connection_generation_and_open_streams() {
+    use groupnet_transport_mem::MemBulkConfig;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let net = MemBulkNet::with_config(MemBulkConfig {
+        accept_queue: 1,
+        pipe_buffer: 8,
+    })
+    .unwrap();
+    let a = net.endpoint(NodeId::new("sender"));
+    let old = net.endpoint(NodeId::new("receiver"));
+    let target = old.local_id().clone();
+    let first = a.connect(&target).await.unwrap();
+    let mut pending = std::pin::pin!(a.connect(&target));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let replacement = net.endpoint(target.clone());
+    let (_, first_inbound) = old.accept().await.unwrap();
+    let _old_second = pending.await.unwrap();
+    let _old_second_inbound = old.accept().await.unwrap();
+    assert_eq!(
+        old.accept().await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    drop(old);
+    let _new = a.connect(&target).await.unwrap();
+    let _new_inbound = replacement.accept().await.unwrap();
+
+    // Endpoint replacement and drop do not disturb pipes already connected.
+    let mut first = first.compat();
+    let mut first_inbound = first_inbound.compat();
+    first.write_all(b"survives").await.unwrap();
+    let mut data = [0; 8];
+    first_inbound.read_exact(&mut data).await.unwrap();
+    assert_eq!(&data, b"survives");
+}
+
+#[tokio::test]
+async fn configured_pipe_buffer_backpressures_writes() {
+    use groupnet_transport_mem::MemBulkConfig;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let net = MemBulkNet::with_config(MemBulkConfig {
+        accept_queue: 1,
+        pipe_buffer: 1,
+    })
+    .unwrap();
+    let a = net.endpoint(NodeId::new("sender"));
+    let b = net.endpoint(NodeId::new("receiver"));
+    let mut out = a.connect(b.local_id()).await.unwrap().compat();
+    let (_, inbound) = b.accept().await.unwrap();
+    let mut inbound = inbound.compat();
+    out.write_all(b"a").await.unwrap();
+    let mut pending = std::pin::pin!(out.write_all(b"b"));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(inbound.read_u8().await.unwrap(), b'a');
+    pending.await.unwrap();
+    assert_eq!(inbound.read_u8().await.unwrap(), b'b');
+}

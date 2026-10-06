@@ -21,6 +21,7 @@ pub struct NodeBuilder {
     config: Config,
     advertise_addr: Option<String>,
     named_seeds: Option<NamedSeeds>,
+    messaging: crate::messaging::MessagingConfig,
 }
 
 impl std::fmt::Debug for NodeBuilder {
@@ -43,6 +44,7 @@ impl NodeBuilder {
             config: Config::default(),
             advertise_addr: None,
             named_seeds: None,
+            messaging: crate::messaging::MessagingConfig::default(),
         }
     }
 
@@ -71,6 +73,13 @@ impl NodeBuilder {
     #[must_use]
     pub fn tunnels(mut self, config: TunnelConfig) -> Self {
         self.network = self.network.with_tunnels(config);
+        self
+    }
+
+    /// Configures shared message payloads, inboxes, retries and group fanout bounds.
+    #[must_use]
+    pub fn messaging(mut self, config: crate::messaging::MessagingConfig) -> Self {
+        self.messaging = config;
         self
     }
 
@@ -181,13 +190,14 @@ impl NodeBuilder {
     /// # Panics
     /// Requires a Tokio runtime; propagates poisoned internal locks.
     pub async fn start(self) -> io::Result<Node> {
+        self.messaging.validate()?;
         let mut seeds = self.seeds;
         seeds.extend(self.network.peers());
         if let Some(named) = &self.named_seeds {
             seeds.extend(named.nodes().cloned());
         }
         let network = self.network.bind(self.id.clone()).await?;
-        let messaging = crate::messaging::Hub::new(network.router())?;
+        let messaging = crate::messaging::Hub::new(network.router(), self.messaging)?;
         let inner = Arc::new(Inner {
             id: self.id,
             transport: Arc::new(network.router().clone()),

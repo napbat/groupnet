@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::Inbound;
 use groupnet_transport::admission::{AcceptedPeer, SessionRegistry};
@@ -394,6 +395,10 @@ impl Endpoint {
             *query = 0;
         }
         let mut peers = lock(&self.peers);
+        peers.retain(|_, peer| peer.lease.is_active() && peer.path(Instant::now()).is_some());
+        if !peers.contains_key(peer) && peers.len() >= self.config.max_peers {
+            return;
+        }
         if let Some(previous) = peers.get_mut(peer) {
             if previous.session == session
                 && previous.secret == secret
@@ -565,7 +570,7 @@ impl Endpoint {
             permit.send(AdmittedInbound {
                 packet: Inbound {
                     from: peer.node.clone(),
-                    msg: message.to_vec(),
+                    msg: Bytes::copy_from_slice(message),
                 },
                 session: Some(peer.lease.id()),
             });

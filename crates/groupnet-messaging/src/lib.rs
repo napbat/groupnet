@@ -5,9 +5,9 @@
 //! confidentiality/authentication. `Delivered` means queue reservation; `Applied`
 //! means explicit application success, never durable/exactly-once execution.
 //! Timeout and route loss after dispatch leave the remote outcome unknown.
-//! Retained duplicate records cover the bounded retry window, not arbitrarily
+//! Retained duplicate records cover the configured retry window, not arbitrarily
 //! delayed traffic or process crashes. Abandoned pending receipts are interrupted
-//! after sixty inactive seconds and retained for another sixty seconds.
+//! after an inactive retention horizon and retained for another horizon.
 //! No ordering is promised.
 //!
 //! The [`codec`] module is pure sans-IO; this crate owns all acknowledgement,
@@ -16,6 +16,8 @@
 /// Sans-IO application message identities, receipt transitions and bounded codec.
 pub mod codec;
 
+mod config;
+pub use config::MessagingConfig;
 mod worker;
 
 #[cfg(test)]
@@ -38,13 +40,10 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub use bytes::Bytes;
 pub use codec::{
-    DEDUP_RETENTION_MS, DecodeError, Delivery, MAX_MESSAGE_BYTES, MAX_TIMEOUT_MS, MessageId,
-    Outcome, Packet, ReceiptState, Rejection, ack, completes, data, decode, destination_valid,
+    DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, DecodeError,
+    Delivery, MessageId, Outcome, Packet, ReceiptState, Rejection, ack, completes, data, decode,
+    destination_valid,
 };
-
-const MAX_PENDING: usize = 256;
-const MAX_RECEIVED: usize = 1024;
-const RETRY: Duration = Duration::from_millis(200);
 
 /// Static-dispatch application messaging with protocol-specific delivery receipts.
 ///
@@ -81,7 +80,7 @@ pub trait MessageProtocol: Send + Sync {
 pub struct SendOptions {
     /// Receiver acknowledgement boundary; defaults to local best effort.
     pub delivery: Delivery,
-    /// Acknowledged sends require a nonzero deadline of at most thirty seconds.
+    /// Acknowledged sends require a nonzero deadline within the endpoint's configuration.
     pub timeout: Duration,
 }
 
@@ -99,10 +98,13 @@ impl SendOptions {
     /// # Errors
     /// Returns `InvalidInput` for oversized data or invalid acknowledged deadlines.
     pub fn validate(self, payload_len: usize) -> io::Result<()> {
-        if payload_len > MAX_MESSAGE_BYTES
+        if u32::try_from(payload_len).is_err()
             || (self.delivery != Delivery::BestEffort
                 && (self.timeout.is_zero()
-                    || self.timeout > Duration::from_millis(codec::MAX_TIMEOUT_MS)))
+                    || config::timeout_ms(self.timeout).is_err()
+                    || std::time::Instant::now()
+                        .checked_add(self.timeout)
+                        .is_none()))
         {
             return Err(error(
                 io::ErrorKind::InvalidInput,
@@ -232,6 +234,7 @@ struct Record {
     from: NodeId,
     id: MessageId,
     delivery: Delivery,
+    retry_horizon_ms: u64,
     group: Option<GroupId>,
     fingerprint: [u8; 32],
     state: Mutex<ReceiptState>,
@@ -296,9 +299,7 @@ impl Receipt {
             // The outcome is recorded before transmission. Transient ACK
             // backpressure/route loss must not fail successful application work;
             // a duplicate data packet replays this retained receipt.
-            let _ = owner
-                .io
-                .send(&self.record.from, &codec::ack(self.record.id, outcome));
+            let _ = owner.acknowledge(&self.record.from, self.record.id, outcome);
         }
         Ok(())
     }
@@ -328,11 +329,48 @@ struct Inner {
     nonce: [u8; 8],
     sequence: AtomicU64,
     epoch: tokio::time::Instant,
+    config: MessagingConfig,
+    retention_ms: u64,
+    max_timeout_ms: u64,
 }
 
 impl Inner {
     fn now(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn dispatch(
+        &self,
+        to: &NodeId,
+        id: MessageId,
+        delivery: Delivery,
+        retry_horizon_ms: u64,
+        group: Option<&GroupId>,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let length = codec::data_len(group, payload.len()).map_err(|_| {
+            error(
+                io::ErrorKind::InvalidInput,
+                "invalid application group or payload",
+            )
+        })?;
+        let mut packet = self.io.packet_buffer(to, length)?;
+        codec::encode_data(id, delivery, retry_horizon_ms, group, payload, |part| {
+            packet.extend_from_slice(part);
+        })
+        .map_err(|_| {
+            error(
+                io::ErrorKind::InvalidInput,
+                "invalid application group or payload",
+            )
+        })?;
+        self.io.send_packet(to, packet)
+    }
+
+    fn acknowledge(&self, to: &NodeId, id: MessageId, outcome: Outcome) -> io::Result<()> {
+        let mut packet = self.io.packet_buffer(to, codec::ack_len(outcome))?;
+        codec::encode_ack(id, outcome, |part| packet.extend_from_slice(part));
+        self.io.send_packet(to, packet)
     }
 
     fn next_id(&self) -> io::Result<MessageId> {
@@ -369,6 +407,15 @@ impl Messaging {
     /// # Errors
     /// Rejects a missing executor, closed router, unavailable randomness or claimed inbox.
     pub fn new(router: &Router) -> io::Result<Self> {
+        Self::with_config(router, MessagingConfig::default())
+    }
+
+    /// Binds messaging with node-wide queue, retry and retention bounds.
+    ///
+    /// # Errors
+    /// Rejects invalid configuration, unavailable executor/randomness or claimed namespace.
+    pub fn with_config(router: &Router, config: MessagingConfig) -> io::Result<Self> {
+        config.validate()?;
         tokio::runtime::Handle::try_current().map_err(|_| closed())?;
         if router.is_closed() {
             return Err(closed());
@@ -378,13 +425,22 @@ impl Messaging {
             .fill(&mut nonce)
             .map_err(|_| io::Error::other("OS randomness unavailable"))?;
         let io = router.bind_protocol(Self::ID)?;
-        Ok(Self::bind(io, nonce))
+        Ok(Self::bind(io, nonce, config))
     }
 
     /// Creates a messaging implementation on its pre-bound namespace.
     /// # Errors
     /// Rejects a wrong namespace, unavailable executor or OS randomness.
     pub fn from_io(io: ProtocolIo) -> io::Result<Self> {
+        Self::from_io_with_config(io, MessagingConfig::default())
+    }
+
+    /// Creates messaging on a pre-bound namespace with explicit endpoint bounds.
+    ///
+    /// # Errors
+    /// Rejects invalid bounds, wrong namespace, unavailable executor or randomness.
+    pub fn from_io_with_config(io: ProtocolIo, config: MessagingConfig) -> io::Result<Self> {
+        config.validate()?;
         tokio::runtime::Handle::try_current().map_err(|_| closed())?;
         if io.id() != Self::ID {
             return Err(error(
@@ -396,13 +452,13 @@ impl Messaging {
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| io::Error::other("OS randomness unavailable"))?;
-        Ok(Self::bind(io, nonce))
+        Ok(Self::bind(io, nonce, config))
     }
 
-    fn bind(io: ProtocolIo, nonce: [u8; 8]) -> Self {
+    fn bind(io: ProtocolIo, nonce: [u8; 8], config: MessagingConfig) -> Self {
         let cancel = io.cancellation();
         let receive = io.clone();
-        let (incoming, receiver) = mpsc::channel(64);
+        let (incoming, receiver) = mpsc::channel(config.inbox_capacity);
         let inner = Arc::new(Inner {
             io,
             state: Mutex::new(State::default()),
@@ -413,11 +469,28 @@ impl Messaging {
             nonce,
             sequence: AtomicU64::new(0),
             epoch: tokio::time::Instant::now(),
+            retention_ms: config.retention_ms(),
+            max_timeout_ms: config.max_timeout_ms(),
+            config,
         });
         inner
             .tasks
             .spawn(worker::drive(Arc::downgrade(&inner), receive, cancel));
         Self { inner }
+    }
+
+    /// The shared endpoint's configured operational bounds.
+    #[must_use]
+    pub fn config(&self) -> &MessagingConfig {
+        &self.inner.config
+    }
+
+    /// Validates an operation against this shared endpoint's settings.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the payload/deadline exceeds configured bounds.
+    pub fn validate_send(&self, options: SendOptions, payload_len: usize) -> io::Result<()> {
+        self.inner.config.validate_send(options, payload_len)
     }
 
     /// Dispatches owned bytes, optionally awaiting queue/application acknowledgement.
@@ -433,7 +506,12 @@ impl Messaging {
         payload: Bytes,
         options: SendOptions,
     ) -> io::Result<MessageId> {
-        options.validate(payload.len())?;
+        self.validate_send(options, payload.len())?;
+        let retry_horizon_ms = if options.delivery == Delivery::BestEffort {
+            0
+        } else {
+            config::timeout_ms(options.timeout)?
+        };
         if !codec::destination_valid(to) {
             return Err(error(
                 io::ErrorKind::InvalidInput,
@@ -445,13 +523,8 @@ impl Messaging {
         }
         let id = self.inner.next_id()?;
         if options.delivery == Delivery::BestEffort {
-            let bytes = codec::data(id, options.delivery, group, &payload).map_err(|_| {
-                error(
-                    io::ErrorKind::InvalidInput,
-                    "invalid application group or payload",
-                )
-            })?;
-            self.inner.io.send(to, &bytes)?;
+            self.inner
+                .dispatch(to, id, options.delivery, retry_horizon_ms, group, &payload)?;
             return Ok(id);
         }
         let (result, mut receive) = oneshot::channel();
@@ -460,7 +533,7 @@ impl Messaging {
             if self.inner.cancel.is_cancelled() {
                 return Err(closed());
             }
-            if state.pending.len() >= MAX_PENDING {
+            if state.pending.len() >= self.inner.config.pending_sends {
                 return Err(error(
                     io::ErrorKind::WouldBlock,
                     "outstanding application send limit",
@@ -479,16 +552,12 @@ impl Messaging {
             owner: &self.inner,
             id,
         };
-        let bytes = codec::data(id, options.delivery, group, &payload).map_err(|_| {
-            error(
-                io::ErrorKind::InvalidInput,
-                "invalid application group or payload",
-            )
-        })?;
-        drop(payload);
         let deadline = tokio::time::Instant::now() + options.timeout;
-        self.inner.io.send(to, &bytes)?;
-        let mut retry = tokio::time::interval_at(tokio::time::Instant::now() + RETRY, RETRY);
+        self.inner
+            .dispatch(to, id, options.delivery, retry_horizon_ms, group, &payload)?;
+        let retry_interval = self.inner.config.retry_interval;
+        let mut retry =
+            tokio::time::interval_at(tokio::time::Instant::now() + retry_interval, retry_interval);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -496,7 +565,7 @@ impl Messaging {
                 () = self.inner.cancel.cancelled() => return Err(closed()),
                 () = tokio::time::sleep_until(deadline) => return Err(error(io::ErrorKind::TimedOut, "application acknowledgement deadline; remote outcome unknown")),
                 result = &mut receive => { result.map_err(|_| closed())??; return Ok(id); }
-                _ = retry.tick() => self.inner.io.send(to, &bytes)?,
+                _ = retry.tick() => self.inner.dispatch(to, id, options.delivery, retry_horizon_ms, group, &payload)?,
             }
         }
     }

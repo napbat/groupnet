@@ -16,12 +16,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::wire::{HEADER, Kind, PAYLOAD, Packet, SessionId, WINDOW};
-use crate::Router;
-
-const INITIAL_RTO: Duration = Duration::from_millis(150);
-const MAX_RTO: Duration = Duration::from_secs(2);
-const PEER_TIMEOUT: Duration = Duration::from_secs(20);
+use super::{
+    TunnelLimits,
+    wire::{HEADER, Kind, Packet, SessionId},
+};
+use crate::{PacketBuffer, Router};
+use bytes::Bytes;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Role {
@@ -46,7 +46,7 @@ pub(super) struct SessionIo {
 #[derive(Debug)]
 struct Segment {
     kind: Kind,
-    payload: Vec<u8>,
+    payload: Bytes,
     start: usize,
     sampled_at: Option<Instant>,
 }
@@ -73,11 +73,11 @@ struct Reliability {
     rto: Duration,
     smoothed_rtt: Duration,
     rtt_variation: Duration,
-    encoded: Vec<u8>,
+    limits: TunnelLimits,
 }
 
 impl Reliability {
-    fn new(id: SessionId, role: Role) -> Self {
+    fn new(id: SessionId, role: Role, limits: TunnelLimits) -> Self {
         let now = Instant::now();
         Self {
             id,
@@ -92,40 +92,42 @@ impl Reliability {
             reordered: BTreeMap::new(),
             delivery: VecDeque::new(),
             offset: 0,
-            credit: WINDOW,
-            congestion: 4,
+            credit: limits.window,
+            congestion: limits.initial_congestion,
             increase: 0,
             duplicate_acks: 0,
             local_fin: false,
             remote_fin: false,
             last_peer: now,
             last_send: now,
-            retransmit_at: now + INITIAL_RTO,
-            rto: INITIAL_RTO,
+            retransmit_at: now + limits.initial_rto,
+            rto: limits.initial_rto,
             smoothed_rtt: Duration::from_millis(50),
             rtt_variation: Duration::from_millis(25),
-            encoded: Vec::with_capacity(PAYLOAD + HEADER),
+            limits,
         }
     }
 
     fn window(&self) -> u16 {
-        u16::try_from(WINDOW - self.reordered.len() - self.delivery.len())
-            .expect("receive queues are bounded by WINDOW")
+        u16::try_from(self.limits.window - self.reordered.len() - self.delivery.len())
+            .expect("validated receive window")
     }
 
     fn send(&mut self, router: &Router, peer: &NodeId, kind: Kind, sequence: u64, payload: &[u8]) {
-        Packet::encode(
-            self.id,
-            kind,
-            sequence,
-            self.next_receive,
-            self.window(),
-            payload,
-            &mut self.encoded,
-        );
-        // Queue saturation and temporarily missing routes are packet loss. The
-        // retransmission timer retries the same ciphertext on the current route.
-        let _ = router.send_tunnel(peer, &self.encoded);
+        if let Ok(mut encoded) = router.tunnel_packet_buffer(peer, HEADER + payload.len()) {
+            Packet::encode(
+                self.id,
+                kind,
+                sequence,
+                self.next_receive,
+                self.window(),
+                payload,
+                &mut encoded,
+            );
+            // Local saturation/missing routes are packet loss. Retain ciphertext
+            // for the retransmission timer, never re-encrypt plaintext.
+            let _ = router.send_tunnel_packet(peer, encoded);
+        }
         self.last_send = Instant::now();
     }
 
@@ -133,20 +135,31 @@ impl Reliability {
         self.send(router, peer, kind, 0, &[]);
     }
 
-    fn transmit(&mut self, router: &Router, peer: &NodeId, kind: Kind, payload: Vec<u8>) {
+    fn transmit(&mut self, router: &Router, peer: &NodeId, kind: Kind, mut packet: PacketBuffer) {
         let sequence = self.next_send;
         self.next_send += 1;
-        self.send(router, peer, kind, sequence, &payload);
+        Packet::stamp(
+            self.id,
+            kind,
+            sequence,
+            self.next_receive,
+            self.window(),
+            packet.payload_mut(),
+        );
+        let Ok(encoded) = router.send_tunnel_retained(peer, packet) else {
+            return;
+        };
+        self.last_send = Instant::now();
         if self.outstanding.is_empty() {
-            self.retransmit_at = Instant::now() + self.rto;
+            self.retransmit_at = self.last_send + self.rto;
         }
         self.outstanding.insert(
             sequence,
             Segment {
                 kind,
-                payload,
+                payload: encoded.slice(HEADER..),
                 start: 0,
-                sampled_at: Some(Instant::now()),
+                sampled_at: Some(self.last_send),
             },
         );
     }
@@ -177,12 +190,12 @@ impl Reliability {
                 self.smoothed_rtt = (self.smoothed_rtt * 7 + sample) / 8;
             }
             self.rto = (self.smoothed_rtt + self.rtt_variation * 4)
-                .clamp(Duration::from_millis(25), MAX_RTO);
+                .clamp(self.limits.min_rto, self.limits.max_rto);
             self.retransmit_at = Instant::now() + self.rto;
             self.increase += acknowledged;
             if self.increase >= self.congestion {
                 self.increase = 0;
-                self.congestion = (self.congestion + 1).min(WINDOW);
+                self.congestion = (self.congestion + 1).min(self.limits.window);
             }
         } else if packet.kind == Kind::Ack
             && self
@@ -208,8 +221,8 @@ impl Reliability {
                 if !self.remote_fin
                     && packet.sequence >= self.next_receive
                     && packet.sequence - self.next_receive
-                        < u64::try_from(WINDOW).expect("small constant")
-                    && self.reordered.len() + self.delivery.len() < WINDOW
+                        < u64::try_from(self.limits.window).expect("validated window")
+                    && self.reordered.len() + self.delivery.len() < self.limits.window
                 {
                     self.reordered.entry(packet.sequence).or_insert(Segment {
                         kind: packet.kind,
@@ -240,37 +253,41 @@ impl Reliability {
         let window = self.window();
         for (sequence, segment) in self.outstanding.iter_mut().take(limit) {
             segment.sampled_at = None;
-            Packet::encode(
-                self.id,
-                segment.kind,
-                *sequence,
-                self.next_receive,
-                window,
-                &segment.payload,
-                &mut self.encoded,
-            );
-            let _ = router.send_tunnel(peer, &self.encoded);
+            if let Ok(mut encoded) =
+                router.tunnel_packet_buffer(peer, HEADER + segment.payload.len())
+            {
+                Packet::encode(
+                    self.id,
+                    segment.kind,
+                    *sequence,
+                    self.next_receive,
+                    window,
+                    &segment.payload,
+                    &mut encoded,
+                );
+                let _ = router.send_tunnel_packet(peer, encoded);
+            }
         }
         self.last_send = Instant::now();
     }
 
     fn tick(&mut self, router: &Router, peer: &NodeId) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.last_peer) >= PEER_TIMEOUT {
+        if now.duration_since(self.last_peer) >= self.limits.peer_timeout {
             return false;
         }
         if self.readiness == Readiness::Opening && now >= self.retransmit_at {
             self.control(router, peer, Kind::Open);
             self.retransmit_at = now + self.rto;
-            self.rto = (self.rto * 2).min(MAX_RTO);
+            self.rto = (self.rto * 2).min(self.limits.max_rto);
         } else if !self.outstanding.is_empty() && now >= self.retransmit_at {
             self.congestion = (self.congestion / 2).max(1);
             self.increase = 0;
             self.retransmit(router, peer, self.congestion);
-            self.rto = (self.rto * 2).min(MAX_RTO);
+            self.rto = (self.rto * 2).min(self.limits.max_rto);
             self.retransmit_at = now + self.rto;
         }
-        if now.duration_since(self.last_send) >= Duration::from_secs(1)
+        if now.duration_since(self.last_send) >= self.limits.heartbeat_interval
             && self.readiness == Readiness::Established
         {
             self.control(router, peer, Kind::Ack);
@@ -284,17 +301,29 @@ enum DeliveryProgress {
     Finished,
 }
 
-pub(super) async fn run(router: Router, peer: NodeId, id: SessionId, role: Role, io: SessionIo) {
+pub(super) async fn run(
+    router: Router,
+    peer: NodeId,
+    id: SessionId,
+    role: Role,
+    limits: TunnelLimits,
+    io: SessionIo,
+) {
     let SessionIo {
         raw,
         mut packets,
         cancel,
         sent,
     } = io;
-    let mut state = Reliability::new(id, role);
+    let mut timer = interval(limits.min_rto);
+    let payload_capacity = limits.payload;
+    let mut state = Reliability::new(id, role, limits);
     let (mut read, mut write) = tokio::io::split(raw);
-    let mut timer = interval(Duration::from_millis(25));
-    let mut buffer = vec![0; PAYLOAD];
+    let Ok(mut buffer) = router.tunnel_packet_buffer(&peer, HEADER + payload_capacity) else {
+        cancel.cancel();
+        return;
+    };
+    buffer.resize_payload(HEADER + payload_capacity);
     state.control(
         &router,
         &peer,
@@ -344,15 +373,17 @@ pub(super) async fn run(router: Router, peer: NodeId, id: SessionId, role: Role,
                     }
                 }
             },
-            result = read.read(&mut buffer), if can_read => {
+            result = read.read(&mut buffer.payload_mut()[HEADER..]), if can_read => {
                 let Ok(length) = result else { break; };
+                buffer.truncate_payload(HEADER + length);
+                let Ok(mut replacement) = router.tunnel_packet_buffer(&peer, HEADER + payload_capacity) else { break; };
+                replacement.resize_payload(HEADER + payload_capacity);
+                let packet = std::mem::replace(&mut buffer, replacement);
                 if length == 0 {
                     state.local_fin = true;
-                    state.transmit(&router, &peer, Kind::Fin, Vec::new());
+                    state.transmit(&router, &peer, Kind::Fin, packet);
                 } else {
-                    let mut payload = std::mem::replace(&mut buffer, vec![0; PAYLOAD]);
-                    payload.truncate(length);
-                    state.transmit(&router, &peer, Kind::Data, payload);
+                    state.transmit(&router, &peer, Kind::Data, packet);
                 }
             },
             _ = timer.tick() => {

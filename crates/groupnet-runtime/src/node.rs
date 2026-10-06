@@ -681,7 +681,7 @@ async fn recv_loop(inner: Arc<Inner>) {
             // never unbounded memory under overload.
             let _ = tx.try_send(Event::Message {
                 from: inbound.from,
-                wire: inbound.msg,
+                wire: inbound.msg.into(),
             });
         }
     }

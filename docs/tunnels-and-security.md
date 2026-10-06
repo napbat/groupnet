@@ -58,6 +58,15 @@ bytes. This is not a guarantee of availability through arbitrary outages.
 - Route changes select another next hop below the existing authenticated
   session. They do not terminate TLS or restart application delivery.
 
+`TunnelConfig::with_limits(TunnelLimits { .. })` configures peer/session admission,
+accept and packet queues, TLS buffering, segment payload, receive/congestion
+windows and setup/retransmission/heartbeat deadlines. Standalone endpoints use
+`TunnelTransport::with_limits`. Wire credit and routing-frame bounds remain
+enforced. TLS ciphertext is initially read into routing-headroom storage;
+retransmissions retain ciphertext rather than re-encrypting application bytes.
+Receive windows may differ between peers: advertised credit describes the remote
+receiver, while each sender still enforces its own congestion and memory bounds.
+
 ### Authenticated unordered sessions
 
 `node.endpoint(Unordered::reliable())?` or `Unordered::unreliable()` resolves a
@@ -220,10 +229,14 @@ sessions remain, rather than remaining inert; callers must explicitly rebind.
 UDP retains its existing rendezvous/discovery lease coupling. Neither TCP control
 nor its relay is automatically TLS-encrypted or an HTTP proxy protocol.
 
-The TCP rendezvous reader paces each admitted connection to 256 frames per
-second using bounded TCP backpressure. A burst of valid tunnel traffic does not
-revoke admission. This includes TLS data and ACK traffic; queues remain bounded,
-and pacing is cancelled when the connection closes.
+TCP rendezvous data uses bounded backpressure by default, not a fixed packet-rate
+cap. `TcpRendezvousConfig` separates control and relay-data queues, pending
+admission and admitted-session capacity. `ControlRateLimit` bounds control traffic
+independently; `RelayPacing::Bytes` optionally limits relay data by bytes per second
+and burst bytes. Waiting for data capacity or pacing is cancellation-aware.
+Choose `bind_config`, `bind_open_config`, or `bind_with_admission_config` to supply
+the policy. UDP rendezvous exposes `RendezvousConfig` / `RendezvousLimits` through
+`Rendezvous::bind_config`.
 
 The following path-selection flow applies with or without a provisioned key:
 

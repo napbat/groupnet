@@ -1,5 +1,8 @@
 //! Bounded address-verified admission, discovery, and session-bound UDP relay.
 
+mod config;
+pub use config::{RendezvousConfig, RendezvousLimits};
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
@@ -7,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest, OpenAdmission};
+use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
@@ -16,12 +19,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::candidates::Candidates;
 use super::wire::{self, Body, MAX_PACKET, Packet, Session};
-use super::{LEASE, MAX_PEERS, NetworkKey, closed, invalid, random, transient, validate_names};
+use super::{LEASE, NetworkKey, closed, random, transient};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(3);
 const RATE_INTERVAL: Duration = Duration::from_secs(1);
 const PACKETS_PER_INTERVAL: u16 = 256;
-const MAX_PENDING_POLICY: usize = 32;
 
 #[derive(Clone, Copy)]
 struct Registration {
@@ -111,9 +113,18 @@ impl Entry {
 }
 
 /// Unproven addresses occupy only an evictable challenge pool, never peer slots.
-#[derive(Default)]
 struct Challenges {
     pending: HashMap<String, Challenge>,
+    capacity: usize,
+}
+
+impl Default for Challenges {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            capacity: RendezvousLimits::default().max_challenges,
+        }
+    }
 }
 
 impl Challenges {
@@ -132,7 +143,7 @@ impl Challenges {
         }) {
             return Ok(None);
         }
-        if !self.pending.contains_key(packet.sender) && self.pending.len() >= MAX_PEERS {
+        if !self.pending.contains_key(packet.sender) && self.pending.len() >= self.capacity {
             let oldest = self
                 .pending
                 .iter()
@@ -218,8 +229,9 @@ impl Drop for Inner {
 /// Explicit open admission provides no cryptographic identity assurance.
 /// Challenges expire after three seconds, sessions after six seconds without
 /// fresh traffic. Live duplicate identities are rejected, never replaced.
-/// At most 128 established identities, 128 evictable address challenges, and
-/// 32 concurrent policy evaluations are retained. Unproven traffic has a separate
+/// Defaults retain at most 128 established identities, 128 evictable address
+/// challenges, and 32 concurrent policy evaluations; configuration may tune these.
+/// Unproven traffic has a separate
 /// 256-packet/second budget; each live session has its own 256-packet/second budget.
 #[derive(Debug)]
 pub struct Rendezvous {
@@ -232,12 +244,7 @@ impl Rendezvous {
     /// # Errors
     /// Rejects malformed allowlists or socket binding failures.
     pub async fn bind(bind: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> io::Result<Self> {
-        validate_names(&peers)?;
-        let allowed = peers
-            .into_iter()
-            .map(|peer| peer.as_str().to_owned())
-            .collect();
-        Self::start(bind, Some(key), Arc::new(OpenAdmission), Some(allowed)).await
+        Self::bind_config(RendezvousConfig::new(bind, key, peers)).await
     }
 
     /// Binds explicitly keyless discovery and relay, permitting requested direct paths.
@@ -245,7 +252,7 @@ impl Rendezvous {
     /// # Errors
     /// Propagates socket binding errors and rejects multicast bind addresses.
     pub async fn bind_open(bind: SocketAddr) -> io::Result<Self> {
-        Self::bind_with_admission(bind, None, Arc::new(OpenAdmission)).await
+        Self::bind_config(RendezvousConfig::open(bind)).await
     }
 
     /// Binds dynamic discovery with application admission and optional fabric HMAC.
@@ -260,22 +267,35 @@ impl Rendezvous {
         key: Option<NetworkKey>,
         admission: Arc<dyn Admission>,
     ) -> io::Result<Self> {
-        Self::start(bind, key, admission, None).await
+        Self::bind_config(RendezvousConfig::with_admission(bind, key, admission)).await
     }
 
-    async fn start(
-        bind: SocketAddr,
-        key: Option<NetworkKey>,
-        admission: Arc<dyn Admission>,
-        allowed: Option<HashSet<String>>,
-    ) -> io::Result<Self> {
-        if bind.ip().is_multicast() {
-            return Err(invalid("multicast rendezvous bind is not supported"));
-        }
-        let socket = UdpSocket::bind(bind).await?;
+    /// Binds a rendezvous with explicit operational capacities and admission policy.
+    ///
+    /// Authentication, replay protection, fixed rate budgets, and challenge/session
+    /// deadlines are unaffected by capacity tuning.
+    ///
+    /// # Errors
+    /// Rejects zero capacities, malformed allowlists, multicast binds, and socket errors.
+    pub async fn bind_config(config: RendezvousConfig) -> io::Result<Self> {
+        config.validate()?;
+        let allowed = config.peers.map(|peers| {
+            peers
+                .into_iter()
+                .map(|peer| peer.as_str().to_owned())
+                .collect()
+        });
+        let socket = UdpSocket::bind(config.bind).await?;
         let address = socket.local_addr()?;
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(serve(socket, key, admission, allowed, cancel.clone()));
+        let task = tokio::spawn(serve(
+            socket,
+            config.key,
+            config.admission,
+            allowed,
+            config.limits,
+            cancel.clone(),
+        ));
         Ok(Self {
             inner: Arc::new(Inner {
                 address,
@@ -319,6 +339,7 @@ struct ServerState {
     challenges: Challenges,
     decisions: JoinSet<Decision>,
     pre_admission: Entry,
+    limits: RendezvousLimits,
 }
 
 async fn serve(
@@ -326,13 +347,18 @@ async fn serve(
     key: Option<NetworkKey>,
     admission: Arc<dyn Admission>,
     allowed: Option<HashSet<String>>,
+    limits: RendezvousLimits,
     cancel: CancellationToken,
 ) {
     let mut state = ServerState {
         entries: HashMap::new(),
-        challenges: Challenges::default(),
+        challenges: Challenges {
+            pending: HashMap::new(),
+            capacity: limits.max_challenges,
+        },
         decisions: JoinSet::new(),
         pre_admission: Entry::new(Instant::now()),
+        limits,
     };
     let mut buffer = [0; MAX_PACKET + 1];
     let mut maintenance = tokio::time::interval(RATE_INTERVAL);
@@ -629,7 +655,9 @@ async fn register(
         return;
     }
     expire_entries(&mut state.entries, now);
-    if state.entries.len() >= MAX_PEERS || state.decisions.len() >= MAX_PENDING_POLICY {
+    if state.entries.len() >= state.limits.max_peers
+        || state.decisions.len() >= state.limits.max_pending_admissions
+    {
         respond(
             socket,
             key,
@@ -870,3 +898,6 @@ mod tests {
 
 #[cfg(test)]
 mod admission_regressions;
+
+#[cfg(test)]
+mod config_tests;

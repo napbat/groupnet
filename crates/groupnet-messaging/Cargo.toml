@@ -12,6 +12,7 @@ groupnet-core.workspace = true
 groupnet-network.workspace = true
 bytes.workspace = true
 ring.workspace = true
+zerocopy.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-util = { workspace = true, features = ["rt"] }
 

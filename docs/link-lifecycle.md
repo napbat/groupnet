@@ -142,6 +142,21 @@ closing the node cancels every owned protocol. Message endpoint receives use the
 existing single-owner runtime inbox, not a new queue or the messaging worker's
 raw receiver. Unordered accepts preserve their descriptor's delivery policy.
 
+### Packet ownership and wire layout
+
+Data-path headers use fixed-layout `zerocopy` types with explicit network byte
+order. Parsing borrows validated header views; variable-length payloads retain
+owned storage through routing and dispatch. Encryption requires writable storage:
+reuse uniquely owned buffers where possible, and copy only when shared ownership
+or insufficient framing capacity requires it. This is not kernel-bypass or a
+promise of zero copies through every socket adapter.
+
+Operational limits belong to typed configuration with finite, validated defaults.
+Wire representability, authentication, replay protection, and memory admission
+remain enforced. Relay data traffic must not share an arbitrary fixed
+packets-per-second throttle with control traffic; data admission uses configurable
+bounded capacity and, when selected, byte-based pacing.
+
 
 ## 3. Startup failures and cancellation
 

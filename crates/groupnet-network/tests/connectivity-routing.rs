@@ -41,7 +41,7 @@ async fn exchange(a: &Router, c: &Router, payload: &[u8]) {
             .unwrap()
             .unwrap();
         assert_eq!(packet.from, *sender.local_id());
-        assert_eq!(packet.msg, payload);
+        assert_eq!(packet.msg.as_ref(), payload);
     }
 }
 
@@ -114,7 +114,7 @@ async fn memory_only_peer_crosses_tcp_direct_and_relay_edges_and_withdraws_depar
             .unwrap();
         let packet = tokio::time::timeout(WAIT, b.recv()).await.unwrap().unwrap();
         assert_eq!(packet.from, *a.local_id());
-        assert_eq!(packet.msg, b"memory adjacency survives TCP loss");
+        assert_eq!(packet.msg.as_ref(), b"memory adjacency survives TCP loss");
         a.close().await;
         b.close().await;
         relay.close().await;

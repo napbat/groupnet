@@ -15,10 +15,12 @@ connectivity = ["dep:groupnet-transport-punch", "link"]
 
 # The direct socket binding depends only on the trait, ids and networking.
 [dependencies]
+bytes = { workspace = true }
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
 groupnet-transport-punch = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "sync"] }
+zerocopy = { workspace = true, features = ["derive"] }
 
 # Test-only: the unit tests exchange real datagrams over loopback, which needs
 # an async runtime + the `#[tokio::test]` macro. This dev dependency enables

@@ -19,6 +19,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::Inbound;
 use groupnet_transport::admission::{SessionLease, SessionRegistry};
@@ -33,12 +34,12 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-pub use server::Rendezvous;
+pub use server::{Rendezvous, RendezvousConfig, RendezvousLimits};
 
 /// Largest application message carried by one session-bound UDP datagram.
 pub const MAX_MESSAGE: usize = 960;
-const MAX_PEERS: usize = 128;
-const QUEUE: usize = 128;
+const DEFAULT_MAX_PEERS: usize = 128;
+const DEFAULT_QUEUE_CAPACITY: usize = 128;
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const LEASE: Duration = Duration::from_secs(6);
 const DIRECT_LEASE: Duration = Duration::from_secs(3);
@@ -133,6 +134,12 @@ pub struct PunchConfig {
     /// Gather usable local interface addresses for wildcard-bound sockets.
     /// Link-local addresses are excluded because remote scope identifiers are not portable.
     pub gather_interfaces: bool,
+    /// Maximum live admitted peers retained by this endpoint (must be nonzero).
+    /// This operational limit does not change candidate or wire-format bounds.
+    pub max_peers: usize,
+    /// Packet capacity of each incoming and outgoing queue (must be nonzero).
+    /// Full queues drop best-effort packets without blocking.
+    pub queue_capacity: usize,
 }
 
 impl PunchConfig {
@@ -156,6 +163,8 @@ impl PunchConfig {
             candidate_binds: Vec::new(),
             advertised_candidates: Vec::new(),
             gather_interfaces: true,
+            max_peers: DEFAULT_MAX_PEERS,
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
         }
     }
 
@@ -197,6 +206,8 @@ impl PunchConfig {
             candidate_binds: Vec::new(),
             advertised_candidates: Vec::new(),
             gather_interfaces: true,
+            max_peers: DEFAULT_MAX_PEERS,
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
         }
     }
 }
@@ -216,6 +227,8 @@ impl fmt::Debug for PunchConfig {
             .field("candidate_binds", &self.candidate_binds)
             .field("advertised_candidates", &self.advertised_candidates)
             .field("gather_interfaces", &self.gather_interfaces)
+            .field("max_peers", &self.max_peers)
+            .field("queue_capacity", &self.queue_capacity)
             .finish()
     }
 }
@@ -350,7 +363,7 @@ struct Outbound {
     to: NodeId,
     session: groupnet_transport::admission::SessionId,
     target: wire::Session,
-    message: Vec<u8>,
+    message: Bytes,
 }
 
 #[derive(Debug)]
@@ -401,7 +414,12 @@ impl UdpConnection {
     /// Rejects invalid configuration, dynamic policy denial or registration
     /// timeout, and socket/random-source failures.
     pub async fn bind(config: PunchConfig) -> io::Result<Self> {
-        validate_names(&config.peers)?;
+        validate_names_with_limit(&config.peers, config.max_peers)?;
+        if config.queue_capacity == 0 || config.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(invalid("invalid UDP queue capacity"));
+        }
+        let sessions = SessionRegistry::new(config.max_peers)?;
         validate_name(&config.local)?;
         if config.credential.len() > groupnet_transport::admission::MAX_CREDENTIAL_BYTES {
             return Err(invalid("invalid credential size"));
@@ -427,10 +445,9 @@ impl UdpConnection {
         let nonce = random()?;
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let cancel = CancellationToken::new();
-        let (outbound, outgoing) = mpsc::channel(QUEUE);
-        let (incoming, inbound) = mpsc::channel(QUEUE);
+        let (outbound, outgoing) = mpsc::channel(config.queue_capacity);
+        let (incoming, inbound) = mpsc::channel(config.queue_capacity);
         let configured = config.peers.clone();
-        let sessions = SessionRegistry::new(MAX_PEERS)?;
         let dynamic = config.dynamic;
         let local = config.local.clone();
         let (ready, admitted) = tokio::sync::oneshot::channel();
@@ -597,11 +614,12 @@ impl UdpConnection {
     fn enqueue(
         &self,
         to: &NodeId,
-        message: &[u8],
+        length: usize,
         expected: Option<groupnet_transport::admission::SessionId>,
+        message: impl FnOnce() -> Bytes,
     ) -> io::Result<()> {
         self.ensure_open()?;
-        if message.len() > MAX_MESSAGE {
+        if length > MAX_MESSAGE {
             return Err(invalid("UDP message exceeds MAX_MESSAGE"));
         }
         if (!self.inner.dynamic && !self.inner.configured.contains(to))
@@ -627,7 +645,7 @@ impl UdpConnection {
                 to: to.clone(),
                 session,
                 target,
-                message: message.to_vec(),
+                message: message(),
             });
         }
         Ok(())
@@ -641,7 +659,9 @@ impl UdpConnection {
     /// # Errors
     /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
     pub fn send(&self, to: &NodeId, message: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
-        std::future::ready(self.enqueue(to, message, None))
+        std::future::ready(
+            self.enqueue(to, message.len(), None, || Bytes::copy_from_slice(message)),
+        )
     }
 
     /// Queues data only when the supplied admission generation is still current.
@@ -657,7 +677,45 @@ impl UdpConnection {
         session: Option<groupnet_transport::admission::SessionId>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         std::future::ready(if session.is_some() {
-            self.enqueue(to, message, session)
+            self.enqueue(to, message.len(), session, || {
+                Bytes::copy_from_slice(message)
+            })
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "punch session required",
+            ))
+        })
+    }
+
+    /// Queues an owned best-effort packet without copying its payload.
+    /// Unknown peers and full queues are dropped without blocking.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    pub fn send_owned(
+        &self,
+        to: &NodeId,
+        message: Bytes,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        std::future::ready(self.enqueue(to, message.len(), None, || message))
+    }
+
+    /// Queues an owned packet only for the supplied current admission generation.
+    /// Stale generations and full queues are dropped without blocking; accepted
+    /// payloads are moved into the queue without copying.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` after shutdown or when no generation is supplied,
+    /// and `InvalidInput` for oversized data.
+    pub fn send_owned_admitted(
+        &self,
+        to: &NodeId,
+        message: Bytes,
+        session: Option<groupnet_transport::admission::SessionId>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        std::future::ready(if session.is_some() {
+            self.enqueue(to, message.len(), session, || message)
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -725,9 +783,9 @@ fn validate_name(node: &NodeId) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_names(nodes: &[NodeId]) -> io::Result<()> {
-    if nodes.len() > MAX_PEERS {
-        return Err(invalid("UDP peer limit is 128"));
+fn validate_names_with_limit(nodes: &[NodeId], limit: usize) -> io::Result<()> {
+    if limit == 0 || nodes.len() > limit {
+        return Err(invalid("invalid UDP peer capacity"));
     }
     let mut seen = HashSet::with_capacity(nodes.len());
     for node in nodes {
@@ -751,3 +809,6 @@ mod tests;
 
 #[cfg(test)]
 mod admission_tests;
+
+#[cfg(test)]
+mod queue_tests;

@@ -13,6 +13,7 @@ groupnet-network.workspace = true
 groupnet-transport = { workspace = true, features = ["bulk"] }
 bytes.workspace = true
 ring.workspace = true
+zerocopy.workspace = true
 futures-util = { workspace = true, features = ["io", "async-await"] }
 tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "macros"] }
 tokio-util = { workspace = true, features = ["rt"] }

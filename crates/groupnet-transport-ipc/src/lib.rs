@@ -12,5 +12,5 @@
 mod ipc;
 mod link;
 
-pub use ipc::{IpcAddress, IpcTransport, MAX_FRAME};
+pub use ipc::{IpcAddress, IpcConfig, IpcTransport, MAX_FRAME};
 pub use link::IpcLink;

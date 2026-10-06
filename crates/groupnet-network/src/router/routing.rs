@@ -5,7 +5,7 @@ use std::io;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use groupnet_core::NodeId;
 use groupnet_transport::Inbound;
 use groupnet_transport::link::AdmittedInbound;
@@ -13,8 +13,8 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use super::{
-    AdvertisedRoute, ApplicationPacket, Candidate, Event, Queued, Route, Shared, Table,
-    TransportId, closed,
+    AdvertisedRoute, ApplicationPacket, Candidate, Event, PacketBuffer, Queued, Route, Shared,
+    Table, TransportId, closed,
 };
 use crate::wire::{self, Frame, PayloadKind, Reassembly};
 
@@ -27,51 +27,80 @@ impl Shared {
     }
 
     pub(super) fn send(&self, to: &NodeId, payload: &[u8], kind: PayloadKind) -> io::Result<()> {
+        let mut packet = PacketBuffer::new(self, to, payload.len(), kind)?;
+        packet.extend_from_slice(payload);
+        self.send_packet(to, packet, kind)
+    }
+
+    pub(super) fn send_owned(
+        &self,
+        to: &NodeId,
+        payload: Bytes,
+        kind: PayloadKind,
+    ) -> io::Result<()> {
         if self.cancel.is_cancelled() {
             return Err(closed());
         }
-        if !wire::id_valid(to) || payload.len() > wire::MAX_FRAME - kind.header_len(&self.local, to)
+        if !wire::id_valid(to)
+            || payload.len()
+                > self
+                    .config
+                    .max_frame
+                    .saturating_sub(kind.header_len(&self.local, to))
         {
             return Err(wire::invalid("routed message exceeds bound"));
         }
         if to == &self.local {
-            if let PayloadKind::Application(id) = kind {
-                self.protocols
-                    .lock()
-                    .map_err(|_| io::Error::other("protocol registry poisoned"))?
-                    .deliver(
-                        id,
-                        ApplicationPacket {
-                            from: self.local.clone(),
-                            payload: Bytes::copy_from_slice(payload),
-                        },
-                    )?;
-            } else {
-                let queue = if kind == PayloadKind::Message {
-                    &self.messages
-                } else {
-                    &self.tunnels
-                };
-                let _ = queue.try_send(Inbound {
-                    from: self.local.clone(),
-                    msg: payload.to_vec(),
-                });
-            }
-        } else if matches!(kind, PayloadKind::Application(_)) {
-            self.forward_application(
-                to,
-                wire::data(kind, 16, self.id(), &self.local, to, payload).into(),
-            )?;
-        } else {
-            self.forward(
-                to,
-                wire::data(kind, 16, self.id(), &self.local, to, payload).into(),
-            );
+            return self.deliver_owned(kind, self.local.clone(), payload);
         }
-        Ok(())
+        let mut packet = PacketBuffer::new(self, to, payload.len(), kind)?;
+        packet.extend_from_slice(&payload);
+        self.send_packet(to, packet, kind)
     }
 
-    fn forward(&self, to: &NodeId, bytes: Arc<[u8]>) {
+    pub(super) fn send_packet(
+        &self,
+        to: &NodeId,
+        packet: PacketBuffer,
+        kind: PayloadKind,
+    ) -> io::Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        let (bytes, offset) = packet.finish(self, to, kind)?;
+        if to == &self.local {
+            self.deliver_owned(kind, self.local.clone(), bytes.slice(offset..))
+        } else if matches!(kind, PayloadKind::Application(_)) {
+            self.forward_application(to, bytes)
+        } else {
+            self.forward(to, bytes);
+            Ok(())
+        }
+    }
+
+    pub(super) fn deliver_owned(
+        &self,
+        kind: PayloadKind,
+        from: NodeId,
+        payload: Bytes,
+    ) -> io::Result<()> {
+        if let PayloadKind::Application(id) = kind {
+            self.protocols
+                .lock()
+                .map_err(|_| io::Error::other("protocol registry poisoned"))?
+                .deliver(id, ApplicationPacket { from, payload })
+        } else {
+            let queue = if kind == PayloadKind::Message {
+                &self.messages
+            } else {
+                &self.tunnels
+            };
+            let _ = queue.try_send(Inbound { from, msg: payload });
+            Ok(())
+        }
+    }
+
+    pub(super) fn forward(&self, to: &NodeId, bytes: Bytes) {
         let table = self.table.lock().expect("router table poisoned");
         if let Some(candidate) = table.candidate(to, self.config.route_ttl)
             && let Some(link) = table.links.get(&candidate.route.transport)
@@ -84,7 +113,7 @@ impl Shared {
         }
     }
 
-    fn forward_application(&self, to: &NodeId, bytes: Arc<[u8]>) -> io::Result<()> {
+    fn forward_application(&self, to: &NodeId, bytes: Bytes) -> io::Result<()> {
         let table = self
             .table
             .lock()
@@ -122,7 +151,15 @@ impl Shared {
                 .keys()
                 .filter_map(|id| table.route(id, self.config.route_ttl))
             {
-                if route.path.len() < wire::MAX_HOPS {
+                if route.path.len() < self.config.max_hops
+                    && 10
+                        + route
+                            .path
+                            .iter()
+                            .map(|node| 1 + node.as_str().len())
+                            .sum::<usize>()
+                        <= self.config.max_frame
+                {
                     routes.push(AdvertisedRoute {
                         path: route.path.clone(),
                         frame: wire::advert(route.cost, &route.path).into(),
@@ -173,7 +210,7 @@ impl Shared {
 pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>) {
     let mut clock = tokio::time::interval(shared.config.announce_interval);
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut fragments = Reassembly::default();
+    let mut fragments = Reassembly::new(shared.config.reassembly.clone(), shared.config.max_frame);
     let mut seen = HashSet::new();
     let mut order = VecDeque::new();
     loop {
@@ -220,7 +257,8 @@ fn process(
     let Some(bytes) = fragments.receive(link.0, session, &packet.from, packet.msg) else {
         return;
     };
-    let Ok(frame) = wire::decode(&bytes) else {
+    let Ok(frame) = wire::decode_bounded(&bytes, shared.config.max_frame, shared.config.max_hops)
+    else {
         return;
     };
     match frame {
@@ -230,7 +268,7 @@ fn process(
         } => {
             if path.first() != Some(&packet.from)
                 || path.contains(&shared.local)
-                || path.len() >= wire::MAX_HOPS
+                || path.len() >= shared.config.max_hops
             {
                 return;
             }
@@ -283,7 +321,7 @@ fn process(
                 return;
             }
             order.push_back(key);
-            if order.len() > 4096
+            if order.len() > shared.config.replay_capacity
                 && let Some(old) = order.pop_front()
             {
                 seen.remove(&old);
@@ -292,30 +330,17 @@ fn process(
                 let offset = bytes.len() - payload.len();
                 deliver(shared, kind, from, bytes, offset);
             } else if shared.config.forwarding && hops > 1 {
-                shared.forward(
-                    &to,
-                    wire::data(kind, hops - 1, id, &from, &to, payload).into(),
-                );
+                let mut forwarded = bytes
+                    .try_into_mut()
+                    .unwrap_or_else(|shared| bytes::BytesMut::from(shared.as_ref()));
+                wire::decrement_hops(&mut forwarded, kind);
+                shared.forward(&to, forwarded.freeze());
             }
         }
     }
 }
 
-fn deliver(shared: &Shared, kind: PayloadKind, from: NodeId, bytes: Vec<u8>, offset: usize) {
-    if let PayloadKind::Application(id) = kind {
-        let payload = Bytes::from(bytes).slice(offset..);
-        if let Ok(registry) = shared.protocols.lock() {
-            let _ = registry.deliver(id, ApplicationPacket { from, payload });
-        }
-    } else {
-        let queue = if kind == PayloadKind::Message {
-            &shared.messages
-        } else {
-            &shared.tunnels
-        };
-        let _ = queue.try_send(Inbound {
-            from,
-            msg: bytes[offset..].to_vec(),
-        });
-    }
+fn deliver(shared: &Shared, kind: PayloadKind, from: NodeId, mut bytes: Bytes, offset: usize) {
+    bytes.advance(offset);
+    let _ = shared.deliver_owned(kind, from, bytes);
 }

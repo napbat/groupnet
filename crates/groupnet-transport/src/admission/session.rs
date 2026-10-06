@@ -70,9 +70,9 @@ impl SessionRegistry {
     /// Creates a registry with an explicit established-peer bound.
     ///
     /// # Errors
-    /// Rejects zero capacity or capacity above the routing bound of 4096.
+    /// Rejects zero capacity or an unrepresentable neighbor snapshot allocation.
     pub fn new(max_peers: usize) -> io::Result<Self> {
-        if !(1..=4096).contains(&max_peers) {
+        if max_peers == 0 || max_peers > (isize::MAX as usize) / size_of::<SessionPeer>() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid session capacity",
@@ -242,5 +242,17 @@ impl SessionLease {
         if let Some(shared) = self.inner.shared.upgrade() {
             shared.remove(&self.inner.node, self.inner.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn established_peer_capacity_has_no_arbitrary_routing_ceiling() {
+        assert!(SessionRegistry::new(8192).is_ok());
+        assert!(SessionRegistry::new(0).is_err());
+        assert!(SessionRegistry::new(usize::MAX).is_err());
     }
 }

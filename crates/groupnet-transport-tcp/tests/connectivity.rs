@@ -64,10 +64,10 @@ async fn exchange(a: &TcpMsgTransport, b: &TcpMsgTransport, data: &[u8]) {
     a.send(&"b".into(), data).await.unwrap();
     let packet = timeout(SETTLE, b.recv()).await.unwrap().unwrap();
     assert_eq!(packet.from, NodeId::from("a"));
-    assert_eq!(packet.msg, data);
+    assert_eq!(packet.msg.as_ref(), data);
     b.send(&"a".into(), b"reverse").await.unwrap();
     assert_eq!(
-        timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg,
+        &(timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg)[..],
         b"reverse"
     );
 }
@@ -218,7 +218,7 @@ async fn replacement_sessions_fence_queued_frames_and_generation_tagged_sends() 
     assert!(timeout(Duration::from_millis(100), a.recv()).await.is_err());
     a.send(&"b".into(), b"replacement frame").await.unwrap();
     assert_eq!(
-        timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg,
+        &(timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg)[..],
         b"replacement frame"
     );
     a.close().await;
@@ -448,7 +448,7 @@ async fn candidate_scheduling_is_fair_across_more_than_four_peers() {
             .unwrap();
         let received = timeout(SETTLE, hub.recv()).await.unwrap().unwrap();
         assert_eq!(received.from, *node);
-        assert_eq!(received.msg, b"fair reverse");
+        assert_eq!(received.msg.as_ref(), b"fair reverse");
     }
     for (_, peer) in peers {
         peer.close().await;

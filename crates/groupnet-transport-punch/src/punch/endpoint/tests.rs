@@ -167,7 +167,7 @@ async fn public_offer_never_authorizes_data_and_forged_packets_do_not_poison_seq
     assert!(incoming.try_recv().is_err());
     endpoint.receive(packet(2, data(capability)), address);
     let received = incoming.try_recv().unwrap();
-    assert_eq!(received.packet.msg, b"payload");
+    assert_eq!(received.packet.msg.as_ref(), b"payload");
     assert!(received.session.is_some());
     assert!(lock(&endpoint.peers)["remote"].checks[0].pending.is_none());
     endpoint.receive(packet(2, data(capability)), address);
@@ -302,7 +302,7 @@ async fn refresh_is_bounded_and_unproved_probes_cannot_replace_confirmed_capabil
     );
     assert_eq!(lock(&endpoint.peers)["remote"].sequence, 0);
     endpoint.receive(packet(4, data(first)), address);
-    assert_eq!(incoming.try_recv().unwrap().packet.msg, b"payload");
+    assert_eq!(incoming.try_recv().unwrap().packet.msg.as_ref(), b"payload");
     endpoint.receive(packet(5, confirmation([9; 16])), address);
     assert_eq!(
         lock(&endpoint.peers)["remote"].checks[0]
@@ -558,7 +558,7 @@ async fn private_control_proof_is_required_even_with_public_identity_session_and
     endpoint.receive(control(10, Body::Registered { proof: [2; 16] }), address);
     assert_eq!(endpoint.heartbeat, 0);
     endpoint.receive(control(1, delivered([2; 16], b"real")), address);
-    assert_eq!(incoming.try_recv().unwrap().packet.msg, b"real");
+    assert_eq!(incoming.try_recv().unwrap().packet.msg.as_ref(), b"real");
     endpoint.receive(control(1, delivered([2; 16], b"replay")), address);
     assert!(incoming.try_recv().is_err());
     endpoint.nonce = [9; 16];
@@ -630,7 +630,7 @@ async fn direct_expiry_routes_the_next_message_to_the_relay_without_a_new_key_or
         to: "remote".into(),
         session: lease,
         target: [3; 16],
-        message: b"payload".to_vec(),
+        message: Bytes::from_static(b"payload"),
     };
     endpoint.send_message(&message);
     let mut bytes = [0; MAX_PACKET];
@@ -663,4 +663,49 @@ async fn direct_expiry_routes_the_next_message_to_the_relay_without_a_new_key_or
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn configured_peer_cap_preserves_existing_peer_and_reclaims_revoked_slot() {
+    let (mut endpoint, _, _, _) = endpoint(PathPolicy::RelayOnly).await;
+    endpoint.config.max_peers = 1;
+    let offer = control(7, Body::Discover { proof: [2; 16] });
+    endpoint.accept_offer(
+        offer,
+        "overflow",
+        [8; 16],
+        None,
+        true,
+        (wire::CandidateList::empty(), [9; 16]),
+    );
+    assert_eq!(lock(&endpoint.peers).len(), 1);
+    assert!(lock(&endpoint.peers).contains_key("remote"));
+    lock(&endpoint.peers)["remote"].lease.revoke();
+    endpoint.accept_offer(
+        offer,
+        "overflow",
+        [8; 16],
+        None,
+        true,
+        (wire::CandidateList::empty(), [9; 16]),
+    );
+    assert_eq!(lock(&endpoint.peers).len(), 1);
+    assert!(lock(&endpoint.peers).contains_key("overflow"));
+}
+
+#[tokio::test]
+async fn inbound_backpressure_drops_without_replaying_or_stalling_the_next_packet() {
+    let (mut endpoint, _, relay, _) = endpoint(PathPolicy::RelayOnly).await;
+    let (incoming, mut receiver) = mpsc::channel(1);
+    endpoint.incoming = incoming;
+    let address = relay.local_addr().unwrap();
+    endpoint.receive(control(1, delivered([2; 16], b"first")), address);
+    endpoint.receive(control(2, delivered([2; 16], b"dropped")), address);
+    let first = receiver.try_recv().unwrap();
+    assert_eq!(first.packet.msg.as_ref(), b"first");
+    assert!(first.session.is_some());
+    endpoint.receive(control(2, delivered([2; 16], b"replayed")), address);
+    assert!(receiver.try_recv().is_err());
+    endpoint.receive(control(3, delivered([2; 16], b"next")), address);
+    assert_eq!(receiver.try_recv().unwrap().packet.msg.as_ref(), b"next");
 }

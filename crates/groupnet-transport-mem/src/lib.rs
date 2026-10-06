@@ -34,10 +34,14 @@
 
 #[cfg(feature = "bulk")]
 pub mod bulk;
+mod config;
 mod mem;
 
 #[cfg(feature = "bulk")]
 pub use bulk::{MemBulkNet, MemBulkTransport};
+#[cfg(feature = "bulk")]
+pub use config::MemBulkConfig;
+pub use config::NetworkConfig;
 pub use mem::{Closed, MemTransport, Network};
 
 #[cfg(feature = "link")]

@@ -106,10 +106,36 @@ Application frames use `groupnet-messaging` above protocol namespace 1 for expli
 `Delivered` / `Applied` acknowledgements and bounded retry/deduplication state.
 Authenticated unordered sessions use namespace 2 through `groupnet-streams`.
 `Router::bind_protocol(id)` exclusively registers an endpoint; its `ProtocolIo`
-shares a bounded queue and cancellation lifecycle. The router supports at most
-32 namespaces with 128 queued packets each; unknown namespaces fail closed.
+shares a bounded queue and cancellation lifecycle. `RouterConfig::max_protocols`
+and `protocol_queue` default to 32 namespaces and 128 packets per namespace;
+unknown namespaces fail closed.
 The router neither decodes protocol bodies nor interprets their ACKs.
 `GNR3` carries the protocol ID; communicating nodes must upgrade together.
+
+## Packet storage and resource policy
+
+`RouterConfig` controls complete-frame size, hop count, replay retention,
+reassembly bounds, protocol/inbox/link capacities and physical-send deadlines.
+Configuration is validated against wire representation and channel limits before
+workers start. Increasing a bound does not enlarge a physical link's MTU:
+fragmentation still applies, and every receiving router enforces its own limits.
+
+`ProtocolIo::packet_buffer(destination, capacity)` reserves routing headroom in
+one owned buffer. A protocol writes its typed header and payload, encrypts in
+place where needed, then calls `send_packet`. Routing consumes that allocation;
+dispatch returns `Bytes` slices without copying the payload. `send_owned` can
+transfer a local packet directly but must prepend a routing envelope for a remote
+destination; protocols producing remote packets should use the headroom path.
+Submission rejects a buffer whose reserved headroom does not match the sending
+router's source identity length, destination, or protocol, before stamping bytes.
+
+Transport `Inbound` and `Outbound` carry `Bytes`. The link worker passes owned
+frames and their captured admission generation to `send_owned_admitted`; custom
+transports may override that method to consume the allocation. Its default
+borrows the existing admitted-send interface. Transit hop updates reuse uniquely
+owned storage and copy only when shared ownership prevents mutation. Fragment
+reassembly retains slices and performs one final contiguous assembly; physical
+fragment encoding still copies each fragment's payload.
 
 ## Implementation references
 

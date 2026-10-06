@@ -53,12 +53,12 @@ async fn keyless_unknown_identities_discover_route_relay_withdraw_and_reconnect(
         .unwrap();
     let received = timeout(SETTLE, b.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, *a.local_id());
-    assert_eq!(received.msg, b"keyless routed message");
+    assert_eq!(received.msg.as_ref(), b"keyless routed message");
     b.send(a.local_id(), b"server-initiated reverse direction")
         .await
         .unwrap();
     assert_eq!(
-        timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg,
+        &(timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg)[..],
         b"server-initiated reverse direction"
     );
     b.close().await;
@@ -79,7 +79,7 @@ async fn keyless_unknown_identities_discover_route_relay_withdraw_and_reconnect(
         .await
         .unwrap();
     assert_eq!(
-        timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg,
+        &(timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg)[..],
         b"fresh generation"
     );
     replacement.close().await;
@@ -165,14 +165,14 @@ async fn custom_accounts(policy: PathPolicy, expected: PeerPath) {
         .unwrap();
     let received = timeout(SETTLE, accepted.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, NodeId::from("second-account"));
-    assert_eq!(received.msg, b"policy admitted traffic");
+    assert_eq!(received.msg.as_ref(), b"policy admitted traffic");
     accepted
         .send(&"second-account".into(), b"reverse account traffic")
         .await
         .unwrap();
     let received = timeout(SETTLE, second.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, NodeId::from("canonical-account"));
-    assert_eq!(received.msg, b"reverse account traffic");
+    assert_eq!(received.msg.as_ref(), b"reverse account traffic");
     second.connection().unwrap().close().await;
     accepted.connection().unwrap().close().await;
     relay.close().await;
@@ -217,13 +217,13 @@ async fn duplicate_incumbent(policy: PathPolicy, expected: PeerPath) {
         .unwrap();
     let received = timeout(SETTLE, b.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, NodeId::from("a"));
-    assert_eq!(received.msg, b"incumbent still owns ID");
+    assert_eq!(received.msg.as_ref(), b"incumbent still owns ID");
     b.send(&"a".into(), b"incumbent still receives")
         .await
         .unwrap();
     let received = timeout(SETTLE, a.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, NodeId::from("b"));
-    assert_eq!(received.msg, b"incumbent still receives");
+    assert_eq!(received.msg.as_ref(), b"incumbent still receives");
     a.connection().unwrap().close().await;
     b.connection().unwrap().close().await;
     relay.close().await;

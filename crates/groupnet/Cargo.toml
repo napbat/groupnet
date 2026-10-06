@@ -157,6 +157,11 @@ required-features = ["runtime", "mem", "tcp-msg", "connectivity"]
 name = "application-messages"
 required-features = ["runtime", "mem", "tcp-msg", "connectivity"]
 
+[[example]]
+name = "packet-path"
+path = "examples/packet-path/main.rs"
+required-features = ["runtime", "mem", "udp", "tcp-msg", "connectivity"]
+
 [lints]
 workspace = true
 

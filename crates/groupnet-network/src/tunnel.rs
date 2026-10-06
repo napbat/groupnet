@@ -1,11 +1,10 @@
 //! End-to-end mutually authenticated TLS 1.3 streams over routed datagrams.
 //!
-//! Each stream has a native bounded sliding window (32 ciphertext packets),
-//! cumulative acknowledgements, deduplication, reordering, receive credit and
-//! retransmission with congestion backoff. Routing changes may retransmit the
-//! same ciphertext through another adapter without changing the TLS identity.
-//! There are at most 128 admitted peers, 64 sessions and 8 sessions per peer;
-//! setup expires after ten seconds, while healthy idle sessions use heartbeats.
+//! Each stream has a configured bounded ciphertext sliding window, cumulative
+//! acknowledgements, deduplication, reordering, receive credit and retransmission
+//! with congestion backoff. Routing changes may retransmit the same ciphertext
+//! through another adapter without changing the TLS identity. Node-wide
+//! [`TunnelLimits`](crate::tunnel::TunnelLimits) bound admission, setup, sessions, queues and idle expiry.
 //! Revocation invalidates active and queued streams. Re-admission creates a new
 //! admission generation and cannot restore an old stream's credentials.
 //!
@@ -14,10 +13,13 @@
 //! bounded accept queues. Unknown namespaces fail closed. Exported session keys
 //! remain tied to the retained control stream's admission and cancellation.
 
+mod config;
 mod reliable;
 mod stream;
 mod tls;
 mod wire;
+
+pub use config::TunnelLimits;
 
 #[cfg(test)]
 mod tests;
@@ -26,7 +28,6 @@ use std::{
     collections::HashMap,
     io,
     sync::{Arc, Mutex, Weak},
-    time::Duration,
 };
 
 use groupnet_core::NodeId;
@@ -46,10 +47,6 @@ use wire::{Kind, Packet, SessionId};
 pub use stream::TunneledStream;
 pub use tls::{PeerIdentity, TlsIdentity};
 
-const MAX_PEERS: usize = 128;
-const MAX_SESSIONS: usize = 64;
-const PER_PEER: usize = 8;
-const SETUP: Duration = Duration::from_secs(10);
 const PREAMBLE: &[u8; 11] = b"GN-TUNNEL-2";
 const ORDERED: u16 = 1;
 const CONTROL: u16 = 2;
@@ -81,6 +78,7 @@ struct Accepted {
 struct Inner {
     router: Router,
     identity: TlsIdentity,
+    limits: TunnelLimits,
     state: Mutex<State>,
     incoming: mpsc::Sender<Accepted>,
     accepts: AsyncMutex<mpsc::Receiver<Accepted>>,
@@ -115,14 +113,28 @@ impl TunnelTransport {
         identity: TlsIdentity,
         peers: Vec<PeerIdentity>,
     ) -> io::Result<Self> {
+        Self::with_limits(router, identity, peers, TunnelLimits::default())
+    }
+
+    /// Claims the tunnel plane using explicit bounded resource/reliability policy.
+    /// # Errors
+    /// Rejects invalid limits, admission, or an already-claimed router.
+    pub fn with_limits(
+        router: Router,
+        identity: TlsIdentity,
+        peers: Vec<PeerIdentity>,
+        limits: TunnelLimits,
+    ) -> io::Result<Self> {
+        limits.validate()?;
         tokio::runtime::Handle::try_current()
             .map_err(|_| error(io::ErrorKind::NotConnected, "Tokio executor required"))?;
-        if peers.len() > MAX_PEERS {
+        if peers.len() > limits.max_peers {
             return Err(error(io::ErrorKind::InvalidInput, "too many TLS peers"));
         }
         let cancel = router.cancellation();
         let mut state = State::default();
         for peer in peers {
+            router.validate_tunnel_payload(&peer.node, limits.payload + wire::HEADER)?;
             let node = peer.node.clone();
             if state
                 .peers
@@ -139,11 +151,12 @@ impl TunnelTransport {
             }
         }
         router.claim_tunnels()?;
-        let (incoming, accepts) = mpsc::channel(32);
-        let (control_incoming, control_accepts) = mpsc::channel(32);
+        let (incoming, accepts) = mpsc::channel(limits.accept_queue);
+        let (control_incoming, control_accepts) = mpsc::channel(limits.accept_queue);
         let inner = Arc::new(Inner {
             router: router.clone(),
             identity,
+            limits,
             state: Mutex::new(state),
             incoming,
             accepts: AsyncMutex::new(accepts),
@@ -164,6 +177,9 @@ impl TunnelTransport {
     /// # Errors
     /// Returns an error if closed, the state lock was poisoned, or admission is full.
     pub fn admit_peer(&self, peer: PeerIdentity) -> io::Result<()> {
+        self.inner
+            .router
+            .validate_tunnel_payload(&peer.node, self.inner.limits.payload + wire::HEADER)?;
         let mut state = self.inner.state.lock().map_err(|_| poisoned())?;
         if self.inner.cancel.is_cancelled() {
             return Err(closed());
@@ -172,7 +188,7 @@ impl TunnelTransport {
             if old.identity.pin == peer.pin {
                 return Ok(());
             }
-        } else if state.peers.len() >= MAX_PEERS {
+        } else if state.peers.len() >= self.inner.limits.max_peers {
             return Err(error(io::ErrorKind::WouldBlock, "TLS admission full"));
         }
         let node = peer.node.clone();
@@ -323,7 +339,7 @@ impl TunnelTransport {
         };
         let result = tokio::select! {
             () = cancel.cancelled() => Err(closed()),
-            result = timeout(SETUP, operation) => result.map_err(|_| error(io::ErrorKind::TimedOut, "TLS tunnel setup deadline"))?,
+            result = timeout(self.inner.limits.setup_timeout, operation) => result.map_err(|_| error(io::ErrorKind::TimedOut, "TLS tunnel setup deadline"))?,
         };
         if result.is_ok() {
             guard.0 = None;
@@ -394,13 +410,13 @@ fn start_session(
     {
         return Err(closed());
     }
-    if state.sessions.len() >= MAX_SESSIONS
+    if state.sessions.len() >= inner.limits.max_sessions
         || state
             .sessions
             .keys()
             .filter(|(node, _)| node == &peer)
             .count()
-            >= PER_PEER
+            >= inner.limits.sessions_per_peer
         || state.sessions.contains_key(&(peer.clone(), id))
     {
         return Err(error(
@@ -408,10 +424,10 @@ fn start_session(
             "TLS session capacity exceeded",
         ));
     }
-    let (packets, receiver) = mpsc::channel(64);
+    let (packets, receiver) = mpsc::channel(inner.limits.packet_queue);
     let cancel = admission.cancel.child_token();
     let sent = CancellationToken::new();
-    let (stream, raw) = tokio::io::duplex(32 * 1024);
+    let (stream, raw) = tokio::io::duplex(inner.limits.stream_buffer);
     state
         .sessions
         .insert((peer.clone(), id), Session { packets });
@@ -419,12 +435,14 @@ fn start_session(
     let router = inner.router.clone();
     let task_cancel = cancel.clone();
     let task_sent = sent.clone();
+    let limits = inner.limits.clone();
     inner.tasks.spawn(async move {
         reliable::run(
             router,
             peer.clone(),
             id,
             role,
+            limits,
             reliable::SessionIo {
                 raw,
                 packets: receiver,
@@ -448,11 +466,11 @@ async fn dispatch(weak: Weak<Inner>, router: Router, cancel: CancellationToken) 
             () = cancel.cancelled() => break,
             inbound = router.recv_tunnel() => match inbound { Ok(inbound) => inbound, Err(_) => break },
         };
-        let Some(packet) = Packet::decode(inbound.msg) else {
-            continue;
-        };
         let Some(inner) = weak.upgrade() else {
             break;
+        };
+        let Some(packet) = Packet::decode(inbound.msg, &inner.limits) else {
+            continue;
         };
         let (existing, admission) = {
             let Ok(state) = inner.state.lock() else {
@@ -500,6 +518,11 @@ async fn authenticate_inbound(
     sent: CancellationToken,
 ) {
     let mut guard = CancelOnDrop(Some(cancel.clone()));
+    let Some(inner) = weak.upgrade() else {
+        return;
+    };
+    let setup_timeout = inner.limits.setup_timeout;
+    drop(inner);
     let operation = async {
         let mut tls = TlsAcceptor::from(server).accept(raw).await?;
         let (_, connection) = tls.get_ref();
@@ -540,7 +563,7 @@ async fn authenticate_inbound(
     };
     let result = tokio::select! {
         () = cancel.cancelled() => return,
-        result = timeout(SETUP, operation) => result,
+        result = timeout(setup_timeout, operation) => result,
     };
     if matches!(result, Ok(Ok(()))) {
         guard.0 = None;

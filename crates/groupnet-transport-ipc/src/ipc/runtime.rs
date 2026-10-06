@@ -4,13 +4,14 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::Inbound;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use super::{IpcAddress, SESSION_QUEUE, Session, State, frame, platform};
+use super::{IpcAddress, Session, State, frame, platform};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,7 +22,7 @@ pub(super) struct Dial {
     pub node: NodeId,
     pub address: IpcAddress,
     pub generation: u64,
-    pub frames: mpsc::Receiver<Vec<u8>>,
+    pub frames: mpsc::Receiver<Bytes>,
     pub slot: OwnedSemaphorePermit,
 }
 
@@ -118,7 +119,7 @@ async fn accept(state: Arc<State>, mut stream: platform::Stream, slot: OwnedSema
         }
     };
     if let Some(remote) = remote.filter(|node| *node != state.local) {
-        let (sender, frames) = mpsc::channel(SESSION_QUEUE);
+        let (sender, frames) = mpsc::channel(state.config.session_queue);
         let generation = {
             let Ok(mut book) = state.book.lock() else {
                 return;
@@ -155,7 +156,7 @@ async fn session(
     state: &State,
     stream: platform::Stream,
     remote: NodeId,
-    mut frames: mpsc::Receiver<Vec<u8>>,
+    mut frames: mpsc::Receiver<Bytes>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let read = read_messages(state, &mut reader, remote);

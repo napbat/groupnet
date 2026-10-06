@@ -60,7 +60,7 @@ async fn advertise(incoming: &mpsc::Sender<AdmittedInbound>, peer: &NodeId, id: 
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(0, std::slice::from_ref(peer)),
+                msg: wire::advert(0, std::slice::from_ref(peer)).into(),
             },
             session: Some(id),
         })
@@ -164,7 +164,7 @@ async fn remaining_fragments_keep_original_generation_and_stop_after_revocation(
     queued
         .send(Queued {
             peer: peer.clone(),
-            bytes: Arc::from(b"fresh".as_slice()),
+            bytes: Bytes::from_static(b"fresh"),
             session: Some(replacement.id()),
         })
         .await

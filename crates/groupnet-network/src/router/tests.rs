@@ -80,14 +80,14 @@ async fn address_updates_reach_only_pre_admitted_links_and_never_admit_a_source(
     incoming
         .send(Inbound {
             from: unknown.clone(),
-            msg: wire::advert(0, std::slice::from_ref(&unknown)),
+            msg: wire::advert(0, std::slice::from_ref(&unknown)).into(),
         })
         .await
         .unwrap();
     incoming
         .send(Inbound {
             from: peer.clone(),
-            msg: wire::advert(0, std::slice::from_ref(&peer)),
+            msg: wire::advert(0, std::slice::from_ref(&peer)).into(),
         })
         .await
         .unwrap();
@@ -269,7 +269,7 @@ async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_nam
             let received = match kind {
                 PayloadKind::Message => router.recv().await?.msg,
                 PayloadKind::Tunnel => router.recv_tunnel().await?.msg,
-                PayloadKind::Application(_) => application.recv().await?.payload.to_vec(),
+                PayloadKind::Application(_) => application.recv().await?.payload,
             };
             assert_eq!(received, payload);
             payload.push(7);
@@ -284,6 +284,164 @@ async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_nam
             );
         }
         router.close().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn owned_protocol_send_and_receive_preserve_headroom_allocation() -> io::Result<()> {
+    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let application = router.bind_protocol(42)?;
+    let mut encoded = application.packet_buffer(router.local_id(), 8)?;
+    encoded.extend_from_slice(b"original");
+    encoded.payload_mut()[0] = b'O';
+    let ptr = encoded.payload().as_ptr() as usize;
+    application.send_packet(router.local_id(), encoded)?;
+    let delivered = application.recv().await?;
+    assert_eq!(delivered.payload.as_ptr() as usize, ptr);
+    assert_eq!(delivered.payload, b"Original".as_slice());
+    let owned = Bytes::from(vec![8; 128]);
+    let ptr = owned.as_ptr() as usize;
+    application.send_owned(router.local_id(), owned)?;
+    assert_eq!(application.recv().await?.payload.as_ptr() as usize, ptr);
+
+    let peer = NodeId::new("peer");
+    let (link, _, incoming) = endpoint(vec![peer.clone()]);
+    router.add_link(link).await?;
+    let frame = Bytes::from(wire::data(
+        PayloadKind::Application(42),
+        16,
+        [3; 16],
+        &peer,
+        router.local_id(),
+        b"inbound",
+    ));
+    let offset = PayloadKind::Application(42).header_len(&peer, router.local_id());
+    let payload_ptr = frame[offset..].as_ptr() as usize;
+    incoming
+        .send(Inbound {
+            from: peer,
+            msg: frame,
+        })
+        .await
+        .unwrap();
+    let received = application.recv().await?;
+    assert_eq!(received.payload.as_ptr() as usize, payload_ptr);
+    assert_eq!(received.payload, b"inbound".as_slice());
+    let mismatch = application.packet_buffer(router.local_id(), 0)?;
+    assert!(
+        application
+            .send_packet(&NodeId::new("other"), mismatch)
+            .is_err()
+    );
+    router.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_protocol_and_queue_capacities_replace_operational_constants() -> io::Result<()>
+{
+    let config = RouterConfig {
+        max_protocols: 40,
+        protocol_queue: 2,
+        max_frame: 70_000,
+        ..RouterConfig::default()
+    };
+    let router = Router::new(NodeId::new("local"), config)?;
+    let mut endpoints = Vec::new();
+    for id in 0..40 {
+        endpoints.push(router.bind_protocol(id)?);
+    }
+    assert_eq!(
+        router.bind_protocol(40).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        endpoints[0].max_payload(router.local_id()),
+        70_000 - 26 - 2 * "local".len()
+    );
+    for _ in 0..2 {
+        endpoints[0].send(router.local_id(), b"bounded")?;
+    }
+    assert_eq!(
+        endpoints[0]
+            .send(router.local_id(), b"overflow")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    router.close().await;
+    Ok(())
+}
+
+#[test]
+fn routing_policy_rejects_only_invalid_resource_or_wire_bounds() {
+    assert!(
+        RouterConfig {
+            max_routes: 8192,
+            max_transports: 4097,
+            ..RouterConfig::default()
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        RouterConfig {
+            protocol_queue: 0,
+            ..RouterConfig::default()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        RouterConfig {
+            max_hops: 256,
+            ..RouterConfig::default()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        RouterConfig {
+            max_frame: wire::MAX_DATA_HEADER - 1,
+            ..RouterConfig::default()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        RouterConfig {
+            reassembly: ReassemblyConfig {
+                max_fragments: 65_536,
+                ..ReassemblyConfig::default()
+            },
+            ..RouterConfig::default()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        RouterConfig {
+            send_timeout: Duration::MAX,
+            ..RouterConfig::default()
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn foreign_packet_headroom_is_rejected_for_longer_and_shorter_sources() -> io::Result<()> {
+    for (creator, sender) in [("a", "longer-source"), ("longer-source", "a")] {
+        let creator = Router::new(NodeId::new(creator), RouterConfig::default())?;
+        let sender = Router::new(NodeId::new(sender), RouterConfig::default())?;
+        let origin = creator.bind_protocol(42)?;
+        let destination = sender.bind_protocol(42)?;
+        let mut packet = origin.packet_buffer(sender.local_id(), 7)?;
+        packet.extend_from_slice(b"payload");
+        assert!(destination.send_packet(sender.local_id(), packet).is_err());
+        creator.close().await;
+        sender.close().await;
     }
     Ok(())
 }

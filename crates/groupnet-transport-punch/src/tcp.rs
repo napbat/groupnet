@@ -11,15 +11,17 @@
 //! Keyed control and all established direct streams use direction-separated MACs
 //! and fresh monotonic per-direction frame sequences.
 //!
-//! Admitted relay readers are paced to 256 frames per second with bounded bursts.
-//! Saturation applies TCP backpressure without revoking a valid peer session.
+//! Relay data uses bounded TCP backpressure, optionally paced by payload bytes.
+//! Control abuse has an independent configurable budget.
 
 mod endpoint;
+mod policy;
 mod server;
 mod sockets;
 mod wire;
 
 use crate::{NetworkKey, PathPolicy, PeerPath};
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{
     Inbound,
@@ -40,13 +42,15 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub use policy::{ControlRateLimit, RelayPacing, TcpRendezvousConfig};
 pub use server::TcpRendezvous;
 
 /// Maximum application payload in one native TCP frame.
 pub const MAX_TCP_MESSAGE: usize = 65_000;
-const MAX_PEERS: usize = 128;
+// A static peer list is encoded with a u8 count. This is a wire invariant,
+// not the operational limit on dynamically admitted sessions.
+const MAX_PEERS: usize = u8::MAX as usize;
 const MAX_CANDIDATES: usize = 8;
-const QUEUE: usize = 128;
 const DEADLINE: Duration = Duration::from_secs(3);
 const IDLE: Duration = Duration::from_secs(6);
 
@@ -81,6 +85,10 @@ pub struct TcpPunchConfig {
     /// Expand wildcard listeners to local interface addresses when gathering.
     /// IPv6 link-local addresses without a scope are not advertised.
     pub gather_interfaces: bool,
+    /// Maximum concurrently admitted neighbors (an operational memory bound).
+    pub max_peers: usize,
+    /// Capacity of the endpoint's bounded packet, event and writer queues.
+    pub queue_capacity: usize,
 }
 
 impl TcpPunchConfig {
@@ -130,6 +138,8 @@ impl TcpPunchConfig {
             candidate_binds: Vec::new(),
             advertised_candidates: Vec::new(),
             gather_interfaces: true,
+            max_peers: 128,
+            queue_capacity: 128,
         }
     }
 }
@@ -147,6 +157,8 @@ impl fmt::Debug for TcpPunchConfig {
             .field("candidate_binds", &self.candidate_binds)
             .field("advertised_candidates", &self.advertised_candidates)
             .field("gather_interfaces", &self.gather_interfaces)
+            .field("max_peers", &self.max_peers)
+            .field("queue_capacity", &self.queue_capacity)
             .finish_non_exhaustive()
     }
 }
@@ -163,7 +175,7 @@ struct Outgoing {
     to: NodeId,
     generation: SessionId,
     target: wire::Token,
-    message: Vec<u8>,
+    message: Bytes,
 }
 
 #[derive(Debug)]
@@ -313,9 +325,15 @@ impl TcpConnection {
         }
     }
 
-    fn enqueue(&self, to: &NodeId, message: &[u8], expected: Option<SessionId>) -> io::Result<()> {
+    fn enqueue(
+        &self,
+        to: &NodeId,
+        length: usize,
+        message: impl FnOnce() -> Bytes,
+        expected: Option<SessionId>,
+    ) -> io::Result<()> {
         self.ensure_open()?;
-        if message.len() > MAX_TCP_MESSAGE {
+        if length > MAX_TCP_MESSAGE {
             return Err(invalid("TCP message exceeds MAX_TCP_MESSAGE"));
         }
         let peers = lock(&self.inner.peers);
@@ -330,7 +348,7 @@ impl TcpConnection {
                 to: to.clone(),
                 generation: peer.lease.id(),
                 target: peer.session,
-                message: message.to_vec(),
+                message: message(),
             });
         }
         Ok(())
@@ -344,7 +362,12 @@ impl TcpConnection {
     /// # Errors
     /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
     pub fn send(&self, to: &NodeId, message: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
-        std::future::ready(self.enqueue(to, message, None))
+        std::future::ready(self.enqueue(
+            to,
+            message.len(),
+            || Bytes::copy_from_slice(message),
+            None,
+        ))
     }
 
     /// Queues data only when the supplied admission generation is still current.
@@ -359,7 +382,42 @@ impl TcpConnection {
         session: Option<SessionId>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         std::future::ready(if session.is_some() {
-            self.enqueue(to, message, session)
+            self.enqueue(
+                to,
+                message.len(),
+                || Bytes::copy_from_slice(message),
+                session,
+            )
+        } else {
+            Ok(())
+        })
+    }
+
+    /// Transfers an owned packet to the bounded queue without copying its payload.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    pub fn send_owned(
+        &self,
+        to: &NodeId,
+        message: Bytes,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        std::future::ready(self.enqueue(to, message.len(), || message, None))
+    }
+
+    /// Transfers owned data only for the still-current admission generation.
+    /// Missing/stale generations and full queues are dropped without blocking.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    pub fn send_owned_admitted(
+        &self,
+        to: &NodeId,
+        message: Bytes,
+        session: Option<SessionId>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        std::future::ready(if session.is_some() {
+            self.enqueue(to, message.len(), || message, session)
         } else {
             Ok(())
         })
@@ -397,6 +455,15 @@ impl TcpConnection {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn validate_capacity(capacity: usize) -> io::Result<()> {
+    if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(invalid(
+            "TCP capacity must be nonzero and fit the channel semaphore",
+        ));
+    }
+    Ok(())
 }
 
 fn closed() -> io::Error {

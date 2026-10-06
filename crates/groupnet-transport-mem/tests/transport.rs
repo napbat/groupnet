@@ -112,5 +112,139 @@ async fn dropping_replaced_endpoint_keeps_replacement_reachable() {
         .send(&NodeId::new("replaced"), b"replacement")
         .await
         .expect("send");
-    assert_eq!(replacement.recv().await.expect("recv").msg, b"replacement");
+    assert_eq!(
+        replacement.recv().await.expect("recv").msg.as_ref(),
+        b"replacement"
+    );
+}
+
+#[test]
+fn configured_message_queues_reject_zero_and_unsupported_capacities() {
+    use groupnet_transport_mem::NetworkConfig;
+
+    for inbound_queue in [0, usize::MAX] {
+        assert_eq!(
+            Network::with_config(NetworkConfig { inbound_queue })
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_message_queue_waits_for_receive_capacity() {
+    use groupnet_transport_mem::NetworkConfig;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let net = Network::with_config(NetworkConfig { inbound_queue: 1 }).unwrap();
+    let a = net.endpoint(NodeId::new("sender"));
+    let b = net.endpoint(NodeId::new("receiver"));
+    let target = b.local_id().clone();
+    a.send(&target, b"first").await.unwrap();
+    let mut pending = std::pin::pin!(a.send(&target, b"second"));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(b.recv().await.unwrap().msg.as_ref(), b"first");
+    pending.await.unwrap();
+    assert_eq!(b.recv().await.unwrap().msg.as_ref(), b"second");
+}
+
+#[tokio::test]
+async fn dropping_full_target_unblocks_a_waiting_sender() {
+    use groupnet_transport_mem::NetworkConfig;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let net = Network::with_config(NetworkConfig { inbound_queue: 1 }).unwrap();
+    let a = net.endpoint(NodeId::new("sender"));
+    let b = net.endpoint(NodeId::new("receiver"));
+    let target = b.local_id().clone();
+    a.send(&target, b"first").await.unwrap();
+    let mut pending = std::pin::pin!(a.send(&target, b"second"));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(b);
+    pending
+        .await
+        .expect("closed targets remain best-effort drops");
+}
+
+#[tokio::test]
+async fn replacement_does_not_redirect_an_already_waiting_send() {
+    use groupnet_transport_mem::NetworkConfig;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let net = Network::with_config(NetworkConfig { inbound_queue: 1 }).unwrap();
+    let a = net.endpoint(NodeId::new("sender"));
+    let old = net.endpoint(NodeId::new("receiver"));
+    let target = old.local_id().clone();
+    a.send(&target, b"first").await.unwrap();
+    let mut pending = std::pin::pin!(a.send(&target, b"old-generation"));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let replacement = net.endpoint(target.clone());
+    assert_eq!(old.recv().await.unwrap().msg.as_ref(), b"first");
+    pending.await.unwrap();
+    assert_eq!(old.recv().await.unwrap().msg.as_ref(), b"old-generation");
+    assert!(old.recv().await.is_err());
+    drop(old);
+    a.send(&target, b"new-generation").await.unwrap();
+    assert_eq!(
+        replacement.recv().await.unwrap().msg.as_ref(),
+        b"new-generation"
+    );
+}
+
+#[cfg(feature = "link")]
+#[tokio::test]
+async fn owned_send_preserves_packet_storage() {
+    let net = Network::new();
+    let a = net.endpoint(NodeId::new("sender"));
+    let b = net.endpoint(NodeId::new("receiver"));
+    let packet = bytes::Bytes::from(vec![0x5a; 4096]);
+    let pointer = packet.as_ptr();
+    a.send_owned_admitted(b.local_id(), packet, None)
+        .await
+        .unwrap();
+    let inbound = b.recv().await.unwrap();
+    assert_eq!(inbound.msg.as_ptr(), pointer);
+    assert_eq!(inbound.msg.len(), 4096);
+}
+
+#[cfg(feature = "link")]
+#[tokio::test]
+async fn static_owned_send_drops_admitted_session_packets() {
+    use bytes::Bytes;
+    use groupnet_transport::admission::{AcceptedPeer, SessionRegistry};
+
+    let net = Network::new();
+    let a = net.endpoint(NodeId::new("sender"));
+    let b = net.endpoint(NodeId::new("receiver"));
+    let registry = SessionRegistry::new(1).unwrap();
+    let lease = registry
+        .try_admit(AcceptedPeer::new(b.local_id().clone()))
+        .unwrap();
+    a.send_owned_admitted(
+        b.local_id(),
+        Bytes::from_static(b"wrong-lifetime"),
+        Some(lease.id()),
+    )
+    .await
+    .unwrap();
+    a.send_owned_admitted(b.local_id(), Bytes::from_static(b"static"), None)
+        .await
+        .unwrap();
+    assert_eq!(b.recv().await.unwrap().msg.as_ref(), b"static");
 }

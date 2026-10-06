@@ -13,7 +13,7 @@ use groupnet_core::NodeId;
 use groupnet_network as network;
 use groupnet_network::{
     Router, RouterConfig,
-    tunnel::{PeerIdentity, TunnelTransport},
+    tunnel::{PeerIdentity, TunnelLimits, TunnelTransport},
 };
 use groupnet_transport::bulk::BulkTransport;
 use tokio::time::{interval, timeout};
@@ -76,6 +76,53 @@ async fn binary_half_close_across_memory_and_tcp_bridge() {
 #[tokio::test]
 async fn retransmission_reordering_and_deduplication_across_multihop_router() {
     transfer(true, false).await;
+}
+
+#[tokio::test]
+async fn different_receive_windows_exchange_streams_in_both_directions() {
+    let fabric = Fabric::new(false, false).await;
+    let (a, c, _) = credentials();
+    let ap = PeerIdentity::new(fabric.c.local_id().clone(), &c.leaf).unwrap();
+    let cp = PeerIdentity::new(fabric.a.local_id().clone(), &a.leaf).unwrap();
+    let small = TunnelLimits {
+        window: 8,
+        setup_timeout: Duration::from_secs(2),
+        ..TunnelLimits::default()
+    };
+    let large = TunnelLimits {
+        window: 64,
+        ..small.clone()
+    };
+    let a = TunnelTransport::with_limits(fabric.a.clone(), a.identity, vec![ap], small).unwrap();
+    let c = TunnelTransport::with_limits(fabric.c.clone(), c.identity, vec![cp], large).unwrap();
+    let payload = binary(16 * 1024);
+    for (sender, receiver, target, origin) in [
+        (&a, &c, fabric.c.local_id(), fabric.a.local_id()),
+        (&c, &a, fabric.a.local_id(), fabric.c.local_id()),
+    ] {
+        timeout(DEADLINE, async {
+            let (outgoing, incoming) = tokio::join!(sender.connect(target), receiver.accept());
+            let mut outgoing = outgoing.unwrap();
+            let (peer, mut incoming) = incoming.unwrap();
+            assert_eq!(&peer, origin);
+            let sending = async {
+                outgoing.write_all(&payload).await.unwrap();
+                outgoing.close().await.unwrap();
+            };
+            let receiving = async {
+                let mut bytes = Vec::new();
+                incoming.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, payload);
+                incoming.close().await.unwrap();
+            };
+            tokio::join!(sending, receiving);
+        })
+        .await
+        .unwrap();
+    }
+    a.close().await;
+    c.close().await;
+    fabric.close().await;
 }
 
 #[tokio::test]

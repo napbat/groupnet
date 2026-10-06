@@ -2,13 +2,29 @@
 
 use std::io;
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zerocopy::byteorder::little_endian::U32;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::MAX_FRAME;
 
 const MAGIC: [u8; 4] = *b"GNI1";
 const MAX_ID: usize = 64;
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
+#[repr(C)]
+struct IntroductionHeader {
+    magic: [u8; 4],
+    id_len: u8,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
+#[repr(C)]
+struct FrameHeader {
+    length: U32,
+}
 
 pub(super) fn validate_id(id: &NodeId) -> io::Result<()> {
     if id.as_str().is_empty() || id.as_str().len() > MAX_ID {
@@ -24,16 +40,21 @@ pub(super) async fn introduce<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     local: &NodeId,
 ) -> io::Result<NodeId> {
+    validate_id(local)?;
     let len = u8::try_from(local.as_str().len()).map_err(|_| invalid("invalid local ID"))?;
-    let mut intro = [0_u8; 5 + MAX_ID];
-    intro[..4].copy_from_slice(&MAGIC);
-    intro[4] = len;
-    intro[5..5 + usize::from(len)].copy_from_slice(local.as_str().as_bytes());
-    stream.write_all(&intro[..5 + usize::from(len)]).await?;
-    let mut header = [0_u8; 5];
-    stream.read_exact(&mut header).await?;
-    let len = usize::from(header[4]);
-    if header[..4] != MAGIC || len == 0 || len > MAX_ID {
+    let header = IntroductionHeader {
+        magic: MAGIC,
+        id_len: len,
+    };
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(local.as_str().as_bytes()).await?;
+    let mut header = IntroductionHeader {
+        magic: [0; 4],
+        id_len: 0,
+    };
+    stream.read_exact(header.as_mut_bytes()).await?;
+    let len = usize::from(header.id_len);
+    if header.magic != MAGIC || len == 0 || len > MAX_ID {
         return Err(invalid("invalid IPC introduction"));
     }
     let mut id = [0_u8; MAX_ID];
@@ -42,15 +63,19 @@ pub(super) async fn introduce<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(NodeId::new(id))
 }
 
-pub(super) async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>> {
-    let length = reader.read_u32_le().await?;
+pub(super) async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Bytes> {
+    let mut header = FrameHeader {
+        length: U32::new(0),
+    };
+    reader.read_exact(header.as_mut_bytes()).await?;
+    let length = header.length.get();
     if length > u32::try_from(MAX_FRAME).expect("IPC frame bound fits u32") {
         return Err(invalid("IPC frame exceeds maximum length"));
     }
     let length = usize::try_from(length).map_err(|_| invalid("IPC length does not fit usize"))?;
     let mut frame = vec![0_u8; length];
     reader.read_exact(&mut frame).await?;
-    Ok(frame)
+    Ok(frame.into())
 }
 
 pub(super) async fn write<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -> io::Result<()> {
@@ -59,10 +84,16 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -
     if frame.len() > MAX_FRAME {
         return Err(invalid("IPC frame exceeds maximum length"));
     }
-    writer.write_u32_le(length).await?;
+    let header = FrameHeader {
+        length: U32::new(length),
+    };
+    writer.write_all(header.as_bytes()).await?;
     writer.write_all(frame).await
 }
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(test)]
+mod tests;

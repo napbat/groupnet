@@ -75,7 +75,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(1, &[peer.clone(), beyond.clone()]),
+                msg: wire::advert(1, &[peer.clone(), beyond.clone()]).into(),
             },
             session: Some(lease.id()),
         })
@@ -96,7 +96,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(1, &[peer.clone(), beyond.clone()]),
+                msg: wire::advert(1, &[peer.clone(), beyond.clone()]).into(),
             },
             session: Some(stale),
         })
@@ -107,7 +107,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(0, std::slice::from_ref(&peer)),
+                msg: wire::advert(0, std::slice::from_ref(&peer)).into(),
             },
             session: Some(replacement.id()),
         })
@@ -136,7 +136,7 @@ fn fragment_assemblies_do_not_cross_session_generations() {
     let old_id = old.id();
     drop(old);
     let new = registry.try_admit(AcceptedPeer::new(peer.clone())).unwrap();
-    let bytes: Arc<[u8]> = vec![3; 200].into();
+    let bytes: Bytes = vec![3; 200].into();
     let parts: Vec<_> = wire::fragment(bytes.clone(), 128, [4; 16]).collect();
     let mut fragments = wire::Reassembly::default();
     assert!(

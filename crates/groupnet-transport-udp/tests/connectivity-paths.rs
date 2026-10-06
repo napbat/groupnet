@@ -37,7 +37,7 @@ async fn deliver(from: &UdpTransport, to: &UdpTransport, sender: &str, receiver:
     from.send(&receiver.into(), msg).await.unwrap();
     let packet = timeout(SETTLE, to.recv()).await.unwrap().unwrap();
     assert_eq!(packet.from, NodeId::from(sender));
-    assert_eq!(packet.msg, msg);
+    assert_eq!(packet.msg.as_ref(), msg);
 }
 
 #[tokio::test]

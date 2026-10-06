@@ -6,6 +6,7 @@
 //! pipe instance. Peer identities are trusted within this OS security boundary;
 //! this transport is not a cryptographic identity layer.
 
+mod config;
 mod frame;
 mod platform;
 mod runtime;
@@ -16,7 +17,9 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
+use groupnet_transport::admission::SessionId;
 use groupnet_transport::link::{LinkFuture, LinkLifecycle};
 use groupnet_transport::{Inbound, Transport};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch};
@@ -24,10 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Largest message accepted by the IPC framing protocol, in bytes.
 pub const MAX_FRAME: usize = 65_000;
-const MAX_PEERS: usize = 128;
-const MAX_SESSIONS: usize = 64;
-const SESSION_QUEUE: usize = 16;
-const INBOUND_QUEUE: usize = 64;
+pub use config::IpcConfig;
 
 /// A native, local-only IPC listener address.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,7 +43,7 @@ pub enum IpcAddress {
 #[derive(Debug)]
 struct Session {
     generation: u64,
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<Bytes>,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +73,7 @@ impl Book {
 #[derive(Debug)]
 struct State {
     local: NodeId,
+    config: IpcConfig,
     book: Mutex<Book>,
     slots: Arc<Semaphore>,
     inbox: AsyncMutex<mpsc::Receiver<Inbound>>,
@@ -95,10 +96,11 @@ impl Drop for Handle {
 
 /// A cloneable, persistent, full-duplex native IPC message transport.
 ///
-/// There are at most 128 registered peers, 64 sessions (including connection
-/// setup), 16 queued messages per session, and 64 queued inbound messages.
-/// Unknown peers, busy connections and full outbound queues drop messages under
-/// the best-effort [`Transport`] contract. Each session introduces its node ID
+/// By default there are at most 128 registered peers, 64 sessions (including
+/// setup), 16 queued messages per session, and 64 queued inbound messages;
+/// [`IpcConfig`] selects other finite limits. Unknown peers, busy connections
+/// and full outbound queues drop messages under the best-effort [`Transport`]
+/// contract. Each session introduces its node ID
 /// once and can carry messages in either direction without a second connection.
 /// Dropping the last handle cancels all workers; [`Self::close`] also waits for
 /// workers to stop and for the owned listener to be released.
@@ -115,17 +117,31 @@ impl IpcTransport {
     /// addresses, missing Tokio runtime, and native listener failures. Unix
     /// callers must create their own private directory before binding.
     pub fn bind(local: NodeId, address: &IpcAddress) -> io::Result<Self> {
+        Self::bind_with_config(local, address, IpcConfig::default())
+    }
+
+    /// Binds a native listener with validated finite operational budgets.
+    ///
+    /// # Errors
+    /// Rejects invalid limits before binding, in addition to [`Self::bind`] errors.
+    pub fn bind_with_config(
+        local: NodeId,
+        address: &IpcAddress,
+        config: IpcConfig,
+    ) -> io::Result<Self> {
+        config.validate()?;
         frame::validate_id(&local)?;
         tokio::runtime::Handle::try_current()
             .map_err(|_| io::Error::other("IPC requires a Tokio runtime"))?;
-        let listener = platform::Listener::bind(address)?;
-        let (incoming, inbox) = mpsc::channel(INBOUND_QUEUE);
-        let (commands, receiver) = mpsc::channel(MAX_SESSIONS);
+        let listener = platform::Listener::bind(address, config.max_sessions)?;
+        let (incoming, inbox) = mpsc::channel(config.inbound_queue);
+        let (commands, receiver) = mpsc::channel(config.max_sessions);
         let (finished, done) = watch::channel(false);
         let state = Arc::new(State {
             local,
+            config,
             book: Mutex::new(Book::default()),
-            slots: Arc::new(Semaphore::new(MAX_SESSIONS)),
+            slots: Arc::new(Semaphore::new(config.max_sessions)),
             inbox: AsyncMutex::new(inbox),
             incoming,
             commands,
@@ -168,7 +184,7 @@ impl IpcTransport {
             .book
             .lock()
             .map_err(|_| io::Error::other("IPC book poisoned"))?;
-        if !book.peers.contains_key(&node) && book.peers.len() == MAX_PEERS {
+        if !book.peers.contains_key(&node) && book.peers.len() >= state.config.max_peers {
             return Err(io::Error::other("IPC peer limit reached"));
         }
         if book.peers.get(&node) != Some(&address) {
@@ -192,12 +208,12 @@ impl IpcTransport {
         }
     }
 
-    fn enqueue(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
+    fn enqueue(&self, to: &NodeId, length: usize, msg: impl FnOnce() -> Bytes) -> io::Result<()> {
         let state = &self.handle.state;
         if state.cancel.is_cancelled() {
             return Err(closed());
         }
-        if msg.len() > MAX_FRAME {
+        if length > MAX_FRAME {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "IPC message exceeds frame limit",
@@ -210,7 +226,7 @@ impl IpcTransport {
         if let Some(session) = book.sessions.get(to) {
             match session.sender.try_reserve() {
                 Ok(permit) => {
-                    permit.send(msg.to_vec());
+                    permit.send(msg());
                     return Ok(());
                 }
                 Err(mpsc::error::TrySendError::Full(())) => return Ok(()),
@@ -227,11 +243,11 @@ impl IpcTransport {
         let Ok(command) = state.commands.try_reserve() else {
             return Ok(());
         };
-        let (sender, frames) = mpsc::channel(SESSION_QUEUE);
+        let (sender, frames) = mpsc::channel(state.config.session_queue);
         let generation = book.generation();
         // The newly allocated queue is empty, so reservation cannot fail.
         sender
-            .try_send(msg.to_vec())
+            .try_send(msg())
             .map_err(|_| io::Error::other("new IPC queue unavailable"))?;
         book.sessions
             .insert(to.clone(), Session { generation, sender });
@@ -260,7 +276,20 @@ impl Transport for IpcTransport {
     type Error = io::Error;
 
     fn send(&self, to: &NodeId, msg: &[u8]) -> impl Future<Output = io::Result<()>> {
-        std::future::ready(self.enqueue(to, msg))
+        std::future::ready(self.enqueue(to, msg.len(), || Bytes::copy_from_slice(msg)))
+    }
+
+    fn send_owned_admitted(
+        &self,
+        to: &NodeId,
+        msg: Bytes,
+        session: Option<SessionId>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        std::future::ready(if session.is_some() {
+            Ok(())
+        } else {
+            self.enqueue(to, msg.len(), || msg)
+        })
     }
 
     async fn recv(&self) -> io::Result<Inbound> {
@@ -276,3 +305,6 @@ impl Transport for IpcTransport {
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "IPC transport closed")
 }
+
+#[cfg(test)]
+mod tests;

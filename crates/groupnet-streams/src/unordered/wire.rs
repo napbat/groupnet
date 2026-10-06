@@ -4,14 +4,28 @@ use std::io;
 
 use bytes::Bytes;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+use zerocopy::byteorder::network_endian::U64;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::UnorderedDelivery;
 
 pub(super) type SessionId = [u8; 16];
-pub(super) const HEADER: usize = 37;
-const TAG: usize = 16;
+pub(super) const HEADER: usize = size_of::<Header>();
+pub(super) const TAG: usize = 16;
+// Security horizon, not an operational queue capacity. Both peers use this
+// fixed layout and send allocation must never advance past unresolved IDs.
 pub(super) const WINDOW: usize = 1024;
-const MAGIC: &[u8; 4] = b"GNU1";
+const MAGIC: [u8; 4] = *b"GNU1";
+
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Header {
+    magic: [u8; 4],
+    session: SessionId,
+    counter: U64,
+    kind: u8,
+    message: U64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -91,87 +105,115 @@ impl Window {
     }
 }
 
-pub(super) struct Crypto {
-    tx: LessSafeKey,
-    rx: LessSafeKey,
+pub(super) struct TxCrypto {
+    key: LessSafeKey,
     next: u64,
+}
+
+pub(super) struct RxCrypto {
+    key: LessSafeKey,
     replay: Window,
 }
 
-impl std::fmt::Debug for Crypto {
+impl std::fmt::Debug for TxCrypto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Crypto").finish_non_exhaustive()
+        f.debug_struct("TxCrypto").finish_non_exhaustive()
     }
 }
 
-impl Crypto {
-    pub(super) fn new(keys: &[u8; 64], initiator: bool) -> io::Result<Self> {
-        let (first, second) = keys.split_at(32);
-        let (tx, rx) = if initiator {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        let key = |bytes| {
-            UnboundKey::new(&aead::CHACHA20_POLY1305, bytes)
-                .map(LessSafeKey::new)
-                .map_err(|_| invalid())
-        };
-        Ok(Self {
-            tx: key(tx)?,
-            rx: key(rx)?,
-            next: 1,
-            replay: Window::default(),
-        })
+impl std::fmt::Debug for RxCrypto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RxCrypto").finish_non_exhaustive()
     }
+}
 
+pub(super) fn crypto(keys: &[u8; 64], initiator: bool) -> io::Result<(TxCrypto, RxCrypto)> {
+    let (first, second) = keys.split_at(32);
+    let (tx, rx) = if initiator {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let key = |bytes| {
+        UnboundKey::new(&aead::CHACHA20_POLY1305, bytes)
+            .map(LessSafeKey::new)
+            .map_err(|_| invalid())
+    };
+    Ok((
+        TxCrypto {
+            key: key(tx)?,
+            next: 1,
+        },
+        RxCrypto {
+            key: key(rx)?,
+            replay: Window::default(),
+        },
+    ))
+}
+
+impl TxCrypto {
+    /// Seals an initialized header/body/tag allocation without copying the body.
+    /// Callers retain retry plaintext separately; failed attempts consume a nonce.
     pub(super) fn seal(
         &mut self,
         session: SessionId,
         kind: Kind,
         message: u64,
-        body: &[u8],
-    ) -> io::Result<Vec<u8>> {
+        packet: &mut [u8],
+    ) -> io::Result<()> {
+        if packet.len() < HEADER + TAG {
+            return Err(invalid());
+        }
         let counter = self.next;
         self.next = self
             .next
             .checked_add(1)
             .ok_or_else(|| io::Error::other("unordered nonce exhausted"))?;
-        let mut packet = Vec::with_capacity(HEADER + body.len() + TAG);
-        packet.extend_from_slice(MAGIC);
-        packet.extend_from_slice(&session);
-        packet.extend_from_slice(&counter.to_be_bytes());
-        packet.push(kind as u8);
-        packet.extend_from_slice(&message.to_be_bytes());
-        let mut header = [0; HEADER];
-        header.copy_from_slice(&packet);
-        packet.extend_from_slice(body);
+        let header = Header {
+            magic: MAGIC,
+            session,
+            counter: U64::new(counter),
+            kind: kind as u8,
+            message: U64::new(message),
+        };
+        let (prefix, body) = packet.split_at_mut(HEADER);
+        prefix.copy_from_slice(header.as_bytes());
+        let length = body.len() - TAG;
+        let (body, suffix) = body.split_at_mut(length);
         let tag = self
-            .tx
-            .seal_in_place_separate_tag(nonce(counter), Aad::from(&header), &mut packet[HEADER..])
+            .key
+            .seal_in_place_separate_tag(nonce(counter), Aad::from(&*prefix), body)
             .map_err(|_| invalid())?;
-        packet.extend_from_slice(tag.as_ref());
-        Ok(packet)
+        suffix.copy_from_slice(tag.as_ref());
+        Ok(())
     }
+}
 
+impl RxCrypto {
     pub(super) fn open(
         &mut self,
-        packet: &[u8],
+        packet: Bytes,
         max_payload: usize,
     ) -> io::Result<(Kind, u64, Bytes)> {
-        if packet.len() < HEADER + TAG || packet.len() > HEADER + TAG + max_payload {
+        if packet.len() < HEADER + TAG || packet.len() - HEADER - TAG > max_payload {
             return Err(invalid());
         }
-        let counter = u64::from_be_bytes(packet[20..28].try_into().map_err(|_| invalid())?);
-        if self.replay.too_old(counter) || self.replay.contains(counter) {
+        let (header, _) = Header::read_from_prefix(packet.as_ref()).map_err(|_| invalid())?;
+        let counter = header.counter.get();
+        if header.magic != MAGIC || self.replay.too_old(counter) || self.replay.contains(counter) {
             return Err(invalid());
         }
-        let kind = Kind::decode(packet[28]).ok_or_else(invalid)?;
-        let message = u64::from_be_bytes(packet[29..37].try_into().map_err(|_| invalid())?);
-        let mut body = packet[HEADER..].to_vec();
+        let kind = Kind::decode(header.kind).ok_or_else(invalid)?;
+        let message = header.message.get();
+        // Unique network packets recover their mutable allocation. Shared Bytes
+        // copy once so neither successful nor failed authentication mutates aliases.
+        let mut packet = packet
+            .try_into_mut()
+            .unwrap_or_else(|shared| shared.as_ref().into());
+        let (prefix, body) = packet.split_at_mut(HEADER);
         let length = self
-            .rx
-            .open_in_place(nonce(counter), Aad::from(&packet[..HEADER]), &mut body)
+            .key
+            .open_in_place(nonce(counter), Aad::from(&*prefix), body)
             .map_err(|_| invalid())?
             .len();
         if (kind != Kind::Data && length != 0)
@@ -179,17 +221,19 @@ impl Crypto {
         {
             return Err(invalid());
         }
+        // Authentication and semantic validation precede replay commitment.
         self.replay.insert(counter);
-        body.truncate(length);
-        Ok((kind, message, Bytes::from(body)))
+        packet.truncate(HEADER + length);
+        Ok((kind, message, packet.freeze().slice(HEADER..)))
     }
 }
 
 pub(super) fn session(packet: &[u8]) -> Option<SessionId> {
-    if packet.len() < HEADER + TAG || !packet.starts_with(MAGIC) {
+    if packet.len() < HEADER + TAG {
         return None;
     }
-    packet[4..20].try_into().ok()
+    let (header, _) = Header::ref_from_prefix(packet).ok()?;
+    (header.magic == MAGIC).then_some(header.session)
 }
 
 fn nonce(counter: u64) -> Nonce {

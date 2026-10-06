@@ -1,12 +1,20 @@
 //! Message endpoint diagnostics, lifecycle, and backend dispatch.
 
-use super::{Backend, Inner, MAX_FRAME, Outbound, TcpMsgTransport, write_loop};
+use super::{Backend, Inner, Outbound, TcpMsgTransport, write_loop};
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc;
 
 impl TcpMsgTransport {
+    #[cfg_attr(
+        not(feature = "connectivity"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "backend access keeps one return type across optional connectivity builds"
+        )
+    )]
     pub(super) fn direct(&self) -> Option<&Arc<Inner>> {
         match &self.backend {
             Backend::Direct(inner) => Some(inner),
@@ -155,14 +163,27 @@ impl Transport for TcpMsgTransport {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "connectivity"),
+        expect(
+            clippy::unused_async_trait_impl,
+            reason = "the connectivity backend awaits I/O; direct sends only enqueue"
+        )
+    )]
     async fn send(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
         match &self.backend {
             Backend::Direct(inner) => {
+                if inner.tasks.stopped() {
+                    return Err(shut_down());
+                }
+                if msg.len() > inner.config.max_frame_bytes {
+                    return Ok(());
+                }
                 #[cfg(feature = "link")]
                 if let Some(managed) = &inner.admission {
-                    return managed.send(inner, to, Some(msg));
+                    return managed.send(inner, to, Some(Bytes::copy_from_slice(msg)));
                 }
-                inner.send_raw(to, msg)
+                inner.send_raw(to, Bytes::copy_from_slice(msg))
             }
             #[cfg(feature = "connectivity")]
             Backend::Connectivity { connection, .. } => connection.send(to, msg).await,
@@ -176,6 +197,32 @@ impl Transport for TcpMsgTransport {
         msg: &[u8],
         session: Option<groupnet_transport::admission::SessionId>,
     ) -> io::Result<()> {
+        if let Some(inner) = self.direct() {
+            if inner.tasks.stopped() {
+                return Err(shut_down());
+            }
+            if msg.len() > inner.config.max_frame_bytes {
+                return Ok(());
+            }
+        }
+        self.send_owned_admitted(to, Bytes::copy_from_slice(msg), session)
+            .await
+    }
+
+    #[cfg_attr(
+        not(feature = "connectivity"),
+        expect(
+            clippy::unused_async_trait_impl,
+            reason = "the connectivity backend awaits I/O; direct sends only enqueue"
+        )
+    )]
+    #[cfg(feature = "link")]
+    async fn send_owned_admitted(
+        &self,
+        to: &NodeId,
+        msg: Bytes,
+        session: Option<groupnet_transport::admission::SessionId>,
+    ) -> io::Result<()> {
         match &self.backend {
             Backend::Direct(inner) => {
                 if let Some(managed) = &inner.admission {
@@ -185,7 +232,7 @@ impl Transport for TcpMsgTransport {
             }
             #[cfg(feature = "connectivity")]
             Backend::Connectivity { connection, .. } => {
-                connection.send_admitted(to, msg, session).await
+                connection.send_owned_admitted(to, msg, session).await
             }
         }
     }
@@ -223,27 +270,20 @@ impl Inner {
         self.inbox.lock().await.recv().await.ok_or_else(shut_down)
     }
 
-    fn send_raw(self: &Arc<Self>, to: &NodeId, msg: &[u8]) -> io::Result<()> {
+    fn send_raw(self: &Arc<Self>, to: &NodeId, mut msg: Bytes) -> io::Result<()> {
         if self.tasks.stopped() {
             return Err(shut_down());
         }
-        if msg.len() > MAX_FRAME {
+        if msg.len() > self.config.max_frame_bytes {
             return Ok(());
         }
-        let mut framed = Vec::with_capacity(4 + msg.len());
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "MAX_FRAME fits the u32 wire length"
-        )]
-        framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-        framed.extend_from_slice(msg);
         {
             let mut pool = self.pool.lock().expect("pool lock poisoned");
             if let Some(conn) = pool.conns.get(to) {
-                match conn.frames.try_send(framed) {
+                match conn.frames.try_send(msg) {
                     Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
                     Err(mpsc::error::TrySendError::Closed(frame)) => {
-                        framed = frame;
+                        msg = frame;
                         pool.remove(to);
                     }
                 }
@@ -256,14 +296,14 @@ impl Inner {
             .get(to)
             .copied();
         if let Some(addr) = addr {
-            self.dial_raw(to, addr, framed);
+            self.dial_raw(to, addr, msg);
         }
         Ok(())
     }
 
-    fn dial_raw(self: &Arc<Self>, to: &NodeId, addr: SocketAddr, framed: Vec<u8>) {
+    fn dial_raw(self: &Arc<Self>, to: &NodeId, addr: SocketAddr, msg: Bytes) {
         let (tx, rx) = mpsc::channel(self.config.outbound_queue);
-        tx.try_send(framed).expect("fresh queue has capacity");
+        tx.try_send(msg).expect("fresh queue has capacity");
         let generation;
         {
             let mut pool = self.pool.lock().expect("pool lock poisoned");

@@ -61,7 +61,7 @@ pub use group::{
     InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
 pub use groupnet_core::{RecoveredGrant, Role, Status};
-pub use groupnet_messaging::{MessageProtocol, Messaging};
+pub use groupnet_messaging::{MessageProtocol, Messaging, MessagingConfig};
 pub use groupnet_streams::{
     SessionProtocol, UnorderedConfig, UnorderedDelivery, UnorderedOptions, UnorderedSession,
 };
