@@ -83,10 +83,19 @@ application's USB ownership. Applications still need their own resource policy.
 
 ## 3. Native discovery, direct paths, and relay
 
-`PunchLink` uses an explicitly started, self-hosted `Rendezvous`. The shared
-`NetworkKey` authenticates the routing fabric. Registration includes a challenge
-response tied to the observed source address; leases, allowlists, replay checks,
-and bounds constrain discovery and relay traffic.
+`PunchLink` uses an explicitly started, self-hosted `Rendezvous`. In keyed mode,
+the shared `NetworkKey` authenticates the routing fabric. Registration includes
+a challenge response tied to the observed source address; leases, admission,
+replay checks, and bounds constrain discovery and relay traffic.
+
+Dynamic admission is distinct from tunnel certificate admission. An explicit
+open policy permits previously unknown routing identities without a key pair.
+Custom policies can require application credentials. A claimed identity and a
+return-routability check do not authenticate a person or prove identity continuity.
+Never send reusable secrets over an unencrypted admission exchange.
+
+The following diagram describes the keyed path; open admission does not acquire
+shared-key authentication merely by using the same routing layer.
 
 ```mermaid
 flowchart TD
@@ -132,8 +141,9 @@ flowchart TB
 
 | Boundary | Implemented guarantee or limitation |
 |---|---|
-| Plain TCP/UDP links | Require a trusted private network; do not imply endpoint authentication or encryption. |
-| Native punching fabric | Shared-key authenticated discovery/relay among trusted participants. |
+| Plain TCP/UDP links | No inherent endpoint authentication or encryption; static configurations assume trusted peers. |
+| Open dynamic admission | Accepts claimed identities without ownership proof; session binding is not account authentication. |
+| Native punching fabric | Keyed mode authenticates fabric membership; explicit keyless mode does not. |
 | Pinned TLS tunnels | End-to-end endpoint identity and application-byte confidentiality across transit peers. |
 | Transit bridges | Can observe routing/traffic metadata and deny service. |
 | Application resources | Authorization and exclusive ownership remain the application's responsibility. |

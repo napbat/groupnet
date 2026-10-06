@@ -7,6 +7,41 @@ configuration, binding, and cleanup; the router owns path selection and packet
 scheduling. It never needs to know whether a provider uses TCP, IPC, or an
 application-defined protocol.
 
+## Dynamic admission contract
+
+Admission is application policy, not a property of a peer's display name or
+discovery record. Dynamic links accept a claimed `NodeId` and bounded opaque
+credentials through a shared asynchronous admission trait. An explicit open
+policy accepts unauthenticated identities; custom policies can reject claims
+or require credentials. No key pair is mandatory. Credentials on a plaintext
+link are not confidential.
+
+Successful admission binds the accepted identity to one live session. Duplicate
+active identities are rejected, not replaced. Disconnect, expiry, cancellation,
+and revocation release admission and withdraw paths through that session.
+Old-session cleanup must not remove a replacement session. Resource capacity,
+credential bounds, handshake deadlines, and bounded pending admission remain
+library responsibilities even when the application accepts everyone.
+
+Bootstrap addresses identify initial contacts; they do not enumerate all future
+members. Only admitted adjacent peers enter routing. Discovery and forwarded
+membership records never independently authorize a new adjacent connection.
+Unauthenticated identifiers do not prove continuity after a session ends.
+
+Route discovery supplies a bounded, replaceable set of bootstrap contacts, not
+membership assertions. Each group contacts those peers through its own protocol;
+an unrelated reachable node is not automatically a member or coordinator.
+Periodic bounded exchanges retry lost bootstrap traffic and permit reconnection
+despite retained dead-member tombstones.
+
+Already-bound managed TCP and punching endpoints expose `into_bound_link(cost)`,
+which transfers their session registry and shutdown lifecycle together. Do not
+reconstruct them as static links from a copied peer list. Custom dynamic
+transports attach `SessionRegistry` through `BoundLink::with_sessions`, tag
+incoming frames at their producing session, and implement `send_admitted` to
+preserve the router-selected generation through queued physical writes.
+The default static send drops tagged traffic rather than silently retargeting it.
+
 ## 1. Successful managed-node startup
 
 `Node::builder(id).link(provider)` and `.links(providers)` populate one

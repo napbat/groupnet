@@ -391,6 +391,7 @@ impl GroupEngine {
     pub(super) fn dissemination_targets(&self) -> Vec<NodeId> {
         let mut set: BTreeSet<NodeId> = self.probe_candidates().cloned().collect();
         set.extend(self.seeds.iter().cloned());
+        set.extend(self.bootstrap_contacts.iter().cloned());
         set.into_iter().collect()
     }
 

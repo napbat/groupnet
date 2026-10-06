@@ -12,13 +12,14 @@
 //! * **`bulk` — data plane.** `TcpBulkTransport` implements `BulkTransport`:
 //!   one reliable, ordered byte stream per `connect`, for replication and
 //!   bulk transfer.
-//! * **`link` — router registration** (opt-in): `TcpLink` binds a
-//!   control-plane endpoint with explicit peer identities and addresses. Its
-//!   lifecycle cancels and drains every accept, read, and write task.
+//! * **`link` — router registration** (opt-in): `TcpLink` admits peers through
+//!   an explicit application policy (a configured-peer allowlist by default).
+//!   Managed sessions are full-duplex, bounded, and retained while connected;
+//!   only live admitted sessions become routing neighbors.
 //!
-//! Both planes attribute connections with the same one-line node-id
-//! handshake, because a TCP source address (ephemeral port) cannot identify
-//! a peer the way a bound UDP source address can.
+//! The low-level message and bulk APIs retain trusted-topology identity
+//! attribution. Managed message admission uses its own bounded wire exchange,
+//! with no downgrade to that raw handshake. Open admission is unauthenticated.
 //!
 //! [`Transport`]: groupnet_transport::Transport
 
@@ -32,6 +33,8 @@ pub use bulk::TcpBulkTransport;
 
 #[cfg(feature = "msg")]
 pub mod msg;
+#[cfg(feature = "link")]
+pub use msg::TcpAdmissionConfig;
 #[cfg(feature = "msg")]
 pub use msg::{TcpMsgConfig, TcpMsgTransport};
 

@@ -8,10 +8,12 @@ use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider};
 
 use crate::{MAX_MESSAGE, PunchConfig, PunchTransport};
 
-/// An authenticated UDP punching configuration bound to its declared identity.
+/// A keyed or explicitly open UDP configuration bound to its declared identity.
 ///
 /// The router's local identity must match [`PunchConfig::local`]. Registration
 /// advertises the native datagram MTU and owns the endpoint's shutdown lifecycle.
+/// Router neighbors come only from live admitted discovery sessions, including
+/// when configured identities seed a keyed endpoint's discovery queries.
 #[derive(Debug)]
 pub struct PunchLink {
     config: PunchConfig,
@@ -33,6 +35,24 @@ impl PunchLink {
     }
 }
 
+impl PunchTransport {
+    /// Transfers this endpoint into a managed link with its live session registry.
+    /// Use this rather than constructing a static `BoundLink` around the endpoint.
+    #[must_use]
+    pub fn into_bound_link(self, cost: u32) -> BoundLink {
+        let config = LinkConfig {
+            peers: self.known_peers(),
+            cost,
+            mtu: MAX_MESSAGE,
+        };
+        let lifecycle = Arc::new(self.clone());
+        let sessions = self.sessions();
+        BoundLink::new(self, config)
+            .with_lifecycle(lifecycle)
+            .with_sessions(sessions)
+    }
+}
+
 impl LinkProvider for PunchLink {
     fn peers(&self) -> &[NodeId] {
         &self.config.peers
@@ -48,17 +68,7 @@ impl LinkProvider for PunchLink {
                 ));
             }
             let transport = PunchTransport::bind(config).await?;
-            let peers = transport.known_peers();
-            let lifecycle = Arc::new(transport.clone());
-            Ok(BoundLink::new(
-                transport,
-                LinkConfig {
-                    peers,
-                    cost,
-                    mtu: MAX_MESSAGE,
-                },
-            )
-            .with_lifecycle(lifecycle))
+            Ok(transport.into_bound_link(cost))
         })
     }
 }

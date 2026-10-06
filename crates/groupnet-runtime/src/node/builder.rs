@@ -225,6 +225,7 @@ impl NodeBuilder {
             routing_group.entries_watch(),
         ));
         let _ = node.inner.routing.set(routing_group);
+        tokio::spawn(super::discovery::discover_peers(node.inner.clone()));
         Ok(node)
     }
 }

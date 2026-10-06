@@ -1,6 +1,7 @@
 //! Bounded routing envelopes and per-link fragmentation.
 
 use groupnet_core::NodeId;
+use groupnet_transport::admission::SessionId;
 use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
@@ -158,11 +159,17 @@ struct Assembly {
 
 #[derive(Default)]
 pub(crate) struct Reassembly {
-    pending: HashMap<(usize, NodeId, [u8; 16]), Assembly>,
+    pending: HashMap<(usize, Option<SessionId>, NodeId, [u8; 16]), Assembly>,
 }
 
 impl Reassembly {
-    pub fn receive(&mut self, link: usize, from: &NodeId, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    pub fn receive(
+        &mut self,
+        link: usize,
+        session: Option<SessionId>,
+        from: &NodeId,
+        bytes: Vec<u8>,
+    ) -> Option<Vec<u8>> {
         self.pending
             .retain(|_, entry| entry.created.elapsed() < Duration::from_secs(3));
         if bytes.starts_with(b"GNR1") {
@@ -179,7 +186,7 @@ impl Reassembly {
         if count == 0 || count > 1024 || index >= count || total > MAX_FRAME || total < count {
             return None;
         }
-        let key = (link, from.clone(), id);
+        let key = (link, session, from.clone(), id);
         if !self.pending.contains_key(&key) && self.pending.len() >= 64 {
             return None;
         }

@@ -85,11 +85,15 @@ pub mod transport {
     #[cfg(feature = "runtime")]
     pub use groupnet_transport::link;
 
+    /// Application admission and live adjacent-peer sessions (feature `runtime`).
+    #[cfg(feature = "runtime")]
+    pub use groupnet_transport::admission;
+
     /// Native local IPC links (feature `ipc`).
     #[cfg(feature = "ipc")]
     pub use groupnet_transport_ipc as ipc;
 
-    /// Authenticated UDP discovery, punching, and relay links (feature `punch`).
+    /// UDP discovery, punching, and relay links with explicit admission (feature `punch`).
     #[cfg(feature = "punch")]
     pub use groupnet_transport_punch as punch;
 }

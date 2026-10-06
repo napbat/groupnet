@@ -125,6 +125,9 @@ Runnable examples live in [`crates/groupnet/examples`](crates/groupnet/examples)
 cargo run --example placement   # weighted HA-hash placement (sync, no I/O)
 cargo run --example cluster     # 3-node convergence, derived coordinator, metadata
 cargo run --example routing     # resolve a resource to its owner from any node
+cargo run --example dynamic-admission --features tcp-msg  # unknown clients, open admission
+cargo run --example dynamic-admission --features tcp-msg -- --invite  # custom credential policy
+cargo run --example dynamic-relay --features punch  # discovery through a keyless relay
 ```
 
 Five more live with the layers they exercise:
@@ -230,10 +233,46 @@ shutdown. Configure membership with `.config(...)`, `.seed(...)`,
 Initialization binds listeners and starts discovery; route convergence remains
 asynchronous and can be inspected with `node.router().route_to(&peer)`.
 
-Adjacent identities declared by each link are also membership seeds. Additional
-membership seeds, DNS answers, and gossiped addresses do **not** grant link
-admission. Pre-admit intended neighbors, including late joiners; only admitted
-neighbors can supply router traffic.
+Configured adjacent identities are initial membership seeds. Dynamic-capable
+links can instead admit previously unknown identities through an application
+policy. Additional membership seeds, DNS answers, and gossiped addresses do
+**not** grant link admission; only configured or successfully admitted neighbors
+can supply router traffic.
+
+For an open TCP listener, select feature `tcp-msg` and explicitly choose the
+unauthenticated policy:
+
+```rust
+use std::sync::Arc;
+use groupnet::core::NodeId;
+use groupnet::runtime::Node;
+use groupnet::transport::{admission::OpenAdmission, tcp::TcpLink};
+
+let node = Node::builder(NodeId::new("game-server"))
+    .link(
+        TcpLink::new("0.0.0.0:7000".parse()?, Vec::new())
+            .with_admission(Arc::new(OpenAdmission)),
+    )
+    .start()
+    .await?;
+let room = node.join_group("game-room");
+```
+
+Clients configure the server as a bootstrap `PeerEndpoint` and use their own
+`NodeId`, such as a generated UUID string. The server need not know those IDs
+before they connect. Membership converges asynchronously after admission.
+The [dynamic admission example](crates/groupnet/examples/dynamic-admission.rs)
+starts an ephemeral listener and two initially unknown clients; its `--invite`
+mode implements a custom `Admission` policy and passes credentials through
+`TcpLink::with_credentials`.
+
+`Admission::admit` receives a claimed identity, bounded opaque credential bytes,
+and the remote address when available. Return `AcceptedPeer` or an error.
+The accepted identity must match the client's configured routing identity:
+account policies should reject mismatched claims, not silently rename a live
+node. Open admission proves no ownership of the name. Duplicate active sessions
+are rejected; after disconnection, the same unauthenticated name can be claimed
+again. Admission is independent of TLS and resource authorization.
 
 Forwarding between configured peers is automatic, including between neighbors
 on the same adapter. No special bridge flag is required:
@@ -246,10 +285,23 @@ Use `.routing(RouterConfig { forwarding: false, ..RouterConfig::default() })`
 for an endpoint-only node which must not advertise or forward transit routes.
 This is a routing-role setting, not an access-control policy for peers or groups.
 
-Plain TCP/UDP adapters require a trusted private network. `PunchConfig` supplies
-a self-hosted rendezvous address, provisioned `NetworkKey`, explicit peers, and
-`PathPolicy`. Direct-preferred mode probes peers simultaneously; relay-only mode
-never sends direct probes. Not every NAT supports direct connectivity.
+Plain TCP/UDP does not provide endpoint authentication or encryption. Static
+links assume trusted peers; explicitly open admission accepts untrusted identity
+claims and does not make their routing advertisements trustworthy.
+Keyed `PunchConfig` supplies a self-hosted rendezvous address, provisioned
+`NetworkKey`, explicit peers, and `PathPolicy`. Direct-preferred mode probes
+peers simultaneously; relay-only mode never sends direct probes. Not every NAT
+supports direct connectivity.
+
+For dynamic keyless discovery, start `Rendezvous::bind_open(address)` and give
+each node `PunchLink::new(PunchConfig::open(local_id, rendezvous_address))`.
+No participant list or shared key is required. This explicit open mode is
+relay-only; requesting keyless direct punching is rejected. The rendezvous
+checks source-address reachability, applies admission, and leases registrations;
+it is not itself a coordination-group member.
+Use `Rendezvous::bind_with_admission` for a custom admission policy and
+`PunchConfig::dynamic` to supply application credentials. See the runnable
+[dynamic relay example](crates/groupnet/examples/dynamic-relay.rs).
 
 For confidential streams, call
 `.tunnels(TunnelConfig::new(identity, [peer_pin]))` on the node builder with a `TlsIdentity` and
@@ -268,8 +320,9 @@ application stream. Certificates must include the `groupnet.peer` DNS SAN and
 client/server authentication usages.
 
 Coordination groups are not permission groups. Private-peer route visibility
-and group-based connection policies are not implemented. The shared network
-key establishes a trusted fabric; it does not securely distinguish its members.
+and group-based connection policies are not implemented. Open admission accepts
+claimed identities without proving who owns them. A shared network key
+establishes a trusted fabric but does not securely distinguish its members.
 Use pinned tunnel identities and application authorization for protected resources.
 
 Windows IPC addresses are local `\\.\pipe\name` paths. Unix IPC requires a

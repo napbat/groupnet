@@ -45,5 +45,9 @@ pub mod bulk;
 #[cfg(feature = "link")]
 pub mod link;
 
+/// Application admission and live adjacent-peer sessions (feature `link`).
+#[cfg(feature = "link")]
+pub mod admission;
+
 #[cfg(doc)]
 use groupnet_core::NodeId;

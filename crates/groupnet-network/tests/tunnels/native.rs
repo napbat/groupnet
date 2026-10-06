@@ -6,9 +6,8 @@ use groupnet_network::tunnel::{PeerIdentity, TunnelTransport};
 use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::bulk::BulkTransport;
-use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport_punch::{
-    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous,
+    NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous,
 };
 use tokio::time::timeout;
 
@@ -51,31 +50,11 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
         let left_router = Router::new(left.clone(), RouterConfig::default()).unwrap();
         let right_router = Router::new(right.clone(), RouterConfig::default()).unwrap();
         left_router
-            .add_link(
-                BoundLink::new(
-                    left_udp.clone(),
-                    LinkConfig {
-                        peers: vec![right.clone()],
-                        cost: 1,
-                        mtu: MAX_MESSAGE,
-                    },
-                )
-                .with_lifecycle(std::sync::Arc::new(left_udp.clone())),
-            )
+            .add_link(left_udp.clone().into_bound_link(1))
             .await
             .unwrap();
         right_router
-            .add_link(
-                BoundLink::new(
-                    right_udp.clone(),
-                    LinkConfig {
-                        peers: vec![left.clone()],
-                        cost: 1,
-                        mtu: MAX_MESSAGE,
-                    },
-                )
-                .with_lifecycle(std::sync::Arc::new(right_udp.clone())),
-            )
+            .add_link(right_udp.clone().into_bound_link(1))
             .await
             .unwrap();
         eventually_within("native routes established", DEADLINE, || {

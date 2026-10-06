@@ -4,6 +4,7 @@
 
 mod anti_entropy;
 mod command;
+mod discovery;
 mod effect;
 mod election;
 mod liveness;

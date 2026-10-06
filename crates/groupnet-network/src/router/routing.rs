@@ -7,10 +7,11 @@ use std::time::Instant;
 
 use groupnet_core::NodeId;
 use groupnet_transport::Inbound;
+use groupnet_transport::link::AdmittedInbound;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use super::{AdvertisedRoute, Candidate, Event, Route, Shared, TransportId, closed};
+use super::{AdvertisedRoute, Candidate, Event, Queued, Route, Shared, Table, TransportId, closed};
 use crate::wire::{self, Frame, PayloadKind, Reassembly};
 
 impl Shared {
@@ -51,14 +52,19 @@ impl Shared {
 
     fn forward(&self, to: &NodeId, bytes: Arc<[u8]>) {
         let table = self.table.lock().expect("router table poisoned");
-        if let Some(route) = table.route(to, self.config.route_ttl)
-            && let Some(link) = table.links.get(&route.transport)
+        if let Some(candidate) = table.candidate(to, self.config.route_ttl)
+            && let Some(link) = table.links.get(&candidate.route.transport)
         {
-            let _ = link.outgoing.try_send((route.next_hop.clone(), bytes));
+            let _ = link.outgoing.try_send(Queued {
+                peer: candidate.route.next_hop.clone(),
+                session: candidate.session,
+                bytes,
+            });
         }
     }
 
     fn announce(&self) {
+        self.refresh_reachable();
         let mut table = self.table.lock().expect("router table poisoned");
         table.candidates.retain(|_, choices| {
             choices.retain(|_, entry| entry.updated.elapsed() < self.config.route_ttl);
@@ -84,6 +90,42 @@ impl Shared {
         }
         self.advertisements.send_replace(Arc::new(routes));
     }
+
+    pub(super) fn refresh_reachable(&self) {
+        let table = self.table.lock().expect("router table poisoned");
+        let mut peers: Vec<_> = table
+            .candidates
+            .keys()
+            .filter(|id| table.route(id, self.config.route_ttl).is_some())
+            .cloned()
+            .collect();
+        peers.sort();
+        self.reachable.send_if_modified(|current| {
+            if current.as_ref() == &peers {
+                return false;
+            }
+            *current = Arc::new(peers);
+            true
+        });
+    }
+
+    fn neighbors_changed(&self, id: TransportId) {
+        let mut table = self.table.lock().expect("router table poisoned");
+        let Table {
+            links, candidates, ..
+        } = &mut *table;
+        candidates.retain(|_, choices| {
+            choices.retain(|(link, peer), candidate| {
+                *link != id
+                    || links
+                        .get(link)
+                        .is_some_and(|adapter| adapter.admits(peer, candidate.session))
+            });
+            !choices.is_empty()
+        });
+        drop(table);
+        self.announce();
+    }
 }
 
 pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>) {
@@ -98,7 +140,10 @@ pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>
             () = shared.cancel.cancelled() => break,
             _ = clock.tick() => shared.announce(),
             event = events.recv() => match event {
-                Some(Event::Received { link, packet }) => process(&shared, link, packet, &mut fragments, &mut seen, &mut order),
+                Some(Event::Received { link, packet }) => {
+                    process(&shared, link, packet, &mut fragments, &mut seen, &mut order);
+                }
+                Some(Event::Neighbors(link)) => shared.neighbors_changed(link),
                 Some(Event::Down(link)) => { shared.table.lock().expect("router table poisoned").remove(link); shared.announce(); }
                 Some(Event::Announce) => shared.announce(),
                 None => break,
@@ -107,25 +152,30 @@ pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>
     }
 }
 
+fn admitted_cost(shared: &Shared, link: TransportId, admitted: &AdmittedInbound) -> Option<u32> {
+    if admitted.packet.from == shared.local {
+        return None;
+    }
+    let table = shared.table.lock().expect("router table poisoned");
+    let adapter = table.links.get(&link)?;
+    adapter
+        .admits(&admitted.packet.from, admitted.session)
+        .then_some(adapter.config.cost)
+}
+
 fn process(
     shared: &Shared,
     link: TransportId,
-    packet: Inbound,
+    admitted: AdmittedInbound,
     fragments: &mut Reassembly,
     seen: &mut HashSet<(NodeId, [u8; 16])>,
     order: &mut VecDeque<(NodeId, [u8; 16])>,
 ) {
-    let cost = {
-        let table = shared.table.lock().expect("router table poisoned");
-        let Some(adapter) = table.links.get(&link) else {
-            return;
-        };
-        if !adapter.config.peers.contains(&packet.from) {
-            return;
-        }
-        adapter.config.cost
+    let Some(cost) = admitted_cost(shared, link, &admitted) else {
+        return;
     };
-    let Some(bytes) = fragments.receive(link.0, &packet.from, packet.msg) else {
+    let AdmittedInbound { packet, session } = admitted;
+    let Some(bytes) = fragments.receive(link.0, session, &packet.from, packet.msg) else {
         return;
     };
     let Ok(frame) = wire::decode(&bytes) else {
@@ -172,8 +222,11 @@ fn process(
                             path: full_path,
                         },
                         updated: Instant::now(),
+                        session,
                     },
                 );
+            drop(table);
+            shared.refresh_reachable();
         }
         Frame::Data {
             kind,

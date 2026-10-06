@@ -1,25 +1,26 @@
-//! Bounded rendezvous registrations and authenticated, non-open relay.
+//! Bounded address-verified admission, discovery, and session-bound UDP relay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest, OpenAdmission};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use super::wire::{self, Body, MAX_PACKET, Packet, Session};
-use super::{LEASE, NetworkKey, closed, invalid, random, transient, validate_names};
+use super::{LEASE, MAX_PEERS, NetworkKey, closed, invalid, random, transient, validate_names};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(3);
 const RATE_INTERVAL: Duration = Duration::from_secs(1);
-// All authenticated packets, including rejected/replayed control packets, count.
 const PACKETS_PER_INTERVAL: u16 = 256;
+const MAX_PENDING_POLICY: usize = 32;
 
 #[derive(Clone, Copy)]
 struct Registration {
@@ -41,12 +42,21 @@ struct Challenge {
 
 struct Entry {
     active: Option<Registration>,
-    pending: Option<Challenge>,
+    admitting: Option<(Session, Instant)>,
     rate_start: Instant,
     rate_count: u16,
 }
 
 impl Entry {
+    fn new(now: Instant) -> Self {
+        Self {
+            active: None,
+            admitting: None,
+            rate_start: now,
+            rate_count: 0,
+        }
+    }
+
     fn admit(&mut self, now: Instant) -> bool {
         if now.duration_since(self.rate_start) >= RATE_INTERVAL {
             self.rate_start = now;
@@ -77,71 +87,110 @@ impl Entry {
         {
             return None;
         }
+        if !self.admit(now) {
+            return None;
+        }
         registration.sequence = packet.sequence;
         registration.seen = now;
         self.active = Some(registration);
         Some(registration)
     }
 
-    fn challenge(
+    fn permits_registration(&self, packet: Packet<'_>, address: SocketAddr, now: Instant) -> bool {
+        self.admitting.is_none()
+            && self.live(now).is_none_or(|active| {
+                active.session == packet.session
+                    && active.address == address
+                    && packet.sequence > active.sequence
+            })
+    }
+}
+
+/// Unproven addresses occupy only an evictable challenge pool, never peer slots.
+#[derive(Default)]
+struct Challenges {
+    pending: HashMap<String, Challenge>,
+}
+
+impl Challenges {
+    fn issue(
         &mut self,
         packet: Packet<'_>,
         address: SocketAddr,
         nonce: Session,
         now: Instant,
     ) -> io::Result<Option<Body<'static>>> {
-        if self.active.is_some_and(|active| {
-            active.session == packet.session && packet.sequence <= active.sequence
-        }) || self.pending.as_ref().is_some_and(|pending| {
-            pending.session == packet.session && packet.sequence <= pending.sequence
+        if self.pending.get(packet.sender).is_some_and(|pending| {
+            pending.session == packet.session
+                && pending.address == address
+                && packet.sequence <= pending.sequence
+                && now.duration_since(pending.issued) < CHALLENGE_TTL
         }) {
             return Ok(None);
         }
+        if !self.pending.contains_key(packet.sender) && self.pending.len() >= MAX_PEERS {
+            let oldest = self
+                .pending
+                .iter()
+                .min_by_key(|(_, pending)| pending.issued)
+                .map(|(name, _)| name.clone());
+            if let Some(oldest) = oldest {
+                self.pending.remove(&oldest);
+            }
+        }
         let cookie = random()?;
-        self.pending = Some(Challenge {
-            address,
-            session: packet.session,
-            nonce,
-            cookie,
-            sequence: packet.sequence,
-            issued: now,
-        });
+        self.pending.insert(
+            packet.sender.to_owned(),
+            Challenge {
+                address,
+                session: packet.session,
+                nonce,
+                cookie,
+                sequence: packet.sequence,
+                issued: now,
+            },
+        );
         Ok(Some(Body::Challenge { nonce, cookie }))
     }
 
-    fn register(
+    fn prove(
         &mut self,
         packet: Packet<'_>,
         address: SocketAddr,
-        nonce: Session,
-        cookie: Session,
-        relay_only: bool,
         now: Instant,
-    ) -> bool {
-        let Some(pending) = self.pending.as_ref() else {
-            return false;
+    ) -> Option<Registration> {
+        let Body::Register {
+            nonce,
+            cookie,
+            relay_only,
+            ..
+        } = packet.body
+        else {
+            return None;
         };
+        let pending = self.pending.get(packet.sender)?;
         if pending.address != address
             || pending.session != packet.session
             || pending.nonce != nonce
             || pending.cookie != cookie
             || packet.sequence <= pending.sequence
             || now.duration_since(pending.issued) >= CHALLENGE_TTL
-            || self.active.is_some_and(|active| {
-                active.session == packet.session && packet.sequence <= active.sequence
-            })
         {
-            return false;
+            return None;
         }
-        self.pending = None;
-        self.active = Some(Registration {
+        self.pending.remove(packet.sender);
+        Some(Registration {
             address,
             session: packet.session,
             sequence: packet.sequence,
             seen: now,
             relay_only,
-        });
-        true
+        })
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.pending
+            .retain(|_, pending| now.duration_since(pending.issued) < CHALLENGE_TTL);
     }
 }
 
@@ -158,50 +207,69 @@ impl Drop for Inner {
     }
 }
 
-/// Native UDP discovery and bounded relay for an explicitly trusted fabric.
+/// Address-verified UDP discovery and bounded relay.
 ///
-/// The allowlist is fixed at bind time (at most 128 identities). A fresh random
-/// challenge must return from its observed UDP address before registration is
-/// replaced, discovery is disclosed, or relay traffic is accepted. Challenges
-/// expire after three seconds and are consumed once; registrations expire after
-/// six seconds without fresh authenticated traffic. Each allowed identity may
-/// submit at most 256 packets per second, each no larger than 1200 bytes.
-/// Shared-key holders are trusted members, not mutually authenticated endpoints.
+/// Explicit open admission provides no cryptographic identity assurance.
+/// Challenges expire after three seconds, sessions after six seconds without
+/// fresh traffic. Live duplicate identities are rejected, never replaced.
+/// At most 128 established identities, 128 evictable address challenges, and
+/// 32 concurrent policy evaluations are retained. Unproven traffic has a separate
+/// 256-packet/second budget; each live session has its own 256-packet/second budget.
 #[derive(Debug)]
 pub struct Rendezvous {
     inner: Arc<Inner>,
 }
 
 impl Rendezvous {
-    /// Binds a rendezvous socket for the fixed identity allowlist.
+    /// Binds an explicitly keyed rendezvous with a fixed identity allowlist.
     ///
     /// # Errors
-    /// Rejects duplicate/empty/oversized identities and allowlists over 128;
-    /// propagates socket bind errors.
+    /// Rejects malformed allowlists or socket binding failures.
     pub async fn bind(bind: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> io::Result<Self> {
         validate_names(&peers)?;
+        let allowed = peers
+            .into_iter()
+            .map(|peer| peer.as_str().to_owned())
+            .collect();
+        Self::start(bind, Some(key), Arc::new(OpenAdmission), Some(allowed)).await
+    }
+
+    /// Binds an explicitly keyless, unauthenticated dynamic relay.
+    ///
+    /// # Errors
+    /// Propagates socket binding errors and rejects multicast bind addresses.
+    pub async fn bind_open(bind: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_admission(bind, None, Arc::new(OpenAdmission)).await
+    }
+
+    /// Binds dynamic discovery with application admission and optional fabric HMAC.
+    ///
+    /// Keyed datagrams never fall back to keyless parsing. Policies run only
+    /// after address return-routability, with bounded time and concurrency.
+    ///
+    /// # Errors
+    /// Propagates socket binding errors and rejects multicast bind addresses.
+    pub async fn bind_with_admission(
+        bind: SocketAddr,
+        key: Option<NetworkKey>,
+        admission: Arc<dyn Admission>,
+    ) -> io::Result<Self> {
+        Self::start(bind, key, admission, None).await
+    }
+
+    async fn start(
+        bind: SocketAddr,
+        key: Option<NetworkKey>,
+        admission: Arc<dyn Admission>,
+        allowed: Option<HashSet<String>>,
+    ) -> io::Result<Self> {
         if bind.ip().is_multicast() {
             return Err(invalid("multicast rendezvous bind is not supported"));
         }
         let socket = UdpSocket::bind(bind).await?;
         let address = socket.local_addr()?;
-        let now = Instant::now();
-        let entries = peers
-            .into_iter()
-            .map(|peer| {
-                (
-                    peer.as_str().to_owned(),
-                    Entry {
-                        active: None,
-                        pending: None,
-                        rate_start: now,
-                        rate_count: 0,
-                    },
-                )
-            })
-            .collect();
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run(socket, key, entries, cancel.clone()));
+        let task = tokio::spawn(serve(socket, key, admission, allowed, cancel.clone()));
         Ok(Self {
             inner: Arc::new(Inner {
                 address,
@@ -211,7 +279,7 @@ impl Rendezvous {
         })
     }
 
-    /// Returns the actual bind address, including an assigned ephemeral port.
+    /// Returns the actual bind address.
     ///
     /// # Errors
     /// Returns `NotConnected` after shutdown.
@@ -223,82 +291,183 @@ impl Rendezvous {
         }
     }
 
-    /// Cancels the socket runtime and waits for all socket I/O to finish.
+    /// Cancels socket I/O and drains all pending policy evaluations.
     pub async fn close(&self) {
         self.inner.cancel.cancel();
         let mut task = self.inner.task.lock().await;
-        if let Some(task) = task.take() {
+        if let Some(task) = task.as_mut() {
             let _ = task.await;
         }
+        task.take();
     }
 }
 
-async fn run(
-    socket: UdpSocket,
-    key: NetworkKey,
+struct Decision {
+    node: NodeId,
+    registration: Registration,
+    accepted: io::Result<AcceptedPeer>,
+}
+
+struct ServerState {
     entries: HashMap<String, Entry>,
+    challenges: Challenges,
+    decisions: JoinSet<Decision>,
+    pre_admission: Entry,
+}
+
+async fn serve(
+    socket: UdpSocket,
+    key: Option<NetworkKey>,
+    admission: Arc<dyn Admission>,
+    allowed: Option<HashSet<String>>,
     cancel: CancellationToken,
 ) {
-    // A cancellation drops all socket I/O, not just the receive operation.
+    let mut state = ServerState {
+        entries: HashMap::new(),
+        challenges: Challenges::default(),
+        decisions: JoinSet::new(),
+        pre_admission: Entry::new(Instant::now()),
+    };
+    let mut buffer = [0; MAX_PACKET + 1];
+    let mut maintenance = tokio::time::interval(RATE_INTERVAL);
+    maintenance.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Cancellation covers every send, not just socket reception.
+    let driver = async {
+        loop {
+            tokio::select! {
+                biased;
+                result = state.decisions.join_next(), if !state.decisions.is_empty() => {
+                    if let Some(Ok(decision)) = result {
+                        apply_decision(&socket, key.as_ref(), &mut state.entries, decision).await;
+                    }
+                }
+                _ = maintenance.tick() => {
+                    let now = Instant::now();
+                    expire_entries(&mut state.entries, now);
+                    state.challenges.expire(now);
+                }
+                received = socket.recv_from(&mut buffer) => {
+                    let (length, address) = match received {
+                        Ok(received) => received,
+                        Err(error) if transient(&error) => continue,
+                        Err(_) => break,
+                    };
+                    if address.ip().is_multicast() || address.ip().is_unspecified() || address.port() == 0 {
+                        continue;
+                    }
+                    let Some(packet) = wire::decode_mode(&buffer[..length], key.as_ref()) else { continue; };
+                    handle_packet(&socket, key.as_ref(), &admission, allowed.as_ref(), &mut state, packet, address).await;
+                }
+            }
+        }
+    };
     tokio::select! {
         biased;
         () = cancel.cancelled() => {}
-        () = serve(socket, key, entries) => {}
+        () = driver => {}
     }
+    state.decisions.abort_all();
+    while state.decisions.join_next().await.is_some() {}
     cancel.cancel();
 }
 
-async fn serve(socket: UdpSocket, key: NetworkKey, mut entries: HashMap<String, Entry>) {
-    let mut buffer = [0; MAX_PACKET + 1];
-    loop {
-        let received = socket.recv_from(&mut buffer).await;
-        let (length, address) = match received {
-            Ok(received) => received,
-            Err(error) if transient(&error) => continue,
-            Err(_) => break,
-        };
-        if address.ip().is_multicast() || address.ip().is_unspecified() || address.port() == 0 {
-            continue;
-        }
-        let Some(packet) = wire::decode(&buffer[..length], &key) else {
-            continue;
-        };
-        let Some(entry) = entries.get_mut(packet.sender) else {
-            continue;
-        };
-        let now = Instant::now();
-        if !entry.admit(now) {
-            continue;
-        }
-        match packet.body {
-            Body::Hello { nonce } => match entry.challenge(packet, address, nonce, now) {
-                Ok(Some(body)) => respond(&socket, &key, address, packet, body).await,
-                Ok(None) => {}
-                Err(_) => break,
-            },
-            Body::Register {
-                nonce,
-                cookie,
-                relay_only,
-            } => {
-                if entry.register(packet, address, nonce, cookie, relay_only, now) {
-                    respond(&socket, &key, address, packet, Body::Registered).await;
-                }
+async fn handle_packet(
+    socket: &UdpSocket,
+    key: Option<&NetworkKey>,
+    admission: &Arc<dyn Admission>,
+    allowed: Option<&HashSet<String>>,
+    state: &mut ServerState,
+    packet: Packet<'_>,
+    address: SocketAddr,
+) {
+    if allowed.is_some_and(|names| !names.contains(packet.sender)) {
+        return;
+    }
+    let now = Instant::now();
+    match packet.body {
+        Body::Hello { nonce } => {
+            if !state.pre_admission.admit(now)
+                || state
+                    .entries
+                    .get(packet.sender)
+                    .is_some_and(|entry| !entry.permits_registration(packet, address, now))
+            {
+                return;
             }
-            Body::Query { peer } => {
-                if entry.authenticate(packet, address, now).is_none() || peer == packet.sender {
+            if let Ok(Some(body)) = state.challenges.issue(packet, address, nonce, now) {
+                respond(socket, key, address, packet, body).await;
+            }
+        }
+        Body::Register { .. } => {
+            if !state.pre_admission.admit(now)
+                || state
+                    .entries
+                    .get(packet.sender)
+                    .is_some_and(|entry| !entry.permits_registration(packet, address, now))
+            {
+                return;
+            }
+            let Some(registration) = state.challenges.prove(packet, address, now) else {
+                return;
+            };
+            register(
+                socket,
+                key,
+                admission,
+                allowed.is_some(),
+                state,
+                packet,
+                registration,
+            )
+            .await;
+        }
+        Body::Heartbeat
+        | Body::Depart
+        | Body::Discover
+        | Body::Query { .. }
+        | Body::Relay { .. } => {
+            handle_established(socket, key, &mut state.entries, packet, address, now).await;
+        }
+        _ => {}
+    }
+}
+
+async fn handle_established(
+    socket: &UdpSocket,
+    key: Option<&NetworkKey>,
+    entries: &mut HashMap<String, Entry>,
+    packet: Packet<'_>,
+    address: SocketAddr,
+    now: Instant,
+) {
+    let Some(entry) = entries.get_mut(packet.sender) else {
+        return;
+    };
+    if entry.authenticate(packet, address, now).is_none() {
+        return;
+    }
+    match packet.body {
+        Body::Heartbeat => respond(socket, key, address, packet, Body::Registered).await,
+        Body::Depart => {
+            entry.active = None;
+        }
+        Body::Discover | Body::Query { .. } => {
+            for (name, target) in entries.iter() {
+                if name == packet.sender
+                    || matches!(packet.body, Body::Query { peer } if peer != name)
+                {
                     continue;
                 }
-                let Some(target) = entries.get(peer).and_then(|entry| entry.live(now)) else {
+                let Some(target) = target.live(now) else {
                     continue;
                 };
                 respond(
-                    &socket,
-                    &key,
+                    socket,
+                    key,
                     address,
                     packet,
                     Body::Offer {
-                        peer,
+                        peer: name,
                         session: target.session,
                         address: target.address,
                         relay_only: target.relay_only,
@@ -306,21 +475,23 @@ async fn serve(socket: UdpSocket, key: NetworkKey, mut entries: HashMap<String, 
                 )
                 .await;
             }
-            Body::Relay {
-                peer,
-                target,
-                message,
-            } => {
-                if entry.authenticate(packet, address, now).is_none() || peer == packet.sender {
-                    continue;
-                }
-                let Some(recipient) = entries.get(peer).and_then(|entry| entry.live(now)) else {
-                    continue;
-                };
-                if recipient.session != target {
-                    continue;
-                }
-                let delivered = Packet {
+        }
+        Body::Relay {
+            peer,
+            target,
+            message,
+        } if peer != packet.sender => {
+            let Some(recipient) = entries.get(peer).and_then(|entry| entry.live(now)) else {
+                return;
+            };
+            if recipient.session != target {
+                return;
+            }
+            transmit(
+                socket,
+                key,
+                recipient.address,
+                Packet {
                     sender: peer,
                     session: recipient.session,
                     sequence: packet.sequence,
@@ -329,17 +500,153 @@ async fn serve(socket: UdpSocket, key: NetworkKey, mut entries: HashMap<String, 
                         session: packet.session,
                         message,
                     },
-                };
-                transmit(&socket, &key, recipient.address, delivered).await;
-            }
-            _ => {}
+                },
+            )
+            .await;
         }
+        _ => {}
     }
+}
+
+async fn register(
+    socket: &UdpSocket,
+    key: Option<&NetworkKey>,
+    admission: &Arc<dyn Admission>,
+    static_allowed: bool,
+    state: &mut ServerState,
+    packet: Packet<'_>,
+    registration: Registration,
+) {
+    let Body::Register { credential, .. } = packet.body else {
+        return;
+    };
+    let now = registration.seen;
+    if (key.is_none() && !registration.relay_only) || (static_allowed && !credential.is_empty()) {
+        respond(socket, key, registration.address, packet, Body::Denied).await;
+        return;
+    }
+    if let Some(entry) = state.entries.get_mut(packet.sender)
+        && entry.live(now).is_some()
+    {
+        entry.active = Some(registration);
+        respond(socket, key, registration.address, packet, Body::Registered).await;
+        return;
+    }
+    expire_entries(&mut state.entries, now);
+    if state.entries.len() >= MAX_PEERS || state.decisions.len() >= MAX_PENDING_POLICY {
+        respond(socket, key, registration.address, packet, Body::Denied).await;
+        return;
+    }
+    let entry = state
+        .entries
+        .entry(packet.sender.to_owned())
+        .or_insert_with(|| Entry::new(now));
+    entry.admitting = Some((packet.session, now));
+    spawn_admission(
+        &mut state.decisions,
+        admission,
+        packet,
+        registration,
+        credential,
+    );
+}
+
+fn expire_entries(entries: &mut HashMap<String, Entry>, now: Instant) {
+    entries.retain(|_, entry| {
+        if entry.live(now).is_none() {
+            entry.active = None;
+        }
+        if entry
+            .admitting
+            .is_some_and(|(_, issued)| now.duration_since(issued) >= CHALLENGE_TTL)
+        {
+            entry.admitting = None;
+        }
+        entry.active.is_some() || entry.admitting.is_some()
+    });
+}
+
+fn spawn_admission(
+    decisions: &mut JoinSet<Decision>,
+    admission: &Arc<dyn Admission>,
+    packet: Packet<'_>,
+    registration: Registration,
+    credential: &[u8],
+) {
+    let node = NodeId::from(packet.sender);
+    let credential = credential.to_vec();
+    let policy = admission.clone();
+    let address = registration.address;
+    decisions.spawn(async move {
+        let accepted = tokio::time::timeout_at(
+            registration.seen + CHALLENGE_TTL,
+            policy.admit(JoinRequest {
+                claimed: &node,
+                credential: &credential,
+                remote: Some(address),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "admission timed out",
+            ))
+        });
+        Decision {
+            node,
+            registration,
+            accepted,
+        }
+    });
+}
+
+async fn apply_decision(
+    socket: &UdpSocket,
+    key: Option<&NetworkKey>,
+    entries: &mut HashMap<String, Entry>,
+    decision: Decision,
+) {
+    let Some(entry) = entries.get_mut(decision.node.as_str()) else {
+        return;
+    };
+    if entry.admitting != Some((decision.registration.session, decision.registration.seen)) {
+        return;
+    }
+    entry.admitting = None;
+    let accepted = decision
+        .accepted
+        .is_ok_and(|accepted| accepted.node == decision.node)
+        && entry.live(Instant::now()).is_none()
+        && Instant::now().duration_since(decision.registration.seen) < CHALLENGE_TTL;
+    let registration = decision.registration;
+    if accepted {
+        entry.active = Some(Registration {
+            seen: Instant::now(),
+            ..registration
+        });
+    }
+    transmit(
+        socket,
+        key,
+        registration.address,
+        Packet {
+            sender: decision.node.as_str(),
+            session: registration.session,
+            sequence: registration.sequence,
+            body: if accepted {
+                Body::Registered
+            } else {
+                Body::Denied
+            },
+        },
+    )
+    .await;
 }
 
 async fn respond(
     socket: &UdpSocket,
-    key: &NetworkKey,
+    key: Option<&NetworkKey>,
     address: SocketAddr,
     request: Packet<'_>,
     body: Body<'_>,
@@ -347,9 +654,14 @@ async fn respond(
     transmit(socket, key, address, Packet { body, ..request }).await;
 }
 
-async fn transmit(socket: &UdpSocket, key: &NetworkKey, address: SocketAddr, packet: Packet<'_>) {
+async fn transmit(
+    socket: &UdpSocket,
+    key: Option<&NetworkKey>,
+    address: SocketAddr,
+    packet: Packet<'_>,
+) {
     let mut buffer = [0; MAX_PACKET];
-    if let Some(length) = wire::encode(packet, key, &mut buffer) {
+    if let Some(length) = wire::encode_mode(packet, key, &mut buffer) {
         let _ = socket.send_to(&buffer[..length], address).await;
     }
 }
@@ -361,8 +673,8 @@ mod tests {
     fn entry(now: Instant) -> Entry {
         Entry {
             active: None,
-            pending: None,
             rate_start: now,
+            admitting: None,
             rate_count: 0,
         }
     }
@@ -441,3 +753,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod admission_regressions;

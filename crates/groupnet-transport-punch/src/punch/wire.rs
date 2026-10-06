@@ -8,10 +8,10 @@ use super::NetworkKey;
 
 pub(super) const MAX_PACKET: usize = 1200;
 const TAG: usize = 32;
-const MAGIC: &[u8; 4] = b"GNP1";
+const MAGIC: &[u8; 4] = b"GNP2";
 pub(super) type Session = [u8; 16];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(super) enum Body<'a> {
     Hello {
         nonce: Session,
@@ -24,8 +24,13 @@ pub(super) enum Body<'a> {
         nonce: Session,
         cookie: Session,
         relay_only: bool,
+        credential: &'a [u8],
     },
     Registered,
+    Discover,
+    Heartbeat,
+    Depart,
+    Denied,
     Query {
         peer: &'a str,
     },
@@ -58,6 +63,28 @@ pub(super) enum Body<'a> {
         session: Session,
         message: &'a [u8],
     },
+}
+
+impl std::fmt::Debug for Body<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Hello { .. } => "Hello",
+            Self::Challenge { .. } => "Challenge",
+            Self::Register { .. } => "Register([REDACTED])",
+            Self::Registered => "Registered",
+            Self::Discover => "Discover",
+            Self::Heartbeat => "Heartbeat",
+            Self::Depart => "Depart",
+            Self::Denied => "Denied",
+            Self::Query { .. } => "Query",
+            Self::Offer { .. } => "Offer",
+            Self::Probe { .. } => "Probe",
+            Self::ProbeAck { .. } => "ProbeAck",
+            Self::Direct { .. } => "Direct",
+            Self::Relay { .. } => "Relay",
+            Self::Delivered { .. } => "Delivered",
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,13 +165,22 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn encode(
     packet: Packet<'_>,
     key: &NetworkKey,
     buffer: &mut [u8; MAX_PACKET],
 ) -> Option<usize> {
+    encode_mode(packet, Some(key), buffer)
+}
+
+pub(super) fn encode_mode(
+    packet: Packet<'_>,
+    key: Option<&NetworkKey>,
+    buffer: &mut [u8; MAX_PACKET],
+) -> Option<usize> {
     let mut writer = Writer {
-        bytes: &mut buffer[..MAX_PACKET - TAG],
+        bytes: &mut buffer[..MAX_PACKET - if key.is_some() { TAG } else { 0 }],
         position: 0,
     };
     writer.put(MAGIC)?;
@@ -160,12 +196,28 @@ pub(super) fn encode(
         Body::Direct { .. } => 9,
         Body::Relay { .. } => 10,
         Body::Delivered { .. } => 11,
+        Body::Discover => 12,
+        Body::Heartbeat => 13,
+        Body::Depart => 14,
+        Body::Denied => 15,
     };
     writer.put(&[kind])?;
     writer.name(packet.sender)?;
     writer.put(&packet.session)?;
     writer.put(&packet.sequence.to_be_bytes())?;
-    match packet.body {
+    encode_body(packet.body, &mut writer)?;
+    let length = writer.position;
+    if let Some(key) = key {
+        let tag = hmac::sign(&key.auth, &buffer[..length]);
+        buffer[length..length + TAG].copy_from_slice(tag.as_ref());
+        Some(length + TAG)
+    } else {
+        Some(length)
+    }
+}
+
+fn encode_body(body: Body<'_>, writer: &mut Writer<'_>) -> Option<()> {
+    match body {
         Body::Hello { nonce } => writer.put(&nonce)?,
         Body::Challenge { nonce, cookie } => {
             writer.put(&nonce)?;
@@ -175,12 +227,18 @@ pub(super) fn encode(
             nonce,
             cookie,
             relay_only,
+            credential,
         } => {
             writer.put(&nonce)?;
             writer.put(&cookie)?;
             writer.put(&[u8::from(relay_only)])?;
+            if credential.len() > groupnet_transport::admission::MAX_CREDENTIAL_BYTES {
+                return None;
+            }
+            writer.put(&u16::try_from(credential.len()).ok()?.to_be_bytes())?;
+            writer.put(credential)?;
         }
-        Body::Registered => {}
+        Body::Registered | Body::Discover | Body::Heartbeat | Body::Depart | Body::Denied => {}
         Body::Query { peer } => writer.name(peer)?,
         Body::Offer {
             peer,
@@ -237,18 +295,25 @@ pub(super) fn encode(
             writer.put(message)?;
         }
     }
-    let length = writer.position;
-    let tag = hmac::sign(&key.auth, &buffer[..length]);
-    buffer[length..length + TAG].copy_from_slice(tag.as_ref());
-    Some(length + TAG)
+    Some(())
 }
 
+#[cfg(test)]
 pub(super) fn decode<'a>(bytes: &'a [u8], key: &NetworkKey) -> Option<Packet<'a>> {
-    if bytes.len() > MAX_PACKET || bytes.len() < TAG {
+    decode_mode(bytes, Some(key))
+}
+
+pub(super) fn decode_mode<'a>(bytes: &'a [u8], key: Option<&NetworkKey>) -> Option<Packet<'a>> {
+    if bytes.len() > MAX_PACKET {
         return None;
     }
-    let length = bytes.len() - TAG;
-    hmac::verify(&key.auth, &bytes[..length], &bytes[length..]).ok()?;
+    let length = if let Some(key) = key {
+        let length = bytes.len().checked_sub(TAG)?;
+        hmac::verify(&key.auth, &bytes[..length], &bytes[length..]).ok()?;
+        length
+    } else {
+        bytes.len()
+    };
     let mut reader = Reader {
         bytes: &bytes[..length],
         position: 0,
@@ -263,6 +328,19 @@ pub(super) fn decode<'a>(bytes: &'a [u8], key: &NetworkKey) -> Option<Packet<'a>
     if sequence == 0 {
         return None;
     }
+    let body = decode_body(kind, &mut reader)?;
+    if reader.position != reader.bytes.len() {
+        return None;
+    }
+    Some(Packet {
+        sender,
+        session,
+        sequence,
+        body,
+    })
+}
+
+fn decode_body<'a>(kind: u8, reader: &mut Reader<'a>) -> Option<Body<'a>> {
     let body = match kind {
         1 => Body::Hello {
             nonce: reader.token()?,
@@ -271,11 +349,21 @@ pub(super) fn decode<'a>(bytes: &'a [u8], key: &NetworkKey) -> Option<Packet<'a>
             nonce: reader.token()?,
             cookie: reader.token()?,
         },
-        3 => Body::Register {
-            nonce: reader.token()?,
-            cookie: reader.token()?,
-            relay_only: reader.flag()?,
-        },
+        3 => {
+            let nonce = reader.token()?;
+            let cookie = reader.token()?;
+            let relay_only = reader.flag()?;
+            let length = usize::from(u16::from_be_bytes(reader.take(2)?.try_into().ok()?));
+            if length > groupnet_transport::admission::MAX_CREDENTIAL_BYTES {
+                return None;
+            }
+            Body::Register {
+                nonce,
+                cookie,
+                relay_only,
+                credential: reader.take(length)?,
+            }
+        }
         4 => Body::Registered,
         5 => Body::Query {
             peer: reader.name()?,
@@ -322,17 +410,13 @@ pub(super) fn decode<'a>(bytes: &'a [u8], key: &NetworkKey) -> Option<Packet<'a>
             session: reader.token()?,
             message: reader.message()?,
         },
+        12 => Body::Discover,
+        13 => Body::Heartbeat,
+        14 => Body::Depart,
+        15 => Body::Denied,
         _ => return None,
     };
-    if reader.position != reader.bytes.len() {
-        return None;
-    }
-    Some(Packet {
-        sender,
-        session,
-        sequence,
-        body,
-    })
+    Some(body)
 }
 
 #[cfg(test)]
@@ -366,8 +450,13 @@ mod tests {
                 nonce: [3; 16],
                 cookie: [4; 16],
                 relay_only: true,
+                credential: &[],
             },
             Body::Registered,
+            Body::Discover,
+            Body::Heartbeat,
+            Body::Depart,
+            Body::Denied,
             Body::Query { peer: "beta" },
             Body::Offer {
                 peer: "beta",
@@ -449,13 +538,14 @@ mod tests {
                 nonce: [7; 16],
                 cookie: [8; 16],
                 relay_only: false,
+                credential: &[],
             }),
             &key(),
             &mut buffer,
         )
         .unwrap();
         let payload = &buffer[..length - TAG];
-        for kind in [0, 12, 255] {
+        for kind in [0, 16, 255] {
             let mut malformed = payload.to_vec();
             malformed[4] = kind;
             assert!(decode(&signed(&malformed), &key()).is_none());
@@ -469,7 +559,7 @@ mod tests {
         malformed[6] = 255;
         assert!(decode(&signed(&malformed), &key()).is_none());
         let mut malformed = payload.to_vec();
-        *malformed.last_mut().unwrap() = 2;
+        malformed[67] = 2; // Relay-only flag follows nonce and cookie.
         assert!(decode(&signed(&malformed), &key()).is_none());
         let mut malformed = payload.to_vec();
         malformed.extend_from_slice(&[0]);

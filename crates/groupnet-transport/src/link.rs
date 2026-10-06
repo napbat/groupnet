@@ -12,6 +12,7 @@ mod worker;
 #[cfg(test)]
 mod tests;
 
+use crate::admission::{SessionId, SessionRegistry};
 use crate::{Inbound, Transport};
 use futures_util::{Sink, Stream};
 use groupnet_core::NodeId;
@@ -101,6 +102,8 @@ pub struct Outbound {
     pub peer: NodeId,
     /// Deadline shared by every fragment of the original routed frame.
     pub deadline: Instant,
+    /// Expected live generation, captured before router queueing or fragmentation.
+    pub session: Option<SessionId>,
     bytes: Buffer,
 }
 
@@ -112,6 +115,7 @@ impl Outbound {
             peer,
             bytes: Buffer::Shared(bytes),
             deadline,
+            session: None,
         }
     }
 
@@ -122,7 +126,15 @@ impl Outbound {
             peer,
             bytes: Buffer::Owned(bytes),
             deadline,
+            session: None,
         }
+    }
+
+    /// Binds this frame to the originally selected admission generation.
+    #[must_use]
+    pub fn with_session(mut self, session: Option<SessionId>) -> Self {
+        self.session = session;
+        self
     }
 
     /// The frame payload.
@@ -135,6 +147,16 @@ impl Outbound {
     }
 }
 
+/// A physical inbound frame and its producing admission generation.
+/// An untagged frame is accepted only by a statically configured link.
+#[derive(Debug)]
+pub struct AdmittedInbound {
+    /// Physical source and payload.
+    pub packet: Inbound,
+    /// Exact session generation captured before queueing this frame.
+    pub session: Option<SessionId>,
+}
+
 /// Router-neutral worker endpoints. Streams/sinks are erased once, not per frame.
 /// The incoming sink receives `None` when the transport fails. Implementations
 /// must preserve backpressure; the shared workers add no extra message queues.
@@ -142,7 +164,7 @@ pub struct LinkIo {
     /// Scheduled physical frames, including any router-generated fragments.
     pub outgoing: Pin<Box<dyn Stream<Item = Outbound> + Send>>,
     /// Incoming frames or a terminal transport failure.
-    pub incoming: Pin<Box<dyn Sink<Option<Inbound>, Error = io::Error> + Send>>,
+    pub incoming: Pin<Box<dyn Sink<Option<AdmittedInbound>, Error = io::Error> + Send>>,
     /// Cancellation owned by the registering network.
     pub cancel: CancellationToken,
     /// Largest accepted incoming physical frame.
@@ -166,6 +188,8 @@ pub struct BoundLink {
     pub config: LinkConfig,
     /// Owned worker and optional protocol-task lifecycle.
     pub driver: LinkDriver,
+    /// Dynamic admission; when present, configured peers are bootstrap seeds only.
+    pub sessions: Option<SessionRegistry>,
 }
 
 impl BoundLink {
@@ -174,9 +198,11 @@ impl BoundLink {
     pub fn new<T: Transport>(transport: T, config: LinkConfig) -> Self {
         Self {
             config,
+            sessions: None,
             driver: LinkDriver {
                 worker: Some(Arc::new(worker::Typed(transport))),
                 lifecycle: None,
+                sessions: None,
             },
         }
     }
@@ -185,6 +211,15 @@ impl BoundLink {
     #[must_use]
     pub fn with_lifecycle(mut self, lifecycle: Arc<dyn LinkLifecycle>) -> Self {
         self.driver.lifecycle = Some(lifecycle);
+        self
+    }
+
+    /// Routes only through live sessions, never through the configured seed list.
+    /// Dynamic adapters must produce generation-tagged inbound frames.
+    #[must_use]
+    pub fn with_sessions(mut self, sessions: SessionRegistry) -> Self {
+        self.driver.sessions = Some(sessions.clone());
+        self.sessions = Some(sessions);
         self
     }
 }
@@ -228,6 +263,7 @@ impl LinkControl {
 pub struct LinkDriver {
     worker: Option<Arc<dyn worker::Worker>>,
     lifecycle: Option<Arc<dyn LinkLifecycle>>,
+    sessions: Option<SessionRegistry>,
 }
 
 impl fmt::Debug for LinkDriver {
@@ -265,6 +301,9 @@ impl LinkDriver {
 
     /// Cancels and drains an endpoint that could not be registered.
     pub async fn close(self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.close();
+        }
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.shutdown();
             lifecycle.close().await;
@@ -274,6 +313,9 @@ impl LinkDriver {
 
 impl Drop for LinkDriver {
     fn drop(&mut self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.close();
+        }
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.shutdown();
         }

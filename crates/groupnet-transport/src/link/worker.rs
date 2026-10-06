@@ -24,15 +24,16 @@ impl<T: Transport> Worker for Typed<T> {
                 while let Some(packet) = io.outgoing.next().await {
                     let _ = tokio::time::timeout_at(
                         packet.deadline,
-                        self.0.send(&packet.peer, packet.bytes()),
+                        self.0
+                            .send_admitted(&packet.peer, packet.bytes(), packet.session),
                     )
                     .await;
                 }
             };
             let receive = async {
                 loop {
-                    match self.0.recv().await {
-                        Ok(packet) if packet.msg.len() <= io.mtu => {
+                    match self.0.recv_admitted().await {
+                        Ok(packet) if packet.packet.msg.len() <= io.mtu => {
                             if io.incoming.send(Some(packet)).await.is_err() {
                                 break;
                             }

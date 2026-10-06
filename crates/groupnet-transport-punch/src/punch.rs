@@ -1,11 +1,9 @@
-//! Native authenticated UDP rendezvous, simultaneous punching and relay fallback.
+//! Native UDP rendezvous, simultaneous punching and relay fallback.
 //!
-//! Provision one [`NetworkKey`](crate::NetworkKey) and an explicit allowlist to every participant.
-//! The shared key authenticates membership in a trusted routing fabric, **not**
-//! Byzantine endpoint identity. Use the router's authenticated tunnels when that
-//! distinction matters. A rendezvous observes identities, addresses and traffic
-//! metadata (and raw transport messages); it is not an unauthenticated reflector.
-//! Messages are bounded best-effort datagrams, with no fragmentation here.
+//! Keyed configurations authenticate a trusted fabric, not Byzantine identities.
+//! Explicit open configurations require no secret and provide no cryptographic
+//! identity assurance. Both modes prove address return-routability before
+//! admission, discovery, or relay. The rendezvous is not a routing participant.
 
 mod endpoint;
 mod server;
@@ -19,6 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_transport::admission::{SessionLease, SessionRegistry};
+use groupnet_transport::link::AdmittedInbound;
 use groupnet_transport::link::{LinkFuture, LinkLifecycle};
 use groupnet_transport::{Inbound, Transport};
 use ring::{
@@ -89,7 +89,7 @@ pub enum PathPolicy {
     RelayOnly,
 }
 
-/// The currently usable path to a configured peer.
+/// The currently usable path to a configured or dynamically admitted peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerPath {
     /// An authenticated round-trip probe recently succeeded.
@@ -99,7 +99,7 @@ pub enum PeerPath {
 }
 
 /// Socket, trusted identities and rendezvous policy for one endpoint.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PunchConfig {
     /// Stable routing identity (1–64 UTF-8 bytes).
     pub local: NodeId,
@@ -107,10 +107,14 @@ pub struct PunchConfig {
     pub bind: SocketAddr,
     /// Explicit rendezvous address; no third-party discovery service is used.
     pub rendezvous: SocketAddr,
-    /// Secret shared with the explicitly trusted fabric.
-    pub key: NetworkKey,
-    /// At most 128 unique, non-local identities; advertisements cannot add peers.
+    /// Optional explicit trusted-fabric key; keyed peers never downgrade.
+    pub key: Option<NetworkKey>,
+    /// Initial static allowlist, or no fixed identities in dynamic mode.
     pub peers: Vec<NodeId>,
+    /// Whether admitted rendezvous peers are discovered dynamically.
+    pub dynamic: bool,
+    /// Opaque application admission credential (at most 1024 bytes).
+    pub credential: Vec<u8>,
     /// Direct-path preference or relay-only operation.
     pub policy: PathPolicy,
 }
@@ -128,10 +132,66 @@ impl PunchConfig {
             local,
             bind,
             rendezvous,
-            key,
+            key: Some(key),
             peers,
+            dynamic: false,
+            credential: Vec::new(),
             policy: PathPolicy::DirectPreferred,
         }
+    }
+
+    /// Creates explicit keyless, unauthenticated, dynamically discovered relay.
+    #[must_use]
+    pub fn open(local: NodeId, rendezvous: SocketAddr) -> Self {
+        Self::dynamic(local, rendezvous, None, Vec::new())
+    }
+
+    /// Creates dynamic discovery with an optional fabric key and opaque credential.
+    /// Keyless operation is relay-only; no unauthenticated direct packets are accepted.
+    #[must_use]
+    pub fn dynamic(
+        local: NodeId,
+        rendezvous: SocketAddr,
+        key: Option<NetworkKey>,
+        credential: Vec<u8>,
+    ) -> Self {
+        Self {
+            local,
+            bind: SocketAddr::new(
+                if rendezvous.is_ipv4() {
+                    Ipv4Addr::UNSPECIFIED.into()
+                } else {
+                    std::net::Ipv6Addr::UNSPECIFIED.into()
+                },
+                0,
+            ),
+            rendezvous,
+            policy: if key.is_some() {
+                PathPolicy::DirectPreferred
+            } else {
+                PathPolicy::RelayOnly
+            },
+            key,
+            peers: Vec::new(),
+            dynamic: true,
+            credential,
+        }
+    }
+}
+
+impl fmt::Debug for PunchConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PunchConfig")
+            .field("local", &self.local)
+            .field("bind", &self.bind)
+            .field("rendezvous", &self.rendezvous)
+            .field("key", &self.key)
+            .field("peers", &self.peers)
+            .field("dynamic", &self.dynamic)
+            .field("credential", &"[REDACTED]")
+            .field("policy", &self.policy)
+            .finish()
     }
 }
 
@@ -145,6 +205,7 @@ struct Peer {
     direct: Option<Instant>,
     probe: Option<wire::Session>,
     sequence: u64,
+    lease: SessionLease,
 }
 
 impl Peer {
@@ -165,6 +226,8 @@ impl Peer {
 #[derive(Debug)]
 struct Outbound {
     to: NodeId,
+    session: groupnet_transport::admission::SessionId,
+    target: wire::Session,
     message: Vec<u8>,
 }
 
@@ -174,7 +237,9 @@ struct Inner {
     configured: Vec<NodeId>,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
     outbound: mpsc::Sender<Outbound>,
-    inbound: AsyncMutex<mpsc::Receiver<Inbound>>,
+    inbound: AsyncMutex<mpsc::Receiver<AdmittedInbound>>,
+    sessions: SessionRegistry,
+    dynamic: bool,
     cancel: CancellationToken,
     task: AsyncMutex<Option<JoinHandle<()>>>,
 }
@@ -182,6 +247,7 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.cancel.cancel();
+        self.sessions.close();
     }
 }
 
@@ -196,13 +262,20 @@ pub struct PunchTransport {
 
 impl PunchTransport {
     /// Binds the socket and starts registration, discovery and keepalive tasks.
+    /// Dynamic configurations wait for actual server admission, failing within
+    /// five seconds; static configurations retain background registration.
     ///
     /// # Errors
-    /// Rejects duplicate, local or oversized peers, invalid rendezvous addresses,
-    /// and incompatible address families; propagates socket/random-source errors.
+    /// Rejects invalid configuration, dynamic policy denial or registration
+    /// timeout, and socket/random-source failures.
     pub async fn bind(config: PunchConfig) -> io::Result<Self> {
         validate_names(&config.peers)?;
         validate_name(&config.local)?;
+        if config.credential.len() > groupnet_transport::admission::MAX_CREDENTIAL_BYTES
+            || (config.key.is_none() && config.policy != PathPolicy::RelayOnly)
+        {
+            return Err(invalid("invalid credential size or keyless direct policy"));
+        }
         if config.peers.contains(&config.local) {
             return Err(invalid("local identity must not be a configured peer"));
         }
@@ -224,15 +297,35 @@ impl PunchTransport {
         let (outbound, outgoing) = mpsc::channel(QUEUE);
         let (incoming, inbound) = mpsc::channel(QUEUE);
         let configured = config.peers.clone();
-        let task = tokio::spawn(endpoint::run(
+        let sessions = SessionRegistry::new(MAX_PEERS)?;
+        let dynamic = config.dynamic;
+        let (ready, admitted) = tokio::sync::oneshot::channel();
+        let mut task = tokio::spawn(endpoint::run(
             config,
             socket,
             (session, nonce),
             peers.clone(),
-            outgoing,
-            incoming,
+            (outgoing, incoming, ready),
+            sessions.clone(),
             cancel.clone(),
         ));
+        if dynamic {
+            let result = tokio::time::timeout(Duration::from_secs(5), admitted).await;
+            let error = match result {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(error))) => Some(error),
+                Ok(Err(_)) => Some(closed()),
+                Err(_) => Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "rendezvous admission timed out",
+                )),
+            };
+            if let Some(error) = error {
+                cancel.cancel();
+                let _ = (&mut task).await;
+                return Err(error);
+            }
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 address,
@@ -241,6 +334,8 @@ impl PunchTransport {
                 outbound,
                 inbound: AsyncMutex::new(inbound),
                 cancel,
+                sessions,
+                dynamic,
                 task: AsyncMutex::new(Some(task)),
             }),
         })
@@ -255,10 +350,18 @@ impl PunchTransport {
         Ok(self.inner.address)
     }
 
-    /// Returns the fixed explicitly configured peer allowlist.
+    /// Returns configured peers, or the currently live discovered peers.
     #[must_use]
     pub fn known_peers(&self) -> Vec<NodeId> {
-        self.inner.configured.clone()
+        if self.inner.dynamic {
+            lock(&self.inner.peers)
+                .values()
+                .filter(|peer| peer.path(Instant::now()).is_some() && peer.lease.is_active())
+                .map(|peer| peer.node.clone())
+                .collect()
+        } else {
+            self.inner.configured.clone()
+        }
     }
 
     /// Returns the current direct or relay path, or `None` before discovery/after expiry.
@@ -267,14 +370,22 @@ impl PunchTransport {
         if self.inner.cancel.is_cancelled() {
             return None;
         }
-        lock(&self.inner.peers)
-            .get(node.as_str())?
-            .path(Instant::now())
+        let peers = lock(&self.inner.peers);
+        let peer = peers.get(node.as_str())?;
+        if !peer.lease.is_active() {
+            return None;
+        }
+        peer.path(Instant::now())
+    }
+
+    pub(crate) fn sessions(&self) -> SessionRegistry {
+        self.inner.sessions.clone()
     }
 
     /// Cancels all I/O and waits for the socket-owning task to finish.
     pub async fn close(&self) {
         self.inner.cancel.cancel();
+        self.inner.sessions.close();
         let mut task = self.inner.task.lock().await;
         if let Some(running) = task.as_mut() {
             let _ = running.await;
@@ -290,17 +401,39 @@ impl PunchTransport {
         }
     }
 
-    fn enqueue(&self, to: &NodeId, message: &[u8]) -> io::Result<()> {
+    fn enqueue(
+        &self,
+        to: &NodeId,
+        message: &[u8],
+        expected: Option<groupnet_transport::admission::SessionId>,
+    ) -> io::Result<()> {
         self.ensure_open()?;
         if message.len() > MAX_MESSAGE {
             return Err(invalid("UDP message exceeds MAX_MESSAGE"));
         }
-        if !self.inner.configured.contains(to) {
+        if (!self.inner.dynamic && !self.inner.configured.contains(to))
+            || (self.inner.dynamic && self.path_to(to).is_none())
+        {
             return Ok(());
         }
+        let (session, target) = {
+            let peers = lock(&self.inner.peers);
+            let Some(peer) = peers.get(to.as_str()) else {
+                return Ok(());
+            };
+            if peer.path(Instant::now()).is_none()
+                || !peer.lease.is_active()
+                || expected.is_some_and(|id| id != peer.lease.id())
+            {
+                return Ok(());
+            }
+            (peer.lease.id(), peer.session)
+        };
         if let Ok(permit) = self.inner.outbound.try_reserve() {
             permit.send(Outbound {
                 to: to.clone(),
+                session,
+                target,
                 message: message.to_vec(),
             });
         }
@@ -311,6 +444,7 @@ impl PunchTransport {
 impl LinkLifecycle for PunchTransport {
     fn shutdown(&self) {
         self.inner.cancel.cancel();
+        self.inner.sessions.close();
     }
 
     fn close(&self) -> LinkFuture<'_, ()> {
@@ -322,14 +456,42 @@ impl Transport for PunchTransport {
     type Error = io::Error;
 
     fn send(&self, to: &NodeId, message: &[u8]) -> impl Future<Output = io::Result<()>> {
-        std::future::ready(self.enqueue(to, message))
+        std::future::ready(self.enqueue(to, message, None))
+    }
+
+    fn send_admitted(
+        &self,
+        to: &NodeId,
+        message: &[u8],
+        session: Option<groupnet_transport::admission::SessionId>,
+    ) -> impl Future<Output = io::Result<()>> {
+        std::future::ready(if session.is_some() {
+            self.enqueue(to, message, session)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "punch session required",
+            ))
+        })
     }
 
     async fn recv(&self) -> io::Result<Inbound> {
-        tokio::select! {
-            biased;
-            () = self.inner.cancel.cancelled() => Err(closed()),
-            message = async { self.inner.inbound.lock().await.recv().await } => message.ok_or_else(closed),
+        Ok(self.recv_admitted().await?.packet)
+    }
+
+    async fn recv_admitted(&self) -> io::Result<AdmittedInbound> {
+        loop {
+            let received = tokio::select! {
+                biased;
+                () = self.inner.cancel.cancelled() => return Err(closed()),
+                message = async { self.inner.inbound.lock().await.recv().await } => message.ok_or_else(closed)?,
+            };
+            if received
+                .session
+                .is_some_and(|id| self.inner.sessions.is_active(&received.packet.from, id))
+            {
+                return Ok(received);
+            }
         }
     }
 }
@@ -489,6 +651,7 @@ mod tests {
                         nonce,
                         cookie,
                         relay_only: policy == PathPolicy::RelayOnly,
+                        credential: &[],
                     },
                 )
                 .await;
@@ -537,6 +700,7 @@ mod tests {
                     nonce,
                     cookie,
                     relay_only: true,
+                    credential: &[],
                 },
             )
             .await;
@@ -550,12 +714,12 @@ mod tests {
             b.observed_peer(address, "a").await.0,
             a.socket.local_addr().unwrap()
         );
-        // Captured Hello may elicit only a new challenge; an old cookie cannot use it.
+        // Even a fresh duplicate Hello from another address cannot challenge an incumbent.
         attacker.send(address, Body::Hello { nonce: [7; 16] }).await;
         attacker.silent().await; // Sequence one is older than the accepted registration.
         attacker.sequence = 100;
         attacker.send(address, Body::Hello { nonce }).await;
-        attacker.receive().await;
+        attacker.silent().await;
         attacker.socket.send_to(&captured, address).await.unwrap();
         attacker.silent().await;
         assert_eq!(
@@ -577,18 +741,18 @@ mod tests {
         let captured = a.register(address, PathPolicy::RelayOnly).await;
         a.socket.send_to(&captured, address).await.unwrap();
         a.silent().await;
+        a.send(address, Body::Depart).await;
         a.session = [3; 16];
         a.sequence = 0;
         a.register(address, PathPolicy::RelayOnly).await;
         a.socket.send_to(&captured, address).await.unwrap();
         a.silent().await;
         assert_eq!(b.observed_peer(address, "a").await.1, [3; 16]);
-        // Replaying an old session's Hello generates a different cookie, never an
-        // old registration that can displace the current session.
+        // Replaying an old session's Hello cannot displace the current session.
         let current = a.session;
         a.session = [1; 16];
         a.send(address, Body::Hello { nonce: [9; 16] }).await;
-        a.receive().await;
+        a.silent().await;
         a.socket.send_to(&captured, address).await.unwrap();
         a.silent().await;
         assert_eq!(b.observed_peer(address, "a").await.1, current);
@@ -626,6 +790,7 @@ mod tests {
                 nonce,
                 cookie,
                 relay_only: true,
+                credential: &[],
             },
         )
         .await;
@@ -794,3 +959,6 @@ mod tests {
         relay.close().await;
     }
 }
+
+#[cfg(test)]
+mod admission_tests;

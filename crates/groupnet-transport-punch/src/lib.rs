@@ -1,8 +1,13 @@
-//! Authenticated UDP discovery, simultaneous hole punching and relay fallback.
+//! UDP discovery, simultaneous keyed hole punching, and relay fallback.
 //!
-//! Provision a [`NetworkKey`] and explicit peer allowlists out of band. The key
-//! authenticates trusted-fabric membership, not Byzantine endpoint identity.
-//! [`Rendezvous`] sees identities, addresses and raw transport messages.
+//! [`PunchConfig::new`] preserves explicitly keyed, allowlisted fabrics.
+//! [`PunchConfig::open`] and [`Rendezvous::bind_open`] explicitly opt into
+//! keyless dynamic relay with no cryptographic identity assurance. Keyless
+//! direct punching is unsupported and rejected, not silently downgraded.
+//! Application policies use [`Rendezvous::bind_with_admission`]. Every
+//! registration proves UDP address return-routability before discovery or relay.
+//! The rendezvous sees identities, addresses, and raw transport messages; it is
+//! not a participant in the routing group.
 //!
 //! [`PunchTransport`] preserves the standalone transport API. [`PunchLink`]
 //! implements [`groupnet_transport::link::LinkProvider`] without depending on a

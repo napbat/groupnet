@@ -20,6 +20,7 @@ use crate::store::{GrantStore, VoterStorage};
 use tokio::sync::broadcast;
 
 mod builder;
+mod discovery;
 pub use builder::NodeBuilder;
 
 /// The reserved group every node joins to disseminate the inter-group routing
@@ -461,13 +462,6 @@ impl Node {
         routing: Option<mpsc::Sender<Event>>,
         profile: GroupProfile,
     ) -> Group {
-        // Tick often enough to service the tightest engine deadline (probe
-        // timeouts are the shortest), so failure detection isn't lagged by a
-        // coarse gossip-only cadence. Sampling at `TICKS_PER_DEADLINE`× the
-        // tightest deadline bounds how late a deadline can fire to one tick; the
-        // engine is idempotent under early/extra ticks, so oversampling is safe.
-        const TICKS_PER_DEADLINE: u64 = 2;
-
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
 
         // The group's *own* config: the node's, with only the mode replaced.
@@ -490,7 +484,8 @@ impl Node {
         // than something applied after the boot blackout has already been
         // armed. Outside `Activation::Quorum` the two constructors are the same
         // engine — a group with no voter ledger has nothing to restore.
-        let (engine, store) = match profile.storage {
+        let reachable = self.inner.transport.reachable().borrow().clone();
+        let (mut engine, store) = match profile.storage {
             Some(storage) => (
                 GroupEngine::with_recovered(
                     group.clone(),
@@ -511,6 +506,11 @@ impl Node {
                 None,
             ),
         };
+        // Discovery contacts receive bounded periodic digest attempts but are
+        // not members until an actual participant exchanges group protocol.
+        engine.apply(groupnet_core::Command::SetBootstrapContacts(
+            reachable.as_ref().clone(),
+        ));
 
         // Seed the readable views from the engine's current truth. The engine
         // only emits change effects on an actual change, so a node that is (and
@@ -553,11 +553,7 @@ impl Node {
                 prompt_tx
             });
 
-        let tightest_deadline_ms = config
-            .gossip_interval_ms
-            .min(config.probe_interval_ms)
-            .min(config.probe_timeout_ms);
-        let tick_period = Duration::from_millis((tightest_deadline_ms / TICKS_PER_DEADLINE).max(1));
+        let tick_period = group_tick_period(&config);
         tokio::spawn(group_task(GroupTask {
             engine,
             inbox: rx,
@@ -600,6 +596,17 @@ impl Node {
             },
         )
     }
+}
+
+fn group_tick_period(config: &groupnet_core::Config) -> Duration {
+    // Service the tightest engine deadline at twice its cadence. The engine is
+    // idempotent under early ticks, so oversampling bounds failure-detector lag.
+    const TICKS_PER_DEADLINE: u64 = 2;
+    let tightest_deadline_ms = config
+        .gossip_interval_ms
+        .min(config.probe_interval_ms)
+        .min(config.probe_timeout_ms);
+    Duration::from_millis((tightest_deadline_ms / TICKS_PER_DEADLINE).max(1))
 }
 
 /// Keeps the transport's address book fed with gossiped `~addr`

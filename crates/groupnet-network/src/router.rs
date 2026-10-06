@@ -6,6 +6,12 @@ mod routing;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod admission_tests;
+
+#[cfg(test)]
+mod outbound_tests;
+
 use routing::drive;
 
 use std::collections::HashMap;
@@ -18,7 +24,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use groupnet_core::NodeId;
-use groupnet_transport::link::{BoundLink, LinkConfig, LinkControl};
+use groupnet_transport::admission::{SessionId, SessionRegistry};
+use groupnet_transport::link::{AdmittedInbound, BoundLink, LinkConfig, LinkControl};
 use groupnet_transport::{Inbound, Transport};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
@@ -73,16 +80,34 @@ pub struct Route {
     pub path: Vec<NodeId>,
 }
 
+struct Queued {
+    peer: NodeId,
+    bytes: Arc<[u8]>,
+    session: Option<SessionId>,
+}
+
 struct Link {
     config: LinkConfig,
     control: LinkControl,
-    outgoing: mpsc::Sender<(NodeId, Arc<[u8]>)>,
+    outgoing: mpsc::Sender<Queued>,
     cancel: CancellationToken,
+    sessions: Option<SessionRegistry>,
+}
+
+impl Link {
+    fn admits(&self, peer: &NodeId, session: Option<SessionId>) -> bool {
+        match (&self.sessions, session) {
+            (Some(registry), Some(id)) => registry.is_active(peer, id),
+            (None, None) => self.config.peers.contains(peer),
+            _ => false,
+        }
+    }
 }
 
 struct Candidate {
     route: Route,
     updated: Instant,
+    session: Option<SessionId>,
 }
 
 #[derive(Default)]
@@ -94,12 +119,28 @@ struct Table {
 
 impl Table {
     fn route(&self, target: &NodeId, ttl: Duration) -> Option<&Route> {
+        self.candidate(target, ttl)
+            .map(|candidate| &candidate.route)
+    }
+
+    fn candidate(&self, target: &NodeId, ttl: Duration) -> Option<&Candidate> {
         self.candidates
             .get(target)?
             .values()
-            .filter(|candidate| candidate.updated.elapsed() < ttl)
-            .map(|candidate| &candidate.route)
-            .min_by(|a, b| (a.cost, &a.path, a.transport).cmp(&(b.cost, &b.path, b.transport)))
+            .filter(|candidate| {
+                candidate.updated.elapsed() < ttl
+                    && self
+                        .links
+                        .get(&candidate.route.transport)
+                        .is_some_and(|link| {
+                            link.admits(&candidate.route.next_hop, candidate.session)
+                        })
+            })
+            .min_by(|a, b| {
+                let a = &a.route;
+                let b = &b.route;
+                (a.cost, &a.path, a.transport).cmp(&(b.cost, &b.path, b.transport))
+            })
     }
 
     fn remove(&mut self, id: TransportId) {
@@ -114,7 +155,11 @@ impl Table {
 }
 
 enum Event {
-    Received { link: TransportId, packet: Inbound },
+    Received {
+        link: TransportId,
+        packet: AdmittedInbound,
+    },
+    Neighbors(TransportId),
     Down(TransportId),
     Announce,
 }
@@ -132,6 +177,7 @@ struct Shared {
     messages: mpsc::Sender<Inbound>,
     tunnels: mpsc::Sender<Inbound>,
     advertisements: watch::Sender<Arc<Vec<AdvertisedRoute>>>,
+    reachable: watch::Sender<Arc<Vec<NodeId>>>,
     cancel: CancellationToken,
     tasks: TaskTracker,
     nonce: [u8; 8],
@@ -196,6 +242,7 @@ impl Router {
         let (messages, message_rx) = mpsc::channel(64);
         let (tunnels, tunnel_rx) = mpsc::channel(256);
         let (advertisements, _) = watch::channel(Arc::new(Vec::new()));
+        let (reachable, _) = watch::channel(Arc::new(Vec::new()));
         let shared = Arc::new(Shared {
             local,
             config,
@@ -204,6 +251,7 @@ impl Router {
             messages,
             tunnels,
             advertisements,
+            reachable,
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
             nonce,
@@ -218,6 +266,13 @@ impl Router {
                 tunnel_claimed: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Watches currently reachable destinations, including newly admitted peers.
+    /// This is discovery, not additional link admission.
+    #[must_use]
+    pub fn reachable(&self) -> watch::Receiver<Arc<Vec<NodeId>>> {
+        self.inner.shared.reachable.subscribe()
     }
 
     /// Registers and starts an adapter. Neighbor lists are explicit link admission.
@@ -279,12 +334,17 @@ impl Router {
         table.next_link = next;
         let (send, outgoing) = mpsc::channel(64);
         let cancel = shared.cancel.child_token();
-        let BoundLink { config, driver } = link;
+        let BoundLink {
+            config,
+            driver,
+            sessions,
+        } = link;
         let control = driver.control();
         let io = adapters::io(
             shared.clone(),
             id,
             config.peers.clone(),
+            sessions.as_ref(),
             config.mtu,
             outgoing,
             cancel.clone(),
@@ -295,11 +355,20 @@ impl Router {
                 config,
                 control,
                 outgoing: send,
-                cancel,
+                cancel: cancel.clone(),
+                sessions: sessions.clone(),
             },
         );
         // Register the task under the same lock used by close's shutdown barrier.
         shared.tasks.spawn(driver.run(io));
+        if let Some(sessions) = sessions {
+            shared.tasks.spawn(adapters::neighbors(
+                shared.clone(),
+                id,
+                sessions.subscribe(),
+                cancel,
+            ));
+        }
         drop(table);
         let _ = shared.events.try_send(Event::Announce);
         Ok(id)
@@ -354,7 +423,17 @@ impl Router {
         }
         let table = shared.table.lock().expect("router table poisoned");
         for link in table.links.values() {
-            if link.config.peers.contains(peer) {
+            let admitted = link.sessions.as_ref().map_or_else(
+                || link.config.peers.contains(peer),
+                |sessions| {
+                    sessions
+                        .subscribe()
+                        .borrow()
+                        .iter()
+                        .any(|entry| &entry.node == peer)
+                },
+            );
+            if admitted {
                 link.control.learn_peer(peer, address);
             }
         }

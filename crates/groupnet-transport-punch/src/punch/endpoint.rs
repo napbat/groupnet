@@ -4,9 +4,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use groupnet_core::NodeId;
 use groupnet_transport::Inbound;
+use groupnet_transport::admission::{AcceptedPeer, SessionRegistry};
+use groupnet_transport::link::AdmittedInbound;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
@@ -22,26 +25,38 @@ struct Endpoint {
     hello: u64,
     registration: u64,
     queries: HashMap<String, u64>,
+    discovery: u64,
+    heartbeat: u64,
+    registered: Option<Instant>,
+    sessions: SessionRegistry,
+    ready: Option<oneshot::Sender<std::io::Result<()>>>,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
-    incoming: mpsc::Sender<Inbound>,
+    incoming: mpsc::Sender<AdmittedInbound>,
 }
+
+pub(super) type Channels = (
+    mpsc::Receiver<Outbound>,
+    mpsc::Sender<AdmittedInbound>,
+    oneshot::Sender<std::io::Result<()>>,
+);
 
 pub(super) async fn run(
     config: PunchConfig,
     socket: UdpSocket,
     seed: (Session, Session),
     peers: Arc<Mutex<HashMap<String, Peer>>>,
-    outgoing: mpsc::Receiver<Outbound>,
-    incoming: mpsc::Sender<Inbound>,
+    channels: Channels,
+    sessions: SessionRegistry,
     cancel: CancellationToken,
 ) {
     // Cancellation wraps the entire driver, including any pending send_to.
     tokio::select! {
         biased;
         () = cancel.cancelled() => {}
-        () = drive(config, socket, seed, peers, outgoing, incoming) => {}
+        () = drive(config, socket, seed, peers.clone(), channels, sessions) => {}
     }
     cancel.cancel();
+    lock(&peers).clear();
 }
 
 async fn drive(
@@ -49,9 +64,10 @@ async fn drive(
     socket: UdpSocket,
     seed: (Session, Session),
     peers: Arc<Mutex<HashMap<String, Peer>>>,
-    mut outgoing: mpsc::Receiver<Outbound>,
-    incoming: mpsc::Sender<Inbound>,
+    channels: Channels,
+    sessions: SessionRegistry,
 ) {
+    let (mut outgoing, incoming, ready) = channels;
     let queries = config
         .peers
         .iter()
@@ -66,6 +82,11 @@ async fn drive(
         hello: 0,
         registration: 0,
         queries,
+        discovery: 0,
+        heartbeat: 0,
+        registered: None,
+        sessions,
+        ready: Some(ready),
         peers,
         incoming,
     };
@@ -78,7 +99,7 @@ async fn drive(
             received = endpoint.socket.recv_from(&mut buffer) => {
                 match received {
                     Ok((length, address)) => {
-                        if let Some(packet) = wire::decode(&buffer[..length], &endpoint.config.key) {
+                        if let Some(packet) = wire::decode_mode(&buffer[..length], endpoint.config.key.as_ref()) {
                             endpoint.receive(packet, address).await;
                         }
                     }
@@ -108,16 +129,35 @@ impl Endpoint {
             sequence: self.sequence,
             body,
         };
-        if let Some(length) = wire::encode(packet, &self.config.key, &mut buffer) {
+        if let Some(length) = wire::encode_mode(packet, self.config.key.as_ref(), &mut buffer) {
             let _ = self.socket.send_to(&buffer[..length], address).await;
         }
         self.sequence
     }
 
     async fn maintain(&mut self) {
-        self.hello = self
-            .transmit(self.config.rendezvous, Body::Hello { nonce: self.nonce })
-            .await;
+        let now = Instant::now();
+        lock(&self.peers).retain(|_, peer| {
+            peer.path(now).is_some()
+                && peer.lease.is_active()
+                && (!self.config.dynamic || now.duration_since(peer.offered) < super::LEASE)
+        });
+        if self
+            .registered
+            .is_none_or(|seen| now.duration_since(seen) >= super::LEASE)
+        {
+            if self.config.dynamic || self.config.key.is_none() {
+                lock(&self.peers).clear();
+            }
+            self.hello = self
+                .transmit(self.config.rendezvous, Body::Hello { nonce: self.nonce })
+                .await;
+        } else {
+            self.heartbeat = self.transmit(self.config.rendezvous, Body::Heartbeat).await;
+            if self.config.dynamic {
+                self.discovery = self.transmit(self.config.rendezvous, Body::Discover).await;
+            }
+        }
         // NodeId clones are Arc clones. Do not hold a path-state lock over I/O.
         for index in 0..self.config.peers.len() {
             let node = self.config.peers[index].clone();
@@ -132,23 +172,37 @@ impl Endpoint {
             if let Some(query) = self.queries.get_mut(node.as_str()) {
                 *query = sequence;
             }
-            let probe = {
-                let mut peers = lock(&self.peers);
-                peers.get_mut(node.as_str()).and_then(|peer| {
-                    if self.config.policy == PathPolicy::RelayOnly
-                        || peer.relay_only
-                        || peer.path(Instant::now()).is_none()
-                    {
-                        return None;
-                    }
-                    let nonce = random().ok()?;
-                    peer.probe = Some(nonce);
-                    Some((peer.address, peer.session, nonce))
-                })
-            };
-            if let Some((address, target, nonce)) = probe {
-                self.transmit(address, Body::Probe { target, nonce }).await;
+            self.probe(&node).await;
+        }
+        if self.config.dynamic && self.config.policy != PathPolicy::RelayOnly {
+            let nodes: Vec<_> = lock(&self.peers)
+                .values()
+                .map(|peer| peer.node.clone())
+                .collect();
+            for node in nodes {
+                self.probe(&node).await;
             }
+        }
+    }
+
+    async fn probe(&mut self, node: &NodeId) {
+        let probe = {
+            let mut peers = lock(&self.peers);
+            peers.get_mut(node.as_str()).and_then(|peer| {
+                if self.config.policy == PathPolicy::RelayOnly
+                    || peer.relay_only
+                    || peer.path(Instant::now()).is_none()
+                    || !peer.lease.is_active()
+                {
+                    return None;
+                }
+                let nonce = random().ok()?;
+                peer.probe = Some(nonce);
+                Some((peer.address, peer.session, nonce))
+            })
+        };
+        if let Some((address, target, nonce)) = probe {
+            self.transmit(address, Body::Probe { target, nonce }).await;
         }
     }
 
@@ -157,7 +211,12 @@ impl Endpoint {
             let peers = lock(&self.peers);
             peers
                 .get(message.to.as_str())
-                .and_then(|peer| Some((peer.path(Instant::now())?, peer.address, peer.session)))
+                .filter(|peer| {
+                    peer.lease.id() == message.session
+                        && peer.lease.is_active()
+                        && peer.session == message.target
+                })
+                .and_then(|peer| Some((peer.path(Instant::now())?, peer.address, message.target)))
         };
         let Some((path, address, target)) = route else {
             return;
@@ -193,10 +252,21 @@ impl Endpoint {
         address: SocketAddr,
         relay_only: bool,
     ) {
-        if self.queries.get(peer).copied() != Some(packet.sequence) {
+        if peer == self.config.local.as_str()
+            || self
+                .registered
+                .is_none_or(|seen| seen.elapsed() >= super::LEASE)
+            || if self.config.dynamic {
+                packet.sequence != self.discovery || self.discovery == 0
+            } else {
+                self.queries.get(peer).copied() != Some(packet.sequence)
+            }
+        {
             return;
         }
-        if let Some(query) = self.queries.get_mut(peer) {
+        if !self.config.dynamic
+            && let Some(query) = self.queries.get_mut(peer)
+        {
             *query = 0;
         }
         let mut peers = lock(&self.peers);
@@ -208,25 +278,16 @@ impl Endpoint {
                 previous.offered = Instant::now();
                 return;
             }
-            *previous = Peer {
-                node: previous.node.clone(),
-                session,
-                address,
-                relay_only,
-                offered: Instant::now(),
-                direct: None,
-                probe: None,
-                sequence: 0,
-            };
-            return;
+            previous.lease.revoke();
         }
-        let Some(node) = self
-            .config
-            .peers
-            .iter()
-            .find(|node| node.as_str() == peer)
-            .cloned()
-        else {
+        let node = if self.config.dynamic {
+            NodeId::from(peer)
+        } else if let Some(node) = self.config.peers.iter().find(|node| node.as_str() == peer) {
+            node.clone()
+        } else {
+            return;
+        };
+        let Ok(lease) = self.sessions.try_admit(AcceptedPeer { node: node.clone() }) else {
             return;
         };
         peers.insert(
@@ -240,6 +301,7 @@ impl Endpoint {
                 direct: None,
                 probe: None,
                 sequence: 0,
+                lease,
             },
         );
     }
@@ -252,7 +314,9 @@ impl Endpoint {
             Body::Challenge { nonce, cookie }
                 if nonce == self.nonce && packet.sequence == self.hello =>
             {
+                self.registered = None;
                 self.hello = 0;
+                let credential = std::mem::take(&mut self.config.credential);
                 self.registration = self
                     .transmit(
                         address,
@@ -260,12 +324,28 @@ impl Endpoint {
                             nonce,
                             cookie,
                             relay_only: self.config.policy == PathPolicy::RelayOnly,
+                            credential: &credential,
                         },
                     )
                     .await;
+                self.config.credential = credential;
             }
-            Body::Registered if packet.sequence == self.registration => {
+            Body::Registered
+                if packet.sequence == self.registration || packet.sequence == self.heartbeat =>
+            {
                 self.registration = 0;
+                self.registered = Some(Instant::now());
+                if let Some(ready) = self.ready.take() {
+                    let _ = ready.send(Ok(()));
+                }
+            }
+            Body::Denied if packet.sequence == self.registration => {
+                if let Some(ready) = self.ready.take() {
+                    let _ = ready.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "rendezvous admission denied",
+                    )));
+                }
             }
             Body::Offer {
                 peer,
@@ -292,9 +372,12 @@ impl Endpoint {
                 }
                 peer.sequence = packet.sequence;
                 if let Ok(permit) = self.incoming.try_reserve() {
-                    permit.send(Inbound {
-                        from: peer.node.clone(),
-                        msg: message.to_vec(),
+                    permit.send(AdmittedInbound {
+                        packet: Inbound {
+                            from: peer.node.clone(),
+                            msg: message.to_vec(),
+                        },
+                        session: Some(peer.lease.id()),
                     });
                 }
             }
@@ -343,9 +426,12 @@ impl Endpoint {
                 } if target_name == self.config.local.as_str() && target == self.session => {
                     peer.sequence = packet.sequence;
                     if let Ok(permit) = self.incoming.try_reserve() {
-                        permit.send(Inbound {
-                            from: peer.node.clone(),
-                            msg: message.to_vec(),
+                        permit.send(AdmittedInbound {
+                            packet: Inbound {
+                                from: peer.node.clone(),
+                                msg: message.to_vec(),
+                            },
+                            session: Some(peer.lease.id()),
                         });
                     }
                     None

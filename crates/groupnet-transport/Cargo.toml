@@ -20,7 +20,7 @@ groupnet-core = { workspace = true }
 bytes = { workspace = true, optional = true }
 futures-util = { workspace = true, features = ["io"], optional = true }
 zerocopy = { workspace = true, features = ["derive"], optional = true }
-tokio = { workspace = true, features = ["rt", "time", "macros"], optional = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }
 tokio-util = { workspace = true, features = ["rt"], optional = true }
 
 [dev-dependencies]
