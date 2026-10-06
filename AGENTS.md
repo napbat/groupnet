@@ -166,8 +166,20 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 
 ## Verification (all must be green before a change is done)
 
+Install the test runner with `cargo install cargo-nextest --locked` if
+`cargo nextest --version` is unavailable. Repository settings are in
+`.config/nextest.toml`: retries are disabled; profile `ci` runs all tests even
+after failures. Use `cargo nextest run --profile ci --workspace --all-features`
+for a complete binary-test run in automation.
+
+Nextest does not run doctests; keep the separate `cargo test --doc` gates.
+The feature-isolated `cargo test` commands below also retain their doctests.
+
 ```bash
-cargo test --workspace
+cargo nextest run --workspace
+cargo test --workspace --doc
+cargo nextest run --workspace --all-features
+cargo test --workspace --all-features --doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo check -p groupnet --no-default-features --all-targets

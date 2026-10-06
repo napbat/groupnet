@@ -1,0 +1,7 @@
+[profile.default]
+# Report failures directly; retries must not hide flaky tests.
+retries = 0
+
+[profile.ci]
+# Finish the run so CI reports every failing test.
+fail-fast = false
