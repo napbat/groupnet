@@ -1,9 +1,11 @@
 //! Native UDP rendezvous, simultaneous punching and relay fallback.
 //!
 //! Keyed configurations authenticate a trusted fabric, not Byzantine identities.
-//! Explicit open configurations require no secret and provide no cryptographic
-//! identity assurance. Both modes prove address return-routability before
-//! admission, discovery, or relay. The rendezvous is not a routing participant.
+//! Keyless configurations (`key: None`) require neither a pre-shared transport
+//! key nor an identity keypair; internal random session challenges still prove
+//! return-routability. Application admission may independently require credentials.
+//! Open admission provides no cryptographic identity assurance. The rendezvous
+//! is not a routing participant.
 
 mod endpoint;
 mod server;
@@ -33,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use server::Rendezvous;
 
-/// Largest application message carried by one authenticated UDP datagram.
+/// Largest application message carried by one session-bound UDP datagram.
 pub const MAX_MESSAGE: usize = 960;
 const MAX_PEERS: usize = 128;
 const QUEUE: usize = 128;
@@ -80,19 +82,21 @@ impl NetworkKey {
 }
 
 /// Which paths may be established for this endpoint.
+/// Independent of transport key presence; keyless direct paths still prove return-routability.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PathPolicy {
     /// Probe peers simultaneously, preferring a live direct path to the relay.
     #[default]
     DirectPreferred,
     /// Never probe or accept direct peer packets; use only the rendezvous relay.
+    /// Pair discovery omits both physical endpoint addresses if either peer is relay-only.
     RelayOnly,
 }
 
 /// The currently usable path to a configured or dynamically admitted peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerPath {
-    /// An authenticated round-trip probe recently succeeded.
+    /// A session-bound return-routability probe recently succeeded.
     Direct,
     /// A live rendezvous registration is available for relay delivery.
     Relay,
@@ -108,6 +112,8 @@ pub struct PunchConfig {
     /// Explicit rendezvous address; no third-party discovery service is used.
     pub rendezvous: SocketAddr,
     /// Optional explicit trusted-fabric key; keyed peers never downgrade.
+    /// `None` requires no provisioned transport key or identity keypair, but does
+    /// not disable internal random challenges or application admission credentials.
     pub key: Option<NetworkKey>,
     /// Initial static allowlist, or no fixed identities in dynamic mode.
     pub peers: Vec<NodeId>,
@@ -140,14 +146,14 @@ impl PunchConfig {
         }
     }
 
-    /// Creates explicit keyless, unauthenticated, dynamically discovered relay.
+    /// Creates explicit keyless dynamic discovery, conservatively defaulting to relay-only.
     #[must_use]
     pub fn open(local: NodeId, rendezvous: SocketAddr) -> Self {
         Self::dynamic(local, rendezvous, None, Vec::new())
     }
 
     /// Creates dynamic discovery with an optional fabric key and opaque credential.
-    /// Keyless operation is relay-only; no unauthenticated direct packets are accepted.
+    /// Keyless configurations default to relay-only; policy may explicitly enable direct paths.
     #[must_use]
     pub fn dynamic(
         local: NodeId,
@@ -195,25 +201,65 @@ impl fmt::Debug for PunchConfig {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Capability {
+    token: wire::Session,
+    issued: Instant,
+}
+
+impl fmt::Debug for Capability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Capability")
+            .field("token", &"[REDACTED]")
+            .field("issued", &self.issued)
+            .finish()
+    }
+}
+
+impl Capability {
+    fn live(self, now: Instant) -> bool {
+        now.duration_since(self.issued) < DIRECT_LEASE
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingCapability {
+    capability: Capability,
+    nonce: wire::Session,
+    sequence: u64,
+}
+
+impl fmt::Debug for PendingCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingCapability")
+            .field("capability", &self.capability)
+            .field("nonce", &"[REDACTED]")
+            .field("sequence", &self.sequence)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 struct Peer {
     node: NodeId,
     session: wire::Session,
-    address: SocketAddr,
+    address: Option<SocketAddr>,
     relay_only: bool,
     offered: Instant,
-    direct: Option<Instant>,
-    probe: Option<wire::Session>,
+    direct: Option<Capability>,
+    probe: Option<Capability>,
+    pending: Option<PendingCapability>,
+    confirmed: Option<Capability>,
+    confirmed_probe: u64,
     sequence: u64,
     lease: SessionLease,
 }
 
 impl Peer {
     fn path(&self, now: Instant) -> Option<PeerPath> {
-        if self
-            .direct
-            .is_some_and(|time| now.duration_since(time) < DIRECT_LEASE)
-        {
+        if self.direct.is_some_and(|capability| capability.live(now)) {
             Some(PeerPath::Direct)
         } else if now.duration_since(self.offered) < LEASE {
             Some(PeerPath::Relay)
@@ -251,7 +297,7 @@ impl Drop for Inner {
     }
 }
 
-/// A bounded best-effort UDP transport with authenticated native hole punching.
+/// A bounded best-effort UDP transport with session-bound native hole punching.
 ///
 /// Clones share queues, path state and one runtime. Closing any clone closes all
 /// clones; dropping the last clone cancels the runtime and releases its socket.
@@ -271,10 +317,8 @@ impl PunchTransport {
     pub async fn bind(config: PunchConfig) -> io::Result<Self> {
         validate_names(&config.peers)?;
         validate_name(&config.local)?;
-        if config.credential.len() > groupnet_transport::admission::MAX_CREDENTIAL_BYTES
-            || (config.key.is_none() && config.policy != PathPolicy::RelayOnly)
-        {
-            return Err(invalid("invalid credential size or keyless direct policy"));
+        if config.credential.len() > groupnet_transport::admission::MAX_CREDENTIAL_BYTES {
+            return Err(invalid("invalid credential size"));
         }
         if config.peers.contains(&config.local) {
             return Err(invalid("local identity must not be a configured peer"));
@@ -547,418 +591,7 @@ fn transient(error: &io::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::SocketAddr;
-    use std::time::Duration;
-
-    use groupnet_testkit::cluster::eventually_within;
-    use tokio::net::UdpSocket;
-    use tokio::time::timeout;
-
-    use super::wire::{Body, MAX_PACKET, Packet, Session};
-    use super::*;
-
-    const SETTLE: Duration = Duration::from_secs(5);
-    const SILENCE: Duration = Duration::from_millis(150);
-
-    fn loopback() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 0))
-    }
-
-    fn key() -> NetworkKey {
-        NetworkKey::from_bytes([23; 32])
-    }
-
-    struct RawPeer {
-        name: &'static str,
-        session: Session,
-        sequence: u64,
-        socket: UdpSocket,
-    }
-
-    impl RawPeer {
-        async fn new(name: &'static str, session: Session) -> Self {
-            Self {
-                name,
-                session,
-                sequence: 0,
-                socket: UdpSocket::bind(loopback()).await.unwrap(),
-            }
-        }
-
-        async fn send(&mut self, address: SocketAddr, body: Body<'_>) -> Vec<u8> {
-            self.sequence += 1;
-            let mut bytes = [0; MAX_PACKET];
-            let length = wire::encode(
-                Packet {
-                    sender: self.name,
-                    session: self.session,
-                    sequence: self.sequence,
-                    body,
-                },
-                &key(),
-                &mut bytes,
-            )
-            .unwrap();
-            self.socket
-                .send_to(&bytes[..length], address)
-                .await
-                .unwrap();
-            bytes[..length].to_vec()
-        }
-
-        async fn receive(&self) -> Vec<u8> {
-            let mut bytes = [0; MAX_PACKET + 1];
-            let (length, _) = timeout(SETTLE, self.socket.recv_from(&mut bytes))
-                .await
-                .unwrap()
-                .unwrap();
-            bytes[..length].to_vec()
-        }
-
-        async fn silent(&self) {
-            let mut bytes = [0; MAX_PACKET + 1];
-            assert!(
-                timeout(SILENCE, self.socket.recv_from(&mut bytes))
-                    .await
-                    .is_err()
-            );
-        }
-
-        async fn challenge(&mut self, server: SocketAddr) -> (Session, Session) {
-            let nonce = random().unwrap();
-            self.send(server, Body::Hello { nonce }).await;
-            let bytes = self.receive().await;
-            let packet = wire::decode(&bytes, &key()).unwrap();
-            match packet.body {
-                Body::Challenge {
-                    nonce: echoed,
-                    cookie,
-                } => {
-                    assert_eq!(echoed, nonce);
-                    (nonce, cookie)
-                }
-                other => panic!("expected challenge, got {other:?}"),
-            }
-        }
-
-        async fn register(&mut self, server: SocketAddr, policy: PathPolicy) -> Vec<u8> {
-            let (nonce, cookie) = self.challenge(server).await;
-            let registration = self
-                .send(
-                    server,
-                    Body::Register {
-                        nonce,
-                        cookie,
-                        relay_only: policy == PathPolicy::RelayOnly,
-                        credential: &[],
-                    },
-                )
-                .await;
-            let bytes = self.receive().await;
-            assert!(matches!(
-                wire::decode(&bytes, &key()).unwrap().body,
-                Body::Registered
-            ));
-            registration
-        }
-
-        async fn observed_peer(&mut self, server: SocketAddr, name: &str) -> (SocketAddr, Session) {
-            self.send(server, Body::Query { peer: name }).await;
-            let bytes = self.receive().await;
-            match wire::decode(&bytes, &key()).unwrap().body {
-                Body::Offer {
-                    peer,
-                    address,
-                    session,
-                    ..
-                } => {
-                    assert_eq!(peer, name);
-                    (address, session)
-                }
-                other => panic!("expected offer, got {other:?}"),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn captured_registration_cannot_redirect_from_a_different_udp_address() {
-        let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
-            .await
-            .unwrap();
-        let address = relay.local_addr().unwrap();
-        let mut a = RawPeer::new("a", [1; 16]).await;
-        let mut b = RawPeer::new("b", [2; 16]).await;
-        let mut attacker = RawPeer::new("a", [1; 16]).await;
-        b.register(address, PathPolicy::RelayOnly).await;
-        let (nonce, cookie) = a.challenge(address).await;
-        // Even an authentic registration needs the challenge's observed address.
-        let captured = a
-            .send(
-                address,
-                Body::Register {
-                    nonce,
-                    cookie,
-                    relay_only: true,
-                    credential: &[],
-                },
-            )
-            .await;
-        attacker.socket.send_to(&captured, address).await.unwrap();
-        attacker.silent().await;
-        assert!(matches!(
-            wire::decode(&a.receive().await, &key()).unwrap().body,
-            Body::Registered
-        ));
-        assert_eq!(
-            b.observed_peer(address, "a").await.0,
-            a.socket.local_addr().unwrap()
-        );
-        // Even a fresh duplicate Hello from another address cannot challenge an incumbent.
-        attacker.send(address, Body::Hello { nonce: [7; 16] }).await;
-        attacker.silent().await; // Sequence one is older than the accepted registration.
-        attacker.sequence = 100;
-        attacker.send(address, Body::Hello { nonce }).await;
-        attacker.silent().await;
-        attacker.socket.send_to(&captured, address).await.unwrap();
-        attacker.silent().await;
-        assert_eq!(
-            b.observed_peer(address, "a").await.0,
-            a.socket.local_addr().unwrap()
-        );
-        relay.close().await;
-    }
-
-    #[tokio::test]
-    async fn consumed_and_old_session_registration_replays_cannot_replace_a_new_session() {
-        let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
-            .await
-            .unwrap();
-        let address = relay.local_addr().unwrap();
-        let mut a = RawPeer::new("a", [1; 16]).await;
-        let mut b = RawPeer::new("b", [2; 16]).await;
-        b.register(address, PathPolicy::RelayOnly).await;
-        let captured = a.register(address, PathPolicy::RelayOnly).await;
-        a.socket.send_to(&captured, address).await.unwrap();
-        a.silent().await;
-        a.send(address, Body::Depart).await;
-        a.session = [3; 16];
-        a.sequence = 0;
-        a.register(address, PathPolicy::RelayOnly).await;
-        a.socket.send_to(&captured, address).await.unwrap();
-        a.silent().await;
-        assert_eq!(b.observed_peer(address, "a").await.1, [3; 16]);
-        // Replaying an old session's Hello cannot displace the current session.
-        let current = a.session;
-        a.session = [1; 16];
-        a.send(address, Body::Hello { nonce: [9; 16] }).await;
-        a.silent().await;
-        a.socket.send_to(&captured, address).await.unwrap();
-        a.silent().await;
-        assert_eq!(b.observed_peer(address, "a").await.1, current);
-        relay.close().await;
-    }
-
-    #[tokio::test]
-    async fn expired_challenge_and_unregistered_relay_are_rejected() {
-        let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
-            .await
-            .unwrap();
-        let address = relay.local_addr().unwrap();
-        let mut a = RawPeer::new("a", [1; 16]).await;
-        let mut b = RawPeer::new("b", [2; 16]).await;
-        b.register(address, PathPolicy::RelayOnly).await;
-        a.send(
-            address,
-            Body::Relay {
-                peer: "b",
-                target: b.session,
-                message: b"not registered",
-            },
-        )
-        .await;
-        b.silent().await;
-        let (nonce, cookie) = a.challenge(address).await;
-        let issued = Instant::now();
-        eventually_within("challenge expires", SETTLE, || {
-            issued.elapsed() >= Duration::from_millis(3100)
-        })
-        .await;
-        a.send(
-            address,
-            Body::Register {
-                nonce,
-                cookie,
-                relay_only: true,
-                credential: &[],
-            },
-        )
-        .await;
-        a.silent().await;
-        b.send(address, Body::Query { peer: "a" }).await;
-        b.silent().await;
-        a.register(address, PathPolicy::RelayOnly).await;
-        assert_eq!(b.observed_peer(address, "a").await.1, a.session);
-        relay.close().await;
-    }
-
-    #[tokio::test]
-    async fn replayed_relay_datagrams_and_wrong_recipient_sessions_are_not_forwarded() {
-        let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
-            .await
-            .unwrap();
-        let address = relay.local_addr().unwrap();
-        let mut a = RawPeer::new("a", [1; 16]).await;
-        let mut b = RawPeer::new("b", [2; 16]).await;
-        a.register(address, PathPolicy::RelayOnly).await;
-        b.register(address, PathPolicy::RelayOnly).await;
-        a.send(
-            address,
-            Body::Relay {
-                peer: "b",
-                target: [7; 16],
-                message: b"stale session",
-            },
-        )
-        .await;
-        b.silent().await;
-        let captured = a
-            .send(
-                address,
-                Body::Relay {
-                    peer: "b",
-                    target: b.session,
-                    message: b"once",
-                },
-            )
-            .await;
-        let delivered = b.receive().await;
-        match wire::decode(&delivered, &key()).unwrap().body {
-            Body::Delivered {
-                peer,
-                session,
-                message,
-            } => {
-                assert_eq!(peer, "a");
-                assert_eq!(session, a.session);
-                assert_eq!(message, b"once");
-            }
-            other => panic!("expected relay delivery, got {other:?}"),
-        }
-        a.socket.send_to(&captured, address).await.unwrap();
-        b.silent().await;
-        relay.close().await;
-    }
-
-    #[tokio::test]
-    async fn unknown_names_and_bad_authentication_cannot_obtain_reflections() {
-        let relay = Rendezvous::bind(loopback(), key(), vec!["a".into()])
-            .await
-            .unwrap();
-        let address = relay.local_addr().unwrap();
-        let mut unknown = RawPeer::new("unknown", [1; 16]).await;
-        unknown.send(address, Body::Hello { nonce: [1; 16] }).await;
-        unknown.silent().await;
-        let a = RawPeer::new("a", [2; 16]).await;
-        let mut bytes = [0; MAX_PACKET];
-        let length = wire::encode(
-            Packet {
-                sender: "a",
-                session: a.session,
-                sequence: 1,
-                body: Body::Hello { nonce: [1; 16] },
-            },
-            &NetworkKey::from_bytes([9; 32]),
-            &mut bytes,
-        )
-        .unwrap();
-        a.socket.send_to(&bytes[..length], address).await.unwrap();
-        a.silent().await;
-        a.socket
-            .send_to(&[0; MAX_PACKET + 100], address)
-            .await
-            .unwrap();
-        a.silent().await;
-        let mut a = a;
-        a.register(address, PathPolicy::RelayOnly).await;
-        relay.close().await;
-    }
-
-    #[tokio::test]
-    async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive_queue() {
-        let relay = Rendezvous::bind(
-            loopback(),
-            key(),
-            vec!["a".into(), "b".into(), "unknown".into()],
-        )
-        .await
-        .unwrap();
-        let address = relay.local_addr().unwrap();
-        let mut config = PunchConfig::new("a".into(), address, key(), vec!["b".into()]);
-        config.bind = loopback();
-        let a = PunchTransport::bind(config).await.unwrap();
-        let mut b = RawPeer::new("b", [2; 16]).await;
-        b.register(address, PathPolicy::DirectPreferred).await;
-        eventually_within("raw peer discovered", SETTLE, || {
-            a.path_to(&"b".into()).is_some()
-        })
-        .await;
-        let a_session = b.observed_peer(address, "a").await.1;
-        let destination = a.local_addr().unwrap();
-        b.socket
-            .send_to(&[0; MAX_PACKET + 100], destination)
-            .await
-            .unwrap();
-        assert!(timeout(SILENCE, a.recv()).await.is_err());
-        let packet = Packet {
-            sender: "b",
-            session: b.session,
-            sequence: 100,
-            body: Body::Direct {
-                peer: "a",
-                target: a_session,
-                message: b"authenticated",
-            },
-        };
-        let mut bytes = [0; MAX_PACKET];
-        let length = wire::encode(packet, &NetworkKey::from_bytes([9; 32]), &mut bytes).unwrap();
-        b.socket
-            .send_to(&bytes[..length], destination)
-            .await
-            .unwrap();
-        assert!(timeout(SILENCE, a.recv()).await.is_err());
-        let length = wire::encode(
-            Packet {
-                sender: "unknown",
-                ..packet
-            },
-            &key(),
-            &mut bytes,
-        )
-        .unwrap();
-        b.socket
-            .send_to(&bytes[..length], destination)
-            .await
-            .unwrap();
-        assert!(timeout(SILENCE, a.recv()).await.is_err());
-        let length = wire::encode(packet, &key(), &mut bytes).unwrap();
-        b.socket
-            .send_to(&bytes[..length], destination)
-            .await
-            .unwrap();
-        assert_eq!(
-            timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg,
-            b"authenticated"
-        );
-        b.socket
-            .send_to(&bytes[..length], destination)
-            .await
-            .unwrap();
-        assert!(timeout(SILENCE, a.recv()).await.is_err());
-        a.close().await;
-        relay.close().await;
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod admission_tests;

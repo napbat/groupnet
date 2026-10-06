@@ -13,6 +13,7 @@ fn registration(now: Instant, address: SocketAddr) -> Registration {
     Registration {
         address,
         session: [7; 16],
+        proof: [9; 16],
         sequence: 1,
         seen: now,
         relay_only: true,
@@ -29,7 +30,7 @@ fn invalid_session_traffic_never_spends_any_established_session_allowance() {
         sender: "incumbent",
         session: [7; 16],
         sequence: 2,
-        body: Body::Heartbeat,
+        body: Body::Heartbeat { proof: [9; 16] },
     };
     for _ in 0..4096 {
         assert!(
@@ -194,7 +195,7 @@ async fn late_completion_with_reused_wire_session_cannot_clear_a_new_attempt() {
         .unwrap();
     assert!(matches!(
         wire::decode_mode(&bytes[..length], None).unwrap().body,
-        Body::Registered
+        Body::Registered { .. }
     ));
 }
 
@@ -234,4 +235,160 @@ async fn delayed_policy_task_uses_the_received_attempt_deadline() {
         decision.accepted.unwrap_err().kind(),
         io::ErrorKind::TimedOut
     );
+}
+
+#[tokio::test]
+async fn public_session_and_spoofed_source_do_not_authorize_depart_relay_or_sequence_poisoning() {
+    let socket = UdpSocket::bind(loopback()).await.unwrap();
+    let incumbent = UdpSocket::bind(loopback()).await.unwrap();
+    let recipient = UdpSocket::bind(loopback()).await.unwrap();
+    let address = incumbent.local_addr().unwrap();
+    let now = Instant::now();
+    let mut entries = HashMap::new();
+    let mut entry = Entry::new(now);
+    entry.active = Some(registration(now, address));
+    entries.insert("incumbent".to_owned(), entry);
+    let mut target = Entry::new(now);
+    target.active = Some(Registration {
+        session: [8; 16],
+        proof: [10; 16],
+        ..registration(now, recipient.local_addr().unwrap())
+    });
+    entries.insert("recipient".to_owned(), target);
+    for body in [
+        Body::Depart { proof: [7; 16] },
+        Body::Heartbeat { proof: [7; 16] },
+        Body::Discover { proof: [7; 16] },
+        Body::Query {
+            proof: [7; 16],
+            peer: "recipient",
+        },
+        Body::Relay {
+            proof: [7; 16],
+            peer: "recipient",
+            target: [8; 16],
+            message: b"forged",
+        },
+    ] {
+        handle_established(
+            &socket,
+            None,
+            &mut entries,
+            Packet {
+                sender: "incumbent",
+                session: [7; 16],
+                sequence: u64::MAX,
+                body,
+            },
+            address,
+            now + Duration::from_secs(1),
+        )
+        .await;
+        let entry = &entries["incumbent"];
+        assert_eq!(entry.rate_count, 0);
+        assert_eq!(entry.active.unwrap().sequence, 1);
+        assert_eq!(entry.active.unwrap().seen, now);
+    }
+    let mut bytes = [0; MAX_PACKET];
+    assert!(
+        timeout(Duration::from_millis(50), recipient.recv_from(&mut bytes))
+            .await
+            .is_err()
+    );
+    assert!(
+        timeout(Duration::from_millis(50), incumbent.recv_from(&mut bytes))
+            .await
+            .is_err()
+    );
+    handle_established(
+        &socket,
+        None,
+        &mut entries,
+        Packet {
+            sender: "incumbent",
+            session: [7; 16],
+            sequence: 2,
+            body: Body::Relay {
+                proof: [9; 16],
+                peer: "recipient",
+                target: [8; 16],
+                message: b"legitimate",
+            },
+        },
+        address,
+        now + Duration::from_secs(1),
+    )
+    .await;
+    let (length, _) = timeout(Duration::from_secs(1), recipient.recv_from(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(wire::decode_mode(&bytes[..length], None).unwrap().body,
+        Body::Delivered { proof, message: b"legitimate", .. } if proof == [10; 16])
+    );
+    assert_eq!(entries["incumbent"].active.unwrap().sequence, 2);
+}
+
+#[tokio::test]
+async fn discovery_only_discloses_addresses_when_both_participants_allow_direct_paths() {
+    let socket = UdpSocket::bind(loopback()).await.unwrap();
+    let requester = UdpSocket::bind(loopback()).await.unwrap();
+    let peer_address: SocketAddr = ([127, 0, 0, 1], 4567).into();
+    for requester_relay in [false, true] {
+        for peer_relay in [false, true] {
+            let now = Instant::now();
+            let mut entries = HashMap::new();
+            let mut entry = Entry::new(now);
+            entry.active = Some(Registration {
+                relay_only: requester_relay,
+                ..registration(now, requester.local_addr().unwrap())
+            });
+            entries.insert("requester".to_owned(), entry);
+            let mut peer = Entry::new(now);
+            peer.active = Some(Registration {
+                session: [8; 16],
+                proof: [10; 16],
+                relay_only: peer_relay,
+                ..registration(now, peer_address)
+            });
+            entries.insert("peer".to_owned(), peer);
+            handle_established(
+                &socket,
+                None,
+                &mut entries,
+                Packet {
+                    sender: "requester",
+                    session: [7; 16],
+                    sequence: 2,
+                    body: Body::Discover { proof: [9; 16] },
+                },
+                requester.local_addr().unwrap(),
+                now,
+            )
+            .await;
+            let mut bytes = [0; MAX_PACKET];
+            let (length, _) = timeout(Duration::from_secs(1), requester.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            let Body::Offer {
+                proof,
+                session,
+                address,
+                relay_only,
+                ..
+            } = wire::decode_mode(&bytes[..length], None).unwrap().body
+            else {
+                panic!("expected pair discovery offer");
+            };
+            assert_eq!(proof, [9; 16]); // Recipient's private proof, not peer session or proof.
+            assert_eq!(session, [8; 16]);
+            assert_eq!(relay_only, requester_relay || peer_relay);
+            assert_eq!(
+                address,
+                (!(requester_relay || peer_relay)).then_some(peer_address)
+            );
+        }
+    }
 }

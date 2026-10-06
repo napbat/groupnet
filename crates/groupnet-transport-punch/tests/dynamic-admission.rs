@@ -112,100 +112,127 @@ impl Admission for AccountPolicy {
     }
 }
 
-#[tokio::test]
-async fn custom_credentials_and_canonical_identity_are_enforced_without_keypairs() {
+async fn custom_accounts(policy: PathPolicy, expected: PeerPath) {
     let relay = Rendezvous::bind_with_admission(loopback(), None, Arc::new(AccountPolicy))
         .await
         .unwrap();
     let address = relay.local_addr().unwrap();
+    let config_for = |identity: &str, credential: Vec<u8>| {
+        let mut config = PunchConfig::dynamic(identity.into(), address, None, credential);
+        config.bind = loopback();
+        config.policy = policy;
+        config
+    };
     for (identity, credential) in [
         ("canonical-account", b"wrong".to_vec()),
         ("claimed-spoof", b"account-proof".to_vec()),
     ] {
-        let config = PunchConfig::dynamic(identity.into(), address, None, credential);
+        let config = config_for(identity, credential);
         assert_eq!(
             PunchTransport::bind(config).await.unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
     }
-    let config = PunchConfig::dynamic(
-        "canonical-account".into(),
-        address,
-        None,
-        b"account-proof".to_vec(),
-    );
+    let config = config_for("canonical-account", b"account-proof".to_vec());
     assert!(!format!("{config:?}").contains("account-proof"));
     let accepted = PunchTransport::bind(config).await.unwrap();
-    let peer = PunchTransport::bind(PunchConfig::dynamic(
-        "other".into(),
-        address,
-        None,
-        b"account-proof".to_vec(),
-    ))
-    .await;
+    let peer = PunchTransport::bind(config_for("other", b"account-proof".to_vec())).await;
     assert_eq!(peer.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-    let second = PunchTransport::bind(PunchConfig::dynamic(
-        "second-account".into(),
-        address,
-        None,
-        b"account-proof".to_vec(),
-    ))
-    .await
-    .unwrap();
-    eventually_within("custom admitted accounts discover", SETTLE, || {
-        accepted.path_to(&"second-account".into()).is_some()
-            && second.path_to(&"canonical-account".into()).is_some()
-    })
-    .await;
-    second
-        .send(&"canonical-account".into(), b"policy admitted relay")
+    let second = PunchTransport::bind(config_for("second-account", b"account-proof".to_vec()))
         .await
         .unwrap();
-    assert_eq!(
-        timeout(SETTLE, accepted.recv()).await.unwrap().unwrap().msg,
-        b"policy admitted relay"
-    );
+    eventually_within(
+        "custom admitted accounts discover selected paths",
+        SETTLE,
+        || {
+            accepted.path_to(&"second-account".into()) == Some(expected)
+                && second.path_to(&"canonical-account".into()) == Some(expected)
+        },
+    )
+    .await;
+    // Policy approval alone is enough; no provisioned keys or keypairs are used.
+    if expected == PeerPath::Direct {
+        relay.close().await;
+    }
+    second
+        .send(&"canonical-account".into(), b"policy admitted traffic")
+        .await
+        .unwrap();
+    let received = timeout(SETTLE, accepted.recv()).await.unwrap().unwrap();
+    assert_eq!(received.from, NodeId::from("second-account"));
+    assert_eq!(received.msg, b"policy admitted traffic");
+    accepted
+        .send(&"second-account".into(), b"reverse account traffic")
+        .await
+        .unwrap();
+    let received = timeout(SETTLE, second.recv()).await.unwrap().unwrap();
+    assert_eq!(received.from, NodeId::from("canonical-account"));
+    assert_eq!(received.msg, b"reverse account traffic");
     second.close().await;
     accepted.close().await;
     relay.close().await;
 }
 
 #[tokio::test]
-async fn duplicate_dynamic_identity_never_evicts_the_incumbent() {
+async fn custom_credentials_and_canonical_identity_are_enforced_without_keypairs() {
+    custom_accounts(PathPolicy::RelayOnly, PeerPath::Relay).await;
+}
+
+#[tokio::test]
+async fn custom_credentials_and_canonical_identity_enforce_keyless_direct_admission() {
+    custom_accounts(PathPolicy::DirectPreferred, PeerPath::Direct).await;
+}
+
+async fn duplicate_incumbent(policy: PathPolicy, expected: PeerPath) {
     let relay = Rendezvous::bind_open(loopback()).await.unwrap();
     let address = relay.local_addr().unwrap();
-    let a = PunchTransport::bind(PunchConfig::open("a".into(), address))
-        .await
-        .unwrap();
-    let b = PunchTransport::bind(PunchConfig::open("b".into(), address))
-        .await
-        .unwrap();
+    let config = |local: &str| {
+        let mut config = PunchConfig::open(local.into(), address);
+        config.bind = loopback();
+        config.policy = policy;
+        config
+    };
+    let a = PunchTransport::bind(config("a")).await.unwrap();
+    let b = PunchTransport::bind(config("b")).await.unwrap();
     eventually_within("open peers discover incumbent", SETTLE, || {
-        a.path_to(&"b".into()).is_some() && b.path_to(&"a".into()).is_some()
+        a.path_to(&"b".into()) == Some(expected) && b.path_to(&"a".into()) == Some(expected)
     })
     .await;
     assert_eq!(
-        PunchTransport::bind(PunchConfig::open("a".into(), address))
-            .await
-            .unwrap_err()
-            .kind(),
+        PunchTransport::bind(config("a")).await.unwrap_err().kind(),
         io::ErrorKind::TimedOut
     );
-    assert_eq!(b.path_to(&"a".into()), Some(PeerPath::Relay));
+    assert_eq!(a.path_to(&"b".into()), Some(expected));
+    assert_eq!(b.path_to(&"a".into()), Some(expected));
     a.send(&"b".into(), b"incumbent still owns ID")
         .await
         .unwrap();
-    assert_eq!(
-        timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg,
-        b"incumbent still owns ID"
-    );
+    let received = timeout(SETTLE, b.recv()).await.unwrap().unwrap();
+    assert_eq!(received.from, NodeId::from("a"));
+    assert_eq!(received.msg, b"incumbent still owns ID");
+    b.send(&"a".into(), b"incumbent still receives")
+        .await
+        .unwrap();
+    let received = timeout(SETTLE, a.recv()).await.unwrap().unwrap();
+    assert_eq!(received.from, NodeId::from("b"));
+    assert_eq!(received.msg, b"incumbent still receives");
     a.close().await;
     b.close().await;
     relay.close().await;
 }
 
 #[tokio::test]
-async fn explicit_keyed_dynamic_mode_never_downgrades_and_keyless_direct_is_rejected() {
+async fn duplicate_dynamic_identity_never_evicts_the_incumbent() {
+    duplicate_incumbent(PathPolicy::RelayOnly, PeerPath::Relay).await;
+}
+
+#[tokio::test]
+async fn duplicate_keyless_direct_identity_never_evicts_the_incumbent() {
+    duplicate_incumbent(PathPolicy::DirectPreferred, PeerPath::Direct).await;
+}
+
+#[tokio::test]
+async fn explicit_keyed_dynamic_mode_never_downgrades_and_credentials_remain_bounded() {
     let key = NetworkKey::from_bytes([41; 32]);
     let relay = Rendezvous::bind_with_admission(
         loopback(),
@@ -215,22 +242,17 @@ async fn explicit_keyed_dynamic_mode_never_downgrades_and_keyless_direct_is_reje
     .await
     .unwrap();
     let address = relay.local_addr().unwrap();
-    assert_eq!(
-        PunchTransport::bind(PunchConfig::open("open".into(), address))
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::TimedOut
-    );
+    for policy in [PathPolicy::RelayOnly, PathPolicy::DirectPreferred] {
+        let mut config = PunchConfig::open("open".into(), address);
+        config.policy = policy;
+        assert_eq!(
+            PunchTransport::bind(config).await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
     let mut config = PunchConfig::dynamic("keyed".into(), address, Some(key), Vec::new());
     config.policy = PathPolicy::RelayOnly;
     let accepted = PunchTransport::bind(config).await.unwrap();
-    let mut direct = PunchConfig::open("invalid".into(), address);
-    direct.policy = PathPolicy::DirectPreferred;
-    assert_eq!(
-        PunchTransport::bind(direct).await.unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
     let mut oversized = PunchConfig::open(NodeId::from("oversized"), address);
     oversized.credential = vec![0; MAX_CREDENTIAL_BYTES + 1];
     assert_eq!(

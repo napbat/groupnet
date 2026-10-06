@@ -26,6 +26,7 @@ const MAX_PENDING_POLICY: usize = 32;
 struct Registration {
     address: SocketAddr,
     session: Session,
+    proof: Session,
     sequence: u64,
     seen: Instant,
     relay_only: bool,
@@ -82,6 +83,7 @@ impl Entry {
     ) -> Option<Registration> {
         let mut registration = self.live(now)?;
         if registration.address != address
+            || packet.body.request_proof() != Some(registration.proof)
             || registration.session != packet.session
             || packet.sequence <= registration.sequence
         {
@@ -182,6 +184,7 @@ impl Challenges {
         Some(Registration {
             address,
             session: packet.session,
+            proof: nonce,
             sequence: packet.sequence,
             seen: now,
             relay_only,
@@ -234,7 +237,7 @@ impl Rendezvous {
         Self::start(bind, Some(key), Arc::new(OpenAdmission), Some(allowed)).await
     }
 
-    /// Binds an explicitly keyless, unauthenticated dynamic relay.
+    /// Binds explicitly keyless discovery and relay, permitting requested direct paths.
     ///
     /// # Errors
     /// Propagates socket binding errors and rejects multicast bind addresses.
@@ -421,9 +424,9 @@ async fn handle_packet(
             )
             .await;
         }
-        Body::Heartbeat
-        | Body::Depart
-        | Body::Discover
+        Body::Heartbeat { .. }
+        | Body::Depart { .. }
+        | Body::Discover { .. }
         | Body::Query { .. }
         | Body::Relay { .. } => {
             handle_established(socket, key, &mut state.entries, packet, address, now).await;
@@ -443,18 +446,29 @@ async fn handle_established(
     let Some(entry) = entries.get_mut(packet.sender) else {
         return;
     };
-    if entry.authenticate(packet, address, now).is_none() {
+    let Some(registration) = entry.authenticate(packet, address, now) else {
         return;
-    }
+    };
     match packet.body {
-        Body::Heartbeat => respond(socket, key, address, packet, Body::Registered).await,
-        Body::Depart => {
+        Body::Heartbeat { .. } => {
+            respond(
+                socket,
+                key,
+                address,
+                packet,
+                Body::Registered {
+                    proof: registration.proof,
+                },
+            )
+            .await;
+        }
+        Body::Depart { .. } => {
             entry.active = None;
         }
-        Body::Discover | Body::Query { .. } => {
+        Body::Discover { .. } | Body::Query { .. } => {
             for (name, target) in entries.iter() {
                 if name == packet.sender
-                    || matches!(packet.body, Body::Query { peer } if peer != name)
+                    || matches!(packet.body, Body::Query { peer, .. } if peer != name)
                 {
                     continue;
                 }
@@ -467,10 +481,12 @@ async fn handle_established(
                     address,
                     packet,
                     Body::Offer {
+                        proof: registration.proof,
                         peer: name,
                         session: target.session,
-                        address: target.address,
-                        relay_only: target.relay_only,
+                        address: (!registration.relay_only && !target.relay_only)
+                            .then_some(target.address),
+                        relay_only: registration.relay_only || target.relay_only,
                     },
                 )
                 .await;
@@ -480,6 +496,7 @@ async fn handle_established(
             peer,
             target,
             message,
+            ..
         } if peer != packet.sender => {
             let Some(recipient) = entries.get(peer).and_then(|entry| entry.live(now)) else {
                 return;
@@ -496,6 +513,7 @@ async fn handle_established(
                     session: recipient.session,
                     sequence: packet.sequence,
                     body: Body::Delivered {
+                        proof: recipient.proof,
                         peer: packet.sender,
                         session: packet.session,
                         message,
@@ -521,20 +539,47 @@ async fn register(
         return;
     };
     let now = registration.seen;
-    if (key.is_none() && !registration.relay_only) || (static_allowed && !credential.is_empty()) {
-        respond(socket, key, registration.address, packet, Body::Denied).await;
+    if static_allowed && !credential.is_empty() {
+        respond(
+            socket,
+            key,
+            registration.address,
+            packet,
+            Body::Denied {
+                proof: registration.proof,
+            },
+        )
+        .await;
         return;
     }
     if let Some(entry) = state.entries.get_mut(packet.sender)
         && entry.live(now).is_some()
     {
         entry.active = Some(registration);
-        respond(socket, key, registration.address, packet, Body::Registered).await;
+        respond(
+            socket,
+            key,
+            registration.address,
+            packet,
+            Body::Registered {
+                proof: registration.proof,
+            },
+        )
+        .await;
         return;
     }
     expire_entries(&mut state.entries, now);
     if state.entries.len() >= MAX_PEERS || state.decisions.len() >= MAX_PENDING_POLICY {
-        respond(socket, key, registration.address, packet, Body::Denied).await;
+        respond(
+            socket,
+            key,
+            registration.address,
+            packet,
+            Body::Denied {
+                proof: registration.proof,
+            },
+        )
+        .await;
         return;
     }
     let entry = state
@@ -635,9 +680,13 @@ async fn apply_decision(
             session: registration.session,
             sequence: registration.sequence,
             body: if accepted {
-                Body::Registered
+                Body::Registered {
+                    proof: registration.proof,
+                }
             } else {
-                Body::Denied
+                Body::Denied {
+                    proof: registration.proof,
+                }
             },
         },
     )
@@ -700,6 +749,7 @@ mod tests {
         state.active = Some(Registration {
             address,
             session: [1; 16],
+            proof: [3; 16],
             sequence: 10,
             seen: now,
             relay_only: false,
@@ -708,7 +758,10 @@ mod tests {
             sender: "a",
             session: [1; 16],
             sequence: 11,
-            body: Body::Query { peer: "b" },
+            body: Body::Query {
+                proof: [3; 16],
+                peer: "b",
+            },
         };
         assert!(
             state

@@ -128,6 +128,7 @@ cargo run --example routing     # resolve a resource to its owner from any node
 cargo run --example dynamic-admission --features tcp-msg  # unknown clients, open admission
 cargo run --example dynamic-admission --features tcp-msg -- --invite  # custom credential policy
 cargo run --example dynamic-relay --features punch  # discovery through a keyless relay
+cargo run --example dynamic-relay --features punch -- --direct  # prefer direct paths; relay fallback
 ```
 
 Five more live with the layers they exercise:
@@ -295,13 +296,45 @@ supports direct connectivity.
 
 For dynamic keyless discovery, start `Rendezvous::bind_open(address)` and give
 each node `PunchLink::new(PunchConfig::open(local_id, rendezvous_address))`.
-No participant list or shared key is required. This explicit open mode is
-relay-only; requesting keyless direct punching is rejected. The rendezvous
-checks source-address reachability, applies admission, and leases registrations;
-it is not itself a coordination-group member.
-Use `Rendezvous::bind_with_admission` for a custom admission policy and
-`PunchConfig::dynamic` to supply application credentials. See the runnable
-[dynamic relay example](crates/groupnet/examples/dynamic-relay.rs).
+No participant list, public/private key pair, or pre-shared transport key is
+required. Here **keyless** means `PunchConfig.key == None`, not an absence of
+application admission or all cryptography. `PunchConfig::open` conservatively
+defaults to `RelayOnly`; select direct punching explicitly:
+
+```rust
+use groupnet::transport::punch::{PathPolicy, PunchConfig, PunchLink};
+
+let mut config = PunchConfig::open(local_id, rendezvous_address);
+config.policy = PathPolicy::DirectPreferred;
+// Register with Node::builder(...).link(PunchLink::new(config)).start().await?
+```
+
+Admission, transport authentication, and path policy are independent choices:
+
+| Choice | Configuration |
+|---|---|
+| Accept a claimed `NodeId` without ownership proof | Explicit `OpenAdmission` / `Rendezvous::bind_open` |
+| Apply application-defined admission rules | `Rendezvous::bind_with_admission`; supply credentials through `PunchConfig::dynamic` |
+| Authenticate datagrams as members of a trusted fabric | Configure the same `NetworkKey`; keyed endpoints never downgrade |
+| Prefer verified direct UDP, falling back to relay | `PathPolicy::DirectPreferred`, with or without a configured key |
+| Use relay only; do not exchange peer socket addresses or send direct probes | `PathPolicy::RelayOnly`; applies to a pair if either endpoint selects it |
+| Authenticate and encrypt application streams | Separately configure pinned TLS tunnels |
+
+These choices are workload-neutral: database engines and general applications
+use the same APIs. Open admission is opt-in, not a recommendation for a database
+trust boundary. Coordination groups do not authorize access to application data.
+
+The rendezvous checks source-address reachability, applies admission, and leases
+registrations; it is not itself a coordination-group member. Fresh private session
+proofs and direct-path challenges bind packets to current sessions; a public
+`NodeId` or advertised session ID alone cannot authorize direct data. These
+mechanisms do not provide identity ownership or confidentiality. Never send
+reusable credentials over an unencrypted admission exchange.
+See the runnable [dynamic relay/direct example](crates/groupnet/examples/dynamic-relay.rs)
+and [security boundaries](docs/tunnels-and-security.md#3-native-discovery-direct-paths-and-relay).
+
+The native UDP wire format is now `GNP3`. Upgrade the rendezvous and all endpoints
+together; earlier formats are rejected, not negotiated or silently downgraded.
 
 For confidential streams, call
 `.tunnels(TunnelConfig::new(identity, [peer_pin]))` on the node builder with a `TlsIdentity` and

@@ -1,4 +1,4 @@
-//! Bounded, authenticated datagrams. Authentication precedes parsing or allocation.
+//! Bounded session-bound datagrams; keyed HMAC verification precedes parsing.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -8,7 +8,7 @@ use super::NetworkKey;
 
 pub(super) const MAX_PACKET: usize = 1200;
 const TAG: usize = 32;
-const MAGIC: &[u8; 4] = b"GNP2";
+const MAGIC: &[u8; 4] = b"GNP3";
 pub(super) type Session = [u8; 16];
 
 #[derive(Clone, Copy)]
@@ -26,18 +26,30 @@ pub(super) enum Body<'a> {
         relay_only: bool,
         credential: &'a [u8],
     },
-    Registered,
-    Discover,
-    Heartbeat,
-    Depart,
-    Denied,
+    Registered {
+        proof: Session,
+    },
+    Discover {
+        proof: Session,
+    },
+    Heartbeat {
+        proof: Session,
+    },
+    Depart {
+        proof: Session,
+    },
+    Denied {
+        proof: Session,
+    },
     Query {
+        proof: Session,
         peer: &'a str,
     },
     Offer {
+        proof: Session,
         peer: &'a str,
         session: Session,
-        address: SocketAddr,
+        address: Option<SocketAddr>,
         relay_only: bool,
     },
     Probe {
@@ -47,22 +59,43 @@ pub(super) enum Body<'a> {
     ProbeAck {
         target: Session,
         nonce: Session,
+        capability: Session,
+    },
+    Confirm {
+        target: Session,
+        capability: Session,
     },
     Direct {
         peer: &'a str,
         target: Session,
+        capability: Session,
         message: &'a [u8],
     },
     Relay {
+        proof: Session,
         peer: &'a str,
         target: Session,
         message: &'a [u8],
     },
     Delivered {
+        proof: Session,
         peer: &'a str,
         session: Session,
         message: &'a [u8],
     },
+}
+
+impl Body<'_> {
+    pub(super) fn request_proof(self) -> Option<Session> {
+        match self {
+            Self::Discover { proof }
+            | Self::Heartbeat { proof }
+            | Self::Depart { proof }
+            | Self::Query { proof, .. }
+            | Self::Relay { proof, .. } => Some(proof),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Body<'_> {
@@ -71,15 +104,16 @@ impl std::fmt::Debug for Body<'_> {
             Self::Hello { .. } => "Hello",
             Self::Challenge { .. } => "Challenge",
             Self::Register { .. } => "Register([REDACTED])",
-            Self::Registered => "Registered",
-            Self::Discover => "Discover",
-            Self::Heartbeat => "Heartbeat",
-            Self::Depart => "Depart",
-            Self::Denied => "Denied",
+            Self::Registered { .. } => "Registered",
+            Self::Discover { .. } => "Discover",
+            Self::Heartbeat { .. } => "Heartbeat",
+            Self::Depart { .. } => "Depart",
+            Self::Denied { .. } => "Denied",
             Self::Query { .. } => "Query",
             Self::Offer { .. } => "Offer",
             Self::Probe { .. } => "Probe",
             Self::ProbeAck { .. } => "ProbeAck",
+            Self::Confirm { .. } => "Confirm",
             Self::Direct { .. } => "Direct",
             Self::Relay { .. } => "Relay",
             Self::Delivered { .. } => "Delivered",
@@ -116,6 +150,31 @@ impl Writer<'_> {
         }
         self.put(&[u8::try_from(name.len()).ok()?])?;
         self.put(name.as_bytes())
+    }
+
+    fn address(&mut self, address: Option<SocketAddr>) -> Option<()> {
+        self.put(&[u8::from(address.is_some())])?;
+        if let Some(address) = address {
+            match address.ip() {
+                IpAddr::V4(ip) => {
+                    self.put(&[4])?;
+                    self.put(&ip.octets())?;
+                }
+                IpAddr::V6(ip) => {
+                    self.put(&[6])?;
+                    self.put(&ip.octets())?;
+                }
+            }
+            self.put(&address.port().to_be_bytes())?;
+        }
+        Some(())
+    }
+
+    fn message(&mut self, message: &[u8]) -> Option<()> {
+        if message.len() > super::MAX_MESSAGE {
+            return None;
+        }
+        self.put(message)
     }
 }
 
@@ -156,6 +215,19 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn address(&mut self) -> Option<SocketAddr> {
+        let ip = match self.byte()? {
+            4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(self.take(4)?).ok()?)),
+            6 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(self.take(16)?).ok()?)),
+            _ => return None,
+        };
+        let port = u16::from_be_bytes(self.take(2)?.try_into().ok()?);
+        if port == 0 || ip.is_unspecified() || ip.is_multicast() {
+            return None;
+        }
+        Some(SocketAddr::new(ip, port))
+    }
+
     fn message(&mut self) -> Option<&'a [u8]> {
         let remaining = self.bytes.len().checked_sub(self.position)?;
         if remaining > super::MAX_MESSAGE {
@@ -188,7 +260,7 @@ pub(super) fn encode_mode(
         Body::Hello { .. } => 1,
         Body::Challenge { .. } => 2,
         Body::Register { .. } => 3,
-        Body::Registered => 4,
+        Body::Registered { .. } => 4,
         Body::Query { .. } => 5,
         Body::Offer { .. } => 6,
         Body::Probe { .. } => 7,
@@ -196,10 +268,11 @@ pub(super) fn encode_mode(
         Body::Direct { .. } => 9,
         Body::Relay { .. } => 10,
         Body::Delivered { .. } => 11,
-        Body::Discover => 12,
-        Body::Heartbeat => 13,
-        Body::Depart => 14,
-        Body::Denied => 15,
+        Body::Discover { .. } => 12,
+        Body::Heartbeat { .. } => 13,
+        Body::Depart { .. } => 14,
+        Body::Denied { .. } => 15,
+        Body::Confirm { .. } => 16,
     };
     writer.put(&[kind])?;
     writer.name(packet.sender)?;
@@ -238,61 +311,80 @@ fn encode_body(body: Body<'_>, writer: &mut Writer<'_>) -> Option<()> {
             writer.put(&u16::try_from(credential.len()).ok()?.to_be_bytes())?;
             writer.put(credential)?;
         }
-        Body::Registered | Body::Discover | Body::Heartbeat | Body::Depart | Body::Denied => {}
-        Body::Query { peer } => writer.name(peer)?,
+        Body::Registered { proof }
+        | Body::Denied { proof }
+        | Body::Discover { proof }
+        | Body::Heartbeat { proof }
+        | Body::Depart { proof } => writer.put(&proof)?,
+        Body::Query { proof, peer } => {
+            writer.put(&proof)?;
+            writer.name(peer)?;
+        }
         Body::Offer {
+            proof,
             peer,
             session,
             address,
             relay_only,
         } => {
+            if relay_only != address.is_none() {
+                return None;
+            }
+            writer.put(&proof)?;
             writer.name(peer)?;
             writer.put(&session)?;
-            match address.ip() {
-                IpAddr::V4(ip) => {
-                    writer.put(&[4])?;
-                    writer.put(&ip.octets())?;
-                }
-                IpAddr::V6(ip) => {
-                    writer.put(&[6])?;
-                    writer.put(&ip.octets())?;
-                }
-            }
-            writer.put(&address.port().to_be_bytes())?;
+            writer.address(address)?;
             writer.put(&[u8::from(relay_only)])?;
         }
-        Body::Probe { target, nonce } | Body::ProbeAck { target, nonce } => {
+        Body::Probe { target, nonce } => {
             writer.put(&target)?;
             writer.put(&nonce)?;
+        }
+        Body::ProbeAck {
+            target,
+            nonce,
+            capability,
+        } => {
+            writer.put(&target)?;
+            writer.put(&nonce)?;
+            writer.put(&capability)?;
+        }
+        Body::Confirm { target, capability } => {
+            writer.put(&target)?;
+            writer.put(&capability)?;
         }
         Body::Direct {
             peer,
             target,
+            capability,
             message,
+        } => {
+            writer.name(peer)?;
+            writer.put(&target)?;
+            writer.put(&capability)?;
+            writer.message(message)?;
         }
-        | Body::Relay {
+        Body::Relay {
+            proof,
             peer,
             target,
             message,
         } => {
-            if message.len() > super::MAX_MESSAGE {
-                return None;
-            }
+            writer.put(&proof)?;
             writer.name(peer)?;
             writer.put(&target)?;
-            writer.put(message)?;
+            writer.message(message)?;
         }
         Body::Delivered {
+            proof,
             peer,
             session,
             message,
         } => {
-            if message.len() > super::MAX_MESSAGE {
-                return None;
-            }
+            writer.put(&proof)?;
             writer.name(peer)?;
             writer.put(&session)?;
-            writer.put(message)?;
+            writer.message(message)?;
         }
     }
     Some(())
@@ -364,27 +456,32 @@ fn decode_body<'a>(kind: u8, reader: &mut Reader<'a>) -> Option<Body<'a>> {
                 credential: reader.take(length)?,
             }
         }
-        4 => Body::Registered,
+        4 => Body::Registered {
+            proof: reader.token()?,
+        },
         5 => Body::Query {
+            proof: reader.token()?,
             peer: reader.name()?,
         },
         6 => {
+            let proof = reader.token()?;
             let peer = reader.name()?;
             let session = reader.token()?;
-            let ip = match reader.byte()? {
-                4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(reader.take(4)?).ok()?)),
-                6 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(reader.take(16)?).ok()?)),
-                _ => return None,
+            let address = if reader.flag()? {
+                Some(reader.address()?)
+            } else {
+                None
             };
-            let port = u16::from_be_bytes(reader.take(2)?.try_into().ok()?);
-            if port == 0 || ip.is_unspecified() || ip.is_multicast() {
+            let relay_only = reader.flag()?;
+            if relay_only != address.is_none() {
                 return None;
             }
             Body::Offer {
+                proof,
                 peer,
                 session,
-                address: SocketAddr::new(ip, port),
-                relay_only: reader.flag()?,
+                address,
+                relay_only,
             }
         }
         7 => Body::Probe {
@@ -394,26 +491,42 @@ fn decode_body<'a>(kind: u8, reader: &mut Reader<'a>) -> Option<Body<'a>> {
         8 => Body::ProbeAck {
             target: reader.token()?,
             nonce: reader.token()?,
+            capability: reader.token()?,
         },
         9 => Body::Direct {
             peer: reader.name()?,
             target: reader.token()?,
+            capability: reader.token()?,
             message: reader.message()?,
         },
         10 => Body::Relay {
+            proof: reader.token()?,
             peer: reader.name()?,
             target: reader.token()?,
             message: reader.message()?,
         },
         11 => Body::Delivered {
+            proof: reader.token()?,
             peer: reader.name()?,
             session: reader.token()?,
             message: reader.message()?,
         },
-        12 => Body::Discover,
-        13 => Body::Heartbeat,
-        14 => Body::Depart,
-        15 => Body::Denied,
+        12 => Body::Discover {
+            proof: reader.token()?,
+        },
+        13 => Body::Heartbeat {
+            proof: reader.token()?,
+        },
+        14 => Body::Depart {
+            proof: reader.token()?,
+        },
+        15 => Body::Denied {
+            proof: reader.token()?,
+        },
+        16 => Body::Confirm {
+            target: reader.token()?,
+            capability: reader.token()?,
+        },
         _ => return None,
     };
     Some(body)
@@ -436,11 +549,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_typed_variant_round_trips_and_truncation_fails_closed() {
+    fn control_variants() -> [Body<'static>; 12] {
         let address = SocketAddr::from(([127, 0, 0, 1], 1234));
-        let message = [6; super::super::MAX_MESSAGE];
-        let variants = [
+        [
             Body::Hello { nonce: [3; 16] },
             Body::Challenge {
                 nonce: [3; 16],
@@ -452,24 +563,41 @@ mod tests {
                 relay_only: true,
                 credential: &[],
             },
-            Body::Registered,
-            Body::Discover,
-            Body::Heartbeat,
-            Body::Depart,
-            Body::Denied,
-            Body::Query { peer: "beta" },
+            Body::Registered { proof: [9; 16] },
+            Body::Discover { proof: [9; 16] },
+            Body::Heartbeat { proof: [9; 16] },
+            Body::Depart { proof: [9; 16] },
+            Body::Denied { proof: [9; 16] },
+            Body::Query {
+                proof: [9; 16],
+                peer: "beta",
+            },
             Body::Offer {
+                proof: [9; 16],
                 peer: "beta",
                 session: [5; 16],
-                address,
+                address: Some(address),
                 relay_only: false,
             },
             Body::Offer {
+                proof: [9; 16],
                 peer: "beta",
                 session: [5; 16],
-                address: "[::1]:1234".parse().unwrap(),
+                address: Some("[::1]:1234".parse().unwrap()),
+                relay_only: false,
+            },
+            Body::Offer {
+                proof: [9; 16],
+                peer: "beta",
+                session: [5; 16],
+                address: None,
                 relay_only: true,
             },
+        ]
+    }
+
+    fn data_variants(message: &[u8]) -> [Body<'_>; 6] {
+        [
             Body::Probe {
                 target: [5; 16],
                 nonce: [3; 16],
@@ -477,24 +605,46 @@ mod tests {
             Body::ProbeAck {
                 target: [5; 16],
                 nonce: [3; 16],
+                capability: [8; 16],
+            },
+            Body::Confirm {
+                target: [5; 16],
+                capability: [8; 16],
             },
             Body::Direct {
                 peer: "beta",
                 target: [5; 16],
-                message: &message,
+                capability: [8; 16],
+                message,
             },
             Body::Relay {
+                proof: [9; 16],
                 peer: "beta",
                 target: [5; 16],
-                message: &message,
+                message,
             },
             Body::Delivered {
+                proof: [9; 16],
                 peer: "beta",
                 session: [5; 16],
                 message: &[],
             },
-        ];
-        for body in variants {
+        ]
+    }
+
+    #[test]
+    fn every_typed_variant_round_trips_and_truncation_fails_closed() {
+        let message = [6; super::super::MAX_MESSAGE];
+        for body in control_variants()
+            .into_iter()
+            .chain(data_variants(&message))
+        {
+            let mut open = [0; MAX_PACKET];
+            let length = encode_mode(packet(body), None, &mut open).unwrap();
+            let decoded = decode_mode(&open[..length], None).unwrap();
+            let mut round_trip = [0; MAX_PACKET];
+            assert_eq!(encode_mode(decoded, None, &mut round_trip), Some(length));
+            assert_eq!(&open[..length], &round_trip[..length]);
             let mut buffer = [0; MAX_PACKET];
             let length = encode(packet(body), &key(), &mut buffer).unwrap();
             assert!(length <= MAX_PACKET);
@@ -545,7 +695,7 @@ mod tests {
         )
         .unwrap();
         let payload = &buffer[..length - TAG];
-        for kind in [0, 16, 255] {
+        for kind in [0, 17, 255] {
             let mut malformed = payload.to_vec();
             malformed[4] = kind;
             assert!(decode(&signed(&malformed), &key()).is_none());
@@ -579,6 +729,7 @@ mod tests {
             session: [1; 16],
             sequence: 1,
             body: Body::Relay {
+                proof: [9; 16],
                 peer: &name,
                 target: [2; 16],
                 message: &message,
@@ -592,6 +743,7 @@ mod tests {
                 packet(Body::Direct {
                     peer: "beta",
                     target: [0; 16],
+                    capability: [8; 16],
                     message: &oversized
                 }),
                 &key(),
@@ -616,6 +768,7 @@ mod tests {
             packet(Body::Direct {
                 peer: "beta",
                 target: [0; 16],
+                capability: [8; 16],
                 message: &message,
             }),
             &key(),
@@ -625,5 +778,65 @@ mod tests {
         let mut payload = buffer[..length - TAG].to_vec();
         payload.push(0);
         assert!(decode(&signed(&payload), &key()).is_none());
+    }
+
+    #[test]
+    fn clean_wire_cutover_and_keyed_parsing_never_downgrade() {
+        let mut bytes = [0; MAX_PACKET];
+        let length = encode_mode(packet(Body::Hello { nonce: [7; 16] }), None, &mut bytes).unwrap();
+        assert!(decode_mode(&bytes[..length], Some(&key())).is_none());
+        let length = encode(packet(Body::Hello { nonce: [7; 16] }), &key(), &mut bytes).unwrap();
+        assert!(decode_mode(&bytes[..length], None).is_none());
+        let mut old = bytes[..length - TAG].to_vec();
+        old[..4].copy_from_slice(b"GNP2");
+        assert!(decode(&signed(&old), &key()).is_none());
+        assert!(decode_mode(&old, None).is_none());
+    }
+
+    #[test]
+    fn maximum_identity_and_payload_fit_all_data_paths_in_both_modes() {
+        let name = "x".repeat(64);
+        let message = [42; super::super::MAX_MESSAGE];
+        let bodies = [
+            Body::Direct {
+                peer: &name,
+                target: [2; 16],
+                capability: [3; 16],
+                message: &message,
+            },
+            Body::Relay {
+                proof: [4; 16],
+                peer: &name,
+                target: [2; 16],
+                message: &message,
+            },
+            Body::Delivered {
+                proof: [4; 16],
+                peer: &name,
+                session: [2; 16],
+                message: &message,
+            },
+        ];
+        for body in bodies {
+            for keyed in [false, true] {
+                let key = key();
+                let mode = keyed.then_some(&key);
+                let mut bytes = [0; MAX_PACKET];
+                let length = encode_mode(
+                    Packet {
+                        sender: &name,
+                        ..packet(body)
+                    },
+                    mode,
+                    &mut bytes,
+                )
+                .unwrap();
+                assert!(length <= MAX_PACKET);
+                let decoded = decode_mode(&bytes[..length], mode).unwrap();
+                assert!(matches!(decoded.body, Body::Direct { message: got, .. }
+                    | Body::Relay { message: got, .. }
+                    | Body::Delivered { message: got, .. } if got == message));
+            }
+        }
     }
 }

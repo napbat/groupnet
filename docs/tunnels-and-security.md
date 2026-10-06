@@ -94,13 +94,42 @@ Custom policies can require application credentials. A claimed identity and a
 return-routability check do not authenticate a person or prove identity continuity.
 Never send reusable secrets over an unencrypted admission exchange.
 
-The following diagram describes the keyed path; open admission does not acquire
-shared-key authentication merely by using the same routing layer.
+**Keyless** specifically means no provisioned `NetworkKey` (`key: None`); no
+public/private key pair is required by the punching transport either. It does
+not forbid application credentials or separately authenticated TLS streams.
+Fresh random protocol capabilities remain mandatory internal session mechanics,
+not application-managed identity keys.
+
+Path selection is independent of admission and configured-key authentication.
+`PunchConfig::open` defaults to `RelayOnly`; setting its public `policy` field to
+`DirectPreferred` enables punching with relay fallback. A pair stays relay-only
+if either endpoint requests it: neither endpoint is offered the other's socket
+address, and neither sends or accepts direct probes/data for that pair. The
+rendezvous still knows both observed addresses; relay-only is not anonymity
+against the operator or a network observer.
+
+Registration establishes a private control proof that is never included in peer
+discovery records. Established rendezvous requests and responses must match that
+proof before mutating session, sequence, or lease state. Direct paths additionally
+exchange fresh, session-bound challenges and responder capabilities; a discovery
+record alone cannot authorize direct data. Pending/confirmed state is bounded,
+unproven probes cannot replace confirmed receive capabilities or advance data
+replay state, and expired direct paths fall back to a live relay registration.
+Reconnection revokes the old generation and its capabilities.
+
+In keyless mode these capabilities travel without encryption. They constrain
+off-path spoofing; they do not resist an observer who captures them, authenticate
+a claimed identity, or make routing participants trustworthy. The rendezvous is
+trusted to introduce peers. Open admission does not make the fabric Byzantine-safe.
+Database engines and other consumers choose their own trust and authorization
+policies; no application-specific admission policy is imposed by Groupnet.
+
+The following path-selection flow applies with or without a provisioned key:
 
 ```mermaid
 flowchart TD
-    Start["PunchLink configured with peers, rendezvous, and NetworkKey"]
-    Register["Authenticated rendezvous registration\nChallenge response and observed endpoint"]
+    Start["PunchLink configured with rendezvous, admission credentials, optional NetworkKey"]
+    Register["Address-verified, admitted rendezvous session"]
     Policy{"PathPolicy"}
     Probe["DirectPreferred\nExchange discovery information and probe peers"]
     Direct["Usable direct UDP path"]
@@ -121,6 +150,10 @@ configured operation; there is no implicit public relay service. Shared-key
 routing authentication is not confidentiality: use pinned TLS tunnels for
 protected application bytes. Shared-key holders are trusted and can impersonate
 routing aliases; the fabric is not Byzantine-safe.
+
+The native UDP format is `GNP3`; the rendezvous and endpoints must upgrade
+together. Earlier formats and authentication-mode mismatches are rejected
+without compatibility fallback.
 
 ## 4. What each security layer actually grants
 

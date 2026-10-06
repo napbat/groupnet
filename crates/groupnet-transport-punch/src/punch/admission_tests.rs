@@ -20,6 +20,7 @@ struct Raw {
     socket: UdpSocket,
     node: String,
     session: Session,
+    proof: Session,
     sequence: u64,
 }
 
@@ -29,6 +30,7 @@ impl Raw {
             socket: UdpSocket::bind(loopback()).await.unwrap(),
             node,
             session: random().unwrap(),
+            proof: [0; 16],
             sequence: 0,
         }
     }
@@ -82,6 +84,7 @@ impl Raw {
                 cookie,
             } => {
                 assert_eq!(nonce, echoed);
+                self.proof = nonce;
                 (nonce, cookie)
             }
             other => panic!("expected challenge, got {other:?}"),
@@ -143,7 +146,7 @@ async fn open_policy_is_not_invoked_before_address_proof_and_proof_is_single_use
     )
     .await;
     raw.silent().await;
-    raw.send(address, Body::Discover).await;
+    raw.send(address, Body::Discover { proof: raw.proof }).await;
     raw.silent().await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let (nonce, cookie) = raw.challenge(address).await;
@@ -164,7 +167,7 @@ async fn open_policy_is_not_invoked_before_address_proof_and_proof_is_single_use
     let bytes = raw.receive().await;
     assert!(matches!(
         wire::decode_mode(&bytes, None).unwrap().body,
-        Body::Registered
+        Body::Registered { .. }
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     raw.socket.send_to(&registration, address).await.unwrap();
@@ -173,6 +176,7 @@ async fn open_policy_is_not_invoked_before_address_proof_and_proof_is_single_use
     raw.send(
         address,
         Body::Query {
+            proof: raw.proof,
             peer: "not-admitted",
         },
     )
@@ -185,10 +189,11 @@ async fn open_policy_is_not_invoked_before_address_proof_and_proof_is_single_use
     raw.silent().await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     raw.session = original;
-    raw.send(address, Body::Heartbeat).await;
+    raw.send(address, Body::Heartbeat { proof: raw.proof })
+        .await;
     assert!(matches!(
         wire::decode_mode(&raw.receive().await, None).unwrap().body,
-        Body::Registered
+        Body::Registered { .. }
     ));
     relay.close().await;
 }
@@ -245,7 +250,7 @@ async fn policy_concurrency_is_bounded_and_shutdown_drains_every_evaluation() {
     let bytes = overflow.receive().await;
     assert!(matches!(
         wire::decode_mode(&bytes, None).unwrap().body,
-        Body::Denied
+        Body::Denied { .. }
     ));
     assert_eq!(active.load(Ordering::SeqCst), 32);
     relay.close().await;
@@ -390,7 +395,7 @@ async fn unadmitted_session_flood_cannot_starve_live_heartbeats_or_relay() {
         wire::decode_mode(&incumbent.receive().await, None)
             .unwrap()
             .body,
-        Body::Registered
+        Body::Registered { .. }
     ));
     let mut recipient = Raw::new("recipient".into()).await;
     recipient.register(address).await;
@@ -398,20 +403,35 @@ async fn unadmitted_session_flood_cannot_starve_live_heartbeats_or_relay() {
     let mut attacker = Raw::new("incumbent".into()).await;
     for _ in 0..8 {
         for _ in 0..40 {
-            attacker.send(address, Body::Discover).await;
+            attacker
+                .send(
+                    address,
+                    Body::Discover {
+                        proof: attacker.proof,
+                    },
+                )
+                .await;
         }
-        incumbent.send(address, Body::Heartbeat).await;
+        incumbent
+            .send(
+                address,
+                Body::Heartbeat {
+                    proof: incumbent.proof,
+                },
+            )
+            .await;
         assert!(matches!(
             wire::decode_mode(&incumbent.receive().await, None)
                 .unwrap()
                 .body,
-            Body::Registered
+            Body::Registered { .. }
         ));
     }
     incumbent
         .send(
             address,
             Body::Relay {
+                proof: incumbent.proof,
                 peer: "recipient",
                 target: recipient.session,
                 message: b"valid traffic after flood",
