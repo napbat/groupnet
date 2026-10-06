@@ -5,8 +5,8 @@ Instructions for any coding agent working in this repository.
 ## Orientation
 
 groupnet is a deterministic, leaderless-by-default coordination fabric for
-sharded distributed systems. Read `README.md` for the architecture,
-`docs/technical.md` for pinned design contracts, and
+sharded distributed systems. Read `README.md` for usage,
+`docs/README.md` for the architecture and network-lifecycle guides, and
 `docs/consistency-modes.md` for the consistency-modes design — that document
 is the **contract of record** for the Hosted-mode/consistency work and its
 Section 6 is the build order.

@@ -1,30 +1,37 @@
 # Optional runtime for volatile peer index bootstrap
 
-Status: **implementation contract for the next slice; runtime and consumer
-integration pending**. The pure claim, donor journal, and transfer engines are
-specified in [replication-volatile-bootstrap.md](replication-volatile-bootstrap.md)
-and [replication-volatile-transfer.md](replication-volatile-transfer.md).
+[Documentation index](README.md) · [Bootstrap protocol](replication-volatile-bootstrap.md) · [Bulk transport](replication-volatile-bulk.md)
+
+Status: **optional recovery-worker composition, native TTL claim/participation
+source, and bulk donor adapter implemented; S3 fleet consumer integration
+and its acceptance measurements remain pending**. The pure engines and
+transfer contract are in [replication-volatile-bootstrap.md](replication-volatile-bootstrap.md).
 This runtime remains opt-in. The default recovery handle uses its current
 origin rebuild and performs no extra coordination writes to S3.
 
 ## One recovery episode and one worker
 
-Add an opt-in `RecoveryHandle::open_with_bootstrap` constructor with the same
-public safety gate and cancellation semantics as `open_with_rearm`. It accepts
-an owned `BootstrapSetup` containing finite claim, journal, transfer, bulk,
-and global-memory limits, a 128-bit `BootId`, and source, donor, and private
-stage capabilities. Existing `RecoveryAdapter` implementations and callers
-of `open` remain source-compatible; they need not implement transfer methods.
+`RecoveryHandle::open_with_bootstrap` opens the same public safety gate and
+cancellation semantics as `open_with_rearm`, accepting a
+`Box<dyn BootstrapDriver>`. The combined constructor is
+`open_with_bootstrap_and_rearm`. `BootstrapSession::new` constructs the
+concrete driver from `BootstrapCapabilities<C: ClaimSource, D: DonorPort>`,
+`BootstrapRuntimeConfig`, scope, node, a 128-bit `BootId`, and session, and
+returns its bounded `DonorSender`. The capabilities share a `ByteAdmission`;
+configuration pins finite claim/transfer, observation, and inbox limits,
+including `require_participation`. Journal/capture and bulk limits are pinned
+by their respective bindings. Existing `RecoveryAdapter` implementations
+and callers of `open` need not implement transfer methods.
 An application may inject a boot identity for tests. Production s3cache fleet
-mode obtains one token per process start from the operating system CSPRNG;
+integration must obtain one token per process start from the operating system CSPRNG;
 failure disables peer bootstrap and leaves guarded origin recovery available.
 An operator-backed monotonic incarnation provider is also valid. A wall
 clock sample or resettable process counter is not.
 
 The existing recovery worker alone drives the selected `ClaimEngine` and
 its `TransferSession` child. There is no spawned per-bucket claim loop and no
-application-owned retry state machine. Add a pure recovery effect for
-`AcquireBaseline { op }` after a full invalidation when bootstrap is enabled;
+application-owned retry state machine. With bootstrap enabled the pure
+recovery engine emits `AcquireBaseline { op }` after full invalidation;
 the default configuration still emits `RebuildOrigin`. The shell drives the
 claim/transfer effects under the current recovery generation and the
 `AcquireBaseline` operation's deadline, which is the episode's `total_ms`
@@ -126,16 +133,17 @@ claim renewal without new progress arrives, or the worker waits for cleanup.
 
 ## Bounded capability surface
 
-`BootstrapSetup` contains an object-safe `ClaimSource` that can publish and
-withdraw native TTL claims, return a **complete** member/claim snapshot with
-count and identity-byte limits enforced before allocation, and refresh one
-exact selected claim from native TTL storage. It distinguishes absent from
-unreadable or malformed observations. Claims and gossip are liveness hints;
+`BootstrapCapabilities` shares the claim source, donor port and byte admission
+with the session. `ClaimSource` publishes and withdraws native TTL claims,
+returns a **complete** member/claim snapshot with count and identity-byte
+limits enforced before allocation, and refreshes one exact selected claim
+from native TTL storage. It distinguishes absent from unreadable or malformed
+observations. Claims and gossip are liveness hints;
 they cannot certify origin freshness or absence. The current live lease and
 write-feed implementation continues running while a follower is origin
 routed or waiting for a donor.
 
-An opt-in `DonorSource` supplies typed offer, reservation, sequential chunk,
+`DonorPort` supplies typed offer, reservation, sequential chunk,
 attachment, atomic barrier, bounded batch, exact ack/readback, and native
 coverage operations. The donor journal is captured under the application's
 index publication lock: first reserve real encoded, decoded, suffix, and
@@ -188,7 +196,7 @@ attached native stream; applies the bounded buffered effects not covered by
 B; swaps the private index; and switches the normal feed applier
 to that installed index. There is **no interval** between candidate swap and
 normal-feed ownership in which an arriving native event can be discarded or
-applied only to the old index. A new typed `NativeHandoffReceipt` binds the
+applied only to the old index. `NativeHandoffReceipt` binds the
 transfer parent, exact B/cuts, native attachment incarnation and contiguous
 position (including valid position zero for a quiet feed), fresh
 normal-applier generation, exact accepted schema, and bounded buffer charge.
@@ -290,7 +298,7 @@ default or optional peer-bootstrap mode.
 
 The current S3 `WriteSync` owns one recovery handle and one `KeyIndex`; its
 `rebuild_origin` walks the bounded union of configured buckets and current
-`KeyIndex` bucket names. The first fleet slice therefore claims **one
+`KeyIndex` bucket names. The S3 integration contract therefore claims **one
 whole-index scope per `WriteSync`**, not a fictitious per-bucket recovery
 handle. Its partition identity is a canonical, length-prefixed encoding of
 that exact sorted union, index schema, and the configured origin
@@ -302,8 +310,8 @@ the declared scope-byte limit exactly; it is never truncated or replaced by
 an unchecked short hash. A changed bucket universe cannot adopt an old donor
 image. A deployment whose complete union exceeds the scope, image, capture,
 or global memory caps uses its existing guarded origin path. This makes the
-first slice finite as bucket count grows; splitting into independent bucket
-scopes requires a later explicit recovery-handle and publication-gate design.
+consumer integration finite as bucket count grows; splitting into independent
+bucket scopes requires an explicit recovery-handle and publication-gate design.
 
 The local provisional builder may publish a `Ready` claim only after the
 guarded origin scan finished every bucket, the bounded private capture is
@@ -315,24 +323,21 @@ authority. When the capture or global admission expires, withdraw or let the
 claim expire and reject new reservations. Continued local serving still
 depends on the ordinary recovery, lease, and application gates.
 
-## First implementation and verification slices
+## Implementation status and consumer acceptance
 
-1. Extend the pure recovery engine with optional baseline acquisition and
-   typed declined/installed transitions, preserving one original total
-   deadline and existing default outputs. Test gap, lapse, rearm, cancel,
-   donor timeout, local build, and origin fallback in deterministic schedules.
-2. Add the thin claim/transfer driver to the existing recovery worker with
-   bounded source callbacks and a shared byte admission object. In-memory
-   fault tests hold a chunk, source callback, and install callback across a
-   gap or cancellation; none may publish. Exercise a late native DELETE and
-   an origin-validated repair between B and handoff, equal-time cross-writer
-   overlap that must abort, cancellation racing the publication critical
-   section, and concurrent body fill. An installed candidate must have every
-   source effect exactly once or remain unservable; stale callbacks cannot
-   replace it. Verify follower lease and feed ingestion continue while reads
-   route to origin. Measure concurrent scope memory and source-call counts
-   against configured bounds.
-3. Wire the S3 index adapter under an explicit fleet opt-in. The normal
+The optional recovery transitions, `BootstrapSession` worker composition,
+shared byte admission, `NativeClaimSource`, and `BulkDonorPort` exist.
+`volatile_bootstrap_runtime.rs` and its scenario children exercise baseline
+acquisition, expiry, stale install, cancellation, donor withdrawal, slow build
+progress, presence maintenance, and roster recapture. Core receipt types bind
+the exact outer recovery operation and child handoff. Bulk adapter tests
+exercise all generic journal request branches over `MemBulkNet`, including
+nonempty suffix and B2/ack readback. These are reusable protocol implementation
+evidence, not a claim of completed S3 consumer integration.
+
+The S3 acceptance boundary remains:
+
+1. Wire the index adapter under an explicit fleet opt-in. The normal
    connected cold fleet elects one provisional origin builder after claim
    convergence; followers transfer and then independently affirm. A failed
    builder permits takeover, while partitioned duplicates remain safe. A
@@ -341,7 +346,158 @@ depends on the ordinary recovery, lease, and application gates.
    assert exact GET/LIST behavior, no control writes to the origin bucket,
    private-image deletion order, and local-hit availability after recovery.
 
-All three slices require the repository's feature-specific tests, strict
-Clippy, formatting, docs, and deterministic fault schedules before claiming
-fleet bootstrap complete. The design does not provide event-complete
-subscriptions or a durable source cursor for S3's ordinary object writes.
+Consumer acceptance requires the repository's feature-specific checks,
+deterministic fault schedules, and measurements before claiming fleet
+bootstrap complete. It must exercise a late native DELETE and local
+origin-validated repair between B and handoff, incomparable equal-time
+cross-writer overlap, cancellation racing publication, concurrent body fill,
+and multiworker faults. Every source effect must appear exactly once or the
+candidate remain unservable. Follower lease/feed ingestion continues while
+reads route to origin; concurrent-scope memory and source-call counts must fit
+configured bounds. This design supplies neither event-complete subscriptions
+nor a durable source cursor for S3's ordinary object writes.
+
+## Native TTL source for volatile bootstrap
+
+`NativeClaimSource` is implemented as an optional Groupnet-backed claim and
+participation adapter. It does not make claims, membership, or a donor image
+authoritative for S3 object state. S3 fleet consumer adoption remains pending;
+default s3cache operation still writes no coordination metadata to S3 or to a
+separate control store.
+
+### One coherent, bounded observation
+
+`Group::set_entry` and `delete_entry` enqueue app-state commands and
+`Group::node_entry` reads a byte-only watch snapshot. That watch does not
+contain the entry's observer-local expiry, and `node_entries` clones values
+before a caller can cap them. `statuses_held_bounded` bounds a roster but is a
+separate watch, so pairing it with entries is not one actor-state cut. The
+native adapter therefore uses generic async actor-side inspection in
+`groupnet-runtime`, with no dependency on `groupnet-consistency`:
+`Group::inspect_scoped_entry<B: EntryBudget>` returns
+`Result<(InspectedEntries, B), EntryInspectionError>`. Its participation-aware
+counterpart, `inspect_scoped_pair`, returns `InspectedPair` from a fixed
+two-key cut; the complete roster contract is in
+[membership binding](replication-volatile-membership.md).
+`EntryBudget: Any + Send` exposes the owned reservation's `bytes()`.
+
+The caller validates the scoped key length and reserves the complete maximum
+response budget **before enqueueing** inspection. The generic runtime query
+carries that owned, type-erased reservation through its bounded actor inbox,
+the actor's response allocation, and the oneshot reply. The adapter recovers
+the reservation and turns the response into its admitted `ClaimSnapshot`;
+if its awaiting future is cancelled, the queued command or reply still owns
+the reservation until its cloned bytes are dropped. The actor validates the
+requested cap against the supplied budget without depending on
+`groupnet-consistency` for accounting. A response with no surviving receiver
+is dropped with its charge.
+
+This pool bounds source-owned commands, response bytes, decoded observations
+and retained published values, not the Group engine's adopted entry storage
+or watch snapshots. Deployments must separately bound configured scope/claim
+count.
+
+The actor samples its current `GroupEngine` membership and exactly that key
+for every retained member at one logical time. It checks member count, each
+`NodeId` byte length, each value byte length, and the checked sum of value,
+identity, and fixed record charges **before cloning** any member or value. It
+then returns bounded status, optional value, the entry's remaining native
+TTL, and its local monotonic sample instant. Overflow, unavailable actor,
+unreadable state, and an unrepresentable clock result are typed failures;
+none means an empty claim. An expired entry is absent even if the next engine
+reap has not run. A present entry without finite TTL is not a valid claim.
+The same bounded actor query handles exact selected-claim refresh; no
+adapter-owned polling roster or unbounded `LIST` exists. An actor inspection
+is a local snapshot, not a fleet barrier.
+
+`ClaimSource::observe_claims` maps the complete inspected roster and valid
+claims into the existing admitted result. Alive status supplies provisional
+eligibility; Suspect/Dead remain visible but ineligible. A malformed present
+claim, mismatched scope/policy, duplicate identity, or omitted member is an
+error rather than silence. The `ClaimSource` returns the sample instant with
+both full-roster and selected-claim observations. After the await,
+`BootstrapSession` first ticks its own logical clock, then subtracts elapsed
+actor-to-core transit from each sampled remaining TTL, rounding elapsed
+milliseconds **up** and allowing one extra millisecond for the actor's
+logical-time quantization. Zero remaining time is absence/expiry. The worker
+passes only this aged duration into `ClaimEngine`, which adds it to its own
+logical `Time`; it never compares the Group actor's time origin with its own,
+or one node's wall clock with another's. The core's high-water renewal rule
+remains decisive: repeated observation of the same claim revision cannot
+restart its lifetime merely because gossip arrived again.
+
+### Entry identity and exact withdrawal
+
+One node-owned entry key is derived from a length-delimited encoding of
+`BootstrapScope`, under a reserved bootstrap namespace. The bounded value
+contains a codec version, exact scope and policy fingerprint, `NodeId`,
+128-bit boot nonce, session, attempt, renewal, phase, build progress, and no wall-clock
+deadline. `Group::set_entry` supplies a finite TTL duration; each observer
+measures remaining life on its own monotonic clock. The codec rejects trailing
+bytes, oversized fields, unknown versions, zero identity components, and a
+value whose embedded scope disagrees with the requested key. It adds no new
+frame kind and changes no existing `EntryDelta` body.
+
+Local enqueue success is not proof that a claim was adopted.
+`Group::set_entry_confirmed` acknowledges actor adoption; an unknown outcome
+is read back through the bounded actor query before reporting publish
+success. The actor samples current monotonic time before arming a confirmed
+claim TTL, publishes the resulting view, then acknowledges; it must not use a
+stale prior periodic-tick stamp for a newly written TTL. An ambiguous
+acknowledgment may be read back by exact value and
+identity. It cannot be reinterpreted as network-wide agreement. Publication
+failure stops this provisional selection episode or causes bounded core
+fallback to origin, never an unbounded source retry loop.
+
+`WithdrawClaim` must not delete a newer local claim on the same key. The
+generic actor command conditionally deletes only when its current value
+matches the caller's last exact published value. The source retains that
+bounded value and serializes local publish/withdraw enqueueing. An old
+incarnation's delayed withdrawal is harmless after a new value replaces it.
+Remote duplicate nodes or partitions can still create competing provisional
+builders; their images remain private until the independent recovery and
+serving gates affirm. Claim expiry/withdrawal does not revoke healthy local
+read permission by itself.
+
+### Wakeup, transport, and tests
+
+The existing `NodeStateChanged`/`MembershipChanged` stream is only a coalesced
+wakeup. On lag, the worker repeats the complete bounded actor inspection;
+core `Tick` keeps finite observation and claim-expiry deadlines even when
+every wakeup is lost. Source reads/publishes are charged to exact child
+operations, never to a fresh outer deadline. `ClaimSource` remains a reusable
+Groupnet capability. The existing recovery worker drives the paired bulk
+protocol as well; no application claim loop or mandatory S3 control object is
+introduced.
+
+### Bounded bulk request/reply
+
+The [bulk data-plane contract](replication-volatile-bulk.md) owns the framing,
+codec and donor adapter details. Both receive and send are bounded to the
+operation's caps; the codec does not alter control-plane `FRAME_VERSION` or
+Hosted handoff bodies. Requests bind complete scope/identities and parent/
+child operations; typed replies, exact capture/reservation/barrier correlation,
+in-band termination and an end-of-stream check are mandatory. Admission
+precedes every frame read and decoded clone.
+
+The donor worker samples its journal under the short ingress lock and sends
+owned admitted buffers off-lock. Full inbox capacity is a typed refusal.
+Offer/barrier metadata and chunk/batch copies retain charges through send or
+cancellation. Connect, request, reply and send use the original correlated
+deadline; only the core decides retry/readback. No claim, response, EOF, or
+matching head grants reads.
+
+`volatile_native_claims.rs` exercises actor-backed native publication,
+participation, expiry, malformed-present versus absent, exact withdrawal,
+and restarted identities. Runtime, bulk codec/fault, and adapter suites
+exercise correlation, cancellation and admission ownership. Those suites
+establish reusable protocol behavior, not S3 fleet acceptance.
+
+Consumer/multiworker acceptance must still partition/heal claim gossip,
+drop/duplicate wakeups, expire a builder, and show one connected builder
+under timely convergence with finite takeover otherwise. No claim or donor
+Ready event may open serving without separate recovery and native-feed
+handoff proof. Fault schedules must inject truncated, duplicated and
+wrong-operation frames, stalled sends, a full donor inbox, lost reservation
+response, and cancellation during install; charges retire and neither EOF
+nor matching peer heads can install or serve an incomplete image.

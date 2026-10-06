@@ -1,6 +1,10 @@
 # Volatile peer-bootstrap membership binding
 
-Status: accepted contract, implemented in the opt-in volatile bootstrap slice.
+[Documentation index](README.md) · [Bootstrap protocol](replication-volatile-bootstrap.md) · [Native claim source](replication-volatile-transfer-runtime.md#native-ttl-source-for-volatile-bootstrap)
+
+Status: **native participation source, membership-bound capture/recapture,
+and worker maintenance implemented; S3 fleet consumer integration remains
+pending**. This contract does not itself establish S3 deployment readiness.
 
 Builder claims and membership are different lifetimes. A follower withdraws
 its builder claim after transfer, while it remains a healthy Groupnet member.
@@ -238,10 +242,11 @@ Each attempt's cut at C is taken under the publication fence and the index
 write lock, and C must stay one atomic cut with its journal ingress and native
 cuts. A runtime task needing either waits meanwhile, so a node on one runtime
 worker pauses for as long as C holds them, and a pause past the lease makes
-the capture cause its own lapse. The consumer therefore keeps C to O(1) work
-in its row count: the S3 consumer sizes the image from per-bucket tallies its
-index keeps current and snapshots persistent maps that share their nodes with
-the live index, then measures and encodes that snapshot off-lock.
+the capture cause its own lapse. The consumer therefore must keep C to O(1)
+work in its row count. For S3 this requires sizing the image from maintained
+per-bucket index tallies and snapshotting structurally shared persistent maps,
+then measuring and encoding that snapshot off-lock. These are consumer
+integration obligations, not evidence supplied by the generic worker.
 While the worker awaits any adapter operation that does not itself drive the
 bootstrap child (invalidation, the origin rebuild, peer observation and
 frontier waits), it keeps the child's maintenance turns running on the
@@ -294,12 +299,10 @@ A transfer the donor refuses or that fails verification (`Continuity`,
 `Stale`, a schema or capacity refusal) excludes that exact claim attempt; it
 does not grant another use of its C. A transfer operation that only failed
 or timed out (`Unavailable`) is no verdict on the image: the request may
-never have reached the donor. On 2026-10-01 a rolling update's follower lost
-one of about 1,750 per-chunk connections to the donor, because its Windows
-host reused a local port still in `TIME_WAIT` toward the same donor
-endpoint (Tcpip event 4227), and the healthy donor, never seeing the
-request, kept advertising the attempt the follower had excluded: the
-follower waited out the donor wait and scanned the origin. Such an attempt
+never have reached the donor. A transient connection failure on an otherwise
+healthy donor is not a continuity verdict; excluding its still-live claim
+would make a follower wait out the donor bound and scan origin unnecessarily.
+Such an attempt
 therefore stays eligible while the first Ready selection's donor-wait
 deadline holds. The follower samples a fresh complete cut one observation
 interval later and transfers from that attempt again if it is still live

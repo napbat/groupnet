@@ -1,8 +1,17 @@
 # Durable named subscriptions and required acknowledgements
 
+[Documentation index](README.md) · [Replication contract](replication.md)
+
+**Navigation:** [status](#implementation-status) ·
+[observable contract](#observable-contract) ·
+[registration and retention](#register-retain-deliver-acknowledge) ·
+[required waits](#named-required-acknowledgement-waits) ·
+[public API](#public-api-and-ownership) ·
+[wait runtime](#named-acknowledgement-wait-runtime).
+
 ## Implementation status
 
-The first delivery slice implements explicit `StartAt` and `ResumeExisting`,
+The delivery core and runtime implement explicit `StartAt` and `ResumeExisting`,
 source registration and exact ambiguous-outcome readback, durable sink epoch
 binding, protected replay, and source acknowledgement after durable sink
 application. `with_event_complete` adds these opt-in capabilities to the
@@ -17,18 +26,20 @@ source-current durable ack without a healthy sink. Source expiry or a proven
 retention gap stops delivery immediately. A separate bounded terminal-ledger
 read exposes a source-certified tombstone, and `ResetAt` atomically compares it
 before claiming a new lineage with a higher persistent ordinal. Unknown
-terminal writes remain unconfirmed until exact readback. A queued 64-seed
+terminal writes remain unconfirmed until exact readback. A 64-seed
 virtual-time test covers lost, delayed, duplicated and reordered delivery
 responses, crash after durable sink effects before source ack, higher-epoch
-resume, and healed progress without duplicate effects. Production
-retained-history adapters and consumer migration remain unfinished.
+resume, and healed progress without duplicate effects. Production retained-history
+adapters and consumer migration remain unfinished. Source-certified fixed-roster
+acknowledgement waits are implemented separately from durable delivery; see
+[the runtime contract](#named-acknowledgement-wait-runtime).
 
 A confirmed unsubscribe releases the named lineage's source retention. It
 does not roll back sink effects or prove that an already-issued remote sink
 transaction has quiesced; sink transactions must still enforce their durable
 epoch and previous-cursor conditions. Detached unsubscribe does no sink I/O.
 
-Status: **accepted contract with core and in-memory runtime implementation**. This refines
+This accepted core/runtime contract refines
 [replication.md](replication.md#3-subscription-guarantees-and-retention). It
 adds an opt-in `EventComplete` capability above source-backed replay. It does
 not change the existing attach-at-head feed, make `StateSync` snapshots count
@@ -162,7 +173,7 @@ names its proof kind and exact scope/history.
    persist expiry keeps retention or fails closed; it cannot silently skip.
    Ambiguous expiry is read back before the source reclaims history.
 
-The first implementation requires an adapter capability that interlocks
+The implemented capability requires an adapter interlock between
 registration, subscriber cursor updates, terminal expiry, and native history
 retirement. If the source cannot provide that interlock, the builder rejects
 `EventComplete`. The source's total retained byte/event/age budgets and its
@@ -192,7 +203,7 @@ the specific intent and prior admission being fenced; it does not assert an
 index rebuild. Materialization refers to an exact source-native cursor and
 query-visible effects. `ReadPermitted` remains a separate read-policy result.
 An ack from a restarted process with the same stable name cannot satisfy the
-old wait by name alone; the first slice waits for its pinned epoch or times
+old wait by name alone; the implemented wait uses its pinned epoch or times
 out.
 
 The sans-IO wait core returns `Satisfied`, `Pending { waiting }`,
@@ -203,13 +214,13 @@ does not cancel an externally committed write or erase its durable event.
 Timeout reports the unmet identities and degradation without claiming the
 selected guarantee or rolling back the source commit. The write result
 reports `SourceCommitted`/unknown commit separately from this wait outcome.
-The first slice permits one active named wait per scope with bounded batch
+The runtime permits one active named wait per scope with bounded batch
 targets; concurrent waits receive backpressure instead of creating an
 unbounded operation map.
 
 For a strong write waiting on **current lease holders**, gossip membership is
 not a sound roster. The source-ordered admission protocol in
-[replication-admission.md](replication-admission.md) supplies an intent-bound
+[replication.md](replication.md#source-ordered-admission-decision-core) supplies an intent-bound
 reader set and join fence. Earlier admissions must acknowledge the exact
 invalidation or conservatively lapse; later admissions inherit the pending
 intent before serving. The wait core consumes that certified roster/proof and
@@ -220,22 +231,21 @@ Admission-lapse fallback uses the checked `ExpiryTiming` clock-rate and
 quantization-margin policy from the admission core; gossip lease timestamps
 cannot provide that proof.
 
-## Smallest implementable API slice
+## Public API and ownership
 
-Keep the existing `StateSync` manager's per-scope registration. Register
-`EventComplete` sessions separately by `(Scope, SubscriberId)` so two named
-consumers of one source partition have independent protected cursors,
-incarnations, and retry budgets. Each uses the same `SessionEngine`
-implementation and its existing `(session, generation, token)` allocator;
-add an internal `EventSubscription` facet and `AckWait` facet with bounded
-state, not a third token space, second replay scheduler, or global
-coordinator. The initial core
-states are `Registering`, `BindingSink`, `Protected`, `Scanning`, `Delivering`, `Acking`,
+`StateSync` keeps its per-scope registration. `EventComplete` sessions register
+separately by `(Scope, SubscriberId)` so two named consumers of one source
+partition have independent protected cursors, incarnations, and retry budgets.
+Each uses the same `SessionEngine` implementation and its existing
+`(session, generation, token)` allocator. The internal subscription and ack-wait
+facets retain bounded state; they do not create another token space, replay
+scheduler, or global coordinator. Subscription stages include `Registering`,
+`BindingSink`, `Protected`, `Scanning`, `Delivering`, `Acking`,
 `ReadingBackAck`, `RetryWait`, `Expired`, and `Cancelled`. Every effect has
-one absolute deadline covering capacity wait and adapter I/O. The core
-retains bounded cursor/proof/identity metadata only; native records and
-transactions stay with the worker. Separate source/application capability
-traits preserve the existing replay-only adapters:
+one absolute deadline covering capacity wait and adapter I/O. The core retains
+bounded cursor/proof/identity metadata only; native records and transactions
+stay with the worker. Separate source/application capability traits preserve
+the replay-only adapters.
 
 `RegisterReceipt` binds the key, new source epoch, monotonic fence ordinal,
 protected native cursor, policy fingerprint, and exact register request.
@@ -245,47 +255,43 @@ application cursor. The core accepts
 exact registration; all later apply receipts bind the same epoch and expected
 previous cursor.
 
+The implemented traits are in
+[`subscription_api.rs`](../crates/groupnet-consistency/src/replication/subscription_api.rs).
+`DurableSubscriptionSource: SourceAdapter` provides `read_current_subscriber`,
+`register_subscriber`, exact `read_subscriber_registration`, `subscriber_tail`,
+`scan_subscriber`, `commit_subscriber_ack`, exact `read_subscriber_ack`,
+`commit_subscriber_terminal`, exact `read_subscriber_terminal`, and
+`read_current_terminal`. `SubscriptionSourceResult` distinguishes accepted
+conditional writes, conclusive no-write rejections, and ambiguous failures.
+`DurableEventSink<P, B>` provides `bind_subscriber_epoch` and
+`apply_subscriber_batch`; the latter takes both the batch's native interval and
+the previous sink cursor, and persists the stable source-ack request ID with
+the effects. Standard futures keep typed native records in the adapter.
+
+The [manager API](../crates/groupnet-consistency/src/replication/shell/event_complete.rs)
+uses an explicit fresh nonzero session incarnation:
+
 ```rust,ignore
-trait DurableSubscriptionSource: SourceAdapter {
-    // Each result includes source history, exact request binding and proof.
-    async fn register(&self, key: SubscriberKey, start: Cursor,
-                      policy: RetentionPolicy, request_id: RegisterRequestId,
-                      op: Operation) -> RegisterReceipt;
-    async fn read_registration(&self, key: SubscriberKey,
-                               request_id: RegisterRequestId,
-                               op: Operation) -> RegisterReceipt;
-    async fn protected_tail(&self, key: SubscriberKey, op: Operation) -> SourceProof;
-    async fn scan_protected(&self, key: SubscriberKey, from: Cursor,
-                            limit: ScanLimit, op: Operation) -> ContiguousBatch;
-    async fn commit_ack(&self, key: SubscriberKey, prior: Cursor, through: Cursor,
-                        request_id: AckRequestId, op: Operation) -> AckCommit;
-    async fn read_ack(&self, key: SubscriberKey, request_id: AckRequestId,
-                      op: Operation) -> AckCommit;
-    async fn expire_or_unsubscribe(&self, key: SubscriberKey,
-                                   request_id: TerminalRequestId, op: Operation)
-        -> TerminalReceipt;
-    async fn read_terminal(&self, key: SubscriberKey,
-                           request_id: TerminalRequestId, op: Operation)
-        -> TerminalReceipt;
-}
-trait DurableEventSink<P, R> {
-    // Atomically bind the source registration epoch and recovered app cursor
-    // in the sink's durable fence before delivery or source ack.
-    async fn bind_epoch(&self, registration: RegisterReceipt,
-                        permit: &InstallPermit) -> FencedCheckpoint<P>;
-    // Conditional exact state/effects + cursor transaction, or equivalent
-    // monotonic ordered idempotency proof; permit checks local lifecycle.
-    async fn apply_and_checkpoint(&self, key: SubscriberKey,
-                                  epoch: SubscriptionEpoch, previous: P,
-                                  records: &[R], through: P,
-                                  permit: &InstallPermit) -> DurableApplyReceipt<P>;
-}
-handle.event_complete(subscriber_id, retention_policy, explicit_start)?;
-handle.wait_for_acks(wait_id, committed_target, fixed_required_set,
-                     ApplyProof::Invalidated, deadline, cancellation)?;
+let subscriptions = replication.with_event_complete(sink, subscription_limits)?;
+let handle = subscriptions.open_named(
+    &scope,
+    subscriber_id,
+    fresh_session_id,
+    SubscriptionStart::StartAt { position, policy, request_id },
+)?;
+// Restart: ResumeExisting { policy, request_id }.
+// Terminal reset: ResetAt { position, policy, request_id, prior: tombstone }.
 ```
 
-The first runtime adapter can use shardstore's CAS log and native checkpoint
+`NamedSubscriptionHandle` reports source ack separately from sink cursor and
+terminal state. Local cancellation/conditional close retain source protection;
+bounded unsubscribe writes an exact durable tombstone. Detached unsubscribe
+reads the source-current ack and performs no sink I/O. Terminal inspection is
+read-only; only a later conditional `ResetAt` comparing that exact tombstone
+can claim a new lineage. Named waits use the separate
+[`wait_named`](#boundary-and-public-shape) API, not a durable-delivery shortcut.
+
+A shardstore adapter can use its CAS log and native checkpoint
 retention, with its batch positions or whole-batch atomicity declaration and
 unknown-outcome readback. It must prove native protected-history behavior
 before enabling EventComplete. A source-backed ack ledger may be required for
@@ -329,3 +335,153 @@ unknown responses; wire codec tests are added only if new control frames are
 actually introduced. Before consumer migration, measure retained bytes,
 source scan/readback requests, ack wait latency, and slow-subscriber
 backpressure as subscriber and stream counts rise.
+
+Evidence entry points:
+[core subscription transitions](../crates/groupnet-core/src/replication/session/subscription.rs),
+[terminal transitions](../crates/groupnet-core/src/replication/session/subscription/terminal.rs),
+[seeded delivery schedules](../crates/groupnet-sim/tests/replication_subscription_delivery.rs),
+[queued fault schedules](../crates/groupnet-sim/tests/replication_subscription_faults.rs),
+and [runtime adapter scenarios](../crates/groupnet-consistency/tests/replication_event_complete.rs).
+They do not establish retention or atomic sink behavior for a production
+consumer adapter.
+
+## Named acknowledgement wait runtime
+
+Status: **implemented fixed-roster core/runtime support**. This runtime waits
+on source-certified evidence; it does not register durable `EventComplete`
+subscribers or infer lease-holder eligibility from gossip. Existing replay,
+native snapshot adapters, and wire formats remain unchanged.
+
+### Boundary and public shape
+
+`SessionHandle::wait_named(request, deadline)` accepts a runtime request
+envelope whose `CertifiedRoster` was obtained from the authoritative source.
+The envelope contains all `AckWaitRequest` fields except its core-clock
+`due`; callers cannot know the worker's clock origin. The request includes a
+stable caller request ID, exact target and source history, proof kind
+(`Invalidated` or `Materialized`), policy version, and the fixed bounded set of
+subscriber names with pinned incarnations and registration epochs. The runtime
+never turns a current peer list into that set. The handle returns the core's
+typed `AckWaitOutcome` plus the wait's exact target and proof kind; a timeout or
+cancelled wait does not change the result of the external write. A second active
+wait on the same session is backpressured. The caller must retain its request
+ID for retry/readback; this API does not claim durable wait recovery after
+process loss.
+
+The public method samples its monotonic `deadline` **before enqueue**. The
+worker converts that original deadline to core-logical `due` before source
+certification. Certification, capacity admission, and observation consume
+that same absolute budget; each source call ends by the earlier of the wait
+deadline and the normal operation timeout. An expired request is never started
+merely because certification returned.
+
+The opt-in bridge is attached to a `Replication` manager once, before any
+session opens, so existing `SourceAdapter`, `ApplicationAdapter`, and snapshot
+mode signatures stay source compatible. The public shape is:
+
+```rust,ignore
+pub trait AckEvidenceSource: Send + Sync + 'static {
+    fn certify<'a>(&'a self, request: &'a NamedAckRequest,
+                   limits: AckWaitLimits)
+        -> Pin<Box<dyn Future<Output = Result<(), AckSourceFailure>> + Send + 'a>>;
+    fn observe<'a>(&'a self, request: &'a AckWaitRequest, poll: Operation,
+                   waiting: &'a [RequiredSubscriber], limits: AckWaitLimits)
+        -> Pin<Box<dyn Future<Output = Result<AckObservation, AckSourceFailure>> + Send + 'a>>;
+}
+pub enum AckObservation {
+    Evidence(Box<AckEvidence>),
+    Pending,
+    AuthorityLost,
+}
+let manager = manager.with_ack_evidence(source, limits)?; // before open()
+handle.wait_named(request, deadline).await;
+```
+
+`certify` verifies the certificate and every pinned registration against the
+source, including scope, history, target, proof kind, policy version, and
+source epoch. `observe` checks the same binding for each acknowledgement;
+the sans-IO core additionally checks exact equality against the active wait
+and rejects duplicate, stale, wrong-kind, and cross-generation evidence. A
+peer's unsigned assertion is never passed as trusted evidence. The bridge
+uses boxed **standard futures** for object-safe opt-in dispatch; it stores no
+erased native records and uses no runtime downcasts. Invalid source evidence
+fails closed as authority loss or terminal adapter failure. Source uncertainty
+never counts as an acknowledgement.
+
+The bridge returns at most one bounded acknowledgement per observation. Each
+query includes the current unmet subset so a stateless source does not keep
+returning an already counted member. `NamedAckResult` binds the request ID,
+exact target, proof kind, and outcome. A timeout reports the last core-confirmed
+unmet identities, including when the caller deadline fires while I/O is blocked.
+Source operations share the existing global operation semaphore, absolute
+operation deadline, and FIFO worker turn with replay and snapshot work. A
+slow source call cannot hold the whole manager's capacity; its future must
+be cancellation-safe. Certification and each observation also carry their
+own bounded byte/identity limits and consume a finite worker queue slot.
+The manager checks `AckWaitLimits` and request metadata before accepting
+work; no source call may allocate an unbounded roster or proof. A certified
+roster larger than the limit is rejected, not truncated. Pending certification
+occupies the session's **one active wait slot**. Even an empty roster needs
+source certification; the shell cannot infer satisfaction.
+
+### Core-driven lifecycle
+
+The manager's per-scope worker retains the current `SessionEngine` and its
+`(session, generation, token)` allocator. It sends `StartAckWait` only after
+source certification. The core holds one stable wait operation for
+cancellation/outcome and allocates a **fresh poll operation** for every
+`ObserveNamedAcks` effect. Both use that same allocator; a delayed empty poll
+cannot clear or satisfy a later poll. The core emits an absolute timer for
+each poll, capped at the earlier of its attempt timeout and whole-wait
+deadline, and eventually `AckWaitFinished` for the stable wait operation.
+The worker forwards only source-verified `AckObserved` or `AckAuthorityLost`
+replies, after advancing the core's logical clock and checking that the
+poll operation is still current. `AckAuthorityLost` and `CancelAckWait` bind
+the stable wait operation. Empty source checks have an explicit core event
+and finite core-scheduled next poll; neither hints nor replay progress are
+needed to discover a later acknowledgement. An empty poll returns `AckChecked`;
+the core arms the next poll at the finite configured `poll_ms`, capped by the
+original wait deadline. A source hint may coalesce an earlier check without
+changing the roster or deadline.
+
+Cancellation ends only this wait and releases its waiter; it cannot cancel a
+committed source mutation or revoke a live state-sync session. The worker
+resolves all waiters on manager close, driver failure, cancellation, and timeout
+so no caller can hang after its bounded deadline. Cancellation, timeout, and
+dropped caller futures fence only their exact wait envelope, including while
+certification is stalled. Pre-start shell correlation uses a local request
+generation plus the caller's stable request ID, never a fabricated protocol
+`Operation`. Once certified, the core's operation is the sole protocol token.
+Stale cancellation from an old envelope cannot cancel a later wait on the same
+scope.
+
+The wait target is source-native and opaque. `Invalidated` evidence is tied
+to the exact intent and admission being fenced; `Materialized` evidence is
+tied to the exact native cursor and query-visible effect. Neither kind is
+substituted for the other, nor does a satisfied wait itself grant local read
+permission. Loss of the source certificate returns `AuthorityLost`. A local
+state-sync `Authority(false)` only closes that session's read path; it cannot
+negate source-certified evidence for an external committed target. The
+separate state-sync read gate continues to follow its own source/domain
+authority rules.
+
+### Completion evidence
+
+Core unit and seeded simulations cover fixed-set counting with two required
+names, duplicate and wrong-kind/epoch rejection, stale generation and late
+response fencing, cancellation, authority loss, and deadline behavior.
+Runtime in-memory tests use one source-certified roster and delayed per-name
+acks, including a commit with **no gossip hint** discovered by polling. They
+also check concurrent replay fairness, a stalled evidence source, bounded
+roster/identity rejection, one-active-wait backpressure, and a closed worker
+resolving the caller. The source adapter remains opt-in; an unsupported source
+or uncertifiable lease-holder roster must return `Unsupported` before the wait
+starts. This implementation does not supply a production lease-holder adapter.
+
+References: [public acknowledgement API](../crates/groupnet-consistency/src/replication/ack_api.rs),
+[runtime driver](../crates/groupnet-consistency/src/replication/shell/driver/ack.rs),
+[core wait transitions](../crates/groupnet-core/src/replication/session/ack_wait.rs),
+[core scenarios](../crates/groupnet-core/src/replication/session/ack_wait_tests.rs),
+[seeded waits](../crates/groupnet-sim/tests/replication_ack_wait.rs),
+[wait fault schedules](../crates/groupnet-sim/tests/replication_ack_wait_faults.rs),
+and [runtime scenarios](../crates/groupnet-consistency/tests/replication_ack.rs).

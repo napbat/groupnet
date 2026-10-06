@@ -1,9 +1,10 @@
 # Volatile coherence recovery for origin-backed caches
 
+[Documentation index](README.md) · [Peer bootstrap](replication-volatile-bootstrap.md)
+
 Status: **sans-IO core, opt-in runtime, and first s3cache consumer implemented**.
 This complements [replication.md](replication.md); it is not a durable replay source.
-Optional OriginOnly retry is specified in
-[replication-volatile-rearm.md](replication-volatile-rearm.md).
+Optional OriginOnly retry is specified [below](#optional-rearm-for-volatile-origin-recovery).
 The first consumer is s3cache's default mode, which performs zero coordination
 or metadata writes to S3. Its origin bucket remains untouched by control data.
 
@@ -30,15 +31,16 @@ The ordinary lease's own `valid` verdict remains an independent read gate.
 
 ## Finite protocol
 
-One `VolatileRecoveryEngine` exists per opened coherence domain, with explicit
+One `RecoveryEngine` exists per opened coherence domain, with explicit
 limits for member count, identities/heads, barrier rounds, operation duration,
 settle interval, and generation/operation tokens. It consumes caller-supplied
 logical time and returns typed effects. No clock, socket, S3 call, or Tokio
 enters the core. A source operation response carries the exact current
 generation and operation token; stale responses cannot affirm a newer gap.
 
-`FeedGap` immediately emits `RevokeServing` and `DistrustBodies`, then a
-bounded `OriginRescan` request. The shell must perform the revocation before
+`FeedGap` immediately emits `CloseGate` and `Invalidate { distrust_bodies: true }`.
+After the correlated `Invalidated` receipt it requests bounded `RebuildOrigin`
+(or opt-in `AcquireBaseline`). The shell must perform the revocation before
 any more local reads: its shared read verdict and index-publication permit
 are latched closed in the same public gap transition, before asynchronous
 worker work is queued. It starts at most one rescan for that generation. The
@@ -98,15 +100,19 @@ reopen serving. Cancel is terminal for that session, including an explicit
 `Start`; reopening requires a new session. No whole-fleet barrier is imposed
 on ordinary reads or writes.
 
-The API should expose a small core `RecoveryConfig`, `RecoveryEvent`,
-`RecoveryEffect`, `RecoveryState`, and `RecoveryEngine::step`. Events include
-`FeedGap`, `LeaseLapse`, per-granter `Renewals`, `Settled`, `Membership`,
-`AdvertisedHeads`, `FrontiersReached`, `Invalidated`, `Materialized`,
-`Affirmed/Declined`, `Failed`, `Tick`, and `Cancel`. Effects include
-`RevokeServing`, `DistrustBodies`, `RescanOrigin`, `SampleRenewals`,
-`WaitSettle`, `SampleMembership`, `SampleHeads`, `WaitFrontiers`, `Affirm`,
-and `ArmTimer`. Exact names may change during implementation, but the two
-distinct completion receipts and every stage's correlation may not.
+The core exposes `RecoveryConfig`, `RecoveryEvent`, `RecoveryEffect`,
+`RecoveryStage`, `RecoveryState`, and `RecoveryEngine::step`. Events include
+`Start`/`StartWithLapses`, `FeedGap`, `LeaseLapse`, `PeersObserved` (bounded
+membership, individual renewals and heads), `FrontiersReached`, `Invalidated`,
+`Materialized`, `Progressed`, `Affirmed { accepted }`, `Failed`, `Tick`, and
+`Cancel`. Effects include `CloseGate`, `Invalidate`, `RebuildOrigin`,
+`ObservePeers`, `WaitFrontiers`, `Affirm`, `FellBack`, and `ArmTimer`.
+Settle and renewal waits use core stages and the same logical timer, not
+separate uncorrelated callbacks. Optional bootstrap adds typed baseline and
+peer-head/handoff transitions described in the
+[runtime contract](replication-volatile-transfer-runtime.md).
+Invalidation and materialization remain distinct correlated completion
+receipts.
 
 ## Consumer cutover and evidence
 
@@ -163,9 +169,10 @@ origin rescan, index, body trust generation, and read fallbacks as adapters.
 The driver must never synthesize a native durable cursor or call the separate
 replication `SessionEngine` with gossip counters. A default startup with no
 control store performs no S3 metadata writes. The first consumer cutover uses
-one origin builder **per node**. Fleet-wide single-builder startup, takeover,
-and safe duplicate builders under partition remain a scheduling follow-up,
-not evidence of read authority. A joined peer still needs its own applicable
+one origin builder **per node**. Reusable fleet claim, takeover, and transfer
+contracts are implemented in [peer bootstrap](replication-volatile-bootstrap.md);
+S3 fleet adoption remains pending and supplies no extra read authority.
+A joined peer still needs its own applicable
 index/recovery proof before local serving.
 
 Deterministic core simulations must cover overlapping gap and lapse,
@@ -179,3 +186,75 @@ pages. Fleet single-builder startup with takeover remains a follow-up.
 Tests may show retained state
 and fewer origin LISTs when the lapse proof succeeds; they must not infer
 durable event completeness from the volatile feed.
+
+## Optional rearm for volatile origin recovery
+
+The core and runtime are implemented; s3cache opt-in remains pending. Rearm
+applies after a full turn exhausts its finite budget. It adds no durable source,
+origin metadata objects, or authority to a gossip head. Without rearm, the
+driver stays `OriginOnly` until an explicit restart or an applicable new
+external recovery signal.
+
+### Policy and safety
+
+An opt-in `RecoveryRearm` has nonzero `initial_ms` and `max_ms`, with
+`initial_ms <= max_ms`. One full attempt continues to use its original
+`RecoveryConfig.total_ms` and per-operation deadlines. At `OriginOnly`, the
+sans-IO engine clears the old operation and schedules a rearm at a checked
+logical deadline. The first exhausted turn waits `initial_ms`; each later
+unsuccessful turn doubles the delay with checked, saturating arithmetic up to
+`max_ms`. A successful, generation-bound affirmation resets the next delay
+to `initial_ms`. Only one rearm timer and one recovery operation exist per
+domain. This bounds retained state and spacing between exhausted episodes
+without pretending that a long origin outage has ended. Inside each active
+episode, the existing failed-scan retry still uses `RecoveryConfig.poll_ms`;
+this policy is not exponential backoff for every origin LIST request.
+
+On the timer, the engine begins a **new full origin recovery generation**.
+The shell's serving gate and all old publication permits remain closed until
+that generation materializes state and receives an independent affirmation.
+The timer itself grants no read permission. A failed automatic episode returns
+to `OriginOnly` and schedules a later timer. An explicit operator `restart`
+may start immediately and cancels the pending timer; it does not reset the
+failure backoff until a turn succeeds. `Cancel` is terminal, including for
+the timer. Generation, operation-token, or deadline arithmetic exhaustion
+leaves the gate closed and disables automatic rearm rather than wrapping.
+
+A feed gap or higher lease-lapse counter observed during an `OriginOnly`
+cooldown updates the covered-lapse obligation but does not start another
+scan ahead of the scheduled timer. This matters during outages: repeated
+volatile gossip notifications cannot turn capped backoff into an unbounded
+origin request loop. The next full generation covers the coalesced signal.
+During an active turn, the existing gap/lapse supersession rules still apply
+and revoke serving synchronously. With rearm disabled, existing signal and
+explicit-restart behavior stays unchanged.
+
+The source adapter remains responsible for bounded origin operations and
+per-page publication permits. The optional policy is local to the recovery
+driver; it does not elect a fleet-wide builder. Without consumer peer-bootstrap
+integration, each s3cache node can create its own origin scan. s3cache may opt in while
+keeping zero coordination/metadata writes to S3 by default, the origin
+bucket free of control objects, and ordinary read fallbacks intact.
+
+### API and execution boundary
+
+`RecoveryEngine::with_rearm(policy)` validates the policy before the first
+event. A coalesced `StartWithLapses` event preserves an explicit restart and
+its highest observed lapse counter in one full recovery generation.
+`RecoveryHandle::open_with_rearm` performs the matching platform
+deadline check before spawning its worker. Existing constructors remain
+unchanged and opt out. The core owns the rearm deadline in `next_deadline`
+and emits `ArmTimer`; the runtime only maps that logical deadline to its
+monotonic clock. No Tokio timer map, app retry loop, or second token allocator
+is introduced. Source and application callbacks retain their exact
+generation/operation correlation and total-attempt deadline.
+
+Deterministic core and seeded simulation tests must prove finite attempts,
+increasing capped intervals, prompt recovery after the source heals,
+no serving between episodes, reset after success, coalesced gap/lapse during
+cooldown, cancellation, and arithmetic exhaustion. Runtime tests with an
+in-memory adapter must prove repeated failures do not spin, a healed source
+eventually reaches `Ready` without external restart, and public cancel/drop
+stops future origin work. An s3cache MinIO fault test must cover an outage
+longer than one total budget, automatic rearm after recovery, unchanged
+origin read fallback while closed, and no default control-object writes.

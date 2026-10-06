@@ -9,6 +9,9 @@ profile, epoch-fenced and majority-committed — while the general replicated-lo
 machine (log repair, compaction, reconfiguration) is deliberately absent. You
 bring the storage and the wire.
 
+Start with the [architecture diagram guides](docs/README.md) for Mermaid maps of
+the crate boundaries, link registration, routing, lifecycle, and security model.
+
 That opt-in is a dial, set per group: eventual metadata for free at one end, an
 elected epoch-fenced host paying a majority round-trip per write at the other,
 and the session and coherence tiers in between. Each rung, its price, and what
@@ -36,9 +39,10 @@ Production source adapters and consumer migrations remain in development.
 Contracts and implementation status are in
 [`docs/replication.md`](docs/replication.md).
 
-> Status: early scaffold. The architecture and public API are in place with a
-> working gossip/coordinator core; several protocol pieces are stubbed and
-> marked `TODO` (see [Roadmap](#roadmap)).
+> Status: the coordination core, routed-network stack, and opt-in consistency
+> layers are implemented. Production source adapters and consumer migrations
+> have separate status notes in the [documentation index](docs/README.md).
+> Loopback networking verification is not public-Internet or USB qualification.
 
 ## Design in one breath
 
@@ -258,7 +262,8 @@ implementation knowledge. Four nodes carried membership, metadata, and an exact
 1 MiB pinned-TLS stream across IPC, TCP, and memory links, with a half-close reply.
 Separate runs exercised UDP, punching/relay configurations, revocation/readmission,
 and failed-initialization cleanup. This is not public-Internet NAT, Unix runtime, or
-physical USB/YubiKey qualification. See [routing design](docs/technical.md#5-multi-transport-routing-and-tunnels).
+physical USB/YubiKey qualification. See the [routing guide](docs/routing.md) and
+[tunnel security boundaries](docs/tunnels-and-security.md).
 
 ### Named seeds
 
@@ -434,36 +439,29 @@ cargo build -p groupnet --no-default-features   # core + transport trait only, n
 
 ## Roadmap
 
-What's done, and what's honestly still stubbed:
+Implemented capabilities and their contracts:
 
-- ~~**Metadata dissemination.**~~ *Done.* Per-key last-writer-wins register
-  (`(version, writer)` tiebreak), so `sync`/`update_metadata` converges
-  cluster-wide. Reads: lock-free snapshot via `Group::metadata`.
-- ~~**Real membership.**~~ *Done.* SWIM-style: per-node incarnation numbers, an
-  `Alive`/`Suspect`/`Dead` state machine, a suspicion window with
-  self-refutation, and a real `leave` that sticks. Read via `Group::members()`.
-- ~~**Indirect probes (`ping-req`).**~~ *Done.* A direct-probe miss enlists *k*
-  indirect probers before suspecting, so a dropped packet or one-way link no
-  longer falsely kills a healthy node.
-- ~~**Dead-node reaping.**~~ *Done.* Tombstones are gossiped for `dead_timeout`,
-  then stop being re-advertised, then reaped at `2×` — so removal converges
-  without peers re-teaching each other.
-- ~~**Inter-group routing map.**~~ *Done.* Cluster-wide `resource → owning group`
-  and `group → coordinator`, resolvable from any node via `Node::routing()`.
-- ~~**Real transports.**~~ *Done.* Concrete bindings are their own
-  `groupnet-transport-*` crates and implement the same link-provider contract.
-  Managed routing is enabled by default; native IPC and authenticated UDP
-  discovery/punching/relay are independent selectable implementations.
-- ~~**Bulk / data-plane transport.**~~ *Done.* A separate stream-shaped
-  `BulkTransport` (its own crate, `futures-io` + `bytes` + `zerocopy`), off the
-  datagram hot path, for replication and bulk state transfer. Verified streaming
-  multi-MB payloads over real TCP.
-- **Data-plane maturity.** The stream transport moves opaque `Bytes`, and
-  `groupnet-rpc` adds multiplexed request/response on top; a store still
-  needs its replication protocol, snapshot/anti-entropy over it, and its own
-  `zerocopy` record layouts.
-- **Dynamic address discovery.** Both socket bindings use a static
-  `NodeId → addr` book; production would gossip or resolve addresses.
+| Area | Current behavior | Details |
+|---|---|---|
+| Coordination | SWIM membership, indirect probes, refutation, tombstone reaping, and digest/delta anti-entropy | [Coordination model](docs/architecture.md#coordination-model) |
+| Metadata | LWW registers, TTL'd node entries, and eventually consistent resource/group/coordinator lookup | [Metadata versus packet routing](docs/architecture.md#metadata-routing-versus-packet-routing) |
+| Networking | Independent protocol providers, intrinsic managed routing, direct/relay discovery, pinned TLS streams | [Diagram guides](docs/README.md#architecture-diagram-guides) |
+| Consistency | Session, acknowledgement, lease, and Hosted tiers selected explicitly | [Consistency contract](docs/consistency-modes.md) |
+| Source-backed replication | Replay, checkpoints, native snapshots, and named subscriptions through application adapters | [Implementation status](docs/replication.md#9-implementation-status) |
+
+Remaining work and deployment boundaries:
+
+- Production source adapters and downstream consumer migrations have their own
+  status in the replication contracts; a byte-stream transport does not supply
+  durable application history or storage semantics.
+- Named DNS seeds and native rendezvous discovery are implemented. Plain
+  TCP/UDP addressing still requires a trusted deployment; discovery is not an
+  authorization or private-peer visibility policy.
+- Permission-group connection policies and VPN interfaces are not implemented.
+- Public-Internet NAT, Unix runtime behavior, and USB/YubiKey hardware require
+  deployment-specific qualification beyond the Windows loopback scenarios.
+- Merkle-style full-state comparison remains an unbuilt scaling option; current
+  full-membership fabrics should stay within the envelope described above.
 
 ## License
 

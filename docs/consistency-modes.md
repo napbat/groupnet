@@ -1,18 +1,40 @@
 # Consistency modes
 
-Status: **accepted 2026-08-05 — all decisions resolved (Section 8);
-implementation begins with Milestone 0.** The milestone list in Section 6 is
-the build order of record.
+[Documentation index](README.md) · [Source-backed replication](replication.md)
 
-This document designs groupnet's consistency-mode surface: what each mode
-honestly guarantees, where each lives, and the order it gets built. It is
-grounded in a review of the two real consumers (docres/shardstore and s3cache)
+Status: **accepted 2026-08-05 — all decisions resolved (Section 8).**
+The consumer-pulled APIs, Hosted election/write path, coherence leases, external
+anchor and optional handoff are implemented in this repository. The as-built
+contracts below record their safety assumptions and review caveats; implementation
+does **not** establish that downstream consumers have migrated. Section 6 preserves
+the build order of record, not a queue of work that has yet to begin.
+
+This document is the **contract of record** for groupnet's consistency-mode
+surface: what each mode honestly guarantees, where each lives, and the pinned
+decisions behind it. It is grounded in the dated consumer review in Section 2
 rather than in taxonomy for its own sake.
 
-The additive source-backed replication proposal for issue #3 is specified in
-[`replication.md`](replication.md). It owns native-cursor replay, snapshot
-recovery, subscriber retention, and read gating above these modes. It does not
-change the Hosted-mode decisions or the build order in Section 6.
+The additive source-backed replication contract for issue #3 is specified in
+[`replication.md`](replication.md), with implementation in
+`groupnet-consistency/src/replication`. It owns native-cursor replay, snapshot
+recovery, subscriber retention, and read gating above these modes. Its detailed
+implementation status and consumer-integration boundaries belong there; it does
+not change the Hosted-mode decisions or the build order in Section 6.
+
+**Navigation:** [terminology](#1-terminology) ·
+[consumer evidence](#2-consumer-ground-truth) ·
+[modes and guarantees](#3-mode-taxonomy-and-honest-guarantees) ·
+[architecture](#4-architecture-and-placement) ·
+[proof obligations](#5-testing-strategy) ·
+[build order](#6-milestones) ·
+[consumer APIs](#7-consumer-pulled-adjacent-work-independent-of-hosted-mode) ·
+[decisions](#8-decisions).
+
+Within Section 3: [the dial](#the-dial-what-you-want--what-you-pay),
+[Quorum](#quorum-activation-as-built-milestone-3),
+[hosted writes](#hosted-write-path-as-built-milestone-4),
+[External](#external-activation-as-built-milestone-5), and
+[handoff](#handoff-as-built-milestone-6).
 
 ---
 
@@ -25,9 +47,9 @@ Two words are load-bearing and must never blur:
   authority, bifurcation under partition remains harmless *because it can do
   nothing binding*. Retrofitting authority onto it would silently change the
   contract under every current consumer.
-* **Host** — the new elected, **epoch-fenced** role introduced by the Hosted
-  mode. In the common case the host lands on the same node the coordinator
-  ranking picks, but it is a distinct concept with a distinct API.
+* **Host** — the elected, **epoch-fenced** role introduced by Hosted mode.
+  In the common case the host lands on the same node the coordinator ranking
+  picks, but it is a distinct concept with a distinct API.
 
 The two **coexist** in a Hosted group: the derived coordinator never goes
 away and never gains authority; the host is additive, opt-in, and the only
@@ -37,13 +59,16 @@ Likewise **modes** vs **tiers**:
 
 * A **mode** is per-group and changes the write path (Eventual, Hosted).
 * A **tier** is a composable opt-in layer above a mode (session feeds,
-  applied-acks). Today's `consistency` and `acks` features are tiers, not
+  applied-acks). The `consistency` and `acks` features are tiers, not
   modes, and stay that way.
 
 ## 2. Consumer ground truth
 
-The design must "retain docres support and support strong". What the two
-consumers actually do today (verified in their code, 2026-08):
+The design must "retain docres support and support strong". The observations
+below are **historical consumer evidence, verified in August 2026**, not a
+fresh audit of either consumer. Present-tense descriptions in this section
+refer to that review. Groupnet's subsequent API delivery (Section 7) does not
+prove adoption by docres/shardstore or s3cache.
 
 ### docres / shardstore
 
@@ -80,7 +105,8 @@ to "serve via the origin — slower, never wrong". It needs the **acks tier**,
 never elected leadership; conflicting durable writes are arbitrated by the
 origin's own conditional-write support, passed through untouched.
 
-Two concrete API gaps groupnet owes it (Section 7):
+Two concrete API gaps identified by that review (now supplied by groupnet;
+consumer adoption remains separate — Section 7):
 
 1. **Detector-timing introspection.** s3cache sizes its authoritative-404
    trust window from `groupnet::core::Config::default()` because the *built*
@@ -128,9 +154,14 @@ the sections that define them.
 | Converges eventually, free | `Eventual` (default; derived coordinator only) — M0 | nothing — gossip amortizes it |
 | Read-your-writes, loss surfaced | + session tier — T1 | nothing extra |
 | One authoritative serializer, "good enough" | Hosted `Settle` × `Commit::Local` — M3 | nothing extra; a migration may lose the acked tail, surfaced as a loud `Gap` |
-| No node serves stale (cluster coherence) | acks tier — T2 (lease tier — T3 — proposed as its successor) | one cluster round per write |
+| No node serves stale (cluster coherence) | lease tier — T3; T2 acks alone retain the bounded-time caveat below | responsive-reader acks or lease lapse per write |
 | **Guaranteed**: no acked write ever lost, no split-brain | Hosted `Quorum` × `Commit::QuorumApplied` — M3 | one voter-majority round per write |
 | **Guaranteed and fast** | Hosted `External` (CAS-anchored fencing) — M3 | ~nothing extra when writes already target a CAS-capable store |
+
+The strong-profile rows are subject to the
+[durability and epoch-uniqueness requirements](#durability-honestly) below.
+External's end-to-end safety requires the consumer's store to enforce the fence;
+winning the anchor alone does not make an unfenced data write safe.
 
 The organizing principle: **you pay for a guarantee where the guarantee
 lives.** In-fabric consensus costs a majority round-trip per write — right
@@ -140,10 +171,11 @@ fencing rides on the durability writes themselves, which is why shardstore
 can honestly say "no election, no coordination round" while staying safe;
 that is the *guaranteed-and-fast* quadrant. Coherence tiers cost a cluster
 round because their guarantee is about **every reader**, not one writer —
-s3cache, which uses no leader of either kind. Eventual is free because it
-promises only convergence. And the knobs being per-group means one
-deployment mixes them: docres runs shard groups with External fencing while
-the fabric group underneath stays pure Eventual metadata.
+s3cache's reviewed design, which used no leader of either kind. Eventual is
+free because it promises only convergence. And the knobs being per-group
+mean one deployment can mix them: docres-shaped consumers can use External
+fencing in shard groups while the underlying fabric stays pure Eventual
+metadata. This is a deployment mapping, not a claim of a completed migration.
 
 ### M0 — Eventual (base fabric; today; unchanged)
 
@@ -223,15 +255,15 @@ Two consumers of the crossing sit outside the feed and honor it the same way:
 Applied-watermark ledgers; `applied_cluster_wide` waits on every member the
 writer currently believes Alive. Bounded-time (not absolute) under asymmetric
 partition inside the probe window — the crate's honesty box stays verbatim.
-This tier is what s3cache's strong mode is built on today; the owner judges
-that construction brittle, and T3 below is the proposed successor. T2 itself
-stays: it is the right tool when the writer only needs *responsive* peers
-coherent and degradation-on-timeout is acceptable.
+At the August 2026 consumer review, s3cache's strong mode was built on this
+tier; the owner judged that construction brittle, motivating the implemented
+T3 successor below. T2 itself stays: it is the right tool when the writer only
+needs *responsive* peers coherent and degradation-on-timeout is acceptable.
 
-### T3 — Coherence-lease tier (proposed; motivated by s3cache's brittle strong mode)
+### T3 — Coherence-lease tier (`consistency-leases` feature)
 
-The owner's assessment — shared after reviewing s3cache — is that its current
-strong mode is brittle. The diagnosis: T2's `applied_cluster_wide` is
+The owner's assessment after the August 2026 s3cache review was that its
+strong mode was brittle. The diagnosis: T2's `applied_cluster_wide` is
 **unanimity over a rumor-derived set**. Every write blocks on every peer the
 writer currently believes Alive (N-of-N, the most fragile quorum), one
 degraded-but-alive peer taxes every write cluster-wide, and an ack timeout
@@ -259,12 +291,12 @@ not a connectivity assumption). Consequences:
   advertised in membership (Section 7, item 2), so writers know exactly whom
   to wait for.
 
-This tier is the **same lease machinery Hosted mode's Milestone 1 builds**
+This tier shares Hosted election's **lease principles**
 (grant/renew/expire, DST-provable disjointness in virtual time), pointed the
 other way: instead of one host holding a lease to *write*, every reader
-holds a lease to *serve*. Lease duration is the knob trading
-write-stall-under-failure against renewal traffic; renewals piggyback on the
-existing gossip cadence.
+holds a lease to *serve*. The coherence protocol has its own cores and
+grant ledger. Lease duration trades write-stall-under-failure against renewal
+traffic; renewals piggyback on the existing gossip cadence.
 
 Status: **delivered** (Milestone 2) — feature `leases` in
 `groupnet-consistency`, `consistency-leases` on the facade. The as-built
@@ -295,7 +327,7 @@ protocol refines the sketch above in ways that are now contract:
   before it, whatever order gossip delivered the two in.
 * **A lapse excuses only a reader that counts the writer.** Each grant map
   carries a row under its author's own id naming the lease life that wrote
-  it (`GranterLife`, an ordinary record older decoders ignore). A writer
+  it (`GranterLife`, a self-identifying row in the grant map). A writer
   excuses a reader by lapse only once that reader's *current* life has
   granted the writer's current renewal — a reader's roster only grows, so
   from then on that reader serves only on the writer's grants. Any other
@@ -344,7 +376,7 @@ protocol refines the sketch above in ways that are now contract:
   partitions past the reap horizon, departures and clock-rate skew within the
   margin: no serving reader ever misses a write any node completed).
 
-### M3 — Hosted mode (new)
+### M3 — Hosted mode
 
 One elected **host** per group serializes the group's authoritative writes for
 the duration of an **epoch**. Epochs are totally ordered and fenced: any node
@@ -375,7 +407,7 @@ already exists and is already tested.
 
 | Policy | Partition behavior | CAP posture | Split-brain |
 |---|---|---|---|
-| `Quorum { voters }` | only a side holding a majority of the **static voter roster** activates a host; the minority side fails hosted writes fast (`NoLeader`, once M4's write path exists) while base-fabric gossip continues | CP for the hosted domain | none outside the lease window (lease expiry + bounded clock-*rate* skew) |
+| `Quorum { voters }` | only a side holding a majority of the **static voter roster** activates a host; a hostless side's write path returns `HostedError::NotHost { host: None }` while base-fabric gossip continues | CP for the hosted domain | none outside the lease window (lease expiry + bounded clock-*rate* skew) |
 | `External` (CAS-anchored lease) | whoever wins the external conditional write is host; partition sides are irrelevant | CP; consensus outsourced to the anchor | **none in epochs, absolutely** — and on the steal path a bounded, always-cross-epoch, always-fenced overlap in *instants* † |
 | `Settle { claim_settle_ms }` (lobby-style) | each side elects its own host after the settle window | AP + serialization per side | yes — bounded and **fenced**: at heal exactly one epoch survives; the loser surfaces as a `Gap` + demotion event for the app to reconcile |
 
@@ -481,11 +513,11 @@ CP path.
   reject a doomed writer's disk I/O; the fence token is the bridge that makes
   "strong" real end-to-end. Same philosophy the README already holds: gossip
   carries liveness and coherence signals; stores own truth.
-* **Host migration / handoff.** Milestone 1 surfaces
+* **Host migration / handoff.** Election surfaces
   `LeadershipChanged { epoch, host, role }`; the write path surfaces
-  migration as the epoch `Gap`. Milestone 6 added optional snapshot handoff
-  over the existing `BulkTransport` data plane — a `Gap` remediator, not a
-  replay (see the M6 as-built subsection).
+  migration as the epoch `Gap`. Optional snapshot handoff uses the existing
+  `BulkTransport` data plane — a `Gap` remediator, not a replay
+  (see the handoff as-built subsection).
 
 #### Quorum activation, as built (Milestone 3)
 
@@ -607,17 +639,17 @@ refine the sketch above and are now contract:
   never activates a host at all — the fail-safe answer, chosen over a `0`
   threshold that would turn a misconfiguration into a silent loss of the very
   property Quorum is picked for.
-* **The minority freeze, as it is observable *today*.** There is no `NoLeader`
-  error yet: it belongs to M4's write path, and until that exists a minority
-  side has nothing to fail fast. What M3 surfaces is `leadership()`. If the
-  incumbent is on the minority side it cannot renew, so its lease lapses, it
-  demotes, and every observer there moves to `(epoch, None)` and stays hostless
-  — a minority candidate can claim but never collects a majority. If the
-  incumbent is on the *majority* side, the minority keeps reporting the stale
-  `(epoch, host)` pair it last adopted, with no local way to tell that it is
-  stale; base-fabric gossip continues underneath either way. Both are correct
-  and neither is an error return, so **a consumer must not read a non-`None`
-  host as permission to serve** until M4 gives the write path its own verdict.
+* **The minority freeze and its API boundary.** A minority side simply never
+  activates. If the incumbent is on that side it cannot renew, so its lease
+  lapses, it demotes, and every observer there moves to `(epoch, None)` and
+  stays hostless — a minority candidate can claim but never collects a
+  majority. If the incumbent is on the *majority* side, the minority keeps
+  reporting the stale `(epoch, host)` pair it last adopted, with no local way
+  to tell that it is stale; base-fabric gossip continues underneath either
+  way. `leadership()` is observation, not an error return or permission to
+  serve. The implemented hosted write path supplies its own admission verdict:
+  `HostedError::NotHost { host: None }` when this node is not host and sees
+  none, or `NotHost { host: Some(peer) }` as a redirect.
 
 Proven at this layer by `groupnet-core/tests/election_quorum.rs` (the grant
 rules and round arithmetic), the Quorum DST seeds in `groupnet-sim`, and
@@ -644,17 +676,18 @@ election was perfectly CP — so `HostedWrites` carries a commit level:
   the session tier; a migration may lose the acked tail, surfaced honestly as
   the epoch `Gap`. The game-lobby default: cheap, and clients rebase.
 * **`Commit::QuorumApplied`** — acked once a majority of the voter roster has
-  *applied* it (the acks-tier machinery scoped to voters). Combined with
-  `Activation::Quorum`, the grant majority and the commit majority intersect,
-  so an activating candidate can — and **must** — recover the newest
-  committed state from the majority it heard before serving. That
+  *applied* it (using the epoch-stamped `CommitLedger` defined below).
+  Combined with `Activation::Quorum`, the commit majority and the fresh
+  recovery majority intersect, so an elected host **must** recover the
+  committed state covered by that recovery majority before serving. That
   **leader-completeness rule** is what upgrades "single serializer with
   fencing" to a real guarantee: no write acked at this level is ever lost,
   and no split-brain exists outside the lease window. This is the
   small-roster strong profile.
-* **`Commit::AllApplied`** — unanimity via T2, for read-anywhere-after-ack.
-  Subject to the T3 brittleness diagnosis; prefer it leased, and only on
-  small fixed rosters.
+* **`Commit::AllApplied`** — the same stamped commit predicate over every
+  selected, currently-`Alive` member, for read-anywhere-after-ack. Its
+  rumour-derived wait set retains T2's bounded-time caveat; it is not a
+  replacement for T3 read-side leases.
 
 Reads, stated per level: host reads are linearizable only under a valid
 lease (or a per-read renewal); follower reads at a commit watermark are
@@ -684,10 +717,9 @@ the facade name is always the prefixed one.
 
 ##### What "gating activation" means — and what it does not
 
-Section 6's Milestone 4 line reads "the leader-completeness recovery step
-gating activation when `QuorumApplied` is in force". As built the word
-*activation* is narrowed to the **activation of hosted service**. The engine's
-leadership activation is **unchanged**.
+The leader-completeness recovery step gates **hosted service** when
+`QuorumApplied` is in force. It does not gate the engine's leadership
+activation.
 
 A candidate that collects a voter majority activates exactly when M3 says it
 does, publishes its `LeadState`, and `Group::leadership()` reports
@@ -708,12 +740,11 @@ host. Four reasons this is the right cut, each load-bearing:
   machinery that may not exist: a consumer of a `Hosted` group that wants only
   the fence token, or only `leadership()` for routing, would never see a host at
   all. Activation stays a membership fact; service is a consumer-layer verdict.
-* **Authority.** Leadership was never permission to serve — that is M3's own
-  contract, stated there in the minority-freeze paragraph ("a consumer must not
-  read a non-`None` host as permission to serve" until M4 gives the write path
-  its own verdict). This milestone supplies the verdict; it does not retract the
-  rule. `Recovering` is what *elected but not yet serving* looks like through
-  the API.
+* **Authority.** Leadership is not permission to serve — the Quorum
+  minority-freeze contract above already forbids reading a non-`None` host
+  that way. The hosted write path supplies its own verdict without retracting
+  that rule. `Recovering` is what *elected but not yet serving* looks like
+  through the API.
 * **DST-provability, equal or better.** The recovery rule is a pure function of
   gossiped readings (`CompletenessCore::step`), so the simulator drives the
   identical code the tokio shell does, in virtual time, with no runtime and no
@@ -726,8 +757,12 @@ host. Four reasons this is the right cut, each load-bearing:
 table promised for a minority side: this node is not the host and believes the
 group has none. `NotHost { host: Some(peer) }` is the redirect.
 `Deposed { epoch }` is a fence hit mid-write. `Recovering` is the gate above.
-`Rejected` is the group actor's bounded inbox refusing the enqueue — a
-backpressure signal, never a consistency verdict.
+`Rejected` is reserved for a path that reports bounded-inbox backpressure;
+the current `publish` / `publish_committed` path does **not** return it. Its
+feed advertisement is best-effort and is re-carried on later publication.
+After admission and publication, `publish_committed` reports `Committed`,
+`Deposed` or `TimedOut` through the receipt's outcome, not a pre-publication
+error; a client may be acknowledged only for `Committed`.
 
 ##### The commit ledger: epoch-stamped, and why literal ack reuse fails
 
@@ -1017,15 +1052,14 @@ that nobody reads "recovery" as "replay":
 * A consumer needing **exact replay** rather than coarse remediation must size
   both the ring's item capacity and the group's frame budget for the worst
   migration lag it accepts. That is a capacity decision and it is the consumer's.
-* **State transfer is not in this milestone**, and it is not in this tier: `Gap`
-  plus the consumer's remediation is the whole story here — which is what the
-  strong-profile-versus-Raft table's "a laggard gaps and state-resyncs" row
-  means in practice. Milestone 6 has since delivered the *optional* way past the
-  bound for consumers whose state **is** the groupnet-carried state (feature
-  `handoff`, module `hosted::handoff`): a covering snapshot pulled from a donor
-  over the data plane, verified at three points, seeded into this ledger. It
-  changes nothing above — the rule still sees only watermarks that moved — and
-  `hosted` is complete without it. See the M6 as-built subsection below.
+* **State transfer is not part of the base hosted tier.** `Gap` plus the
+  consumer's remediation is the story there — the strong-profile-versus-Raft
+  table's "a laggard gaps and state-resyncs" row. The optional `handoff` feature
+  (`hosted::handoff`) supplies a covering snapshot for consumers whose state
+  **is** the groupnet-carried state: pull from a donor over the data plane,
+  verify at three points, and seed this ledger. It changes nothing above —
+  the rule still sees only watermarks that moved — and `hosted` is complete
+  without it. See the handoff as-built subsection below.
 
 #### External activation, as built (Milestone 5)
 
@@ -1044,7 +1078,7 @@ Status: **Delivered (pending review).** What shipped, by layer:
   per-node wall-clock skew and ambiguous writes in **both** readings (applied
   but unreported, and never applied and unreported), all orthogonal to fabric
   partitions.
-* **tests** — `groupnet-core/tests/election_external.rs`, the three
+* **tests** — `groupnet-core/tests/election_external.rs`, the
   `groupnet-sim/tests/election_external*.rs` suites,
   `groupnet-runtime/tests/external.rs` and `external_faults.rs`, and a runnable
   example (`cargo run -p groupnet-consistency --example anchored_ownership
@@ -1242,7 +1276,7 @@ anchor access at all*, so nobody replaces it and the group is left **hostless
 despite having a working, willing host**. That is the compound price of the two
 gates together (`X-rank` × row X7), it is the CP posture being honest rather
 than a bug, and it is pinned by `X-rank-compound` in
-`election_external_failover.rs`, which asserts both halves: the incumbent
+`election_external_rank.rs`, which asserts both halves: the incumbent
 lapses, and the group stays hostless past the instant its record became
 stealable until the top-ranked node's anchor heals.
 
@@ -1369,7 +1403,8 @@ allowed to depend on a courtesy.
 | `groupnet-core/src/anchor.rs` (unit) | the decision rules as tables: absent/held-by-self/live-other/stealable at the exact millisecond, the hint as a floor, saturating arithmetic, the ambiguous-write truth table — including the renewal that did **not** apply and must not be mistaken for the record it meant to replace |
 | `groupnet-core/tests/election_external.rs` | the `X`-rows against a real engine, including the rank-gated X7, the fail-closed step-down, and the leave that no in-flight anchor round may undo; **X-purity** asserted over each run's *whole* effect stream |
 | `groupnet-sim/tests/election_external.rs` | **X-S1** over 128 chaos seeds (crashes, amnesiac restarts, partitions, anchor outages, loss, reorder, arbitrary skew) — unconditional, with no storage anywhere; X-S2/S4b sampled after every round; **L1-external** (one host, it is the register's holder *and* the rendezvous owner of the live set) |
-| `groupnet-sim/tests/election_external_failover.rs` | the shaped scenarios: **X-part** (partition-irrelevance, with the `Quorum` inversion on the identical schedule), **X-closed** (no anchor, no host), **X-rank** (the rank-pinned-hostless cost), **X-rank-compound** (that cost composed with the rank-gated renewal: a working host lapses and nobody replaces it), **X-handback**, and **X-budget** — 32 seeds against an itemized virtual-time budget with no fudge term |
+| `groupnet-sim/tests/election_external_failover.rs` | **X-part** (partition-irrelevance, with the `Quorum` inversion on the identical schedule), **X-closed** (no anchor, no host), and **X-budget** — 32 seeds against an itemized virtual-time budget with no fudge term |
+| `groupnet-sim/tests/election_external_rank.rs` | **X-rank** (the rank-pinned-hostless cost), **X-rank-compound** (that cost composed with rank-gated renewal: a working host lapses and nobody replaces it), and **X-handback** |
 | `groupnet-sim/tests/election_external_skew.rs` | **X-skew-a** (96 seeds, `hosts() ≤ 1` after *every scheduled event*), **X-skew-b** (64 seeds, each producing a real overlap: bounded by the excess, always cross-epoch, always resolved), **X-ambiguity-a** (64 seeds with a fifth to a half of writes applying and reporting `Unknown`), **X-ambiguity-b** (32 seeds of the store that swallows every write and still says `Unknown`: the lease lapses at exactly the instant the last landed round bought it, with perfect clocks and no overlap) |
 | `groupnet-runtime/tests/external.rs` | the driver half over the async runtime and a real `Anchor`: elect, steal, the two inert postures, release-on-leave |
 | `groupnet-runtime/tests/external_faults.rs` | the same fixture with the store broken: unreachable-anchor availability, the incumbent-only cut, ambiguous-write read-back, and the write-throttled store whose failed renewals must lapse the lease instead of extending it |
@@ -1380,23 +1415,19 @@ before it drifts past it.
 
 ##### Non-goals for this milestone
 
-* **No handoff.** `AnchorRecord` carries no `handoff_to` successor hint, unlike
-  shardstore's `WriterRecord`. Adding the field early would put an unexercised
-  branch in the steal rule. *(Resolved in Milestone 6: the hint is **dropped**,
-  not deferred — rank gates make a successor hint unable to change who claims,
-  release-on-leave already shortens the voluntary path, and crash paths cannot
-  cooperate. See "The two Milestone 6 conditionals, discharged" below.)*
+* **No successor hint.** `AnchorRecord` carries no `handoff_to` field. The
+  idea is **dropped**, not deferred: rank gates make it unable to change who
+  claims, release-on-leave already shortens the voluntary path, and crash
+  paths cannot cooperate. See "The two Milestone 6 conditionals, discharged"
+  below. This does not exclude the optional snapshot handoff tier.
 * **No `GrantStore` analogue, and none is coming.** The anchor *is* the ledger.
   There is no `Effect::Persist*` under `External`, no recovery constructor, and
   no boot blackout — those exist under `Quorum` to stand in for a durable
   allocator, and here there is a real one.
-* **Two hot-path lines touched, both of them rank conditions.** Row 5's
-  condition moves from `is_coordinator() && !is_quorum()` to
-  `is_coordinator() && is_settle()` — value-identical for `Settle` and `Quorum`,
-  and what stops an `External` host renewing its engine lease off its own rank
-  instead of off the anchor. Row X7's prompt gained the same
-  `is_coordinator()` gate row Q7 already had (see above). The regression bar for
-  both is that every pre-existing suite passes byte-unmodified.
+* **Rank is not renewal evidence.** Row 5's `is_coordinator() && is_settle()`
+  condition stops an `External` host renewing its engine lease off its own
+  rank instead of off the anchor. Row X7's prompt also requires
+  `is_coordinator()`, just as row Q7 does; the liveness cost is recorded above.
 
 #### Handoff, as built (Milestone 6)
 
@@ -1406,8 +1437,8 @@ Status: **Delivered (pending review).** What shipped, by layer:
   `MemBulkTransport`: an in-process **data plane** of `tokio::io::duplex` pipes,
   the sibling of the control plane's `Network` one plane down. Connection-
   oriented, so connecting to an unknown id is an error rather than the silent
-  drop the datagram plane owes. Without it nothing could exercise both planes in
-  one process, and this milestone is the first thing that needs to.
+  drop the datagram plane owes. It lets integration suites exercise both planes
+  in one process.
 * **`groupnet-consistency`**, feature `handoff` (facade
   **`consistency-handoff`**), module `hosted::handoff` — the sans-IO
   `HandoffCore` (three verdicts) and `HandoffPhase` (the order they must be
@@ -1422,8 +1453,9 @@ Status: **Delivered (pending review).** What shipped, by layer:
   `crates/groupnet-consistency/examples/hosted_handoff.rs`.
 
 The tier is **optional and additive**: `hosted` is complete without it, the
-`handoff` feature is off in every build that does not ask for it, and it is the
-only consistency feature whose dependency graph reaches the data plane.
+`handoff` feature is off in every build that does not ask for it. Both it and
+the separate `volatile-bootstrap-bulk` feature reach the data plane; ordinary
+replication and volatile recovery do not require that plane.
 
 ##### It remediates a `Gap`, and it adds no cursor
 
@@ -1646,12 +1678,10 @@ bounds its own retries and surfaces the stall.
 
 ##### The two Milestone 6 conditionals, discharged
 
-Two conditionals pointed at this milestone, from two different places. Section 6's
-Milestone 6 line carried **one** "if" clause of its own — *plus host-scoped
-registers if fence tokens prove insufficient for docres locks*. The other was left
-here by **M5's as-built non-goals**, which deferred the anchor's `handoff_to`
-successor hint on the grounds that cooperative handoff was Milestone 6's business.
-Both are now answered, and neither is being built.
+Two historical conditionals are resolved here: host-scoped registers if fence
+tokens proved insufficient for docres-shaped locks, and an anchor `handoff_to`
+successor hint for cooperative succession. Neither is being built; these
+decisions do not depend on a downstream migration being complete.
 
 * **Host-scoped registers: DEFERRED.** The clause was "*plus host-scoped
   registers if fence tokens prove insufficient for docres locks*". They are
@@ -1661,15 +1691,13 @@ Both are now answered, and neither is being built.
   the store under the fence that authorized it, with the store refusing the
   deposed writer. Nothing in that path wants a register: the record lives where
   truth already lives (the consumer's store), and a groupnet-side register would
-  be a second copy of it under weaker durability. No consumer has pulled for one
-  — docres/shardstore's stated needs (Section 2) are membership, TTL'd entries,
-  placement and the fence, and s3cache does not use Hosted mode at all. Deferred
-  rather than rejected: **revisit only against a concrete consumer** with a
-  requirement the fence token demonstrably cannot carry.
-* **The M5 anchor's `handoff_to` successor hint: DROPPED.** The External
-  as-built subsection flagged cooperative handoff as "Milestone 6's business"
-  and left `AnchorRecord` without a successor hint. It stays without one, for
-  three reasons that compound:
+  be a second copy of it under weaker durability. The August 2026 consumer review
+  supplied no register requirement: docres/shardstore used membership, TTL'd
+  entries and placement, with its own store fencing, and s3cache did not use
+  Hosted mode. Deferred rather than rejected: **revisit only against a concrete
+  consumer** with a requirement the fence token demonstrably cannot carry.
+* **The anchor's `handoff_to` successor hint: DROPPED.** `AnchorRecord` stays
+  without a successor hint for three reasons that compound:
   * **A hint cannot change who claims.** Renewal and claiming are *rank-gated*
     under every activation (the M5 as-built row X7 / Q7 change): the top-ranked
     live member is the one that bids. A departing host naming a successor could
@@ -1687,9 +1715,9 @@ Both are now answered, and neither is being built.
     hurts. A mechanism that helps only the case already handled, and cannot help
     the case that is not, is not worth a wire field.
 
-  What Milestone 6 *did* deliver against the same underlying complaint is the
-  half that generalizes: state transfer, so a successor's slowness is a capacity
-  question rather than an unbounded wait on a ring.
+  Snapshot handoff addresses the half of the underlying complaint that
+  generalizes: state transfer, so a successor's slowness is a capacity question
+  rather than an unbounded wait on a ring.
 
 #### Consumer mapping
 
@@ -1700,8 +1728,9 @@ Both are now answered, and neither is being built.
   storage I/O docres already pays — and a lift of the pattern shardstore's
   `caslog/epoch.rs` already implements by hand; the ambition is that
   shardstore could eventually shed that bespoke code.
-* **s3cache** does not use Hosted mode at all; it is served by T2 plus the
-  API gaps in Section 7.
+* **s3cache's August 2026 design** did not use Hosted mode; it used T2.
+  T3 and the APIs in Section 7 are available migration targets, not evidence
+  that s3cache has adopted them.
 * **p2p-game-style consumers** use `Settle` + `Commit::Local` — the lobby
   semantics the mode was named for. A small session that must never lose
   acked state (or a small cache cluster wanting real strong) steps up to
@@ -1727,7 +1756,7 @@ branding:
 | Candidate | deterministic (rendezvous top-ranked live) | any server, randomized timeouts |
 | Votes | ≤ 1 grant / epoch / voter, majority | same rule |
 | Vote durability | persisted grant when the driver has storage; restart-blackout fallback | persisted `votedFor`, mandatory |
-| Leader completeness | **recovery after winning**: fetch newest committed state from the heard majority (Viewstamped-Replication-style view change) | **election restriction**: stale candidates are refused votes |
+| Leader completeness | **recovery after winning**: recover the state covered by a fresh recovery majority (Viewstamped-Replication-style view change) | **election restriction**: stale candidates are refused votes |
 | Replication substrate | the existing session feed (bounded ring); a laggard gaps and state-resyncs | append-entries log, log matching, backtracking repair |
 | Compaction | none needed — state is the artifact, there is no unbounded log | snapshots + InstallSnapshot |
 | Membership change | none — static voter roster, changed by redeploy | joint consensus |
@@ -1735,65 +1764,56 @@ branding:
 
 So the accurate boundary is not "no Raft" but: **consensus comes in
 (opt-in, small static rosters, VR-style view change over the existing feed);
-the general replicated-log machine stays out** — log repair, compaction,
-snapshot install, dynamic reconfiguration, client sessions. Those are the
-second product this library refuses to become. Neither consumer needs it
-(docres: ownership/serialization via M3-External; s3cache: coherence via
-T2/T3), and the fence token keeps an external CP store composable for
-anyone who does. Revisit only against a concrete consumer.
+the general replicated-log machine stays out** — log repair, unbounded-log
+compaction, Raft-style snapshot install, dynamic reconfiguration, client
+sessions. Optional covering-state handoff and the separate source-backed
+replication tier do not turn Hosted mode into that machine. The reviewed
+consumers did not require it (docres: external-CAS ownership/serialization;
+s3cache: coherence), and the fence token keeps an external CP store composable.
+Revisit only against a concrete consumer.
 
 No other speculative modes: causal broadcast and multi-writer CRDT registers
 were considered and dropped for lack of consumer pull.
 
 ## 4. Architecture and placement
 
-**Decided: election lives inside the engine** — a new
-`groupnet-core/src/engine/election.rs`, sibling to `liveness.rs`/
-`anti_entropy.rs`/`merge.rs`, active only when the group's mode is Hosted.
+**Decided and implemented: election lives inside the engine** —
+`groupnet-core/src/engine/election/`, active only when the group's mode is Hosted.
 Rationale: the sim drives engines only, so anything outside the engine is
 invisible to DST — and DST must own election correctness; fencing lives in
 the merge path, which is engine-internal; the election consumes SWIM state
 and rendezvous ranking already resident in the engine; zero new dependencies.
 
-| Layer | Change |
+| Layer | Implemented surface |
 |---|---|
-| `groupnet-core` | `engine/election.rs`; `Config.mode: GroupMode` (`Eventual` default / `Hosted(HostedConfig)`); wire kinds `KIND_LEAD_CLAIM=8`, `KIND_LEAD_GRANT=9`, `KIND_LEAD_STATE=10` inside `FRAME_VERSION 3`; `Effect::LeadershipChanged { epoch, host }`; epoch-major merge rule for host-scoped state |
-| `groupnet-sim` | dispatch the new effect (a `leadership_log` mirroring `coordinator_log`), accessors, and a deterministic in-sim CAS register modeling the external anchor |
-| `groupnet-runtime` | `GroupEvent::LeadershipChanged`, `Group::leadership()`, `Node::join_group_with(name, GroupProfile)`; effect plumbing in `driver.rs` |
-| `groupnet-consistency` | feature `hosted` (following the `acks` pattern): `HostedWrites` — a `WriteFeed` whose epoch *is* the leadership epoch; fence surfacing; commit levels composing with T2 |
-| `groupnet` facade | feature `hosted` → `consistency` layering, mirroring `consistency-acks` |
+| `groupnet-core` | `engine/election/`; `Config.mode: GroupMode` (`Eventual` default / `Hosted(HostedConfig)`); wire kinds `KIND_LEAD_CLAIM=8`, `KIND_LEAD_GRANT=9`, `KIND_LEAD_STATE=10` inside `FRAME_VERSION 3`; `Effect::LeadershipChanged`; epoch-major fencing-pair adoption |
+| `groupnet-sim` | leadership-effect dispatch and log, election accessors, and a deterministic in-sim CAS register modeling the external anchor |
+| `groupnet-runtime` | `GroupEvent::LeadershipChanged`, `Group::leadership()`, `Node::join_group_with(name, GroupProfile)`; effect plumbing in `driver.rs`; `GrantStore` and `Anchor` integration |
+| `groupnet-consistency` | `hosted`: `HostedWrites` with leadership-epoch tokens; `HostedReads`; fence surfacing; epoch-stamped `CommitLedger` and service recovery gate |
+| `groupnet` facade | `consistency-hosted` → `consistency` + `groupnet-consistency/hosted`; optional `consistency-handoff` adds the data plane |
 
 **Wire:** the election adds new frame kinds; digest bodies are untouched.
 Peers upgrade together, so there is no mixed-version cluster to plan for: an
 unknown kind is malformed and decodes to `None`, and `FRAME_VERSION` rejects a
 mis-deployed node rather than letting it misparse frames.
 
-**API sketch** (consumer's view):
+**Consumer API:** select the group mode with `GroupProfile::hosted(HostedConfig)`
+and `Node::join_group_with`; observe it with `Group::leadership()`. Construct a
+Local-only path with `HostedWrites::new(group, me, capacity, encode)`, or a
+quorum-committed path with `HostedWrites::committed(group, me, capacity, encode,
+ledger)`, which validates the Hosted/Quorum configuration and ledger binding.
+`fence()` returns `Option<Fence>` only when service is admitted; `publish` returns
+a token or `HostedError`. Request a commit level and deadline through
+`publish_committed`, not by assuming that `publish` alone waited for a majority.
 
-```rust
-// Mode selection, per group:
-let group = node.join_group_with("docs-shard-7", GroupProfile::hosted(
-    HostedConfig {
-        activation: Activation::Quorum { voters: roster },
-        lease_ms: 2_000,
-    },
-));
-
-// Observing leadership (watch-shaped, like coordinator):
-let lead = group.leadership();   // Leadership { epoch, host: Option<NodeId>, role }
-
-// Fenced write path (groupnet-consistency, feature "hosted"):
-let hosted = HostedWrites::new(group.clone(), codec);
-match hosted.publish(&op).await {
-    Ok(token)                 => { /* WriteToken { epoch = leadership epoch, seq } */ }
-    Err(NotHost { host, .. }) => { /* redirect to `host` */ }
-    Err(Deposed { epoch })    => { /* fenced out mid-write */ }
-}
-let fence: Fence = hosted.fence()?;  // stamp data-plane ops / external CAS
-```
-
-Followers consume the host's feed through the existing
-`PeerWrites`/`Frontier`/`AckLedger` machinery unchanged.
+Followers use `HostedReads` and `CommitLedger`, with `Frontier` for applied
+barriers; the T2 `AckLedger` is not the hosted commit ledger. The binding,
+apply-before-record and refresh requirements in the deployment contract above
+remain mandatory. See the maintained
+[`fenced_ownership` example](../crates/groupnet-consistency/examples/fenced_ownership.rs)
+for the Quorum path and
+[`anchored_ownership`](../crates/groupnet-consistency/examples/anchored_ownership.rs)
+for the External/store-fence path.
 
 ## 5. Testing strategy
 
@@ -1889,102 +1909,84 @@ consumers earliest. Settle is built first not because it is the priority but
 because it is the smallest activation that exercises the entire
 epoch/fencing/lease skeleton; Quorum and External land on the proven result.
 
-* **Milestone 0 — consumer-pulled API (starts immediately).** The four
-  items of Section 7: detector-timing introspection, capability
-  advertisement, fencing-verdict roster, externally-typed sequence floors.
-  Small, independently valuable to shipping consumers, no election
-  dependency. Item 4 is the largest; if design shows it needs its own
-  slice, it splits out rather than delaying the other three.
-* **Milestone 1 — election skeleton with Settle activation.**
-  `election.rs`: epochs, `LeadClaim`/`LeadGrant`/`LeadState` frames + codec
-  round-trip tests, the epoch-major fencing merge rule, leases +
-  self-demotion, `Effect::LeadershipChanged`, `Config.mode`, `Settle`
-  activation; sim dispatch + DST (S1, S2, S4, L1, fenced-split-brain heal
-  seeds); runtime surfacing (`Group::leadership()`, `join_group_with`,
-  `GroupEvent::LeadershipChanged`). Excluded: voting, write path, anchors.
-* **Milestone 2 — coherence-lease tier (T3).** Reader serve-leases over the
-  freshly DST-proven lease machinery; writer invalidation blocks on
-  responsive lease-holders or lease lapse; the successor to s3cache's
-  unanimity-ack strong mode. Milestone 0's items 1–2 are part of its
-  contract.
+The numbered milestones below are the historical dependency order. M0–M2 now
+have source-backed delivery evidence; M3–M6 retain their recorded **delivered
+(pending review)** labels. Those labels do not imply a fresh verification run
+or completion of downstream integration.
+
+* **Milestone 0 — consumer-pulled API. Implemented.** Effective config,
+  capability advertisement, continuous-status roster and external sequence
+  floors are supplied by the APIs in Section 7; none depends on election.
+* **Milestone 1 — election skeleton with Settle activation. Implemented.**
+  `engine/election/`: epochs, `LeadClaim`/`LeadGrant`/`LeadState` codecs,
+  fencing-pair adoption, lease self-demotion, `Config.mode` and Settle
+  activation. Runtime leadership surfacing and sim S1/S2/S4/L1 schedules
+  exercise the skeleton. This rung excludes voting, hosted writes and anchors.
+* **Milestone 2 — coherence-lease tier (T3). Delivered.** Reader serve-leases
+  and coherent-write waits over responsive holders or lease lapse. T3's
+  as-built subsection records the confirmation, roster, warm-up, resync and
+  clock-rate contracts. M0's config and capability APIs support this tier;
+  s3cache adoption is not established here.
 * **Milestone 3 — Quorum activation. Delivered (pending review).** Static
-  voter roster, one grant per epoch per voter, the grant promise, send-instant
-  lease attribution, persisted grants over a runtime `GrantStore` (with the
-  restart-blackout fallback retained as the storage-free posture); DST S3
-  including voter crash-restart seeds. The minority freeze is *structural*
-  here — a minority side simply never activates — but has no `NoLeader` error
-  to report until M4 gives the hosted write path one; see the M3 as-built
-  subsection for what it looks like through `leadership()` today.
+  voter roster, grant promise, send-instant attribution, `GrantStore` persistence
+  and recovered/blackout postures; S3/S4c and storage-conditional S1-strict.
+  See [Quorum as built](#quorum-activation-as-built-milestone-3) for the
+  persist-error caveats and observer-local minority freeze.
 * **Milestone 4 — hosted write path + commit levels. Delivered (pending
-  review).** `HostedWrites` in `groupnet-consistency` behind feature `hosted`
-  (`consistency-hosted` on the facade); fence surfacing;
-  `Local` / `QuorumApplied` / `AllApplied` with the leader-completeness
-  recovery step gating activation when `QuorumApplied` is in force (DST
-  property S5); `NotHost`/`Deposed`; a runnable fenced-ownership example
-  (the docres shape:
-  `cargo run -p groupnet-consistency --example fenced_ownership --features
-  hosted`). **The strong profile is complete at the end of this
-  milestone.** As built, "gating activation" means gating *hosted service*
-  and the commit ledger is epoch-stamped rather than a literal reuse of the
-  ack tier — see the M4 as-built subsection above for the two rules, the
-  intersection argument, the deployment contract they impose (including the
-  serving host's own lineage cut), the latched recovery verdict, and the two
-  reviewed deviations that are now contract.
+  review).** `HostedWrites` / `HostedReads` / `CommitLedger`, feature `hosted`
+  (`consistency-hosted` on the facade), fence surfacing and `Local` /
+  `QuorumApplied` / `AllApplied`. The strong profile is implemented at this rung:
+  recovery gates **hosted service**, not engine leadership. The
+  [as-built write contract](#hosted-write-path-as-built-milestone-4) owns S5's
+  intersection proof, durability assumptions, voter follower-loop requirements,
+  serving-host lineage cut and latched verdict.
 * **Milestone 5 — external-CAS anchor. Delivered (pending review).**
-  `Activation::External` with a driver-side `Anchor` trait (runtime layer, never
-  core); the engine consumes anchor outcomes as commands; the sim models the
-  anchor as a deterministic CAS register with orthogonal knobs for store
-  reachability, per-node wall-clock skew and ambiguous writes. The
-  shardstore-pattern lift — docres's guaranteed-and-fast quadrant. A runnable
-  anchored-ownership example (the docres shape with the election replaced:
-  `cargo run -p groupnet-consistency --example anchored_ownership --features
-  hosted`). As built, renewal is rank-gated under *every* activation (row X7
-  gained row Q7's `is_coordinator()` gate, reviewed and owner-approved during
-  the milestone), the driver decides claim-versus-renew from the hold and the
-  published leadership together with a bounded `Wait` for the third case, and a
-  voluntary leave *releases* the record while every other ending lapses — see
-  the M5 as-built subsection above for those and for the shape the `X`
-  properties landed in.
+  `Activation::External`, runtime `Anchor`, engine outcomes as commands and
+  deterministic CAS-store simulation. See
+  [External as built](#external-activation-as-built-milestone-5) for X properties,
+  pairwise wall-clock skew, rank gates, ambiguous-write read-back, bounded `Wait`,
+  and release-on-leave versus lapse. The ownership example demonstrates the
+  docres-shaped fence contract; it is not a docres migration.
 * **Milestone 6 (optional) — snapshot handoff. Delivered (pending review).**
-  The handoff helper over `BulkTransport`: `hosted::handoff` behind feature
-  `handoff` (`consistency-handoff` on the facade) — three sans-IO verdicts and
-  the phase table that orders them, the `GNHO/1` stream protocol with its own
-  in-band terminator, `donors()` / `fetch()` / `offer()` / `seed()`, and the
-  `SnapshotSource` / `SnapshotSink` pair through which the consumer supplies
-  both ends of the data. Plus the in-process data plane it is exercised over
-  (`groupnet-transport-mem`'s `bulk` feature) and a runnable late-joiner example
-  (`cargo run -p groupnet-consistency --example hosted_handoff --features
-  handoff`). It is a **`Gap` remediator and adds no cursor API**: the `Gap`
-  already positioned the subscriber, the transfer supplies the state behind it,
-  and idempotent re-apply absorbs the overlap. Both conditionals aimed at this
-  milestone are discharged in the M6 as-built subsection — this line's own "if"
-  clause, **host-scoped registers DEFERRED** (fence tokens are sufficient; the two
-  ownership examples are the docres lock shape, and no consumer has pulled for a
-  register — revisit only against a concrete one), and the one M5's as-built
-  non-goals left here, **the anchor's `handoff_to` hint DROPPED** (rank
-  gates make a successor hint unable to change who claims, release-on-leave
-  already shortens the voluntary path, and crash paths cannot cooperate).
+  Feature `handoff` (`consistency-handoff`), `HandoffCore` / `HandoffPhase`,
+  `GNHO/1`, `SnapshotSource` / `SnapshotSink`, and the in-process bulk plane.
+  It remediates a `Gap` and adds no cursor API. See
+  [handoff as built](#handoff-as-built-milestone-6) for verification points,
+  source/sink obligations, idempotent overlap and capacity requirements. Its
+  resolved conditionals stay pinned: **host-scoped registers deferred** until a
+  concrete unmet consumer need; **anchor successor hint dropped**.
 
 ## 7. Consumer-pulled adjacent work (independent of Hosted mode)
 
-Cheap, concrete, and directly "retains docres/s3cache support". **This is
-Milestone 0** (decision D-api):
+These four items are **Milestone 0** (decision D-api). Groupnet now supplies
+the following surfaces; consumers still own policy and migration:
 
-1. **Detector-timing introspection** — expose the effective probe/suspect
-   timings on the built `Node`/`Group` so s3cache stops reading
-   `Config::default()` and its 404-trust window stays honest under
-   configuration drift.
-2. **Capability advertisement in membership** — let a node advertise (e.g.)
-   ack participation so strong-mode writers exclude non-acking peers instead
-   of eating timeouts in mixed deployments.
-3. **Fencing-verdict roster** — formalize the "gossip-dead for N ⇒ fence
-   verdict; gossip-healthy for N ⇒ unfence verdict" contract shardstore
-   hand-rolls over `members()` (the durable act stays with the consumer's
-   CAS log; groupnet supplies the verdict, liveness-only).
-4. **Externally-typed sequence numbers** — let the session tier carry
-   consumer-typed sequence floors (shard LSNs) with TTL'd dissemination and
-   a fallback-when-unknown posture, so shardstore's hand-rolled hot-set
-   could migrate onto `groupnet-consistency`.
+1. **Detector-timing introspection — implemented on `Group`.**
+   `Group::config()` exposes effective builder-applied configuration, including
+   `Config::detection_window_ms`. A consumer sizes its trust window from that
+   configuration, not `Config::default()`; `NodeBuilder::config` sets it.
+2. **Capability advertisement — implemented.**
+   `Group::advertise_capabilities`, `node_capabilities`, `node_has_capability`
+   and `members_with_capability` expose opt-in participation. `CAP_ACKS`,
+   `CAP_LEASE` and `CAP_HOSTED` distinguish the tiers; the caller still chooses
+   its wait set and must not infer authority from an advertisement.
+3. **Fencing-verdict roster — implemented as continuous-status evidence.**
+   `Group::status_held_for` and `statuses_held` report observer-local status and
+   uninterrupted duration. Thresholds and the durable fence/unfence act remain
+   consumer policy, anchored in its CAS log. Dead tombstones disappear at the
+   reap horizon (`2 × dead_timeout_ms`); an unknown node is not automatically a
+   fencing verdict.
+4. **External sequence floors — implemented.** `SeqFloors` disseminates
+   per-node, per-key consumer-space `u64` floors with TTL, max-folding within
+   one publisher life and fallback on an absent/expired/undecodable claim.
+   These are routing hints, not durable replay positions or cross-writer
+   aggregates; wrappers such as shard LSN types remain the consumer's.
+
+Source evidence: `groupnet-runtime/src/group.rs`, `node.rs` and `capability.rs`,
+and `groupnet-consistency/src/floor.rs`. The runtime `capabilities.rs` and
+`status_duration.rs` integration suites cover the corresponding public surfaces.
+Section 2 records why they were requested; it does not certify that either
+consumer has replaced its bespoke code.
 
 ## 8. Decisions
 
@@ -2016,7 +2018,7 @@ with a new owner decision.
   commitment to Quorum itself is unchanged.
 * **D-lease** (formerly O5): the coherence-lease tier T3 is **adopted**,
   sequenced as Milestone 2 — the most consumer-pulled piece of the design.
-* **D-api** (formerly O2): the four consumer-pulled items land first, as
-  **Milestone 0, starting immediately**.
+* **D-api** (formerly O2): the four consumer-pulled items were ordered first,
+  as **Milestone 0**. Their implemented surfaces are recorded in Section 7.
 * **D-strong** (historical): Quorum activation is committed; its original
   "day one" sequencing is superseded by D-order.
