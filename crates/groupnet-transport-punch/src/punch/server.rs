@@ -14,6 +14,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+use super::candidates::Candidates;
 use super::wire::{self, Body, MAX_PACKET, Packet, Session};
 use super::{LEASE, MAX_PEERS, NetworkKey, closed, invalid, random, transient, validate_names};
 
@@ -30,6 +31,7 @@ struct Registration {
     sequence: u64,
     seen: Instant,
     relay_only: bool,
+    candidates: Candidates,
 }
 
 struct Challenge {
@@ -188,6 +190,7 @@ impl Challenges {
             sequence: packet.sequence,
             seen: now,
             relay_only,
+            candidates: Candidates::default(),
         })
     }
 
@@ -428,7 +431,8 @@ async fn handle_packet(
         | Body::Depart { .. }
         | Body::Discover { .. }
         | Body::Query { .. }
-        | Body::Relay { .. } => {
+        | Body::Relay { .. }
+        | Body::Candidates { .. } => {
             handle_established(socket, key, &mut state.entries, packet, address, now).await;
         }
         _ => {}
@@ -450,6 +454,25 @@ async fn handle_established(
         return;
     };
     match packet.body {
+        Body::Candidates { candidates, .. } if !registration.relay_only => {
+            if let Some(active) = entry.active.as_mut() {
+                active.candidates = Candidates::default();
+                for candidate in candidates.iter() {
+                    active.candidates.insert(candidate);
+                }
+            }
+            respond(
+                socket,
+                key,
+                address,
+                packet,
+                Body::Observed {
+                    proof: registration.proof,
+                    address: registration.address,
+                },
+            )
+            .await;
+        }
         Body::Heartbeat { .. } => {
             respond(
                 socket,
@@ -466,31 +489,7 @@ async fn handle_established(
             entry.active = None;
         }
         Body::Discover { .. } | Body::Query { .. } => {
-            for (name, target) in entries.iter() {
-                if name == packet.sender
-                    || matches!(packet.body, Body::Query { peer, .. } if peer != name)
-                {
-                    continue;
-                }
-                let Some(target) = target.live(now) else {
-                    continue;
-                };
-                respond(
-                    socket,
-                    key,
-                    address,
-                    packet,
-                    Body::Offer {
-                        proof: registration.proof,
-                        peer: name,
-                        session: target.session,
-                        address: (!registration.relay_only && !target.relay_only)
-                            .then_some(target.address),
-                        relay_only: registration.relay_only || target.relay_only,
-                    },
-                )
-                .await;
-            }
+            discover(socket, key, entries, &packet, &registration, address, now).await;
         }
         Body::Relay {
             peer,
@@ -524,6 +523,67 @@ async fn handle_established(
         }
         _ => {}
     }
+}
+
+async fn discover(
+    socket: &UdpSocket,
+    key: Option<&NetworkKey>,
+    entries: &HashMap<String, Entry>,
+    packet: &Packet<'_>,
+    registration: &Registration,
+    address: SocketAddr,
+    now: Instant,
+) {
+    for (name, target) in entries {
+        if name == packet.sender || matches!(packet.body, Body::Query { peer, .. } if peer != name)
+        {
+            continue;
+        }
+        let Some(target) = target.live(now) else {
+            continue;
+        };
+        let relay_only = registration.relay_only || target.relay_only;
+        respond(
+            socket,
+            key,
+            address,
+            *packet,
+            Body::Offer {
+                proof: registration.proof,
+                peer: name,
+                session: target.session,
+                address: (!relay_only).then_some(target.address),
+                relay_only,
+                candidates: if relay_only {
+                    wire::CandidateList::empty()
+                } else {
+                    (&target.candidates).into()
+                },
+                secret: pair_secret(registration, &target),
+            },
+        )
+        .await;
+    }
+}
+
+fn pair_secret(left: &Registration, right: &Registration) -> Session {
+    // Both registrations contain private OS-random proofs. Sorting gives the
+    // same per-pair secret in each offer; replacement sessions derive a new key.
+    let (first, second) = if left.session < right.session {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &first.proof);
+    let mut context = ring::hmac::Context::with_key(&key);
+    context.update(b"groupnet-udp-pair-v4");
+    context.update(&first.session);
+    context.update(&second.session);
+    context.update(&second.proof);
+    let tag = context.sign();
+    let mut secret = [0; 16];
+    secret.copy_from_slice(&tag.as_ref()[..16]);
+    secret
 }
 
 async fn register(
@@ -753,6 +813,7 @@ mod tests {
             sequence: 10,
             seen: now,
             relay_only: false,
+            candidates: Candidates::default(),
         });
         let valid = Packet {
             sender: "a",

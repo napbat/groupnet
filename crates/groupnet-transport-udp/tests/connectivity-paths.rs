@@ -1,3 +1,4 @@
+#![cfg(feature = "connectivity")]
 //! Explicit keyless path policy, real UDP delivery, and fresh-session reconnects.
 
 use std::io;
@@ -7,9 +8,8 @@ use std::time::Duration;
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
-use groupnet_transport_punch::{
-    MAX_MESSAGE, PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous,
-};
+use groupnet_transport_punch::{MAX_MESSAGE, PathPolicy, PeerPath, PunchConfig, Rendezvous};
+use groupnet_transport_udp::UdpTransport;
 use tokio::time::timeout;
 
 const SETTLE: Duration = Duration::from_secs(15);
@@ -18,28 +18,22 @@ fn loopback() -> SocketAddr {
     ([127, 0, 0, 1], 0).into()
 }
 
-async fn endpoint(local: &str, address: SocketAddr, policy: PathPolicy) -> PunchTransport {
+async fn endpoint(local: &str, address: SocketAddr, policy: PathPolicy) -> UdpTransport {
     let mut config = PunchConfig::open(local.into(), address);
     assert_eq!(config.policy, PathPolicy::RelayOnly);
     config.bind = loopback();
     config.policy = policy;
-    PunchTransport::bind(config).await.unwrap()
+    UdpTransport::bind_connectivity(config).await.unwrap()
 }
 
-async fn paths(a: &PunchTransport, b: &PunchTransport, expected: PeerPath) {
+async fn paths(a: &UdpTransport, b: &UdpTransport, expected: PeerPath) {
     eventually_within("keyless bidirectional path convergence", SETTLE, || {
         a.path_to(&"b".into()) == Some(expected) && b.path_to(&"a".into()) == Some(expected)
     })
     .await;
 }
 
-async fn deliver(
-    from: &PunchTransport,
-    to: &PunchTransport,
-    sender: &str,
-    receiver: &str,
-    msg: &[u8],
-) {
+async fn deliver(from: &UdpTransport, to: &UdpTransport, sender: &str, receiver: &str, msg: &[u8]) {
     from.send(&receiver.into(), msg).await.unwrap();
     let packet = timeout(SETTLE, to.recv()).await.unwrap().unwrap();
     assert_eq!(packet.from, NodeId::from(sender));
@@ -78,8 +72,8 @@ async fn keyless_direct_preferred_discovers_bidirectional_paths_and_preserves_me
     }
     assert_eq!(a.path_to(&"b".into()), Some(PeerPath::Direct));
     assert_eq!(b.path_to(&"a".into()), Some(PeerPath::Direct));
-    a.close().await;
-    b.close().await;
+    a.connection().unwrap().close().await;
+    b.connection().unwrap().close().await;
 }
 
 #[tokio::test]
@@ -104,8 +98,8 @@ async fn keyless_relay_only_and_mixed_policies_deliver_bidirectionally_without_d
             assert_eq!(a.path_to(&"b".into()), Some(PeerPath::Relay));
             assert_eq!(b.path_to(&"a".into()), Some(PeerPath::Relay));
         }
-        a.close().await;
-        b.close().await;
+        a.connection().unwrap().close().await;
+        b.connection().unwrap().close().await;
         relay.close().await;
     }
 }
@@ -125,7 +119,7 @@ async fn keyless_direct_reconnects_with_fresh_session_at_the_same_socket_address
     ] {
         deliver(&b, &a, "b", "a", msg).await;
     }
-    b.close().await;
+    b.connection().unwrap().close().await;
     eventually_within("old direct session and registration expire", SETTLE, || {
         a.path_to(&"b".into()).is_none() && a.known_peers().is_empty()
     })
@@ -133,7 +127,7 @@ async fn keyless_direct_reconnects_with_fresh_session_at_the_same_socket_address
     let mut config = PunchConfig::open("b".into(), address);
     config.bind = bind;
     config.policy = PathPolicy::DirectPreferred;
-    let replacement = PunchTransport::bind(config).await.unwrap();
+    let replacement = UdpTransport::bind_connectivity(config).await.unwrap();
     assert_eq!(replacement.local_addr().unwrap(), bind);
     paths(&a, &replacement, PeerPath::Direct).await;
     // A fresh sender starts its sequence again; the incumbent must not retain
@@ -143,6 +137,6 @@ async fn keyless_direct_reconnects_with_fresh_session_at_the_same_socket_address
     deliver(&a, &replacement, "a", "b", b"fresh session reverse").await;
     assert_eq!(a.path_to(&"b".into()), Some(PeerPath::Direct));
     assert_eq!(replacement.path_to(&"a".into()), Some(PeerPath::Direct));
-    replacement.close().await;
-    a.close().await;
+    replacement.connection().unwrap().close().await;
+    a.connection().unwrap().close().await;
 }

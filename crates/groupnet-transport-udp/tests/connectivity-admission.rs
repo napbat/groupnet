@@ -1,3 +1,4 @@
+#![cfg(feature = "connectivity")]
 //! Dynamic relay admission through real UDP sockets and the real router.
 
 use std::io;
@@ -11,9 +12,8 @@ use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest, MAX_CREDENTIAL_BYTES};
 use groupnet_transport::link::{LinkFuture, LinkProvider};
-use groupnet_transport_punch::{
-    NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchLink, PunchTransport, Rendezvous,
-};
+use groupnet_transport_punch::{NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous};
+use groupnet_transport_udp::{UdpLink, UdpTransport};
 use tokio::time::timeout;
 
 const SETTLE: Duration = Duration::from_secs(15);
@@ -25,7 +25,7 @@ fn loopback() -> SocketAddr {
 async fn attach(router: &Router, address: SocketAddr) {
     let mut config = PunchConfig::open(router.local_id().clone(), address);
     config.bind = loopback();
-    let link = Box::new(PunchLink::new(config))
+    let link = Box::new(UdpLink::connectivity(config))
         .bind(router.local_id().clone())
         .await
         .unwrap();
@@ -129,18 +129,23 @@ async fn custom_accounts(policy: PathPolicy, expected: PeerPath) {
     ] {
         let config = config_for(identity, credential);
         assert_eq!(
-            PunchTransport::bind(config).await.unwrap_err().kind(),
+            UdpTransport::bind_connectivity(config)
+                .await
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::PermissionDenied
         );
     }
     let config = config_for("canonical-account", b"account-proof".to_vec());
     assert!(!format!("{config:?}").contains("account-proof"));
-    let accepted = PunchTransport::bind(config).await.unwrap();
-    let peer = PunchTransport::bind(config_for("other", b"account-proof".to_vec())).await;
+    let accepted = UdpTransport::bind_connectivity(config).await.unwrap();
+    let peer =
+        UdpTransport::bind_connectivity(config_for("other", b"account-proof".to_vec())).await;
     assert_eq!(peer.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-    let second = PunchTransport::bind(config_for("second-account", b"account-proof".to_vec()))
-        .await
-        .unwrap();
+    let second =
+        UdpTransport::bind_connectivity(config_for("second-account", b"account-proof".to_vec()))
+            .await
+            .unwrap();
     eventually_within(
         "custom admitted accounts discover selected paths",
         SETTLE,
@@ -168,8 +173,8 @@ async fn custom_accounts(policy: PathPolicy, expected: PeerPath) {
     let received = timeout(SETTLE, second.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, NodeId::from("canonical-account"));
     assert_eq!(received.msg, b"reverse account traffic");
-    second.close().await;
-    accepted.close().await;
+    second.connection().unwrap().close().await;
+    accepted.connection().unwrap().close().await;
     relay.close().await;
 }
 
@@ -192,14 +197,17 @@ async fn duplicate_incumbent(policy: PathPolicy, expected: PeerPath) {
         config.policy = policy;
         config
     };
-    let a = PunchTransport::bind(config("a")).await.unwrap();
-    let b = PunchTransport::bind(config("b")).await.unwrap();
+    let a = UdpTransport::bind_connectivity(config("a")).await.unwrap();
+    let b = UdpTransport::bind_connectivity(config("b")).await.unwrap();
     eventually_within("open peers discover incumbent", SETTLE, || {
         a.path_to(&"b".into()) == Some(expected) && b.path_to(&"a".into()) == Some(expected)
     })
     .await;
     assert_eq!(
-        PunchTransport::bind(config("a")).await.unwrap_err().kind(),
+        UdpTransport::bind_connectivity(config("a"))
+            .await
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::TimedOut
     );
     assert_eq!(a.path_to(&"b".into()), Some(expected));
@@ -216,8 +224,8 @@ async fn duplicate_incumbent(policy: PathPolicy, expected: PeerPath) {
     let received = timeout(SETTLE, a.recv()).await.unwrap().unwrap();
     assert_eq!(received.from, NodeId::from("b"));
     assert_eq!(received.msg, b"incumbent still receives");
-    a.close().await;
-    b.close().await;
+    a.connection().unwrap().close().await;
+    b.connection().unwrap().close().await;
     relay.close().await;
 }
 
@@ -246,19 +254,25 @@ async fn explicit_keyed_dynamic_mode_never_downgrades_and_credentials_remain_bou
         let mut config = PunchConfig::open("open".into(), address);
         config.policy = policy;
         assert_eq!(
-            PunchTransport::bind(config).await.unwrap_err().kind(),
+            UdpTransport::bind_connectivity(config)
+                .await
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::TimedOut
         );
     }
     let mut config = PunchConfig::dynamic("keyed".into(), address, Some(key), Vec::new());
     config.policy = PathPolicy::RelayOnly;
-    let accepted = PunchTransport::bind(config).await.unwrap();
+    let accepted = UdpTransport::bind_connectivity(config).await.unwrap();
     let mut oversized = PunchConfig::open(NodeId::from("oversized"), address);
     oversized.credential = vec![0; MAX_CREDENTIAL_BYTES + 1];
     assert_eq!(
-        PunchTransport::bind(oversized).await.unwrap_err().kind(),
+        UdpTransport::bind_connectivity(oversized)
+            .await
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::InvalidInput
     );
-    accepted.close().await;
+    accepted.connection().unwrap().close().await;
     relay.close().await;
 }

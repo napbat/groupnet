@@ -3,13 +3,21 @@
 //! A real [`Transport`] over UDP datagrams — a concrete binding of Groupnet's
 //! transport-agnostic trait.
 //!
-//! UDP is the natural fit for the best-effort, message-oriented contract: one
-//! frame per datagram, loss and reorder tolerated, no connection state.
-//! The opt-in `link` feature exposes `UdpLink` for router registration with
-//! explicit peer identities and addresses. It owns its bound socket without
-//! independently spawned tasks; dropping the link's workers releases it.
+//! UDP fits the best-effort, message-oriented contract: one frame per datagram,
+//! loss and reorder tolerated. The opt-in `link` feature exposes `UdpLink` for
+//! router registration with explicit peer identities and addresses. Raw mode owns
+//! its bound socket without independently spawned tasks.
 //!
-//! ## Scaffold simplifications
+//! The optional `connectivity` feature lets the same `UdpTransport` and `UdpLink`
+//! own a native UDP connection from `groupnet-transport-punch`: admission,
+//! candidate checks, maintained direct paths and relay fallback all use that
+//! connection's actual leased sockets. Use `UdpTransport::bind_connectivity` or
+//! `UdpLink::connectivity`; transfer an already-bound endpoint with
+//! `UdpTransport::into_bound_link` to retain sessions, native MTU and task cleanup.
+//! Connected mode never admits peers from `register_peer`, advertisements or raw
+//! datagram self-attribution.
+//!
+//! ## Raw datagram behavior
 //!
 //! * **Seeded address book.** The engine speaks only in [`NodeId`]s, so this
 //!   transport maps them to socket addresses via a book: seeds are registered
@@ -19,9 +27,9 @@
 //!   the book through `Transport::learn_peer` (the runtime feeds them
 //!   automatically). Inbound datagrams carry their sender's id, so a peer the
 //!   book has never heard of is attributed and learned from its first frame.
-//! * **One frame per datagram.** A frame must fit in a single UDP packet; very
-//!   large clusters could exceed the MTU. Fragmentation / a stream fallback is
-//!   future work.
+//! * **One frame per datagram.** A raw frame must fit in a single UDP packet.
+//!   Managed connected links advertise the native protocol's smaller message MTU
+//!   so routing can fragment frames before sending.
 //!
 //! [`Transport`]: groupnet_transport::Transport
 

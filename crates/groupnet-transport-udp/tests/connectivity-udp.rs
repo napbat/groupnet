@@ -1,3 +1,4 @@
+#![cfg(feature = "connectivity")]
 //! Loopback-only native discovery, direct/relay delivery and lifecycle scenarios.
 
 use std::io;
@@ -8,11 +9,11 @@ use groupnet_core::NodeId;
 use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
-use groupnet_transport::link::{LinkLifecycle, LinkProvider};
+use groupnet_transport::link::LinkProvider;
 use groupnet_transport_punch::{
-    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchLink, PunchTransport,
-    Rendezvous,
+    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous,
 };
+use groupnet_transport_udp::{UdpLink, UdpTransport};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -31,7 +32,7 @@ async fn endpoint(
     peers: &[&str],
     rendezvous: SocketAddr,
     policy: PathPolicy,
-) -> PunchTransport {
+) -> UdpTransport {
     let mut config = PunchConfig::new(
         NodeId::from(local),
         rendezvous,
@@ -40,10 +41,10 @@ async fn endpoint(
     );
     config.bind = loopback();
     config.policy = policy;
-    PunchTransport::bind(config).await.unwrap()
+    UdpTransport::bind_connectivity(config).await.unwrap()
 }
 
-async fn pair(policy: PathPolicy) -> (Rendezvous, PunchTransport, PunchTransport) {
+async fn pair(policy: PathPolicy) -> (Rendezvous, UdpTransport, UdpTransport) {
     let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
         .await
         .unwrap();
@@ -96,8 +97,8 @@ async fn simultaneous_punching_establishes_direct_paths_and_preserves_boundaries
         .await;
     }
     assert_eq!(a.path_to(&"b".into()), Some(PeerPath::Direct));
-    a.close().await;
-    b.close().await;
+    a.connection().unwrap().close().await;
+    b.connection().unwrap().close().await;
 }
 
 #[tokio::test]
@@ -127,14 +128,14 @@ async fn relay_only_paths_deliver_both_directions_and_keep_idle_registrations_li
         timeout(SETTLE, a.recv()).await.unwrap().unwrap().msg,
         b"back"
     );
-    b.close().await;
+    b.connection().unwrap().close().await;
     eventually_within(
         "dead relay registration expires",
         Duration::from_secs(14),
         || a.path_to(&"b".into()).is_none(),
     )
     .await;
-    a.close().await;
+    a.connection().unwrap().close().await;
     relay.close().await;
 }
 
@@ -156,8 +157,8 @@ async fn one_relay_only_peer_forces_relay_fallback() {
         timeout(SETTLE, b.recv()).await.unwrap().unwrap().msg,
         b"fallback"
     );
-    a.close().await;
-    b.close().await;
+    a.connection().unwrap().close().await;
+    b.connection().unwrap().close().await;
     relay.close().await;
 }
 
@@ -175,7 +176,7 @@ async fn wrong_keys_unknown_identities_and_advertisements_cannot_join() {
         vec!["a".into()],
     );
     config.bind = loopback();
-    let wrong = PunchTransport::bind(config).await.unwrap();
+    let wrong = UdpTransport::bind_connectivity(config).await.unwrap();
     let unknown = endpoint("unknown", &["a"], address, PathPolicy::RelayOnly).await;
     a.learn_peer(
         &"unknown".into(),
@@ -187,9 +188,9 @@ async fn wrong_keys_unknown_identities_and_advertisements_cannot_join() {
     assert!(a.path_to(&"b".into()).is_none());
     assert!(wrong.path_to(&"a".into()).is_none());
     assert!(unknown.path_to(&"a".into()).is_none());
-    wrong.close().await;
-    unknown.close().await;
-    a.close().await;
+    wrong.connection().unwrap().close().await;
+    unknown.connection().unwrap().close().await;
+    a.connection().unwrap().close().await;
     relay.close().await;
 }
 
@@ -199,7 +200,7 @@ async fn clones_shutdown_receivers_and_last_drop_releases_sockets() {
     let address = a.local_addr().unwrap();
     let clone = a.clone();
     let receiver = tokio::spawn(async move { clone.recv().await });
-    a.close().await;
+    a.connection().unwrap().close().await;
     assert_eq!(
         timeout(SETTLE, receiver)
             .await
@@ -253,7 +254,10 @@ async fn configuration_limits_and_secret_debug_are_explicit() {
         let mut config = PunchConfig::new("a".into(), address, key(), peers);
         config.bind = loopback();
         assert_eq!(
-            PunchTransport::bind(config).await.unwrap_err().kind(),
+            UdpTransport::bind_connectivity(config)
+                .await
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
     }
@@ -290,7 +294,7 @@ async fn provider_binds_identity_cost_and_native_mtu_and_router_closes_socket() 
         );
         config.bind = bind;
         config.policy = PathPolicy::RelayOnly;
-        let provider = PunchLink::new(config).with_cost(cost);
+        let provider = UdpLink::connectivity(config).with_cost(cost);
         router
             .add_link(
                 Box::new(provider)
@@ -331,7 +335,7 @@ async fn provider_rejects_a_different_local_identity_before_binding() {
     );
     config.bind = bind;
     assert_eq!(
-        Box::new(PunchLink::new(config))
+        Box::new(UdpLink::connectivity(config))
             .bind("different".into())
             .await
             .unwrap_err()
@@ -353,7 +357,7 @@ async fn failed_router_registration_drains_provider_endpoint() {
         vec!["peer".into()],
     );
     config.bind = bind;
-    let bound = Box::new(PunchLink::new(config).with_cost(0))
+    let bound = Box::new(UdpLink::connectivity(config).with_cost(0))
         .bind(router.local_id().clone())
         .await
         .unwrap();
@@ -373,7 +377,7 @@ async fn bound_provider_drop_cancels_socket_owner() {
         Vec::new(),
     );
     config.bind = bind;
-    let bound = Box::new(PunchLink::new(config))
+    let bound = Box::new(UdpLink::connectivity(config))
         .bind("local".into())
         .await
         .unwrap();
@@ -396,15 +400,17 @@ async fn lifecycle_shutdown_is_synchronous_and_close_drains_owned_socket() {
     let (relay, a, b) = pair(PathPolicy::RelayOnly).await;
     let bind = a.local_addr().unwrap();
     let clone = a.clone();
-    LinkLifecycle::shutdown(&a);
+    a.connection().unwrap().shutdown();
     assert_eq!(
         clone.recv().await.unwrap_err().kind(),
         io::ErrorKind::NotConnected
     );
-    timeout(SETTLE, LinkLifecycle::close(&a)).await.unwrap();
+    timeout(SETTLE, a.connection().unwrap().close())
+        .await
+        .unwrap();
     let rebound = UdpSocket::bind(bind).await.unwrap();
     drop(rebound);
-    b.close().await;
+    b.connection().unwrap().close().await;
     relay.close().await;
 }
 
@@ -417,15 +423,17 @@ async fn cancelled_close_preserves_the_task_for_a_later_drain() {
         Vec::new(),
     );
     config.bind = loopback();
-    let transport = PunchTransport::bind(config).await.unwrap();
+    let transport = UdpTransport::bind_connectivity(config).await.unwrap();
     let bind = transport.local_addr().unwrap();
     // On this current-thread runtime the newly spawned endpoint has not been
     // polled yet. Poll close once to initiate cancellation without yielding to it.
-    let mut closing = Box::pin(transport.close());
+    let mut closing = Box::pin(transport.connection().unwrap().close());
     let first = std::future::poll_fn(|cx| std::task::Poll::Ready(closing.as_mut().poll(cx))).await;
     assert!(first.is_pending());
     drop(closing);
-    timeout(SETTLE, transport.close()).await.unwrap();
+    timeout(SETTLE, transport.connection().unwrap().close())
+        .await
+        .unwrap();
     let rebound = UdpSocket::bind(bind).await.unwrap();
     drop(rebound);
 }

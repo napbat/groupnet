@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest};
+use groupnet_transport::link::LinkFuture;
 use tokio::time::timeout;
 
 use super::wire::{Body, MAX_PACKET, Packet, Session};
@@ -262,16 +263,20 @@ async fn policy_concurrency_is_bounded_and_shutdown_drains_every_evaluation() {
 async fn stale_queue_generation_cannot_be_reauthorized_using_reused_identity() {
     let relay = Rendezvous::bind_open(loopback()).await.unwrap();
     let address = relay.local_addr().unwrap();
-    let a = PunchTransport::bind(PunchConfig::open("a".into(), address))
+    let a = UdpConnection::bind(PunchConfig::open("a".into(), address))
         .await
         .unwrap();
-    let b = PunchTransport::bind(PunchConfig::open("b".into(), address))
+    let b = UdpConnection::bind(PunchConfig::open("b".into(), address))
         .await
         .unwrap();
     eventually_within("peer discovery", SETTLE, || {
         a.path_to(&"b".into()).is_some() && b.path_to(&"a".into()).is_some()
     })
     .await;
+    assert_eq!(a.local_id(), &NodeId::from("a"));
+    assert_eq!(b.local_id(), &NodeId::from("b"));
+    let registry = b.sessions();
+    let same_registry = b.clone().sessions();
     a.send(&"b".into(), b"queued old generation").await.unwrap();
     timeout(SETTLE, async {
         loop {
@@ -285,18 +290,20 @@ async fn stale_queue_generation_cannot_be_reauthorized_using_reused_identity() {
     .unwrap();
     let old = lock(&b.inner.peers).get("a").unwrap().lease.clone();
     old.revoke();
-    let replacement = b
-        .inner
-        .sessions
+    let replacement = registry
         .try_admit(AcceptedPeer { node: "a".into() })
         .unwrap();
     assert_ne!(old.id(), replacement.id());
     assert!(timeout(SILENCE, b.recv_admitted()).await.is_err());
     assert!(replacement.is_active());
+    assert!(same_registry.is_active(&NodeId::from("a"), replacement.id()));
     drop(old);
     assert!(replacement.is_active());
     a.close().await;
     b.close().await;
+    assert!(!registry.is_active(&NodeId::from("a"), replacement.id()));
+    assert!(!same_registry.is_active(&NodeId::from("a"), replacement.id()));
+    assert_eq!(b.local_id(), &NodeId::from("b"));
     relay.close().await;
 }
 
@@ -333,10 +340,10 @@ fn maximum_credential_with_maximum_identity_fits_keyed_and_open_datagrams() {
 async fn selected_outbound_generation_cannot_send_to_a_replacement_lease() {
     let relay = Rendezvous::bind_open(loopback()).await.unwrap();
     let address = relay.local_addr().unwrap();
-    let a = PunchTransport::bind(PunchConfig::open("a".into(), address))
+    let a = UdpConnection::bind(PunchConfig::open("a".into(), address))
         .await
         .unwrap();
-    let b = PunchTransport::bind(PunchConfig::open("b".into(), address))
+    let b = UdpConnection::bind(PunchConfig::open("b".into(), address))
         .await
         .unwrap();
     eventually_within("outbound generation discovery", SETTLE, || {
@@ -463,7 +470,7 @@ async fn unproved_challenge_saturation_does_not_reserve_established_peer_capacit
         attacker.challenge(address).await;
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let admitted = PunchTransport::bind(PunchConfig::dynamic(
+    let admitted = UdpConnection::bind(PunchConfig::dynamic(
         "legitimate".into(),
         address,
         None,

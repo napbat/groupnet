@@ -34,9 +34,12 @@ an unrelated reachable node is not automatically a member or coordinator.
 Periodic bounded exchanges retry lost bootstrap traffic and permit reconnection
 despite retained dead-member tombstones.
 
-Already-bound managed TCP and punching endpoints expose `into_bound_link(cost)`,
-which transfers their session registry and shutdown lifecycle together. Do not
-reconstruct them as static links from a copied peer list. Custom dynamic
+Already-bound managed TCP and connectivity-backed TCP/UDP adapters expose
+`into_bound_link(cost)`, transferring session registry and shutdown lifecycle
+together. The connectivity library itself never registers a router link.
+It owns live paths, candidate checks, refresh and relay fallback; the protocol
+adapter owns transport integration. Do not reconstruct dynamic adapters as
+static links from a copied peer list. Custom dynamic
 transports attach `SessionRegistry` through `BoundLink::with_sessions`, tag
 incoming frames at their producing session, and implement `send_admitted` to
 preserve the router-selected generation through queued physical writes.

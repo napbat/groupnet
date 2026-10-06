@@ -42,12 +42,12 @@ impl RawPeer {
         self.sequence += 1;
         let mut bytes = [0; MAX_PACKET];
         let length = wire::encode(
-            Packet {
+            wire::sign_check(Packet {
                 sender: self.name,
                 session: self.session,
                 sequence: self.sequence,
                 body,
-            },
+            }),
             &key(),
             &mut bytes,
         )
@@ -120,7 +120,7 @@ impl RawPeer {
         &mut self,
         server: SocketAddr,
         name: &str,
-    ) -> (Option<SocketAddr>, Session) {
+    ) -> (Option<SocketAddr>, Session, Session) {
         self.send(
             server,
             Body::Query {
@@ -136,11 +136,12 @@ impl RawPeer {
                     peer,
                     address,
                     session,
+                    secret,
                     ..
                 } = wire::decode(&bytes, &key()).unwrap().body
                 {
                     assert_eq!(peer, name);
-                    break (address, session);
+                    break (address, session, secret);
                 }
             }
         })
@@ -375,14 +376,14 @@ async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive
     let address = relay.local_addr().unwrap();
     let mut config = PunchConfig::new("a".into(), address, key(), vec!["b".into()]);
     config.bind = loopback();
-    let a = PunchTransport::bind(config).await.unwrap();
+    let a = UdpConnection::bind(config).await.unwrap();
     let mut b = RawPeer::new("b", [2; 16]).await;
     b.register(address, PathPolicy::DirectPreferred).await;
     eventually_within("raw peer discovered", SETTLE, || {
         a.path_to(&"b".into()).is_some()
     })
     .await;
-    let a_session = b.observed_peer(address, "a").await.1;
+    let (_, a_session, secret) = b.observed_peer(address, "a").await;
     let destination = a.local_addr().unwrap();
     b.socket
         .send_to(&[0; MAX_PACKET + 100], destination)
@@ -395,6 +396,7 @@ async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive
         Body::Probe {
             target: a_session,
             nonce,
+            secret,
         },
     )
     .await;
@@ -414,7 +416,7 @@ async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive
     })
     .await
     .unwrap();
-    let packet = Packet {
+    let packet = wire::sign_check(Packet {
         sender: "b",
         session: b.session,
         sequence: 100,
@@ -422,9 +424,10 @@ async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive
             peer: "a",
             target: a_session,
             capability,
+            secret,
             message: b"authenticated",
         },
-    };
+    });
     let mut bytes = [0; MAX_PACKET];
     let length = wire::encode(packet, &NetworkKey::from_bytes([9; 32]), &mut bytes).unwrap();
     b.socket

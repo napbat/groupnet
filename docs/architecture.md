@@ -29,14 +29,28 @@ flowchart TB
     App -->|"connect / accept"| Tunnels
     Links <-->|"One-hop frames"| IPC["IPC peer"]
     Links <-->|"One-hop frames"| TCP["TCP peer"]
-    Links <-->|"One-hop frames"| UDP["UDP / punch peer"]
+    Links <-->|"One-hop frames"| UDP["UDP peer"]
     Links <-->|"In-process frames"| Mem["Memory peer"]
+    TCP --> Connectivity["Native adjacent connectivity\nCandidates, checks, session fencing\nDirect path / relay fallback"]
+    UDP --> Connectivity
+    Connectivity <-->|"Admission and candidate exchange"| Rendezvous["Rendezvous service\nNot a group member or router link"]
 ```
 
 Routing is intrinsic to every runtime node. Applications and tests use
 `Node::builder(id).link(provider).start().await`; all protocol choices produce
 the same `Node` type. `NetworkConfig::bind` starts a standalone routed `Network`
 without the node's membership actors.
+
+Applications such as docstore, docres, and s3cache use this domain-neutral layer
+for groups, peer-addressed traffic and coordination; application data and access
+policy remain above it. TCP/UDP adapters may consume the native connectivity
+library to establish and maintain adjacent direct or relayed paths. That library
+does not implement a transport or logical route bridging.
+
+A memory-only node A reaches TCP-only C through edge B, which owns both protocols.
+If A gains compatible admitted network connectivity to C, routing may prefer its
+cheaper one-hop route and fall back through B after that adjacency fails. Group
+discovery supplies hints, not permission to create arbitrary adjacent sessions.
 
 ## 2. Crate dependency boundaries
 
@@ -49,13 +63,18 @@ flowchart TB
     Facade["groupnet\nFeature-selected facade"]
     Runtime["groupnet-runtime\nNode and Group actors"]
     Network["groupnet-network\nRouting and TLS tunnels"]
-    Protocols["Protocol implementation crates\nTCP, UDP, memory, IPC, punch"]
+    Protocols["Protocol implementation crates\nTCP, UDP, memory, IPC"]
+    Connectivity["Native connectivity library\nAdjacent UDP/TCP direct + relay paths"]
     Shared["groupnet-transport\nTransport + optional bulk and link contracts"]
     Core["groupnet-core\nSans-IO coordination"]
     Sim["groupnet-sim\nDeterministic simulation"]
     Facade --> Runtime
     Facade --> Network
     Facade --> Protocols
+    Facade -->|"Optional connectivity feature"| Connectivity
+    Protocols -->|"TCP/UDP only, opt-in"| Connectivity
+    Connectivity -->|"Admission and session primitives"| Shared
+    Connectivity --> Core
     Runtime --> Network
     Runtime --> Shared
     Runtime --> Core
@@ -69,9 +88,9 @@ flowchart TB
 
 There is deliberately **no network-to-protocol dependency**. A protocol implements
 `LinkProvider` in its own crate; an application registers it without editing a
-router enum or match. IPC and punching are independent implementation crates,
-not modules owned by the network layer. `groupnet-core` never depends on Tokio,
-a clock, or a transport implementation.
+router enum or match. IPC is a protocol implementation; the punch crate is an
+independent connection library beneath TCP/UDP, not another router link.
+`groupnet-core` never depends on Tokio, a clock, or a transport implementation.
 
 ## 3. One pure engine, two execution environments
 

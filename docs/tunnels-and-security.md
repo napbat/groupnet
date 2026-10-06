@@ -83,7 +83,7 @@ application's USB ownership. Applications still need their own resource policy.
 
 ## 3. Native discovery, direct paths, and relay
 
-`PunchLink` uses an explicitly started, self-hosted `Rendezvous`. In keyed mode,
+`UdpLink::connectivity` uses an explicitly started, self-hosted `Rendezvous`. In keyed mode,
 the shared `NetworkKey` authenticates the routing fabric. Registration includes
 a challenge response tied to the observed source address; leases, admission,
 replay checks, and bounds constrain discovery and relay traffic.
@@ -95,7 +95,7 @@ return-routability check do not authenticate a person or prove identity continui
 Never send reusable secrets over an unencrypted admission exchange.
 
 **Keyless** specifically means no provisioned `NetworkKey` (`key: None`); no
-public/private key pair is required by the punching transport either. It does
+public/private key pair is required by the connection library either. It does
 not forbid application credentials or separately authenticated TLS streams.
 Fresh random protocol capabilities remain mandatory internal session mechanics,
 not application-managed identity keys.
@@ -124,11 +124,68 @@ trusted to introduce peers. Open admission does not make the fabric Byzantine-sa
 Database engines and other consumers choose their own trust and authorization
 policies; no application-specific admission policy is imposed by Groupnet.
 
+### Native multi-candidate traversal contract
+
+UDP and TCP connection establishment remain distinct protocol implementations
+in the custom connectivity library, consumed by the actual TCP/UDP transport
+adapters. The library implements neither `Transport` nor router registration.
+Native candidate exchange is not ICE/STUN/TURN. Candidate
+gathering, bounded session-bound checks, and stable path selection have separate
+responsibilities. Working relay paths remain usable while direct checks run.
+Local, observed, and explicitly configured addresses are untrusted candidates;
+neither advertising an address nor receiving an unsolicited packet proves a path.
+IPv4 and IPv6 candidates must be checked using compatible owned sockets.
+
+TCP traversal requires TCP rendezvous and relay connections, independent of UDP.
+Direct attempts coordinate reusable source-port connections with passive accepts
+where supported by the OS. Ordinary dialing from an unrelated ephemeral port is
+not evidence of TCP hole punching. Simultaneous-open and NAT behavior vary by
+platform; failed direct attempts must retain relay operation, not claim success.
+Neither transport provides a universal NAT traversal guarantee.
+
+Logical route bridging is separate from adjacent connection establishment. A
+memory-only node reaches a remote TCP node through an edge with both adapters.
+The router can prefer a cheaper compatible admitted adjacency when one becomes
+available and retain transit routes otherwise. Group membership, addresses, and
+route advertisements do not grant admission or create unsupported transports.
+
+Admission, duplicate-identity rejection, producing-session generation, and
+bounded queues apply to every candidate and path. Relay-only participants do not
+disclose candidate addresses or initiate direct checks. Path replacement cannot
+move old queued traffic into a replacement session, and an unverified candidate
+cannot replace a working path. Application encryption remains separately chosen.
+
+Both endpoint configurations expose up to three additional candidate binds and
+eight explicit advertised addresses, plus optional interface gathering. UDP
+retains the separately observed mapping alongside those advertisements and caps
+active candidate/socket checks at 32, rotating unvalidated checks as necessary.
+Authenticated peer-reflexive sources can replace an unvalidated slot, never a
+healthy selected path. UDP final data and confirmations require pair-secret MACs:
+forwarding a captured authentic probe and learning its returned capability is
+not sufficient to inject data or advance replay state.
+
+TCP direct and keyed control streams derive separate transmit/receive MAC keys
+and authenticate monotonic frame sequences. Reflection and replay cannot convert
+locally emitted traffic into traffic attributed to the remote peer. Direct
+handshakes include fresh mutual challenges, including the two-active-open case.
+At most sixteen candidate dials run concurrently, with at most sixteen new checks
+per second; per-tuple bursts and cooldowns prevent indefinite aggressive probing.
+Rendezvous established events take precedence over unauthenticated accepts.
+
+TCP admission lasts for the live admitted session. Losing either peer's rendezvous
+connection does not revoke a healthy direct session, but disables that peer's relay
+fallback and further candidate checks. The generation is withdrawn when its direct
+stream closes; a fresh rendezvous admission can supersede it with a new generation.
+An endpoint with a lost local control connection terminates when no usable direct
+sessions remain, rather than remaining inert; callers must explicitly rebind.
+UDP retains its existing rendezvous/discovery lease coupling. Neither TCP control
+nor its relay is automatically TLS-encrypted or an HTTP proxy protocol.
+
 The following path-selection flow applies with or without a provisioned key:
 
 ```mermaid
 flowchart TD
-    Start["PunchLink configured with rendezvous, admission credentials, optional NetworkKey"]
+    Start["TCP/UDP link configured with connectivity, credentials, optional NetworkKey"]
     Register["Address-verified, admitted rendezvous session"]
     Policy{"PathPolicy"}
     Probe["DirectPreferred\nExchange discovery information and probe peers"]
@@ -151,9 +208,9 @@ routing authentication is not confidentiality: use pinned TLS tunnels for
 protected application bytes. Shared-key holders are trusted and can impersonate
 routing aliases; the fabric is not Byzantine-safe.
 
-The native UDP format is `GNP3`; the rendezvous and endpoints must upgrade
-together. Earlier formats and authentication-mode mismatches are rejected
-without compatibility fallback.
+The native UDP format is `GNP4`; TCP frames use version 2. Each rendezvous and
+its endpoints must upgrade together. Earlier formats and authentication-mode
+mismatches are rejected without compatibility fallback.
 
 ## 4. What each security layer actually grants
 

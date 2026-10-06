@@ -1,6 +1,6 @@
 //! Three previously unknown nodes discover one another through a keyless relay.
 //!
-//! Run with `cargo run -p groupnet --example dynamic-relay --features punch`.
+//! Run with `cargo run -p groupnet --example dynamic-relay --features udp,connectivity`.
 //! Add `-- --direct` to prefer verified direct UDP paths with relay fallback.
 //! Open admission deliberately provides no cryptographic endpoint identity or
 //! confidentiality. The rendezvous is not itself a coordination-group member.
@@ -8,9 +8,10 @@
 use std::io;
 use std::time::Duration;
 
+use groupnet::connectivity::{PathPolicy, PeerPath, PunchConfig, Rendezvous};
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
-use groupnet::transport::punch::{PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous};
+use groupnet::transport::udp::UdpTransport;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -38,7 +39,7 @@ async fn main() -> io::Result<()> {
     for id in &ids {
         let mut config = PunchConfig::open(id.clone(), address);
         config.policy = policy;
-        let transport = PunchTransport::bind(config).await?;
+        let transport = UdpTransport::bind_connectivity(config).await?;
         nodes.push(
             Node::builder(id.clone())
                 .link(transport.clone().into_bound_link(1))

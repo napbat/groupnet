@@ -6,9 +6,8 @@ use groupnet_network::tunnel::{PeerIdentity, TunnelTransport};
 use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::bulk::BulkTransport;
-use groupnet_transport_punch::{
-    NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous,
-};
+use groupnet_transport_punch::{NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous};
+use groupnet_transport_udp::UdpTransport;
 use tokio::time::timeout;
 
 use super::{DEADLINE, binary, fixtures::credentials};
@@ -33,10 +32,10 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
             config.policy = policy;
             config
         };
-        let left_udp = PunchTransport::bind(configure(left.clone(), right.clone()))
+        let left_udp = UdpTransport::bind_connectivity(configure(left.clone(), right.clone()))
             .await
             .unwrap();
-        let right_udp = PunchTransport::bind(configure(right.clone(), left.clone()))
+        let right_udp = UdpTransport::bind_connectivity(configure(right.clone(), left.clone()))
             .await
             .unwrap();
         let path = match policy {

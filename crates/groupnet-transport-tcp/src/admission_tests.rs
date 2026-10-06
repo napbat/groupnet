@@ -119,7 +119,8 @@ async fn custom_policy_rejects_wrong_credentials_and_claims_without_leaking_secr
         eventually(|| policy.called.load(Ordering::SeqCst) >= expected).await;
         eventually(|| {
             client
-                .inner
+                .direct()
+                .expect("direct endpoint")
                 .admission
                 .as_ref()
                 .expect("managed")
@@ -158,7 +159,8 @@ async fn duplicate_identity_cannot_evict_incumbent_and_clean_reconnect_works() {
     connect(&duplicate, &server);
     eventually(|| {
         duplicate
-            .inner
+            .direct()
+            .expect("direct endpoint")
             .admission
             .as_ref()
             .expect("managed")
@@ -235,7 +237,8 @@ async fn revoke_disconnects_and_fences_queued_frames_before_reconnect() {
     // Wait for the frame to queue without consuming it, then revoke its producer.
     eventually(|| {
         server
-            .inner
+            .direct()
+            .expect("direct endpoint")
             .inbox
             .try_lock()
             .is_ok_and(|inbox| !inbox.is_empty())
@@ -245,7 +248,8 @@ async fn revoke_disconnects_and_fences_queued_frames_before_reconnect() {
     eventually(|| peers(&client) == 0).await;
     eventually(|| {
         client
-            .inner
+            .direct()
+            .expect("direct endpoint")
             .admission
             .as_ref()
             .expect("managed")
@@ -308,7 +312,8 @@ async fn pending_policy_capacity_and_deadline_are_bounded_and_shutdown_drains() 
     connect(&denied, &server);
     eventually(|| {
         denied
-            .inner
+            .direct()
+            .expect("direct endpoint")
             .admission
             .as_ref()
             .expect("managed")
@@ -322,7 +327,8 @@ async fn pending_policy_capacity_and_deadline_are_bounded_and_shutdown_drains() 
     assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
     eventually(|| {
         server
-            .inner
+            .direct()
+            .expect("direct endpoint")
             .admission
             .as_ref()
             .expect("managed")
@@ -402,7 +408,8 @@ async fn oversized_wire_credentials_are_rejected_before_policy_and_capacity_hold
     connect(&excess, &server);
     eventually(|| {
         excess
-            .inner
+            .direct()
+            .expect("direct endpoint")
             .admission
             .as_ref()
             .expect("managed")
@@ -436,7 +443,8 @@ async fn policy_cannot_silently_rename_local_identity() {
     connect(&client, &server);
     eventually(|| {
         client
-            .inner
+            .direct()
+            .expect("direct endpoint")
             .admission
             .as_ref()
             .expect("managed")
@@ -610,7 +618,8 @@ async fn shutdown_cancels_policy_work_without_waiting_for_handshake_deadline() {
         .expect("policy drained immediately");
     assert_eq!(
         server
-            .inner
+            .direct()
+            .expect("direct endpoint")
             .admission
             .as_ref()
             .expect("managed")

@@ -85,7 +85,7 @@ requirements, so they're separate traits bound to separate physical connections.
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
 | [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) | persistent TCP messages, TCP streams, and `TcpLink` registration |
 | [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | control | transport(link), core, tokio | native named pipes/Unix sockets and `IpcLink` registration |
-| [`groupnet-transport-punch`](crates/groupnet-transport-punch) | control | transport(link), core, tokio, ring | authenticated UDP discovery/punching/relay and `PunchLink` registration |
+| [`groupnet-transport-punch`](crates/groupnet-transport-punch) | connectivity | transport admission/session primitives, core, tokio, ring, socket2, if-addrs | native adjacent-node UDP/TCP connections, candidate checks, rendezvous and relay; no transport or router link |
 | [`groupnet-network`](crates/groupnet-network) | both | transport(bulk, link), tokio, rustls, ring | protocol-independent group-network routing and pinned end-to-end TLS streams |
 | [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), network, tokio | non-generic managed `Node`, group actors, and `FileGrantStore` |
 | [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
@@ -127,8 +127,15 @@ cargo run --example cluster     # 3-node convergence, derived coordinator, metad
 cargo run --example routing     # resolve a resource to its owner from any node
 cargo run --example dynamic-admission --features tcp-msg  # unknown clients, open admission
 cargo run --example dynamic-admission --features tcp-msg -- --invite  # custom credential policy
-cargo run --example dynamic-relay --features punch  # discovery through a keyless relay
-cargo run --example dynamic-relay --features punch -- --direct  # prefer direct paths; relay fallback
+cargo run --example dynamic-relay --features udp,connectivity  # discovery through a keyless relay
+cargo run --example dynamic-relay --features udp,connectivity -- --direct
+cargo run --example native-traversal --features udp,tcp-msg,connectivity
+cargo run --example native-traversal --features udp,tcp-msg,connectivity -- --tcp
+cargo run --example native-traversal --features udp,tcp-msg,connectivity -- --tcp --relay-only
+cargo run --example native-traversal --features udp,tcp-msg,connectivity -- --ipv6
+cargo run --example connectivity-bridge --features tcp-msg,connectivity  # memory A -> TCP edge B -> remote C
+cargo run --example connectivity-bridge --features tcp-msg,connectivity -- --relay-only
+cargo run --example connectivity-bridge --features tcp-msg,connectivity -- --upgrade
 ```
 
 Five more live with the layers they exercise:
@@ -180,7 +187,7 @@ let node = Node::builder(NodeId::new("node-a"))
 ### Node-owned heterogeneous connections
 
 Select the protocol features you need (`tcp-msg` for this example; also `udp`,
-`ipc`, and `punch`). Add several links to the same builder to bridge protocols:
+`ipc`; enable `connectivity` for native TCP/UDP paths). Add links to bridge protocols:
 
 ```rust
 use groupnet::core::NodeId;
@@ -203,7 +210,7 @@ let devices = node.join_group("devices");
 node.close().await;
 ```
 
-`TcpLink`, `UdpLink`, `MemLink`, `IpcLink`, and `PunchLink` belong to their
+`TcpLink`, `UdpLink`, `MemLink`, and `IpcLink` belong to their
 implementation crates. All implement `groupnet::transport::link::LinkProvider`;
 there is no protocol enum or special custom-adapter path. To add a protocol,
 implement that shared contract outside the router. Binding returns a `BoundLink`
@@ -295,18 +302,19 @@ peers simultaneously; relay-only mode never sends direct probes. Not every NAT
 supports direct connectivity.
 
 For dynamic keyless discovery, start `Rendezvous::bind_open(address)` and give
-each node `PunchLink::new(PunchConfig::open(local_id, rendezvous_address))`.
+each node `UdpLink::connectivity(PunchConfig::open(local_id, rendezvous_address))`.
 No participant list, public/private key pair, or pre-shared transport key is
 required. Here **keyless** means `PunchConfig.key == None`, not an absence of
 application admission or all cryptography. `PunchConfig::open` conservatively
 defaults to `RelayOnly`; select direct punching explicitly:
 
 ```rust
-use groupnet::transport::punch::{PathPolicy, PunchConfig, PunchLink};
+use groupnet::connectivity::{PathPolicy, PunchConfig};
+use groupnet::transport::udp::UdpLink;
 
 let mut config = PunchConfig::open(local_id, rendezvous_address);
 config.policy = PathPolicy::DirectPreferred;
-// Register with Node::builder(...).link(PunchLink::new(config)).start().await?
+// Register with Node::builder(...).link(UdpLink::connectivity(config)).start().await?
 ```
 
 Admission, transport authentication, and path policy are independent choices:
@@ -333,8 +341,100 @@ reusable credentials over an unencrypted admission exchange.
 See the runnable [dynamic relay/direct example](crates/groupnet/examples/dynamic-relay.rs)
 and [security boundaries](docs/tunnels-and-security.md#3-native-discovery-direct-paths-and-relay).
 
-The native UDP wire format is now `GNP3`. Upgrade the rendezvous and all endpoints
-together; earlier formats are rejected, not negotiated or silently downgraded.
+Native UDP uses `GNP4`; native TCP frames use version 2. Upgrade the rendezvous
+and its endpoints together; earlier formats are rejected without negotiation.
+
+### Native UDP and TCP candidate traversal
+
+The `connectivity` feature exposes the custom native connection library through
+`groupnet::connectivity` and enables it internally for selected `udp` / `tcp-msg`
+bindings. It is not a transport or a separately registered router link.
+
+| Actual transport | Connectivity configuration / transport-owned link | Rendezvous |
+|---|---|---|
+| UDP | `PunchConfig` / `UdpLink::connectivity(config)` | `Rendezvous` |
+| TCP | `TcpPunchConfig` / `TcpLink::connectivity(config)` | `TcpRendezvous` |
+
+The library owns live `UdpConnection` / `TcpConnection` resources: discovery,
+bounded checks, mapping refresh, path recovery, and relay fallback. The adapters
+own transport traits, link registration, admitted-session integration, and
+shutdown. A connection is not just an address to reopen later: preserving the
+actual checked socket or established stream preserves its NAT mapping.
+
+The router remains responsible for logical multi-hop paths. With memory-only A,
+edge B owning memory and TCP, and TCP-only C, A addresses C by `NodeId`; ordinary
+routing forwards A → B → C without application forwarding code on B. If A gains
+compatible admitted TCP connectivity to C, its cheaper one-hop route can replace
+the bridge route; loss of that adjacency permits fallback through B. Membership
+or route advertisements alone never authorize that new adjacent connection.
+
+Applications such as docstore, docres, and s3cache build on these domain-neutral
+APIs. They choose groups, admission, security, and application behavior—not NAT
+checks or bridge forwarding. `RelayOnly` controls the physical adjacent path,
+not whether the router may forward through other nodes.
+
+Both configurations support `candidate_binds` (up to three additional owned
+sockets), `advertised_candidates` (up to eight explicit address hints), and
+`gather_interfaces` (enabled by default). Wildcard binds gather compatible local
+interface addresses; binding one family does not automatically create sockets
+for the other. Add a bind in the other family when both IPv4 and IPv6 paths are
+required. Link-local/scoped, multicast, broadcast, unspecified, and zero-port
+remote candidate addresses are not usable advertised destinations.
+
+Checks are bounded and session-authenticated. A dead candidate does not block
+other candidates or working relay traffic. UDP preserves a healthy selected path
+and falls back to another validated path or the relay when it expires. Authenticated
+peer-reflexive checks can discover source mappings not in the original candidate
+list; arbitrary source-address changes are not accepted as proof.
+
+TCP uses its own TCP rendezvous and framed relay, with no UDP dependency. It
+coordinates active opens from reusable source ports and accepts validated passive
+connections. Direct success depends on OS socket-reuse and NAT behavior; failure
+retains TCP relay operation. This is native TCP, not HTTPS proxy traversal or a
+TLS-wrapped control protocol.
+
+```rust
+use groupnet::runtime::Node;
+use groupnet::connectivity::{PathPolicy, TcpPunchConfig};
+use groupnet::transport::tcp::TcpLink;
+
+let mut config = TcpPunchConfig::open(local_id.clone(), tcp_rendezvous_address);
+config.policy = PathPolicy::DirectPreferred;
+config.candidate_binds.push("[::]:0".parse()?);
+let node = Node::builder(local_id)
+    .link(TcpLink::connectivity(config))
+    .start()
+    .await?;
+```
+
+Protocol adapters `UdpTransport::bind_connectivity(config)` and
+`TcpMsgTransport::bind_connectivity(config)` expose `local_addrs()`,
+`local_candidates()`, `observed_addr()`, `direct_addr_to(&peer)`, and
+`path_to(&peer)` for inspecting actual selected paths. Their `into_bound_link(cost)`
+transfers the live session registry and shutdown lifecycle together.
+The [native traversal example](crates/groupnet/examples/native-traversal.rs)
+exercises bidirectional bytes, managed membership, and departure cleanup.
+Its `--tcp`, `--ipv6`, and `--relay-only` flags may be combined.
+
+UDP dynamic sessions retain rendezvous/discovery lease requirements. TCP keeps
+already-established direct sessions after rendezvous loss; when no usable direct
+sessions remain, the endpoint terminates and callers must rebind. TCP does not
+silently reconnect its control session. A path change never carries queued traffic
+into a replacement admission generation.
+
+Neither implementation is ICE/STUN/TURN or guarantees traversal through arbitrary
+NATs. Open admission proves no identity ownership; transport MACs are not payload
+encryption. Use application-defined admission and pinned tunnels where required.
+
+The [connectivity bridge example](crates/groupnet/examples/connectivity-bridge.rs)
+demonstrates memory-only A talking bidirectionally to TCP-only C through B,
+group convergence, and route withdrawal without breaking the memory adjacency.
+With `--upgrade`, A explicitly gains a TCP adapter; routing promotes its admitted
+A-C connection to a one-hop route, then restores transit through B after TCP loss.
+
+The example provisions disposable pinned TLS identities and exchanges application
+bytes through `Node`'s bulk-stream API. The managed node owns `router().recv()`
+for group coordination; applications must not compete for that inbox.
 
 For confidential streams, call
 `.tunnels(TunnelConfig::new(identity, [peer_pin]))` on the node builder with a `TlsIdentity` and

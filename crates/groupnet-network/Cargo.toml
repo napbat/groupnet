@@ -24,9 +24,10 @@ tokio-rustls.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 groupnet-transport-mem.workspace = true
-groupnet-transport-tcp = { workspace = true, features = ["msg", "link"] }
+groupnet-transport-tcp = { workspace = true, features = ["msg", "link", "connectivity"] }
 groupnet-transport-ipc.workspace = true
 groupnet-transport-punch.workspace = true
+groupnet-transport-udp = { workspace = true, features = ["connectivity"] }
 rcgen.workspace = true
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
 

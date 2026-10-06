@@ -1,7 +1,7 @@
 //! Control-plane messaging over **persistent** TCP connections.
 //!
 //! [`TcpMsgTransport`] implements the best-effort, message-oriented
-//! [`Transport`] contract on top of pooled, long-lived connections instead of
+//! [`Transport`](groupnet_transport::Transport) contract on pooled, long-lived connections instead of
 //! datagrams — the constant-connection option for clusters that want frames
 //! (gossip, eager delta push) delivered at network latency over reliable
 //! links, without changing the engine or the protocol:
@@ -29,7 +29,7 @@
 //! fills itself in two ways: the dial handshake carries the dialer's own
 //! listener address, so the accepting side can dial back a peer nobody
 //! registered on it (a joiner reaching a seed); and gossiped `advertise_addr`
-//! values arrive through [`Transport::learn_peer`] (the runtime feeds them
+//! values arrive through [`groupnet_transport::Transport::learn_peer`] (the runtime feeds them
 //! automatically), which resolves third parties. Between them, a cluster
 //! bootstraps from seed addresses alone.
 //!
@@ -46,6 +46,10 @@
 //! a full-duplex socket for each live identity. Managed sockets are not subject
 //! to raw idle/oldest-first eviction: dropping an idle writer must not withdraw
 //! an admitted neighbor or prevent a server from reaching a joiner behind NAT.
+//!
+//! With `connectivity`, `TcpMsgTransport::bind_connectivity` owns a native
+//! TCP connection with admitted candidate traversal and relay fallback instead
+//! of a raw connection pool. Address hints cannot bypass native admission.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -54,7 +58,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_transport::{Inbound, Transport};
+use groupnet_transport::Inbound;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex as AsyncMutex;
@@ -70,6 +74,12 @@ mod admitted;
 #[cfg(feature = "link")]
 pub use admitted::TcpAdmissionConfig;
 
+#[cfg(feature = "connectivity")]
+#[path = "connectivity.rs"]
+mod connectivity;
+#[path = "msg_endpoint.rs"]
+mod endpoint;
+
 #[derive(Debug)]
 struct QueuedInbound {
     packet: Inbound,
@@ -84,7 +94,7 @@ struct QueuedInbound {
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Inbound frames buffered between the reader tasks and
-/// [`Transport::recv`]. When the consumer lags, readers stop pulling from
+/// [`groupnet_transport::Transport::recv`]. When the consumer lags, readers stop pulling from
 /// their sockets and TCP backpressure does the rest.
 const INBOUND_QUEUE: usize = 1024;
 
@@ -202,7 +212,17 @@ impl Drop for Inner {
 /// when the listener and session sockets must be fully released before continuing.
 #[derive(Clone, Debug)]
 pub struct TcpMsgTransport {
-    inner: Arc<Inner>,
+    backend: Backend,
+}
+
+#[derive(Clone, Debug)]
+enum Backend {
+    Direct(Arc<Inner>),
+    #[cfg(feature = "connectivity")]
+    Connectivity {
+        connection: groupnet_transport_punch::TcpConnection,
+        address: SocketAddr,
+    },
 }
 
 impl TcpMsgTransport {
@@ -275,277 +295,9 @@ impl TcpMsgTransport {
             read_idle,
             Arc::downgrade(&inner),
         ));
-        Ok(Self { inner })
-    }
-
-    /// This endpoint's local node id.
-    #[must_use]
-    pub fn local_id(&self) -> &NodeId {
-        &self.inner.local
-    }
-
-    /// The address the listener is bound to (useful with an ephemeral `:0`).
-    #[must_use]
-    pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr
-    }
-
-    /// Initiates cancellation of the listener and every inbound/outbound session.
-    /// All clones share this shutdown state; no new tasks can be started afterward.
-    ///
-    /// # Panics
-    /// If the task registry or connection pool was poisoned.
-    pub fn shutdown(&self) {
-        self.inner.tasks.shutdown();
-        #[cfg(feature = "link")]
-        if let Some(managed) = &self.inner.admission {
-            managed.shutdown();
-        }
-        let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
-        pool.conns.clear();
-        pool.order.clear();
-    }
-
-    /// Cancels and drains every owned task, releasing listener/session sockets.
-    /// Safe to call repeatedly or concurrently through different clones.
-    ///
-    /// # Panics
-    /// If the task registry or connection pool was poisoned.
-    pub async fn close(&self) {
-        self.shutdown();
-        self.inner.tasks.close().await;
-    }
-
-    #[cfg(feature = "link")]
-    pub(crate) fn lifecycle(&self) -> Arc<dyn groupnet_transport::link::LinkLifecycle> {
-        Arc::new(self.clone())
-    }
-
-    /// Teaches this endpoint that `node` listens at `addr`, replacing any
-    /// previous binding. An existing connection to `node` is left alone; it
-    /// dials the new address only after it next closes (idle or error).
-    ///
-    /// # Panics
-    /// If the address book was poisoned by a panic in another thread.
-    pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
-        self.inner
-            .peers
-            .write()
-            .expect("peers lock poisoned")
-            .insert(node, addr);
-    }
-
-    /// The address this endpoint would dial for `node`, however it was
-    /// learned — registration, a gossiped advertisement, or a dial-back
-    /// intro. `None` if unknown.
-    ///
-    /// # Panics
-    /// If the address book was poisoned by a panic in another thread.
-    #[must_use]
-    pub fn peer_addr(&self, node: &NodeId) -> Option<SocketAddr> {
-        self.inner
-            .peers
-            .read()
-            .expect("peers lock poisoned")
-            .get(node)
-            .copied()
-    }
-
-    /// Outbound connections currently pooled (established or still dialing).
-    /// For admitted endpoints this counts initiated full-duplex sessions,
-    /// including pending handshakes; accepted sockets are not outbound entries.
-    ///
-    /// # Panics
-    /// If the connection pool was poisoned by a panic in another thread.
-    #[must_use]
-    pub fn outbound_connections(&self) -> usize {
-        #[cfg(feature = "link")]
-        if let Some(managed) = &self.inner.admission {
-            return managed.outbound_connections();
-        }
-        self.inner
-            .pool
-            .lock()
-            .expect("pool lock poisoned")
-            .conns
-            .len()
-    }
-
-    #[cfg(feature = "link")]
-    /// Returns the live admitted-session registry, if admission is configured.
-    #[must_use]
-    pub fn sessions(&self) -> Option<groupnet_transport::admission::SessionRegistry> {
-        self.inner
-            .admission
-            .as_ref()
-            .map(|managed| managed.sessions.clone())
-    }
-}
-
-impl Transport for TcpMsgTransport {
-    type Error = io::Error;
-
-    fn learn_peer(&self, node: &NodeId, addr: &str) {
-        // An advertisement is a hint: register what parses, ignore the rest.
-        if let Ok(addr) = addr.parse::<SocketAddr>() {
-            self.register_peer(node.clone(), addr);
-        }
-    }
-
-    fn send(&self, to: &NodeId, msg: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
-        #[cfg(feature = "link")]
-        if let Some(managed) = &self.inner.admission {
-            return std::future::ready(managed.send(&self.inner, to, Some(msg)));
-        }
-        let result: io::Result<()> = (|| {
-            if self.inner.tasks.stopped() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "tcp msg transport shut down",
-                ));
-            }
-            if msg.len() > MAX_FRAME {
-                return Ok(()); // oversized frame = drop, never poison the link
-            }
-            // Pre-frame (length prefix + payload) so the writer hands the socket
-            // one buffer per frame.
-            let mut framed = Vec::with_capacity(4 + msg.len());
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "the length prefix is a u32 on the wire, and the oversize guard \
-                      above already returned for anything past MAX_FRAME"
-            )]
-            framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-            framed.extend_from_slice(msg);
-
-            // Fast path: an existing (possibly still dialing) connection.
-            {
-                let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
-                if let Some(conn) = pool.conns.get(to) {
-                    match conn.frames.try_send(framed) {
-                        // Handed to the writer, or dropped because its queue is
-                        // full — best-effort either way; anti-entropy repairs.
-                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
-                        // The writer is exiting (idle close or error): remove the
-                        // husk and fall through to a fresh dial.
-                        Err(mpsc::error::TrySendError::Closed(frame)) => {
-                            framed = frame;
-                            pool.remove(to);
-                        }
-                    }
-                }
-            }
-
-            // Resolve the address after releasing the connection-pool lock.
-            let addr = self
-                .inner
-                .peers
-                .read()
-                .expect("peers lock poisoned")
-                .get(to)
-                .copied();
-            let Some(addr) = addr else {
-                return Ok(()); // unknown peer = drop, per the trait contract
-            };
-
-            let (tx, rx) = mpsc::channel(self.inner.config.outbound_queue);
-            tx.try_send(framed).expect("fresh queue has capacity");
-            let generation;
-            {
-                let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
-                // At the cap: close the oldest connection(s) first. Dropping the
-                // sender ends that writer task; if its peer is still active, the
-                // next frame to it simply re-dials.
-                while pool.conns.len() >= self.inner.config.max_outbound {
-                    let Some((g, node)) = pool.order.pop_front() else {
-                        break;
-                    };
-                    if pool.conns.get(&node).is_some_and(|c| c.generation == g) {
-                        pool.conns.remove(&node);
-                    }
-                }
-                generation = pool.next_generation;
-                pool.next_generation += 1;
-                pool.conns.insert(
-                    to.clone(),
-                    Conn {
-                        generation,
-                        frames: tx,
-                    },
-                );
-                pool.order.push_back((generation, to.clone()));
-            }
-            // Concurrent sends to the same peer can race past the fast path; the
-            // loser's insert replaces the winner's entry and the winner's task
-            // exits once its now-unreferenced queue drains. Rare and harmless.
-            if !self.inner.tasks.spawn(write_loop(Outbound {
-                inner: Arc::downgrade(&self.inner),
-                peer: to.clone(),
-                generation,
-                addr,
-                frames: rx,
-                idle: self.inner.config.idle_timeout,
-                local: self.inner.local.clone(),
-                intro: self.inner.intro.clone(),
-            })) {
-                self.inner
-                    .pool
-                    .lock()
-                    .expect("pool lock poisoned")
-                    .remove_generation(to, generation);
-            }
-            Ok(())
-        })();
-        std::future::ready(result)
-    }
-
-    #[cfg(feature = "link")]
-    async fn send_admitted(
-        &self,
-        to: &NodeId,
-        msg: &[u8],
-        session: Option<groupnet_transport::admission::SessionId>,
-    ) -> io::Result<()> {
-        if let Some(managed) = &self.inner.admission {
-            return managed.send_admitted(&self.inner, to, msg, session);
-        }
-        self.send(to, msg).await
-    }
-
-    async fn recv(&self) -> io::Result<Inbound> {
-        // The tokio mutex is held across the await intentionally; only the
-        // single receive loop ever calls this.
-        if self.inner.tasks.stopped() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "tcp msg transport shut down",
-            ));
-        }
-        let mut inbox = self.inner.inbox.lock().await;
-        inbox
-            .recv()
-            .await
-            .map(|queued| queued.packet)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "tcp msg transport shut down"))
-    }
-
-    #[cfg(feature = "link")]
-    async fn recv_admitted(&self) -> io::Result<groupnet_transport::link::AdmittedInbound> {
-        if self.inner.tasks.stopped() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "tcp msg transport shut down",
-            ));
-        }
-        let mut inbox = self.inner.inbox.lock().await;
-        inbox
-            .recv()
-            .await
-            .map(|queued| groupnet_transport::link::AdmittedInbound {
-                packet: queued.packet,
-                session: queued.session,
-            })
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "tcp msg transport shut down"))
+        Ok(Self {
+            backend: Backend::Direct(inner),
+        })
     }
 }
 

@@ -35,6 +35,9 @@ futures-util = { version = "0.3", default-features = false }
 futures = { version = "0.3", default-features = false }
 zerocopy = "0.8"
 divan = "0.1.21"
+# Native traversal uses safe platform socket options and interface enumeration.
+socket2 = { version = "0.6", features = ["all"] }
+if-addrs = "0.15"
 # Audited cryptographic primitives and TLS only; routing, discovery, reliability,
 # UDP hole-punching, IPC, and relay logic are implemented in this workspace.
 ring = "0.17"

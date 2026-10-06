@@ -1,5 +1,5 @@
-//! The [`UdpTransport`] binding: one frame per datagram over a shared
-//! socket, peers attributed by source address.
+//! The [`UdpTransport`] binding: raw self-attributed datagrams, or optional
+//! session-fenced native connectivity over the connection's owned sockets.
 
 use std::collections::HashMap;
 use std::io;
@@ -9,6 +9,9 @@ use std::sync::{Arc, RwLock};
 use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
 use tokio::net::{ToSocketAddrs, UdpSocket};
+
+#[cfg(feature = "connectivity")]
+use groupnet_transport_punch::{PeerPath, PunchConfig, UdpConnection};
 
 /// Receive-buffer size: the largest possible UDP payload (the length field is
 /// 16 bits), so any single datagram is read in one `recv_from` with no
@@ -68,6 +71,7 @@ fn unframe(datagram: &[u8]) -> Option<(NodeId, &[u8])> {
 /// re-resolution of gossip seeds under pod-IP churn).
 #[derive(Debug)]
 struct Inner {
+    socket: UdpSocket,
     local: NodeId,
     /// `NodeId` -> where to send. Interior mutability so peers can be registered
     /// after binding (e.g. once ephemeral ports are known).
@@ -76,14 +80,20 @@ struct Inner {
     by_addr: RwLock<HashMap<SocketAddr, NodeId>>,
 }
 
+#[derive(Clone, Debug)]
+enum Backend {
+    Direct(Arc<Inner>),
+    #[cfg(feature = "connectivity")]
+    Connectivity(UdpConnection),
+}
+
 /// A UDP-backed transport endpoint.
 ///
-/// Cheap to [`Clone`]: clones share one socket and one address book, so a
-/// [`register_peer`](Self::register_peer) through any handle is visible to all.
+/// Cheap to [`Clone`]: raw clones share one socket and address book; connected
+/// clones share the native connection's sockets, sessions and protocol tasks.
 #[derive(Clone, Debug)]
 pub struct UdpTransport {
-    socket: Arc<UdpSocket>,
-    inner: Arc<Inner>,
+    backend: Backend,
 }
 
 impl UdpTransport {
@@ -95,28 +105,174 @@ impl UdpTransport {
     pub async fn bind(local: NodeId, bind_addr: impl ToSocketAddrs) -> io::Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
         Ok(Self {
-            socket: Arc::new(socket),
-            inner: Arc::new(Inner {
+            backend: Backend::Direct(Arc::new(Inner {
+                socket,
                 local,
                 peers: RwLock::new(HashMap::new()),
                 by_addr: RwLock::new(HashMap::new()),
-            }),
+            })),
+        })
+    }
+
+    /// Binds native connectivity using the connection's actual leased sockets.
+    /// Peer admission, candidate checks and relay fallback are session-fenced;
+    /// address advertisements and [`register_peer`](Self::register_peer) have no effect.
+    ///
+    /// # Errors
+    /// Propagates invalid configuration, admission and socket errors.
+    #[cfg(feature = "connectivity")]
+    pub async fn bind_connectivity(config: PunchConfig) -> io::Result<Self> {
+        Ok(Self {
+            backend: Backend::Connectivity(UdpConnection::bind(config).await?),
         })
     }
 
     /// This endpoint's local node id.
     #[must_use]
     pub fn local_id(&self) -> &NodeId {
-        &self.inner.local
+        match &self.backend {
+            Backend::Direct(inner) => &inner.local,
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => connection.local_id(),
+        }
     }
 
     /// The address the socket is bound to (useful when binding to an ephemeral
     /// port with `:0`).
     ///
     /// # Errors
-    /// Propagates any socket error.
+    /// Propagates socket errors, or `NotConnected` after connection shutdown.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+        match &self.backend {
+            Backend::Direct(inner) => inner.socket.local_addr(),
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => connection.local_addr(),
+        }
+    }
+
+    /// Returns registered raw peers, or the connection's configured/live peers.
+    ///
+    /// # Panics
+    /// If the raw address book was poisoned by a panic in another thread.
+    #[must_use]
+    pub fn known_peers(&self) -> Vec<NodeId> {
+        match &self.backend {
+            Backend::Direct(inner) => inner
+                .peers
+                .read()
+                .expect("peers lock poisoned")
+                .keys()
+                .cloned()
+                .collect(),
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => connection.known_peers(),
+        }
+    }
+
+    /// Returns every leased socket's actual bind address (one in raw mode).
+    ///
+    /// # Errors
+    /// Propagates socket errors, or `NotConnected` after connection shutdown.
+    #[cfg(feature = "connectivity")]
+    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        match &self.backend {
+            Backend::Direct(inner) => Ok(vec![inner.socket.local_addr()?]),
+            Backend::Connectivity(connection) => connection.local_addrs(),
+        }
+    }
+
+    /// Returns advertised native candidates, or the raw socket's bind address.
+    /// Relay-only connections return no candidates.
+    ///
+    /// # Errors
+    /// Propagates socket errors, or `NotConnected` after connection shutdown.
+    #[cfg(feature = "connectivity")]
+    pub fn local_candidates(&self) -> io::Result<Vec<SocketAddr>> {
+        match &self.backend {
+            Backend::Direct(inner) => Ok(vec![inner.socket.local_addr()?]),
+            Backend::Connectivity(connection) => connection.local_candidates(),
+        }
+    }
+
+    /// Returns the rendezvous-observed primary mapping, if disclosed and live.
+    /// Raw endpoints have no rendezvous mapping.
+    #[cfg(feature = "connectivity")]
+    #[must_use]
+    pub fn observed_addr(&self) -> Option<SocketAddr> {
+        match &self.backend {
+            Backend::Direct(_) => None,
+            Backend::Connectivity(connection) => connection.observed_addr(),
+        }
+    }
+
+    /// Returns the validated live direct address, or a raw registered address.
+    ///
+    /// # Panics
+    /// If the raw address book was poisoned by a panic in another thread.
+    #[cfg(feature = "connectivity")]
+    #[must_use]
+    pub fn direct_addr_to(&self, node: &NodeId) -> Option<SocketAddr> {
+        match &self.backend {
+            Backend::Direct(inner) => inner
+                .peers
+                .read()
+                .expect("peers lock poisoned")
+                .get(node)
+                .copied(),
+            Backend::Connectivity(connection) => connection.direct_addr_to(node),
+        }
+    }
+
+    /// Returns the connection's live path, or `Direct` for a raw registered peer.
+    /// A raw registration is an address hint, not proof of reachability.
+    ///
+    /// # Panics
+    /// If the raw address book was poisoned by a panic in another thread.
+    #[cfg(feature = "connectivity")]
+    #[must_use]
+    pub fn path_to(&self, node: &NodeId) -> Option<PeerPath> {
+        match &self.backend {
+            Backend::Direct(_) => self.direct_addr_to(node).map(|_| PeerPath::Direct),
+            Backend::Connectivity(connection) => connection.path_to(node),
+        }
+    }
+
+    /// Returns the connection's shared live session registry, or `None` in raw mode.
+    #[cfg(feature = "link")]
+    #[must_use]
+    pub fn sessions(&self) -> Option<groupnet_transport::admission::SessionRegistry> {
+        match &self.backend {
+            Backend::Direct(_) => None,
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => Some(connection.sessions()),
+        }
+    }
+
+    /// Transfers the live endpoint into a managed link without rebinding.
+    /// Connectivity mode retains its session registry, task lifecycle and native
+    /// message MTU; raw mode uses the registered peers as static neighbors.
+    ///
+    /// # Panics
+    /// If the raw address book was poisoned by a panic in another thread.
+    #[cfg(feature = "link")]
+    #[must_use]
+    pub fn into_bound_link(self, cost: u32) -> groupnet_transport::link::BoundLink {
+        use groupnet_transport::link::{BoundLink, LinkConfig};
+
+        let mut config = LinkConfig::new(self.known_peers());
+        config.cost = cost;
+        match &self.backend {
+            Backend::Direct(_) => BoundLink::new(self, config),
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => {
+                config.mtu = groupnet_transport_punch::MAX_MESSAGE;
+                let sessions = connection.sessions();
+                let lifecycle = Arc::new(ConnectivityLifecycle(connection.clone()));
+                BoundLink::new(self, config)
+                    .with_lifecycle(lifecycle)
+                    .with_sessions(sessions)
+            }
+        }
     }
 
     /// Teaches this endpoint that `node` is reachable at `addr`, replacing any
@@ -129,14 +285,22 @@ impl UdpTransport {
     /// datagram once that address is reused by another node. Callable through
     /// any clone — all clones share one book.
     ///
+    /// Has no effect in connectivity mode: only native admission and validated
+    /// candidate checks may establish or change a connected peer's path.
+    ///
     /// # Panics
     /// If either half of the address book was poisoned by a panic in another
     /// thread.
     pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
+        let inner = match &self.backend {
+            Backend::Direct(inner) => inner,
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(_) => return,
+        };
         // Take both locks (peers before by_addr — the only site that holds
         // both) so the forward and reverse maps update atomically.
-        let mut peers = self.inner.peers.write().expect("peers lock poisoned");
-        let mut by_addr = self.inner.by_addr.write().expect("by_addr lock poisoned");
+        let mut peers = inner.peers.write().expect("peers lock poisoned");
+        let mut by_addr = inner.by_addr.write().expect("by_addr lock poisoned");
         let stale = peers
             .insert(node.clone(), addr)
             .filter(|prev| *prev != addr);
@@ -145,22 +309,46 @@ impl UdpTransport {
         }
         by_addr.insert(addr, node);
     }
+
+    /// Returns the owned native connection when connectivity is enabled.
+    ///
+    /// Closing this shared resource cancels native I/O and withdraws sessions
+    /// from every adapter clone. Raw socket endpoints return `None`; their
+    /// socket lifetime is controlled by dropping all owning clones.
+    #[cfg(feature = "connectivity")]
+    #[must_use]
+    pub fn connection(&self) -> Option<&UdpConnection> {
+        match &self.backend {
+            Backend::Direct(_) => None,
+            Backend::Connectivity(connection) => Some(connection),
+        }
+    }
 }
 
 impl Transport for UdpTransport {
     type Error = io::Error;
 
     fn learn_peer(&self, node: &NodeId, addr: &str) {
-        // An advertisement is a hint: register what parses, ignore the rest.
-        if let Ok(addr) = addr.parse::<SocketAddr>() {
-            self.register_peer(node.clone(), addr);
+        match &self.backend {
+            Backend::Direct(_) => {
+                // Raw advertisements are hints: register only parseable addresses.
+                if let Ok(addr) = addr.parse::<SocketAddr>() {
+                    self.register_peer(node.clone(), addr);
+                }
+            }
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(_) => {}
         }
     }
 
     async fn send(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
+        let inner = match &self.backend {
+            Backend::Direct(inner) => inner,
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => return connection.send(to, msg).await,
+        };
         // Resolve the address without holding the lock across the await.
-        let addr = self
-            .inner
+        let addr = inner
             .peers
             .read()
             .expect("peers lock poisoned")
@@ -168,18 +356,39 @@ impl Transport for UdpTransport {
             .copied();
         if let Some(addr) = addr {
             // Best-effort: a send error is a drop, which the protocol tolerates.
-            let _ = self
-                .socket
-                .send_to(&frame(&self.inner.local, msg), addr)
-                .await;
+            let _ = inner.socket.send_to(&frame(&inner.local, msg), addr).await;
         }
         Ok(())
     }
 
+    #[cfg(feature = "link")]
+    async fn send_admitted(
+        &self,
+        to: &NodeId,
+        msg: &[u8],
+        session: Option<groupnet_transport::admission::SessionId>,
+    ) -> io::Result<()> {
+        match &self.backend {
+            Backend::Direct(_) => {
+                if session.is_none() {
+                    self.send(to, msg).await?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => connection.send_admitted(to, msg, session).await,
+        }
+    }
+
     async fn recv(&self) -> io::Result<Inbound> {
+        let inner = match &self.backend {
+            Backend::Direct(inner) => inner,
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => return connection.recv().await,
+        };
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
-            let (n, addr) = match self.socket.recv_from(&mut buf).await {
+            let (n, addr) = match inner.socket.recv_from(&mut buf).await {
                 Ok(received) => received,
                 Err(error) if retryable_recv_error(&error) => continue,
                 Err(error) => return Err(error),
@@ -189,8 +398,7 @@ impl Transport for UdpTransport {
                 // reverse path works even for a peer nothing told us about
                 // (a restart at a fresh address). Only touch the book when
                 // the binding actually changed.
-                let known = self
-                    .inner
+                let known = inner
                     .peers
                     .read()
                     .expect("peers lock poisoned")
@@ -204,8 +412,7 @@ impl Transport for UdpTransport {
             }
             // No usable prefix: fall back to address attribution, so a peer
             // still running a pre-prefix build is understood during a roll.
-            let from = self
-                .inner
+            let from = inner
                 .by_addr
                 .read()
                 .expect("by_addr lock poisoned")
@@ -218,7 +425,37 @@ impl Transport for UdpTransport {
             // Unattributable datagram — ignore and keep receiving.
         }
     }
+
+    #[cfg(feature = "link")]
+    async fn recv_admitted(&self) -> io::Result<groupnet_transport::link::AdmittedInbound> {
+        match &self.backend {
+            Backend::Direct(_) => Ok(groupnet_transport::link::AdmittedInbound {
+                packet: self.recv().await?,
+                session: None,
+            }),
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(connection) => connection.recv_admitted().await,
+        }
+    }
 }
+
+#[cfg(feature = "connectivity")]
+#[derive(Debug)]
+struct ConnectivityLifecycle(UdpConnection);
+
+#[cfg(feature = "connectivity")]
+impl groupnet_transport::link::LinkLifecycle for ConnectivityLifecycle {
+    fn shutdown(&self) {
+        self.0.shutdown();
+    }
+
+    fn close(&self) -> groupnet_transport::link::LinkFuture<'_, ()> {
+        Box::pin(self.0.close())
+    }
+}
+
+#[cfg(all(test, feature = "connectivity"))]
+mod connectivity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -229,6 +466,14 @@ mod tests {
     use groupnet_transport::Transport;
 
     use super::{UdpTransport, retryable_recv_error};
+
+    fn raw_inner(transport: &UdpTransport) -> &super::Inner {
+        match &transport.backend {
+            super::Backend::Direct(inner) => inner,
+            #[cfg(feature = "connectivity")]
+            super::Backend::Connectivity(_) => panic!("expected a raw endpoint"),
+        }
+    }
 
     /// Bind a loopback endpoint on an ephemeral port under the given id.
     async fn bind_as(id: &str) -> UdpTransport {
@@ -381,7 +626,11 @@ mod tests {
             .expect("recv");
         assert_eq!(inbound.from, sender_id);
         assert_eq!(
-            receiver.inner.peers.read().expect("peers").get(&sender_id),
+            raw_inner(&receiver)
+                .peers
+                .read()
+                .expect("peers")
+                .get(&sender_id),
             Some(&sender.local_addr().expect("addr")),
             "the book rebound to the sender's live address"
         );
@@ -426,8 +675,11 @@ mod tests {
         t.register_peer(peer.clone(), old);
         t.register_peer(peer.clone(), new);
 
-        assert_eq!(t.inner.peers.read().expect("peers").get(&peer), Some(&new));
-        let by_addr = t.inner.by_addr.read().expect("by_addr");
+        assert_eq!(
+            raw_inner(&t).peers.read().expect("peers").get(&peer),
+            Some(&new)
+        );
+        let by_addr = raw_inner(&t).by_addr.read().expect("by_addr");
         assert_eq!(by_addr.get(&new), Some(&peer));
         assert!(
             !by_addr.contains_key(&old),

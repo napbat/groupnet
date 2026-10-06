@@ -15,6 +15,8 @@ use crate::{TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
 ///
 /// Available with the `link` feature, which also activates `msg`. Binding owns
 /// the listener and all session tasks; link shutdown cancels and drains them.
+/// With `connectivity`, `Self::connectivity` uses native rendezvous admission,
+/// candidate-path maintenance, and relay fallback through this same link type.
 pub struct TcpLink {
     bind: SocketAddr,
     peers: Vec<NodeId>,
@@ -23,19 +25,24 @@ pub struct TcpLink {
     admission: Option<Arc<dyn Admission>>,
     credential: Credential,
     admission_config: TcpAdmissionConfig,
+    #[cfg(feature = "connectivity")]
+    connectivity: Option<groupnet_transport_punch::TcpPunchConfig>,
 }
 
 impl std::fmt::Debug for TcpLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TcpLink")
+        let mut debug = f.debug_struct("TcpLink");
+        debug
             .field("bind", &self.bind)
             .field("peers", &self.peers)
             .field("addresses", &self.addresses)
             .field("cost", &self.cost)
             .field("custom_admission", &self.admission.is_some())
             .field("credential", &self.credential)
-            .field("admission_config", &self.admission_config)
-            .finish()
+            .field("admission_config", &self.admission_config);
+        #[cfg(feature = "connectivity")]
+        debug.field("connectivity", &self.connectivity);
+        debug.finish()
     }
 }
 
@@ -55,11 +62,25 @@ impl TcpLink {
             admission: None,
             credential: Credential(Vec::new()),
             admission_config: TcpAdmissionConfig::default(),
+            #[cfg(feature = "connectivity")]
+            connectivity: None,
         }
+    }
+
+    #[cfg(feature = "connectivity")]
+    /// Configures a native TCP connection. `config.local` must match the binding
+    /// node identity. Admission, credentials, discovery, and path policy come from
+    /// this configuration; direct-link admission setters have no effect on it.
+    #[must_use]
+    pub fn connectivity(config: groupnet_transport_punch::TcpPunchConfig) -> Self {
+        let mut link = Self::new(config.bind, Vec::new());
+        link.connectivity = Some(config);
+        link
     }
 
     /// Selects the application policy, enabling peers absent from the bootstrap list.
     /// `OpenAdmission` is an explicit unauthenticated membership choice.
+    /// Applies only to direct links; native links use rendezvous admission.
     #[must_use]
     pub fn with_admission(mut self, admission: Arc<dyn Admission>) -> Self {
         self.admission = Some(admission);
@@ -68,6 +89,7 @@ impl TcpLink {
 
     /// Supplies bounded opaque credentials presented to the remote admission policy.
     /// Credentials are omitted from debug output. Binding rejects oversized values.
+    /// Applies only to direct links; native links use their configuration credential.
     #[must_use]
     pub fn with_credentials(mut self, credential: Vec<u8>) -> Self {
         self.credential = Credential(credential);
@@ -75,6 +97,7 @@ impl TcpLink {
     }
 
     /// Sets handshake concurrency, established-peer capacity, and handshake deadline.
+    /// Applies only to direct links; native connectivity has its own bounded protocol.
     #[must_use]
     pub fn with_admission_config(mut self, config: TcpAdmissionConfig) -> Self {
         self.admission_config = config;
@@ -91,11 +114,26 @@ impl TcpLink {
 
 impl LinkProvider for TcpLink {
     fn peers(&self) -> &[NodeId] {
+        #[cfg(feature = "connectivity")]
+        if let Some(config) = &self.connectivity {
+            return &config.peers;
+        }
         &self.peers
     }
 
     fn bind(self: Box<Self>, local: NodeId) -> LinkFuture<'static, io::Result<BoundLink>> {
         Box::pin(async move {
+            #[cfg(feature = "connectivity")]
+            if let Some(config) = self.connectivity {
+                if config.local != local {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "TCP connectivity identity differs from node identity",
+                    ));
+                }
+                let transport = TcpMsgTransport::bind_connectivity(config).await?;
+                return Ok(transport.into_bound_link(self.cost));
+            }
             let Self {
                 bind,
                 peers,
@@ -104,6 +142,7 @@ impl LinkProvider for TcpLink {
                 admission,
                 credential,
                 admission_config,
+                ..
             } = *self;
             let policy = admission.unwrap_or_else(|| Arc::new(ConfiguredAdmission(peers.clone())));
             let transport = TcpMsgTransport::bind_admitted(

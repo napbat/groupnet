@@ -122,6 +122,8 @@ impl TcpMsgTransport {
 
     /// Initiates admission to a registered bootstrap endpoint without a frame.
     /// Unknown addresses are ignored, following the best-effort send contract.
+    /// Native connectivity maintains admission automatically; this only checks
+    /// that its endpoint is still running and does not admit a supplied hint.
     ///
     /// # Errors
     /// Returns an error if this endpoint is shut down or is not admission-enabled.
@@ -129,13 +131,23 @@ impl TcpMsgTransport {
     /// # Panics
     /// If a connection or address-book lock was poisoned.
     pub fn connect_peer(&self, node: &NodeId) -> io::Result<()> {
-        let Some(managed) = &self.inner.admission else {
+        #[cfg(feature = "connectivity")]
+        if let super::Backend::Connectivity { connection, .. } = &self.backend {
+            return connection.local_addr().map(|_| ());
+        }
+        let Some(inner) = self.direct() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a direct endpoint",
+            ));
+        };
+        let Some(managed) = &inner.admission else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "TCP admission is not configured",
             ));
         };
-        managed.send(&self.inner, node, None)
+        managed.send(inner, node, None)
     }
 
     /// Packages this endpoint with its owned workers and live-session routing.
@@ -145,6 +157,10 @@ impl TcpMsgTransport {
     pub fn into_bound_link(self, cost: u32) -> BoundLink {
         let mut config = LinkConfig::new(Vec::new());
         config.cost = cost;
+        #[cfg(feature = "connectivity")]
+        if matches!(&self.backend, super::Backend::Connectivity { .. }) {
+            config.mtu = groupnet_transport_punch::MAX_TCP_MESSAGE;
+        }
         let lifecycle = self.lifecycle();
         let sessions = self.sessions();
         let bound = BoundLink::new(self, config).with_lifecycle(lifecycle);
@@ -161,8 +177,11 @@ impl TcpMsgTransport {
         if peers.is_empty() {
             return;
         }
-        let inner = Arc::downgrade(&self.inner);
-        self.inner.tasks.spawn(async move {
+        let Some(endpoint) = self.direct() else {
+            return;
+        };
+        let inner = Arc::downgrade(endpoint);
+        endpoint.tasks.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut first = 0;

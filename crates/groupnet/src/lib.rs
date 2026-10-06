@@ -8,6 +8,7 @@
 //! |--------|------|
 //! | [`core`] | sans-IO state machine, identity, weighted [`placement`](core::placement) (HA-hash), and the [`wire`](core::wire) protocol — pure, deterministic, dep-free |
 //! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) (persistent control-plane connections *and* bulk streams) |
+//! | `connectivity` | native adjacent-node connection establishment and live direct/relay path management, used internally by TCP/UDP adapters *(feature `connectivity`)* |
 //! | [`network`] | protocol-independent routing and pinned end-to-end TLS streams *(feature `runtime`, default)* |
 //! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
 //! | [`rpc`] | request/response calls over the data plane: an [`RpcClient`](rpc::RpcClient) multiplexing concurrent calls onto one stream per peer, and an [`RpcServer`](rpc::RpcServer) answering them under deadlines and per-connection limits *(feature `rpc`)* |
@@ -92,11 +93,13 @@ pub mod transport {
     /// Native local IPC links (feature `ipc`).
     #[cfg(feature = "ipc")]
     pub use groupnet_transport_ipc as ipc;
-
-    /// UDP discovery, punching, and relay links with explicit admission (feature `punch`).
-    #[cfg(feature = "punch")]
-    pub use groupnet_transport_punch as punch;
 }
+
+/// Native adjacent-node connection establishment and live path management
+/// *(feature `connectivity`)*. TCP/UDP adapters consume these resources; logical
+/// multi-hop forwarding remains in the protocol-independent router.
+#[cfg(feature = "connectivity")]
+pub use groupnet_transport_punch as connectivity;
 
 /// Managed networks: protocol-independent routing and encrypted streams
 /// *(feature `runtime`)*. Link implementations remain in [`transport`].

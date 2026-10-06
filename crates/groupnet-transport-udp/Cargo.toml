@@ -10,12 +10,14 @@ repository.workspace = true
 [features]
 # Opt-in router registration; the default socket binding stays minimal.
 link = ["groupnet-transport/link"]
+# Native admission, direct traversal and maintained relay fallback.
+connectivity = ["dep:groupnet-transport-punch", "link"]
 
-# Depends only on the trait + id type, plus tokio's networking slice. The
-# runtime never needs to know this crate exists.
+# The direct socket binding depends only on the trait, ids and networking.
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true }
+groupnet-transport-punch = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["net"] }
 
 # Test-only: the unit tests exchange real datagrams over loopback, which needs
@@ -24,6 +26,8 @@ tokio = { workspace = true, features = ["net"] }
 # (no new crate — tokio is already a dependency).
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+groupnet-network = { workspace = true }
+groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
 
 [lints]
 workspace = true

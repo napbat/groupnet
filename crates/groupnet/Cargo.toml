@@ -34,7 +34,12 @@ tcp = ["bulk", "dep:groupnet-transport-tcp", "groupnet-transport-tcp/bulk"]
 tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
 # Native link implementations are independent crates, not router built-ins.
 ipc = ["dep:groupnet-transport-ipc"]
-punch = ["dep:groupnet-transport-punch"]
+# Native adjacent-path establishment used internally by enabled TCP/UDP bindings.
+connectivity = [
+    "dep:groupnet-transport-punch",
+    "groupnet-transport-tcp?/connectivity",
+    "groupnet-transport-udp?/connectivity",
+]
 # Request/response RPC over the data plane: concurrent calls multiplexed onto
 # one stream per peer, with deadlines, bounded frames and per-connection
 # handler limits. Rides `bulk`, so bring a binding (`tcp`, or your own). The
@@ -113,6 +118,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # implements those two traits declares its own bytes dependency. This test uses
 # the workspace version. Dev-only: nothing enters the published graph.
 bytes = { workspace = true }
+rcgen = { workspace = true }
+futures-util = { workspace = true, features = ["io"] }
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,
 # so this never enters the published dependency graph. Do NOT add `version`.
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
@@ -134,7 +141,15 @@ required-features = ["runtime", "tcp-msg"]
 
 [[example]]
 name = "dynamic-relay"
-required-features = ["runtime", "punch"]
+required-features = ["runtime", "udp", "connectivity"]
+
+[[example]]
+name = "native-traversal"
+required-features = ["runtime", "udp", "tcp-msg", "connectivity"]
+
+[[example]]
+name = "connectivity-bridge"
+required-features = ["runtime", "mem", "tcp-msg", "connectivity"]
 
 [lints]
 workspace = true

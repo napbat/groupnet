@@ -1,5 +1,6 @@
 //! One bounded socket-owning endpoint task.
 
+mod candidates;
 mod direct;
 
 use std::collections::HashMap;
@@ -23,6 +24,10 @@ use super::{
 struct Endpoint {
     config: PunchConfig,
     socket: UdpSocket,
+    extra_sockets: Vec<UdpSocket>,
+    local_candidates: super::candidates::Candidates,
+    observed: Arc<Mutex<Option<SocketAddr>>>,
+    announcement: u64,
     session: Session,
     nonce: Session,
     sequence: u64,
@@ -44,9 +49,15 @@ pub(super) type Channels = (
     oneshot::Sender<std::io::Result<()>>,
 );
 
+pub(super) type SocketLeases = (
+    Vec<UdpSocket>,
+    super::candidates::Candidates,
+    Arc<Mutex<Option<SocketAddr>>>,
+);
+
 pub(super) async fn run(
     config: PunchConfig,
-    socket: UdpSocket,
+    sockets: SocketLeases,
     seed: (Session, Session),
     peers: Arc<Mutex<HashMap<String, Peer>>>,
     channels: Channels,
@@ -57,7 +68,7 @@ pub(super) async fn run(
     tokio::select! {
         biased;
         () = cancel.cancelled() => {}
-        () = drive(config, socket, seed, peers.clone(), channels, sessions) => {}
+        () = drive(config, sockets, seed, peers.clone(), channels, sessions) => {}
     }
     cancel.cancel();
     lock(&peers).clear();
@@ -65,13 +76,15 @@ pub(super) async fn run(
 
 async fn drive(
     config: PunchConfig,
-    socket: UdpSocket,
+    sockets: SocketLeases,
     seed: (Session, Session),
     peers: Arc<Mutex<HashMap<String, Peer>>>,
     channels: Channels,
     sessions: SessionRegistry,
 ) {
     let (mut outgoing, incoming, ready) = channels;
+    let (mut sockets, local_candidates, observed) = sockets;
+    let socket = sockets.remove(0);
     let queries = config
         .peers
         .iter()
@@ -80,6 +93,10 @@ async fn drive(
     let mut endpoint = Endpoint {
         config,
         socket,
+        extra_sockets: sockets,
+        local_candidates,
+        observed,
+        announcement: 0,
         session: seed.0,
         nonce: seed.1,
         sequence: 0,
@@ -98,13 +115,15 @@ async fn drive(
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // One extra byte detects oversize/truncation instead of accepting a prefix.
     let mut buffer = [0; MAX_PACKET + 1];
+    let mut first_socket = 0;
     loop {
         tokio::select! {
-            received = endpoint.socket.recv_from(&mut buffer) => {
+            received = candidates::receive(&endpoint.socket, &endpoint.extra_sockets, &mut buffer, first_socket) => {
                 match received {
-                    Ok((length, address)) => {
+                    Ok((length, address, socket)) => {
+                        first_socket = (socket + 1) % (1 + endpoint.extra_sockets.len());
                         if let Some(packet) = wire::decode_mode(&buffer[..length], endpoint.config.key.as_ref()) {
-                            endpoint.receive(packet, address).await;
+                            endpoint.receive_on(packet, address, socket);
                         }
                     }
                     Err(error) if transient(&error) => {}
@@ -112,10 +131,10 @@ async fn drive(
                 }
             }
             message = outgoing.recv() => {
-                if let Some(message) = message { endpoint.send_message(&message).await; }
+                if let Some(message) = message { endpoint.send_message(&message); }
                 else { break; }
             }
-            _ = interval.tick() => endpoint.maintain().await,
+            _ = interval.tick() => endpoint.maintain(),
         }
         if endpoint.sequence == u64::MAX {
             break;
@@ -124,22 +143,40 @@ async fn drive(
 }
 
 impl Endpoint {
-    async fn transmit(&mut self, address: SocketAddr, body: Body<'_>) -> u64 {
+    fn transmit(&mut self, address: SocketAddr, body: Body<'_>) -> u64 {
+        self.transmit_on(0, address, body)
+    }
+
+    fn transmit_on(&mut self, socket: usize, address: SocketAddr, body: Body<'_>) -> u64 {
         self.sequence = self.sequence.saturating_add(1);
+        self.emit(socket, address, body);
+        self.sequence
+    }
+
+    fn emit(&self, socket: usize, address: SocketAddr, body: Body<'_>) {
         let mut buffer = [0; MAX_PACKET];
-        let packet = Packet {
+        let packet = wire::sign_check(Packet {
             sender: self.config.local.as_str(),
             session: self.session,
             sequence: self.sequence,
             body,
-        };
+        });
         if let Some(length) = wire::encode_mode(packet, self.config.key.as_ref(), &mut buffer) {
-            let _ = self.socket.send_to(&buffer[..length], address).await;
+            let socket = if socket == 0 {
+                Some(&self.socket)
+            } else {
+                self.extra_sockets.get(socket - 1)
+            };
+            if let Some(socket) = socket {
+                // Never let one unreachable/would-block pair stall relay or other checks.
+                // Borrow the nonblocking socket directly: cached Tokio writable
+                // readiness may not yet exist for a newly bound candidate.
+                let _ = socket2::SockRef::from(socket).send_to(&buffer[..length], &address.into());
+            }
         }
-        self.sequence
     }
 
-    async fn maintain(&mut self) {
+    fn maintain(&mut self) {
         let now = Instant::now();
         lock(&self.peers).retain(|_, peer| {
             peer.path(now).is_some()
@@ -153,38 +190,44 @@ impl Endpoint {
             if self.config.dynamic || self.config.key.is_none() {
                 lock(&self.peers).clear();
             }
-            self.hello = self
-                .transmit(self.config.rendezvous, Body::Hello { nonce: self.nonce })
-                .await;
+            *lock(&self.observed) = None;
+            self.hello = self.transmit(self.config.rendezvous, Body::Hello { nonce: self.nonce });
         } else {
-            self.heartbeat = self
-                .transmit(
-                    self.config.rendezvous,
-                    Body::Heartbeat { proof: self.nonce },
-                )
-                .await;
+            self.heartbeat = self.transmit(
+                self.config.rendezvous,
+                Body::Heartbeat { proof: self.nonce },
+            );
             if self.config.dynamic {
-                self.discovery = self
-                    .transmit(self.config.rendezvous, Body::Discover { proof: self.nonce })
-                    .await;
+                self.discovery =
+                    self.transmit(self.config.rendezvous, Body::Discover { proof: self.nonce });
+            }
+            if self.config.policy != PathPolicy::RelayOnly {
+                self.sequence = self.sequence.saturating_add(1);
+                self.announcement = self.sequence;
+                self.emit(
+                    0,
+                    self.config.rendezvous,
+                    Body::Candidates {
+                        proof: self.nonce,
+                        candidates: (&self.local_candidates).into(),
+                    },
+                );
             }
         }
         // NodeId clones are Arc clones. Do not hold a path-state lock over I/O.
         for index in 0..self.config.peers.len() {
             let node = self.config.peers[index].clone();
-            let sequence = self
-                .transmit(
-                    self.config.rendezvous,
-                    Body::Query {
-                        proof: self.nonce,
-                        peer: node.as_str(),
-                    },
-                )
-                .await;
+            let sequence = self.transmit(
+                self.config.rendezvous,
+                Body::Query {
+                    proof: self.nonce,
+                    peer: node.as_str(),
+                },
+            );
             if let Some(query) = self.queries.get_mut(node.as_str()) {
                 *query = sequence;
             }
-            self.probe(&node).await;
+            self.probe(&node);
         }
         if self.config.dynamic && self.config.policy != PathPolicy::RelayOnly {
             let nodes: Vec<_> = lock(&self.peers)
@@ -192,37 +235,74 @@ impl Endpoint {
                 .map(|peer| peer.node.clone())
                 .collect();
             for node in nodes {
-                self.probe(&node).await;
+                self.probe(&node);
             }
         }
     }
 
-    async fn probe(&mut self, node: &NodeId) {
-        let probe = {
-            let mut peers = lock(&self.peers);
-            peers.get_mut(node.as_str()).and_then(|peer| {
-                if self.config.policy == PathPolicy::RelayOnly
-                    || peer.relay_only
-                    || peer.path(Instant::now()).is_none()
-                    || !peer.lease.is_active()
-                {
-                    return None;
-                }
-                let nonce = random().ok()?;
-                let address = peer.address?;
-                peer.probe = Some(Capability {
-                    token: nonce,
-                    issued: Instant::now(),
-                });
-                Some((address, peer.session, nonce))
-            })
+    fn probe(&mut self, node: &NodeId) {
+        let mut peers = lock(&self.peers);
+        let Some(peer) = peers.get_mut(node.as_str()) else {
+            return;
         };
-        if let Some((address, target, nonce)) = probe {
-            self.transmit(address, Body::Probe { target, nonce }).await;
+        let now = Instant::now();
+        if self.config.policy == PathPolicy::RelayOnly
+            || peer.relay_only
+            || peer.path(now).is_none()
+            || !peer.lease.is_active()
+        {
+            return;
+        }
+        self.rotate_check(peer, now);
+        // A live selected pair is sticky. Independent alternatives stay checked
+        // so expiry immediately has another validated path or relay available.
+        if peer
+            .selected
+            .is_none_or(|index| peer.checks[index].direct.is_none_or(|cap| !cap.live(now)))
+        {
+            peer.selected = peer
+                .checks
+                .iter()
+                .position(|check| check.direct.is_some_and(|cap| cap.live(now)));
+        }
+        let target = peer.session;
+        let secret = peer.secret;
+        let mut probes = [None; 32];
+        for (slot, check) in probes.iter_mut().zip(&mut peer.checks) {
+            if now < check.next_probe || check.probe.is_some_and(|probe| probe.live(now)) {
+                continue;
+            }
+            if check.attempts >= 3 {
+                check.attempts = 0;
+                check.next_probe = now + std::time::Duration::from_secs(10);
+                continue;
+            }
+            let Ok(nonce) = random() else {
+                continue;
+            };
+            check.probe = Some(Capability {
+                token: nonce,
+                issued: now,
+            });
+            check.attempts += 1;
+            check.next_probe = now + HEARTBEAT;
+            *slot = Some((check.socket, check.address, nonce));
+        }
+        drop(peers);
+        for (socket, address, nonce) in probes.into_iter().flatten() {
+            self.transmit_on(
+                socket,
+                address,
+                Body::Probe {
+                    target,
+                    nonce,
+                    secret,
+                },
+            );
         }
     }
 
-    async fn send_message(&mut self, message: &Outbound) {
+    fn send_message(&mut self, message: &Outbound) {
         let route = {
             let peers = lock(&self.peers);
             peers
@@ -235,28 +315,30 @@ impl Endpoint {
                 .and_then(|peer| {
                     Some((
                         peer.path(Instant::now())?,
-                        peer.address,
+                        peer.direct_path(Instant::now())
+                            .map(|check| (check.socket, check.address, check.direct)),
                         message.target,
-                        peer.direct,
+                        peer.secret,
                     ))
                 })
         };
-        let Some((path, address, target, capability)) = route else {
+        let Some((path, direct, target, secret)) = route else {
             return;
         };
         if path == super::PeerPath::Direct
-            && let (Some(address), Some(capability)) = (address, capability)
+            && let Some((socket, address, Some(capability))) = direct
         {
-            self.transmit(
+            self.transmit_on(
+                socket,
                 address,
                 Body::Direct {
                     peer: message.to.as_str(),
                     target,
                     capability: capability.token,
+                    secret,
                     message: &message.message,
                 },
-            )
-            .await;
+            );
         } else {
             self.transmit(
                 self.config.rendezvous,
@@ -266,8 +348,7 @@ impl Endpoint {
                     target,
                     message: &message.message,
                 },
-            )
-            .await;
+            );
         }
     }
 
@@ -278,7 +359,9 @@ impl Endpoint {
         session: Session,
         address: Option<SocketAddr>,
         relay_only: bool,
+        introduction: (wire::CandidateList<'_>, Session),
     ) {
+        let (candidates, secret) = introduction;
         if peer == self.config.local.as_str()
             || relay_only != address.is_none()
             || (self.config.policy == PathPolicy::RelayOnly && !relay_only)
@@ -293,6 +376,18 @@ impl Endpoint {
         {
             return;
         }
+        let mut addresses = super::candidates::PeerCandidates::default();
+        if let Some(address) = address
+            && !addresses.insert(address)
+        {
+            return;
+        }
+        for candidate in candidates.iter() {
+            addresses.insert(candidate);
+        }
+        if relay_only && !addresses.is_empty() {
+            return;
+        }
         if !self.config.dynamic
             && let Some(query) = self.queries.get_mut(peer)
         {
@@ -301,9 +396,30 @@ impl Endpoint {
         let mut peers = lock(&self.peers);
         if let Some(previous) = peers.get_mut(peer) {
             if previous.session == session
-                && previous.address == address
+                && previous.secret == secret
                 && previous.relay_only == relay_only
             {
+                if previous.addresses != addresses {
+                    let mut checks = self.make_checks(addresses);
+                    for check in &mut checks {
+                        if let Some(index) = previous.checks.iter().position(|old| {
+                            old.address == check.address && old.socket == check.socket
+                        }) {
+                            std::mem::swap(check, &mut previous.checks[index]);
+                        }
+                    }
+                    let selected = previous
+                        .selected
+                        .and_then(|index| previous.checks.get(index))
+                        .map(|check| (check.address, check.socket));
+                    previous.selected = selected.and_then(|(address, socket)| {
+                        checks
+                            .iter()
+                            .position(|check| check.address == address && check.socket == socket)
+                    });
+                    previous.checks = checks;
+                    previous.addresses = addresses;
+                }
                 previous.offered = Instant::now();
                 return;
             }
@@ -324,21 +440,20 @@ impl Endpoint {
             Peer {
                 node,
                 session,
-                address,
+                addresses,
+                candidate_cursor: 32,
+                secret,
                 relay_only,
                 offered: Instant::now(),
-                direct: None,
-                probe: None,
-                pending: None,
-                confirmed: None,
-                confirmed_probe: 0,
+                checks: self.make_checks(addresses),
+                selected: None,
                 sequence: 0,
                 lease,
             },
         );
     }
 
-    async fn receive_rendezvous(&mut self, packet: Packet<'_>, address: SocketAddr) {
+    fn receive_rendezvous(&mut self, packet: Packet<'_>, address: SocketAddr) {
         if packet.sender != self.config.local.as_str() || packet.session != self.session {
             return;
         }
@@ -349,17 +464,15 @@ impl Endpoint {
                 self.registered = None;
                 self.hello = 0;
                 let credential = std::mem::take(&mut self.config.credential);
-                self.registration = self
-                    .transmit(
-                        address,
-                        Body::Register {
-                            nonce,
-                            cookie,
-                            relay_only: self.config.policy == PathPolicy::RelayOnly,
-                            credential: &credential,
-                        },
-                    )
-                    .await;
+                self.registration = self.transmit(
+                    address,
+                    Body::Register {
+                        nonce,
+                        cookie,
+                        relay_only: self.config.policy == PathPolicy::RelayOnly,
+                        credential: &credential,
+                    },
+                );
                 self.config.credential = credential;
             }
             Body::Registered { proof }
@@ -393,53 +506,91 @@ impl Endpoint {
                 session,
                 address,
                 relay_only,
+                candidates,
+                secret,
             } if proof == self.nonce => {
-                self.accept_offer(packet, peer, session, address, relay_only);
+                self.accept_offer(
+                    packet,
+                    peer,
+                    session,
+                    address,
+                    relay_only,
+                    (candidates, secret),
+                );
             }
-            Body::Delivered {
-                proof,
-                peer,
-                session,
-                message,
-            } if proof == self.nonce
-                && self
-                    .registered
-                    .is_some_and(|seen| seen.elapsed() < super::LEASE) =>
+            Body::Delivered { proof, .. }
+                if proof == self.nonce
+                    && self
+                        .registered
+                        .is_some_and(|seen| seen.elapsed() < super::LEASE) =>
             {
-                let mut peers = lock(&self.peers);
-                let Some(peer) = peers.get_mut(peer) else {
-                    return;
-                };
-                if peer.session != session
-                    || peer.path(Instant::now()).is_none()
-                    || packet.sequence <= peer.sequence
-                    || !peer.lease.is_active()
-                {
-                    return;
-                }
-                peer.sequence = packet.sequence;
-                if let Ok(permit) = self.incoming.try_reserve() {
-                    permit.send(AdmittedInbound {
-                        packet: Inbound {
-                            from: peer.node.clone(),
-                            msg: message.to_vec(),
-                        },
-                        session: Some(peer.lease.id()),
-                    });
-                }
+                self.deliver_relay(&packet);
+            }
+            Body::Observed { proof, address }
+                if proof == self.nonce
+                    && packet.sequence == self.announcement
+                    && self.announcement != 0
+                    && self.config.policy != PathPolicy::RelayOnly =>
+            {
+                *lock(&self.observed) = Some(address);
+                self.announcement = 0;
             }
             _ => {}
         }
     }
 
-    async fn receive(&mut self, packet: Packet<'_>, address: SocketAddr) {
-        if address == self.config.rendezvous {
-            self.receive_rendezvous(packet, address).await;
+    fn deliver_relay(&self, packet: &Packet<'_>) {
+        let Body::Delivered {
+            peer,
+            session,
+            message,
+            ..
+        } = packet.body
+        else {
+            return;
+        };
+        let mut peers = lock(&self.peers);
+        let Some(peer) = peers.get_mut(peer) else {
+            return;
+        };
+        if peer.session != session
+            || peer.path(Instant::now()).is_none()
+            || packet.sequence <= peer.sequence
+            || !peer.lease.is_active()
+        {
             return;
         }
-        self.receive_direct(packet, address).await;
+        peer.sequence = packet.sequence;
+        if let Ok(permit) = self.incoming.try_reserve() {
+            permit.send(AdmittedInbound {
+                packet: Inbound {
+                    from: peer.node.clone(),
+                    msg: message.to_vec(),
+                },
+                session: Some(peer.lease.id()),
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn receive(&mut self, packet: Packet<'_>, address: SocketAddr) {
+        self.receive_on(packet, address, 0);
+    }
+
+    fn receive_on(&mut self, packet: Packet<'_>, address: SocketAddr, socket: usize) {
+        if socket == 0 && address == self.config.rendezvous {
+            self.receive_rendezvous(packet, address);
+            return;
+        }
+        self.receive_direct(packet, address, socket);
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod candidate_review_tests;
+
+#[cfg(test)]
+mod candidate_state_tests;

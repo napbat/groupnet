@@ -1,4 +1,4 @@
-//! UDP discovery, session-bound hole punching, and relay fallback.
+//! Native UDP and TCP multi-candidate traversal with session-bound relay fallback.
 //!
 //! [`PunchConfig::new`] preserves explicitly keyed, allowlisted fabrics.
 //! [`PunchConfig::open`] defaults to [`PathPolicy::RelayOnly`]. Explicitly setting
@@ -8,23 +8,33 @@
 //! not cryptographic identity. Application admission may independently require
 //! credentials through [`Rendezvous::bind_with_admission`]; keyed configurations
 //! retain strict HMAC authentication and never downgrade.
-//! Every registration proves UDP address return-routability before discovery or
-//! relay. Direct data additionally requires a current session-bound capability.
+//! UDP registration proves address return-routability before discovery or relay.
+//! Direct data requires current session-bound path proofs and message authentication.
 //! Relay-only pair discovery omits physical endpoint addresses and never probes.
 //! The rendezvous sees identities, addresses, and raw transport messages; it is
 //! not a participant in the routing group.
 //!
-//! [`PunchTransport`] preserves the standalone transport API. [`PunchLink`]
-//! implements [`groupnet_transport::link::LinkProvider`] without depending on a
-//! concrete router, validates the bound node identity, and advertises
-//! [`MAX_MESSAGE`] as its MTU. Its lifecycle cancels and drains owned UDP I/O on
-//! registration rollback and router shutdown. Messages remain best-effort
-//! datagrams; this transport does not fragment oversized payloads.
+//! [`UdpConnection`] and [`TcpConnection`] establish and maintain adjacent packet
+//! paths, with bounded best-effort I/O, admission generations, and explicit
+//! cancellation/drain. They do not implement router transport or link traits.
+//! TCP/UDP transport adapters own routing integration; the router alone performs
+//! logical multi-hop forwarding. UDP does not fragment oversized payloads.
+//!
+//! [`TcpPunchConfig`], [`TcpConnection`], and [`TcpRendezvous`]
+//! provide independent TCP-only discovery, coordinated reusable-source-port active
+//! opens, passive acceptance, and framed relay traffic. TCP does not depend on UDP.
+//! Both configurations support additional candidate binds, explicit advertised
+//! hints, and interface gathering; candidates are never authorization by themselves.
+//! Validated TCP streams survive rendezvous loss; when none remain the endpoint
+//! terminates and callers must rebind. TCP control does not implicitly reconnect.
+//! Neither native protocol implements ICE/STUN/TURN or encrypts application bytes.
+//! Actual traversal depends on OS/NAT behavior; unsupported direct paths retain
+//! relay operation where that relay remains reachable.
 
-mod link;
 mod punch;
+mod tcp;
 
-pub use link::PunchLink;
 pub use punch::{
-    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous,
+    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous, UdpConnection,
 };
+pub use tcp::{MAX_TCP_MESSAGE, TcpConnection, TcpPunchConfig, TcpRendezvous};

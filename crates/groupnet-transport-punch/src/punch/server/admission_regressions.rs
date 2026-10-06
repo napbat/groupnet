@@ -17,6 +17,7 @@ fn registration(now: Instant, address: SocketAddr) -> Registration {
         sequence: 1,
         seen: now,
         relay_only: true,
+        candidates: Candidates::default(),
     }
 }
 

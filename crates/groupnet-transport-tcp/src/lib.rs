@@ -16,6 +16,12 @@
 //!   an explicit application policy (a configured-peer allowlist by default).
 //!   Managed sessions are full-duplex, bounded, and retained while connected;
 //!   only live admitted sessions become routing neighbors.
+//! * **`connectivity` — native TCP paths** (opt-in): the existing message transport
+//!   and `TcpLink` can own a `TcpConnection` from `groupnet-transport-punch`,
+//!   with rendezvous admission, candidate traversal, and maintained relay fallback.
+//!   Use `TcpMsgTransport::bind_connectivity` or `TcpLink::connectivity`; no separate
+//!   transport or link type is registered. Native paths retain their protocol MTU
+//!   and live admission generations across conversion into a managed link.
 //!
 //! The low-level message and bulk APIs retain trusted-topology identity
 //! attribution. Managed message admission uses its own bounded wire exchange,

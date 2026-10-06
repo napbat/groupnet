@@ -7,6 +7,7 @@
 //! Open admission provides no cryptographic identity assurance. The rendezvous
 //! is not a routing participant.
 
+mod candidates;
 mod endpoint;
 mod server;
 mod wire;
@@ -19,10 +20,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_transport::Inbound;
 use groupnet_transport::admission::{SessionLease, SessionRegistry};
 use groupnet_transport::link::AdmittedInbound;
-use groupnet_transport::link::{LinkFuture, LinkLifecycle};
-use groupnet_transport::{Inbound, Transport};
 use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
@@ -107,7 +107,8 @@ pub enum PeerPath {
 pub struct PunchConfig {
     /// Stable routing identity (1–64 UTF-8 bytes).
     pub local: NodeId,
-    /// Local UDP bind address; use the correct address family for the rendezvous.
+    /// Primary UDP bind address; its family must match the rendezvous.
+    /// This socket owns the observed mapping and remains the relay/control path.
     pub bind: SocketAddr,
     /// Explicit rendezvous address; no third-party discovery service is used.
     pub rendezvous: SocketAddr,
@@ -123,6 +124,15 @@ pub struct PunchConfig {
     pub credential: Vec<u8>,
     /// Direct-path preference or relay-only operation.
     pub policy: PathPolicy,
+    /// Additional direct-path sockets (at most three), including another IP family.
+    /// Their lifetimes are owned by this endpoint; the primary `bind` owns relay registration.
+    pub candidate_binds: Vec<SocketAddr>,
+    /// Operator-supplied direct addresses (at most eight), checked independently.
+    /// Addresses are untrusted hints, never proof of a usable path.
+    pub advertised_candidates: Vec<SocketAddr>,
+    /// Gather usable local interface addresses for wildcard-bound sockets.
+    /// Link-local addresses are excluded because remote scope identifiers are not portable.
+    pub gather_interfaces: bool,
 }
 
 impl PunchConfig {
@@ -143,6 +153,9 @@ impl PunchConfig {
             dynamic: false,
             credential: Vec::new(),
             policy: PathPolicy::DirectPreferred,
+            candidate_binds: Vec::new(),
+            advertised_candidates: Vec::new(),
+            gather_interfaces: true,
         }
     }
 
@@ -181,6 +194,9 @@ impl PunchConfig {
             peers: Vec::new(),
             dynamic: true,
             credential,
+            candidate_binds: Vec::new(),
+            advertised_candidates: Vec::new(),
+            gather_interfaces: true,
         }
     }
 }
@@ -197,6 +213,9 @@ impl fmt::Debug for PunchConfig {
             .field("dynamic", &self.dynamic)
             .field("credential", &"[REDACTED]")
             .field("policy", &self.policy)
+            .field("candidate_binds", &self.candidate_binds)
+            .field("advertised_candidates", &self.advertised_candidates)
+            .field("gather_interfaces", &self.gather_interfaces)
             .finish()
     }
 }
@@ -241,31 +260,88 @@ impl fmt::Debug for PendingCapability {
     }
 }
 
-#[derive(Debug)]
 struct Peer {
     node: NodeId,
     session: wire::Session,
-    address: Option<SocketAddr>,
+    addresses: candidates::PeerCandidates,
+    secret: wire::Session,
     relay_only: bool,
     offered: Instant,
+    checks: Vec<PathCheck>,
+    selected: Option<usize>,
+    candidate_cursor: usize,
+    sequence: u64,
+    lease: SessionLease,
+}
+
+impl fmt::Debug for Peer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Peer")
+            .field("node", &self.node)
+            .field("session", &self.session)
+            .field("addresses", &self.addresses)
+            .field("secret", &"[REDACTED]")
+            .field("relay_only", &self.relay_only)
+            .field("offered", &self.offered)
+            .field("checks", &self.checks)
+            .field("selected", &self.selected)
+            .field("candidate_cursor", &self.candidate_cursor)
+            .field("sequence", &self.sequence)
+            .field("lease", &self.lease)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+struct PathCheck {
+    address: SocketAddr,
+    socket: usize,
     direct: Option<Capability>,
     probe: Option<Capability>,
     pending: Option<PendingCapability>,
     confirmed: Option<Capability>,
     confirmed_probe: u64,
-    sequence: u64,
-    lease: SessionLease,
+    attempts: u8,
+    next_probe: Instant,
+}
+
+impl PathCheck {
+    fn new(address: SocketAddr, socket: usize) -> Self {
+        Self {
+            address,
+            socket,
+            direct: None,
+            probe: None,
+            pending: None,
+            confirmed: None,
+            confirmed_probe: 0,
+            attempts: 0,
+            next_probe: Instant::now(),
+        }
+    }
 }
 
 impl Peer {
     fn path(&self, now: Instant) -> Option<PeerPath> {
-        if self.direct.is_some_and(|capability| capability.live(now)) {
+        if self.direct_path(now).is_some() {
             Some(PeerPath::Direct)
         } else if now.duration_since(self.offered) < LEASE {
             Some(PeerPath::Relay)
         } else {
             None
         }
+    }
+
+    fn direct_path(&self, now: Instant) -> Option<&PathCheck> {
+        self.selected
+            .and_then(|index| self.checks.get(index))
+            .filter(|check| check.direct.is_some_and(|capability| capability.live(now)))
+            .or_else(|| {
+                self.checks
+                    .iter()
+                    .find(|check| check.direct.is_some_and(|capability| capability.live(now)))
+            })
     }
 }
 
@@ -279,7 +355,11 @@ struct Outbound {
 
 #[derive(Debug)]
 struct Inner {
+    local: NodeId,
     address: SocketAddr,
+    addresses: Vec<SocketAddr>,
+    candidates: candidates::Candidates,
+    observed: Arc<Mutex<Option<SocketAddr>>>,
     configured: Vec<NodeId>,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
     outbound: mpsc::Sender<Outbound>,
@@ -297,17 +377,23 @@ impl Drop for Inner {
     }
 }
 
-/// A bounded best-effort UDP transport with session-bound native hole punching.
+/// A bounded best-effort UDP connection with session-bound native hole punching.
 ///
 /// Clones share queues, path state and one runtime. Closing any clone closes all
-/// clones; dropping the last clone cancels the runtime and releases its socket.
+/// clones; dropping the last clone cancels the runtime and releases every socket.
+/// At most four leased sockets, eight advertised addresses plus their observed
+/// mapping, and 32 active independent checks per peer are retained. Remaining
+/// configured pairs rotate through expired unvalidated slots.
+/// Checks have three-second deadlines; failed
+/// pairs pause for ten seconds after three attempts. A healthy selection is
+/// sticky while alternatives remain eligible for expiry-driven failover.
 #[derive(Clone, Debug)]
-pub struct PunchTransport {
+pub struct UdpConnection {
     inner: Arc<Inner>,
 }
 
-impl PunchTransport {
-    /// Binds the socket and starts registration, discovery and keepalive tasks.
+impl UdpConnection {
+    /// Binds the primary and candidate sockets, then starts registration and checks.
     /// Dynamic configurations wait for actual server admission, failing within
     /// five seconds; static configurations retain background registration.
     ///
@@ -323,17 +409,20 @@ impl PunchTransport {
         if config.peers.contains(&config.local) {
             return Err(invalid("local identity must not be a configured peer"));
         }
-        if config.rendezvous.port() == 0
-            || config.rendezvous.ip().is_unspecified()
-            || config.rendezvous.ip().is_multicast()
+        if !candidates::valid(config.rendezvous)
             || config.bind.is_ipv4() != config.rendezvous.is_ipv4()
         {
             return Err(invalid(
                 "invalid rendezvous address or socket address family",
             ));
         }
-        let socket = UdpSocket::bind(config.bind).await?;
-        let address = socket.local_addr()?;
+        let (sockets, local_candidates) = candidates::bind(&config).await?;
+        let addresses = sockets
+            .iter()
+            .map(UdpSocket::local_addr)
+            .collect::<io::Result<Vec<_>>>()?;
+        let address = addresses[0];
+        let observed = Arc::new(Mutex::new(None));
         let session = random()?;
         let nonce = random()?;
         let peers = Arc::new(Mutex::new(HashMap::new()));
@@ -343,10 +432,11 @@ impl PunchTransport {
         let configured = config.peers.clone();
         let sessions = SessionRegistry::new(MAX_PEERS)?;
         let dynamic = config.dynamic;
+        let local = config.local.clone();
         let (ready, admitted) = tokio::sync::oneshot::channel();
         let mut task = tokio::spawn(endpoint::run(
             config,
-            socket,
+            (sockets, local_candidates, observed.clone()),
             (session, nonce),
             peers.clone(),
             (outgoing, incoming, ready),
@@ -372,7 +462,11 @@ impl PunchTransport {
         }
         Ok(Self {
             inner: Arc::new(Inner {
+                local,
                 address,
+                addresses,
+                candidates: local_candidates,
+                observed,
                 configured,
                 peers,
                 outbound,
@@ -392,6 +486,48 @@ impl PunchTransport {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.ensure_open()?;
         Ok(self.inner.address)
+    }
+
+    /// Returns every leased socket's actual bind address.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` after shutdown.
+    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        self.ensure_open()?;
+        Ok(self.inner.addresses.clone())
+    }
+
+    /// Returns the bounded advertised local candidates (empty under relay-only policy).
+    ///
+    /// # Errors
+    /// Returns `NotConnected` after shutdown.
+    pub fn local_candidates(&self) -> io::Result<Vec<SocketAddr>> {
+        self.ensure_open()?;
+        Ok(self.inner.candidates.iter().collect())
+    }
+
+    /// Returns the primary address observed by the current rendezvous registration.
+    /// Relay-only endpoints do not retain or disclose this address.
+    #[must_use]
+    pub fn observed_addr(&self) -> Option<SocketAddr> {
+        if self.inner.cancel.is_cancelled() {
+            return None;
+        }
+        *lock(&self.inner.observed)
+    }
+
+    /// Returns the selected live direct peer address, or `None` while relaying.
+    #[must_use]
+    pub fn direct_addr_to(&self, node: &NodeId) -> Option<SocketAddr> {
+        if self.inner.cancel.is_cancelled() {
+            return None;
+        }
+        let peers = lock(&self.inner.peers);
+        let peer = peers.get(node.as_str())?;
+        if !peer.lease.is_active() {
+            return None;
+        }
+        Some(peer.direct_path(Instant::now())?.address)
     }
 
     /// Returns configured peers, or the currently live discovered peers.
@@ -422,14 +558,27 @@ impl PunchTransport {
         peer.path(Instant::now())
     }
 
-    pub(crate) fn sessions(&self) -> SessionRegistry {
+    /// Returns the application identity retained by this connection.
+    #[must_use]
+    pub fn local_id(&self) -> &NodeId {
+        &self.inner.local
+    }
+
+    /// Returns a clone of the same live admission and generation registry.
+    #[must_use]
+    pub fn sessions(&self) -> SessionRegistry {
         self.inner.sessions.clone()
+    }
+
+    /// Cancels owned I/O and invalidates all admitted sessions on every clone.
+    pub fn shutdown(&self) {
+        self.inner.cancel.cancel();
+        self.inner.sessions.close();
     }
 
     /// Cancels all I/O and waits for the socket-owning task to finish.
     pub async fn close(&self) {
-        self.inner.cancel.cancel();
-        self.inner.sessions.close();
+        self.shutdown();
         let mut task = self.inner.task.lock().await;
         if let Some(running) = task.as_mut() {
             let _ = running.await;
@@ -485,30 +634,28 @@ impl PunchTransport {
     }
 }
 
-impl LinkLifecycle for PunchTransport {
-    fn shutdown(&self) {
-        self.inner.cancel.cancel();
-        self.inner.sessions.close();
-    }
-
-    fn close(&self) -> LinkFuture<'_, ()> {
-        Box::pin(Self::close(self))
-    }
-}
-
-impl Transport for PunchTransport {
-    type Error = io::Error;
-
-    fn send(&self, to: &NodeId, message: &[u8]) -> impl Future<Output = io::Result<()>> {
+impl UdpConnection {
+    /// Queues a bounded best-effort packet for a live admitted neighbor.
+    /// Unknown peers and full queues are dropped without blocking.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    pub fn send(&self, to: &NodeId, message: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
         std::future::ready(self.enqueue(to, message, None))
     }
 
-    fn send_admitted(
+    /// Queues data only when the supplied admission generation is still current.
+    /// Stale generations and full queues are dropped without blocking.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` after shutdown or when no generation is supplied,
+    /// and `InvalidInput` for oversized data.
+    pub fn send_admitted(
         &self,
         to: &NodeId,
         message: &[u8],
         session: Option<groupnet_transport::admission::SessionId>,
-    ) -> impl Future<Output = io::Result<()>> {
+    ) -> impl Future<Output = io::Result<()>> + Send {
         std::future::ready(if session.is_some() {
             self.enqueue(to, message, session)
         } else {
@@ -519,11 +666,20 @@ impl Transport for PunchTransport {
         })
     }
 
-    async fn recv(&self) -> io::Result<Inbound> {
+    /// Receives a packet from a currently admitted neighbor.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` when this connection closes.
+    pub async fn recv(&self) -> io::Result<Inbound> {
         Ok(self.recv_admitted().await?.packet)
     }
 
-    async fn recv_admitted(&self) -> io::Result<AdmittedInbound> {
+    /// Receives a packet with its current admission generation.
+    /// Queued packets from revoked or replaced generations are discarded.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` when this connection closes.
+    pub async fn recv_admitted(&self) -> io::Result<AdmittedInbound> {
         loop {
             let received = tokio::select! {
                 biased;
@@ -545,7 +701,7 @@ fn invalid(message: &str) -> io::Error {
 }
 
 fn closed() -> io::Error {
-    io::Error::new(io::ErrorKind::NotConnected, "UDP transport closed")
+    io::Error::new(io::ErrorKind::NotConnected, "UDP connection closed")
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

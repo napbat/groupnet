@@ -1,14 +1,17 @@
 //! Bounded session-bound datagrams; keyed HMAC verification precedes parsing.
 
+mod candidates;
+pub(super) use candidates::CandidateList;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use ring::hmac;
 
 use super::NetworkKey;
+use super::candidates::{Candidates, MAX_CANDIDATES, valid};
 
 pub(super) const MAX_PACKET: usize = 1200;
 const TAG: usize = 32;
-const MAGIC: &[u8; 4] = b"GNP3";
+const MAGIC: &[u8; 4] = b"GNP4";
 pub(super) type Session = [u8; 16];
 
 #[derive(Clone, Copy)]
@@ -51,25 +54,31 @@ pub(super) enum Body<'a> {
         session: Session,
         address: Option<SocketAddr>,
         relay_only: bool,
+        candidates: CandidateList<'a>,
+        secret: Session,
     },
     Probe {
         target: Session,
         nonce: Session,
+        secret: Session,
     },
     ProbeAck {
         target: Session,
         nonce: Session,
         capability: Session,
+        secret: Session,
     },
     Confirm {
         target: Session,
         capability: Session,
+        secret: Session,
     },
     Direct {
         peer: &'a str,
         target: Session,
         capability: Session,
         message: &'a [u8],
+        secret: Session,
     },
     Relay {
         proof: Session,
@@ -83,6 +92,14 @@ pub(super) enum Body<'a> {
         session: Session,
         message: &'a [u8],
     },
+    Candidates {
+        proof: Session,
+        candidates: CandidateList<'a>,
+    },
+    Observed {
+        proof: Session,
+        address: SocketAddr,
+    },
 }
 
 impl Body<'_> {
@@ -92,7 +109,8 @@ impl Body<'_> {
             | Self::Heartbeat { proof }
             | Self::Depart { proof }
             | Self::Query { proof, .. }
-            | Self::Relay { proof, .. } => Some(proof),
+            | Self::Relay { proof, .. }
+            | Self::Candidates { proof, .. } => Some(proof),
             _ => None,
         }
     }
@@ -117,6 +135,8 @@ impl std::fmt::Debug for Body<'_> {
             Self::Direct { .. } => "Direct",
             Self::Relay { .. } => "Relay",
             Self::Delivered { .. } => "Delivered",
+            Self::Candidates { .. } => "Candidates",
+            Self::Observed { .. } => "Observed",
         })
     }
 }
@@ -155,6 +175,9 @@ impl Writer<'_> {
     fn address(&mut self, address: Option<SocketAddr>) -> Option<()> {
         self.put(&[u8::from(address.is_some())])?;
         if let Some(address) = address {
+            if !valid(address) {
+                return None;
+            }
             match address.ip() {
                 IpAddr::V4(ip) => {
                     self.put(&[4])?;
@@ -166,6 +189,14 @@ impl Writer<'_> {
                 }
             }
             self.put(&address.port().to_be_bytes())?;
+        }
+        Some(())
+    }
+
+    fn candidates(&mut self, candidates: CandidateList<'_>) -> Option<()> {
+        self.put(&[u8::try_from(candidates.len()).ok()?])?;
+        for address in candidates.iter() {
+            self.address(Some(address))?;
         }
         Some(())
     }
@@ -222,10 +253,28 @@ impl<'a> Reader<'a> {
             _ => return None,
         };
         let port = u16::from_be_bytes(self.take(2)?.try_into().ok()?);
-        if port == 0 || ip.is_unspecified() || ip.is_multicast() {
+        if !valid(SocketAddr::new(ip, port)) {
             return None;
         }
         Some(SocketAddr::new(ip, port))
+    }
+
+    fn candidates(&mut self) -> Option<CandidateList<'a>> {
+        let count = self.byte()?;
+        if usize::from(count) > MAX_CANDIDATES {
+            return None;
+        }
+        let start = self.position;
+        let mut candidates = Candidates::default();
+        for _ in 0..count {
+            if !self.flag()? || !candidates.insert(self.address()?) {
+                return None;
+            }
+        }
+        Some(CandidateList::Encoded(
+            &self.bytes[start..self.position],
+            count,
+        ))
     }
 
     fn message(&mut self) -> Option<&'a [u8]> {
@@ -273,6 +322,8 @@ pub(super) fn encode_mode(
         Body::Depart { .. } => 14,
         Body::Denied { .. } => 15,
         Body::Confirm { .. } => 16,
+        Body::Candidates { .. } => 17,
+        Body::Observed { .. } => 18,
     };
     writer.put(&[kind])?;
     writer.name(packet.sender)?;
@@ -326,8 +377,10 @@ fn encode_body(body: Body<'_>, writer: &mut Writer<'_>) -> Option<()> {
             session,
             address,
             relay_only,
+            candidates,
+            secret,
         } => {
-            if relay_only != address.is_none() {
+            if relay_only != address.is_none() || (relay_only && !candidates.is_empty()) {
                 return None;
             }
             writer.put(&proof)?;
@@ -335,33 +388,67 @@ fn encode_body(body: Body<'_>, writer: &mut Writer<'_>) -> Option<()> {
             writer.put(&session)?;
             writer.address(address)?;
             writer.put(&[u8::from(relay_only)])?;
+            writer.candidates(candidates)?;
+            writer.put(&secret)?;
         }
-        Body::Probe { target, nonce } => {
+        Body::Probe {
+            target,
+            nonce,
+            secret,
+        } => {
             writer.put(&target)?;
             writer.put(&nonce)?;
+            writer.put(&secret)?;
         }
         Body::ProbeAck {
             target,
             nonce,
             capability,
+            secret,
         } => {
             writer.put(&target)?;
             writer.put(&nonce)?;
             writer.put(&capability)?;
+            writer.put(&secret)?;
         }
-        Body::Confirm { target, capability } => {
+        Body::Confirm { .. }
+        | Body::Direct { .. }
+        | Body::Relay { .. }
+        | Body::Delivered { .. } => return encode_payload(body, writer),
+        Body::Candidates { proof, candidates } => {
+            writer.put(&proof)?;
+            writer.candidates(candidates)?;
+        }
+        Body::Observed { proof, address } => {
+            writer.put(&proof)?;
+            writer.address(Some(address))?;
+        }
+    }
+    Some(())
+}
+
+fn encode_payload(body: Body<'_>, writer: &mut Writer<'_>) -> Option<()> {
+    match body {
+        Body::Confirm {
+            target,
+            capability,
+            secret,
+        } => {
             writer.put(&target)?;
             writer.put(&capability)?;
+            writer.put(&secret)?;
         }
         Body::Direct {
             peer,
             target,
             capability,
             message,
+            secret,
         } => {
             writer.name(peer)?;
             writer.put(&target)?;
             writer.put(&capability)?;
+            writer.put(&secret)?;
             writer.message(message)?;
         }
         Body::Relay {
@@ -386,6 +473,7 @@ fn encode_body(body: Body<'_>, writer: &mut Writer<'_>) -> Option<()> {
             writer.put(&session)?;
             writer.message(message)?;
         }
+        _ => return None,
     }
     Some(())
 }
@@ -473,7 +561,9 @@ fn decode_body<'a>(kind: u8, reader: &mut Reader<'a>) -> Option<Body<'a>> {
                 None
             };
             let relay_only = reader.flag()?;
-            if relay_only != address.is_none() {
+            let candidates = reader.candidates()?;
+            let secret = reader.token()?;
+            if relay_only != address.is_none() || (relay_only && !candidates.is_empty()) {
                 return None;
             }
             Body::Offer {
@@ -482,35 +572,22 @@ fn decode_body<'a>(kind: u8, reader: &mut Reader<'a>) -> Option<Body<'a>> {
                 session,
                 address,
                 relay_only,
+                candidates,
+                secret,
             }
         }
         7 => Body::Probe {
             target: reader.token()?,
             nonce: reader.token()?,
+            secret: reader.token()?,
         },
         8 => Body::ProbeAck {
             target: reader.token()?,
             nonce: reader.token()?,
             capability: reader.token()?,
+            secret: reader.token()?,
         },
-        9 => Body::Direct {
-            peer: reader.name()?,
-            target: reader.token()?,
-            capability: reader.token()?,
-            message: reader.message()?,
-        },
-        10 => Body::Relay {
-            proof: reader.token()?,
-            peer: reader.name()?,
-            target: reader.token()?,
-            message: reader.message()?,
-        },
-        11 => Body::Delivered {
-            proof: reader.token()?,
-            peer: reader.name()?,
-            session: reader.token()?,
-            message: reader.message()?,
-        },
+        9..=11 => decode_payload(kind, reader)?,
         12 => Body::Discover {
             proof: reader.token()?,
         },
@@ -526,317 +603,131 @@ fn decode_body<'a>(kind: u8, reader: &mut Reader<'a>) -> Option<Body<'a>> {
         16 => Body::Confirm {
             target: reader.token()?,
             capability: reader.token()?,
+            secret: reader.token()?,
         },
+        17 => Body::Candidates {
+            proof: reader.token()?,
+            candidates: reader.candidates()?,
+        },
+        18 => decode_observed(reader)?,
         _ => return None,
     };
     Some(body)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key() -> NetworkKey {
-        NetworkKey::from_bytes([4; 32])
+fn decode_observed<'a>(reader: &mut Reader<'a>) -> Option<Body<'a>> {
+    let proof = reader.token()?;
+    if !reader.flag()? {
+        return None;
     }
-
-    fn packet(body: Body<'_>) -> Packet<'_> {
-        Packet {
-            sender: "alpha",
-            session: [2; 16],
-            sequence: 7,
-            body,
-        }
-    }
-
-    fn control_variants() -> [Body<'static>; 12] {
-        let address = SocketAddr::from(([127, 0, 0, 1], 1234));
-        [
-            Body::Hello { nonce: [3; 16] },
-            Body::Challenge {
-                nonce: [3; 16],
-                cookie: [4; 16],
-            },
-            Body::Register {
-                nonce: [3; 16],
-                cookie: [4; 16],
-                relay_only: true,
-                credential: &[],
-            },
-            Body::Registered { proof: [9; 16] },
-            Body::Discover { proof: [9; 16] },
-            Body::Heartbeat { proof: [9; 16] },
-            Body::Depart { proof: [9; 16] },
-            Body::Denied { proof: [9; 16] },
-            Body::Query {
-                proof: [9; 16],
-                peer: "beta",
-            },
-            Body::Offer {
-                proof: [9; 16],
-                peer: "beta",
-                session: [5; 16],
-                address: Some(address),
-                relay_only: false,
-            },
-            Body::Offer {
-                proof: [9; 16],
-                peer: "beta",
-                session: [5; 16],
-                address: Some("[::1]:1234".parse().unwrap()),
-                relay_only: false,
-            },
-            Body::Offer {
-                proof: [9; 16],
-                peer: "beta",
-                session: [5; 16],
-                address: None,
-                relay_only: true,
-            },
-        ]
-    }
-
-    fn data_variants(message: &[u8]) -> [Body<'_>; 6] {
-        [
-            Body::Probe {
-                target: [5; 16],
-                nonce: [3; 16],
-            },
-            Body::ProbeAck {
-                target: [5; 16],
-                nonce: [3; 16],
-                capability: [8; 16],
-            },
-            Body::Confirm {
-                target: [5; 16],
-                capability: [8; 16],
-            },
-            Body::Direct {
-                peer: "beta",
-                target: [5; 16],
-                capability: [8; 16],
-                message,
-            },
-            Body::Relay {
-                proof: [9; 16],
-                peer: "beta",
-                target: [5; 16],
-                message,
-            },
-            Body::Delivered {
-                proof: [9; 16],
-                peer: "beta",
-                session: [5; 16],
-                message: &[],
-            },
-        ]
-    }
-
-    #[test]
-    fn every_typed_variant_round_trips_and_truncation_fails_closed() {
-        let message = [6; super::super::MAX_MESSAGE];
-        for body in control_variants()
-            .into_iter()
-            .chain(data_variants(&message))
-        {
-            let mut open = [0; MAX_PACKET];
-            let length = encode_mode(packet(body), None, &mut open).unwrap();
-            let decoded = decode_mode(&open[..length], None).unwrap();
-            let mut round_trip = [0; MAX_PACKET];
-            assert_eq!(encode_mode(decoded, None, &mut round_trip), Some(length));
-            assert_eq!(&open[..length], &round_trip[..length]);
-            let mut buffer = [0; MAX_PACKET];
-            let length = encode(packet(body), &key(), &mut buffer).unwrap();
-            assert!(length <= MAX_PACKET);
-            let decoded = decode(&buffer[..length], &key()).unwrap();
-            assert_eq!(decoded.sender, "alpha");
-            assert_eq!(decoded.session, [2; 16]);
-            assert_eq!(decoded.sequence, 7);
-            let mut round_trip = [0; MAX_PACKET];
-            assert_eq!(encode(decoded, &key(), &mut round_trip), Some(length));
-            assert_eq!(&buffer[..length], &round_trip[..length]);
-            for prefix in 0..length {
-                assert!(decode(&buffer[..prefix], &key()).is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn bad_tags_wrong_keys_and_every_single_byte_tamper_are_rejected() {
-        let mut bytes = [0; MAX_PACKET];
-        let length = encode(packet(Body::Hello { nonce: [7; 16] }), &key(), &mut bytes).unwrap();
-        assert!(decode(&bytes[..length], &NetworkKey::from_bytes([9; 32])).is_none());
-        for index in 0..length {
-            bytes[index] ^= 1;
-            assert!(decode(&bytes[..length], &key()).is_none());
-            bytes[index] ^= 1;
-        }
-        assert!(decode(&[0; MAX_PACKET + 1], &key()).is_none());
-    }
-
-    fn signed(payload: &[u8]) -> Vec<u8> {
-        let mut bytes = payload.to_vec();
-        bytes.extend_from_slice(hmac::sign(&key().auth, payload).as_ref());
-        bytes
-    }
-
-    #[test]
-    fn authenticated_malformed_payloads_unknown_kinds_flags_and_utf8_fail_closed() {
-        let mut buffer = [0; MAX_PACKET];
-        let length = encode(
-            packet(Body::Register {
-                nonce: [7; 16],
-                cookie: [8; 16],
-                relay_only: false,
-                credential: &[],
-            }),
-            &key(),
-            &mut buffer,
-        )
-        .unwrap();
-        let payload = &buffer[..length - TAG];
-        for kind in [0, 17, 255] {
-            let mut malformed = payload.to_vec();
-            malformed[4] = kind;
-            assert!(decode(&signed(&malformed), &key()).is_none());
-        }
-        for name_length in [0, 65, 255] {
-            let mut malformed = payload.to_vec();
-            malformed[5] = name_length;
-            assert!(decode(&signed(&malformed), &key()).is_none());
-        }
-        let mut malformed = payload.to_vec();
-        malformed[6] = 255;
-        assert!(decode(&signed(&malformed), &key()).is_none());
-        let mut malformed = payload.to_vec();
-        malformed[67] = 2; // Relay-only flag follows nonce and cookie.
-        assert!(decode(&signed(&malformed), &key()).is_none());
-        let mut malformed = payload.to_vec();
-        malformed.extend_from_slice(&[0]);
-        assert!(decode(&signed(&malformed), &key()).is_none());
-        let mut malformed = payload.to_vec();
-        malformed[27..35].fill(0); // Sequence after the five-byte name and session.
-        assert!(decode(&signed(&malformed), &key()).is_none());
-    }
-
-    #[test]
-    fn exact_limits_accept_unicode_and_reject_oversized_messages_and_names() {
-        let name = "é".repeat(32);
-        let message = [0; super::super::MAX_MESSAGE];
-        let mut buffer = [0; MAX_PACKET];
-        let value = Packet {
-            sender: &name,
-            session: [1; 16],
-            sequence: 1,
-            body: Body::Relay {
-                proof: [9; 16],
-                peer: &name,
-                target: [2; 16],
-                message: &message,
-            },
-        };
-        let length = encode(value, &key(), &mut buffer).unwrap();
-        assert_eq!(decode(&buffer[..length], &key()).unwrap().sender, name);
-        let oversized = [0; super::super::MAX_MESSAGE + 1];
-        assert!(
-            encode(
-                packet(Body::Direct {
-                    peer: "beta",
-                    target: [0; 16],
-                    capability: [8; 16],
-                    message: &oversized
-                }),
-                &key(),
-                &mut buffer
-            )
-            .is_none()
-        );
-        let long = "x".repeat(65);
-        assert!(
-            encode(
-                Packet {
-                    sender: &long,
-                    ..value
-                },
-                &key(),
-                &mut buffer
-            )
-            .is_none()
-        );
-        // Produce an authenticated oversized body manually, without the encoder.
-        let length = encode(
-            packet(Body::Direct {
-                peer: "beta",
-                target: [0; 16],
-                capability: [8; 16],
-                message: &message,
-            }),
-            &key(),
-            &mut buffer,
-        )
-        .unwrap();
-        let mut payload = buffer[..length - TAG].to_vec();
-        payload.push(0);
-        assert!(decode(&signed(&payload), &key()).is_none());
-    }
-
-    #[test]
-    fn clean_wire_cutover_and_keyed_parsing_never_downgrade() {
-        let mut bytes = [0; MAX_PACKET];
-        let length = encode_mode(packet(Body::Hello { nonce: [7; 16] }), None, &mut bytes).unwrap();
-        assert!(decode_mode(&bytes[..length], Some(&key())).is_none());
-        let length = encode(packet(Body::Hello { nonce: [7; 16] }), &key(), &mut bytes).unwrap();
-        assert!(decode_mode(&bytes[..length], None).is_none());
-        let mut old = bytes[..length - TAG].to_vec();
-        old[..4].copy_from_slice(b"GNP2");
-        assert!(decode(&signed(&old), &key()).is_none());
-        assert!(decode_mode(&old, None).is_none());
-    }
-
-    #[test]
-    fn maximum_identity_and_payload_fit_all_data_paths_in_both_modes() {
-        let name = "x".repeat(64);
-        let message = [42; super::super::MAX_MESSAGE];
-        let bodies = [
-            Body::Direct {
-                peer: &name,
-                target: [2; 16],
-                capability: [3; 16],
-                message: &message,
-            },
-            Body::Relay {
-                proof: [4; 16],
-                peer: &name,
-                target: [2; 16],
-                message: &message,
-            },
-            Body::Delivered {
-                proof: [4; 16],
-                peer: &name,
-                session: [2; 16],
-                message: &message,
-            },
-        ];
-        for body in bodies {
-            for keyed in [false, true] {
-                let key = key();
-                let mode = keyed.then_some(&key);
-                let mut bytes = [0; MAX_PACKET];
-                let length = encode_mode(
-                    Packet {
-                        sender: &name,
-                        ..packet(body)
-                    },
-                    mode,
-                    &mut bytes,
-                )
-                .unwrap();
-                assert!(length <= MAX_PACKET);
-                let decoded = decode_mode(&bytes[..length], mode).unwrap();
-                assert!(matches!(decoded.body, Body::Direct { message: got, .. }
-                    | Body::Relay { message: got, .. }
-                    | Body::Delivered { message: got, .. } if got == message));
-            }
-        }
-    }
+    Some(Body::Observed {
+        proof,
+        address: reader.address()?,
+    })
 }
+
+fn decode_payload<'a>(kind: u8, reader: &mut Reader<'a>) -> Option<Body<'a>> {
+    Some(match kind {
+        9 => Body::Direct {
+            peer: reader.name()?,
+            target: reader.token()?,
+            capability: reader.token()?,
+            secret: reader.token()?,
+            message: reader.message()?,
+        },
+        10 => Body::Relay {
+            proof: reader.token()?,
+            peer: reader.name()?,
+            target: reader.token()?,
+            message: reader.message()?,
+        },
+        11 => Body::Delivered {
+            proof: reader.token()?,
+            peer: reader.name()?,
+            session: reader.token()?,
+            message: reader.message()?,
+        },
+        _ => return None,
+    })
+}
+
+// Only a MAC, never the pair key, goes to an untrusted advertised address.
+pub(super) fn check_proof(secret: Session, packet: Packet<'_>) -> Session {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &secret);
+    let mut context = hmac::Context::with_key(&key);
+    context.update(b"groupnet-udp-check-v4");
+    context.update(&[u8::try_from(packet.sender.len()).unwrap_or(0)]);
+    context.update(packet.sender.as_bytes());
+    context.update(&packet.session);
+    context.update(&packet.sequence.to_be_bytes());
+    match packet.body {
+        Body::Probe { target, nonce, .. } => {
+            context.update(&[1]);
+            context.update(&target);
+            context.update(&nonce);
+        }
+        Body::ProbeAck {
+            target,
+            nonce,
+            capability,
+            ..
+        } => {
+            context.update(&[2]);
+            context.update(&target);
+            context.update(&nonce);
+            context.update(&capability);
+        }
+        Body::Confirm {
+            target, capability, ..
+        } => {
+            context.update(&[3]);
+            context.update(&target);
+            context.update(&capability);
+        }
+        Body::Direct {
+            peer,
+            target,
+            capability,
+            message,
+            ..
+        } => {
+            context.update(&[4]);
+            context.update(&[u8::try_from(peer.len()).unwrap_or(0)]);
+            context.update(peer.as_bytes());
+            context.update(&target);
+            context.update(&capability);
+            context.update(message);
+        }
+        _ => {}
+    }
+    let tag = context.sign();
+    let mut proof = [0; 16];
+    proof.copy_from_slice(&tag.as_ref()[..16]);
+    proof
+}
+
+pub(super) fn sign_check(mut packet: Packet<'_>) -> Packet<'_> {
+    let (Body::Probe { secret, .. }
+    | Body::ProbeAck { secret, .. }
+    | Body::Confirm { secret, .. }
+    | Body::Direct { secret, .. }) = packet.body
+    else {
+        return packet;
+    };
+    let proof = check_proof(secret, packet);
+    match &mut packet.body {
+        Body::Probe { secret, .. }
+        | Body::ProbeAck { secret, .. }
+        | Body::Confirm { secret, .. }
+        | Body::Direct { secret, .. } => *secret = proof,
+        _ => {}
+    }
+    packet
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[path = "wire/candidate_tests.rs"]
+mod candidate_tests;
