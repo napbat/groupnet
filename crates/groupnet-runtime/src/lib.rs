@@ -57,6 +57,8 @@ pub use group::{
     InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
 pub use groupnet_core::{RecoveredGrant, Role, Status};
+#[cfg(feature = "router")]
+pub use network::NetworkBuilder;
 pub use node::{GroupProfile, Node, NodeBuilder};
 pub use routing::Routing;
 #[cfg(feature = "dns")]

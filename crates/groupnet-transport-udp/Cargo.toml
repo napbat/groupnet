@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Opt-in router registration; the default socket binding stays minimal.
+link = ["groupnet-transport/link"]
+
 # Depends only on the trait + id type, plus tokio's networking slice. The
 # runtime never needs to know this crate exists.
 [dependencies]

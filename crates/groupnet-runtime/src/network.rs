@@ -3,13 +3,22 @@
 use std::io;
 
 use groupnet_core::NodeId;
-use groupnet_transport::bulk::BulkTransport;
+use groupnet_transport::{bulk::BulkTransport, link::LinkProvider};
 use groupnet_transport_router::tunnel::{TunnelTransport, TunneledStream};
-use groupnet_transport_router::{NetworkConfig, Router};
+use groupnet_transport_router::{NetworkConfig, Router, RouterConfig, TunnelConfig};
 
 use crate::{Node, NodeBuilder};
 
 impl Node<Router> {
+    /// Builds a managed node with intrinsic routing over registered link providers.
+    #[must_use]
+    pub fn network_builder(id: NodeId) -> NetworkBuilder {
+        NetworkBuilder {
+            id,
+            config: NetworkConfig::default(),
+        }
+    }
+
     /// Initializes adapters, routing, optional TLS tunnels, and membership.
     /// Adjacent peers become initial membership seeds. Every ordinary [`Node`]
     /// clone retains network ownership; dropping the last initiates shutdown.
@@ -89,5 +98,66 @@ impl BulkTransport for Node<Router> {
 
     async fn accept(&self) -> io::Result<(NodeId, Self::Stream)> {
         self.tunnels()?.accept().await
+    }
+}
+
+/// Configures link implementations beneath a node's routing and membership layer.
+/// Link providers own their protocol settings; no protocol enumeration is required.
+#[derive(Debug)]
+pub struct NetworkBuilder {
+    id: NodeId,
+    config: NetworkConfig,
+}
+
+impl NetworkBuilder {
+    /// Registers one configured protocol implementation.
+    #[must_use]
+    pub fn link(mut self, provider: impl LinkProvider) -> Self {
+        self.config = self.config.with_link(provider);
+        self
+    }
+
+    /// Registers a heterogeneous collection of configured protocol implementations.
+    #[must_use]
+    pub fn links(mut self, providers: impl IntoIterator<Item = Box<dyn LinkProvider>>) -> Self {
+        self.config = self.config.with_links(providers);
+        self
+    }
+
+    /// Sets routing limits and transit policy, independently of link protocols.
+    #[must_use]
+    pub fn routing(mut self, config: RouterConfig) -> Self {
+        self.config = self.config.with_router(config);
+        self
+    }
+
+    /// Enables pinned, end-to-end TLS streams over routed paths.
+    #[must_use]
+    pub fn tunnels(mut self, config: TunnelConfig) -> Self {
+        self.config = self.config.with_tunnels(config);
+        self
+    }
+
+    /// Binds all links and starts routing and membership.
+    ///
+    /// # Errors
+    /// Propagates binding, registration, or security setup failures.
+    /// # Panics
+    /// Requires a Tokio runtime; propagates poisoned internal locks.
+    pub async fn start(self) -> io::Result<Node<Router>> {
+        Node::network(self.id, self.config).await
+    }
+
+    /// Starts with the existing membership builder's settings, without duplicating them.
+    ///
+    /// # Errors
+    /// Propagates binding, registration, or security setup failures.
+    /// # Panics
+    /// Requires a Tokio runtime; propagates poisoned locks or a panicking callback.
+    pub async fn start_with(
+        self,
+        configure: impl FnOnce(NodeBuilder<Router>) -> NodeBuilder<Router>,
+    ) -> io::Result<Node<Router>> {
+        Node::network_with(self.id, self.config, configure).await
     }
 }

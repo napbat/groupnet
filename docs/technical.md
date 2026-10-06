@@ -118,10 +118,11 @@ group.sync(|ctx| {
 
 ## **5. Multi-transport routing and tunnels**
 
-`groupnet-transport-router` composes any number of existing `Transport`
-implementations. A peer may attach only IPC, another only network transports,
-and a bridge both. Link adapters establish one-hop communication; the router
-learns bounded path-vector routes and forwards packets across those links.
+Managed nodes always route over their registered links. `groupnet-transport-router`
+has no production dependency on a concrete protocol implementation. A peer may
+attach only IPC, another only network transports, and a bridge both. Adapters
+establish one-hop communication; routing learns bounded path-vector routes and
+forwards packets across those links.
 Forwarding is enabled by default between configured peers, across adapters and
 within one adapter. Set `RouterConfig::forwarding = false` for an endpoint-only
 node: it neither advertises learned transit routes nor forwards transit packets.
@@ -136,8 +137,9 @@ observe routing metadata and deny service but cannot decrypt tunnel contents.
 Application bytes are not replayed when retransmissions take another route.
 Admission and cryptographic identity are separate from advertised reachability.
 
-Native adapters supply local IPC and authenticated UDP discovery, simultaneous
-hole-punch probes, and self-hosted relay fallback. The UDP fabric is provisioned
+Independent `groupnet-transport-ipc` and `groupnet-transport-punch` crates supply
+local IPC and authenticated UDP discovery, simultaneous hole-punch probes, and
+self-hosted relay fallback. The UDP fabric is provisioned
 with a random shared network key: participants are mutually trusted for routing,
 not Byzantine-safe. End-to-end tunnel certificates enforce endpoint identity
 even across a trusted forwarding fabric. No public third-party relay is needed.
@@ -148,27 +150,42 @@ Membership/route availability never authorizes attachment to a security key.
 
 ### Initialization and ownership
 
-The facade and runtime expose this path behind feature `router`.
-`Node::network(id, NetworkConfig)` binds configured `TransportConfig` values,
-seeds membership from their explicit neighbors, and returns an ordinary
-`Node<Router>`. `Node::network_with` accepts a typed `NodeBuilder<Router>`
-configuration closure rather than duplicating membership settings.
+The facade enables routing by default; low-level runtime consumers can select
+the `router` feature independently. `Node::network_builder(id).link(provider)`
+or `.links(providers)` collects implementations and `.start().await` binds them,
+starts routing, and seeds membership from explicit neighbors. The result is an
+ordinary `Node<Router>`. The equivalent prebuilt configuration path is
+`Node::network(id, NetworkConfig)`. `start_with` and `Node::network_with` accept the
+existing typed `NodeBuilder<Router>` closure for membership settings.
 Every ordinary node clone retains the managed network. Ownership lives on the
 public handles, not in the receive loop's shared state: a background task must
 not keep its own network alive forever. A raw router clone or group handle alone
 does not extend that lifetime. Dropping the last node owner initiates cancellation;
 closing any clone drains network tasks and closes connections for all clones.
 
-`NetworkConfig` uses `with_router`, `with_transport`, and `with_tunnels`.
-`TransportConfig::{tcp, udp, ipc, punch, custom}` provides typed constructors;
-all adapters start in insertion order within `RouterConfig` bounds.
-Built-ins default to cost 1, overridable with `with_cost`; custom adapters retain
-their `LinkConfig` cost unless overridden. No public enum exposes allocation
-details. Custom registration erases only the initialization closure, not
-per-packet futures, and transfers the adapter to router workers. Independently
-retained custom-adapter handles and their resources remain caller-owned.
-`TransportId`, `NodeId`, `Route`, `PeerEndpoint`, `LinkConfig`, and `PathPolicy`
-retain their types throughout the public API.
+`groupnet-transport::link` defines the shared object-safe `LinkProvider` contract
+below both routing and protocol crates. Providers receive a local identity and
+return a `BoundLink`, never a concrete router. Each implementation owns typed
+addresses/configuration and binding. `NetworkConfig` stores
+`Vec<Box<dyn LinkProvider>>`; there is no closed protocol enum or custom escape hatch.
+`TcpLink`, `UdpLink`, `MemLink`, `IpcLink`, and `PunchLink` use that same interface.
+All providers start in insertion order within the router's admission/capacity bounds.
+
+`BoundLink` carries a `LinkConfig` and single-use `LinkDriver`. The driver erases
+one worker lifetime while keeping the concrete `Transport` send/receive futures
+monomorphized. `LinkIo` supplies an outgoing stream and backpressured incoming sink
+over the router's existing queues; registration adds no extra packet queue or
+per-packet boxed future. Router scheduling still owns announcements, fragmentation,
+MTU enforcement, and per-frame deadlines. Shared frames and owned fragments cross
+the interface without copying their payload allocations.
+
+Protocols with independently spawned tasks supply `LinkLifecycle`. Dropping its
+owner initiates cancellation; worker completion and explicit close drain protocol
+tasks. TCP owns listener/readers/writers; native IPC and punching retain their
+own supervisors. Socket/channel-only implementations release resources when their
+typed workers drop. Registration failure drains rejected endpoints, and partial
+startup closes previously registered links. Router close synchronizes with link
+registration before waiting for workers, preventing late registrations from escaping.
 
 Initialization failure and explicit close share one shutdown path, including
 draining a native listener when its peer registration fails. Dropping an
@@ -183,12 +200,12 @@ returns `Unsupported`, never plaintext. `tunnels()?` exposes per-peer admission:
 its active and queued streams. This is bidirectional admission, not directional
 permission-group policy or application-resource authorization.
 
-The implementation separates network configuration/lifetime (`config.rs`),
-adapter preparation (`config/transport.rs`), public routing state (`router.rs`),
-adapter I/O (`router/adapters.rs`), path learning/forwarding (`router/routing.rs`),
-and bounded codecs (`wire.rs`). Wire-only helpers are private; native OS handles
-are visible only within `ipc`. Native adapters and tunnels have their own modules.
-Targets follow
+The shared registration and worker machinery lives in `groupnet-transport/src/link`.
+The router separates network configuration/lifetime (`config.rs`), public routing
+state (`router.rs`), scheduling (`router/adapters.rs`), path learning/forwarding
+(`router/routing.rs`), and bounded codecs (`wire.rs`). Protocol configuration,
+binding, and native OS workers live in their respective implementation crates.
+Adding a protocol does not require modifying routing. Targets follow
 [Cargo's project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html);
 the multi-file tunnel suite is `tests/tunnels/main.rs` with suite-local fixtures.
 

@@ -3,8 +3,8 @@
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::bulk::BulkTransport;
+use groupnet_transport::link::LinkConfig;
 use groupnet_transport_mem::Network;
-use groupnet_transport_router::LinkConfig;
 use tokio::time::timeout;
 
 use super::{

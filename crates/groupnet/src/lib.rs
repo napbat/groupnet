@@ -76,10 +76,21 @@ pub mod transport {
     #[cfg(any(feature = "tcp", feature = "tcp-msg"))]
     pub use groupnet_transport_tcp as tcp;
 
-    /// Multi-transport routing, native IPC/UDP discovery, and encrypted tunnels
-    /// *(feature `router`)*.
+    /// Intrinsic managed-network routing and encrypted streams (enabled by default).
     #[cfg(feature = "router")]
     pub use groupnet_transport_router as router;
+
+    /// Object-safe link registration and owned worker lifecycle (feature `router`).
+    #[cfg(feature = "router")]
+    pub use groupnet_transport::link;
+
+    /// Native local IPC links (feature `ipc`).
+    #[cfg(feature = "ipc")]
+    pub use groupnet_transport_ipc as ipc;
+
+    /// Authenticated UDP discovery, punching, and relay links (feature `punch`).
+    #[cfg(feature = "punch")]
+    pub use groupnet_transport_punch as punch;
 }
 
 /// Async runtime: the group-per-task [`Node`](runtime::Node) /

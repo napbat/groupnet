@@ -21,11 +21,11 @@ groupnet-transport-router = { workspace = true, optional = true }
 # deployment with its own `SeedResolver` keeps the runtime socket-free.
 dns = ["tokio/net"]
 # Initialize and own heterogeneous connections through Node::network.
-router = ["dep:groupnet-transport-router", "groupnet-transport/bulk"]
+router = ["dep:groupnet-transport-router", "groupnet-transport/bulk", "groupnet-transport/link"]
 
 # Concrete transports are pulled in only to exercise the tests.
 [dev-dependencies]
-groupnet-transport-mem = { workspace = true }
+groupnet-transport-mem = { workspace = true, features = ["link"] }
 groupnet-transport-udp = { workspace = true }
 # The named-seed resolver's unit tests drive its schedule on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }

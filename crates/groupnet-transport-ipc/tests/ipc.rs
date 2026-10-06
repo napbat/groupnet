@@ -4,8 +4,11 @@ use std::io;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
-use groupnet_transport_router::ipc::{IpcAddress, IpcTransport, MAX_FRAME};
+use groupnet_transport::link::{LinkLifecycle, LinkProvider, PeerEndpoint};
+use groupnet_transport_ipc::{IpcAddress, IpcLink, IpcTransport, MAX_FRAME};
+use groupnet_transport_router::{Router, RouterConfig};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -389,5 +392,136 @@ async fn windows_last_handle_drop_releases_the_reserved_pipe_name() {
     })
     .await
     .unwrap();
+    replacement.close().await;
+}
+
+#[tokio::test]
+async fn provider_routes_bounded_frames_and_router_drains_listener() {
+    let left_address = Address::new();
+    let right_address = Address::new();
+    let left = Router::new(NodeId::new("left"), RouterConfig::default()).unwrap();
+    let right = Router::new(NodeId::new("right"), RouterConfig::default()).unwrap();
+    let left_provider = IpcLink::new(
+        left_address.ipc.clone(),
+        vec![PeerEndpoint::new(
+            right.local_id().clone(),
+            right_address.ipc.clone(),
+        )],
+    )
+    .with_cost(7);
+    let right_provider = IpcLink::new(
+        right_address.ipc.clone(),
+        vec![PeerEndpoint::new(
+            left.local_id().clone(),
+            left_address.ipc.clone(),
+        )],
+    );
+    left.add_link(
+        Box::new(left_provider)
+            .bind(left.local_id().clone())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    right
+        .add_link(
+            Box::new(right_provider)
+                .bind(right.local_id().clone())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    eventually_within("IPC provider routes established", DEADLINE, || {
+        left.route_to(right.local_id()).is_some() && right.route_to(left.local_id()).is_some()
+    })
+    .await;
+    assert_eq!(left.route_to(right.local_id()).unwrap().cost, 7);
+    assert_eq!(
+        left.send(right.local_id(), &vec![0x5a; MAX_FRAME + 1])
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    let payload = vec![0x5a; 60_000];
+    left.send(right.local_id(), &payload).await.unwrap();
+    let received = timeout(DEADLINE, right.recv()).await.unwrap().unwrap();
+    assert_eq!(received.from, *left.local_id());
+    assert_eq!(received.msg, payload);
+    left.close().await;
+    right.close().await;
+    let replacement = IpcTransport::bind(NodeId::new("replacement"), &left_address.ipc).unwrap();
+    replacement.close().await;
+    let replacement = IpcTransport::bind(NodeId::new("replacement"), &right_address.ipc).unwrap();
+    replacement.close().await;
+}
+
+#[tokio::test]
+async fn provider_peer_registration_failure_drains_bound_listener() {
+    let address = Address::new();
+    let local = NodeId::new("local");
+    let provider = IpcLink::new(
+        address.ipc.clone(),
+        vec![PeerEndpoint::new(local.clone(), address.ipc.clone())],
+    );
+    assert_eq!(
+        Box::new(provider).bind(local).await.unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let replacement = IpcTransport::bind(NodeId::new("replacement"), &address.ipc).unwrap();
+    replacement.close().await;
+}
+
+#[tokio::test]
+async fn rejected_router_registration_closes_provider_listener_before_returning() {
+    let address = Address::new();
+    let router = Router::new(NodeId::new("local"), RouterConfig::default()).unwrap();
+    router.close().await;
+    let bound = Box::new(IpcLink::new(address.ipc.clone(), Vec::new()))
+        .bind(router.local_id().clone())
+        .await
+        .unwrap();
+    assert!(router.add_link(bound).await.is_err());
+    let replacement = IpcTransport::bind(NodeId::new("replacement"), &address.ipc).unwrap();
+    replacement.close().await;
+}
+
+#[tokio::test]
+async fn bound_provider_drop_releases_native_listener() {
+    let address = Address::new();
+    let bound = Box::new(IpcLink::new(address.ipc.clone(), Vec::new()))
+        .bind(NodeId::new("local"))
+        .await
+        .unwrap();
+    drop(bound);
+    timeout(DEADLINE, async {
+        loop {
+            if let Ok(replacement) = IpcTransport::bind(NodeId::new("replacement"), &address.ipc) {
+                replacement.close().await;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_shutdown_synchronously_cancels_all_handles_then_close_drains() {
+    let address = Address::new();
+    let transport = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap();
+    let clone = transport.clone();
+    LinkLifecycle::shutdown(&transport);
+    assert_eq!(
+        clone.recv().await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    timeout(DEADLINE, LinkLifecycle::close(&transport))
+        .await
+        .unwrap();
+    let replacement = IpcTransport::bind(NodeId::new("replacement"), &address.ipc).unwrap();
     replacement.close().await;
 }

@@ -7,9 +7,12 @@ use std::time::Duration;
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
-use groupnet_transport_router::punch::{
-    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous,
+use groupnet_transport::link::{LinkLifecycle, LinkProvider};
+use groupnet_transport_punch::{
+    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchLink, PunchTransport,
+    Rendezvous,
 };
+use groupnet_transport_router::{Router, RouterConfig};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -258,4 +261,170 @@ async fn configuration_limits_and_secret_debug_are_explicit() {
             .await
             .is_err()
     );
+}
+
+async fn unused_address() -> SocketAddr {
+    let socket = UdpSocket::bind(loopback()).await.unwrap();
+    socket.local_addr().unwrap()
+}
+
+#[tokio::test]
+async fn provider_binds_identity_cost_and_native_mtu_and_router_closes_socket() {
+    let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
+        .await
+        .unwrap();
+    let a = Router::new("a".into(), RouterConfig::default()).unwrap();
+    let b = Router::new("b".into(), RouterConfig::default()).unwrap();
+    let a_address = unused_address().await;
+    let b_address = unused_address().await;
+    for (router, peer, bind, cost) in [
+        (&a, b.local_id(), a_address, 7),
+        (&b, a.local_id(), b_address, 1),
+    ] {
+        let mut config = PunchConfig::new(
+            router.local_id().clone(),
+            relay.local_addr().unwrap(),
+            key(),
+            vec![peer.clone()],
+        );
+        config.bind = bind;
+        config.policy = PathPolicy::RelayOnly;
+        let provider = PunchLink::new(config).with_cost(cost);
+        router
+            .add_link(
+                Box::new(provider)
+                    .bind(router.local_id().clone())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    eventually_within("native provider relay routes", SETTLE, || {
+        a.route_to(b.local_id()).is_some() && b.route_to(a.local_id()).is_some()
+    })
+    .await;
+    assert_eq!(a.route_to(b.local_id()).unwrap().cost, 7);
+    let payload = vec![0x6d; MAX_MESSAGE * 3 + 1];
+    a.send(b.local_id(), &payload).await.unwrap();
+    let received = timeout(SETTLE, b.recv()).await.unwrap().unwrap();
+    assert_eq!(received.from, *a.local_id());
+    assert_eq!(received.msg, payload);
+    a.close().await;
+    b.close().await;
+    let rebound = UdpSocket::bind(a_address).await.unwrap();
+    drop(rebound);
+    let rebound = UdpSocket::bind(b_address).await.unwrap();
+    drop(rebound);
+    relay.close().await;
+}
+
+#[tokio::test]
+async fn provider_rejects_a_different_local_identity_before_binding() {
+    let bind = unused_address().await;
+    let mut config = PunchConfig::new(
+        "configured".into(),
+        SocketAddr::from(([127, 0, 0, 1], 12345)),
+        key(),
+        vec!["peer".into()],
+    );
+    config.bind = bind;
+    assert_eq!(
+        Box::new(PunchLink::new(config))
+            .bind("different".into())
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let rebound = UdpSocket::bind(bind).await.unwrap();
+    drop(rebound);
+}
+
+#[tokio::test]
+async fn failed_router_registration_drains_provider_endpoint() {
+    let bind = unused_address().await;
+    let router = Router::new("local".into(), RouterConfig::default()).unwrap();
+    let mut config = PunchConfig::new(
+        router.local_id().clone(),
+        SocketAddr::from(([127, 0, 0, 1], 12345)),
+        key(),
+        vec!["peer".into()],
+    );
+    config.bind = bind;
+    let bound = Box::new(PunchLink::new(config).with_cost(0))
+        .bind(router.local_id().clone())
+        .await
+        .unwrap();
+    assert!(router.add_link(bound).await.is_err());
+    let rebound = UdpSocket::bind(bind).await.unwrap();
+    drop(rebound);
+    router.close().await;
+}
+
+#[tokio::test]
+async fn bound_provider_drop_cancels_socket_owner() {
+    let bind = unused_address().await;
+    let mut config = PunchConfig::new(
+        "local".into(),
+        SocketAddr::from(([127, 0, 0, 1], 12345)),
+        key(),
+        Vec::new(),
+    );
+    config.bind = bind;
+    let bound = Box::new(PunchLink::new(config))
+        .bind("local".into())
+        .await
+        .unwrap();
+    drop(bound);
+    timeout(SETTLE, async {
+        loop {
+            if let Ok(socket) = UdpSocket::bind(bind).await {
+                drop(socket);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_shutdown_is_synchronous_and_close_drains_owned_socket() {
+    let (relay, a, b) = pair(PathPolicy::RelayOnly).await;
+    let bind = a.local_addr().unwrap();
+    let clone = a.clone();
+    LinkLifecycle::shutdown(&a);
+    assert_eq!(
+        clone.recv().await.unwrap_err().kind(),
+        io::ErrorKind::NotConnected
+    );
+    timeout(SETTLE, LinkLifecycle::close(&a)).await.unwrap();
+    let rebound = UdpSocket::bind(bind).await.unwrap();
+    drop(rebound);
+    b.close().await;
+    relay.close().await;
+}
+
+#[tokio::test]
+async fn cancelled_close_preserves_the_task_for_a_later_drain() {
+    let mut config = PunchConfig::new(
+        "local".into(),
+        SocketAddr::from(([127, 0, 0, 1], 12345)),
+        key(),
+        Vec::new(),
+    );
+    config.bind = loopback();
+    let transport = PunchTransport::bind(config).await.unwrap();
+    let bind = transport.local_addr().unwrap();
+    // On this current-thread runtime the newly spawned endpoint has not been
+    // polled yet. Poll close once to initiate cancellation without yielding to it.
+    let mut closing = Box::pin(transport.close());
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(closing.as_mut().poll(cx))).await;
+    assert!(first.is_pending());
+    drop(closing);
+    timeout(SETTLE, transport.close()).await.unwrap();
+    let rebound = UdpSocket::bind(bind).await.unwrap();
+    drop(rebound);
 }

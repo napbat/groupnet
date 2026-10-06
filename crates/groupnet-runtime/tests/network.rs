@@ -5,8 +5,8 @@ use groupnet_core::NodeId;
 use groupnet_runtime::Node;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
-use groupnet_transport_mem::Network;
-use groupnet_transport_router::{LinkConfig, NetworkConfig, RouterConfig, TransportConfig};
+use groupnet_transport_mem::{MemLink, Network};
+use groupnet_transport_router::{NetworkConfig, RouterConfig};
 use std::io;
 use std::time::Duration;
 
@@ -24,23 +24,11 @@ async fn initialized_nodes_route_membership_and_entries_across_a_bridge() -> io:
             ..RouterConfig::default()
         })
     };
-    let a_config = configure().with_transport(TransportConfig::custom(
-        left.endpoint(a.clone()),
-        LinkConfig::new(vec![b.clone()]),
-    ));
+    let a_config = configure().with_link(MemLink::new(left.endpoint(a.clone()), vec![b.clone()]));
     let b_config = configure()
-        .with_transport(TransportConfig::custom(
-            left.endpoint(b.clone()),
-            LinkConfig::new(vec![a.clone()]),
-        ))
-        .with_transport(TransportConfig::custom(
-            right.endpoint(b.clone()),
-            LinkConfig::new(vec![c.clone()]),
-        ));
-    let c_config = configure().with_transport(TransportConfig::custom(
-        right.endpoint(c.clone()),
-        LinkConfig::new(vec![b.clone()]),
-    ));
+        .with_link(MemLink::new(left.endpoint(b.clone()), vec![a.clone()]))
+        .with_link(MemLink::new(right.endpoint(b.clone()), vec![c.clone()]));
+    let c_config = configure().with_link(MemLink::new(right.endpoint(c.clone()), vec![b.clone()]));
     let node_a = Node::network_with(a.clone(), a_config, |builder| {
         builder.gossip_interval_ms(30)
     })

@@ -5,6 +5,9 @@
 //!
 //! UDP is the natural fit for the best-effort, message-oriented contract: one
 //! frame per datagram, loss and reorder tolerated, no connection state.
+//! The opt-in `link` feature exposes `UdpLink` for router registration with
+//! explicit peer identities and addresses. It owns its bound socket without
+//! independently spawned tasks; dropping the link's workers releases it.
 //!
 //! ## Scaffold simplifications
 //!
@@ -27,3 +30,8 @@
 mod udp;
 
 pub use udp::UdpTransport;
+
+#[cfg(feature = "link")]
+mod link;
+#[cfg(feature = "link")]
+pub use link::UdpLink;

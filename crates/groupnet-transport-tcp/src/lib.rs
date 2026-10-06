@@ -12,6 +12,9 @@
 //! * **`bulk` — data plane.** `TcpBulkTransport` implements `BulkTransport`:
 //!   one reliable, ordered byte stream per `connect`, for replication and
 //!   bulk transfer.
+//! * **`link` — router registration** (opt-in): `TcpLink` binds a
+//!   control-plane endpoint with explicit peer identities and addresses. Its
+//!   lifecycle cancels and drains every accept, read, and write task.
 //!
 //! Both planes attribute connections with the same one-line node-id
 //! handshake, because a TCP source address (ephemeral port) cannot identify
@@ -31,3 +34,10 @@ pub use bulk::TcpBulkTransport;
 pub mod msg;
 #[cfg(feature = "msg")]
 pub use msg::{TcpMsgConfig, TcpMsgTransport};
+
+#[cfg(feature = "link")]
+mod link;
+#[cfg(feature = "msg")]
+mod tasks;
+#[cfg(feature = "link")]
+pub use link::TcpLink;

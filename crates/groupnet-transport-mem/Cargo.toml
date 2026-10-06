@@ -13,6 +13,8 @@ repository.workspace = true
 # pipe (`io-util`), and the futures-io compat shim — all inert by default, so
 # the control-plane-only build stays on tokio's `sync` slice alone.
 bulk = ["groupnet-transport/bulk", "tokio/io-util", "dep:tokio-util"]
+# Opt-in managed link registration and executor-driven link workers.
+link = ["groupnet-transport/link"]
 
 # A concrete Transport binding depends only on the trait and the id type — never
 # on the runtime. It pulls just tokio's channel/sync slice.

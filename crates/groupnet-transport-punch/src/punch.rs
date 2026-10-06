@@ -1,6 +1,6 @@
 //! Native authenticated UDP rendezvous, simultaneous punching and relay fallback.
 //!
-//! Provision one [`NetworkKey`](crate::punch::NetworkKey) and an explicit allowlist to every participant.
+//! Provision one [`NetworkKey`](crate::NetworkKey) and an explicit allowlist to every participant.
 //! The shared key authenticates membership in a trusted routing fabric, **not**
 //! Byzantine endpoint identity. Use the router's authenticated tunnels when that
 //! distinction matters. A rendezvous observes identities, addresses and traffic
@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_transport::link::{LinkFuture, LinkLifecycle};
 use groupnet_transport::{Inbound, Transport};
 use ring::{
     hmac,
@@ -275,9 +276,10 @@ impl PunchTransport {
     pub async fn close(&self) {
         self.inner.cancel.cancel();
         let mut task = self.inner.task.lock().await;
-        if let Some(task) = task.take() {
-            let _ = task.await;
+        if let Some(running) = task.as_mut() {
+            let _ = running.await;
         }
+        task.take();
     }
 
     fn ensure_open(&self) -> io::Result<()> {
@@ -303,6 +305,16 @@ impl PunchTransport {
             });
         }
         Ok(())
+    }
+}
+
+impl LinkLifecycle for PunchTransport {
+    fn shutdown(&self) {
+        self.inner.cancel.cancel();
+    }
+
+    fn close(&self) -> LinkFuture<'_, ()> {
+        Box::pin(Self::close(self))
     }
 }
 

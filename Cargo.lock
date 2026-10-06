@@ -311,7 +311,9 @@ dependencies = [
  "groupnet-sim",
  "groupnet-testkit",
  "groupnet-transport",
+ "groupnet-transport-ipc",
  "groupnet-transport-mem",
+ "groupnet-transport-punch",
  "groupnet-transport-router",
  "groupnet-transport-tcp",
  "groupnet-transport-udp",
@@ -392,7 +394,22 @@ dependencies = [
  "futures",
  "futures-util",
  "groupnet-core",
+ "tokio",
+ "tokio-util",
  "zerocopy",
+]
+
+[[package]]
+name = "groupnet-transport-ipc"
+version = "0.1.0"
+dependencies = [
+ "groupnet-core",
+ "groupnet-testkit",
+ "groupnet-transport",
+ "groupnet-transport-router",
+ "ring",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -407,6 +424,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "groupnet-transport-punch"
+version = "0.1.0"
+dependencies = [
+ "groupnet-core",
+ "groupnet-testkit",
+ "groupnet-transport",
+ "groupnet-transport-router",
+ "ring",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "groupnet-transport-router"
 version = "0.1.0"
 dependencies = [
@@ -414,9 +444,10 @@ dependencies = [
  "groupnet-core",
  "groupnet-testkit",
  "groupnet-transport",
+ "groupnet-transport-ipc",
  "groupnet-transport-mem",
+ "groupnet-transport-punch",
  "groupnet-transport-tcp",
- "groupnet-transport-udp",
  "rcgen",
  "ring",
  "rustls",

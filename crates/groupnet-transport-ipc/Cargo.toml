@@ -1,0 +1,23 @@
+[package]
+name = "groupnet-transport-ipc"
+description = "Persistent native local IPC and router link providers for Groupnet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+groupnet-core.workspace = true
+groupnet-transport = { workspace = true, features = ["link"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+groupnet-transport-router.workspace = true
+ring.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
+
+[lints]
+workspace = true

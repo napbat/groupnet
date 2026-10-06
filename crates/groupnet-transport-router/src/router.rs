@@ -3,7 +3,6 @@
 mod adapters;
 mod routing;
 
-use adapters::{receive_adapter, send_adapter};
 use routing::drive;
 
 use std::collections::HashMap;
@@ -16,6 +15,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use groupnet_core::NodeId;
+use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
@@ -51,29 +51,6 @@ impl Default for RouterConfig {
             max_transports: 16,
             route_ttl: Duration::from_secs(6),
             announce_interval: Duration::from_secs(1),
-        }
-    }
-}
-
-/// Link-level trust, routing cost, and maximum adapter message size.
-#[derive(Clone, Debug)]
-pub struct LinkConfig {
-    /// Admitted adjacent peers; received packets from anyone else are discarded.
-    pub peers: Vec<NodeId>,
-    /// Positive cost of traversing this link. Lower aggregate cost is preferred.
-    pub cost: u32,
-    /// Maximum message accepted by the adapter; larger router frames are fragmented.
-    pub mtu: usize,
-}
-
-impl LinkConfig {
-    /// Creates an equal-cost link with the largest supported message size.
-    #[must_use]
-    pub fn new(peers: Vec<NodeId>) -> Self {
-        Self {
-            peers,
-            cost: 1,
-            mtu: wire::MAX_FRAME,
         }
     }
 }
@@ -249,10 +226,30 @@ impl Router {
         transport: T,
         config: LinkConfig,
     ) -> io::Result<TransportId> {
-        let shared = &self.inner.shared;
-        if shared.cancel.is_cancelled() {
-            return Err(closed());
+        self.attach_link(BoundLink::new(transport, config))
+            .map_err(|(error, _link)| error)
+    }
+
+    /// Registers a bound provider endpoint and owns its complete worker lifecycle.
+    /// Failed registration drains the endpoint before returning.
+    ///
+    /// # Errors
+    /// Rejects invalid admission/cost/MTU, exhausted capacity, or a closed router.
+    /// # Panics
+    /// Requires a Tokio runtime; propagates a poisoned routing-state lock.
+    pub async fn add_link(&self, link: BoundLink) -> io::Result<TransportId> {
+        match self.attach_link(link) {
+            Ok(id) => Ok(id),
+            Err((error, link)) => {
+                link.driver.close().await;
+                Err(error)
+            }
         }
+    }
+
+    fn attach_link(&self, link: BoundLink) -> Result<TransportId, (io::Error, BoundLink)> {
+        let shared = &self.inner.shared;
+        let config = &link.config;
         if config.cost == 0
             || config.peers.len() > shared.config.max_routes
             || config
@@ -261,46 +258,42 @@ impl Router {
                 .any(|peer| !wire::id_valid(peer) || peer == &shared.local)
             || !(128..=wire::MAX_FRAME).contains(&config.mtu)
         {
-            return Err(wire::invalid("invalid link configuration"));
+            return Err((wire::invalid("invalid link configuration"), link));
         }
+        let mut table = shared.table.lock().expect("router table poisoned");
+        if shared.cancel.is_cancelled() {
+            return Err((closed(), link));
+        }
+        if table.links.len() >= shared.config.max_transports {
+            return Err((io::Error::other("transport capacity reached"), link));
+        }
+        let Some(next) = table.next_link.checked_add(1) else {
+            return Err((io::Error::other("transport identifier exhausted"), link));
+        };
+        let id = TransportId(table.next_link);
+        table.next_link = next;
         let (send, outgoing) = mpsc::channel(64);
         let cancel = shared.cancel.child_token();
-        let mtu = config.mtu;
-        let peers = config.peers.clone();
-        let mut table = shared.table.lock().expect("router table poisoned");
-        if table.links.len() >= shared.config.max_transports {
-            return Err(io::Error::other("transport capacity reached"));
-        }
-        let id = TransportId(table.next_link);
-        table.next_link = table
-            .next_link
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("transport identifier exhausted"))?;
+        let BoundLink { config, driver } = link;
+        let io = adapters::io(
+            shared.clone(),
+            id,
+            config.peers.clone(),
+            config.mtu,
+            outgoing,
+            cancel.clone(),
+        );
         table.links.insert(
             id,
             Link {
                 config,
                 outgoing: send,
-                cancel: cancel.clone(),
+                cancel,
             },
         );
+        // Register the task under the same lock used by close's shutdown barrier.
+        shared.tasks.spawn(driver.run(io));
         drop(table);
-        let transport = Arc::new(transport);
-        shared.tasks.spawn(receive_adapter(
-            transport.clone(),
-            id,
-            mtu,
-            shared.events.clone(),
-            cancel.clone(),
-        ));
-        shared.tasks.spawn(send_adapter(
-            transport,
-            outgoing,
-            mtu,
-            peers,
-            shared.clone(),
-            cancel,
-        ));
         let _ = shared.events.try_send(Event::Announce);
         Ok(id)
     }
@@ -347,8 +340,19 @@ impl Router {
 
     /// Cancels the routing actor/adapters and waits for owned tasks to terminate.
     /// All clones share this shutdown. Pending receivers wake with an error.
+    ///
+    /// # Panics
+    /// Propagates a poisoned routing-state lock.
     pub async fn close(&self) {
         self.inner.shared.cancel.cancel();
+        // A concurrent registration must finish spawning its owned worker first.
+        drop(
+            self.inner
+                .shared
+                .table
+                .lock()
+                .expect("router table poisoned"),
+        );
         self.inner.shared.tasks.close();
         self.inner.shared.tasks.wait().await;
     }

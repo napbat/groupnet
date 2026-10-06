@@ -149,6 +149,11 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 - Keep public configuration and lifecycle APIs separate from adapter workers,
   routing state transitions, and wire codecs. Split by responsibility rather
   than adding wrappers or weakening lints to accommodate oversized functions.
+- Routing is intrinsic to managed networks, not a selectable link implementation.
+  Keep `LinkProvider`/`BoundLink`/`LinkLifecycle` in `groupnet-transport::link`.
+  Protocol crates own their typed configuration and binding and must not depend on
+  the concrete router in production. Never add protocol-kind or shutdown enums to
+  the router; all links register through the shared contract.
 - Workspace lints also enforce `unsafe_code = "forbid"`, `missing_docs`,
   `missing_debug_implementations` — document every public item.
 - Bounded polling via `groupnet_testkit::cluster::eventually` /
@@ -168,6 +173,8 @@ cargo test -p groupnet-runtime --features dns
 cargo clippy -p groupnet-runtime -p groupnet --all-targets --features groupnet-runtime/dns,groupnet/dns,groupnet/udp -- -D warnings
 cargo test -p groupnet-transport-router -p groupnet-runtime --features groupnet-runtime/router
 cargo clippy -p groupnet-transport-router -p groupnet-runtime -p groupnet --all-targets --features groupnet/router,groupnet-runtime/router -- -D warnings
+cargo test --workspace --features groupnet/ipc,groupnet/punch,groupnet/udp,groupnet/tcp-msg
+cargo clippy --workspace --all-targets --features groupnet/ipc,groupnet/punch,groupnet/udp,groupnet/tcp-msg -- -D warnings
 cargo test -p groupnet-consistency --features acks
 cargo test -p groupnet-consistency --features leases
 cargo test -p groupnet-consistency --features hosted

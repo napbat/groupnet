@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use groupnet_core::NodeId;
+use groupnet_transport::link::{LinkFuture, LinkLifecycle};
 use groupnet_transport::{Inbound, Transport};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -242,6 +243,16 @@ impl IpcTransport {
             slot,
         });
         Ok(())
+    }
+}
+
+impl LinkLifecycle for IpcTransport {
+    fn shutdown(&self) {
+        self.handle.state.cancel.cancel();
+    }
+
+    fn close(&self) -> LinkFuture<'_, ()> {
+        Box::pin(Self::close(self))
     }
 }
 

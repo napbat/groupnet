@@ -1,20 +1,13 @@
 //! Typed adapter configuration and a node-owned network lifecycle.
 
-mod transport;
-
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 
-use groupnet_core::NodeId;
-use groupnet_transport::bulk::BulkTransport;
-
-use crate::ipc::IpcTransport;
-use crate::punch::PunchTransport;
 use crate::tunnel::{PeerIdentity, TlsIdentity, TunnelTransport, TunneledStream};
 use crate::{Router, RouterConfig};
-
-pub use transport::{PeerEndpoint, TransportConfig};
+use groupnet_core::NodeId;
+use groupnet_transport::{bulk::BulkTransport, link::LinkProvider};
 
 /// End-to-end encrypted streams with explicit, bidirectional peer admission.
 /// Certificate pins authenticate peers and allow tunnels; they do not grant
@@ -36,16 +29,16 @@ impl TunnelConfig {
     }
 }
 
-/// Typed connection configuration for a Groupnet node.
+/// A managed group network: intrinsic routing over a collection of link providers.
 ///
-/// All adapters use [`with_transport`](Self::with_transport), in insertion order.
-/// TCP/UDP require a trusted private network. Use [`TransportConfig::punch`] for
-/// Internet links and [`with_tunnels`](Self::with_tunnels) for confidential streams.
-/// Fabric admission does not authorize application resources.
+/// [`with_link`](Self::with_link) and [`with_links`](Self::with_links) register any
+/// implementation through the same contract, in insertion order. Protocol crates
+/// own their configuration and binding. Configure [`with_tunnels`](Self::with_tunnels)
+/// for confidential streams; link admission never authorizes application resources.
 #[derive(Debug, Default)]
 pub struct NetworkConfig {
     router: RouterConfig,
-    transports: Vec<TransportConfig>,
+    links: Vec<Box<dyn LinkProvider>>,
     tunnels: Option<TunnelConfig>,
 }
 
@@ -57,10 +50,20 @@ impl NetworkConfig {
         self
     }
 
-    /// Adds a built-in or custom adapter, subject to the router's transport limit.
+    /// Adds a configured link implementation, subject to routing capacity limits.
     #[must_use]
-    pub fn with_transport(mut self, config: TransportConfig) -> Self {
-        self.transports.push(config);
+    pub fn with_link(mut self, provider: impl LinkProvider) -> Self {
+        self.links.push(Box::new(provider));
+        self
+    }
+
+    /// Adds heterogeneous link implementations in iteration order.
+    #[must_use]
+    pub fn with_links(
+        mut self,
+        providers: impl IntoIterator<Item = Box<dyn LinkProvider>>,
+    ) -> Self {
+        self.links.extend(providers);
         self
     }
 
@@ -75,8 +78,8 @@ impl NetworkConfig {
     #[must_use]
     pub fn peers(&self) -> Vec<NodeId> {
         let mut peers = BTreeSet::new();
-        for transport in &self.transports {
-            transport.extend_peers(&mut peers);
+        for link in &self.links {
+            peers.extend(link.peers().iter().cloned());
         }
         peers.into_iter().collect()
     }
@@ -91,13 +94,11 @@ impl NetworkConfig {
         let mut network = NetworkInner {
             router: Router::new(local.clone(), self.router)?,
             tunnels: None,
-            owned: Vec::new(),
         };
         let started = async {
-            for transport in self.transports {
-                transport
-                    .bind(&local, &network.router, &mut network.owned)
-                    .await?;
+            for provider in self.links {
+                let link = provider.bind(local.clone()).await?;
+                network.router.add_link(link).await?;
             }
             network.tunnels = self
                 .tunnels
@@ -119,35 +120,15 @@ impl NetworkConfig {
 }
 
 #[derive(Debug)]
-enum OwnedAdapter {
-    Ipc(IpcTransport),
-    Punch(PunchTransport),
-}
-
-impl OwnedAdapter {
-    async fn close(&self) {
-        match self {
-            Self::Ipc(adapter) => adapter.close().await,
-            Self::Punch(adapter) => adapter.close().await,
-        }
-    }
-}
-
-#[derive(Debug)]
 struct NetworkInner {
     router: Router,
     tunnels: Option<TunnelTransport>,
-    owned: Vec<OwnedAdapter>,
 }
 
 impl NetworkInner {
     async fn close(&self) {
         if let Some(tunnels) = &self.tunnels {
             tunnels.close().await;
-        }
-        self.router.shutdown();
-        for adapter in &self.owned {
-            adapter.close().await;
         }
         self.router.close().await;
     }
@@ -161,7 +142,7 @@ impl Drop for NetworkInner {
 
 /// Shared network lifetime, also usable directly as a secure [`BulkTransport`].
 /// Dropping the final clone initiates shutdown; [`close`](Self::close) drains tasks.
-/// Custom adapters' independently retained handles remain caller-owned.
+/// Owned link workers drain each provider's lifecycle through the shared contract.
 #[derive(Clone, Debug)]
 pub struct Network {
     inner: Arc<NetworkInner>,

@@ -1,6 +1,6 @@
 [package]
 name = "groupnet-transport-router"
-description = "Multi-transport routing, native discovery and encrypted tunnels for Groupnet."
+description = "Protocol-independent group-network routing and end-to-end encrypted streams."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,12 +9,10 @@ repository.workspace = true
 
 [dependencies]
 groupnet-core.workspace = true
-groupnet-transport = { workspace = true, features = ["bulk"] }
-groupnet-transport-udp.workspace = true
-groupnet-transport-tcp = { workspace = true, features = ["msg"] }
+groupnet-transport = { workspace = true, features = ["bulk", "link"] }
 tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time", "macros"] }
 tokio-util = { workspace = true, features = ["compat", "rt"] }
-futures-util = { workspace = true, features = ["io"] }
+futures-util = { workspace = true, features = ["io", "sink", "async-await"] }
 ring.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
@@ -22,6 +20,9 @@ tokio-rustls.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 groupnet-transport-mem.workspace = true
+groupnet-transport-tcp = { workspace = true, features = ["msg", "link"] }
+groupnet-transport-ipc.workspace = true
+groupnet-transport-punch.workspace = true
 rcgen.workspace = true
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
 

@@ -41,5 +41,9 @@ pub use transport::{Inbound, Transport};
 #[cfg(feature = "bulk")]
 pub mod bulk;
 
+/// Protocol-neutral link registration, workers, and lifecycle (feature `link`).
+#[cfg(feature = "link")]
+pub mod link;
+
 #[cfg(doc)]
 use groupnet_core::NodeId;

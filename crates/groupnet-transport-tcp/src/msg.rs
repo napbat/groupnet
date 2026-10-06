@@ -57,6 +57,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::handshake::{read_id, read_str, write_id, write_str};
+use crate::tasks::Tasks;
 
 /// Hard upper bound on a single frame. Engine frames are soft-capped far
 /// below this (`Config::max_delta_frame_bytes`); the guard only stops a
@@ -163,6 +164,13 @@ struct Inner {
     peers: RwLock<HashMap<NodeId, SocketAddr>>,
     pool: Mutex<Pool>,
     inbox: AsyncMutex<mpsc::Receiver<Inbound>>,
+    tasks: Arc<Tasks>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.tasks.shutdown();
+    }
 }
 
 /// A persistent-connection TCP endpoint for the control plane.
@@ -170,6 +178,8 @@ struct Inner {
 /// Cheap to [`Clone`]: clones share the listener, the address book, and the
 /// connection pool, so a [`register_peer`](Self::register_peer) through any
 /// handle is visible to all.
+/// Dropping the last handle cancels every owned task. Call [`close`](Self::close)
+/// when the listener and session sockets must be fully released before continuing.
 #[derive(Clone, Debug)]
 pub struct TcpMsgTransport {
     inner: Arc<Inner>,
@@ -215,8 +225,9 @@ impl TcpMsgTransport {
             peers: RwLock::new(HashMap::new()),
             pool: Mutex::new(Pool::default()),
             inbox: AsyncMutex::new(inbound_rx),
+            tasks: Arc::new(Tasks::default()),
         });
-        tokio::spawn(accept_loop(
+        inner.tasks.spawn(accept_loop(
             listener,
             inbound_tx,
             read_idle,
@@ -235,6 +246,33 @@ impl TcpMsgTransport {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
+    }
+
+    /// Initiates cancellation of the listener and every inbound/outbound session.
+    /// All clones share this shutdown state; no new tasks can be started afterward.
+    ///
+    /// # Panics
+    /// If the task registry or connection pool was poisoned.
+    pub fn shutdown(&self) {
+        self.inner.tasks.shutdown();
+        let mut pool = self.inner.pool.lock().expect("pool lock poisoned");
+        pool.conns.clear();
+        pool.order.clear();
+    }
+
+    /// Cancels and drains every owned task, releasing listener/session sockets.
+    /// Safe to call repeatedly or concurrently through different clones.
+    ///
+    /// # Panics
+    /// If the task registry or connection pool was poisoned.
+    pub async fn close(&self) {
+        self.shutdown();
+        self.inner.tasks.close().await;
+    }
+
+    #[cfg(feature = "link")]
+    pub(crate) fn lifecycle(&self) -> Arc<dyn groupnet_transport::link::LinkLifecycle> {
+        self.inner.tasks.clone()
     }
 
     /// Teaches this endpoint that `node` listens at `addr`, replacing any
@@ -300,6 +338,12 @@ impl Transport for TcpMsgTransport {
         msg: &[u8],
     ) -> impl std::future::Future<Output = io::Result<()>> + Send {
         let result: io::Result<()> = (|| {
+            if self.inner.tasks.stopped() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "tcp msg transport shut down",
+                ));
+            }
             if msg.len() > MAX_FRAME {
                 return Ok(()); // oversized frame = drop, never poison the link
             }
@@ -374,7 +418,7 @@ impl Transport for TcpMsgTransport {
             // Concurrent sends to the same peer can race past the fast path; the
             // loser's insert replaces the winner's entry and the winner's task
             // exits once its now-unreferenced queue drains. Rare and harmless.
-            tokio::spawn(write_loop(Outbound {
+            if !self.inner.tasks.spawn(write_loop(Outbound {
                 inner: Arc::downgrade(&self.inner),
                 peer: to.clone(),
                 generation,
@@ -383,7 +427,13 @@ impl Transport for TcpMsgTransport {
                 idle: self.inner.config.idle_timeout,
                 local: self.inner.local.clone(),
                 intro: self.inner.intro.clone(),
-            }));
+            })) {
+                self.inner
+                    .pool
+                    .lock()
+                    .expect("pool lock poisoned")
+                    .remove_generation(to, generation);
+            }
             Ok(())
         })();
         std::future::ready(result)
@@ -482,7 +532,15 @@ async fn accept_loop(
                     return; // listener failure ends intake; readers drain on their own
                 };
                 let _ = sock.set_nodelay(true);
-                tokio::spawn(read_loop(sock, inbound.clone(), read_idle, inner.clone()));
+                let Some(endpoint) = inner.upgrade() else {
+                    return;
+                };
+                endpoint.tasks.spawn(read_loop(
+                    sock,
+                    inbound.clone(),
+                    read_idle,
+                    inner.clone(),
+                ));
             }
             () = inbound.closed() => return, // transport dropped
         }
@@ -743,5 +801,45 @@ mod tests {
         a.send(&NodeId::new("cap-c"), b"two").await.expect("send");
         assert_eq!(recv_one(&c).await.msg, b"two".to_vec());
         assert_eq!(a.outbound_connections(), 1, "cap held: oldest was closed");
+    }
+
+    #[tokio::test]
+    async fn close_drains_listener_incomplete_handshakes_and_sessions() {
+        use tokio::io::AsyncReadExt;
+
+        let a = bind_as("close-a").await;
+        let b = bind_as("close-b").await;
+        let address = a.local_addr();
+        a.register_peer(NodeId::new("close-b"), b.local_addr());
+        a.send(&NodeId::new("close-b"), b"outbound")
+            .await
+            .expect("send");
+        assert_eq!(recv_one(&b).await.msg, b"outbound");
+        b.send(&NodeId::new("close-a"), b"inbound")
+            .await
+            .expect("send");
+        assert_eq!(recv_one(&a).await.msg, b"inbound");
+
+        // A client that never finishes the introduction must not keep close
+        // waiting for the handshake's idle timeout.
+        let mut stalled = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        tokio::time::timeout(Duration::from_secs(5), a.close())
+            .await
+            .expect("close must drain promptly");
+        assert_eq!(a.outbound_connections(), 0);
+        let _replacement = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("close released listener");
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(5), stalled.read(&mut byte))
+            .await
+            .expect("session socket released");
+        assert!(matches!(read, Ok(0) | Err(_)), "session remained open");
+        assert!(a.send(&NodeId::new("close-b"), b"late").await.is_err());
+        assert!(a.recv().await.is_err());
+        a.close().await;
+        b.close().await;
     }
 }

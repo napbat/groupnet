@@ -4,11 +4,12 @@ use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::bulk::BulkTransport;
-use groupnet_transport_router::punch::{
+use groupnet_transport::link::{BoundLink, LinkConfig};
+use groupnet_transport_punch::{
     MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous,
 };
 use groupnet_transport_router::tunnel::{PeerIdentity, TunnelTransport};
-use groupnet_transport_router::{LinkConfig, Router, RouterConfig};
+use groupnet_transport_router::{Router, RouterConfig};
 use tokio::time::timeout;
 
 use super::{DEADLINE, binary, fixtures::credentials};
@@ -50,24 +51,32 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
         let left_router = Router::new(left.clone(), RouterConfig::default()).unwrap();
         let right_router = Router::new(right.clone(), RouterConfig::default()).unwrap();
         left_router
-            .add_transport(
-                left_udp.clone(),
-                LinkConfig {
-                    peers: vec![right.clone()],
-                    cost: 1,
-                    mtu: MAX_MESSAGE,
-                },
+            .add_link(
+                BoundLink::new(
+                    left_udp.clone(),
+                    LinkConfig {
+                        peers: vec![right.clone()],
+                        cost: 1,
+                        mtu: MAX_MESSAGE,
+                    },
+                )
+                .with_lifecycle(std::sync::Arc::new(left_udp.clone())),
             )
+            .await
             .unwrap();
         right_router
-            .add_transport(
-                right_udp.clone(),
-                LinkConfig {
-                    peers: vec![left.clone()],
-                    cost: 1,
-                    mtu: MAX_MESSAGE,
-                },
+            .add_link(
+                BoundLink::new(
+                    right_udp.clone(),
+                    LinkConfig {
+                        peers: vec![left.clone()],
+                        cost: 1,
+                        mtu: MAX_MESSAGE,
+                    },
+                )
+                .with_lifecycle(std::sync::Arc::new(right_udp.clone())),
             )
+            .await
             .unwrap();
         eventually_within("native routes established", DEADLINE, || {
             left_router.route_to(&right).is_some() && right_router.route_to(&left).is_some()
@@ -86,8 +95,6 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
         server_endpoint.close().await;
         left_router.close().await;
         right_router.close().await;
-        left_udp.close().await;
-        right_udp.close().await;
         relay.close().await;
     }
 }

@@ -215,29 +215,46 @@ impl Reassembly {
     }
 }
 
-pub(crate) fn fragment(
-    bytes: &[u8],
-    mtu: usize,
+pub(crate) struct Fragments {
+    bytes: std::sync::Arc<[u8]>,
+    chunk: usize,
     id: [u8; 16],
-) -> impl Iterator<Item = Vec<u8>> + '_ {
+    index: u16,
+    count: u16,
+}
+
+pub(crate) fn fragment(bytes: std::sync::Arc<[u8]>, mtu: usize, id: [u8; 16]) -> Fragments {
     let chunk = mtu - FRAGMENT;
     let count = u16::try_from(bytes.len().div_ceil(chunk)).expect("bounded frame and MTU");
-    bytes.chunks(chunk).enumerate().map(move |(index, part)| {
+    Fragments {
+        bytes,
+        chunk,
+        id,
+        index: 0,
+        count,
+    }
+}
+
+impl Iterator for Fragments {
+    type Item = Vec<u8>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.count {
+            return None;
+        }
+        let offset = usize::from(self.index) * self.chunk;
+        let part = &self.bytes[offset..(offset + self.chunk).min(self.bytes.len())];
         let mut packet = Vec::with_capacity(FRAGMENT + part.len());
         packet.extend_from_slice(b"GNF1");
-        packet.extend_from_slice(&id);
+        packet.extend_from_slice(&self.id);
+        packet.extend_from_slice(&self.index.to_be_bytes());
+        packet.extend_from_slice(&self.count.to_be_bytes());
         packet.extend_from_slice(
-            &u16::try_from(index)
-                .expect("bounded fragment index")
-                .to_be_bytes(),
-        );
-        packet.extend_from_slice(&count.to_be_bytes());
-        packet.extend_from_slice(
-            &u32::try_from(bytes.len())
+            &u32::try_from(self.bytes.len())
                 .expect("bounded frame")
                 .to_be_bytes(),
         );
         packet.extend_from_slice(part);
-        packet
-    })
+        self.index += 1;
+        Some(packet)
+    }
 }

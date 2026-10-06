@@ -8,11 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# `runtime` (the async Node/Group API + tokio) and `mem` (the in-memory
-# transport) are on by default so the basic example works out of the box. `udp`
-# (real sockets) and `sim` (the deterministic simulator) are opt-in. Depend with
-# `default-features = false` for just the sans-IO core + transport trait.
-default = ["runtime", "mem"]
+# The managed group network includes routing by default. Protocol bindings remain
+# selectable; memory supports the default examples without opening OS sockets.
+# Disable defaults for the dependency-free coordination core and transport trait.
+default = ["runtime", "mem", "router"]
 runtime = ["dep:groupnet-runtime"]
 mem = ["dep:groupnet-transport-mem"]
 udp = ["dep:groupnet-transport-udp"]
@@ -30,7 +29,14 @@ tcp = ["bulk", "dep:groupnet-transport-tcp", "groupnet-transport-tcp/bulk"]
 # deployments keep `udp`; nothing forces a socket per member.
 tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
 # Heterogeneous, multi-hop packet routing and reliable end-to-end TLS tunnels.
-router = ["runtime", "bulk", "dep:groupnet-transport-router", "groupnet-runtime/router"]
+router = [
+    "runtime", "bulk", "dep:groupnet-transport-router", "groupnet-runtime/router",
+    "groupnet-transport-mem?/link", "groupnet-transport-tcp?/link",
+    "groupnet-transport-udp?/link",
+]
+# Native link implementations are independent crates, not router built-ins.
+ipc = ["dep:groupnet-transport-ipc"]
+punch = ["dep:groupnet-transport-punch"]
 # Request/response RPC over the data plane: concurrent calls multiplexed onto
 # one stream per peer, with deadlines, bounded frames and per-connection
 # handler limits. Rides `bulk`, so bring a binding (`tcp`, or your own). The
@@ -94,6 +100,8 @@ groupnet-transport-mem = { workspace = true, optional = true }
 groupnet-transport-udp = { workspace = true, optional = true }
 groupnet-transport-tcp = { workspace = true, optional = true }
 groupnet-transport-router = { workspace = true, optional = true }
+groupnet-transport-ipc = { workspace = true, optional = true }
+groupnet-transport-punch = { workspace = true, optional = true }
 groupnet-runtime = { workspace = true, optional = true }
 groupnet-rpc = { workspace = true, optional = true }
 groupnet-consistency = { workspace = true, optional = true }
