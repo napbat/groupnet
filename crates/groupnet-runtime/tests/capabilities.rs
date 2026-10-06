@@ -30,7 +30,8 @@ async fn an_advertisement_reaches_peers_and_scopes_the_member_set() {
     let cluster = MemCluster::builder(&["cap-a", "cap-b", "cap-c"])
         .gossip_interval_ms(10)
         .anti_entropy_interval_ms(25)
-        .spawn();
+        .spawn()
+        .await;
     let (a_id, c_id) = (cluster.ids[0].clone(), cluster.ids[2].clone());
     let (a, b) = (&cluster.groups[0], &cluster.groups[1]);
     converged_within(&cluster.groups.iter().collect::<Vec<_>>(), SETTLE).await;
@@ -74,7 +75,8 @@ async fn re_advertising_replaces_the_whole_set() {
     let cluster = MemCluster::builder(&["cap-r-a", "cap-r-b"])
         .gossip_interval_ms(10)
         .anti_entropy_interval_ms(25)
-        .spawn();
+        .spawn()
+        .await;
     let a_id = cluster.ids[0].clone();
     let (a, b) = (&cluster.groups[0], &cluster.groups[1]);
     converged_within(&[a, b], SETTLE).await;
@@ -112,8 +114,8 @@ async fn re_advertising_replaces_the_whole_set() {
 #[tokio::test]
 async fn a_restart_retires_the_previous_lifes_advertisement() {
     let net = Network::new();
-    let (a_id, a_node, a_group) = spawn_mem_node(&net, "cap-x-a", &["cap-x-b"], &opts());
-    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "cap-x-b", &["cap-x-a"], &opts());
+    let (a_id, a_node, a_group) = spawn_mem_node(&net, "cap-x-a", &["cap-x-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "cap-x-b", &["cap-x-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
     a_group.advertise_capabilities([CAP]).unwrap();
@@ -122,21 +124,15 @@ async fn a_restart_retires_the_previous_lifes_advertisement() {
     })
     .await;
 
-    // Kill the node. Dropping the handles is *not* on its own enough: the
-    // node's receive loop owns an `Arc` of the same inner state that owns the
-    // transport, so its group actors keep ticking (and gossiping) with no
-    // handle left. What finishes the job here is the rebirth below —
-    // `spawn_mem_node` registers the id on the `Network` again, which replaces
-    // the sender, closes the old inbox, ends that receive loop and breaks the
-    // cycle. Between the two, a faithful process death.
-    //
-    // B, meanwhile, still holds (and will echo back) the first life's
-    // advertisement.
+    // Stop the managed network before rebirth. B still holds (and will echo
+    // back) the first life's advertisement.
     drop(a_group);
+    a_node.close().await;
     drop(a_node);
 
     // The reborn node runs without the capability and says so at startup.
-    let (_reborn_id, _reborn_node, reborn) = spawn_mem_node(&net, "cap-x-a", &["cap-x-b"], &opts());
+    let (_reborn_id, _reborn_node, reborn) =
+        spawn_mem_node(&net, "cap-x-a", &["cap-x-b"], &opts()).await;
     reborn.advertise_capabilities(Vec::<&str>::new()).unwrap();
 
     eventually("the previous life's advertisement dies on b", || {

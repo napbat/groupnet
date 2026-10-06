@@ -12,6 +12,7 @@ const FRAGMENT: usize = 28;
 pub(crate) fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
 pub(crate) fn id_valid(id: &NodeId) -> bool {
     !id.as_str().is_empty() && id.as_str().len() <= 255
 }
@@ -237,6 +238,7 @@ pub(crate) fn fragment(bytes: std::sync::Arc<[u8]>, mtu: usize, id: [u8; 16]) ->
 
 impl Iterator for Fragments {
     type Item = Vec<u8>;
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.index == self.count {
             return None;

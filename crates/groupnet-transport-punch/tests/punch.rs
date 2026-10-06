@@ -21,6 +21,7 @@ const SETTLE: Duration = Duration::from_secs(8);
 fn loopback() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
+
 fn key() -> NetworkKey {
     NetworkKey::from_bytes([37; 32])
 }

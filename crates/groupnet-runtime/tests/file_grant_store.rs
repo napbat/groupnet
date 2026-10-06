@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use groupnet_core::{Activation, HostedConfig, NodeId, RecoveredGrant, VoterRoster};
 use groupnet_runtime::{FileGrantStore, Group, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_transport_mem::Network;
 
 /// Poll budget: an election cannot open before the boot guard, and the
 /// restart additionally waits out the starved host's lease.
@@ -56,14 +56,14 @@ impl Drop for Scratch {
 
 /// Boots one voter of `voters` from the ledger at `path`: open, load, then
 /// join — the order the store's docs require.
-fn boot_voter(
+async fn boot_voter(
     net: &Network,
     path: &Path,
     id: &str,
     seeds: &[&str],
     voters: &[&str],
     group: &str,
-) -> (RecoveredGrant, Node<MemTransport>, Group) {
+) -> (RecoveredGrant, Node, Group) {
     let store = FileGrantStore::open(path).expect("open ledger");
     let recovered = store.load().expect("an intact ledger loads");
     let profile = GroupProfile::hosted(HostedConfig {
@@ -76,7 +76,7 @@ fn boot_voter(
     let opts = NodeOpts::new(group)
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(profile);
-    let (_, node, joined) = spawn_mem_node(net, id, seeds, &opts);
+    let (_, node, joined) = spawn_mem_node(net, id, seeds, &opts).await;
     (recovered, node, joined)
 }
 
@@ -108,7 +108,7 @@ async fn a_voter_restarted_from_its_file_recovers_its_grant() {
     for id in IDS {
         let seeds: Vec<&str> = IDS.iter().copied().filter(|other| *other != id).collect();
         let (recovered, node, group) =
-            boot_voter(&net, &scratch.ledger(id), id, &seeds, &IDS, GROUP);
+            boot_voter(&net, &scratch.ledger(id), id, &seeds, &IDS, GROUP).await;
         assert_eq!(
             recovered,
             RecoveredGrant::none(),
@@ -149,14 +149,11 @@ async fn a_voter_restarted_from_its_file_recovers_its_grant() {
         .find(|i| *i != restart)
         .expect("two non-hosts");
 
-    // Kill both non-hosts: drop the handles and evict their endpoints so the
-    // receive loops stop.
+    // Stop both managed networks; no receive loop can keep a voter alive.
     for index in [restart, gone] {
         groups[index] = None;
-        nodes[index] = None;
+        nodes[index].take().expect("live voter").close().await;
     }
-    let _evicted_restart = net.endpoint(NodeId::new(IDS[restart]));
-    let _evicted_gone = net.endpoint(NodeId::new(IDS[gone]));
     let host_group = groups[host_index].as_ref().expect("the host survives");
 
     eventually_within("the starved host to lose its lease", SETTLE, || {
@@ -173,7 +170,8 @@ async fn a_voter_restarted_from_its_file_recovers_its_grant() {
         &[host.as_str()],
         &IDS,
         GROUP,
-    );
+    )
+    .await;
     assert_eq!(
         recovered,
         RecoveredGrant::granted(first.epoch, host.clone()),

@@ -9,10 +9,11 @@ application-defined protocol.
 
 ## 1. Successful managed-node startup
 
-`.link(provider)` and `.links(providers)` populate one heterogeneous collection.
-`NetworkConfig::with_link` / `with_links` provide the equivalent prebuilt-config
-API. Providers bind in insertion order; their explicit adjacent peers become
-initial membership seeds.
+`Node::builder(id).link(provider)` and `.links(providers)` populate one
+heterogeneous collection. Membership settings live on that same builder.
+Providers bind in insertion order; their explicit adjacent peers become initial
+membership seeds. `NetworkConfig::with_link` / `with_links` configure standalone
+networks without coordination actors.
 
 ```mermaid
 sequenceDiagram
@@ -22,7 +23,7 @@ sequenceDiagram
     participant Provider as LinkProvider
     participant Router as Router
     participant Worker as LinkDriver
-    App->>Node: network_builder(id).link(...).start()
+    App->>Node: builder(id).link(...).start()
     Node->>Config: peers() — deduplicate membership seeds
     Node->>Config: bind(local_id)
     Config->>Router: Create router
@@ -44,8 +45,9 @@ sequenceDiagram
     Note over App,Router: Startup does not wait for remote peers or route convergence
 ```
 
-`start_with` and `Node::network_with` reuse a `NodeBuilder<Router>` closure for
-membership configuration instead of duplicating those settings in link providers.
+The single `NodeBuilder` exposes `.config(...)`, `.seed(...)`, `.named_seeds(...)`,
+and timing setters alongside link/routing/tunnel settings. Startup is fallible
+and asynchronous; there is no direct-transport or blocking node constructor.
 
 ## 2. Where dynamic dispatch stops
 
@@ -80,6 +82,11 @@ across the boundary. This is not a claim that the entire routing/TLS stack is
 zero-copy. `LinkIo` must preserve backpressure; it does not add another packet
 queue. Socket-only adapters need no separate `LinkLifecycle`; TCP, IPC, and
 punching use it to cancel and drain independently spawned tasks.
+
+Address hints use a weak `LinkControl` handle to the concrete worker. DNS and
+gossip updates reach only links that already admit the hinted identity, even
+before a route is learned. These control handles do not retain endpoints after
+shutdown and do not add a per-packet queue or boxed packet future.
 
 ## 3. Startup failures and cancellation
 
@@ -135,7 +142,8 @@ routers.
 
 ## Implementation references
 
-- [Node builder, seeds, clone-facing API](../crates/groupnet-runtime/src/network.rs)
+- [Node builder and startup](../crates/groupnet-runtime/src/node/builder.rs)
+- [Clone-facing network API](../crates/groupnet-runtime/src/network.rs)
 - [Startup rollback and shared network lifetime](../crates/groupnet-transport-router/src/config.rs)
 - [Provider, driver, and lifecycle contracts](../crates/groupnet-transport/src/link.rs)
 - [Concrete packet worker](../crates/groupnet-transport/src/link/worker.rs)

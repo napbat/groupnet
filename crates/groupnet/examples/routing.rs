@@ -13,31 +13,33 @@ use std::time::Duration;
 
 use groupnet::core::{GroupId, NodeId};
 use groupnet::runtime::Node;
-use groupnet::transport::mem::{MemTransport, Network};
+use groupnet::transport::mem::{MemLink, Network};
 
 const NODE_IDS: [&str; 3] = ["node-a", "node-b", "node-c"];
 const SHARD: &str = "shard-1";
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let net = Network::new();
 
     // Every node joins group "shard-1". Each group actor auto-publishes the
     // coordinator it observes into the routing table, so routing needs no
     // separate bookkeeping.
-    let nodes: Vec<(NodeId, Node<MemTransport>)> = NODE_IDS
-        .iter()
-        .map(|id| {
-            let me = NodeId::new(*id);
-            let mut builder = Node::builder(me.clone(), net.endpoint(me.clone()));
-            for peer in NODE_IDS.iter().filter(|p| *p != id) {
-                builder = builder.seed(NodeId::new(*peer));
-            }
-            let node = builder.spawn();
-            node.join_group(SHARD); // the group actor stays alive inside the node
-            (me, node)
-        })
-        .collect();
+    let mut nodes: Vec<(NodeId, Node)> = Vec::with_capacity(NODE_IDS.len());
+    for id in NODE_IDS {
+        let me = NodeId::new(id);
+        let peers = NODE_IDS
+            .iter()
+            .filter(|peer| **peer != id)
+            .map(|peer| NodeId::new(*peer))
+            .collect();
+        let node = Node::builder(me.clone())
+            .link(MemLink::new(net.endpoint(me.clone()), peers))
+            .start()
+            .await?;
+        node.join_group(SHARD); // the group actor stays alive inside the node
+        nodes.push((me, node));
+    }
 
     // Wait until every node's routing table knows shard-1's coordinator.
     let shard = GroupId::new(SHARD);
@@ -66,6 +68,7 @@ async fn main() {
         let route = routing.route("users").map(|n| n.to_string());
         println!("  {id}: owner={owner:?}  route={route:?}");
     }
+    Ok(())
 }
 
 /// Polls `cond` until it holds or a generous deadline elapses.

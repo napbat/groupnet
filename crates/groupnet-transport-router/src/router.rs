@@ -3,6 +3,9 @@
 mod adapters;
 mod routing;
 
+#[cfg(test)]
+mod tests;
+
 use routing::drive;
 
 use std::collections::HashMap;
@@ -15,7 +18,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use groupnet_core::NodeId;
-use groupnet_transport::link::{BoundLink, LinkConfig};
+use groupnet_transport::link::{BoundLink, LinkConfig, LinkControl};
 use groupnet_transport::{Inbound, Transport};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
@@ -72,6 +75,7 @@ pub struct Route {
 
 struct Link {
     config: LinkConfig,
+    control: LinkControl,
     outgoing: mpsc::Sender<(NodeId, Arc<[u8]>)>,
     cancel: CancellationToken,
 }
@@ -97,6 +101,7 @@ impl Table {
             .map(|candidate| &candidate.route)
             .min_by(|a, b| (a.cost, &a.path, a.transport).cmp(&(b.cost, &b.path, b.transport)))
     }
+
     fn remove(&mut self, id: TransportId) {
         if let Some(link) = self.links.remove(&id) {
             link.cancel.cancel();
@@ -275,6 +280,7 @@ impl Router {
         let (send, outgoing) = mpsc::channel(64);
         let cancel = shared.cancel.child_token();
         let BoundLink { config, driver } = link;
+        let control = driver.control();
         let io = adapters::io(
             shared.clone(),
             id,
@@ -287,6 +293,7 @@ impl Router {
             id,
             Link {
                 config,
+                control,
                 outgoing: send,
                 cancel,
             },
@@ -333,9 +340,34 @@ impl Router {
             .cloned()
     }
 
+    /// Forwards an address hint only to links that explicitly admit this peer.
+    ///
+    /// Learning an address never expands adjacent-peer admission. The controls
+    /// retained in the routing table do not keep closed endpoints alive.
+    ///
+    /// # Panics
+    /// Panics if an earlier panic poisoned the internal table.
+    pub fn learn_peer(&self, peer: &NodeId, address: &str) {
+        let shared = &self.inner.shared;
+        if shared.cancel.is_cancelled() {
+            return;
+        }
+        let table = shared.table.lock().expect("router table poisoned");
+        for link in table.links.values() {
+            if link.config.peers.contains(peer) {
+                link.control.learn_peer(peer, address);
+            }
+        }
+    }
+
     /// Initiates shutdown without waiting; use [`close`](Self::close) to drain tasks.
     pub fn shutdown(&self) {
         self.inner.shared.cancel.cancel();
+    }
+
+    /// Waits for shutdown to be initiated, without waiting for tasks to drain.
+    pub async fn cancelled(&self) {
+        self.inner.shared.cancel.cancelled().await;
     }
 
     /// Cancels the routing actor/adapters and waits for owned tasks to terminate.
@@ -360,9 +392,11 @@ impl Router {
     pub(crate) fn send_tunnel(&self, to: &NodeId, payload: &[u8]) -> io::Result<()> {
         self.inner.shared.send(to, payload, PayloadKind::Tunnel)
     }
+
     pub(crate) async fn recv_tunnel(&self) -> io::Result<Inbound> {
         receive(&self.inner.tunnels, &self.inner.shared.cancel).await
     }
+
     pub(crate) fn claim_tunnels(&self) -> io::Result<()> {
         self.inner
             .tunnel_claimed
@@ -375,6 +409,7 @@ impl Router {
                 )
             })
     }
+
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.inner.shared.cancel.clone()
     }
@@ -382,9 +417,15 @@ impl Router {
 
 impl Transport for Router {
     type Error = io::Error;
+
+    fn learn_peer(&self, peer: &NodeId, address: &str) {
+        Self::learn_peer(self, peer, address);
+    }
+
     fn send(&self, to: &NodeId, msg: &[u8]) -> impl Future<Output = io::Result<()>> {
         std::future::ready(self.inner.shared.send(to, msg, PayloadKind::Message))
     }
+
     async fn recv(&self) -> io::Result<Inbound> {
         receive(&self.inner.messages, &self.inner.shared.cancel).await
     }

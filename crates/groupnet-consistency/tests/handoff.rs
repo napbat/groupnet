@@ -256,12 +256,13 @@ struct Wire {
 }
 
 impl Wire {
-    fn build(group: &str, ids: [&str; 2]) -> Self {
+    async fn build(group: &str, ids: [&str; 2]) -> Self {
         Self {
             cluster: MemCluster::builder(&ids)
                 .group(group)
                 .gossip_interval_ms(GOSSIP_MS)
-                .spawn(),
+                .spawn()
+                .await,
             bulk: MemBulkNet::new(),
         }
     }
@@ -300,7 +301,7 @@ impl Wire {
 /// read, and the frontier its own readers barrier on.
 #[tokio::test]
 async fn a_covering_snapshot_crosses_whole_and_seeds_the_receiving_node() {
-    let wire = Wire::build("handoff-happy", ["hh-req", "hh-donor"]);
+    let wire = Wire::build("handoff-happy", ["hh-req", "hh-donor"]).await;
     let chunks = vec![
         Bytes::from_static(b"the first piece of somebody's state"),
         // An empty chunk is a chunk: boundaries are the source's business, and
@@ -391,7 +392,7 @@ async fn a_covering_snapshot_crosses_whole_and_seeds_the_receiving_node() {
 /// reason the coverage check sits where it does.
 #[tokio::test]
 async fn a_donor_short_of_the_target_refuses_before_a_byte_is_read() {
-    let wire = Wire::build("handoff-short", ["hn-req", "hn-donor"]);
+    let wire = Wire::build("handoff-short", ["hn-req", "hn-donor"]).await;
     let covers = marks(&[("w-a", 1, 5)]);
     let source = TestSource::new(
         covers.clone(),
@@ -447,7 +448,7 @@ async fn a_donor_short_of_the_target_refuses_before_a_byte_is_read() {
 /// What had already crossed goes with the sink.
 #[tokio::test]
 async fn a_donor_that_dies_mid_stream_installs_nothing() {
-    let wire = Wire::build("handoff-cut", ["hc-req", "hc-donor"]);
+    let wire = Wire::build("handoff-cut", ["hc-req", "hc-donor"]).await;
     // Held open after two chunks, so the cut lands in a known place.
     let gate = watch::channel(false).0;
     let source = TestSource::new(
@@ -497,7 +498,7 @@ async fn a_donor_that_dies_mid_stream_installs_nothing() {
 /// wire rather than hand-built.
 #[tokio::test]
 async fn is_request_tells_a_handoff_opener_from_anything_else() {
-    let wire = Wire::build("handoff-demux", ["hx-req", "hx-donor"]);
+    let wire = Wire::build("handoff-demux", ["hx-req", "hx-donor"]).await;
     let need = marks(&[("w-a", 1, 1)]);
 
     // --- a genuine opener, captured from a real fetch ---

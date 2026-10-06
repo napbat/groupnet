@@ -18,7 +18,8 @@ async fn keyed_entries_disseminate_expire_and_delete() {
                 if id.as_str() == "node-a" { 1 } else { 2 }
             ))
         })
-        .spawn();
+        .spawn()
+        .await;
     let ids = &cluster.ids;
     let a = &cluster.groups[0];
     let b = &cluster.groups[1];
@@ -71,7 +72,8 @@ async fn events_stream_fires_on_entry_changes() {
     let cluster = MemCluster::builder(&["node-a", "node-b"])
         .group("g")
         .gossip_interval_ms(20)
-        .spawn();
+        .spawn()
+        .await;
     let ids = &cluster.ids;
     let a = &cluster.groups[0];
     let b = &cluster.groups[1];

@@ -70,7 +70,7 @@ use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport::bulk::{DataPlane, DataStream};
-use groupnet_transport_mem::{MemBulkNet, MemTransport, Network};
+use groupnet_transport_mem::{MemBulkNet, Network};
 use tokio::sync::watch;
 
 /// The poll budget for every assertion here. As loose as `hosted_migration`'s
@@ -294,7 +294,7 @@ fn lone_settle_profile() -> GroupProfile {
 /// epochs, not a write path.
 struct Cell {
     id: NodeId,
-    _node: Node<MemTransport>,
+    _node: Node,
     group: Group,
 }
 
@@ -307,21 +307,21 @@ impl Cell {
 /// Brings `ids` up as an all-to-all Quorum cluster on `net`. **Nothing is
 /// elected yet**: the storage-free posture charges the first epoch a boot
 /// blackout, and one test below opens a transfer inside that window on purpose.
-fn quorum_cluster(net: &Network, group: &str, ids: &[&str]) -> Vec<Cell> {
-    ids.iter()
-        .map(|id| {
-            let seeds: Vec<&str> = ids.iter().copied().filter(|other| other != id).collect();
-            let opts = NodeOpts::new(group)
-                .gossip_interval_ms(GOSSIP_MS)
-                .group_profile(quorum_profile(ids));
-            let (id, node, group) = spawn_mem_node(net, id, &seeds, &opts);
-            Cell {
-                id,
-                _node: node,
-                group,
-            }
-        })
-        .collect()
+async fn quorum_cluster(net: &Network, group: &str, ids: &[&str]) -> Vec<Cell> {
+    let mut cells = Vec::with_capacity(ids.len());
+    for id in ids {
+        let seeds: Vec<&str> = ids.iter().copied().filter(|other| other != id).collect();
+        let opts = NodeOpts::new(group)
+            .gossip_interval_ms(GOSSIP_MS)
+            .group_profile(quorum_profile(ids));
+        let (id, node, group) = spawn_mem_node(net, id, &seeds, &opts).await;
+        cells.push(Cell {
+            id,
+            _node: node,
+            group,
+        });
+    }
+    cells
 }
 
 /// The leadership every node agrees on, or `None` while it is still settling:
@@ -370,7 +370,7 @@ async fn elected(cells: &[Cell]) -> (Leadership, usize) {
 /// takes a hostship the requester's cluster will never agree with.
 struct Stranger {
     _net: Network,
-    _node: Node<MemTransport>,
+    _node: Node,
     id: NodeId,
     group: Group,
 }
@@ -382,12 +382,12 @@ impl Stranger {
     }
 }
 
-fn stranger(group: &str, id: &str, profile: GroupProfile) -> Stranger {
+async fn stranger(group: &str, id: &str, profile: GroupProfile) -> Stranger {
     let net = Network::new();
     let opts = NodeOpts::new(group)
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(profile);
-    let (id, node, handle) = spawn_mem_node(&net, id, &[], &opts);
+    let (id, node, handle) = spawn_mem_node(&net, id, &[], &opts).await;
     assert_eq!(
         handle.leadership().epoch,
         0,
@@ -415,10 +415,10 @@ async fn a_donor_whose_fence_is_behind_is_refused_at_the_offer() {
 
     let net = Network::new();
     let bulk = MemBulkNet::new();
-    let cells = quorum_cluster(&net, GROUP, &IDS);
+    let cells = quorum_cluster(&net, GROUP, &IDS).await;
     let (lead, _host) = elected(&cells).await;
     assert!(lead.epoch >= 1, "an epoch closed: {lead:?}");
-    let donor = stranger(GROUP, "hs-stranger", quorum_profile(&IDS));
+    let donor = stranger(GROUP, "hs-stranger", quorum_profile(&IDS)).await;
     let requester = &cells[0];
 
     // Covering outright: nothing about this donor's *state* is short.
@@ -490,8 +490,8 @@ async fn a_donor_whose_fence_falls_behind_mid_stream_is_refused_at_the_terminato
     let bulk = MemBulkNet::new();
     // Not awaited: the transfer below opens inside the boot blackout, while the
     // requester's group is still hostless at epoch 0.
-    let cells = quorum_cluster(&net, GROUP, &IDS);
-    let donor = stranger(GROUP, "hd-stranger", quorum_profile(&IDS));
+    let cells = quorum_cluster(&net, GROUP, &IDS).await;
+    let donor = stranger(GROUP, "hd-stranger", quorum_profile(&IDS)).await;
     let requester = &cells[0];
     assert_eq!(requester.epoch(), 0, "no epoch has closed yet");
 
@@ -585,8 +585,8 @@ async fn a_donor_that_takes_a_hostship_mid_stream_stamps_it_into_the_terminator(
     let bulk = MemBulkNet::new();
     // Not awaited: the transfer below opens inside the boot blackout, while the
     // requester's group is still hostless at epoch 0.
-    let cells = quorum_cluster(&net, GROUP, &IDS);
-    let donor = stranger(GROUP, "hb-donor", lone_settle_profile());
+    let cells = quorum_cluster(&net, GROUP, &IDS).await;
+    let donor = stranger(GROUP, "hb-donor", lone_settle_profile()).await;
     let requester = &cells[0];
     assert_eq!(requester.epoch(), 0, "no epoch has closed yet");
 
@@ -692,7 +692,7 @@ async fn donors_asks_the_host_first_and_leaves_out_whoever_is_short() {
     const IDS: [&str; 3] = ["dn-a", "dn-b", "dn-c"];
 
     let net = Network::new();
-    let cells = quorum_cluster(&net, GROUP, &IDS);
+    let cells = quorum_cluster(&net, GROUP, &IDS).await;
     let (lead, host) = elected(&cells).await;
     let host_id = lead.host.clone().expect("agreement names a host");
     let short = (0..cells.len())

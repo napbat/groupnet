@@ -25,18 +25,20 @@
 //! # mod example {
 //! use groupnet::core::NodeId;
 //! use groupnet::runtime::Node;
-//! use groupnet::transport::mem::Network;
+//! use groupnet::transport::mem::{MemLink, Network};
 //!
-//! # async fn demo() {
+//! # async fn demo() -> std::io::Result<()> {
 //! let net = Network::new();
-//! let node = Node::builder(NodeId::new("node-a"), net.endpoint(NodeId::new("node-a")))
-//!     .seed(NodeId::new("node-b"))
-//!     .spawn();
+//! let id = NodeId::new("node-a");
+//! let node = Node::builder(id.clone())
+//!     .link(MemLink::new(net.endpoint(id), vec![NodeId::new("node-b")]))
+//!     .start().await?;
 //!
 //! let group = node.join_group("shard-42");
 //! if group.is_coordinator() {
 //!     group.sync(|ctx| ctx.update_metadata("routing", "v3"));
 //! }
+//! # Ok(())
 //! # }
 //! # }
 //! ```
@@ -76,12 +78,12 @@ pub mod transport {
     #[cfg(any(feature = "tcp", feature = "tcp-msg"))]
     pub use groupnet_transport_tcp as tcp;
 
-    /// Intrinsic managed-network routing and encrypted streams (enabled by default).
-    #[cfg(feature = "router")]
+    /// Intrinsic node routing and encrypted streams (feature `runtime`).
+    #[cfg(feature = "runtime")]
     pub use groupnet_transport_router as router;
 
-    /// Object-safe link registration and owned worker lifecycle (feature `router`).
-    #[cfg(feature = "router")]
+    /// Object-safe link registration and owned worker lifecycle (feature `runtime`).
+    #[cfg(feature = "runtime")]
     pub use groupnet_transport::link;
 
     /// Native local IPC links (feature `ipc`).

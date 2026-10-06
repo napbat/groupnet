@@ -121,10 +121,12 @@ mod tests {
         fn new(seed: u64) -> Self {
             Self(seed)
         }
+
         fn next_u64(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(GOLDEN);
             mix64(self.0)
         }
+
         fn below(&mut self, n: u32) -> u32 {
             u32::try_from(self.next_u64() % u64::from(n)).expect("`% n` bounds the draw by n")
         }

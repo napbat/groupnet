@@ -87,19 +87,20 @@ requirements, so they're separate traits bound to separate physical connections.
 | [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | control | transport(link), core, tokio | native named pipes/Unix sockets and `IpcLink` registration |
 | [`groupnet-transport-punch`](crates/groupnet-transport-punch) | control | transport(link), core, tokio, ring | authenticated UDP discovery/punching/relay and `PunchLink` registration |
 | [`groupnet-transport-router`](crates/groupnet-transport-router) | both | transport(bulk, link), tokio, rustls, ring | protocol-independent group-network routing and pinned end-to-end TLS streams |
-| [`groupnet-runtime`](crates/groupnet-runtime) | — | core, transport, tokio *(+router: transport-router)* | generic async coordination driver, managed routed-network initialization, and `FileGrantStore` |
+| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), transport-router, tokio | non-generic managed `Node`, group actors, and `FileGrantStore` |
 | [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff`)* | core, runtime, tokio(sync) *(+handoff feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; the opt-in `handoff` tier is the one piece that reaches the data plane, to pull a covering snapshot a gap cannot replay |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
-| [`groupnet`](crates/groupnet) | — | facade | `runtime`+`mem`+`router` default; socket protocols, RPC, and simulator selectable by feature |
+| [`groupnet`](crates/groupnet) | — | facade | `runtime`+`mem` default; routing is intrinsic to runtime; socket protocols, RPC, and simulator selectable by feature |
 | [`groupnet-testkit`](crates/groupnet-testkit) | — | core *(+cluster feature: runtime, transport-mem, tokio)* | shared test support: sans-IO frame fixtures + an async multi-node harness. Internal, `publish = false`, dev-dependency only |
 
-Routing is intrinsic to managed networks and enabled by default in the facade.
-`Node::network_builder(id)` registers protocol providers, then starts routing and
-membership together. The low-level `Node::builder(id, transport)` remains available
-for isolated coordination drivers and tests. `groupnet-transport` without features
-and `groupnet` with `default-features = false` retain their dependency-free core
-surface. Protocol implementations never enter `groupnet-core`.
+Every runtime node owns a routed network. Use
+`Node::builder(id).link(provider).start().await` for memory, sockets, or a mixture:
+protocol choices do not change the `Node` type or its coordination API. Links and
+membership settings share one builder; startup binds all links before spawning
+coordination. `groupnet-transport` without features and `groupnet` with
+`default-features = false` retain their dependency-free core surface. Protocol
+implementations never enter `groupnet-core`.
 
 The same core runs under both drivers: `groupnet-runtime` across threads in
 production, `groupnet-sim` in a single-threaded, reproducible event loop for
@@ -107,7 +108,7 @@ tests.
 
 Most consumers pull the single `groupnet` facade, which mirrors each layer as a
 module — `groupnet::core`, `groupnet::transport` (with the `mem` / `udp` / `tcp` /
-`bulk` bindings nested under it), `groupnet::router`, `groupnet::runtime`,
+`bulk` bindings nested under it), `groupnet::transport::router`, `groupnet::runtime`,
 `groupnet::rpc`, and `groupnet::sim` — so you write
 `groupnet::transport::Transport`, never the underlying crate name.
 
@@ -134,12 +135,14 @@ cargo run -p groupnet-consistency --example hosted_handoff --features handoff   
 ```rust
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
-use groupnet::transport::mem::Network;
+use groupnet::transport::mem::{MemLink, Network};
 
-let net = Network::new(); // any Transport impl works here
-let node = Node::builder(NodeId::new("node-a"), net.endpoint(NodeId::new("node-a")))
-    .seed(NodeId::new("node-b"))
-    .spawn();
+let net = Network::new();
+let id = NodeId::new("node-a");
+let node = Node::builder(id.clone())
+    .link(MemLink::new(net.endpoint(id), vec![NodeId::new("node-b")]))
+    .start()
+    .await?;
 
 let group = node.join_group("shard-42");
 
@@ -148,30 +151,34 @@ if group.is_coordinator() {
 }
 ```
 
-Swap the in-memory transport for real UDP sockets without touching anything else
-— just bind a different `Transport`:
+Use the same node and group APIs with UDP sockets — select feature `udp` and
+register a `UdpLink` instead:
 
 ```rust
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
-use groupnet::transport::udp::UdpTransport; // enable feature "udp"
+use groupnet::transport::{link::PeerEndpoint, udp::UdpLink};
 
-let transport = UdpTransport::bind(NodeId::new("node-a"), "0.0.0.0:7000").await?;
-transport.register_peer(NodeId::new("node-b"), "10.0.0.2:7000".parse()?);
-let node = Node::builder(NodeId::new("node-a"), transport).seed(NodeId::new("node-b")).spawn();
+let node = Node::builder(NodeId::new("node-a"))
+    .link(UdpLink::new(
+        "0.0.0.0:7000".parse()?,
+        vec![PeerEndpoint::new(NodeId::new("node-b"), "10.0.0.2:7000".parse()?)],
+    ))
+    .start()
+    .await?;
 ```
 
 ### Node-owned heterogeneous connections
 
-The facade includes routing by default. Select the protocol features you need
-(`tcp-msg` for this example; also `udp`, `ipc`, and `punch`):
+Select the protocol features you need (`tcp-msg` for this example; also `udp`,
+`ipc`, and `punch`). Add several links to the same builder to bridge protocols:
 
 ```rust
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
 use groupnet::transport::{link::PeerEndpoint, tcp::TcpLink};
 
-let node = Node::network_builder(NodeId::new("node-a"))
+let node = Node::builder(NodeId::new("node-a"))
     .link(TcpLink::new(
         "127.0.0.1:7000".parse()?,
         vec![PeerEndpoint::new(
@@ -179,6 +186,7 @@ let node = Node::network_builder(NodeId::new("node-a"))
             "127.0.0.1:7001".parse()?,
         )],
     ))
+    .gossip_interval_ms(100)
     .start()
     .await?;
 let devices = node.join_group("devices");
@@ -199,22 +207,28 @@ Already configured providers can be registered as a heterogeneous collection:
 use groupnet::transport::link::LinkProvider;
 
 let links: Vec<Box<dyn LinkProvider>> = vec![Box::new(tcp), Box::new(ipc)];
-let node = Node::network_builder(local_id).links(links).start().await?;
+let node = Node::builder(local_id).links(links).start().await?;
 ```
 
-`NetworkConfig::with_link` / `with_links` also support prebuilt configurations for
-`Node::network(id, config)` or standalone `config.bind(id)`. The router depends
-only on the shared link contract, not TCP, UDP, IPC, or punching implementations.
-Registration erases provider and worker lifetimes once; packet send/receive
-futures remain statically dispatched. Existing bounded scheduling queues are reused.
+`NetworkConfig::with_link` / `with_links` configure a standalone routed network
+through `config.bind(id)` when no coordination groups are needed. Nodes always
+use `Node::builder`. The router depends only on the shared link contract, not
+TCP, UDP, IPC, or punching implementations. Registration erases provider and
+worker lifetimes once; packet send/receive futures remain statically dispatched.
+Existing bounded scheduling queues are reused.
 
-Initialization returns an ordinary `Node<Router>`. Every node clone retains
-network ownership; a raw router clone or group handle does not. Closing any
-node clone closes connections for all of them; dropping the last node clone
-initiates shutdown. `start_with` (or `Node::network_with`) accepts a
-`NodeBuilder<Router>` closure for membership settings without duplicating that API.
+Initialization returns a non-generic `Node`. Every node clone retains network
+ownership; a raw router clone or group handle does not. Closing any node clone
+closes connections for all of them; dropping the last node clone initiates
+shutdown. Configure membership with `.config(...)`, `.seed(...)`,
+`.named_seeds(...)`, and the timing setters directly on the same builder.
 Initialization binds listeners and starts discovery; route convergence remains
 asynchronous and can be inspected with `node.router().route_to(&peer)`.
+
+Adjacent identities declared by each link are also membership seeds. Additional
+membership seeds, DNS answers, and gossiped addresses do **not** grant link
+admission. Pre-admit intended neighbors, including late joiners; only admitted
+neighbors can supply router traffic.
 
 Forwarding between configured peers is automatic, including between neighbors
 on the same adapter. No special bridge flag is required:
@@ -271,20 +285,30 @@ In an orchestrated deployment a seed's address moves (a `StatefulSet` peer's DNS
 record appears after its pod starts; a rolling restart hands it a new IP). Name
 the seed instead and let the node keep it current: it is resolved off the
 startup path, retried until it first resolves, re-resolved for the life of the
-node, and every new address reaches the transport through
-`Transport::learn_peer` (feature `dns` for the operating system resolver; any
-`SeedResolver` works):
+node, and every new address reaches links that already admit that identity through
+`Transport::learn_peer`. Feature `dns` supplies the operating-system resolver;
+any `SeedResolver` works. Address learning never widens the admitted peer set:
 
 ```rust
-use groupnet::runtime::{NamedSeeds, SystemResolver}; // enable feature "dns"
+use groupnet::core::NodeId;
+use groupnet::runtime::{NamedSeeds, Node, SystemResolver}; // feature "dns"
+use groupnet::transport::{link::{BoundLink, LinkConfig}, udp::UdpTransport}; // feature "udp"
 
-let node = Node::builder(NodeId::new("node-a"), transport)
-    .named_seeds(NamedSeeds::new(SystemResolver).seed(NodeId::new("node-b"), "node-b.peers:7000"))
-    .spawn();
+let id = NodeId::new("node-a");
+let peer = NodeId::new("node-b");
+let udp = UdpTransport::bind(id.clone(), "0.0.0.0:7000").await?;
+let node = Node::builder(id)
+    .link(BoundLink::new(udp, LinkConfig::new(vec![peer.clone()])))
+    .named_seeds(NamedSeeds::new(SystemResolver).seed(peer, "node-b.peers:7000"))
+    .start()
+    .await?;
 ```
 
-Binding your own transport is one trait — implement it and the runtime works
-unchanged:
+Custom protocols implement `Transport` for concrete packet I/O and `LinkProvider`
+for configuration/binding. Already-bound transports register through
+`BoundLink::new(transport, LinkConfig::new(peers))`, which itself implements
+`LinkProvider`. Supply `with_lifecycle` when the endpoint owns independent tasks
+that must be cancelled and drained; no separate node construction path is needed:
 
 ```rust
 pub trait Transport: Send + Sync + 'static {

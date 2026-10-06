@@ -176,12 +176,15 @@
 //! use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed};
 //! use groupnet_core::NodeId;
 //! use groupnet_runtime::Node;
-//! use groupnet_transport_mem::Network;
+//! use groupnet_transport_mem::{MemLink, Network};
 //!
 //! # async fn demo() {
 //! let net = Network::new();
 //! let me = NodeId::new("node-a");
-//! let node = Node::builder(me.clone(), net.endpoint(me.clone())).spawn();
+//! let node = Node::builder(me.clone())
+//!     .link(MemLink::new(net.endpoint(me.clone()), vec![NodeId::new("node-b")]))
+//!     .seed(NodeId::new("node-b"))
+//!     .start().await.expect("the memory link binds");
 //! let group = node.join_group("stores");
 //!
 //! let feed = WriteFeed::new(

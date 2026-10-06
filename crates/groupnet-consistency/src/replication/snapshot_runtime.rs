@@ -39,6 +39,7 @@ where
     ) -> Work<'_, SnapshotHold<Self::Hold>> {
         unavailable()
     }
+
     fn offer<'a>(
         _: &'a S,
         _: &'a mut Self::Hold,
@@ -47,9 +48,11 @@ where
     ) -> Work<'a, SnapshotImage<Self::ReadHandle>> {
         unavailable()
     }
+
     fn read<'a>(_: &'a S, _: &'a mut Self::ReadHandle, _: u64, _: usize) -> Work<'a, Vec<u8>> {
         unavailable()
     }
+
     fn barrier<'a>(
         _: &'a S,
         _: &'a mut Self::Hold,
@@ -58,6 +61,7 @@ where
     ) -> Work<'a, SourceProof> {
         unavailable()
     }
+
     fn attach<'a>(
         _: &'a S,
         _: &'a mut Self::Hold,
@@ -65,9 +69,11 @@ where
     ) -> Work<'a, SnapshotAttachment<Self::Attachment>> {
         unavailable()
     }
+
     fn release(_: &S, _: Self::Hold) -> Work<'_, ()> {
         unavailable()
     }
+
     fn open<'a>(
         _: &'a A,
         _: Scope,
@@ -76,12 +82,15 @@ where
     ) -> Work<'a, SnapshotStage<Self::Stage>> {
         unavailable()
     }
+
     fn write<'a>(_: &'a A, _: &'a mut Self::Stage, _: u64, _: Vec<u8>) -> Work<'a, usize> {
         unavailable()
     }
+
     fn verify<'a>(_: &'a A, _: &'a mut Self::Stage, _: &'a [u8]) -> Work<'a, usize> {
         unavailable()
     }
+
     fn apply<'a>(
         _: &'a A,
         _: &'a mut Self::Stage,
@@ -91,6 +100,7 @@ where
     ) -> Work<'a, usize> {
         unavailable()
     }
+
     fn seal(
         _: &A,
         _: Self::Stage,
@@ -138,6 +148,7 @@ where
                 .map_err(|e| e.class())
         })
     }
+
     fn offer<'a>(
         source: &'a S,
         hold: &'a mut Self::Hold,
@@ -151,6 +162,7 @@ where
                 .map_err(|e| e.class())
         })
     }
+
     fn read<'a>(
         source: &'a S,
         read: &'a mut Self::ReadHandle,
@@ -164,6 +176,7 @@ where
                 .map_err(|e| e.class())
         })
     }
+
     fn barrier<'a>(
         source: &'a S,
         hold: &'a mut Self::Hold,
@@ -177,6 +190,7 @@ where
                 .map_err(|e| e.class())
         })
     }
+
     fn attach<'a>(
         source: &'a S,
         hold: &'a mut Self::Hold,
@@ -184,9 +198,11 @@ where
     ) -> Work<'a, SnapshotAttachment<Self::Attachment>> {
         Box::pin(async move { source.attach(hold, after).await.map_err(|e| e.class()) })
     }
+
     fn release(source: &S, hold: Self::Hold) -> Work<'_, ()> {
         Box::pin(async move { source.release_hold(hold).await.map_err(|e| e.class()) })
     }
+
     fn open<'a>(
         app: &'a A,
         scope: Scope,
@@ -199,6 +215,7 @@ where
                 .map_err(|e| e.class())
         })
     }
+
     fn write<'a>(
         app: &'a A,
         stage: &'a mut Self::Stage,
@@ -211,9 +228,11 @@ where
                 .map_err(|e| e.class())
         })
     }
+
     fn verify<'a>(app: &'a A, stage: &'a mut Self::Stage, digest: &'a [u8]) -> Work<'a, usize> {
         Box::pin(async move { app.verify_image(stage, digest).await.map_err(|e| e.class()) })
     }
+
     fn apply<'a>(
         app: &'a A,
         stage: &'a mut Self::Stage,
@@ -227,6 +246,7 @@ where
                 .map_err(|e| e.class())
         })
     }
+
     fn seal(
         app: &A,
         stage: Self::Stage,

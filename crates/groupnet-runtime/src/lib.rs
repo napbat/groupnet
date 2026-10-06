@@ -5,25 +5,27 @@
 //! them across every core with no shared lock on the hot path — the classic
 //! single-writer-per-shard model.
 //!
-//! You bind any [`Transport`] and get a [`Node`]; from it you [`join_group`] to
-//! get a [`Group`] handle. This crate is **transport-agnostic** — the concrete
-//! bindings live in their own crates (`groupnet-transport-mem`,
-//! `groupnet-transport-udp`, …), or you implement the trait yourself:
+//! You configure protocol links and start a managed [`Node`]; from it you
+//! [`join_group`] to get a [`Group`] handle. This crate is **protocol-agnostic**:
+//! the concrete link providers live in their own crates
+//! (`groupnet-transport-mem`, `groupnet-transport-udp`, …).
 //!
 //! ```no_run
 //! use groupnet_runtime::Node;
 //! use groupnet_core::NodeId;
-//! use groupnet_transport::Transport;
+//! use groupnet_transport::link::LinkProvider;
 //!
-//! # async fn demo<T: Transport>(transport: T) {
-//! let node = Node::builder(NodeId::new("node-a"), transport)
+//! # async fn demo(link: impl LinkProvider) -> std::io::Result<()> {
+//! let node = Node::builder(NodeId::new("node-a"))
+//!     .link(link)
 //!     .seed(NodeId::new("node-b"))
-//!     .spawn();
+//!     .start().await?;
 //!
 //! let group = node.join_group("shard-42");
 //! if group.is_coordinator() {
 //!     group.sync(|ctx| ctx.update_metadata("routing", "v3"));
 //! }
+//! # Ok(())
 //! # }
 //! ```
 //!
@@ -42,7 +44,6 @@ mod anchor;
 mod capability;
 mod driver;
 mod group;
-#[cfg(feature = "router")]
 mod network;
 mod node;
 mod routing;
@@ -57,8 +58,6 @@ pub use group::{
     InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
 pub use groupnet_core::{RecoveredGrant, Role, Status};
-#[cfg(feature = "router")]
-pub use network::NetworkBuilder;
 pub use node::{GroupProfile, Node, NodeBuilder};
 pub use routing::Routing;
 #[cfg(feature = "dns")]

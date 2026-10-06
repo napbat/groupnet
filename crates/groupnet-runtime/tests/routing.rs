@@ -17,7 +17,8 @@ async fn resolves_resource_to_owning_groups_coordinator() {
     let cluster = MemCluster::builder(&["node-a", "node-b", "node-c"])
         .group(shard1.clone())
         .gossip_interval_ms(20)
-        .spawn();
+        .spawn()
+        .await;
     let groups = &cluster.groups;
     let nodes = &cluster.nodes;
 

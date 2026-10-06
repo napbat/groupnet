@@ -136,6 +136,10 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    - wire changes: codec round-trip tests;
    - untested code is unfinished code.
 
+4. **Separate functions with a blank line**, including methods and trait method
+   declarations. Put the separator before the next function's doc comments and
+   attributes, not between those comments/attributes and the function.
+
 ## Testing conventions
 
 - Follow [Cargo's project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html):
@@ -171,8 +175,8 @@ cargo check -p groupnet-transport --no-default-features
 cargo test -p groupnet --features tcp-msg
 cargo test -p groupnet-runtime --features dns
 cargo clippy -p groupnet-runtime -p groupnet --all-targets --features groupnet-runtime/dns,groupnet/dns,groupnet/udp -- -D warnings
-cargo test -p groupnet-transport-router -p groupnet-runtime --features groupnet-runtime/router
-cargo clippy -p groupnet-transport-router -p groupnet-runtime -p groupnet --all-targets --features groupnet/router,groupnet-runtime/router -- -D warnings
+cargo test -p groupnet-transport-router -p groupnet-runtime
+cargo clippy -p groupnet-transport-router -p groupnet-runtime -p groupnet --all-targets -- -D warnings
 cargo test --workspace --features groupnet/ipc,groupnet/punch,groupnet/udp,groupnet/tcp-msg
 cargo clippy --workspace --all-targets --features groupnet/ipc,groupnet/punch,groupnet/udp,groupnet/tcp-msg -- -D warnings
 cargo test -p groupnet-consistency --features acks

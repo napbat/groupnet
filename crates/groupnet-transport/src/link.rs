@@ -3,13 +3,25 @@
 //! Providers bind typed protocol configuration without knowing about a router.
 //! Dynamic dispatch occurs at initialization and worker lifetime boundaries;
 //! individual transport send/receive futures remain statically dispatched.
+//! An already-bound [`BoundLink`](crate::link::BoundLink) is itself a
+//! [`LinkProvider`](crate::link::LinkProvider), so custom transports use the same
+//! initialization path as protocol providers.
 
 mod worker;
+
+#[cfg(test)]
+mod tests;
 
 use crate::{Inbound, Transport};
 use futures_util::{Sink, Stream};
 use groupnet_core::NodeId;
-use std::{fmt, future::Future, io, pin::Pin, sync::Arc};
+use std::{
+    fmt,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{Arc, Weak},
+};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -42,6 +54,7 @@ pub struct LinkConfig {
     /// Maximum physical frame size supported by the link.
     pub mtu: usize,
 }
+
 impl LinkConfig {
     /// Creates an equal-cost link supporting frames up to 65,000 bytes.
     #[must_use]
@@ -59,6 +72,7 @@ impl LinkConfig {
 pub trait LinkProvider: Send + fmt::Debug + 'static {
     /// Explicit adjacent peers, used as initial membership seeds.
     fn peers(&self) -> &[NodeId];
+
     /// Binds this implementation for the supplied local identity.
     fn bind(self: Box<Self>, local: NodeId) -> LinkFuture<'static, io::Result<BoundLink>>;
 }
@@ -69,6 +83,7 @@ pub trait LinkProvider: Send + fmt::Debug + 'static {
 pub trait LinkLifecycle: Send + Sync + fmt::Debug + 'static {
     /// Synchronously initiates cancellation of all owned protocol tasks.
     fn shutdown(&self);
+
     /// Waits for owned protocol tasks and resource cleanup to finish.
     fn close(&self) -> LinkFuture<'_, ()>;
 }
@@ -88,6 +103,7 @@ pub struct Outbound {
     pub deadline: Instant,
     bytes: Buffer,
 }
+
 impl Outbound {
     /// Queues a shared frame without copying its bytes.
     #[must_use]
@@ -98,6 +114,7 @@ impl Outbound {
             deadline,
         }
     }
+
     /// Queues a uniquely owned frame without converting/copying its allocation.
     #[must_use]
     pub fn owned(peer: NodeId, bytes: Vec<u8>, deadline: Instant) -> Self {
@@ -107,6 +124,7 @@ impl Outbound {
             deadline,
         }
     }
+
     /// The frame payload.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
@@ -130,6 +148,7 @@ pub struct LinkIo {
     /// Largest accepted incoming physical frame.
     pub mtu: usize,
 }
+
 impl fmt::Debug for LinkIo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinkIo")
@@ -139,6 +158,8 @@ impl fmt::Debug for LinkIo {
 }
 
 /// A bound protocol endpoint plus the routing metadata needed to register it.
+/// Implements [`LinkProvider`] without rebinding; the supplied endpoint must
+/// already use the intended local identity.
 #[derive(Debug)]
 pub struct BoundLink {
     /// Adjacent-peer admission, cost, and frame bounds.
@@ -146,6 +167,7 @@ pub struct BoundLink {
     /// Owned worker and optional protocol-task lifecycle.
     pub driver: LinkDriver,
 }
+
 impl BoundLink {
     /// Prepares statically dispatched workers for any transport implementation.
     #[must_use]
@@ -153,11 +175,12 @@ impl BoundLink {
         Self {
             config,
             driver: LinkDriver {
-                worker: Some(Box::new(worker::Typed(transport))),
+                worker: Some(Arc::new(worker::Typed(transport))),
                 lifecycle: None,
             },
         }
     }
+
     /// Attaches cleanup for an adapter's independently spawned protocol tasks.
     #[must_use]
     pub fn with_lifecycle(mut self, lifecycle: Arc<dyn LinkLifecycle>) -> Self {
@@ -166,12 +189,47 @@ impl BoundLink {
     }
 }
 
+impl LinkProvider for BoundLink {
+    fn peers(&self) -> &[NodeId] {
+        &self.config.peers
+    }
+
+    fn bind(self: Box<Self>, _local: NodeId) -> LinkFuture<'static, io::Result<Self>> {
+        Box::pin(std::future::ready(Ok(*self)))
+    }
+}
+
+/// Weak access to a bound endpoint's address book.
+///
+/// Controls never retain the transport or its sockets. Updates become no-ops
+/// once the owning driver has released its worker.
+#[derive(Clone)]
+pub struct LinkControl {
+    worker: Weak<dyn worker::Worker>,
+}
+
+impl fmt::Debug for LinkControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinkControl").finish_non_exhaustive()
+    }
+}
+
+impl LinkControl {
+    /// Forwards an address hint to the concrete transport while it is alive.
+    pub fn learn_peer(&self, peer: &NodeId, address: &str) {
+        if let Some(worker) = self.worker.upgrade() {
+            worker.learn_peer(peer, address);
+        }
+    }
+}
+
 /// Single-use, protocol-neutral worker owner. Drop initiates protocol shutdown;
 /// [`run`](Self::run) and [`close`](Self::close) also drain protocol tasks.
 pub struct LinkDriver {
-    worker: Option<Box<dyn worker::Worker>>,
+    worker: Option<Arc<dyn worker::Worker>>,
     lifecycle: Option<Arc<dyn LinkLifecycle>>,
 }
+
 impl fmt::Debug for LinkDriver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinkDriver")
@@ -179,7 +237,19 @@ impl fmt::Debug for LinkDriver {
             .finish_non_exhaustive()
     }
 }
+
 impl LinkDriver {
+    /// Returns weak address-book access without extending endpoint lifetime.
+    ///
+    /// # Panics
+    /// Only if the internal single-use worker invariant is violated.
+    #[must_use]
+    pub fn control(&self) -> LinkControl {
+        LinkControl {
+            worker: Arc::downgrade(self.worker.as_ref().expect("single-use link worker")),
+        }
+    }
+
     /// Runs typed I/O until cancellation, input exhaustion, or transport failure,
     /// then cancels and drains the protocol's independently owned tasks.
     ///
@@ -192,6 +262,7 @@ impl LinkDriver {
             self.close().await;
         })
     }
+
     /// Cancels and drains an endpoint that could not be registered.
     pub async fn close(self) {
         if let Some(lifecycle) = &self.lifecycle {
@@ -200,6 +271,7 @@ impl LinkDriver {
         }
     }
 }
+
 impl Drop for LinkDriver {
     fn drop(&mut self) {
         if let Some(lifecycle) = &self.lifecycle {

@@ -337,14 +337,17 @@ impl Transport for PunchTransport {
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
+
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "UDP transport closed")
 }
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
 fn random<const N: usize>() -> io::Result<[u8; N]> {
     let mut bytes = [0; N];
     SystemRandom::new()
@@ -352,12 +355,14 @@ fn random<const N: usize>() -> io::Result<[u8; N]> {
         .map_err(|_| io::Error::other("secure random source failed"))?;
     Ok(bytes)
 }
+
 fn validate_name(node: &NodeId) -> io::Result<()> {
     if node.as_str().is_empty() || node.as_str().len() > 64 {
         return Err(invalid("UDP identities must contain 1–64 UTF-8 bytes"));
     }
     Ok(())
 }
+
 fn validate_names(nodes: &[NodeId]) -> io::Result<()> {
     if nodes.len() > MAX_PEERS {
         return Err(invalid("UDP peer limit is 128"));
@@ -371,6 +376,7 @@ fn validate_names(nodes: &[NodeId]) -> io::Result<()> {
     }
     Ok(())
 }
+
 fn transient(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused)
         // Winsock consumes an oversized UDP datagram with WSAEMSGSIZE rather
@@ -396,6 +402,7 @@ mod tests {
     fn loopback() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 0))
     }
+
     fn key() -> NetworkKey {
         NetworkKey::from_bytes([23; 32])
     }

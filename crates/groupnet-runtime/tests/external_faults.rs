@@ -39,7 +39,7 @@ use groupnet_runtime::{
     Leadership, Node, Role,
 };
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_transport_mem::Network;
 use tokio::sync::broadcast::error::RecvError;
 
 /// The poll budget for every assertion here. Deliberately looser than the
@@ -278,7 +278,7 @@ impl Anchor for FakeAnchor {
 /// object every node's anchor handle points at.
 struct Fleet {
     ids: Vec<NodeId>,
-    nodes: Vec<Node<MemTransport>>,
+    nodes: Vec<Node>,
     groups: Vec<Group>,
 }
 
@@ -291,18 +291,14 @@ impl Fleet {
             .expect("the node is one of ours")
     }
 
-    /// Faithful process death, exactly as `leadership.rs` performs it: dropping
-    /// the handles is not enough on its own (the node's receive loop owns an
-    /// `Arc` of the same inner state), so the endpoint is re-registered, which
-    /// closes the old inbox, ends that loop and tears the actors down — the
-    /// anchor task included, which is why the record then goes unrenewed
-    /// instead of being kept alive by a zombie.
-    fn kill(&mut self, net: &Network, id: &NodeId) {
+    /// Stops the managed network and its actors, including anchor renewals.
+    async fn kill(&mut self, id: &NodeId) {
         let index = self.index_of(id);
         drop(self.groups.remove(index));
-        drop(self.nodes.remove(index));
+        let node = self.nodes.remove(index);
+        node.close().await;
         self.ids.remove(index);
-        let _evicted = net.endpoint(id.clone());
+        drop(node);
     }
 
     fn refs(&self) -> Vec<&Group> {
@@ -315,7 +311,7 @@ impl Fleet {
 /// applied on the join that creates the group, since a later
 /// `join_group_with` is handed the existing handle and ignores what it asks
 /// for.
-fn spawn_fleet(
+async fn spawn_fleet(
     net: &Network,
     group: &str,
     ids: &[&str],
@@ -332,7 +328,7 @@ fn spawn_fleet(
         let opts = NodeOpts::new(group)
             .gossip_interval_ms(GOSSIP_MS)
             .group_profile(profile(anchor));
-        let (node_id, node, joined) = spawn_mem_node(net, id, &seeds, &opts);
+        let (node_id, node, joined) = spawn_mem_node(net, id, &seeds, &opts).await;
         fleet.ids.push(node_id);
         fleet.nodes.push(node);
         fleet.groups.push(joined);
@@ -424,7 +420,8 @@ async fn an_unreachable_anchor_leaves_the_group_hostless_until_it_heals() {
     let net = Network::new();
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
         external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
-    });
+    })
+    .await;
     let refs = fleet.refs();
     converged_within(&refs, SETTLE).await;
 
@@ -502,7 +499,8 @@ async fn cutting_only_the_incumbents_anchor_lapses_its_lease_and_pins_the_group(
     let net = Network::new();
     let mut fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
         external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
-    });
+    })
+    .await;
 
     let first = elected(&fleet, "the cluster to elect").await;
     let incumbent = first.host.clone().expect("agreement requires a named host");
@@ -559,7 +557,7 @@ async fn cutting_only_the_incumbents_anchor_lapses_its_lease_and_pins_the_group(
     );
 
     // --- Now take it out of the ranking. ---
-    fleet.kill(&net, &incumbent);
+    fleet.kill(&incumbent).await;
     let survivors = fleet.refs();
     eventually_within("a rival to steal the abandoned record", SETTLE, || {
         agreed(&survivors).is_some_and(|l| l.epoch > first.epoch)
@@ -596,7 +594,8 @@ async fn unknown_writes_that_applied_are_resolved_by_read_back() {
     let net = Network::new();
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
         external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
-    });
+    })
+    .await;
     let logs: Vec<LeadershipLog> = fleet.groups.iter().map(watch_leadership).collect();
 
     let lead = elected(&fleet, "the cluster to resolve an ambiguous win").await;
@@ -690,7 +689,8 @@ async fn writes_that_fail_while_reads_work_lapse_the_lease_instead_of_extending_
     let net = Network::new();
     let mut fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
         external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
-    });
+    })
+    .await;
 
     let first = elected(&fleet, "the cluster to elect").await;
     let incumbent = first.host.clone().expect("agreement requires a named host");
@@ -754,7 +754,7 @@ async fn writes_that_fail_while_reads_work_lapse_the_lease_instead_of_extending_
     );
 
     // --- Take it out of the ranking, and the succession is the ordinary one.
-    fleet.kill(&net, &incumbent);
+    fleet.kill(&incumbent).await;
     let survivors = fleet.refs();
     eventually_within(
         "a successor to steal the record left to age out",

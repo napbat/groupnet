@@ -5,6 +5,8 @@
 //! and lifecycle. Transit forwarding is enabled by default, including between
 //! neighbors on the same adapter. [`RouterConfig::forwarding`] can disable transit for an
 //! endpoint-only node. Bounded queues, expiry, and hop limits constrain faults.
+//! Address hints update only explicitly admitted adjacent peers; they never
+//! grant admission. Closed routers retain routing records, not endpoint resources.
 //!
 //! Raw routing messages trust the configured fabric and adjacent peers. The
 //! [`tunnel`] layer separately authenticates pinned TLS identities and encrypts
@@ -18,6 +20,10 @@
 mod config;
 mod router;
 mod wire;
+
+/// Codec-backed inspection helpers for transport fault/count fixtures.
+#[cfg(feature = "test-support")]
+pub mod testing;
 
 /// Reliable, pinned, mutually authenticated TLS streams over routed packets.
 pub mod tunnel;

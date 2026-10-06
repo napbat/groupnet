@@ -2,9 +2,8 @@
 //! membership converges and an entry authored on one node arrives on the
 //! other, with the connection pool staying bounded to the active fanout.
 //!
-//! This is the constant-connection deployment shape: the choice lives
-//! entirely in the transport handed to `Node::builder` — the engine, the
-//! protocol, and gossip-over-UDP deployments are untouched.
+//! The protocol choice lives in the registered link; every deployment uses the
+//! same managed `Node` and membership API.
 
 #![cfg(all(feature = "runtime", feature = "tcp-msg"))]
 
@@ -12,6 +11,7 @@ use std::time::Duration;
 
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
+use groupnet::transport::link::{BoundLink, LinkConfig};
 use groupnet::transport::tcp::TcpMsgTransport;
 use groupnet_testkit::cluster::eventually_within;
 
@@ -37,16 +37,20 @@ async fn nodes_gossip_and_sync_entries_over_persistent_tcp() {
     let a_pool = ta.clone();
     let b_pool = tb.clone();
 
-    let a = Node::builder(a_id.clone(), ta)
-        .seed(b_id.clone())
+    let a = Node::builder(a_id.clone())
+        .link(BoundLink::new(ta, LinkConfig::new(vec![b_id.clone()])))
         .gossip_interval_ms(20)
         .anti_entropy_interval_ms(50)
-        .spawn();
-    let b = Node::builder(b_id.clone(), tb)
-        .seed(a_id.clone())
+        .start()
+        .await
+        .expect("start a");
+    let b = Node::builder(b_id.clone())
+        .link(BoundLink::new(tb, LinkConfig::new(vec![a_id.clone()])))
         .gossip_interval_ms(20)
         .anti_entropy_interval_ms(50)
-        .spawn();
+        .start()
+        .await
+        .expect("start b");
 
     let ga = a.join_group("shard");
     let gb = b.join_group("shard");
@@ -64,12 +68,16 @@ async fn nodes_gossip_and_sync_entries_over_persistent_tcp() {
     // One peer each: the persistent pool holds one warm socket, not a mesh.
     assert!(a_pool.outbound_connections() <= 1);
     assert!(b_pool.outbound_connections() <= 1);
+    a.close().await;
+    b.close().await;
+    a_pool.close().await;
+    b_pool.close().await;
 }
 
-/// The only static addressing in this cluster is "where is the seed": the
-/// seed learns joiners from the dial-back intro, joiners learn each other
-/// from gossiped advertisements, and state flows between two nodes that were
-/// never configured with each other's address. No full-mesh registration.
+/// Only the seed's physical address is configured: its TCP intro learns
+/// joiners, and joiners learn each other from gossiped advertisements. All
+/// logical neighbor identities are explicitly admitted before startup; learning
+/// an address does not grant router admission.
 #[tokio::test]
 async fn seed_only_bootstrap_resolves_every_address_dynamically() {
     let a_id = NodeId::new("boot-a");
@@ -89,23 +97,39 @@ async fn seed_only_bootstrap_resolves_every_address_dynamically() {
 
     let a_book = ta.clone();
     let c_book = tc.clone();
-    let a = Node::builder(a_id.clone(), ta)
-        .seed(b_id.clone())
+    let a = Node::builder(a_id.clone())
+        .link(BoundLink::new(
+            ta,
+            LinkConfig::new(vec![b_id.clone(), c_id.clone()]),
+        ))
         .advertise_addr(a_book.local_addr().to_string())
         .gossip_interval_ms(20)
         .anti_entropy_interval_ms(50)
-        .spawn();
-    let b = Node::builder(b_id.clone(), tb.clone())
+        .start()
+        .await
+        .expect("start a");
+    let b = Node::builder(b_id.clone())
+        .link(BoundLink::new(
+            tb.clone(),
+            LinkConfig::new(vec![a_id.clone(), c_id.clone()]),
+        ))
         .advertise_addr(tb.local_addr().to_string())
         .gossip_interval_ms(20)
         .anti_entropy_interval_ms(50)
-        .spawn();
-    let c = Node::builder(c_id.clone(), tc)
-        .seed(b_id.clone())
+        .start()
+        .await
+        .expect("start b");
+    let c = Node::builder(c_id.clone())
+        .link(BoundLink::new(
+            tc,
+            LinkConfig::new(vec![a_id.clone(), b_id.clone()]),
+        ))
         .advertise_addr(c_book.local_addr().to_string())
         .gossip_interval_ms(20)
         .anti_entropy_interval_ms(50)
-        .spawn();
+        .start()
+        .await
+        .expect("start c");
 
     let ga = a.join_group("boot");
     let gb = b.join_group("boot");
@@ -128,4 +152,10 @@ async fn seed_only_bootstrap_resolves_every_address_dynamically() {
         ga.node_entry(&c_id, "who").as_deref() == Some(b"c")
     })
     .await;
+    a.close().await;
+    b.close().await;
+    c.close().await;
+    a_book.close().await;
+    tb.close().await;
+    c_book.close().await;
 }

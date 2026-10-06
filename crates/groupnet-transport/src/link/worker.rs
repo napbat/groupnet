@@ -2,15 +2,23 @@
 use super::{LinkFuture, LinkIo};
 use crate::Transport;
 use futures_util::{SinkExt, StreamExt};
+use groupnet_core::NodeId;
+use std::sync::Arc;
 
-pub(super) trait Worker: Send {
-    fn run(self: Box<Self>, io: LinkIo) -> LinkFuture<'static, ()>;
+pub(super) trait Worker: Send + Sync {
+    fn learn_peer(&self, peer: &NodeId, address: &str);
+
+    fn run(self: Arc<Self>, io: LinkIo) -> LinkFuture<'static, ()>;
 }
 
 pub(super) struct Typed<T>(pub(super) T);
 
 impl<T: Transport> Worker for Typed<T> {
-    fn run(self: Box<Self>, mut io: LinkIo) -> LinkFuture<'static, ()> {
+    fn learn_peer(&self, peer: &NodeId, address: &str) {
+        self.0.learn_peer(peer, address);
+    }
+
+    fn run(self: Arc<Self>, mut io: LinkIo) -> LinkFuture<'static, ()> {
         Box::pin(async move {
             let send = async {
                 while let Some(packet) = io.outgoing.next().await {

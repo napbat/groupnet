@@ -8,11 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# The managed group network includes routing by default. Protocol bindings remain
-# selectable; memory supports the default examples without opening OS sockets.
+# Every runtime node owns a routed network. Protocol bindings remain selectable;
+# memory supports the default examples without opening OS sockets.
 # Disable defaults for the dependency-free coordination core and transport trait.
-default = ["runtime", "mem", "router"]
-runtime = ["dep:groupnet-runtime"]
+default = ["runtime", "mem"]
+runtime = [
+    "dep:groupnet-runtime", "bulk", "dep:groupnet-transport-router",
+    "groupnet-transport/link", "groupnet-transport-mem?/link",
+    "groupnet-transport-tcp?/link", "groupnet-transport-udp?/link",
+]
 mem = ["dep:groupnet-transport-mem"]
 udp = ["dep:groupnet-transport-udp"]
 # Named seeds resolved through the operating system's resolver
@@ -28,12 +32,6 @@ tcp = ["bulk", "dep:groupnet-transport-tcp", "groupnet-transport-tcp/bulk"]
 # that want frames delivered at network latency over reliable links. Gossip
 # deployments keep `udp`; nothing forces a socket per member.
 tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
-# Heterogeneous, multi-hop packet routing and reliable end-to-end TLS tunnels.
-router = [
-    "runtime", "bulk", "dep:groupnet-transport-router", "groupnet-runtime/router",
-    "groupnet-transport-mem?/link", "groupnet-transport-tcp?/link",
-    "groupnet-transport-udp?/link",
-]
 # Native link implementations are independent crates, not router built-ins.
 ipc = ["dep:groupnet-transport-ipc"]
 punch = ["dep:groupnet-transport-punch"]

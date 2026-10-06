@@ -13,12 +13,13 @@ default = []
 # Async multi-node harness (Node/Group over the in-memory transport + bounded
 # polling). Dev-only everywhere; keeps the default testkit dep-free so
 # groupnet-core's test graph stays free of tokio.
-cluster = ["dep:groupnet-runtime", "dep:groupnet-transport-mem", "dep:tokio"]
+cluster = ["dep:groupnet-runtime", "dep:groupnet-transport-mem", "dep:groupnet-transport-router", "dep:tokio"]
 
 [dependencies]
 groupnet-core = { workspace = true }
 groupnet-runtime = { workspace = true, optional = true }
-groupnet-transport-mem = { workspace = true, optional = true }
+groupnet-transport-mem = { workspace = true, features = ["link"], optional = true }
+groupnet-transport-router = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"], optional = true }
 
 [lints]

@@ -121,9 +121,11 @@ impl Model {
     fn head(&self) -> u8 {
         u8::try_from(self.source.len()).unwrap()
     }
+
     fn at(&self, n: u8) -> Option<u8> {
         self.source[usize::from(n - 1)]
     }
+
     fn commit(&mut self, value: Option<u8>) {
         self.source.push(value);
     }

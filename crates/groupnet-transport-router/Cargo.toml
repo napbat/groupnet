@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Internal fault/count fixtures inspect router frames through the real codec.
+test-support = []
+
 [dependencies]
 groupnet-core.workspace = true
 groupnet-transport = { workspace = true, features = ["bulk", "link"] }

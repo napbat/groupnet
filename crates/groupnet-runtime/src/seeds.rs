@@ -20,15 +20,15 @@
 //!   one is not re-taught. A failed lookup keeps the last address — a DNS blip
 //!   must not churn the book.
 //!
-//! Every named seed joins the node's seed set at [`spawn`](crate::NodeBuilder::spawn),
+//! Every named seed joins the node's seed set at [`start`](crate::NodeBuilder::start),
 //! so every group contacts it the moment its address is known; until then a
 //! send to it is a transport-level drop, which the protocol tolerates. Startup
 //! never waits on DNS.
 //!
-//! Addresses reach the transport through [`Transport::learn_peer`] — the same
-//! path gossiped advertisements take — so any address-book binding (UDP,
-//! persistent TCP) works unchanged and nothing here is socket-specific. The
-//! lookup itself is a [`SeedResolver`]: [`SystemResolver`] (feature `dns`) in
+//! Addresses reach admitted links through [`Transport::learn_peer`] — the same
+//! path gossiped advertisements take — so address-book bindings (UDP,
+//! persistent TCP) work unchanged. Resolution never grants link admission.
+//! The lookup itself is a [`SeedResolver`]: [`SystemResolver`] (feature `dns`) in
 //! production, any other implementation in tests.
 
 use std::fmt;
@@ -125,17 +125,19 @@ type Observer = Arc<dyn Fn(&SeedEvent) + Send + Sync>;
 ///
 /// ```no_run
 /// # #[cfg(feature = "dns")]
-/// # async fn demo<T: groupnet_transport::Transport>(transport: T) {
+/// # async fn demo(link: impl groupnet_transport::link::LinkProvider) -> std::io::Result<()> {
 /// use groupnet_core::NodeId;
 /// use groupnet_runtime::{NamedSeeds, Node, SystemResolver};
 ///
-/// let node = Node::builder(NodeId::new("cache-1"), transport)
+/// let node = Node::builder(NodeId::new("cache-1"))
+///     .link(link)
 ///     .named_seeds(
 ///         NamedSeeds::new(SystemResolver)
 ///             .seed(NodeId::new("cache-0"), "cache-0.cache.svc:7000"),
 ///     )
-///     .spawn();
+///     .start().await?;
 /// # let _ = node;
+/// # Ok(())
 /// # }
 /// ```
 #[derive(Clone)]
@@ -176,7 +178,7 @@ impl NamedSeeds {
     }
 
     /// Adds `node`, reachable at the `host:port` `name`. A seed naming the
-    /// local node is ignored at spawn, so one shared all-replicas list can
+    /// local node is ignored at start, so one shared all-replicas list can
     /// configure every replica.
     #[must_use]
     pub fn seed(mut self, node: NodeId, name: impl Into<String>) -> Self {
@@ -241,7 +243,8 @@ struct Slot {
 }
 
 /// Resolves `seeds` for the life of `transport`, teaching each new address via
-/// [`Transport::learn_peer`]. Ends when the transport is dropped. Seeds naming
+/// [`Transport::learn_peer`]. Ends when the transport is dropped; the managed
+/// node also cancels this future when its router is cancelled. Seeds naming
 /// `local` are skipped.
 pub(crate) async fn resolve_named_seeds<T: Transport>(
     transport: Weak<T>,

@@ -1,32 +1,30 @@
 [package]
 name = "groupnet-runtime"
-description = "Async, group-per-task driver for Groupnet: turns the sans-IO core into an ergonomic Node/Group API over a bound Transport."
+description = "Async, group-per-task driver for Groupnet: turns the sans-IO core into an ergonomic Node/Group API over managed protocol links."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# The default runtime depends only on the transport trait. The opt-in `router`
-# initialization path owns typed adapter configuration and network lifecycle.
+# Routing and managed link lifecycle are intrinsic to every runtime node.
 [dependencies]
 groupnet-core = { workspace = true }
-groupnet-transport = { workspace = true }
+groupnet-transport = { workspace = true, features = ["bulk", "link"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
-groupnet-transport-router = { workspace = true, optional = true }
+groupnet-transport-router = { workspace = true }
 
 [features]
 # The operating system resolver for named seeds (`SystemResolver`): Tokio's
 # `net` slice for `lookup_host`. Named seeds themselves need no feature — a
-# deployment with its own `SeedResolver` keeps the runtime socket-free.
+# deployment with its own `SeedResolver` avoids operating-system DNS lookups.
 dns = ["tokio/net"]
-# Initialize and own heterogeneous connections through Node::network.
-router = ["dep:groupnet-transport-router", "groupnet-transport/bulk", "groupnet-transport/link"]
 
 # Concrete transports are pulled in only to exercise the tests.
 [dev-dependencies]
 groupnet-transport-mem = { workspace = true, features = ["link"] }
 groupnet-transport-udp = { workspace = true }
+groupnet-transport-router = { workspace = true, features = ["test-support"] }
 # The named-seed resolver's unit tests drive its schedule on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,

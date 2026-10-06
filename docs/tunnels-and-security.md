@@ -9,7 +9,7 @@ to open a protected resource.
 ## 1. Authenticated streams across a bridge
 
 Both endpoints configure a `TlsIdentity` and explicit `PeerIdentity` certificate
-pins. `Node<Router>` and standalone `Network` implement `BulkTransport` through
+pins. `Node` and standalone `Network` implement `BulkTransport` through
 this tunnel endpoint. Without tunnel configuration, `connect` and `accept` return
 `Unsupported`; there is no plaintext fallback.
 

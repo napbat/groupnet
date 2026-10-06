@@ -108,9 +108,11 @@ impl<'a> Reader<'a> {
     fn byte(&mut self) -> Option<u8> {
         Some(*self.take(1)?.first()?)
     }
+
     fn token(&mut self) -> Option<Session> {
         self.take(16)?.try_into().ok()
     }
+
     fn name(&mut self) -> Option<&'a str> {
         let length = usize::from(self.byte()?);
         if length == 0 || length > 64 {
@@ -118,6 +120,7 @@ impl<'a> Reader<'a> {
         }
         std::str::from_utf8(self.take(length)?).ok()
     }
+
     fn flag(&mut self) -> Option<bool> {
         match self.byte()? {
             0 => Some(false),
@@ -125,6 +128,7 @@ impl<'a> Reader<'a> {
             _ => None,
         }
     }
+
     fn message(&mut self) -> Option<&'a [u8]> {
         let remaining = self.bytes.len().checked_sub(self.position)?;
         if remaining > super::MAX_MESSAGE {
@@ -338,6 +342,7 @@ mod tests {
     fn key() -> NetworkKey {
         NetworkKey::from_bytes([4; 32])
     }
+
     fn packet(body: Body<'_>) -> Packet<'_> {
         Packet {
             sender: "alpha",

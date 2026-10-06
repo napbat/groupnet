@@ -9,7 +9,7 @@ control.
 
 ## 1. From application to physical links
 
-A managed `Node<Router>` owns coordination and its routed network. Applications
+A non-generic `Node` owns coordination and its routed network. Applications
 address logical `NodeId` values, not a particular TCP connection or IPC pipe.
 The router selects an adjacent peer and link for each destination.
 
@@ -33,16 +33,16 @@ flowchart TB
     Links <-->|"In-process frames"| Mem["Memory peer"]
 ```
 
-Routing is intrinsic to **managed** networks. The low-level
-`Node::builder(id, transport)` API remains available for isolated coordination
-engines and tests. `NetworkConfig::bind` starts a standalone routed `Network`
+Routing is intrinsic to every runtime node. Applications and tests use
+`Node::builder(id).link(provider).start().await`; all protocol choices produce
+the same `Node` type. `NetworkConfig::bind` starts a standalone routed `Network`
 without the node's membership actors.
 
 ## 2. Crate dependency boundaries
 
 Arrows mean **depends on**, not packet flow. This is the relevant production
-subgraph, not an exhaustive workspace/dependency listing. The runtime's router
-integration is feature-gated; the facade enables it by default.
+subgraph, not an exhaustive workspace/dependency listing. Runtime always depends
+on the router; disabling the facade's default features keeps the core-only surface.
 
 ```mermaid
 flowchart TB
@@ -149,7 +149,7 @@ those stronger guarantees are required.
 ## Implementation references
 
 - [Workspace architecture and feature selection](../README.md#workspace-layout)
-- [Managed node initialization](../crates/groupnet-runtime/src/network.rs)
+- [Managed node initialization](../crates/groupnet-runtime/src/node/builder.rs)
 - [Shared registration contracts](../crates/groupnet-transport/src/link.rs)
 - [Network ownership and standalone binding](../crates/groupnet-transport-router/src/config.rs)
 - [Group engine membership and anti-entropy](../crates/groupnet-core/src/engine/state.rs)

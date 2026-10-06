@@ -26,17 +26,16 @@
 use std::io;
 
 use bytes::Bytes;
-use groupnet::consistency::hosted::handoff::{Coverage, HandoffCore, Staleness, is_request};
 use groupnet::consistency::{
-    CommitLedger, Frontier, Handoff, HandoffError, Offered, Snapshot, SnapshotChunks, SnapshotSink,
+    CommitLedger, Frontier, Handoff, Offered, Snapshot, SnapshotChunks, SnapshotSink,
     SnapshotSource, Watermarks, WriteToken,
 };
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
 use groupnet::transport::bulk::DataPlane;
-use groupnet::transport::mem::{MemBulkNet, Network};
+use groupnet::transport::mem::{MemBulkNet, MemLink, Network};
 
-/// The `(writer, token)` map spelling both tests here use.
+/// The `(writer, token)` map used for coverage and installed frontiers.
 fn marks(pairs: &[(&str, u64, u64)]) -> Watermarks {
     pairs
         .iter()
@@ -90,35 +89,6 @@ impl SnapshotSink for VecSink {
     }
 }
 
-/// The tier's vocabulary is reachable through the facade, under both the module
-/// path and the crate root the other tiers use — and its sans-IO verdicts answer
-/// there exactly as they do at home.
-#[test]
-fn the_handoff_tier_is_reachable_through_the_facade() {
-    // The Hosted tier this one is built on came with it.
-    assert_eq!(groupnet::consistency::CAP_HOSTED, "hosted");
-    // The three verdicts, at the crate root like every other tier's types.
-    assert_eq!(
-        HandoffCore::coverage(&marks(&[("w", 1, 4)]), &marks(&[("w", 1, 9)])),
-        Coverage::Ok
-    );
-    assert_eq!(
-        HandoffCore::staleness((4, None), (6, None)),
-        Staleness::Stale,
-        "the epoch is the fence"
-    );
-    assert_eq!(
-        HandoffCore::staleness((6, None), (6, Some(&NodeId::new("h")))),
-        Staleness::Ok,
-        "…and a hostless stamp at our own epoch is not provably behind it"
-    );
-    // The demux a shared data plane needs, reachable under the module path.
-    assert!(!is_request(b"hello, world"));
-    // And the error vocabulary, so a caller can match on it from here.
-    let err = HandoffError::Truncated;
-    assert!(err.to_string().contains("whole"), "{err}");
-}
-
 /// …and one real transfer runs on it: a group over the facade's in-memory
 /// **control** plane, a snapshot over the facade's in-memory **data** plane, and
 /// the receipt seeded into a commit ledger. Both planes, one process, one
@@ -128,14 +98,16 @@ async fn a_handoff_runs_over_the_facades_two_planes() {
     let net = Network::new();
     let bulk = MemBulkNet::new();
     let (from, to) = (NodeId::new("fh-req"), NodeId::new("fh-donor"));
-    let groups: Vec<_> = [&from, &to]
-        .into_iter()
-        .map(|id| {
-            let node = Node::builder(id.clone(), net.endpoint(id.clone())).spawn();
-            let group = node.join_group("shard-42");
-            (node, group)
-        })
-        .collect();
+    let mut groups = Vec::with_capacity(2);
+    for (id, peer) in [(&from, &to), (&to, &from)] {
+        let node = Node::builder(id.clone())
+            .link(MemLink::new(net.endpoint(id.clone()), vec![peer.clone()]))
+            .start()
+            .await
+            .expect("start node");
+        let group = node.join_group("shard-42");
+        groups.push((node, group));
+    }
 
     let covers = marks(&[("w-a", 2, 7)]);
     let source = FixedSource(

@@ -7,6 +7,8 @@ use std::time::Duration;
 use groupnet_core::NodeId;
 use groupnet_runtime::Node;
 use groupnet_testkit::cluster::eventually_within;
+use groupnet_transport::link::{BoundLink, LinkConfig};
+use groupnet_transport_router::RouterConfig;
 use groupnet_transport_udp::UdpTransport;
 
 /// The poll budget this assertion carried before the shared harness: a
@@ -44,13 +46,20 @@ async fn three_nodes_converge_over_udp() {
     // Bring up the nodes over their UDP transports.
     let mut nodes = Vec::new();
     for (i, t) in transports.into_iter().enumerate() {
-        let mut builder = Node::builder(ids[i].clone(), t).gossip_interval_ms(30);
+        let peers = ids.iter().filter(|id| *id != &ids[i]).cloned().collect();
+        let mut builder = Node::builder(ids[i].clone())
+            .link(BoundLink::new(t, LinkConfig::new(peers)))
+            .routing(RouterConfig {
+                announce_interval: Duration::from_millis(30),
+                ..RouterConfig::default()
+            })
+            .gossip_interval_ms(30);
         for (j, id) in ids.iter().enumerate() {
             if i != j {
                 builder = builder.seed(id.clone());
             }
         }
-        nodes.push(builder.spawn());
+        nodes.push(builder.start().await.expect("UDP link binds"));
     }
 
     let groups: Vec<_> = nodes.iter().map(|n| n.join_group("shard-42")).collect();

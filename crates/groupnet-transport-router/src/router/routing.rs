@@ -20,6 +20,7 @@ impl Shared {
         id[8..].copy_from_slice(&self.sequence.fetch_add(1, Ordering::Relaxed).to_be_bytes());
         id
     }
+
     pub(super) fn send(&self, to: &NodeId, payload: &[u8], kind: PayloadKind) -> io::Result<()> {
         if self.cancel.is_cancelled() {
             return Err(closed());
@@ -47,6 +48,7 @@ impl Shared {
         }
         Ok(())
     }
+
     fn forward(&self, to: &NodeId, bytes: Arc<[u8]>) {
         let table = self.table.lock().expect("router table poisoned");
         if let Some(route) = table.route(to, self.config.route_ttl)
@@ -55,6 +57,7 @@ impl Shared {
             let _ = link.outgoing.try_send((route.next_hop.clone(), bytes));
         }
     }
+
     fn announce(&self) {
         let mut table = self.table.lock().expect("router table poisoned");
         table.candidates.retain(|_, choices| {
@@ -82,6 +85,7 @@ impl Shared {
         self.advertisements.send_replace(Arc::new(routes));
     }
 }
+
 pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>) {
     let mut clock = tokio::time::interval(shared.config.announce_interval);
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);

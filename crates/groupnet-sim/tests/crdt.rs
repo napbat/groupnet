@@ -28,6 +28,7 @@ fn encode(inc: u64, dec: u64) -> Vec<u8> {
     v.extend_from_slice(&dec.to_le_bytes());
     v
 }
+
 fn decode(bytes: &[u8]) -> (u64, u64) {
     let inc = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
     let dec = u64::from_le_bytes(bytes[8..16].try_into().unwrap());

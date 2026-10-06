@@ -6,6 +6,7 @@ use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, RecoveredGrant,
 };
 use groupnet_transport::Transport;
+use groupnet_transport_router::{Network, Router};
 use tokio::sync::{mpsc, watch};
 
 use crate::anchor::{Anchor, AnchorTask, anchor_task};
@@ -15,9 +16,11 @@ use crate::driver::{
 };
 use crate::group::{Group, Leadership};
 use crate::routing::Routing;
-use crate::seeds::{NamedSeeds, resolve_named_seeds};
 use crate::store::{GrantStore, VoterStorage};
 use tokio::sync::broadcast;
+
+mod builder;
+pub use builder::NodeBuilder;
 
 /// The reserved group every node joins to disseminate the inter-group routing
 /// table. Its metadata holds `owner:<resource>` and `coord:<group>` entries.
@@ -36,7 +39,7 @@ pub(crate) const ROUTING_GROUP: &str = "__groupnet_routing__";
 /// use groupnet_core::{Activation, HostedConfig};
 /// use groupnet_runtime::GroupProfile;
 ///
-/// # fn demo<T: groupnet_transport::Transport>(node: &groupnet_runtime::Node<T>) {
+/// # fn demo(node: &groupnet_runtime::Node) {
 /// let shard = node.join_group_with(
 ///     "shard-7",
 ///     GroupProfile::hosted(HostedConfig {
@@ -149,8 +152,8 @@ impl GroupProfile {
     /// # use std::sync::Arc;
     /// # use groupnet_core::{Activation, HostedConfig, RecoveredGrant, VoterRoster};
     /// # use groupnet_runtime::{GrantStore, GroupProfile};
-    /// # fn demo<T: groupnet_transport::Transport>(
-    /// #     node: &groupnet_runtime::Node<T>,
+    /// # fn demo(
+    /// #     node: &groupnet_runtime::Node,
     /// #     store: Arc<dyn GrantStore>,
     /// #     recovered: RecoveredGrant,
     /// #     voters: VoterRoster,
@@ -213,8 +216,8 @@ impl GroupProfile {
     /// # use std::sync::Arc;
     /// # use groupnet_core::{Activation, HostedConfig};
     /// # use groupnet_runtime::{Anchor, GroupProfile};
-    /// # fn demo<T: groupnet_transport::Transport>(
-    /// #     node: &groupnet_runtime::Node<T>,
+    /// # fn demo(
+    /// #     node: &groupnet_runtime::Node,
     /// #     anchor: Arc<dyn Anchor>,
     /// # ) {
     /// let shard = node.join_group_with(
@@ -272,9 +275,9 @@ fn external_anchor(
     Some((anchor, hosted.lease_ms, *steal_margin_ms))
 }
 
-struct Inner<T: Transport> {
+struct Inner {
     id: NodeId,
-    transport: Arc<T>,
+    transport: Arc<Router>,
     seeds: Vec<NodeId>,
     config: Config,
     /// Joined groups (handle + inbox). Holding the `Group` makes `join_group`
@@ -286,27 +289,25 @@ struct Inner<T: Transport> {
     routing: OnceLock<Group>,
 }
 
-/// A running Groupnet node: owns a bound transport and hosts group
-/// memberships. Cheap to clone (it's an `Arc` inside).
-pub struct Node<T: Transport> {
-    inner: Arc<Inner<T>>,
+/// A running Groupnet node: owns a managed network and hosts group
+/// memberships. Cheap to clone; every clone retains the network's lifetime.
+pub struct Node {
+    inner: Arc<Inner>,
     // Kept on public handles, not Inner: the receive task retains Inner while
     // awaiting packets and must not keep its own network alive indefinitely.
-    #[cfg(feature = "router")]
-    pub(super) network: Option<groupnet_transport_router::Network>,
+    pub(super) network: Network,
 }
 
-impl<T: Transport> Clone for Node<T> {
+impl Clone for Node {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            #[cfg(feature = "router")]
             network: self.network.clone(),
         }
     }
 }
 
-impl<T: Transport> std::fmt::Debug for Node<T> {
+impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Node")
             .field("id", &self.inner.id)
@@ -314,23 +315,11 @@ impl<T: Transport> std::fmt::Debug for Node<T> {
     }
 }
 
-impl<T: Transport> Node<T> {
-    /// Starts building a node with the given id and bound transport.
+impl Node {
+    /// Starts building a managed node with the given logical id.
     #[must_use]
-    pub fn builder(id: NodeId, transport: T) -> NodeBuilder<T> {
-        NodeBuilder {
-            id,
-            transport,
-            seeds: Vec::new(),
-            config: Config::default(),
-            advertise_addr: None,
-            named_seeds: None,
-        }
-    }
-
-    #[cfg(feature = "router")]
-    pub(super) fn transport(&self) -> &T {
-        &self.inner.transport
+    pub fn builder(id: NodeId) -> NodeBuilder {
+        NodeBuilder::new(id)
     }
 
     /// This node's id.
@@ -388,7 +377,7 @@ impl<T: Transport> Node<T> {
     pub fn join_group_with(&self, group: impl Into<GroupId>, profile: GroupProfile) -> Group {
         // Real groups announce their coordinator into the routing group. Read
         // outside the lock: the routing group is joined once, during
-        // `NodeBuilder::spawn`, before any `Node` handle exists to race with.
+        // `NodeBuilder::start`, before any `Node` handle exists to race with.
         let routing = self.inner.routing.get().map(Group::command_sender);
         self.get_or_spawn(group.into(), routing, profile)
     }
@@ -436,7 +425,7 @@ impl<T: Transport> Node<T> {
     ///
     /// # Panics
     /// Never in practice: the reserved routing group is joined during
-    /// [`NodeBuilder::spawn`], before any `Node` handle exists.
+    /// [`NodeBuilder::start`], before any `Node` handle exists.
     #[must_use]
     pub fn routing(&self) -> Routing {
         let group = self
@@ -613,183 +602,13 @@ impl<T: Transport> Node<T> {
     }
 }
 
-/// Builder for a [`Node`].
-pub struct NodeBuilder<T: Transport> {
-    id: NodeId,
-    transport: T,
-    seeds: Vec<NodeId>,
-    config: Config,
-    advertise_addr: Option<String>,
-    named_seeds: Option<NamedSeeds>,
-}
-
-impl<T: Transport> std::fmt::Debug for NodeBuilder<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NodeBuilder")
-            .field("id", &self.id)
-            .field("seeds", &self.seeds)
-            .field("named_seeds", &self.named_seeds)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<T: Transport> NodeBuilder<T> {
-    /// Adds a seed peer to bootstrap gossip against.
-    #[must_use]
-    pub fn seed(mut self, id: NodeId) -> Self {
-        self.seeds.push(id);
-        self
-    }
-
-    /// Adds seeds addressed by `host:port` name, resolved and kept current by
-    /// the node itself (see [`NamedSeeds`]): every seed joins the seed set
-    /// now, its address reaches the transport through
-    /// [`Transport::learn_peer`] once it resolves, and it is re-resolved for
-    /// the life of the node. A later call replaces an earlier one.
-    #[must_use]
-    pub fn named_seeds(mut self, seeds: NamedSeeds) -> Self {
-        self.named_seeds = Some(seeds);
-        self
-    }
-
-    /// Enables or disables eager delta push (default: enabled) — see
-    /// [`groupnet_core::Config::eager_push`].
-    #[must_use]
-    pub fn eager_push(mut self, enabled: bool) -> Self {
-        self.config.eager_push = enabled;
-        self
-    }
-
-    /// Overrides the gossip interval (milliseconds). Lower is faster to
-    /// converge but chattier. Since G3 the round runs digest/delta anti-entropy,
-    /// so this also sets the anti-entropy cadence in step (override it separately
-    /// afterwards with [`anti_entropy_interval_ms`](Self::anti_entropy_interval_ms)).
-    #[must_use]
-    pub fn gossip_interval_ms(mut self, ms: u64) -> Self {
-        let ms = ms.max(1);
-        self.config.gossip_interval_ms = ms;
-        self.config.anti_entropy_interval_ms = ms;
-        self
-    }
-
-    /// Overrides just the anti-entropy digest cadence (milliseconds), leaving the
-    /// gossip interval as set. Call after [`gossip_interval_ms`](Self::gossip_interval_ms),
-    /// which sets both.
-    #[must_use]
-    pub fn anti_entropy_interval_ms(mut self, ms: u64) -> Self {
-        self.config.anti_entropy_interval_ms = ms.max(1);
-        self
-    }
-
-    /// Overrides how many peers each anti-entropy round sends a digest to
-    /// (default 2). Fanout rotates round-robin so every peer is covered over
-    /// successive rounds.
-    #[must_use]
-    pub fn anti_entropy_fanout(mut self, peers: usize) -> Self {
-        self.config.anti_entropy_fanout = peers.max(1);
-        self
-    }
-
-    /// Overrides the soft per-frame byte cap for digests and deltas (default
-    /// `60_000`). Larger deltas are split across successive anti-entropy rounds.
-    #[must_use]
-    pub fn max_delta_frame_bytes(mut self, bytes: usize) -> Self {
-        self.config.max_delta_frame_bytes = bytes.max(1);
-        self
-    }
-
-    /// Overrides how often a given peer receives a full digest instead of a
-    /// per-peer delta digest (default 4; `1` makes every digest full). Delta
-    /// digests keep the steady-state round proportional to recent churn
-    /// instead of membership size — see [`Config::full_digest_every`].
-    #[must_use]
-    pub fn full_digest_every(mut self, n: u64) -> Self {
-        self.config.full_digest_every = n.max(1);
-        self
-    }
-
-    /// Replaces the full protocol [`Config`] (probe/suspect/dead timings,
-    /// fanout, indirect probes, anti-entropy cadence/fanout/frame cap). The
-    /// narrow per-knob setters remain for the common cases.
-    #[must_use]
-    pub fn config(mut self, config: Config) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Advertise a reachable address for this node, disseminated cluster-wide
-    /// as the reserved `~addr` state entry on the routing group — so only
-    /// seeds need out-of-band addressing and everyone else resolves peers
-    /// from gossip ([`Group::node_entry`] / [`Node::peer_addr`]).
-    ///
-    /// Every node also feeds the advertisements it *receives* into its own
-    /// transport ([`Transport::learn_peer`]) automatically, so address-book
-    /// transports (UDP, persistent TCP) fill themselves from gossip.
-    #[must_use]
-    pub fn advertise_addr(mut self, addr: impl Into<String>) -> Self {
-        self.advertise_addr = Some(addr.into());
-        self
-    }
-
-    /// Spawns the node: starts the transport receive loop and returns a handle.
-    /// Must be called from within a Tokio runtime.
-    pub fn spawn(self) -> Node<T> {
-        let mut seeds = self.seeds;
-        if let Some(named) = &self.named_seeds {
-            seeds.extend(named.nodes().cloned());
-        }
-        let inner = Arc::new(Inner {
-            id: self.id,
-            transport: Arc::new(self.transport),
-            seeds,
-            config: self.config,
-            routes: Mutex::new(HashMap::new()),
-            start: Instant::now(),
-            routing: OnceLock::new(),
-        });
-        let advertise = self.advertise_addr;
-        tokio::spawn(recv_loop(inner.clone()));
-        if let Some(named) = self.named_seeds {
-            tokio::spawn(resolve_named_seeds(
-                Arc::downgrade(&inner.transport),
-                inner.id.clone(),
-                named,
-            ));
-        }
-        let node = Node {
-            inner,
-            #[cfg(feature = "router")]
-            network: None,
-        };
-        // Join the reserved routing group (no coordinator publisher of its
-        // own). `spawn_group` pins it Eventual whatever this asks for.
-        let routing_group = node.get_or_spawn(
-            GroupId::new(ROUTING_GROUP),
-            None,
-            GroupProfile::from_mode(node.inner.config.mode.clone()),
-        );
-        if let Some(addr) = advertise {
-            let _ = routing_group.set_entry("~addr", addr.into_bytes(), None);
-        }
-        // Feed gossiped `~addr` advertisements into the transport's address
-        // book, so only seeds need out-of-band registration. Transports that
-        // resolve peers another way ignore the calls (default `learn_peer`).
-        tokio::spawn(sync_peer_addrs(
-            node.inner.transport.clone(),
-            node.inner.id.clone(),
-            routing_group.entries_watch(),
-        ));
-        let _ = node.inner.routing.set(routing_group);
-        node
-    }
-}
-
 /// Keeps the transport's address book fed with gossiped `~addr`
 /// advertisements via [`Transport::learn_peer`]. Each distinct advertised
 /// value is taught once (including unparseable ones, so a bad value is never
-/// re-taught every wakeup). Ends when the routing group's actor does.
-async fn sync_peer_addrs<T: Transport>(
-    transport: Arc<T>,
+/// re-taught every wakeup). Ends when the router is cancelled or the routing
+/// group's actor does.
+async fn sync_peer_addrs(
+    transport: Arc<Router>,
     local: NodeId,
     mut entries: watch::Receiver<NodeEntriesSnapshot>,
 ) {
@@ -811,15 +630,21 @@ async fn sync_peer_addrs<T: Transport>(
             }
             taught.insert(node.clone(), advertised.clone());
         }
-        if entries.changed().await.is_err() {
-            return;
+        tokio::select! {
+            biased;
+            () = transport.cancelled() => return,
+            changed = entries.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
 
 /// The node's single receive loop: pulls inbound frames off the transport and
 /// demuxes each to the right group actor by peeking its [`GroupId`].
-async fn recv_loop<T: Transport>(inner: Arc<Inner<T>>) {
+async fn recv_loop(inner: Arc<Inner>) {
     // Loop until the transport reports it's shut down (`recv` returns `Err`).
     while let Ok(inbound) = inner.transport.recv().await {
         let Some(group) = groupnet_core::wire::peek_group(&inbound.msg) else {

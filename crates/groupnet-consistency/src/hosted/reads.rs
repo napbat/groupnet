@@ -12,49 +12,6 @@
 //! every lineage — is [`Lineage`](super::lineage), sans-IO next door, where its
 //! whole truth table is unit-tested without a group or a runtime. Read that
 //! module for the semantics; read this one for the plumbing.
-//!
-//! # The follower loop this tier asks for
-//!
-//! ```no_run
-//! # use std::sync::Arc;
-//! # use groupnet_consistency::hosted::{CommitLedger, HostedRead, HostedReads, HostedWrites};
-//! # use groupnet_core::NodeId;
-//! # async fn demo(
-//! #     mut reads: HostedReads<String>,
-//! #     ledger: Arc<CommitLedger>,
-//! #     writes: Arc<HostedWrites<String>>,
-//! # ) {
-//! // One builder step, before the loop takes the handle: when this node begins
-//! // serving, its own lineage is cut there and the predecessor's late tail dies
-//! // instead of being applied behind this host's own writes.
-//! writes.bind(&mut reads);
-//!
-//! // The lineage's host, as the last `Migrated` named it: a `Gap` belongs to
-//! // the lineage rather than to a peer, so the watermark it raises is the
-//! // host's.
-//! let mut host: Option<NodeId> = None;
-//! while let Some(event) = reads.next().await {
-//!     match event {
-//!         HostedRead::Wrote { host: writer, token, key } => {
-//!             let _ = key;                    // apply it
-//!             ledger.record(&writer, token).await;
-//!         }
-//!         HostedRead::Gap { missed_through } => {
-//!             // coarse remediation: flush, rebuild, refetch
-//!             if let Some(host) = &host {
-//!                 ledger.record(host, missed_through).await;
-//!             }
-//!         }
-//!         HostedRead::Migrated { host: adopted, .. } => {
-//!             host = adopted;
-//!             // Re-stamp, so a recovering host can see this voter's view is
-//!             // *fresh* even while no new writes arrive.
-//!             ledger.refresh().await;
-//!         }
-//!     }
-//! }
-//! # }
-//! ```
 
 use std::fmt;
 use std::sync::Arc;
@@ -74,11 +31,50 @@ use crate::peers::{PeerWrite, PeerWrites};
 ///
 /// Drive it from a task — `while let Some(event) = reads.next().await { … }` —
 /// and pair it with a [`CommitLedger`](super::CommitLedger) exactly as the
-/// module docs show. **Every voter of a `Quorum` group must run this loop**: the
+/// example below shows. **Every voter of a `Quorum` group must run this loop**: the
 /// commit rule and the recovery rule are both predicates over what voters
 /// publish, and a voter that votes without applying is invisible to both. The
 /// tier fails closed around it — commits time out naming it, and a new host
 /// stalls in recovery — but that is availability spent for nothing.
+///
+/// # The follower loop
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use groupnet_consistency::hosted::{CommitLedger, HostedRead, HostedReads, HostedWrites};
+/// # use groupnet_core::NodeId;
+/// # async fn demo(
+/// #     mut reads: HostedReads<String>,
+/// #     ledger: Arc<CommitLedger>,
+/// #     writes: Arc<HostedWrites<String>>,
+/// # ) {
+/// // When this node begins serving, cut the predecessor's late tail so it
+/// // cannot be applied behind this host's own writes.
+/// writes.bind(&mut reads);
+///
+/// // A gap belongs to the adopted lineage, not to a fixed peer.
+/// let mut host: Option<NodeId> = None;
+/// while let Some(event) = reads.next().await {
+///     match event {
+///         HostedRead::Wrote { host: writer, token, key } => {
+///             let _ = key; // apply it
+///             ledger.record(&writer, token).await;
+///         }
+///         HostedRead::Gap { missed_through } => {
+///             // Flush, rebuild, or refetch before recording coverage.
+///             if let Some(host) = &host {
+///                 ledger.record(host, missed_through).await;
+///             }
+///         }
+///         HostedRead::Migrated { host: adopted, .. } => {
+///             host = adopted;
+///             // Publish this voter's fresh view even if no writes arrive.
+///             ledger.refresh().await;
+///         }
+///     }
+/// }
+/// # }
+/// ```
 pub struct HostedReads<K> {
     group: Group,
     inner: PeerWrites<K>,

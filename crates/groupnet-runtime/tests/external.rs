@@ -45,7 +45,7 @@ use groupnet_runtime::{
 use groupnet_testkit::cluster::{
     MemCluster, NodeOpts, converged_within, eventually_within, spawn_mem_node,
 };
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_transport_mem::Network;
 use tokio::sync::broadcast::error::RecvError;
 
 /// The poll budget for every assertion here. Deliberately looser than the
@@ -262,7 +262,7 @@ impl Anchor for FakeAnchor {
 /// object every node's anchor handle points at.
 struct Fleet {
     ids: Vec<NodeId>,
-    nodes: Vec<Node<MemTransport>>,
+    nodes: Vec<Node>,
     groups: Vec<Group>,
 }
 
@@ -275,18 +275,14 @@ impl Fleet {
             .expect("the node is one of ours")
     }
 
-    /// Faithful process death, exactly as `leadership.rs` performs it: dropping
-    /// the handles is not enough on its own (the node's receive loop owns an
-    /// `Arc` of the same inner state), so the endpoint is re-registered, which
-    /// closes the old inbox, ends that loop and tears the actors down — the
-    /// anchor task included, which is why the record then goes unrenewed
-    /// instead of being kept alive by a zombie.
-    fn kill(&mut self, net: &Network, id: &NodeId) {
+    /// Stops the managed network and its actors, including anchor renewals.
+    async fn kill(&mut self, id: &NodeId) {
         let index = self.index_of(id);
         drop(self.groups.remove(index));
-        drop(self.nodes.remove(index));
+        let node = self.nodes.remove(index);
+        node.close().await;
         self.ids.remove(index);
-        let _evicted = net.endpoint(id.clone());
+        drop(node);
     }
 
     fn refs(&self) -> Vec<&Group> {
@@ -299,7 +295,7 @@ impl Fleet {
 /// applied on the join that creates the group, since a later
 /// `join_group_with` is handed the existing handle and ignores what it asks
 /// for.
-fn spawn_fleet(
+async fn spawn_fleet(
     net: &Network,
     group: &str,
     ids: &[&str],
@@ -316,7 +312,7 @@ fn spawn_fleet(
         let opts = NodeOpts::new(group)
             .gossip_interval_ms(GOSSIP_MS)
             .group_profile(profile(anchor));
-        let (node_id, node, joined) = spawn_mem_node(net, id, &seeds, &opts);
+        let (node_id, node, joined) = spawn_mem_node(net, id, &seeds, &opts).await;
         fleet.ids.push(node_id);
         fleet.nodes.push(node);
         fleet.groups.push(joined);
@@ -401,7 +397,8 @@ async fn three_external_nodes_elect_through_the_anchor() {
     let net = Network::new();
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
         external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
-    });
+    })
+    .await;
     let logs: Vec<LeadershipLog> = fleet.groups.iter().map(watch_leadership).collect();
 
     let lead = elected(&fleet, "the cluster to win an epoch at the anchor").await;
@@ -470,11 +467,12 @@ async fn killing_the_host_lets_a_survivor_steal_the_record() {
     let net = Network::new();
     let mut fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
         external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
-    });
+    })
+    .await;
 
     let first = elected(&fleet, "the cluster to elect").await;
     let dead_id = first.host.clone().expect("agreement requires a named host");
-    fleet.kill(&net, &dead_id);
+    fleet.kill(&dead_id).await;
 
     let survivors = fleet.refs();
     eventually_within("a survivor to steal the stale record", SETTLE, || {
@@ -533,7 +531,8 @@ async fn an_anchor_on_an_eventual_group_is_never_called() {
     // Eventual — the default posture — carrying an anchor anyway.
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
         GroupProfile::eventual().with_anchor(anchor.as_anchor())
-    });
+    })
+    .await;
 
     let refs = fleet.refs();
     converged_within(&refs, SETTLE).await;
@@ -580,7 +579,8 @@ async fn an_external_group_without_an_anchor_never_hosts() {
         .group(GROUP)
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(external_profile(LEASE_MS))
-        .spawn();
+        .spawn()
+        .await;
     let logs: Vec<LeadershipLog> = cluster.groups.iter().map(watch_leadership).collect();
 
     let refs: Vec<&Group> = cluster.groups.iter().collect();
@@ -645,7 +645,8 @@ async fn leaving_releases_the_record_so_a_successor_claims_early() {
     let net = Network::new();
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
         external_profile(RELEASE_LEASE_MS).with_anchor(anchor.as_anchor())
-    });
+    })
+    .await;
 
     let first = elected(&fleet, "the cluster to elect").await;
     let leaver = first.host.clone().expect("agreement requires a named host");

@@ -10,7 +10,7 @@
 
 use groupnet::core::NodeId;
 use groupnet::runtime::{Group, Node};
-use groupnet::transport::mem::{MemTransport, Network};
+use groupnet::transport::mem::{MemLink, Network};
 use groupnet::transport::{Inbound, Transport};
 use groupnet_testkit::cluster::eventually;
 
@@ -24,15 +24,16 @@ async fn cluster_built_from_facade_paths_converges_and_replicates() {
 
     // Built by hand rather than via a fixture: the point is that these exact
     // facade paths resolve under default features.
-    let mut nodes: Vec<Node<MemTransport>> = Vec::with_capacity(ids.len());
+    let mut nodes: Vec<Node> = Vec::with_capacity(ids.len());
     let mut groups: Vec<Group> = Vec::with_capacity(ids.len());
     for id in &ids {
-        let mut builder =
-            Node::builder(id.clone(), net.endpoint(id.clone())).gossip_interval_ms(20);
-        for seed in ids.iter().filter(|other| *other != id) {
-            builder = builder.seed(seed.clone());
-        }
-        let node = builder.spawn();
+        let peers = ids.iter().filter(|other| *other != id).cloned().collect();
+        let node = Node::builder(id.clone())
+            .link(MemLink::new(net.endpoint(id.clone()), peers))
+            .gossip_interval_ms(20)
+            .start()
+            .await
+            .expect("start node");
         groups.push(node.join_group("shard-42"));
         nodes.push(node);
     }

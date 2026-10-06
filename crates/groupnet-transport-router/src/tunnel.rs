@@ -468,9 +468,11 @@ async fn authenticate_inbound(
 fn error(kind: io::ErrorKind, message: &'static str) -> io::Error {
     io::Error::new(kind, message)
 }
+
 fn closed() -> io::Error {
     error(io::ErrorKind::ConnectionAborted, "tunnel transport closed")
 }
+
 fn poisoned() -> io::Error {
     io::Error::other("tunnel state lock poisoned")
 }

@@ -83,10 +83,12 @@ impl Pause {
         self.enabled.store(true, Ordering::Release);
         self.released.store(false, Ordering::Release);
     }
+
     fn release(&self) {
         self.released.store(true, Ordering::Release);
         self.wake.notify_one();
     }
+
     async fn wait(&self) {
         if self.enabled.load(Ordering::Acquire) {
             self.entered.store(true, Ordering::Release);
@@ -109,6 +111,7 @@ impl Source {
     fn commit(&self) -> u64 {
         self.head.fetch_add(1, Ordering::AcqRel) + 1
     }
+
     fn proof(&self, scope: &Scope) -> SourceProof {
         let head = self.head.load(Ordering::Acquire);
         SourceProof {
@@ -132,6 +135,7 @@ impl SourceAdapter for Source {
     fn cursor(&self, scope: &Scope, position: &u64) -> Result<Cursor, AdapterFailure<io::Error>> {
         Ok(cursor(scope, *position))
     }
+
     fn position(&self, cursor: &Cursor) -> Result<u64, AdapterFailure<io::Error>> {
         let bytes: [u8; 8] = cursor
             .position
@@ -140,6 +144,7 @@ impl SourceAdapter for Source {
             .map_err(|_| AdapterFailure::Terminal(io::Error::other("cursor")))?;
         Ok(u64::from_le_bytes(bytes))
     }
+
     fn compare(
         &self,
         left: &Cursor,
@@ -162,6 +167,7 @@ impl SourceAdapter for Source {
             order,
         })
     }
+
     async fn tail(
         &self,
         scope: Scope,
@@ -177,6 +183,7 @@ impl SourceAdapter for Source {
         flight.completed = true;
         Ok(self.proof(&scope))
     }
+
     async fn scan_after(
         &self,
         _scope: Scope,
@@ -225,6 +232,7 @@ impl ApplicationAdapter<u64, ()> for App {
             bytes: 1,
         }))
     }
+
     async fn install_checkpoint(
         &self,
         _scope: Scope,
@@ -239,6 +247,7 @@ impl ApplicationAdapter<u64, ()> for App {
             .map_err(AdapterFailure::Terminal)?
             .ok_or_else(|| AdapterFailure::Retryable(io::Error::other("stale checkpoint")))
     }
+
     async fn revoke_serving(
         &self,
         _scope: Scope,
@@ -249,6 +258,7 @@ impl ApplicationAdapter<u64, ()> for App {
             .map_err(AdapterFailure::Terminal)?
             .ok_or_else(|| AdapterFailure::Retryable(io::Error::other("stale revoke")))
     }
+
     async fn apply(
         &self,
         _scope: Scope,
@@ -265,6 +275,7 @@ impl ApplicationAdapter<u64, ()> for App {
             .map_err(AdapterFailure::Terminal)?
             .ok_or_else(|| AdapterFailure::Retryable(io::Error::other("stale apply")))
     }
+
     fn may_serve(&self, _scope: &Scope, through: &u64) -> bool {
         self.applied.load(Ordering::Acquire) >= *through
     }
@@ -308,6 +319,7 @@ impl AckEvidenceSource for EvidenceSource {
             Ok(())
         })
     }
+
     fn observe<'a>(
         &'a self,
         request: &'a AckWaitRequest,
@@ -398,7 +410,7 @@ fn outcome(
 
 #[tokio::test]
 async fn two_named_acks_arrive_without_hint_while_replay_stays_ready() {
-    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn();
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
     let source = Source::default();
     let app = App::default();
     let evidence = EvidenceSource::default();
@@ -454,7 +466,7 @@ async fn two_named_acks_arrive_without_hint_while_replay_stays_ready() {
 
 #[tokio::test]
 async fn bad_ack_evidence_fails_only_the_wait_and_later_replay_progresses() {
-    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn();
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
     let source = Source::default();
     let app = App::default();
     let evidence = EvidenceSource::default();
@@ -514,7 +526,7 @@ async fn bad_ack_evidence_fails_only_the_wait_and_later_replay_progresses() {
 
 #[tokio::test]
 async fn stalled_certification_is_bounded_and_old_cancellation_cannot_end_new_wait() {
-    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn();
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
     let source = Source::default();
     let app = App::default();
     let evidence = EvidenceSource::default();
@@ -587,7 +599,7 @@ async fn stalled_certification_is_bounded_and_old_cancellation_cannot_end_new_wa
 
 #[tokio::test]
 async fn certification_deadline_expires_without_starting_a_wait_or_stopping_replay() {
-    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn();
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
     let source = Source::default();
     let app = App::default();
     let evidence = EvidenceSource::default();
@@ -628,7 +640,7 @@ async fn certification_deadline_expires_without_starting_a_wait_or_stopping_repl
 
 #[tokio::test]
 async fn timeout_receipt_lists_only_the_name_still_unmet() {
-    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn();
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
     let source = Source::default();
     let app = App::default();
     let evidence = EvidenceSource::default();
@@ -667,7 +679,7 @@ async fn timeout_receipt_lists_only_the_name_still_unmet() {
 
 #[tokio::test]
 async fn stalled_ack_source_keeps_global_operation_room_for_another_scope() {
-    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn();
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
     let source = Source::default();
     let app = App::default();
     let evidence = EvidenceSource::default();
@@ -712,7 +724,7 @@ async fn stalled_ack_source_keeps_global_operation_room_for_another_scope() {
 
 #[tokio::test]
 async fn cancelling_session_resolves_stalled_named_wait_without_leaving_a_slot() {
-    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn();
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
     let source = Source::default();
     let app = App::default();
     let evidence = EvidenceSource::default();
@@ -747,7 +759,7 @@ async fn cancelling_session_resolves_stalled_named_wait_without_leaving_a_slot()
 
 #[tokio::test]
 async fn replay_operation_keeps_its_own_deadline_while_ack_poll_timer_is_earlier() {
-    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn();
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
     let source = Source::default();
     let app = App::default();
     let evidence = EvidenceSource::default();

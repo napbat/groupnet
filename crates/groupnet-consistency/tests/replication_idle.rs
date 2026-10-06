@@ -240,7 +240,8 @@ fn limits() -> Limits {
 async fn quiet_scope_backs_off_but_discovers_a_commit_without_a_hint() {
     let cluster = MemCluster::builder(&["idle-reader"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = Source::default();
     let app = App::default();
     let manager = Replication::new(
@@ -297,7 +298,8 @@ async fn quiet_scope_backs_off_but_discovers_a_commit_without_a_hint() {
 async fn blocked_idle_check_expires_read_gate_and_activity_revalidates() {
     let cluster = MemCluster::builder(&["blocked-reader"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = Source::default();
     let manager = Replication::new(
         cluster.groups[0].clone(),
@@ -346,7 +348,8 @@ async fn blocked_idle_check_expires_read_gate_and_activity_revalidates() {
 async fn read_burst_shortens_an_idle_poll_without_a_query_per_read() {
     let cluster = MemCluster::builder(&["active-reader"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = Source::default();
     let manager = Replication::new(
         cluster.groups[0].clone(),
@@ -386,7 +389,8 @@ async fn read_burst_shortens_an_idle_poll_without_a_query_per_read() {
 async fn already_covered_floor_waits_use_the_fresh_local_proof() {
     let cluster = MemCluster::builder(&["floor-reader"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = Source::default();
     let manager = Replication::new(
         cluster.groups[0].clone(),
@@ -420,7 +424,8 @@ async fn already_covered_floor_waits_use_the_fresh_local_proof() {
 async fn restored_authority_rechecks_even_when_false_command_was_backpressured() {
     let cluster = MemCluster::builder(&["restore-reader"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = Source::default();
     let mut config = limits();
     config.queue_depth = 1;

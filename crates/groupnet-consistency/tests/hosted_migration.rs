@@ -42,7 +42,7 @@ use groupnet_consistency::{
 use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster, placement};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
-use groupnet_transport_mem::{MemTransport, Network};
+use groupnet_transport_mem::Network;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -145,8 +145,7 @@ enum Seen {
 /// is the failure the tier's contract is written about.
 struct Voter {
     id: NodeId,
-    net: Network,
-    node: Option<Node<MemTransport>>,
+    node: Option<Node>,
     group: Option<Group>,
     ledger: Option<Arc<CommitLedger>>,
     writes: Option<Arc<HostedWrites<String>>>,
@@ -158,11 +157,11 @@ struct Voter {
 impl Voter {
     /// Brings one node up, joined to `group` under the Quorum profile over
     /// `voters`, advertising [`CAP_HOSTED`] — but not yet following.
-    fn spawn(net: &Network, group: &str, id: &str, seeds: &[&str], voters: &[&str]) -> Self {
+    async fn spawn(net: &Network, group: &str, id: &str, seeds: &[&str], voters: &[&str]) -> Self {
         let opts = NodeOpts::new(group)
             .gossip_interval_ms(GOSSIP_MS)
             .group_profile(quorum_profile(voters));
-        let (id, node, handle) = spawn_mem_node(net, id, seeds, &opts);
+        let (id, node, handle) = spawn_mem_node(net, id, seeds, &opts).await;
         handle
             .advertise_capabilities([CAP_HOSTED])
             .expect("the advertisement is enqueued");
@@ -177,7 +176,6 @@ impl Voter {
         .expect("a Quorum group supports the committed regime");
         Self {
             id,
-            net: net.clone(),
             node: Some(node),
             group: Some(handle),
             ledger: Some(ledger),
@@ -286,10 +284,7 @@ impl Voter {
 
     /// Kills the node outright, endpoint and all.
     ///
-    /// Dropping the handles is not enough on its own: the node's receive loop
-    /// owns an `Arc` of the same inner state, so the actors keep ticking until
-    /// the endpoint is evicted from the `Network` (registering the id again
-    /// replaces the sender and closes the old inbox).
+    /// Managed shutdown closes every link before another incarnation starts.
     async fn kill(&mut self) {
         if let Some(apply) = self.apply.take() {
             apply.abort();
@@ -298,8 +293,9 @@ impl Voter {
         self.writes = None;
         self.ledger = None;
         self.group = None;
-        self.node = None;
-        drop(self.net.endpoint(self.id.clone()));
+        if let Some(node) = self.node.take() {
+            node.close().await;
+        }
     }
 
     /// Everything this node's follower loop has observed.
@@ -310,13 +306,13 @@ impl Voter {
 
 /// Brings `ids` up as an all-to-all Quorum cluster, each node a voter, none of
 /// them following yet.
-fn spawn_roster(net: &Network, group: &str, ids: &[&str]) -> Vec<Voter> {
-    ids.iter()
-        .map(|id| {
-            let seeds: Vec<&str> = ids.iter().copied().filter(|other| other != id).collect();
-            Voter::spawn(net, group, id, &seeds, ids)
-        })
-        .collect()
+async fn spawn_roster(net: &Network, group: &str, ids: &[&str]) -> Vec<Voter> {
+    let mut voters = Vec::with_capacity(ids.len());
+    for id in ids {
+        let seeds: Vec<&str> = ids.iter().copied().filter(|other| other != id).collect();
+        voters.push(Voter::spawn(net, group, id, &seeds, ids).await);
+    }
+    voters
 }
 
 /// The live members' group handles, for the convergence and agreement helpers.
@@ -354,6 +350,7 @@ async fn elected(voters: &mut [Voter]) -> (Leadership, usize) {
     .await;
     (lead, index)
 }
+
 /// Killing the host is a **migration**, and to a subscriber it is exactly one
 /// `Migrated`, exactly one `Gap`, and then the successor's writes. The successor
 /// recovers before it serves, and the write it then publishes commits.
@@ -367,7 +364,7 @@ async fn killing_the_host_migrates_the_lineage_and_the_successor_recovers() {
     // index 1 is the one that inherits when it dies.
     let rank = ranked(GROUP, &IDS);
     let order: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
-    let mut voters = spawn_roster(&net, GROUP, &order);
+    let mut voters = spawn_roster(&net, GROUP, &order).await;
     let (first, host) = elected(&mut voters).await;
     assert_eq!(
         host, 0,
@@ -569,7 +566,7 @@ async fn a_serving_host_cuts_its_predecessors_late_tail() {
     // Rendezvous order again: index 0 bids, index 1 inherits.
     let rank = ranked(GROUP, &IDS);
     let order: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
-    let mut voters = spawn_roster(&net, GROUP, &order);
+    let mut voters = spawn_roster(&net, GROUP, &order).await;
     let (first, host) = elected(&mut voters).await;
     assert_eq!(host, 0);
     let old_host = voters[0].id.clone();
@@ -674,7 +671,7 @@ async fn a_host_elect_that_has_not_caught_up_refuses_service_until_it_has() {
     let net = Network::new();
     let rank = ranked(GROUP, &IDS);
     let order: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
-    let mut voters = spawn_roster(&net, GROUP, &order);
+    let mut voters = spawn_roster(&net, GROUP, &order).await;
     let (first, host) = elected(&mut voters).await;
     assert_eq!(host, 0);
     let old_host = voters[0].id.clone();

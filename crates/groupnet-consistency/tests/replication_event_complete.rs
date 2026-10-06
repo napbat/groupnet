@@ -350,7 +350,8 @@ impl DurableEventSink<u64, Vec<u64>> for MemSink {
 async fn failed_sink_operation_retires_its_cloned_permit_before_retry() {
     let cluster = MemCluster::builder(&["event-failed-permit"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     let sink = MemSink::default();
     sink.fail_bind_once.store(true, Ordering::Release);
@@ -416,7 +417,8 @@ fn limits() -> Limits {
 async fn first_operation_budget_starts_before_blocked_cursor_encoding() {
     let cluster = MemCluster::builder(&["event-first-deadline"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     let gate = Arc::new(CursorGate::default());
     *source.cursor_gate.lock().expect("cursor gate lock") = Some(Arc::clone(&gate));
@@ -467,7 +469,8 @@ async fn first_operation_budget_starts_before_blocked_cursor_encoding() {
 async fn committed_events_arrive_without_hints_and_ack_only_after_sink_effects() {
     let cluster = MemCluster::builder(&["event-reader"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     let sink = MemSink::default();
     let manager = Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, limits())
@@ -505,7 +508,8 @@ async fn committed_events_arrive_without_hints_and_ack_only_after_sink_effects()
 async fn unknown_ack_is_read_back_then_restart_resumes_exact_protected_cursor() {
     let cluster = MemCluster::builder(&["event-restart"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let source = MemSource::default();
     let sink = MemSink::default();
     source.unknown_ack_once.store(true, Ordering::Release);
@@ -559,7 +563,8 @@ async fn unknown_ack_is_read_back_then_restart_resumes_exact_protected_cursor() 
 async fn two_names_share_native_scope_and_global_registry_capacity() {
     let cluster = MemCluster::builder(&["event-capacity"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let mut bounds = limits();
     bounds.max_scopes = 2;
     let source = MemSource::default();
@@ -634,7 +639,8 @@ async fn two_names_share_native_scope_and_global_registry_capacity() {
 async fn two_names_progress_with_one_operation_and_one_batch_of_bytes() {
     let cluster = MemCluster::builder(&["event-one-slot"])
         .group("stores")
-        .spawn();
+        .spawn()
+        .await;
     let mut bounds = limits();
     bounds.max_scopes = 2;
     bounds.max_parallel_ops = 1;
