@@ -62,11 +62,11 @@ use std::time::Duration;
 use groupnet_consistency::{Fence, HostedRead, HostedReads, HostedWrites};
 use groupnet_core::anchor::AnchorRecord;
 use groupnet_core::{Activation, HostedConfig, NodeId};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{
     Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf, Group, GroupProfile, Node, Role,
 };
 use groupnet_transport_mem::{MemLink, Network};
-use groupnet_transport_router::RouterConfig;
 use tokio::task::JoinHandle;
 
 /// The hosted group: one shard's worth of documents.

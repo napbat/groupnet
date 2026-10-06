@@ -101,7 +101,7 @@ all gossip into a reliable stream.
 
 ## Implementation references
 
-- [Routes, link registration, and configuration](../crates/groupnet-transport-router/src/router.rs)
-- [Learning, replay suppression, and forwarding](../crates/groupnet-transport-router/src/router/routing.rs)
-- [Outgoing scheduling and fragmentation](../crates/groupnet-transport-router/src/router/adapters.rs)
+- [Routes, link registration, and configuration](../crates/groupnet-network/src/router.rs)
+- [Learning, replay suppression, and forwarding](../crates/groupnet-network/src/router/routing.rs)
+- [Outgoing scheduling and fragmentation](../crates/groupnet-network/src/router/adapters.rs)
 - [Incoming worker bounds](../crates/groupnet-transport/src/link/worker.rs)

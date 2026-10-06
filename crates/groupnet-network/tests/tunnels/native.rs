@@ -2,14 +2,14 @@
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
+use groupnet_network::tunnel::{PeerIdentity, TunnelTransport};
+use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::bulk::BulkTransport;
 use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport_punch::{
     MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchTransport, Rendezvous,
 };
-use groupnet_transport_router::tunnel::{PeerIdentity, TunnelTransport};
-use groupnet_transport_router::{Router, RouterConfig};
 use tokio::time::timeout;
 
 use super::{DEADLINE, binary, fixtures::credentials};

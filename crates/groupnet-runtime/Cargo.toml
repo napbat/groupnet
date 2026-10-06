@@ -12,7 +12,7 @@ repository.workspace = true
 groupnet-core = { workspace = true }
 groupnet-transport = { workspace = true, features = ["bulk", "link"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
-groupnet-transport-router = { workspace = true }
+groupnet-network = { workspace = true }
 
 [features]
 # The operating system resolver for named seeds (`SystemResolver`): Tokio's
@@ -24,7 +24,7 @@ dns = ["tokio/net"]
 [dev-dependencies]
 groupnet-transport-mem = { workspace = true, features = ["link"] }
 groupnet-transport-udp = { workspace = true }
-groupnet-transport-router = { workspace = true, features = ["test-support"] }
+groupnet-network = { workspace = true, features = ["test-support"] }
 # The named-seed resolver's unit tests drive its schedule on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,

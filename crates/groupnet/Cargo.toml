@@ -13,7 +13,7 @@ repository.workspace = true
 # Disable defaults for the dependency-free coordination core and transport trait.
 default = ["runtime", "mem"]
 runtime = [
-    "dep:groupnet-runtime", "bulk", "dep:groupnet-transport-router",
+    "dep:groupnet-runtime", "bulk", "dep:groupnet-network",
     "groupnet-transport/link", "groupnet-transport-mem?/link",
     "groupnet-transport-tcp?/link", "groupnet-transport-udp?/link",
 ]
@@ -97,7 +97,7 @@ groupnet-transport = { workspace = true }
 groupnet-transport-mem = { workspace = true, optional = true }
 groupnet-transport-udp = { workspace = true, optional = true }
 groupnet-transport-tcp = { workspace = true, optional = true }
-groupnet-transport-router = { workspace = true, optional = true }
+groupnet-network = { workspace = true, optional = true }
 groupnet-transport-ipc = { workspace = true, optional = true }
 groupnet-transport-punch = { workspace = true, optional = true }
 groupnet-runtime = { workspace = true, optional = true }

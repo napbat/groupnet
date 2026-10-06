@@ -1,6 +1,6 @@
 //! The **default-feature** smoke test for the umbrella crate: a three-node
-//! cluster built only out of `groupnet::*` re-exports (`core`, `runtime`,
-//! `transport::mem`), converging and replicating a metadata write.
+//! cluster built only out of `groupnet::*` re-exports (`core`, `network`,
+//! `runtime`, `transport::mem`), converging and replicating a metadata write.
 //!
 //! Its subject is the facade surface itself — the paths a new user copies out
 //! of the crate docs must compile and run with nothing but `default`
@@ -9,6 +9,7 @@
 #![cfg(all(feature = "runtime", feature = "mem"))]
 
 use groupnet::core::NodeId;
+use groupnet::network::RouterConfig;
 use groupnet::runtime::{Group, Node};
 use groupnet::transport::mem::{MemLink, Network};
 use groupnet::transport::{Inbound, Transport};
@@ -30,6 +31,7 @@ async fn cluster_built_from_facade_paths_converges_and_replicates() {
         let peers = ids.iter().filter(|other| *other != id).cloned().collect();
         let node = Node::builder(id.clone())
             .link(MemLink::new(net.endpoint(id.clone()), peers))
+            .routing(RouterConfig::default())
             .gossip_interval_ms(20)
             .start()
             .await

@@ -5,10 +5,10 @@
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_network::RouterConfig;
 use groupnet_runtime::Node;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::link::{BoundLink, LinkConfig};
-use groupnet_transport_router::RouterConfig;
 use groupnet_transport_udp::UdpTransport;
 
 /// The poll budget this assertion carried before the shared harness: a

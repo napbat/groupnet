@@ -9,11 +9,11 @@ use std::{io, sync::atomic::Ordering, time::Duration};
 use fixtures::{Fabric, credentials};
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
-use groupnet_transport::bulk::BulkTransport;
-use groupnet_transport_router::{
+use groupnet_network::{
     Router, RouterConfig,
     tunnel::{PeerIdentity, TunnelTransport},
 };
+use groupnet_transport::bulk::BulkTransport;
 use tokio::time::{interval, timeout};
 
 const DEADLINE: Duration = Duration::from_secs(30);

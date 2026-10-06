@@ -8,6 +8,7 @@
 //! |--------|------|
 //! | [`core`] | sans-IO state machine, identity, weighted [`placement`](core::placement) (HA-hash), and the [`wire`](core::wire) protocol — pure, deterministic, dep-free |
 //! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) (persistent control-plane connections *and* bulk streams) |
+//! | [`network`] | protocol-independent routing and pinned end-to-end TLS streams *(feature `runtime`, default)* |
 //! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
 //! | [`rpc`] | request/response calls over the data plane: an [`RpcClient`](rpc::RpcClient) multiplexing concurrent calls onto one stream per peer, and an [`RpcServer`](rpc::RpcServer) answering them under deadlines and per-connection limits *(feature `rpc`)* |
 //! | [`consistency`] | session-consistency layer: per-writer sequenced [`WriteFeed`](consistency::WriteFeed)s with loss detection, and [`Frontier`](consistency::Frontier) read-your-writes barriers *(feature `consistency`)* |
@@ -24,6 +25,7 @@
 //! # #[cfg(all(feature = "runtime", feature = "mem"))]
 //! # mod example {
 //! use groupnet::core::NodeId;
+//! use groupnet::network::RouterConfig;
 //! use groupnet::runtime::Node;
 //! use groupnet::transport::mem::{MemLink, Network};
 //!
@@ -32,6 +34,7 @@
 //! let id = NodeId::new("node-a");
 //! let node = Node::builder(id.clone())
 //!     .link(MemLink::new(net.endpoint(id), vec![NodeId::new("node-b")]))
+//!     .routing(RouterConfig::default())
 //!     .start().await?;
 //!
 //! let group = node.join_group("shard-42");
@@ -78,10 +81,6 @@ pub mod transport {
     #[cfg(any(feature = "tcp", feature = "tcp-msg"))]
     pub use groupnet_transport_tcp as tcp;
 
-    /// Intrinsic node routing and encrypted streams (feature `runtime`).
-    #[cfg(feature = "runtime")]
-    pub use groupnet_transport_router as router;
-
     /// Object-safe link registration and owned worker lifecycle (feature `runtime`).
     #[cfg(feature = "runtime")]
     pub use groupnet_transport::link;
@@ -94,6 +93,11 @@ pub mod transport {
     #[cfg(feature = "punch")]
     pub use groupnet_transport_punch as punch;
 }
+
+/// Managed networks: protocol-independent routing and encrypted streams
+/// *(feature `runtime`)*. Link implementations remain in [`transport`].
+#[cfg(feature = "runtime")]
+pub use groupnet_network as network;
 
 /// Async runtime: the group-per-task [`Node`](runtime::Node) /
 /// [`Group`](runtime::Group) driver and the cluster [`Routing`](runtime::Routing)

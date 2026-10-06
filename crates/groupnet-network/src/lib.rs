@@ -1,4 +1,4 @@
-//! Typed heterogeneous routing and end-to-end tunnels for Groupnet.
+//! Groupnet managed networks: heterogeneous routing and end-to-end tunnels.
 //!
 //! [`NetworkConfig`] starts registered link providers behind one [`Router`].
 //! The router has no protocol-specific dependencies: transport crates own binding

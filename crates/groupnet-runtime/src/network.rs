@@ -3,9 +3,9 @@
 use std::io;
 
 use groupnet_core::NodeId;
+use groupnet_network::Router;
+use groupnet_network::tunnel::{TunnelTransport, TunneledStream};
 use groupnet_transport::bulk::BulkTransport;
-use groupnet_transport_router::Router;
-use groupnet_transport_router::tunnel::{TunnelTransport, TunneledStream};
 
 use crate::Node;
 

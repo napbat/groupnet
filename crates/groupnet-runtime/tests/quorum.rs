@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use groupnet_core::{
     Activation, HostedConfig, NodeId, RecoveredGrant, VoterRoster, placement, wire,
 };
+use groupnet_network::{RouterConfig, testing::message_payload};
 use groupnet_runtime::{GrantStore, Group, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{
     MemCluster, NodeOpts, converged_within, eventually_within, spawn_mem_node,
@@ -42,7 +43,6 @@ use groupnet_testkit::cluster::{
 use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
 use groupnet_transport_mem::{MemTransport, Network};
-use groupnet_transport_router::{RouterConfig, testing::message_payload};
 
 /// The poll budget for every assertion here. Deliberately looser than the
 /// harness default: an election cannot even open before the engine's boot

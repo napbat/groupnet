@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use groupnet_core::{Config, GroupId, NodeId};
+use groupnet_network::{NetworkConfig, RouterConfig, TunnelConfig};
 use groupnet_transport::link::LinkProvider;
-use groupnet_transport_router::{NetworkConfig, RouterConfig, TunnelConfig};
 
 use super::{GroupProfile, Inner, Node, ROUTING_GROUP, recv_loop, sync_peer_addrs};
 use crate::seeds::{NamedSeeds, resolve_named_seeds};

@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_network::{Router, RouterConfig, TransportId};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::link::LinkConfig;
 use groupnet_transport_ipc::{IpcAddress, IpcTransport};
 use groupnet_transport_mem::Network;
-use groupnet_transport_router::{Router, RouterConfig, TransportId};
 use groupnet_transport_tcp::TcpMsgTransport;
 
 const WAIT: Duration = Duration::from_secs(10);

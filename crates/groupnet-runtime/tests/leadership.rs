@@ -30,12 +30,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_core::{Activation, Config, GroupMode, HostedConfig, NodeId, wire};
+use groupnet_network::{RouterConfig, testing::message_payload};
 use groupnet_runtime::{Group, GroupEvent, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{MemCluster, converged_within, eventually_within};
 use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
 use groupnet_transport_mem::{MemLink, MemTransport, Network};
-use groupnet_transport_router::{RouterConfig, testing::message_payload};
 use tokio::sync::broadcast::error::RecvError;
 
 /// The poll budget for every assertion here.

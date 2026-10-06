@@ -32,9 +32,9 @@ use std::time::Duration;
 
 use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed};
 use groupnet_core::NodeId;
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{Group, Node};
 use groupnet_transport_mem::{MemLink, Network};
-use groupnet_transport_router::RouterConfig;
 
 const GROUP: &str = "stores";
 

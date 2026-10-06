@@ -145,6 +145,6 @@ loopback smoke coverage does not establish those guarantees.
 
 ## Implementation references
 
-- [Tunnel establishment, admission, revocation, and close](../crates/groupnet-transport-router/src/tunnel.rs)
+- [Tunnel establishment, admission, revocation, and close](../crates/groupnet-network/src/tunnel.rs)
 - [Native punching implementation crate](../crates/groupnet-transport-punch)
 - [Configuration and public stream API](../README.md#node-owned-heterogeneous-connections)

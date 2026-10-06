@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, RecoveredGrant,
 };
+use groupnet_network::{Network, Router};
 use groupnet_transport::Transport;
-use groupnet_transport_router::{Network, Router};
 use tokio::sync::{mpsc, watch};
 
 use crate::anchor::{Anchor, AnchorTask, anchor_task};

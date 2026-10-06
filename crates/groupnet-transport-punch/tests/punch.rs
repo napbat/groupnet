@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::link::{LinkLifecycle, LinkProvider};
@@ -12,7 +13,6 @@ use groupnet_transport_punch::{
     MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, PunchLink, PunchTransport,
     Rendezvous,
 };
-use groupnet_transport_router::{Router, RouterConfig};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 

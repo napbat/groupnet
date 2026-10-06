@@ -86,8 +86,8 @@ requirements, so they're separate traits bound to separate physical connections.
 | [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) | persistent TCP messages, TCP streams, and `TcpLink` registration |
 | [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | control | transport(link), core, tokio | native named pipes/Unix sockets and `IpcLink` registration |
 | [`groupnet-transport-punch`](crates/groupnet-transport-punch) | control | transport(link), core, tokio, ring | authenticated UDP discovery/punching/relay and `PunchLink` registration |
-| [`groupnet-transport-router`](crates/groupnet-transport-router) | both | transport(bulk, link), tokio, rustls, ring | protocol-independent group-network routing and pinned end-to-end TLS streams |
-| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), transport-router, tokio | non-generic managed `Node`, group actors, and `FileGrantStore` |
+| [`groupnet-network`](crates/groupnet-network) | both | transport(bulk, link), tokio, rustls, ring | protocol-independent group-network routing and pinned end-to-end TLS streams |
+| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), network, tokio | non-generic managed `Node`, group actors, and `FileGrantStore` |
 | [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff`)* | core, runtime, tokio(sync) *(+handoff feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; the opt-in `handoff` tier is the one piece that reaches the data plane, to pull a covering snapshot a gap cannot replay |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
@@ -102,13 +102,18 @@ coordination. `groupnet-transport` without features and `groupnet` with
 `default-features = false` retain their dependency-free core surface. Protocol
 implementations never enter `groupnet-core`.
 
+`groupnet-network` implements routed networks independently of the transport
+contracts and protocol implementations. The facade exposes it as
+`groupnet::network`; `groupnet::transport` keeps the shared contracts and protocol
+bindings.
+
 The same core runs under both drivers: `groupnet-runtime` across threads in
 production, `groupnet-sim` in a single-threaded, reproducible event loop for
 tests.
 
 Most consumers pull the single `groupnet` facade, which mirrors each layer as a
 module — `groupnet::core`, `groupnet::transport` (with the `mem` / `udp` / `tcp` /
-`bulk` bindings nested under it), `groupnet::transport::router`, `groupnet::runtime`,
+`bulk` bindings nested under it), `groupnet::network`, `groupnet::runtime`,
 `groupnet::rpc`, and `groupnet::sim` — so you write
 `groupnet::transport::Transport`, never the underlying crate name.
 

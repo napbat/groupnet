@@ -41,9 +41,9 @@ use groupnet_consistency::{
     Commit, CommitLedger, Completeness, Fence, HostedError, HostedRead, HostedReads, HostedWrites,
 };
 use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{Group, GroupProfile, Node, Role};
 use groupnet_transport_mem::{MemLink, Network};
-use groupnet_transport_router::RouterConfig;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 

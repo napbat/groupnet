@@ -1,5 +1,5 @@
 [package]
-name = "groupnet-transport-router"
+name = "groupnet-network"
 description = "Protocol-independent group-network routing and end-to-end encrypted streams."
 version.workspace = true
 edition.workspace = true

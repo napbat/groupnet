@@ -42,36 +42,36 @@ without the node's membership actors.
 
 Arrows mean **depends on**, not packet flow. This is the relevant production
 subgraph, not an exhaustive workspace/dependency listing. Runtime always depends
-on the router; disabling the facade's default features keeps the core-only surface.
+on the network layer; disabling the facade's default features keeps the core-only surface.
 
 ```mermaid
 flowchart TB
     Facade["groupnet\nFeature-selected facade"]
     Runtime["groupnet-runtime\nNode and Group actors"]
-    Router["groupnet-transport-router\nRouting and TLS tunnels"]
+    Network["groupnet-network\nRouting and TLS tunnels"]
     Protocols["Protocol implementation crates\nTCP, UDP, memory, IPC, punch"]
     Shared["groupnet-transport\nTransport + optional bulk and link contracts"]
     Core["groupnet-core\nSans-IO coordination"]
     Sim["groupnet-sim\nDeterministic simulation"]
     Facade --> Runtime
-    Facade --> Router
+    Facade --> Network
     Facade --> Protocols
-    Runtime --> Router
+    Runtime --> Network
     Runtime --> Shared
     Runtime --> Core
-    Router --> Shared
-    Router --> Core
+    Network --> Shared
+    Network --> Core
     Protocols --> Shared
     Protocols --> Core
     Shared --> Core
     Sim --> Core
 ```
 
-There is deliberately **no router-to-protocol dependency**. A protocol implements
+There is deliberately **no network-to-protocol dependency**. A protocol implements
 `LinkProvider` in its own crate; an application registers it without editing a
 router enum or match. IPC and punching are independent implementation crates,
-not modules owned by the router. `groupnet-core` never depends on Tokio, a clock,
-or a transport implementation.
+not modules owned by the network layer. `groupnet-core` never depends on Tokio,
+a clock, or a transport implementation.
 
 ## 3. One pure engine, two execution environments
 
@@ -151,7 +151,7 @@ those stronger guarantees are required.
 - [Workspace architecture and feature selection](../README.md#workspace-layout)
 - [Managed node initialization](../crates/groupnet-runtime/src/node/builder.rs)
 - [Shared registration contracts](../crates/groupnet-transport/src/link.rs)
-- [Network ownership and standalone binding](../crates/groupnet-transport-router/src/config.rs)
+- [Network ownership and standalone binding](../crates/groupnet-network/src/config.rs)
 - [Group engine membership and anti-entropy](../crates/groupnet-core/src/engine/state.rs)
 - [Metadata-based inter-group routing](../crates/groupnet-runtime/src/routing.rs)
 - [Group operation batching](../crates/groupnet-runtime/src/group.rs)

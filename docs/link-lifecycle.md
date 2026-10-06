@@ -144,7 +144,7 @@ routers.
 
 - [Node builder and startup](../crates/groupnet-runtime/src/node/builder.rs)
 - [Clone-facing network API](../crates/groupnet-runtime/src/network.rs)
-- [Startup rollback and shared network lifetime](../crates/groupnet-transport-router/src/config.rs)
+- [Startup rollback and shared network lifetime](../crates/groupnet-network/src/config.rs)
 - [Provider, driver, and lifecycle contracts](../crates/groupnet-transport/src/link.rs)
 - [Concrete packet worker](../crates/groupnet-transport/src/link/worker.rs)
-- [Router registration and close synchronization](../crates/groupnet-transport-router/src/router.rs)
+- [Router registration and close synchronization](../crates/groupnet-network/src/router.rs)

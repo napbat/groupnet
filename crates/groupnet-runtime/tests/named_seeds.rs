@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{NamedSeeds, Node, ResolveFuture, SeedEvent, SeedResolver};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport_mem::{MemLink, Network};
-use groupnet_transport_router::RouterConfig;
 use groupnet_transport_udp::UdpTransport;
 
 /// The re-resolution cadence under test: short, so healing is quick.

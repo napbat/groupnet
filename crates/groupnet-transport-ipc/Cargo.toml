@@ -14,7 +14,7 @@ tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time", 
 tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
-groupnet-transport-router.workspace = true
+groupnet-network.workspace = true
 ring.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }

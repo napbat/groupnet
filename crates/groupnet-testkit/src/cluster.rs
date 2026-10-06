@@ -14,9 +14,9 @@ use std::fmt;
 use std::time::Duration;
 
 use groupnet_core::{GroupId, NodeId};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{Group, GroupProfile, Node};
 use groupnet_transport_mem::{MemLink, Network};
-use groupnet_transport_router::RouterConfig;
 
 /// [`POLL_INTERVAL`] in milliseconds — the single literal both the interval and
 /// the default budget are built from, so neither can drift from the other.

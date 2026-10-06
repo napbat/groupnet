@@ -175,8 +175,8 @@ cargo check -p groupnet-transport --no-default-features
 cargo test -p groupnet --features tcp-msg
 cargo test -p groupnet-runtime --features dns
 cargo clippy -p groupnet-runtime -p groupnet --all-targets --features groupnet-runtime/dns,groupnet/dns,groupnet/udp -- -D warnings
-cargo test -p groupnet-transport-router -p groupnet-runtime
-cargo clippy -p groupnet-transport-router -p groupnet-runtime -p groupnet --all-targets -- -D warnings
+cargo test -p groupnet-network -p groupnet-runtime
+cargo clippy -p groupnet-network -p groupnet-runtime -p groupnet --all-targets -- -D warnings
 cargo test --workspace --features groupnet/ipc,groupnet/punch,groupnet/udp,groupnet/tcp-msg
 cargo clippy --workspace --all-targets --features groupnet/ipc,groupnet/punch,groupnet/udp,groupnet/tcp-msg -- -D warnings
 cargo test -p groupnet-consistency --features acks

@@ -48,10 +48,10 @@ use groupnet_consistency::{
     advertised_head_named,
 };
 use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster, placement};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{Group, GroupProfile, Node, Role};
 use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, MemLink, Network};
-use groupnet_transport_router::RouterConfig;
 use tokio::sync::mpsc;
 
 /// The hosted group: one shard's worth of records.

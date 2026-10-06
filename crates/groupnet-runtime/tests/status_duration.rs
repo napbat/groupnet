@@ -26,12 +26,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use groupnet_core::{Config, NodeId, Status};
+use groupnet_network::RouterConfig;
 use groupnet_runtime::{BoundedRosterError, Group, Node};
 use groupnet_testkit::cluster::{MemCluster, converged_within, eventually_within};
 use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
 use groupnet_transport_mem::{MemTransport, Network};
-use groupnet_transport_router::RouterConfig;
 
 /// The poll budget for these assertions: a genuine regression reports in a few
 /// seconds rather than riding the harness default out.

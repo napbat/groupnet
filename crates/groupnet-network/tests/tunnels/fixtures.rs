@@ -10,14 +10,14 @@ use std::{
 };
 
 use groupnet_core::NodeId;
+use groupnet_network::{
+    Router, RouterConfig,
+    tunnel::{PeerIdentity, TlsIdentity, TunnelTransport},
+};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::link::LinkConfig;
 use groupnet_transport::{Inbound, Transport};
 use groupnet_transport_mem::{MemTransport, Network};
-use groupnet_transport_router::{
-    Router, RouterConfig,
-    tunnel::{PeerIdentity, TlsIdentity, TunnelTransport},
-};
 use groupnet_transport_tcp::TcpMsgTransport;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,

@@ -4,11 +4,11 @@ use std::io;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
+use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::link::{LinkLifecycle, LinkProvider, PeerEndpoint};
 use groupnet_transport_ipc::{IpcAddress, IpcLink, IpcTransport, MAX_FRAME};
-use groupnet_transport_router::{Router, RouterConfig};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;

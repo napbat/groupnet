@@ -1,11 +1,11 @@
 //! Groupnet initialization owns routing and heterogeneous connection lifetimes.
 
 use groupnet_core::NodeId;
+use groupnet_network::RouterConfig;
 use groupnet_runtime::Node;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport_mem::{MemLink, Network};
-use groupnet_transport_router::RouterConfig;
 use std::io;
 use std::time::Duration;
 
