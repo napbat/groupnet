@@ -48,6 +48,54 @@ impl TunneledStream {
         }
     }
 
+    /// Derives session key material from the authenticated TLS 1.3 exporter.
+    ///
+    /// Both peers obtain the same bytes for the same label, context and output
+    /// length. Use a protocol-specific label and bind the negotiated session ID,
+    /// policy and direction into the context; never reuse exported keys or
+    /// nonces across directions. This exposes no certificate private key.
+    ///
+    /// # Errors
+    /// Returns an error if the session was revoked or cancelled, or TLS rejects
+    /// the exporter request.
+    pub fn export_keying_material(
+        &self,
+        output: &mut [u8],
+        label: &[u8],
+        context: Option<&[u8]>,
+    ) -> io::Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "tunnel cancelled or peer revoked",
+            ));
+        }
+        match self.inner.get_ref() {
+            TlsStream::Client(stream) => stream
+                .get_ref()
+                .1
+                .export_keying_material(output, label, context)
+                .map(|_| ()),
+            TlsStream::Server(stream) => stream
+                .get_ref()
+                .1
+                .export_keying_material(output, label, context)
+                .map(|_| ()),
+        }
+        .map_err(io::Error::other)
+    }
+
+    /// Returns this stream's cancellation token.
+    ///
+    /// Revocation, node shutdown and stream drop notify the token. Cancelling it
+    /// terminates only this session, not the shared transport or other streams.
+    /// Secure datagram protocols must retain the control stream and bind their
+    /// session lifetime to this token so exported keys cannot outlive admission.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         if self.cancelled.as_mut().poll(cx).is_ready() {
             Err(io::Error::new(

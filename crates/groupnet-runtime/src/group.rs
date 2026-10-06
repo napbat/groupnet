@@ -10,6 +10,8 @@ use crate::driver::{
     StatusesSnapshot, now_since,
 };
 
+mod messaging;
+
 /// A local command could not be enqueued: the group actor's bounded inbox is
 /// full (sustained overload) or the actor has shut down. Callers retry after a
 /// beat or treat it as the group being gone.
@@ -265,6 +267,7 @@ pub struct Group {
     /// `status_since` stamp and a read taken here share one clock.
     start: Instant,
     tx: mpsc::Sender<Event>,
+    messaging: crate::messaging::GroupMessaging,
     coord_rx: watch::Receiver<Option<NodeId>>,
     leadership_rx: watch::Receiver<Leadership>,
     meta_rx: watch::Receiver<MetaSnapshot>,
@@ -283,6 +286,7 @@ impl Group {
         start: Instant,
         tx: mpsc::Sender<Event>,
         views: GroupViews,
+        messaging: crate::messaging::GroupMessaging,
     ) -> Self {
         Self {
             id,
@@ -290,6 +294,7 @@ impl Group {
             config,
             start,
             tx,
+            messaging,
             coord_rx: views.coordinator,
             leadership_rx: views.leadership,
             meta_rx: views.metadata,

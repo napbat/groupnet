@@ -21,7 +21,10 @@ use tokio::sync::broadcast;
 
 mod builder;
 mod discovery;
+mod messaging;
+mod protocols;
 pub use builder::NodeBuilder;
+pub use protocols::{Endpoint, Messages, Ordered, Peer, PeerImplementation, Unordered};
 
 /// The reserved group every node joins to disseminate the inter-group routing
 /// table. Its metadata holds `owner:<resource>` and `coord:<group>` entries.
@@ -281,6 +284,14 @@ struct Inner {
     transport: Arc<Router>,
     seeds: Vec<NodeId>,
     config: Config,
+    messaging: crate::messaging::Hub,
+    ordered: Mutex<Option<groupnet_streams::OrderedProtocol>>,
+    unordered: Mutex<
+        Option<(
+            groupnet_streams::UnorderedConfig,
+            Option<groupnet_streams::UnorderedProtocol>,
+        )>,
+    >,
     /// Joined groups (handle + inbox). Holding the `Group` makes `join_group`
     /// idempotent: a repeat join returns the existing handle instead of
     /// spawning a second, orphaned actor for the same group.
@@ -594,6 +605,7 @@ impl Node {
                 net_stats: net_stats_rx,
                 events: events_tx,
             },
+            self.inner.messaging.group(),
         )
     }
 }

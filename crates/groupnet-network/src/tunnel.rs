@@ -8,11 +8,19 @@
 //! setup expires after ten seconds, while healthy idle sessions use heartbeats.
 //! Revocation invalidates active and queued streams. Re-admission creates a new
 //! admission generation and cannot restore an old stream's credentials.
+//!
+//! Pinned TLS authenticates the protocol-tagged setup preamble before delivery:
+//! bulk ordered streams and secure datagram session controls have independent
+//! bounded accept queues. Unknown namespaces fail closed. Exported session keys
+//! remain tied to the retained control stream's admission and cancellation.
 
 mod reliable;
 mod stream;
 mod tls;
 mod wire;
+
+#[cfg(test)]
+mod tests;
 
 use std::{
     collections::HashMap,
@@ -42,7 +50,9 @@ const MAX_PEERS: usize = 128;
 const MAX_SESSIONS: usize = 64;
 const PER_PEER: usize = 8;
 const SETUP: Duration = Duration::from_secs(10);
-const PREAMBLE: &[u8; 11] = b"GN-TUNNEL-1";
+const PREAMBLE: &[u8; 11] = b"GN-TUNNEL-2";
+const ORDERED: u16 = 1;
+const CONTROL: u16 = 2;
 
 #[derive(Debug)]
 struct Admission {
@@ -74,6 +84,8 @@ struct Inner {
     state: Mutex<State>,
     incoming: mpsc::Sender<Accepted>,
     accepts: AsyncMutex<mpsc::Receiver<Accepted>>,
+    control_incoming: mpsc::Sender<Accepted>,
+    control_accepts: AsyncMutex<mpsc::Receiver<Accepted>>,
     cancel: CancellationToken,
     tasks: TaskTracker,
 }
@@ -108,7 +120,7 @@ impl TunnelTransport {
         if peers.len() > MAX_PEERS {
             return Err(error(io::ErrorKind::InvalidInput, "too many TLS peers"));
         }
-        let cancel = router.cancellation().child_token();
+        let cancel = router.cancellation();
         let mut state = State::default();
         for peer in peers {
             let node = peer.node.clone();
@@ -128,12 +140,15 @@ impl TunnelTransport {
         }
         router.claim_tunnels()?;
         let (incoming, accepts) = mpsc::channel(32);
+        let (control_incoming, control_accepts) = mpsc::channel(32);
         let inner = Arc::new(Inner {
             router: router.clone(),
             identity,
             state: Mutex::new(state),
             incoming,
             accepts: AsyncMutex::new(accepts),
+            control_incoming,
+            control_accepts: AsyncMutex::new(control_accepts),
             cancel: cancel.clone(),
             tasks: TaskTracker::new(),
         });
@@ -186,6 +201,35 @@ impl TunnelTransport {
         true
     }
 
+    /// Connects an authenticated session-setup channel, isolated from bulk streams.
+    ///
+    /// This channel is for secure datagram session negotiation and exporter key
+    /// derivation, not the unordered payload plane. The namespace is exchanged
+    /// inside pinned TLS before either endpoint receives the stream.
+    ///
+    /// # Errors
+    /// Returns an error for missing admission, capacity, failed authentication,
+    /// revocation, shutdown, or the bounded setup deadline.
+    pub async fn connect_control(&self, to: &NodeId) -> io::Result<TunneledStream> {
+        self.connect_namespace(to, CONTROL).await
+    }
+
+    /// Accepts only authenticated session-setup channels, never bulk streams.
+    ///
+    /// # Errors
+    /// Returns an error when the transport closes or its state lock is poisoned.
+    pub async fn accept_control(&self) -> io::Result<(NodeId, TunneledStream)> {
+        self.accept_namespace(&self.inner.control_accepts).await
+    }
+
+    /// Returns a child token notified by transport or node shutdown.
+    ///
+    /// Cancelling the returned token does not close the shared transport.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.inner.cancel.child_token()
+    }
+
     /// Cancels sessions and queued accepts, then waits for all owned tasks to stop.
     pub async fn close(&self) {
         {
@@ -197,6 +241,10 @@ impl TunnelTransport {
         self.inner.accepts.lock().await.close();
         let mut queue = self.inner.accepts.lock().await;
         while queue.try_recv().is_ok() {}
+        drop(queue);
+        let mut queue = self.inner.control_accepts.lock().await;
+        queue.close();
+        while queue.try_recv().is_ok() {}
     }
 }
 
@@ -205,6 +253,16 @@ impl BulkTransport for TunnelTransport {
     type Stream = TunneledStream;
 
     async fn connect(&self, to: &NodeId) -> io::Result<Self::Stream> {
+        self.connect_namespace(to, ORDERED).await
+    }
+
+    async fn accept(&self) -> io::Result<(NodeId, Self::Stream)> {
+        self.accept_namespace(&self.inner.accepts).await
+    }
+}
+
+impl TunnelTransport {
+    async fn connect_namespace(&self, to: &NodeId, namespace: u16) -> io::Result<TunneledStream> {
         let admission = self
             .inner
             .state
@@ -238,6 +296,7 @@ impl BulkTransport for TunnelTransport {
                 connection.alpn_protocol(),
             )?;
             tls.write_all(PREAMBLE).await?;
+            tls.write_all(&namespace.to_be_bytes()).await?;
             tls.flush().await?;
             let mut reply = [0; PREAMBLE.len()];
             tls.read_exact(&mut reply).await?;
@@ -245,6 +304,14 @@ impl BulkTransport for TunnelTransport {
                 return Err(error(
                     io::ErrorKind::InvalidData,
                     "invalid authenticated preamble",
+                ));
+            }
+            let mut reply_namespace = [0; 2];
+            tls.read_exact(&mut reply_namespace).await?;
+            if u16::from_be_bytes(reply_namespace) != namespace {
+                return Err(error(
+                    io::ErrorKind::InvalidData,
+                    "invalid tunnel namespace",
                 ));
             }
             ensure_admitted(&self.inner, &admission)?;
@@ -264,10 +331,13 @@ impl BulkTransport for TunnelTransport {
         result
     }
 
-    async fn accept(&self) -> io::Result<(NodeId, Self::Stream)> {
+    async fn accept_namespace(
+        &self,
+        accepts: &AsyncMutex<mpsc::Receiver<Accepted>>,
+    ) -> io::Result<(NodeId, TunneledStream)> {
         let mut queue = tokio::select! {
             () = self.inner.cancel.cancelled() => return Err(closed()),
-            queue = self.inner.accepts.lock() => queue,
+            queue = accepts.lock() => queue,
         };
         loop {
             let accepted = tokio::select! {
@@ -446,13 +516,25 @@ async fn authenticate_inbound(
                 "invalid authenticated preamble",
             ));
         }
-        tls.write_all(PREAMBLE).await?;
-        tls.flush().await?;
+        let mut namespace = [0; 2];
+        tls.read_exact(&mut namespace).await?;
         let inner = weak.upgrade().ok_or_else(closed)?;
+        let incoming = match u16::from_be_bytes(namespace) {
+            ORDERED => &inner.incoming,
+            CONTROL => &inner.control_incoming,
+            _ => {
+                return Err(error(
+                    io::ErrorKind::InvalidData,
+                    "unknown tunnel namespace",
+                ));
+            }
+        };
         ensure_admitted(&inner, &admission)?;
+        tls.write_all(PREAMBLE).await?;
+        tls.write_all(&namespace).await?;
+        tls.flush().await?;
         let stream = TunneledStream::new(TlsStream::Server(tls), cancel.clone(), sent);
-        inner
-            .incoming
+        incoming
             .try_send(Accepted { admission, stream })
             .map_err(|_| error(io::ErrorKind::WouldBlock, "TLS accept queue full"))
     };

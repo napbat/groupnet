@@ -28,7 +28,10 @@ impl Node {
     /// Closes connections across all node clones and drains owned network tasks.
     /// Group handles may remain readable, but cannot exchange further messages.
     pub async fn close(&self) {
+        self.shutdown_protocols();
         self.network.close().await;
+        self.close_messaging().await;
+        self.close_protocols().await;
     }
 }
 

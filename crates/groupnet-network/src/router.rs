@@ -1,7 +1,10 @@
 //! Router lifecycle, typed links, path-vector learning, and packet forwarding.
 
 mod adapters;
+mod protocol;
 mod routing;
+
+pub use protocol::{ProtocolId, ProtocolIo};
 
 #[cfg(test)]
 mod tests;
@@ -23,6 +26,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{SessionId, SessionRegistry};
 use groupnet_transport::link::{AdmittedInbound, BoundLink, LinkConfig, LinkControl};
@@ -169,6 +173,18 @@ struct AdvertisedRoute {
     frame: Arc<[u8]>,
 }
 
+/// Opaque application-plane packet, separate from coordination and tunnel traffic.
+///
+/// The router attributes the origin to its trusted fabric, without authenticating
+/// application identities or interpreting payloads, receipts, or retry semantics.
+#[derive(Debug)]
+pub struct ApplicationPacket {
+    /// Original routed sender, not the forwarding neighbor.
+    pub from: NodeId,
+    /// Complete owned opaque application packet bytes.
+    pub payload: Bytes,
+}
+
 struct Shared {
     local: NodeId,
     config: RouterConfig,
@@ -176,6 +192,7 @@ struct Shared {
     events: mpsc::Sender<Event>,
     messages: mpsc::Sender<Inbound>,
     tunnels: mpsc::Sender<Inbound>,
+    protocols: Mutex<protocol::Registry>,
     advertisements: watch::Sender<Arc<Vec<AdvertisedRoute>>>,
     reachable: watch::Sender<Arc<Vec<NodeId>>>,
     cancel: CancellationToken,
@@ -251,6 +268,7 @@ impl Router {
             messages,
             tunnels,
             advertisements,
+            protocols: Mutex::new(protocol::Registry::default()),
             reachable,
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -444,6 +462,12 @@ impl Router {
         self.inner.shared.cancel.cancel();
     }
 
+    /// Whether shared router shutdown has been initiated.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.shared.cancel.is_cancelled()
+    }
+
     /// Waits for shutdown to be initiated, without waiting for tasks to drain.
     pub async fn cancelled(&self) {
         self.inner.shared.cancel.cancelled().await;
@@ -489,8 +513,25 @@ impl Router {
             })
     }
 
-    pub(crate) fn cancellation(&self) -> CancellationToken {
-        self.inner.shared.cancel.clone()
+    /// Exclusively binds a bounded application protocol namespace.
+    ///
+    /// Registration is shared by clones and released on shutdown or last drop.
+    /// Unknown protocol identifiers are discarded at the destination.
+    ///
+    /// # Errors
+    /// Returns `AlreadyExists`, `WouldBlock`, or `NotConnected` for duplicate,
+    /// exhausted, or closed registrations.
+    pub fn bind_protocol(&self, id: ProtocolId) -> io::Result<ProtocolIo> {
+        protocol::bind(self.clone(), id)
+    }
+
+    /// Returns a child token cancelled when this router shuts down.
+    ///
+    /// An endpoint may cancel its token without shutting down the router or another
+    /// endpoint. Keep the token alongside a claimed channel to observe shutdown.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.inner.shared.cancel.child_token()
     }
 }
 

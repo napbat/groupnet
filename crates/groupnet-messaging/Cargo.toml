@@ -1,0 +1,24 @@
+[package]
+name = "groupnet-messaging"
+description = "Opaque application messaging, bounded delivery receipts, and sans-IO codec."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+groupnet-core.workspace = true
+groupnet-network.workspace = true
+bytes.workspace = true
+ring.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+groupnet-transport = { workspace = true, features = ["link"] }
+groupnet-transport-mem.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

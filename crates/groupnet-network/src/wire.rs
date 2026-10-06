@@ -50,6 +50,18 @@ fn take_id(bytes: &mut &[u8]) -> io::Result<NodeId> {
 pub(crate) enum PayloadKind {
     Message,
     Tunnel,
+    Application(u16),
+}
+
+impl PayloadKind {
+    pub(crate) fn header_len(self, from: &NodeId, to: &NodeId) -> usize {
+        let namespace = if matches!(self, Self::Application(_)) {
+            2
+        } else {
+            0
+        };
+        24 + namespace + from.as_str().len() + to.as_str().len()
+    }
 }
 
 pub(crate) enum Frame<'a> {
@@ -68,7 +80,7 @@ pub(crate) enum Frame<'a> {
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> io::Result<Frame<'_>> {
-    if bytes.len() > MAX_FRAME || !bytes.starts_with(b"GNR1") {
+    if bytes.len() > MAX_FRAME || !bytes.starts_with(b"GNR3") {
         return Err(invalid("invalid router frame"));
     }
     let mut body = &bytes[4..];
@@ -91,11 +103,11 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Frame<'_>> {
             return Err(invalid("trailing route bytes"));
         }
         Ok(Frame::Advert { cost, path })
-    } else if kind == 1 || kind == 2 {
-        let kind = if kind == 1 {
-            PayloadKind::Message
-        } else {
-            PayloadKind::Tunnel
+    } else if (1..=3).contains(&kind) {
+        let kind = match kind {
+            1 => PayloadKind::Message,
+            2 => PayloadKind::Tunnel,
+            _ => PayloadKind::Application(u16::from_be_bytes(take(&mut body)?)),
         };
         let [hops] = take(&mut body)?;
         if hops == 0 || usize::from(hops) > MAX_HOPS {
@@ -118,7 +130,7 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Frame<'_>> {
 }
 
 pub(crate) fn advert(cost: u32, path: &[NodeId]) -> Vec<u8> {
-    let mut bytes = b"GNR1\0".to_vec();
+    let mut bytes = b"GNR3\0".to_vec();
     bytes.extend_from_slice(&cost.to_be_bytes());
     bytes.push(u8::try_from(path.len()).expect("bounded route"));
     for node in path {
@@ -135,13 +147,16 @@ pub(crate) fn data(
     to: &NodeId,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut bytes =
-        Vec::with_capacity(24 + from.as_str().len() + to.as_str().len() + payload.len());
-    bytes.extend_from_slice(b"GNR1");
+    let mut bytes = Vec::with_capacity(kind.header_len(from, to) + payload.len());
+    bytes.extend_from_slice(b"GNR3");
     bytes.push(match kind {
         PayloadKind::Message => 1,
         PayloadKind::Tunnel => 2,
+        PayloadKind::Application(_) => 3,
     });
+    if let PayloadKind::Application(id) = kind {
+        bytes.extend_from_slice(&id.to_be_bytes());
+    }
     bytes.push(hops);
     bytes.extend_from_slice(&id);
     put_id(&mut bytes, from);
@@ -172,7 +187,7 @@ impl Reassembly {
     ) -> Option<Vec<u8>> {
         self.pending
             .retain(|_, entry| entry.created.elapsed() < Duration::from_secs(3));
-        if bytes.starts_with(b"GNR1") {
+        if bytes.starts_with(b"GNR3") {
             return (bytes.len() <= MAX_FRAME).then_some(bytes);
         }
         if !bytes.starts_with(b"GNF1") || bytes.len() <= FRAGMENT {
@@ -265,5 +280,89 @@ impl Iterator for Fragments {
         packet.extend_from_slice(part);
         self.index += 1;
         Some(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_payload_kind_preserves_its_exact_boundary_when_decoded_and_forwarded() {
+        for length in [1, 255] {
+            let from = NodeId::new("f".repeat(length));
+            let to = NodeId::new("t".repeat(length));
+            for (kind, overhead) in [
+                (PayloadKind::Message, 24),
+                (PayloadKind::Tunnel, 24),
+                (PayloadKind::Application(42), 26),
+            ] {
+                let payload = vec![7; MAX_FRAME - 2 * length - overhead];
+                let envelope = data(kind, 16, [4; 16], &from, &to, &payload);
+                assert_eq!(kind.header_len(&from, &to), overhead + 2 * length);
+                assert_eq!(envelope.len(), MAX_FRAME);
+                let Frame::Data {
+                    kind: decoded_kind,
+                    hops,
+                    id,
+                    from: decoded_from,
+                    to: decoded_to,
+                    payload: decoded_payload,
+                } = decode(&envelope).unwrap()
+                else {
+                    panic!("expected routed data");
+                };
+                assert_eq!(decoded_kind, kind);
+                assert_eq!(decoded_from, from);
+                assert_eq!(decoded_to, to);
+                assert_eq!(decoded_payload, payload);
+                let mut forwarded = data(
+                    decoded_kind,
+                    hops - 1,
+                    id,
+                    &decoded_from,
+                    &decoded_to,
+                    decoded_payload,
+                );
+                assert_eq!(forwarded.len(), MAX_FRAME);
+                assert!(matches!(
+                    decode(&forwarded),
+                    Ok(Frame::Data { hops: 15, .. })
+                ));
+                forwarded.push(7);
+                assert!(decode(&forwarded).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_application_envelope_rejects_old_versions_and_unknown_kinds() {
+        let from = NodeId::new("f".repeat(255));
+        let to = NodeId::new("t".repeat(255));
+        // Exercise the full routing bound without interpreting an application codec.
+        let payload = vec![7; MAX_FRAME - from.as_str().len() - to.as_str().len() - 26];
+        let mut envelope = data(
+            PayloadKind::Application(42),
+            16,
+            [4; 16],
+            &from,
+            &to,
+            &payload,
+        );
+        assert_eq!(envelope.len(), MAX_FRAME);
+        assert!(matches!(
+            decode(&envelope),
+            Ok(Frame::Data {
+                kind: PayloadKind::Application(42),
+                ..
+            })
+        ));
+        envelope[..4].copy_from_slice(b"GNR1");
+        assert!(decode(&envelope).is_err());
+        envelope[..4].copy_from_slice(b"GNR2");
+        assert!(decode(&envelope).is_err());
+        envelope[..4].copy_from_slice(b"GNR3");
+        envelope[4] = 4;
+        assert!(decode(&envelope).is_err());
     }
 }

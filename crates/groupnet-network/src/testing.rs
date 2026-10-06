@@ -17,7 +17,7 @@ pub fn message_payload(frame: &[u8]) -> Option<&[u8]> {
         } => Some(payload),
         Frame::Advert { .. }
         | Frame::Data {
-            kind: PayloadKind::Tunnel,
+            kind: PayloadKind::Tunnel | PayloadKind::Application(_),
             ..
         } => None,
     }

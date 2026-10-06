@@ -19,6 +19,8 @@ groupnet-transport-udp = { path = "crates/groupnet-transport-udp", version = "0.
 # exactly one plane; direct dependents get both planes by default anyway.
 groupnet-transport-tcp = { path = "crates/groupnet-transport-tcp", version = "0.1.0", default-features = false }
 groupnet-network = { path = "crates/groupnet-network", version = "0.1.0" }
+groupnet-messaging = { path = "crates/groupnet-messaging", version = "0.1.0" }
+groupnet-streams = { path = "crates/groupnet-streams", version = "0.1.0" }
 groupnet-transport-ipc = { path = "crates/groupnet-transport-ipc", version = "0.1.0" }
 groupnet-transport-punch = { path = "crates/groupnet-transport-punch", version = "0.1.0" }
 groupnet-runtime = { path = "crates/groupnet-runtime", version = "0.1.0" }

@@ -5,13 +5,17 @@ use std::io;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Instant;
 
+use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::Inbound;
 use groupnet_transport::link::AdmittedInbound;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use super::{AdvertisedRoute, Candidate, Event, Queued, Route, Shared, Table, TransportId, closed};
+use super::{
+    AdvertisedRoute, ApplicationPacket, Candidate, Event, Queued, Route, Shared, Table,
+    TransportId, closed,
+};
 use crate::wire::{self, Frame, PayloadKind, Reassembly};
 
 impl Shared {
@@ -26,21 +30,38 @@ impl Shared {
         if self.cancel.is_cancelled() {
             return Err(closed());
         }
-        if !wire::id_valid(to)
-            || payload.len() + self.local.as_str().len() + to.as_str().len() + 24 > wire::MAX_FRAME
+        if !wire::id_valid(to) || payload.len() > wire::MAX_FRAME - kind.header_len(&self.local, to)
         {
             return Err(wire::invalid("routed message exceeds bound"));
         }
         if to == &self.local {
-            let queue = if kind == PayloadKind::Message {
-                &self.messages
+            if let PayloadKind::Application(id) = kind {
+                self.protocols
+                    .lock()
+                    .map_err(|_| io::Error::other("protocol registry poisoned"))?
+                    .deliver(
+                        id,
+                        ApplicationPacket {
+                            from: self.local.clone(),
+                            payload: Bytes::copy_from_slice(payload),
+                        },
+                    )?;
             } else {
-                &self.tunnels
-            };
-            let _ = queue.try_send(Inbound {
-                from: self.local.clone(),
-                msg: payload.to_vec(),
-            });
+                let queue = if kind == PayloadKind::Message {
+                    &self.messages
+                } else {
+                    &self.tunnels
+                };
+                let _ = queue.try_send(Inbound {
+                    from: self.local.clone(),
+                    msg: payload.to_vec(),
+                });
+            }
+        } else if matches!(kind, PayloadKind::Application(_)) {
+            self.forward_application(
+                to,
+                wire::data(kind, 16, self.id(), &self.local, to, payload).into(),
+            )?;
         } else {
             self.forward(
                 to,
@@ -61,6 +82,27 @@ impl Shared {
                 bytes,
             });
         }
+    }
+
+    fn forward_application(&self, to: &NodeId, bytes: Arc<[u8]>) -> io::Result<()> {
+        let table = self
+            .table
+            .lock()
+            .map_err(|_| io::Error::other("router table poisoned"))?;
+        let candidate = table
+            .candidate(to, self.config.route_ttl)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no application route"))?;
+        let link = table
+            .links
+            .get(&candidate.route.transport)
+            .ok_or_else(closed)?;
+        link.outgoing
+            .try_send(Queued {
+                peer: candidate.route.next_hop.clone(),
+                session: candidate.session,
+                bytes,
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.to_string()))
     }
 
     fn announce(&self) {
@@ -247,15 +289,8 @@ fn process(
                 seen.remove(&old);
             }
             if to == shared.local {
-                let queue = if kind == PayloadKind::Message {
-                    &shared.messages
-                } else {
-                    &shared.tunnels
-                };
-                let _ = queue.try_send(Inbound {
-                    from,
-                    msg: payload.to_vec(),
-                });
+                let offset = bytes.len() - payload.len();
+                deliver(shared, kind, from, bytes, offset);
             } else if shared.config.forwarding && hops > 1 {
                 shared.forward(
                     &to,
@@ -263,5 +298,24 @@ fn process(
                 );
             }
         }
+    }
+}
+
+fn deliver(shared: &Shared, kind: PayloadKind, from: NodeId, bytes: Vec<u8>, offset: usize) {
+    if let PayloadKind::Application(id) = kind {
+        let payload = Bytes::from(bytes).slice(offset..);
+        if let Ok(registry) = shared.protocols.lock() {
+            let _ = registry.deliver(id, ApplicationPacket { from, payload });
+        }
+    } else {
+        let queue = if kind == PayloadKind::Message {
+            &shared.messages
+        } else {
+            &shared.tunnels
+        };
+        let _ = queue.try_send(Inbound {
+            from,
+            msg: bytes[offset..].to_vec(),
+        });
     }
 }

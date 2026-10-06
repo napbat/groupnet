@@ -58,6 +58,45 @@ bytes. This is not a guarantee of availability through arbitrary outages.
 - Route changes select another next hop below the existing authenticated
   session. They do not terminate TLS or restart application delivery.
 
+### Authenticated unordered sessions
+
+`node.endpoint(Unordered::reliable())?` or `Unordered::unreliable()` resolves a
+shared unordered protocol engine behind the generic `Endpoint<P>` handle.
+Pinned TLS is used only for setup and lifetime binding. Its setup accept queues
+are distinct from ordered application accepts and demultiplexed by the bound
+reliable/unreliable policy, so concurrent accepts cannot steal a different
+policy's session. The authenticated `GN-TUNNEL-2` preamble selects the namespace;
+unknown namespaces fail closed. Both peers must resolve the unordered protocol
+and explicitly permit the requested policy in node-wide `UnorderedConfig`;
+there is no silent downgrade. Binding an endpoint or peer opens no connection.
+
+Setup binds a fresh session identity and policy to TLS-exported directional
+ChaCha20-Poly1305 keys. Application messages, ACKs, heartbeats and close records
+travel through routed protocol namespace 2, not through the ordered TLS stream.
+Authenticated headers bind session identity, packet nonce, message identity and
+record kind. Peer checks, directional keys and bounded replay windows prevent
+cross-peer/session substitution and replay acceptance.
+
+Reliable unordered messages retry independently, using the same logical message
+identity and a fresh packet nonce. ACKs mean a bounded destination inbox accepted
+the message; they do not mean application processing or persistence. Lost earlier
+messages do not hold up later arrivals. Sending is bounded by pending capacity,
+the reliable sequence horizon, finite attempts and a deadline; timeout leaves
+acceptance unknown. Unreliable data has no ACK or added retransmission.
+Both modes preserve message boundaries and impose no application delivery order.
+
+The retained control stream ties keys to pinned admission. Revocation, endpoint
+shutdown, final session-handle drop, or liveness expiry cancels affected sessions
+and blocked operations. A replacement session has fresh identity and keys; it
+does not resume an old conversation. Transit peers can still drop, delay or
+reorder traffic and observe routing/traffic metadata.
+
+An unreliable policy does not prohibit underlying TCP links, which retain TCP
+ordering and retransmission. Strict UDP-only route selection and VPN/TUN/game
+adapters are not supplied by this session API.
+See [usage and default bounds](../README.md#typed-message-and-session-protocols).
+
+
 
 ## 2. Peer admission and revocation
 
@@ -181,6 +220,11 @@ sessions remain, rather than remaining inert; callers must explicitly rebind.
 UDP retains its existing rendezvous/discovery lease coupling. Neither TCP control
 nor its relay is automatically TLS-encrypted or an HTTP proxy protocol.
 
+The TCP rendezvous reader paces each admitted connection to 256 frames per
+second using bounded TCP backpressure. A burst of valid tunnel traffic does not
+revoke admission. This includes TLS data and ACK traffic; queues remain bounded,
+and pacing is cancelled when the connection closes.
+
 The following path-selection flow applies with or without a provisioned key:
 
 ```mermaid
@@ -235,6 +279,7 @@ flowchart TB
 | Open dynamic admission | Accepts claimed identities without ownership proof; session binding is not account authentication. |
 | Native punching fabric | Keyed mode authenticates fabric membership; explicit keyless mode does not. |
 | Pinned TLS tunnels | End-to-end endpoint identity and application-byte confidentiality across transit peers. |
+| Authenticated unordered sessions | TLS-pinned setup and directional AEAD datagrams; bounded replay protection, with explicit reliable/unreliable delivery. |
 | Transit bridges | Can observe routing/traffic metadata and deny service. |
 | Application resources | Authorization and exclusive ownership remain the application's responsibility. |
 | Permission groups and private-peer discovery | Not implemented; ordinary coordination groups are not security groups. |
@@ -246,5 +291,6 @@ loopback smoke coverage does not establish those guarantees.
 ## Implementation references
 
 - [Tunnel establishment, admission, revocation, and close](../crates/groupnet-network/src/tunnel.rs)
+- [Typed session protocols and unordered implementation](../crates/groupnet-streams/src/lib.rs)
 - [Native punching implementation crate](../crates/groupnet-transport-punch)
 - [Configuration and public stream API](../README.md#node-owned-heterogeneous-connections)

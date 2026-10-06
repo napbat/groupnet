@@ -29,21 +29,24 @@
 //! # }
 //! ```
 //!
-//! The protocol logic lives entirely in the sans-IO [`groupnet-core`]; this
-//! crate is just the glue that pumps events between the engine and the
-//! transport. Swap the transport (or drive the same core with
-//! [`groupnet-sim`]) without touching a line of coordination logic.
+//! Coordination protocol logic lives entirely in the sans-IO [`groupnet-core`];
+//! [`groupnet-messaging`] owns opaque application frames and their delivery
+//! receipts. This crate drives both through the managed network. Swap the
+//! transport (or drive the same core with [`groupnet-sim`]) without touching
+//! coordination logic.
 //!
 //! [`GroupEngine`]: groupnet_core::GroupEngine
 //! [`Transport`]: groupnet_transport::Transport
 //! [`join_group`]: Node::join_group
 //! [`groupnet-core`]: groupnet_core
+//! [`groupnet-messaging`]: groupnet_messaging
 //! [`groupnet-sim`]: https://docs.rs/groupnet-sim
 
 mod anchor;
 mod capability;
 mod driver;
 mod group;
+pub mod messaging;
 mod network;
 mod node;
 mod routing;
@@ -58,7 +61,14 @@ pub use group::{
     InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
 pub use groupnet_core::{RecoveredGrant, Role, Status};
-pub use node::{GroupProfile, Node, NodeBuilder};
+pub use groupnet_messaging::{MessageProtocol, Messaging};
+pub use groupnet_streams::{
+    SessionProtocol, UnorderedConfig, UnorderedDelivery, UnorderedOptions, UnorderedSession,
+};
+pub use node::{
+    Endpoint, GroupProfile, Messages, Node, NodeBuilder, Ordered, Peer, PeerImplementation,
+    Unordered,
+};
 pub use routing::Routing;
 #[cfg(feature = "dns")]
 pub use seeds::SystemResolver;

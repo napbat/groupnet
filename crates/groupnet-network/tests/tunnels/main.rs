@@ -3,12 +3,14 @@
 mod failover;
 mod fixtures;
 mod native;
+mod protocols;
 
 use std::{io, sync::atomic::Ordering, time::Duration};
 
 use fixtures::{Fabric, credentials};
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
+use groupnet_network as network;
 use groupnet_network::{
     Router, RouterConfig,
     tunnel::{PeerIdentity, TunnelTransport},

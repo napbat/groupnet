@@ -10,8 +10,11 @@ repository.workspace = true
 # Routing and managed link lifecycle are intrinsic to every runtime node.
 [dependencies]
 groupnet-core = { workspace = true }
+groupnet-messaging = { workspace = true }
+groupnet-streams = { workspace = true }
 groupnet-transport = { workspace = true, features = ["bulk", "link"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { workspace = true, features = ["rt"] }
 groupnet-network = { workspace = true }
 
 [features]
@@ -22,6 +25,8 @@ dns = ["tokio/net"]
 
 # Concrete transports are pulled in only to exercise the tests.
 [dev-dependencies]
+rcgen = { workspace = true }
+futures-util = { workspace = true, features = ["io"] }
 groupnet-transport-mem = { workspace = true, features = ["link"] }
 groupnet-transport-udp = { workspace = true }
 groupnet-network = { workspace = true, features = ["test-support"] }

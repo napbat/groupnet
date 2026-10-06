@@ -29,4 +29,6 @@ pub mod testing;
 pub mod tunnel;
 
 pub use config::{Network, NetworkConfig, TunnelConfig};
-pub use router::{Route, Router, RouterConfig, TransportId};
+pub use router::{
+    ApplicationPacket, ProtocolId, ProtocolIo, Route, Router, RouterConfig, TransportId,
+};

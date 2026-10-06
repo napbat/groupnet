@@ -87,7 +87,9 @@ requirements, so they're separate traits bound to separate physical connections.
 | [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | control | transport(link), core, tokio | native named pipes/Unix sockets and `IpcLink` registration |
 | [`groupnet-transport-punch`](crates/groupnet-transport-punch) | connectivity | transport admission/session primitives, core, tokio, ring, socket2, if-addrs | native adjacent-node UDP/TCP connections, candidate checks, rendezvous and relay; no transport or router link |
 | [`groupnet-network`](crates/groupnet-network) | both | transport(bulk, link), tokio, rustls, ring | protocol-independent group-network routing and pinned end-to-end TLS streams |
-| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), network, tokio | non-generic managed `Node`, group actors, and `FileGrantStore` |
+| [`groupnet-messaging`](crates/groupnet-messaging) | application packets | core, network, bytes, ring, tokio, tokio-util | static `MessageProtocol`, generic receipt contexts, `Messaging` endpoint, bounded retry/deduplication |
+| [`groupnet-streams`](crates/groupnet-streams) | sessions | core, network, transport(bulk), bytes, ring, futures-util, tokio, tokio-util | static `SessionProtocol`, shared protocol engines, authenticated session policies |
+| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), messaging, streams, network, tokio | non-generic managed `Node`, unsealed `PeerImplementation`, generic `Endpoint<P>` / `Peer<P>`, group actors, receive callbacks/fanout reports, and `FileGrantStore` |
 | [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff`)* | core, runtime, tokio(sync) *(+handoff feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; the opt-in `handoff` tier is the one piece that reaches the data plane, to pull a covering snapshot a gap cannot replay |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
@@ -107,14 +109,22 @@ contracts and protocol implementations. The facade exposes it as
 `groupnet::network`; `groupnet::transport` keeps the shared contracts and protocol
 bindings.
 
+Opaque application packets follow `runtime -> messaging -> network -> transport`.
+`groupnet-messaging` owns the application codec and `BestEffort` / `Delivered` /
+`Applied` acknowledgement state. The router carries opaque application packets
+without decoding their payloads or interpreting receipts. Runtime retains node
+and group receive ownership, callbacks, membership-snapshot fanout, and reports.
+The facade preserves these ergonomic APIs under `groupnet::messaging`; standalone
+routed networks can use `groupnet_messaging::Messaging` directly.
+
 The same core runs under both drivers: `groupnet-runtime` across threads in
 production, `groupnet-sim` in a single-threaded, reproducible event loop for
 tests.
 
 Most consumers pull the single `groupnet` facade, which mirrors each layer as a
 module — `groupnet::core`, `groupnet::transport` (with the `mem` / `udp` / `tcp` /
-`bulk` bindings nested under it), `groupnet::network`, `groupnet::runtime`,
-`groupnet::rpc`, and `groupnet::sim` — so you write
+`bulk` bindings nested under it), `groupnet::network`, `groupnet::messaging`,
+`groupnet::runtime`, `groupnet::rpc`, and `groupnet::sim` — so you write
 `groupnet::transport::Transport`, never the underlying crate name.
 
 ## Example
@@ -183,6 +193,259 @@ let node = Node::builder(NodeId::new("node-a"))
     .start()
     .await?;
 ```
+
+### Application buffers, frames, and callbacks
+
+`Node` and `Group` expose matching buffer and frame APIs:
+
+| Operation | Buffer API | Frame API |
+|---|---|---|
+| Send | `send(..., bytes)` | `send_frame(..., Bytes, SendOptions)` |
+| Manual receive | `recv() -> (MessageContext, Bytes)` | `recv_frame() -> Frame` |
+| Async callback | `on_recv(|context, bytes| async { ... })` | `on_frame(|frame| async { ... })` |
+
+Send/receive operations are awaited and return `io::Result`; callback registration
+returns `io::Result<ReceiveHandle>`. Callbacks return `io::Result<()>`.
+The node send methods take a destination `&NodeId`; group sends resolve recipients.
+
+Applications address a node or group, never an intermediate bridge:
+
+```rust
+use groupnet::messaging::{Bytes, Delivery, SendOptions};
+use std::time::Duration;
+
+// On the receiving node: keep the handle alive while receiving.
+let incoming = receiver.join_group("cache-invalidations");
+let handler = incoming.on_recv(|context, bytes| async move {
+    apply_invalidation(&context.from, &bytes).await?;
+    Ok(()) // Applied is acknowledged only after this returns successfully.
+})?;
+
+// On the sending node:
+let outgoing = sender.join_group("cache-invalidations");
+// Wait for both membership views to converge before sending.
+let report = outgoing.send_frame(
+    Bytes::from_static(b"opaque application bytes"),
+    SendOptions {
+        delivery: Delivery::Applied,
+        timeout: Duration::from_secs(5),
+    },
+).await?;
+for outcome in report.outcomes {
+    outcome.result?; // Every selected recipient has its own result.
+}
+handler.close().await?; // Cancels/drains the callback and releases its inbox.
+```
+
+`apply_invalidation` is application code; Groupnet does not interpret the buffer.
+Manual buffer receives retain the complete message context and receipt:
+
+```rust
+let (context, bytes) = incoming.recv().await?;
+apply_invalidation(&context.from, &bytes).await?;
+drop(bytes); // Moving or dropping the payload does not discard its receipt.
+context.applied()?; // Explicitly acknowledge successful processing.
+```
+
+Use that manual receive after closing the callback handle above. Alternatively,
+receive a full `Frame` with `recv_frame()`, process `frame.payload`, then call
+`frame.applied()?`. These are equivalent lossless representations:
+`frame.into_parts()` moves every field into `(MessageContext, Bytes)` without
+cloning metadata, cloning the receipt, or copying the payload. The context
+retains `id`, original `from` (A, not forwarding bridge B), optional `group`, and
+the receipt; `context.delivery()` reports the requested delivery boundary.
+`context.receipt()` returns a cheap, independent receipt handle, while
+`context.reject(error_kind)?` or `frame.receipt().reject(error_kind)?` explicitly
+rejects processing.
+
+For frame-aware callbacks, use `group.on_frame(|frame| async move { ... })`.
+`Node` provides the same receive and callback variants for node-addressed messages
+(`group` is `None`). Borrowed sends copy into owned storage; `send_frame` takes
+existing `Bytes`, shared across group recipients. Buffer receives/callbacks move
+the existing context and payload without copying them.
+
+Neither manual receive variant automatically acknowledges `Applied`; call
+`context.applied()` or `frame.applied()` after successful processing. Both callback
+variants retain a receipt internally and automatically acknowledge successful
+completion, even if the callback moves or drops the context/frame and payload.
+
+| Delivery | Successful send means |
+|---|---|
+| `BestEffort` (default for `send`) | Locally accepted for routing, not remotely acknowledged |
+| `Delivered` | Destination reserved its bounded application inbox |
+| `Applied` | Destination explicitly acknowledged processing, or its callback returned `Ok(())` |
+
+Groupnet freezes its local live-membership snapshot, excludes self, routes to
+each member, and reports every selected recipient's outcome. Departures do not
+erase failures; later joins do not add recipients or replay prior messages.
+An empty recipient snapshot succeeds with an empty report. Receiver-local
+membership can lag: unjoined groups and unknown/dead group senders are rejected.
+A nonmember bridge forwards without receiving or acknowledging application work.
+
+Node and group inboxes are separate from each other, metadata, coordination,
+and TLS streams. Buffer/frame variants share the same inbox; they do not duplicate
+delivery. Each inbox has one receive owner: `recv`, `recv_frame`, `on_recv`, or
+`on_frame`. Competing owners fail with `WouldBlock`. Callback errors reject the
+frame and stop the worker; observe them through `handler.wait().await`.
+Dropping the handle cancels its worker, including an in-flight callback.
+Cancellation cannot undo side effects and does not acknowledge unfinished work.
+Use `close().await` to drain before switching back to manual receives.
+Network shutdown cancels blocked receives and callbacks.
+
+Bounds: 60,000 payload bytes, 64 queued frames per runtime inbox, at most 32
+concurrent sends per group fanout, and 256 outstanding acknowledged sends per
+node. Acknowledged deadlines must be nonzero and at most 30 seconds. Retries
+retain message identity and use bounded duplicate suppression; timeout means
+**unknown outcome**, not proof of nonexecution. There is no ordering, durability,
+crash recovery, or exactly-once guarantee.
+
+These are **trusted-fabric messages, not encrypted/authenticated application
+channels**. Sender attribution and membership checks trust transit peers.
+Use the existing pinned TLS stream API for confidential/authenticated traffic.
+Metadata still converges as replicated state; Hosted/quorum commits, feeds,
+frontiers, and coherence leases retain their existing separate contracts.
+Sending to a Hosted group does not turn a frame into a quorum commit.
+The routed wire guard is now `GNR3`, and the authenticated tunnel preamble is
+`GN-TUNNEL-2`; upgrade communicating nodes together.
+
+Executable memory A → TCP bridge B → TCP C demonstration:
+
+```bash
+cargo run -p groupnet --example application-messages --features tcp-msg,connectivity
+cargo run -p groupnet --example application-messages --features tcp-msg,connectivity -- --relay-only
+```
+
+The example checks original A attribution across B, group destinations and
+receipt delivery modes for both buffer receive variants. Manual node and group
+buffers acknowledge `Applied` through their contexts after the payload is dropped;
+node and group callbacks demonstrate automatic success acknowledgements.
+
+### Typed message and session protocols
+
+`node.endpoint(implementation)?` returns a generic `Endpoint<P>`;
+`node.peer(id, implementation)?` returns a destination-bound `Peer<P>`.
+`Messages`, `Ordered`, and `Unordered` select the concrete protocol and its
+options once; callers do not retrieve and shuttle raw protocol engines into
+peers. Both constructors resolve the node's shared protocol state internally
+and create no connection. The handles use static dispatch and retain the
+managed node's lifetime. Routes, physical connections, and protocol workers
+remain shared underneath them. There is one public endpoint handle family,
+not separate message/ordered/unordered endpoint types.
+
+| Descriptor | Send/connect contract | Receive surface |
+|---|---|---|
+| `Messages::best_effort()` | Send once, without an application receipt wait | Existing node/group lossless contexts, frames and callbacks |
+| `Messages::delivered(timeout)` / `Messages::applied(timeout)` | Wait for inbox acceptance / application acknowledgement | Existing node/group lossless contexts, frames and callbacks |
+| `Ordered::new()` | Reliable ordered bytes through pinned TLS tunnels | `AsyncRead` / `AsyncWrite` |
+| `Unordered::reliable()` | Independently retry each message until inbox acceptance or a finite deadline | Whole messages; no waiting for an earlier missing message |
+| `Unordered::unreliable()` | Send once, without data ACKs or session-layer retries | Whole messages; loss and reordering permitted |
+
+```rust,ignore
+use groupnet::{Messages, Ordered, Unordered};
+use groupnet::messaging::Bytes;
+use std::time::Duration;
+
+let messages = node.peer(remote.clone(), Messages::best_effort())?;
+messages.send(Bytes::from_static(b"update")).await?;
+
+let applied = node.peer(remote.clone(), Messages::applied(Duration::from_secs(5)))?;
+applied.send(Bytes::from_static(b"process this")).await?;
+
+let ordered = node.peer(remote.clone(), Ordered::new())?;
+let stream = ordered.connect().await?;
+
+let reliable = node.peer(remote.clone(), Unordered::reliable())?;
+let reliable_session = reliable.connect().await?;
+
+let peer = node.peer(remote, Unordered::unreliable())?;
+let session = peer.connect().await?;
+session.send(Bytes::from_static(b"current state")).await?;
+let response = session.recv().await?;
+session.close().await?;
+```
+
+The receiver creates an endpoint for the desired policy and calls
+`node.endpoint(Unordered::reliable())?.accept()` (or `Unordered::unreliable()`).
+It receives the authenticated original `NodeId` and a session exposing
+`delivery()` and `session_id()`. Reliable and unreliable accepts consume
+separate policy queues, so both can run concurrently without stealing each
+other's sessions. Configure node-wide capacity, timers, and
+`allow_reliable` / `allow_unreliable` with `node.configure_unordered(config)?`
+before the protocol is first resolved. Disallowed policies are rejected; there
+is no silent downgrade. Ordered streams arrive through `node.accept()` or
+`node.endpoint(Ordered::new())?.accept()`. The two session protocols do not
+compete for setup traffic.
+
+Both session protocols require configured TLS identity and peer pins. Unordered
+setup derives directional AEAD keys from the pinned TLS exporter; payloads travel
+as authenticated encrypted routed datagrams, **not over the ordered control
+stream**. Reliable unordered success means bounded receiver-inbox acceptance,
+not application processing or durability. A timeout leaves acceptance unknown.
+Replay/deduplication windows are bounded; neither mode promises exactly-once
+application execution or successful delivery across arbitrary outages.
+
+Default unordered limits: 48 KiB per message, 32 queued messages and 32 pending
+sends per session, 64 sessions and eight per peer (also subject to tunnel limits).
+Setup and queued accepts count against the same session limits. Admitted setups
+run concurrently with individual deadlines; a slow peer does not serialize
+every other peer's handshake. Saturated setup capacity fails closed.
+Reliable sends have a ten-second deadline, 100 ms retry interval and 100-attempt
+cap. Healthy held sessions exchange heartbeats; five seconds without fresh
+authenticated traffic expires them. Endpoint limits and timers are configurable.
+Reliable sends return `WouldBlock` if a new logical ID would overtake the oldest
+unresolved send beyond the bounded deduplication horizon, even when a concurrent
+send slot is free. This protects pending retries without imposing receive order.
+TCP paths retain TCP's own ordering/retransmission even for unreliable sessions:
+this policy does not constrain route selection to UDP.
+
+`Node` owns and caches the distinct underlying protocol engines; `Endpoint<P>`
+and `Peer<P>` are handles over that shared state, not new workers. Node-wide
+`UnorderedConfig` is separate from the per-handle delivery/setup options selected
+by `Unordered`; repeated identical configuration is allowed, but conflicting
+protocol configuration returns `InvalidInput`. `Messages::new(SendOptions)` and
+`Unordered::new(UnorderedOptions)` bind explicit per-handle options when the
+convenience constructors are insufficient. `peer.send(bytes)` and
+`peer.connect()` take no options: every operation reuses the bound policy.
+
+For node-addressed messaging without a fixed destination, use
+`node.endpoint(Messages::applied(timeout))?.send(&remote, bytes).await?`.
+Message endpoints expose `recv`, `recv_frame`, `on_recv`, and `on_frame` through
+the same single-owner runtime inbox as `Node`: a competing receive returns
+`WouldBlock`, not a second copy or a frame stolen from the messaging worker.
+The group receive surface remains `Group`'s existing inbox.
+
+Dropping a temporary peer does not cancel a stream retained by the application
+while the node remains alive. Node close, admission revocation, protocol shutdown,
+and last session-handle drop terminate affected sessions. Dropping an endpoint
+handle alone does not close the node; cached protocol state remains owned by it.
+`endpoint.protocol()` exposes the concrete lower-level implementation for
+explicit protocol lifecycle management (`shutdown` / `closed`) or custom
+protocol operations; ordinary sends, receives, connects and accepts use the
+generic handles.
+
+Custom descriptors implement the public, unsealed `PeerImplementation` trait
+exported by `groupnet-runtime` and the `groupnet` facade. Its associated
+`Protocol` and cloneable `Options` types identify the concrete protocol engine
+and bound options; `bind(self, node: &Node)` returns that protocol/options pair as
+an `io::Result`. Custom implementations can resolve shared node resources and
+return their own protocol without changing `Node` or using dynamic dispatch.
+The protocol engine implements the existing unsealed `MessageProtocol` or
+`SessionProtocol` contract; no per-call future boxing is required.
+`MessageProtocol` associates send options and receipt type; `Frame<R>` and
+`MessageContext<R>` retain that receipt without requiring `Clone`.
+`SessionProtocol` associates connect options and the concrete session type;
+there is no byte-IO requirement on message-oriented sessions.
+Register custom routed protocols through `Router::bind_protocol(id)`, obtaining
+bounded `ProtocolIo`. IDs 1 and 2 belong to messaging and unordered datagrams;
+unknown destination namespaces are rejected/dropped, never reinterpreted.
+The router demultiplexes IDs, not application bodies or receipts.
+
+The managed messaging receiver remains owned by the runtime dispatcher: use
+message endpoints, `node.recv()` / `group.recv()`, and callback variants, not a
+competing raw `Messaging::recv()`. Creating a custom peer does not install its
+protocol on the remote node. Application timers decide continuous traffic versus
+periodic polling; neither requires rebuilding a peer or endpoint between sends.
+
 
 ### Node-owned heterogeneous connections
 
@@ -432,9 +695,10 @@ group convergence, and route withdrawal without breaking the memory adjacency.
 With `--upgrade`, A explicitly gains a TCP adapter; routing promotes its admitted
 A-C connection to a one-hop route, then restores transit through B after TCP loss.
 
-The example provisions disposable pinned TLS identities and exchanges application
-bytes through `Node`'s bulk-stream API. The managed node owns `router().recv()`
-for group coordination; applications must not compete for that inbox.
+The example provisions disposable pinned TLS identities and exercises messaging,
+ordered byte streams and both unordered policies over the same bridge.
+The managed node owns `router().recv()` for group coordination; applications
+must not compete for that inbox.
 
 For confidential streams, call
 `.tunnels(TunnelConfig::new(identity, [peer_pin]))` on the node builder with a `TlsIdentity` and

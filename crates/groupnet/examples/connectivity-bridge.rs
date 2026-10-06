@@ -23,6 +23,9 @@ use rcgen::{
     KeyUsagePurpose,
 };
 
+#[path = "connectivity-bridge/protocols.rs"]
+mod protocols;
+
 const WAIT: Duration = Duration::from_secs(20);
 
 #[tokio::main]
@@ -150,6 +153,7 @@ async fn demonstrate(
     println!("PASS: application group converged; route memory-a -> edge-b -> remote-c");
     exchange(a, c, b"request from memory-only application").await?;
     println!("PASS: bidirectional A-C bytes preserve origin; no application forwarding on B");
+    protocols::exchange(a, c).await?;
     if let Some((address, policy)) = upgrade {
         promote(a, c, address, policy).await?;
     }

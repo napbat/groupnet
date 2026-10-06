@@ -139,6 +139,37 @@ pub(super) fn validate_peers(peers: &[NodeId]) -> io::Result<HashSet<NodeId>> {
     Ok(seen)
 }
 
+const FRAMES_PER_SECOND: u16 = 256;
+
+/// Reserves a bounded burst for one connection, then delays its reader rather
+/// than revoking admission. Only one decoded frame waits outside the queues.
+struct ReadBudget {
+    window: tokio::time::Instant,
+    count: u16,
+}
+
+impl ReadBudget {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            window: now,
+            count: 0,
+        }
+    }
+
+    fn ready_at(&mut self, now: tokio::time::Instant) -> tokio::time::Instant {
+        if now >= self.window + Duration::from_secs(1) {
+            self.window = now;
+            self.count = 0;
+        }
+        if self.count == FRAMES_PER_SECOND {
+            self.window += Duration::from_secs(1);
+            self.count = 0;
+        }
+        self.count += 1;
+        self.window.max(now)
+    }
+}
+
 struct Registration {
     node: NodeId,
     session: Token,
@@ -153,8 +184,6 @@ struct Entry {
     registration: Registration,
     writer: mpsc::Sender<Message>,
     cancel: CancellationToken,
-    rate: tokio::time::Instant,
-    count: u16,
 }
 
 enum Event {
@@ -367,8 +396,6 @@ fn join(
             registration,
             writer,
             cancel: peer_cancel,
-            rate: tokio::time::Instant::now(),
-            count: 0,
         },
     );
 }
@@ -398,21 +425,12 @@ fn remove(entries: &mut HashMap<NodeId, Entry>, node: &NodeId, session: Token) {
 }
 
 fn relay(entries: &mut HashMap<NodeId, Entry>, source: &NodeId, session: Token, message: Message) {
-    let Some(sender) = entries.get_mut(source) else {
+    let Some(sender) = entries.get(source) else {
         return;
     };
     if sender.registration.session != session {
         return;
     }
-    if sender.rate.elapsed() >= Duration::from_secs(1) {
-        sender.rate = tokio::time::Instant::now();
-        sender.count = 0;
-    }
-    if sender.count >= 256 {
-        sender.cancel.cancel();
-        return;
-    }
-    sender.count += 1;
     match message {
         Message::Ping => {
             let _ = sender.writer.try_send(Message::Ping);
@@ -474,13 +492,49 @@ async fn read_client(
     node: &NodeId,
     session: Token,
 ) -> io::Result<()> {
+    let mut budget = ReadBudget::new(tokio::time::Instant::now());
     loop {
         let message = tokio::time::timeout(IDLE, wire::read(reader, auth))
             .await
             .map_err(|_| closed())??;
+        // Apply the existing per-connection rate bound as TCP backpressure.
+        // A valid tunnel transfer exceeds a burst through DATA and ACK frames;
+        // cancelling its admission here would strand its reliable FIN.
+        let now = tokio::time::Instant::now();
+        let ready = budget.ready_at(now);
+        if ready > now {
+            tokio::time::sleep_until(ready).await;
+        }
         events
             .send(Event::Frame(node.clone(), session, message))
             .await
             .map_err(|_| closed())?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FRAMES_PER_SECOND, ReadBudget};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn reader_budget_paces_successive_bursts_and_resets_after_idle() {
+        let start = Instant::now();
+        let mut budget = ReadBudget::new(start);
+        for _ in 0..FRAMES_PER_SECOND {
+            assert_eq!(budget.ready_at(start), start);
+        }
+        let second = start + Duration::from_secs(1);
+        assert_eq!(budget.ready_at(start), second);
+        for _ in 1..FRAMES_PER_SECOND {
+            assert_eq!(budget.ready_at(second), second);
+        }
+        assert_eq!(budget.ready_at(second), second + Duration::from_secs(1));
+        let idle = start + Duration::from_secs(10);
+        for _ in 0..FRAMES_PER_SECOND {
+            assert_eq!(budget.ready_at(idle), idle);
+        }
+        assert_eq!(budget.ready_at(idle), idle + Duration::from_secs(1));
     }
 }

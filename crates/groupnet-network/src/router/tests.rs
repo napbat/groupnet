@@ -165,3 +165,125 @@ async fn cancelled_signals_initiation_without_waiting_for_protocol_drain() -> io
         .expect("close task");
     Ok(())
 }
+
+#[tokio::test]
+async fn protocol_namespaces_are_exclusive_isolated_and_generation_safe() -> io::Result<()> {
+    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let application = router.bind_protocol(1)?;
+    let other = router.bind_protocol(2)?;
+    assert_eq!(
+        router.bind_protocol(1).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    application.send(router.local_id(), b"opaque packet")?;
+    other.send(router.local_id(), b"independent")?;
+    let packet = application.recv().await?;
+    assert_eq!(packet.from, *router.local_id());
+    assert_eq!(packet.payload.as_ref(), b"opaque packet");
+    assert_eq!(other.recv().await?.payload.as_ref(), b"independent");
+    assert!(
+        router
+            .inner
+            .messages
+            .try_lock()
+            .unwrap()
+            .try_recv()
+            .is_err()
+    );
+    let stale = application.clone();
+    application.shutdown();
+    assert!(!router.is_closed());
+    assert!(!other.cancellation().is_cancelled());
+    let replacement = router.bind_protocol(1)?;
+    drop(application);
+    stale.shutdown();
+    drop(stale);
+    assert_eq!(
+        router.bind_protocol(1).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    replacement.send(router.local_id(), b"replacement")?;
+    assert_eq!(replacement.recv().await?.payload.as_ref(), b"replacement");
+    drop(replacement);
+    let rebound = router.bind_protocol(1)?;
+    router.shutdown();
+    assert!(rebound.cancellation().is_cancelled());
+    assert_eq!(
+        other.recv().await.unwrap_err().kind(),
+        io::ErrorKind::NotConnected
+    );
+    router.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn protocol_capacity_and_unknown_destination_fail_closed() -> io::Result<()> {
+    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    assert!(
+        router
+            .inner
+            .shared
+            .send(router.local_id(), b"unknown", PayloadKind::Application(500))
+            .is_err()
+    );
+    let mut endpoints = Vec::new();
+    for id in 0..32 {
+        endpoints.push(router.bind_protocol(id)?);
+    }
+    assert_eq!(
+        router.bind_protocol(32).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    for _ in 0..128 {
+        endpoints[0].send(router.local_id(), b"bounded")?;
+    }
+    assert_eq!(
+        endpoints[0]
+            .send(router.local_id(), b"overflow")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    endpoints[1].send(router.local_id(), b"other queue")?;
+    assert_eq!(endpoints[1].recv().await?.payload.as_ref(), b"other queue");
+    router.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_namespace()
+-> io::Result<()> {
+    for length in [1, 255] {
+        let router = Router::new(NodeId::new("n".repeat(length)), RouterConfig::default())?;
+        let application = router.bind_protocol(42)?;
+        for (kind, overhead) in [
+            (PayloadKind::Message, 24),
+            (PayloadKind::Tunnel, 24),
+            (PayloadKind::Application(42), 26),
+        ] {
+            let mut payload = vec![7; wire::MAX_FRAME - 2 * length - overhead];
+            router
+                .inner
+                .shared
+                .send(router.local_id(), &payload, kind)?;
+            let received = match kind {
+                PayloadKind::Message => router.recv().await?.msg,
+                PayloadKind::Tunnel => router.recv_tunnel().await?.msg,
+                PayloadKind::Application(_) => application.recv().await?.payload.to_vec(),
+            };
+            assert_eq!(received, payload);
+            payload.push(7);
+            assert_eq!(
+                router
+                    .inner
+                    .shared
+                    .send(router.local_id(), &payload, kind)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        router.close().await;
+    }
+    Ok(())
+}

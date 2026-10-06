@@ -106,11 +106,36 @@ pub use groupnet_transport_punch as connectivity;
 #[cfg(feature = "runtime")]
 pub use groupnet_network as network;
 
+/// Opaque node/group frames, delivery receipts, and receive callbacks
+/// *(feature `runtime`)*. Message types come from `groupnet-messaging`; callback
+/// ownership and group fanout reports remain runtime concerns.
+#[cfg(feature = "runtime")]
+pub mod messaging {
+    pub use groupnet_messaging::{
+        Bytes, Delivery, Frame, MAX_MESSAGE_BYTES, MessageContext, MessageId, MessageProtocol,
+        Messaging, Receipt, SendOptions,
+    };
+    pub use groupnet_runtime::messaging::{GroupSendReport, ReceiveHandle, RecipientOutcome};
+}
+
 /// Async runtime: the group-per-task [`Node`](runtime::Node) /
 /// [`Group`](runtime::Group) driver and the cluster [`Routing`](runtime::Routing)
 /// table.
 #[cfg(feature = "runtime")]
 pub use groupnet_runtime as runtime;
+
+/// Ordered streams and explicitly reliable or unreliable unordered sessions.
+#[cfg(feature = "runtime")]
+pub use groupnet_streams as streams;
+
+#[cfg(feature = "runtime")]
+pub use groupnet_messaging::MessageProtocol;
+#[cfg(feature = "runtime")]
+pub use groupnet_runtime::{Endpoint, Messages, Ordered, Peer, PeerImplementation, Unordered};
+#[cfg(feature = "runtime")]
+pub use groupnet_streams::{
+    SessionProtocol, UnorderedConfig, UnorderedDelivery, UnorderedOptions, UnorderedSession,
+};
 
 /// Request/response RPC over the data plane: an
 /// [`RpcClient`](rpc::RpcClient) multiplexes concurrent calls onto one

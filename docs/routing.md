@@ -85,6 +85,9 @@ flowchart TD
     Local -->|"Yes"| Plane{"Payload kind"}
     Plane -->|"Message"| Messages["Bounded control-message queue"]
     Plane -->|"Tunnel"| Tunnels["Bounded tunnel-packet queue"]
+    Plane -->|"Application"| Namespace{"Registered protocol ID?"}
+    Namespace -->|"Yes"| Applications["Protocol-specific bounded opaque queue"]
+    Namespace -->|"No"| Drop
     Local -->|"No"| Transit{"Forwarding enabled and hop budget remains?"}
     Transit -->|"No"| Drop
     Transit -->|"Yes"| Route{"Live route available?"}
@@ -98,6 +101,15 @@ acknowledgement of remote delivery. The outgoing scheduler handles announcements
 link MTUs, fragmentation, and deadlines. Reliability for application streams is
 provided by the separate [tunnel layer](tunnels-and-security.md), not by turning
 all gossip into a reliable stream.
+
+Application frames use `groupnet-messaging` above protocol namespace 1 for explicit
+`Delivered` / `Applied` acknowledgements and bounded retry/deduplication state.
+Authenticated unordered sessions use namespace 2 through `groupnet-streams`.
+`Router::bind_protocol(id)` exclusively registers an endpoint; its `ProtocolIo`
+shares a bounded queue and cancellation lifecycle. The router supports at most
+32 namespaces with 128 queued packets each; unknown namespaces fail closed.
+The router neither decodes protocol bodies nor interprets their ACKs.
+`GNR3` carries the protocol ID; communicating nodes must upgrade together.
 
 ## Implementation references
 

@@ -10,6 +10,9 @@
 //! direct peer terminates the endpoint so callers can explicitly rebind it.
 //! Keyed control and all established direct streams use direction-separated MACs
 //! and fresh monotonic per-direction frame sequences.
+//!
+//! Admitted relay readers are paced to 256 frames per second with bounded bursts.
+//! Saturation applies TCP backpressure without revoking a valid peer session.
 
 mod endpoint;
 mod server;

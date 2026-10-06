@@ -1,0 +1,28 @@
+[package]
+name = "groupnet-streams"
+description = "Typed ordered streams and authenticated unordered sessions over group networks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+groupnet-core.workspace = true
+groupnet-network.workspace = true
+groupnet-transport = { workspace = true, features = ["bulk"] }
+bytes.workspace = true
+ring.workspace = true
+futures-util = { workspace = true, features = ["io", "async-await"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+groupnet-transport-mem.workspace = true
+groupnet-transport = { workspace = true, features = ["link"] }
+rcgen.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
+
+[lints]
+workspace = true

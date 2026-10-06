@@ -9,11 +9,11 @@ use std::{
     time::Duration,
 };
 
-use groupnet_core::NodeId;
-use groupnet_network::{
+use super::network::{
     Router, RouterConfig,
     tunnel::{PeerIdentity, TlsIdentity, TunnelTransport},
 };
+use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::link::LinkConfig;
 use groupnet_transport::{Inbound, Transport};

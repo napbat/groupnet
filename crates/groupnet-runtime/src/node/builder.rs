@@ -187,16 +187,21 @@ impl NodeBuilder {
             seeds.extend(named.nodes().cloned());
         }
         let network = self.network.bind(self.id.clone()).await?;
+        let messaging = crate::messaging::Hub::new(network.router())?;
         let inner = Arc::new(Inner {
             id: self.id,
             transport: Arc::new(network.router().clone()),
             seeds,
             config: self.config,
+            messaging,
+            ordered: Mutex::new(None),
+            unordered: Mutex::new(None),
             routes: Mutex::new(HashMap::new()),
             start: Instant::now(),
             routing: OnceLock::new(),
         });
         tokio::spawn(recv_loop(inner.clone()));
+        super::messaging::start_dispatcher(&inner);
         if let Some(named) = self.named_seeds {
             let router = inner.transport.clone();
             let local = inner.id.clone();

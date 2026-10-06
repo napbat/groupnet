@@ -162,6 +162,25 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
   not a transport or independently registered link. TCP/UDP protocol crates consume
   owned connections and register their own links. Logical heterogeneous forwarding
   stays in the router; group/route discovery never grants adjacent-peer admission.
+- Application messaging follows `groupnet-runtime -> groupnet-messaging ->
+  groupnet-network -> groupnet-transport`. `groupnet-messaging` owns application
+  codecs, endpoint receipts, retry and deduplication state; the router carries
+  opaque packets through bounded protocol-ID queues and must not interpret ACKs.
+  `groupnet-streams` owns static session protocols: ordered TLS bytes and encrypted
+  unordered messages with explicit reliable/unreliable policy. Runtime owns the
+  single public `Endpoint<P>` and `Peer<P>` handle families, shared protocol state,
+  node/group callbacks and fanout reports. `Messages`, `Ordered`, and `Unordered`
+  are descriptors: `node.endpoint(implementation)` and
+  `node.peer(id, implementation)` resolve shared node resources internally and
+  bind per-operation options once, without opening a connection. Keep node-wide
+  capacity/configuration separate from descriptor delivery/setup options.
+  Public unsealed binding and message/session traits support custom static
+  implementations; do not introduce a protocol enum or boxed per-call futures.
+  Managed message receives always use the existing single-owner node/group inbox,
+  never the raw messaging worker queue. Ordered/unordered setup queues remain
+  isolated, and unordered accepts must respect the selected policy.
+  Keep the lossless buffer/context and frame APIs equivalent, with explicit
+  `BestEffort` (default), `Delivered`, and `Applied` boundaries.
 - Workspace lints also enforce `unsafe_code = "forbid"`, `missing_docs`,
   `missing_debug_implementations` — document every public item.
 - Bounded polling via `groupnet_testkit::cluster::eventually` /
@@ -191,8 +210,8 @@ cargo check -p groupnet-transport --no-default-features
 cargo test -p groupnet --features tcp-msg
 cargo test -p groupnet-runtime --features dns
 cargo clippy -p groupnet-runtime -p groupnet --all-targets --features groupnet-runtime/dns,groupnet/dns,groupnet/udp -- -D warnings
-cargo test -p groupnet-network -p groupnet-runtime
-cargo clippy -p groupnet-network -p groupnet-runtime -p groupnet --all-targets -- -D warnings
+cargo test -p groupnet-streams -p groupnet-messaging -p groupnet-network -p groupnet-runtime
+cargo clippy -p groupnet-streams -p groupnet-messaging -p groupnet-network -p groupnet-runtime -p groupnet --all-targets -- -D warnings
 cargo test --workspace --features groupnet/ipc,groupnet/connectivity,groupnet/udp,groupnet/tcp-msg
 cargo clippy --workspace --all-targets --features groupnet/ipc,groupnet/connectivity,groupnet/udp,groupnet/tcp-msg -- -D warnings
 cargo test -p groupnet-consistency --features acks

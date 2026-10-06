@@ -18,14 +18,17 @@ flowchart TB
     App["Application"]
     subgraph Managed["Managed Node — shared lifetime across node clones"]
         Groups["Coordination groups\nMembership and metadata"]
+        Messaging["Application messaging\nOpaque frames and delivery receipts"]
         Tunnels["Optional TLS tunnels\nBulkTransport streams"]
         Router["Router\nDiscovery, path selection, forwarding"]
         Links["Registered link workers\nBounded physical-frame I/O"]
         Groups -->|"Best-effort messages"| Router
+        Messaging -->|"Opaque application packets"| Router
         Tunnels -->|"Reliable tunnel packets"| Router
         Router --> Links
     end
     App -->|"join_group"| Groups
+    App -->|"Node / Group send and receive"| Messaging
     App -->|"connect / accept"| Tunnels
     Links <-->|"One-hop frames"| IPC["IPC peer"]
     Links <-->|"One-hop frames"| TCP["TCP peer"]
@@ -52,16 +55,105 @@ If A gains compatible admitted network connectivity to C, routing may prefer its
 cheaper one-hop route and fall back through B after that adjacency fails. Group
 discovery supplies hints, not permission to create arbitrary adjacent sessions.
 
+### Application messages and receive ownership
+
+Node-addressed and group-addressed application frames use a separate routed
+payload kind and bounded inboxes; they never enter the coordination decoder or
+compete with TLS stream acceptance. Payloads are opaque bytes with original
+sender, optional group, and message identity retained at the receiver.
+
+`groupnet-messaging` owns the application codec, endpoint, receipt state, retries,
+and deduplication. `groupnet-network` only routes opaque application packets
+through bounded protocol-ID queues; it never decodes the message body or
+interprets an application ACK. `groupnet-runtime` attaches node/group inboxes,
+serial callbacks, and membership-snapshot fanout reports to the endpoint.
+The static `MessageProtocol` trait allows protocol-specific options and receipts;
+`Frame<R>` and `MessageContext<R>` preserve those receipts without a payload copy.
+
+`send` defaults to best effort. Explicit delivery options distinguish receiver
+queue acceptance (`Delivered`) from application acknowledgement (`Applied`).
+Acknowledged sends have bounded deadlines and retry/deduplication state; timeout
+means unknown outcome, never proof that the application did not act. These are
+trusted-fabric messages, not an implicit authenticated or encrypted channel.
+Pinned TLS streams and TLS-bootstrapped encrypted unordered sessions provide
+confidential authenticated application transport.
+
+Group sends resolve a snapshot of the local membership internally, exclude the
+sender, and return per-recipient outcomes. Departures do not shrink an in-flight
+receipt requirement; later joiners receive no implicit replay. Group membership
+is not authentication. Existing metadata, Hosted/quorum commit, feed/frontier,
+and coherence-lease APIs retain their own contracts; an application message is
+not silently converted into a replicated commit because its group is Hosted.
+
+Each node inbox and each group inbox has one receive owner at a time. `recv`
+returns `(MessageContext, Bytes)`; `recv_frame` returns a full `Frame`. These are
+equivalent lossless representations: `Frame::into_parts` moves every field into
+the context and payload without cloning metadata or receipts or copying bytes.
+The context preserves message `id`, original `from` (not the forwarding bridge),
+optional `group`, and receipt. Its `delivery()` reports the requested boundary,
+`receipt()` returns an independent receipt handle, `applied()` acknowledges
+successful processing, and `reject(error_kind)` rejects processing. Moving or
+dropping the payload does not invalidate the context's receipt.
+
+`on_recv` receives `(MessageContext, Bytes)` as two callback arguments;
+`on_frame` receives a full `Frame`. All four APIs share one queue and the same
+exclusive receive ownership, with no duplicate deliveries or payload copy when
+selecting buffers. Neither manual receive automatically acknowledges `Applied`;
+call `context.applied()` or `frame.applied()` after successful processing.
+Both callback variants retain a receipt internally for automatic success
+acknowledgement even when application code moves or drops the context/frame and
+payload. A competing receiver fails with `WouldBlock` instead of stealing
+messages. Callbacks execute serially outside the coordination loop; successful
+completion acknowledges application, failure is surfaced through the callback
+handle, and cancellation never acknowledges unfinished work. Dropping/closing
+that handle cancels its worker and releases receive ownership. Network shutdown
+also cancels blocked receives and callbacks.
+
+### Typed sessions and logical peers
+
+`node.endpoint(implementation)?` creates an `Endpoint<P>` handle for a concrete
+protocol; `node.peer(id, implementation)?` creates its destination-bound
+`Peer<P>`. Both use the same public unsealed binding contract and retain managed
+node lifetime. `Messages`, `Ordered`, and `Unordered` descriptors bind their
+delivery/setup options once and resolve the node's shared protocol state
+internally. Creating either handle does not establish a connection, allocate a
+per-peer receive queue, or require dynamic dispatch. Node-wide capacities and
+timers are configured separately from per-handle options.
+
+The lower-level `MessageProtocol` and `SessionProtocol` traits retain concrete
+receipt/session types and static send/connect futures. Ordered sessions supply
+reliable TLS bytes; unordered sessions supply whole authenticated messages under
+an explicit reliable or unreliable policy. Reliable unordered messages
+acknowledge inbox acceptance and retry independently; missing earlier messages
+never block later arrivals. Unreliable messages add no data ACK/retry.
+Underlying TCP routes retain their native transport behavior.
+
+Protocol state is shared per node, not replaced by an enum or multiplexed public
+receive type. Message endpoints receive from the existing runtime inbox and obey
+its exclusive receive ownership; they never compete for the messaging worker's
+raw receive queue. Ordered application accepts and unordered TLS setup have
+separate authenticated namespaces; unordered accepts respect the selected
+delivery policy. Application datagrams use their own routed protocol ID.
+Unordered keys derive from the pinned TLS exporter and payloads bypass the
+ordered control stream. Revocation and shutdown invalidate both the retained
+control session and its datagram keys. See
+[session bounds and usage](../README.md#typed-message-and-session-protocols).
+
+
 ## 2. Crate dependency boundaries
 
 Arrows mean **depends on**, not packet flow. This is the relevant production
-subgraph, not an exhaustive workspace/dependency listing. Runtime always depends
-on the network layer; disabling the facade's default features keeps the core-only surface.
+subgraph, not an exhaustive workspace/dependency listing. Application packet flow
+is `runtime -> messaging/streams -> network -> transport`; runtime also uses
+network directly for coordination and TLS streams. Disabling the facade's
+default features keeps the core-only surface.
 
 ```mermaid
 flowchart TB
     Facade["groupnet\nFeature-selected facade"]
     Runtime["groupnet-runtime\nNode and Group actors"]
+    Messaging["groupnet-messaging\nApplication codec and delivery receipts"]
+    Streams["groupnet-streams\nTyped ordered and unordered sessions"]
     Network["groupnet-network\nRouting and TLS tunnels"]
     Protocols["Protocol implementation crates\nTCP, UDP, memory, IPC"]
     Connectivity["Native connectivity library\nAdjacent UDP/TCP direct + relay paths"]
@@ -69,12 +161,20 @@ flowchart TB
     Core["groupnet-core\nSans-IO coordination"]
     Sim["groupnet-sim\nDeterministic simulation"]
     Facade --> Runtime
+    Facade --> Messaging
+    Facade --> Streams
     Facade --> Network
     Facade --> Protocols
     Facade -->|"Optional connectivity feature"| Connectivity
     Protocols -->|"TCP/UDP only, opt-in"| Connectivity
     Connectivity -->|"Admission and session primitives"| Shared
     Connectivity --> Core
+    Runtime --> Messaging
+    Runtime --> Streams
+    Streams --> Network
+    Streams --> Shared
+    Messaging --> Network
+    Messaging --> Core
     Runtime --> Network
     Runtime --> Shared
     Runtime --> Core
@@ -171,6 +271,8 @@ those stronger guarantees are required.
 - [Managed node initialization](../crates/groupnet-runtime/src/node/builder.rs)
 - [Shared registration contracts](../crates/groupnet-transport/src/link.rs)
 - [Network ownership and standalone binding](../crates/groupnet-network/src/config.rs)
+- [Application codec and delivery endpoint](../crates/groupnet-messaging/src/lib.rs)
+- [Runtime callbacks and fanout reports](../crates/groupnet-runtime/src/messaging.rs)
 - [Group engine membership and anti-entropy](../crates/groupnet-core/src/engine/state.rs)
 - [Metadata-based inter-group routing](../crates/groupnet-runtime/src/routing.rs)
 - [Group operation batching](../crates/groupnet-runtime/src/group.rs)

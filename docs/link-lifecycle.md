@@ -126,6 +126,23 @@ gossip updates reach only links that already admit the hinted identity, even
 before a route is learned. These control handles do not retain endpoints after
 shutdown and do not add a per-packet queue or boxed packet future.
 
+Application protocol dispatch is also static inside `Endpoint<P>` and `Peer<P>`.
+`node.endpoint(implementation)?` binds a descriptor's options and shared node
+resources; `node.peer(id, implementation)?` additionally binds a logical
+destination. Neither creates a dedicated connection. Built-in descriptors are
+`Messages`, `Ordered`, and `Unordered`; custom descriptors use the same public
+unsealed binding trait. Node-wide protocol capacity/configuration is separate
+from the options retained by an endpoint or peer.
+
+Message implementations use bounded `ProtocolIo` namespaces; ordered and
+unordered sessions have separate authenticated setup queues. `Node` owns shared
+protocol state and retains its lifetime across temporary endpoint/peer handles.
+Closing a protocol endpoint does not close the router or unrelated protocols;
+closing the node cancels every owned protocol. Message endpoint receives use the
+existing single-owner runtime inbox, not a new queue or the messaging worker's
+raw receiver. Unordered accepts preserve their descriptor's delivery policy.
+
+
 ## 3. Startup failures and cancellation
 
 Failure must not strand an already-bound listener. A rejected `BoundLink` is
