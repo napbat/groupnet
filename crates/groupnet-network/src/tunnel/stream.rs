@@ -8,8 +8,8 @@ use std::{
     task::{Context, Poll},
 };
 
+use super::pipe::TlsEnd;
 use futures_util::io::{AsyncRead, AsyncWrite};
-use tokio::io::DuplexStream;
 use tokio_rustls::TlsStream;
 use tokio_util::{
     compat::{Compat, TokioAsyncReadCompatExt},
@@ -22,7 +22,7 @@ use tokio_util::{
 /// acknowledgement without closing the read direction. Dropping the stream
 /// cancels its session. Revocation interrupts even already-buffered TLS data.
 pub struct TunneledStream {
-    inner: Compat<TlsStream<DuplexStream>>,
+    inner: Compat<TlsStream<TlsEnd>>,
     cancel: CancellationToken,
     cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
     sent: Pin<Box<WaitForCancellationFutureOwned>>,
@@ -36,7 +36,7 @@ impl fmt::Debug for TunneledStream {
 
 impl TunneledStream {
     pub(super) fn new(
-        inner: TlsStream<DuplexStream>,
+        inner: TlsStream<TlsEnd>,
         cancel: CancellationToken,
         sent: CancellationToken,
     ) -> Self {

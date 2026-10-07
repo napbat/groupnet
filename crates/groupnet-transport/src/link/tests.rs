@@ -116,9 +116,86 @@ async fn link_worker_transfers_the_allocation_and_selected_generation() {
         .run(LinkIo {
             outgoing: Box::pin(outgoing),
             incoming: Box::pin(incoming),
+            direct: None,
             cancel: CancellationToken::new(),
             mtu: 65_000,
         })
         .await;
     assert_eq!(observed.load(Ordering::SeqCst), ptr);
+}
+
+#[derive(Debug, Default)]
+struct Pushing {
+    sink: std::sync::OnceLock<InboundSink>,
+}
+
+impl Transport for Arc<Pushing> {
+    type Error = io::Error;
+
+    fn send(&self, _to: &NodeId, _msg: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    async fn recv(&self) -> io::Result<Inbound> {
+        std::future::pending().await
+    }
+
+    fn attach_inbound(&self, sink: InboundSink) {
+        assert!(self.sink.set(sink).is_ok(), "offered once per worker");
+    }
+}
+
+#[derive(Debug)]
+struct Collected(std::sync::mpsc::Sender<(usize, Option<SessionId>)>);
+
+impl InboundDelivery for Collected {
+    fn deliver(&self, packet: AdmittedInbound) {
+        let _ = self.0.send((packet.packet.msg.len(), packet.session));
+    }
+}
+
+#[tokio::test]
+async fn worker_offers_the_direct_sink_bounded_by_the_link_mtu() {
+    let transport = Arc::new(Pushing::default());
+    let bound = BoundLink::new(transport.clone(), LinkConfig::new(Vec::new()));
+    let (collected, delivered) = std::sync::mpsc::channel();
+    let cancel = CancellationToken::new();
+    let incoming = futures_util::SinkExt::sink_map_err(
+        futures_util::sink::drain::<Option<AdmittedInbound>>(),
+        |never: std::convert::Infallible| match never {},
+    );
+    let worker = tokio::spawn(bound.driver.run(LinkIo {
+        outgoing: Box::pin(futures_util::stream::pending()),
+        incoming: Box::pin(incoming),
+        direct: Some(InboundSink::new(Arc::new(Collected(collected)), 8)),
+        cancel: cancel.clone(),
+        mtu: 8,
+    }));
+    let sink = loop {
+        if let Some(sink) = transport.sink.get() {
+            break sink.clone();
+        }
+        tokio::task::yield_now().await;
+    };
+    let registry = SessionRegistry::new(1).unwrap();
+    let session = registry
+        .try_admit(crate::admission::AcceptedPeer::new(NodeId::new("peer")))
+        .unwrap()
+        .id();
+    for length in [8, 9] {
+        sink.deliver(AdmittedInbound {
+            packet: Inbound {
+                from: NodeId::new("peer"),
+                msg: bytes::Bytes::from(vec![0; length]),
+            },
+            session: Some(session),
+        });
+    }
+    assert_eq!(
+        delivered.try_iter().collect::<Vec<_>>(),
+        [(8, Some(session))],
+        "delivered inline with its generation; the oversized frame dropped"
+    );
+    cancel.cancel();
+    worker.await.unwrap();
 }

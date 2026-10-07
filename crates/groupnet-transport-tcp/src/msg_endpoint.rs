@@ -272,6 +272,19 @@ impl Transport for TcpMsgTransport {
             Backend::Connectivity { connection, .. } => connection.recv_admitted().await,
         }
     }
+
+    /// Direct endpoints' reader tasks deliver straight into the attached sink
+    /// from then on; frames already queued still drain through the worker.
+    #[cfg(feature = "link")]
+    fn attach_inbound(&self, sink: groupnet_transport::link::InboundSink) {
+        match &self.backend {
+            Backend::Direct(inner) => {
+                let _ = inner.direct.set(sink);
+            }
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity { .. } => {}
+        }
+    }
 }
 
 impl Inner {

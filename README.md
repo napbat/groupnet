@@ -311,7 +311,8 @@ Metadata still converges as replicated state; Hosted/quorum commits, feeds,
 frontiers, and coherence leases retain their existing separate contracts.
 Sending to a Hosted group does not turn a frame into a quorum commit.
 The routed wire guard is `GNR3`, messaging is `GNA2` (including an explicit
-retry horizon), and the authenticated tunnel preamble is `GN-TUNNEL-2`;
+retry horizon), and the authenticated tunnel preamble is `GN-TUNNEL-3` (byte-based
+receive credit);
 upgrade communicating nodes together.
 
 Executable memory A → TCP bridge B → TCP C demonstration:
@@ -435,6 +436,18 @@ unreliable sessions and 64/1200-byte packets. CSV output reports actual delivere
 packets/bytes, local errors, missing packets, elapsed throughput and completed
 roundtrip p50/p99 latency. Setup and warmup are excluded; always interpret latency
 alongside losses. Loopback measurements do not qualify Internet/NAT performance.
+
+Measure pinned TLS tunnel streams over admitted TCP links against TLS 1.3 over
+plain TCP and plain TCP, with the same generated credentials and buffer sizes:
+
+```bash
+cargo run --release -p groupnet --example tunnel-throughput --features tcp-msg
+cargo run --release -p groupnet --example tunnel-throughput --features tcp-msg -- --path tunnel --workload bulk --bytes 1024 --threads 4
+```
+
+It reports bulk MB/s (first write until the receiver acknowledges the last
+byte) and request/response p50/p99/mean latency per path, plus each path's
+median bulk rate as a share of the TLS baseline.
 
 ### Endpoint ownership
 

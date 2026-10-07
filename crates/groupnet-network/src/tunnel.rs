@@ -1,12 +1,13 @@
 //! End-to-end mutually authenticated TLS 1.3 streams over routed datagrams.
 //!
 //! Each stream has a configured bounded ciphertext sliding window, cumulative
-//! acknowledgements, deduplication, reordering, receive credit and retransmission
-//! with slow-start congestion control. Routing changes may retransmit the same
-//! ciphertext through another adapter without changing the TLS identity. Node-wide
-//! [`TunnelLimits`](crate::tunnel::TunnelLimits) bound admission, setup, sessions,
-//! queues and idle expiry. Each endpoint chooses its own send segment and window;
-//! every endpoint accepts segments up to the protocol-wide
+//! acknowledgements, deduplication, reordering, reserved byte credit and
+//! retransmission with slow-start congestion control. Routing changes may
+//! retransmit the same ciphertext through another adapter without changing the
+//! TLS identity. Node-wide [`TunnelLimits`](crate::tunnel::TunnelLimits) bound
+//! admission, setup, sessions, queues, retained ciphertext memory and idle
+//! expiry. Each endpoint chooses its own send segment and windows; every
+//! endpoint accepts segments up to the protocol-wide
 //! [`SegmentSize::MAX`](crate::tunnel::SegmentSize::MAX).
 //! Revocation invalidates active and queued streams. Re-admission creates a new
 //! admission generation and cannot restore an old stream's credentials.
@@ -16,12 +17,15 @@
 //! bounded accept queues. Unknown namespaces fail closed. Exported session keys
 //! remain tied to the retained control stream's admission and cancellation.
 
+mod budget;
 mod config;
+mod pipe;
 mod reliable;
 mod stream;
 mod tls;
 mod wire;
 
+pub(crate) use config::DEFAULT_STREAM_FRAMES;
 pub use config::{RetransmitTimeouts, SegmentSize, TunnelLimits};
 
 #[cfg(test)]
@@ -37,7 +41,7 @@ use groupnet_core::NodeId;
 use groupnet_transport::bulk::BulkTransport;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex as AsyncMutex, mpsc},
     time::timeout,
 };
@@ -45,12 +49,17 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::Router;
+use bytes::Bytes;
 use wire::{Kind, Packet, SessionId};
 
 pub use stream::TunneledStream;
 pub use tls::{PeerIdentity, TlsIdentity};
 
-const PREAMBLE: &[u8; 11] = b"GN-TUNNEL-2";
+/// Authenticated preamble; its digit is the tunnel protocol [`wire::VERSION`].
+const PREAMBLE: &[u8; 11] = b"GN-TUNNEL-3";
+
+const _: () = assert!(PREAMBLE[10] == b'0' + wire::VERSION);
+
 const ORDERED: u16 = 1;
 const CONTROL: u16 = 2;
 
@@ -82,6 +91,7 @@ struct Inner {
     router: Router,
     identity: TlsIdentity,
     limits: TunnelLimits,
+    budget: Arc<budget::MemoryBudget>,
     state: Mutex<State>,
     incoming: mpsc::Sender<Accepted>,
     accepts: AsyncMutex<mpsc::Receiver<Accepted>>,
@@ -153,24 +163,24 @@ impl TunnelTransport {
                 return Err(error(io::ErrorKind::InvalidInput, "duplicate TLS peer"));
             }
         }
-        router.claim_tunnels()?;
         let (incoming, accepts) = mpsc::channel(limits.accept_queue.get());
         let (control_incoming, control_accepts) = mpsc::channel(limits.accept_queue.get());
         let inner = Arc::new(Inner {
-            router: router.clone(),
+            router,
             identity,
+            budget: budget::MemoryBudget::new(&limits),
             limits,
             state: Mutex::new(state),
             incoming,
             accepts: AsyncMutex::new(accepts),
             control_incoming,
             control_accepts: AsyncMutex::new(control_accepts),
-            cancel: cancel.clone(),
+            cancel,
             tasks: TaskTracker::new(),
         });
         inner
-            .tasks
-            .spawn(dispatch(Arc::downgrade(&inner), router, cancel));
+            .router
+            .claim_tunnels(Arc::new(Dispatcher(Arc::downgrade(&inner))))?;
         Ok(Self { inner })
     }
 
@@ -247,6 +257,14 @@ impl TunnelTransport {
     #[must_use]
     pub fn cancellation(&self) -> CancellationToken {
         self.inner.cancel.child_token()
+    }
+
+    /// Tunnel ciphertext bytes currently reserved against
+    /// [`TunnelLimits::memory_budget`]: every live session's floors plus growth
+    /// lent above them.
+    #[must_use]
+    pub fn reserved_memory(&self) -> usize {
+        self.inner.budget.in_use()
     }
 
     /// Cancels sessions and queued accepts, then waits for all owned tasks to stop.
@@ -401,7 +419,7 @@ fn start_session(
     admission: &Arc<Admission>,
     id: SessionId,
     role: reliable::Role,
-) -> io::Result<(DuplexStream, CancellationToken, CancellationToken)> {
+) -> io::Result<(pipe::TlsEnd, CancellationToken, CancellationToken)> {
     let mut state = inner.state.lock().map_err(|_| poisoned())?;
     let peer = admission.identity.node.clone();
     if inner.cancel.is_cancelled()
@@ -428,9 +446,17 @@ fn start_session(
         ));
     }
     let (packets, receiver) = mpsc::channel(inner.limits.packet_queue().get());
+    // The session count bound above keeps every floor within the set-aside budget.
+    let floor = inner.limits.min_window.get() as usize;
+    let send_memory = inner.budget.reserve(floor);
+    let receive_memory = inner.budget.reserve(floor);
     let cancel = admission.cancel.child_token();
     let sent = CancellationToken::new();
-    let (stream, raw) = tokio::io::duplex(inner.limits.stream_buffer.get());
+    let (stream, segments) = pipe::pair(
+        inner.router.tunnel_buffers(&peer),
+        inner.limits.stream_buffer.get(),
+        inner.limits.payload.get(),
+    );
     state
         .sessions
         .insert((peer.clone(), id), Session { packets });
@@ -447,10 +473,12 @@ fn start_session(
             role,
             limits,
             reliable::SessionIo {
-                raw,
+                pipe: segments,
                 packets: receiver,
                 cancel: task_cancel,
                 sent: task_sent,
+                send_memory,
+                receive_memory,
             },
         )
         .await;
@@ -463,60 +491,62 @@ fn start_session(
     Ok((stream, cancel, sent))
 }
 
-async fn dispatch(weak: Weak<Inner>, router: Router, cancel: CancellationToken) {
-    loop {
-        let inbound = tokio::select! {
-            () = cancel.cancelled() => break,
-            inbound = router.recv_tunnel() => match inbound { Ok(inbound) => inbound, Err(_) => break },
+/// Routes each arriving tunnel packet to its session's bounded queue, or opens
+/// a responder session for an admitted peer's `Open`. Runs inline on the link
+/// worker that received the packet; a full session queue drops the packet as loss.
+#[derive(Debug)]
+struct Dispatcher(Weak<Inner>);
+
+impl crate::router::TunnelInbox for Dispatcher {
+    fn deliver(&self, from: NodeId, payload: Bytes) {
+        let Some(inner) = self.0.upgrade() else {
+            return;
         };
-        let Some(inner) = weak.upgrade() else {
-            break;
+        if inner.cancel.is_cancelled() {
+            return;
+        }
+        let Some(packet) = Packet::decode(payload) else {
+            return;
         };
-        let Some(packet) = Packet::decode(inbound.msg) else {
-            continue;
-        };
-        let (existing, admission) = {
+        let admission = {
             let Ok(state) = inner.state.lock() else {
-                break;
+                inner.cancel.cancel();
+                return;
             };
-            (
-                state
-                    .sessions
-                    .get(&(inbound.from.clone(), packet.id))
-                    .map(|session| session.packets.clone()),
-                state.peers.get(&inbound.from).cloned(),
-            )
-        };
-        if let Some(existing) = existing {
-            let _ = existing.try_send(packet);
-        } else if packet.kind == Kind::Open {
-            let Some(admission) = admission else {
-                continue;
-            };
-            if let Ok((raw, session_cancel, sent)) =
-                start_session(&inner, &admission, packet.id, reliable::Role::Responder)
-            {
-                let server = inner.identity.server.clone();
-                let weak = Arc::downgrade(&inner);
-                inner.tasks.spawn(authenticate_inbound(
-                    weak,
-                    server,
-                    admission,
-                    raw,
-                    session_cancel,
-                    sent,
-                ));
+            if let Some(session) = state.sessions.get(&(from.clone(), packet.id)) {
+                let _ = session.packets.try_send(packet);
+                return;
             }
+            if packet.kind != Kind::Open {
+                return;
+            }
+            let Some(admission) = state.peers.get(&from).cloned() else {
+                return;
+            };
+            admission
+        };
+        if let Ok((raw, session_cancel, sent)) =
+            start_session(&inner, &admission, packet.id, reliable::Role::Responder)
+        {
+            let server = inner.identity.server.clone();
+            let weak = Arc::downgrade(&inner);
+            inner.tasks.spawn(authenticate_inbound(
+                weak,
+                server,
+                admission,
+                raw,
+                session_cancel,
+                sent,
+            ));
         }
     }
-    cancel.cancel();
 }
 
 async fn authenticate_inbound(
     weak: Weak<Inner>,
     server: Arc<rustls::ServerConfig>,
     admission: Arc<Admission>,
-    raw: DuplexStream,
+    raw: pipe::TlsEnd,
     cancel: CancellationToken,
     sent: CancellationToken,
 ) {

@@ -777,6 +777,67 @@ async fn admitted_reader_applies_configured_frame_cap() {
     server.close().await;
 }
 
+#[derive(Debug)]
+struct Pushed(std::sync::mpsc::Sender<(Bytes, Option<groupnet_transport::admission::SessionId>)>);
+
+impl groupnet_transport::link::InboundDelivery for Pushed {
+    fn deliver(&self, packet: groupnet_transport::link::AdmittedInbound) {
+        let _ = self.0.send((packet.packet.msg, packet.session));
+    }
+}
+
+#[tokio::test]
+async fn attached_sink_receives_admitted_frames_inline_and_bounded() {
+    let server = endpoint("push-server", Arc::new(OpenAdmission), &[]).await;
+    let client = endpoint("push-client", Arc::new(OpenAdmission), &[]).await;
+    connect(&client, &server);
+    eventually(|| peers(&server) == 1 && peers(&client) == 1).await;
+    let generation = server.sessions().expect("sessions").subscribe().borrow()[0].id;
+    client
+        .send(server.local_id(), b"queued")
+        .await
+        .expect("send");
+    let queued = timeout(Duration::from_secs(5), server.recv_admitted())
+        .await
+        .expect("receive deadline")
+        .expect("queued frame");
+    assert_eq!(queued.packet.msg.as_ref(), b"queued", "unattached: inbox");
+    let (pushed, delivered) = std::sync::mpsc::channel();
+    server.attach_inbound(groupnet_transport::link::InboundSink::new(
+        Arc::new(Pushed(pushed)),
+        8,
+    ));
+    for frame in [&b"direct"[..], b"oversized", b"last"] {
+        client.send(server.local_id(), frame).await.expect("send");
+    }
+    let mut received = Vec::new();
+    eventually(|| {
+        received.extend(delivered.try_iter());
+        received.len() == 2
+    })
+    .await;
+    assert_eq!(
+        received,
+        [
+            (Bytes::from_static(b"direct"), Some(generation)),
+            (Bytes::from_static(b"last"), Some(generation)),
+        ],
+        "in order, generation-tagged, the frame over the sink bound dropped"
+    );
+    assert!(
+        server
+            .direct()
+            .expect("direct")
+            .inbox
+            .lock()
+            .await
+            .is_empty(),
+        "attached frames bypass the inbox"
+    );
+    client.close().await;
+    server.close().await;
+}
+
 #[tokio::test]
 async fn hello_codec_round_trips_its_typed_network_layout() {
     let mut wire = Vec::new();

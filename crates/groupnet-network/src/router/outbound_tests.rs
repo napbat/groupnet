@@ -2,6 +2,7 @@ use super::*;
 use futures_util::StreamExt;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::admission::AcceptedPeer;
+use groupnet_transport::link::AdmittedInbound;
 
 const WAIT: Duration = Duration::from_secs(10);
 

@@ -2,11 +2,16 @@
 
 use super::{AdvertisedRoute, Event, Queued, Shared, TransportId};
 use crate::wire::{self, Fragments};
-use futures_util::{SinkExt, stream};
+use futures_util::{Sink, stream};
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{SessionId, SessionPeer, SessionRegistry};
-use groupnet_transport::link::{AdmittedInbound, LinkIo, Outbound};
-use std::{io, sync::Arc};
+use groupnet_transport::link::{AdmittedInbound, InboundDelivery, InboundSink, LinkIo, Outbound};
+use std::{
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, ready},
+};
 use tokio::{
     sync::{mpsc, watch},
     time::Instant,
@@ -22,14 +27,19 @@ pub(super) fn io(
     outgoing: mpsc::Receiver<Queued>,
     cancel: CancellationToken,
 ) -> LinkIo {
-    let incoming = PollSender::new(shared.events.clone())
-        .sink_map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "router event queue closed"))
-        .with(move |packet: Option<AdmittedInbound>| {
-            std::future::ready(Ok(match packet {
-                Some(packet) => Event::Received { link: id, packet },
-                None => Event::Down(id),
-            }))
-        });
+    let direct = InboundSink::new(
+        Arc::new(Direct {
+            shared: shared.clone(),
+            link: id,
+        }),
+        mtu,
+    );
+    let incoming = Incoming {
+        shared: shared.clone(),
+        link: id,
+        events: PollSender::new(shared.events.clone()),
+        down: false,
+    };
     let mut advertisements = shared.advertisements.subscribe();
     let mut neighbors = sessions.map(SessionRegistry::subscribe);
     let peers: Vec<_> = neighbors.as_mut().map_or_else(
@@ -65,8 +75,64 @@ pub(super) fn io(
     LinkIo {
         outgoing: Box::pin(outgoing),
         incoming: Box::pin(incoming),
+        direct: Some(direct),
         cancel,
         mtu,
+    }
+}
+
+/// Frames a transport's own reader tasks hand over through [`InboundSink`]:
+/// processed inline on the reading task, exactly as [`Incoming`] processes
+/// frames the link worker received.
+struct Direct {
+    shared: Arc<Shared>,
+    link: TransportId,
+}
+
+impl InboundDelivery for Direct {
+    fn deliver(&self, packet: AdmittedInbound) {
+        self.shared.receive(self.link, packet);
+    }
+}
+
+/// The link worker's inbound sink. Frames are processed synchronously on the
+/// worker that read them; only the terminal transport failure becomes a router
+/// event, sent with the event queue's backpressure on flush.
+struct Incoming {
+    shared: Arc<Shared>,
+    link: TransportId,
+    events: PollSender<Event>,
+    down: bool,
+}
+
+impl Sink<Option<AdmittedInbound>> for Incoming {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, packet: Option<AdmittedInbound>) -> io::Result<()> {
+        match packet {
+            Some(packet) => self.shared.receive(self.link, packet),
+            None => self.down = true,
+        }
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.down {
+            let closed = |_| io::Error::new(io::ErrorKind::BrokenPipe, "router event queue closed");
+            ready!(self.events.poll_reserve(cx)).map_err(closed)?;
+            let link = self.link;
+            self.events.send_item(Event::Down(link)).map_err(closed)?;
+            self.down = false;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(cx)
     }
 }
 

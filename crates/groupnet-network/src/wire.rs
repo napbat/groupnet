@@ -3,11 +3,8 @@
 use bytes::{Bytes, BytesMut};
 use groupnet_core::NodeId;
 use groupnet_transport::admission::SessionId;
-use std::{
-    collections::HashMap,
-    io,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, io, time::Duration};
+use tokio::time::Instant;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
     byteorder::network_endian::{U16, U32},

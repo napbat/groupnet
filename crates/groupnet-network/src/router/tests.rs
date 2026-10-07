@@ -1,8 +1,19 @@
 use super::*;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::link::{LinkFuture, LinkLifecycle};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const WAIT: Duration = Duration::from_secs(10);
+
+/// Records tunnel packets that link workers deliver inline.
+#[derive(Default)]
+pub(super) struct TunnelCapture(pub(super) Mutex<Vec<(NodeId, Bytes)>>);
+
+impl TunnelInbox for TunnelCapture {
+    fn deliver(&self, from: NodeId, payload: Bytes) {
+        self.0.lock().expect("capture lock").push((from, payload));
+    }
+}
 
 #[derive(Debug, Default)]
 struct Probe {
@@ -256,6 +267,15 @@ async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_nam
     for length in [1, 255] {
         let router = Router::new(NodeId::new("n".repeat(length)), RouterConfig::default())?;
         let application = router.bind_protocol(42)?;
+        let tunnels = Arc::new(TunnelCapture::default());
+        router.claim_tunnels(tunnels.clone())?;
+        assert_eq!(
+            router
+                .claim_tunnels(Arc::new(TunnelCapture::default()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
         for (kind, overhead) in [
             (PayloadKind::Message, 24),
             (PayloadKind::Tunnel, 24),
@@ -268,7 +288,11 @@ async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_nam
                 .send(router.local_id(), &payload, kind)?;
             let received = match kind {
                 PayloadKind::Message => router.recv().await?.msg,
-                PayloadKind::Tunnel => router.recv_tunnel().await?.msg,
+                PayloadKind::Tunnel => {
+                    let (from, payload) = tunnels.0.lock().expect("capture").pop().expect("inline");
+                    assert_eq!(&from, router.local_id());
+                    payload
+                }
                 PayloadKind::Application(_) => application.recv().await?.payload,
             };
             assert_eq!(received, payload);
@@ -285,6 +309,52 @@ async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_nam
         }
         router.close().await;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sent_packet_storage_returns_to_the_pool_when_its_last_view_drops() -> io::Result<()> {
+    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let peer = NodeId::new("peer");
+    let segment = 16 * 1024;
+    let packet = router.tunnel_packet_buffer(&peer, segment)?;
+    let storage = packet.payload().as_ptr();
+    drop(packet);
+    let mut packet = router.tunnel_packet_buffer(&peer, segment)?;
+    assert_eq!(
+        packet.payload().as_ptr(),
+        storage,
+        "unsent storage is reused"
+    );
+    packet.extend_from_slice(&vec![7; segment]);
+    let sent = router.send_tunnel_retained(&peer, packet)?;
+    assert_eq!(sent.as_ptr(), storage, "sent without copying");
+    let other = router.tunnel_packet_buffer(&peer, segment)?;
+    assert_ne!(
+        other.payload().as_ptr(),
+        storage,
+        "in flight storage is not reused"
+    );
+    drop(other);
+    let retransmission = sent.clone();
+    drop(sent);
+    assert_ne!(
+        router
+            .tunnel_packet_buffer(&peer, segment)?
+            .payload()
+            .as_ptr(),
+        storage
+    );
+    drop(retransmission);
+    assert_eq!(
+        router
+            .tunnel_packet_buffer(&peer, segment)?
+            .payload()
+            .as_ptr(),
+        storage,
+        "returned when the last view drops"
+    );
+    router.close().await;
     Ok(())
 }
 

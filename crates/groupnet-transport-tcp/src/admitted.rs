@@ -16,11 +16,11 @@ use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkLifecycle}
 use groupnet_transport::{MAX_NODE_ID_BYTES, QueueCapacity};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use super::{Inner, QueuedInbound, TcpMsgConfig, TcpMsgTransport};
+use super::{InboundPath, Inner, QueuedInbound, TcpMsgConfig, TcpMsgTransport};
 use crate::handshake::{
     check_id, decode_id, field_header, read_addr, read_body, read_field, read_id, write_id,
 };
@@ -84,7 +84,7 @@ pub(super) struct Managed {
     config: TcpAdmissionConfig,
     pending: Arc<Semaphore>,
     connections: Mutex<Connections>,
-    inbound: Mutex<Option<mpsc::Sender<QueuedInbound>>>,
+    inbound: Mutex<Option<InboundPath>>,
 }
 
 impl fmt::Debug for Managed {
@@ -242,7 +242,7 @@ impl Managed {
             .count()
     }
 
-    pub(super) fn set_inbound(&self, inbound: mpsc::Sender<QueuedInbound>) {
+    pub(super) fn set_inbound(&self, inbound: InboundPath) {
         *self.inbound.lock().expect("inbound lock poisoned") = Some(inbound);
     }
 
@@ -421,7 +421,16 @@ impl Managed {
             .await;
             drop(permit);
             if let Ok(Ok((socket, lease, owner, receiver, cancelled))) = result {
-                run_session(socket, lease, owner, receiver, cancelled, max_frame_bytes).await;
+                run_session(
+                    socket,
+                    lease,
+                    owner,
+                    receiver,
+                    cancelled,
+                    &weak,
+                    max_frame_bytes,
+                )
+                .await;
             }
         });
     }
@@ -585,19 +594,29 @@ async fn run_pending(
     };
     drop(permit);
     if let Ok(Ok((socket, lease))) = result {
-        if inner.upgrade().is_none() {
-            return;
-        }
-        run_session(socket, lease, owner, receiver, cancelled, max_frame_bytes).await;
+        run_session(
+            socket,
+            lease,
+            owner,
+            receiver,
+            cancelled,
+            &inner,
+            max_frame_bytes,
+        )
+        .await;
     }
 }
 
+/// Runs one admitted socket: this task writes queued frames while a sibling
+/// task reads and hands over inbound frames, so inline inbound processing never
+/// delays the writer. Either side ending, revocation or cancellation ends both.
 async fn run_session(
     socket: TcpStream,
     lease: SessionLease,
     owner: Owner,
     mut frames: mpsc::Receiver<Bytes>,
     mut cancelled: watch::Receiver<bool>,
+    inner: &Weak<Inner>,
     max_frame_bytes: usize,
 ) {
     let Some(inbound) = owner
@@ -611,26 +630,45 @@ async fn run_session(
     };
     let mut sessions = owner.managed.sessions.subscribe();
     let (mut reader, mut writer) = socket.into_split();
-    let reading = async {
-        while let Ok(Some(msg)) = super::read_frame(&mut reader, max_frame_bytes).await {
-            if !lease.is_active() {
-                break;
-            }
-            let queued = QueuedInbound {
-                packet: groupnet_transport::Inbound {
-                    from: lease.node().clone(),
-                    msg,
-                },
-                session: Some(lease.id()),
-            };
-            if inbound.send(queued).await.is_err() {
-                break;
+    let (stop, stopped) = oneshot::channel::<()>();
+    let (done, mut finished) = oneshot::channel::<()>();
+    let reading = {
+        let lease = lease.clone();
+        async move {
+            let mut incoming = super::FrameReader::new(max_frame_bytes);
+            while let Ok(Some(msg)) = incoming.next(&mut reader).await {
+                if !lease.is_active() {
+                    break;
+                }
+                let queued = QueuedInbound {
+                    packet: groupnet_transport::Inbound {
+                        from: lease.node().clone(),
+                        msg,
+                    },
+                    session: Some(lease.id()),
+                };
+                if !inbound.deliver(queued).await {
+                    break;
+                }
             }
         }
     };
+    let spawned = inner.upgrade().is_some_and(|inner| {
+        inner.tasks.spawn(async move {
+            tokio::select! {
+                () = reading => {},
+                _ = stopped => {},
+            }
+            drop(done);
+        })
+    });
+    if !spawned {
+        return;
+    }
     let writing = async {
-        while let Some(frame) = frames.recv().await {
-            if !lease.is_active() || super::write_frame(&mut writer, &frame).await.is_err() {
+        let mut batch = Vec::with_capacity(super::framing::WRITE_BATCH);
+        while super::next_batch(&mut frames, &mut batch).await {
+            if !lease.is_active() || super::write_frames(&mut writer, &batch).await.is_err() {
                 break;
             }
         }
@@ -642,14 +680,19 @@ async fn run_session(
             }
         }
     };
-    tokio::select! {
-        () = reading => {},
-        () = writing => {},
-        () = revoked => {},
-        _ = cancelled.changed() => {},
+    let read_ended = tokio::select! {
+        _ = &mut finished => true,
+        () = writing => false,
+        () = revoked => false,
+        _ = cancelled.changed() => false,
+    };
+    drop(stop);
+    if !read_ended {
+        let _ = finished.await;
     }
-    // Owner and lease drop together on every exit/cancellation path. Queued
-    // frames keep the producing generation, never a fresh identity-only lookup.
+    // Owner and lease drop together, after the reader released its clone, on
+    // every exit path; shutdown aborts both tasks. Queued frames keep the
+    // producing generation, never a fresh identity-only lookup.
 }
 
 struct Hello {

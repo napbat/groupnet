@@ -49,19 +49,68 @@ bytes. This is not a guarantee of availability through arbitrary outages.
 ### Reliable stream contract
 
 - Bounded ordered segments use cumulative acknowledgements and receive credit.
-- Each endpoint reads TLS ciphertext into segments of its own configured
-  `payload` (its send segment). Every receiver accepts any segment up to the
-  protocol-wide `SegmentSize::MAX` (64,939 bytes: the default 65,000-byte routing
-  envelope minus the smallest tunnel envelope and the 35-byte reliability
-  header), so peers may choose different segment sizes and receive windows.
-- Slow start opens the congestion window from `initial_congestion` by one
-  segment per acknowledged segment, doubling it every round trip, until the
-  slow-start threshold (initially the receive window). Loss — three duplicate
-  acknowledgements, which also trigger one fast retransmit, or a retransmission
-  timeout — sets the threshold and the window to half the congestion window;
-  from there the window grows by one segment per window acknowledged. A larger
-  advertised window at the same cumulative acknowledgement is a window update
-  sent as data is delivered, never a duplicate.
+  Every reliability packet starts with tunnel version byte `3` (also the
+  `GN-TUNNEL-3` preamble); other versions are discarded, never misparsed.
+- Credit is counted in bytes of retained segment cost: each segment costs its
+  ciphertext plus the 38-byte reliability header. Every packet carries a `u32`
+  credit relative to its cumulative acknowledgement. A sender keeps the cost of
+  unacknowledged segments plus the next segment within the newest credit, and
+  its unacknowledged segment count within the congestion window. Credit is
+  taken only from the highest acknowledgement seen (at an equal acknowledgement,
+  only a larger credit), so a reordered stale acknowledgement never extends it.
+- Each endpoint reads TLS ciphertext into segments of at most its configured
+  `payload` (its send segment), shortened to fit the remaining credit; while
+  segments are unacknowledged it waits for a full segment's credit instead of
+  sending a shorter one. Every receiver accepts any segment up to the
+  protocol-wide `SegmentSize::MAX` (64,936 bytes: the default 65,000-byte routing
+  envelope minus the smallest tunnel envelope and the reliability header), so
+  peers may choose different segment sizes and windows.
+- The receiver advertises only bytes it has reserved. Its advertised right edge
+  (acknowledged position plus credit) never moves backwards except through the
+  idle relinquish below, so data a sender transmits within credit is always
+  held, never dropped for lack of memory. Data beyond credit is discarded.
+- Slow start opens the congestion window from `initial_congestion` by two
+  segments per acknowledged segment, tripling it every round trip (close to
+  BBR's startup gain), until the slow-start threshold (initially
+  `max_window / payload` segments), loss, or queueing delay. A larger credit at
+  the same cumulative acknowledgement is a window update sent as data is
+  delivered, never a duplicate.
+- Queueing delay is controlled Vegas-style, so a window larger than the path
+  never becomes a standing queue (bufferbloat). The base round trip is the
+  windowed minimum sample of the last ten seconds. A round lasts until
+  everything sent when it began is acknowledged, or twice the base round trip,
+  whichever is first; from the round's smallest sample the sender estimates
+  queued segments as `in_flight × (rtt − base) / rtt`. The tolerated queue is
+  the segments worth a target delay — the larger of 250 µs and an eighth of the
+  base round trip — or two segments. The target keeps round-trip jitter (timer
+  granularity, scheduler wakes of tens of microseconds per hop) from being read
+  as a queue, and bounds a WAN queue to a fraction of its round trip. The time
+  bound on rounds sees a queue that builds within one long burst.
+- Once a round has eight samples, more than the tolerated queue ends slow
+  start, cutting the window to the estimated path capacity (in flight minus
+  queued) plus the tolerated queue. Afterwards each round grows a window it used
+  (at least half in flight) by a quarter while less than half the tolerated
+  queue builds and by one segment while less than all of it does; above twice
+  it (at least four segments) the window is cut the same way, by at most half.
+  The round after a cut carries segments sent before it and is not measured.
+  `max_window` therefore bounds memory and the bandwidth-delay product
+  reachable, not the queue a stream builds.
+- Loss — three duplicate acknowledgements or a retransmission timeout — sets
+  the threshold and the window to half the congestion window and starts
+  recovery for everything sent so far. Three duplicate acknowledgements
+  retransmit the oldest unacknowledged segment; a timeout retransmits from it up
+  to the congestion window. Each partial acknowledgement then retransmits the
+  following segments, keeping retransmissions within the window, so every gap
+  in a window is repaired at the acknowledgement clock rather than one gap per
+  timeout. The window is frozen during recovery: duplicate acknowledgements
+  never halve it again and acknowledgements never grow it.
+- In-order data arriving together is acknowledged once (at most 16 packets per
+  acknowledgement); duplicates, out-of-order segments and segments that fill a
+  gap are acknowledged at once so duplicate-acknowledgement repair still works.
+  Delivery to TLS announces reopened credit only when it grew by half the
+  receive reservation or the last credit was below one maximal segment;
+  heartbeats repair a lost announcement. A sender reads up to 16 segments of
+  buffered ciphertext per wake while credit, window and memory allow.
 - Retransmission timeouts follow RFC 6298: the first round-trip sample sets the
   estimate, later samples smooth it, and retransmitted segments are never
   sampled (Karn's rule). The timeout starts at one second, is floored at 200 ms
@@ -74,49 +123,89 @@ bytes. This is not a guarantee of availability through arbitrary outages.
 - Route changes select another next hop below the existing authenticated
   session. They do not terminate TLS or restart application delivery.
 
+### Node memory budget
+
+`TunnelLimits::memory_budget` bounds all retained tunnel ciphertext of one
+`TunnelTransport`: unacknowledged sent segments and received segments awaiting
+reordering or delivery to TLS, in both directions of every session.
+
+- Each session holds a guaranteed floor of `min_window` bytes per direction from
+  admission until it ends. Validation requires
+  `memory_budget >= max_sessions × 2 × min_window`, and the floors of sessions
+  not yet admitted are never lent out, so a new session always gets its floor and
+  every session progresses on it alone, even when the rest of the budget is held
+  by others.
+- Above the floor a direction grows opportunistically, without waiting, from the
+  shared remainder up to `max_window`. A sender reserves before reading a segment
+  and returns the reservation as acknowledgements free segments. A receiver grows
+  by seven times each in-order segment it accepts, so its credit grows eightfold
+  every round trip — ahead of a sender's slow start even from the floor — while
+  the application keeps up; when the shared remainder is exhausted it keeps
+  advertising what it already holds.
+- A sender that has sent no data for `heartbeat_interval` with nothing
+  unacknowledged relinquishes its credit with a sequenced, empty `Idle` segment
+  and takes no further credit until that segment is acknowledged. Processing it
+  in order, the receiver releases its reservation down to the floor (and to what
+  it still buffers), returning memory to other sessions. Because credit is taken
+  only from acknowledgements beyond the `Idle` segment, no data is in flight
+  under the released credit.
+- Reservations never wait, so acknowledgement, retransmission and heartbeat
+  processing never block on memory. `TunnelTransport::reserved_memory()` reports
+  the bytes currently reserved.
+
 `TunnelConfig::with_limits(TunnelLimits { .. })` configures peer/session admission,
-the accept queue, TLS buffering, send segment, receive/initial congestion
-windows and setup/retransmission/heartbeat deadlines. Standalone endpoints use
-`TunnelTransport::with_limits`. Each field's range is its type: `QueueCapacity`
-for the accept queue, `SegmentSize` for the send segment, `NonZeroU16` for the
-windows (the wire's u16 credit), nonzero counts, and `RetransmitTimeouts`, whose
-constructor orders `min <= initial <= max` once. `TunnelLimits::validate` checks
-only cross-field relations: sessions per peer within `max_sessions`, initial
-congestion within the window, and a peer timeout longer than both the heartbeat
-interval and the retransmission cap. TLS ciphertext is initially read into
-routing-headroom storage; retransmissions retain ciphertext rather than
-re-encrypting application bytes. Advertised credit describes the remote
-receiver, while each sender still enforces its own congestion and memory bounds.
+the accept queue, TLS buffering, send segment, windows, memory budget, initial
+congestion window and setup/retransmission/heartbeat deadlines. Standalone
+endpoints use `TunnelTransport::with_limits`. Each field's range is its type:
+`QueueCapacity` for the accept queue, `SegmentSize` for the send segment,
+`NonZeroU32` for the byte windows (the wire's u32 credit), nonzero counts and
+budget, and `RetransmitTimeouts`, whose constructor orders `min <= initial <= max`
+once. `TunnelLimits::validate` checks only cross-field relations: sessions per
+peer within `max_sessions`; `payload + 38 <= min_window <= max_window`; the
+budget covering every floor; initial congestion within `max_window / payload`
+segments; and a peer timeout longer than both the heartbeat interval and the
+retransmission cap. TLS ciphertext is initially read into routing-headroom
+storage; retransmissions retain ciphertext rather than re-encrypting application
+bytes.
 
 | `TunnelLimits` field | Default |
 |---|---|
 | `payload` (send segment) | 16 KiB |
-| `window` / `initial_congestion` | 64 / 4 segments |
+| `min_window` / `max_window` (per direction) | 128 KiB / 16 MiB |
+| `memory_budget` (per transport) | 128 MiB |
+| `initial_congestion` | 4 segments |
 | `retransmit` | 200 ms minimum, 1 s initial, 2 s maximum |
 | `stream_buffer` | 32 KiB per direction |
 | `max_peers` / `max_sessions` / `sessions_per_peer` | 128 / 64 / 8 |
 | `accept_queue` | 32 per namespace |
 | `setup_timeout` / `peer_timeout` / `heartbeat_interval` | 10 s / 20 s / 1 s |
 
-These defaults are bulk-capable: a stream keeps up to `window × payload` = 1 MiB
-in flight per direction, about 100 Mbit/s at an 80 ms round trip. A paused-clock
-regression test moves 1 MiB across an 80 ms round trip within eight round trips,
-which 512-byte segments in a 32-segment window cannot.
+A 16 MiB window sustains about 1.6 Gbit/s at an 80 ms round trip, covering a
+1 Gbit/s × 100 ms path with one stream. The default budget guarantees 16 MiB of
+floors (64 sessions × 2 × 128 KiB) and lends the remaining 112 MiB, enough for
+seven directions at full window at once. Paused-clock regression tests move
+16 MiB each way across an 80 ms, 1 Gbit/s link with 4 ms of delay jitter within
+eight round trips per direction (about six in practice; the former 1 MiB window
+needs more than sixteen, and the former two-segment slow-start exit stalled one
+direction past twelve), and move 8 MiB twice across an 80 ms, 100 Mbit/s link:
+slow start overshoots by under three round trips of queue (about 190 ms), and
+the warmed transfer keeps the link queue below one round trip (about 50 ms;
+hundreds of milliseconds without delay control).
 
-Memory per session is bounded by:
+Memory per transport is bounded by `memory_budget` of retained ciphertext, plus
+per session one `payload` read buffer, `2 × stream_buffer` of TLS buffering, and
+the inbound packet queue, `TunnelLimits::packet_queue()` = `2 × max_window /
+payload + 16` packets (2,064), derived rather than configured. Queued packets
+from an honest peer lie within its credit and are already covered by the
+reservation; arrivals beyond the queue are loss. A peer sending much smaller
+segments than the local `payload` may overflow the queue and see loss.
 
-- `window × payload` of sent ciphertext awaiting acknowledgement (1 MiB);
-- `window × SegmentSize::MAX` of received ciphertext awaiting in-order delivery
-  (about 4 MiB; 1 MiB from a peer using the default send segment);
-- `2 × stream_buffer` of TLS buffering (64 KiB);
-- the inbound packet queue, `TunnelLimits::packet_queue()` = `2 × window + 16`
-  packets (144), derived from the window rather than configured, which holds
-  arrivals not yet moved into the buffers above. Arrivals beyond it are loss.
-
-With defaults and default peers a saturated session retains about 2 MiB, so 64
-saturated sessions retain about 132 MiB; size `max_sessions`, `window` and
-`payload` together. The router's `tunnel_queue` bounds packets awaiting session
-dispatch ([routing resource policy](routing.md#packet-storage-and-resource-policy)).
+The router's per-link `link_queue` is sized from the same defaults: one
+saturated stream keeps about `TunnelLimits::stream_frames()` =
+`2 × max_window / payload` frames queued (a window of data plus its
+acknowledgements, 2,048 by default). Tunnel packets are dispatched to sessions
+inline from the router, without an intermediate node-wide queue. See the
+[routing resource policy](routing.md#packet-storage-and-resource-policy).
 
 ### Authenticated unordered sessions
 
@@ -125,7 +214,7 @@ shared unordered protocol engine behind the generic `Endpoint<P>` handle.
 Pinned TLS is used only for setup and lifetime binding. Its setup accept queues
 are distinct from ordered application accepts and demultiplexed by the bound
 reliable/unreliable policy, so concurrent accepts cannot steal a different
-policy's session. The authenticated `GN-TUNNEL-2` preamble selects the namespace;
+policy's session. The authenticated `GN-TUNNEL-3` preamble selects the namespace;
 unknown namespaces fail closed. Both peers must resolve the unordered protocol
 and explicitly permit the requested policy in node-wide `UnorderedConfig`;
 there is no silent downgrade. Binding an endpoint or peer opens no connection.

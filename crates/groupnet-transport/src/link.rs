@@ -154,6 +154,50 @@ pub struct AdmittedInbound {
     pub session: Option<SessionId>,
 }
 
+/// Synchronous inbound processing supplied by the registering network.
+///
+/// The network processes each frame inline on the calling task and never
+/// waits: every hand-off behind it is bounded and drops on overflow. A caller
+/// therefore keeps its own backpressure simply by not reading further input
+/// until `deliver` returns.
+pub trait InboundDelivery: Send + Sync + 'static {
+    /// Processes one admitted physical frame.
+    fn deliver(&self, packet: AdmittedInbound);
+}
+
+/// A cloneable handle to the network's [`InboundDelivery`], bounded by the
+/// link's frame limit. Transports whose reader tasks hold it deliver admitted
+/// frames directly instead of handing them to the link worker's receive loop.
+#[derive(Clone)]
+pub struct InboundSink {
+    delivery: Arc<dyn InboundDelivery>,
+    mtu: usize,
+}
+
+impl fmt::Debug for InboundSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InboundSink")
+            .field("mtu", &self.mtu)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InboundSink {
+    /// Bounds `delivery` to frames of at most `mtu` bytes.
+    #[must_use]
+    pub fn new(delivery: Arc<dyn InboundDelivery>, mtu: usize) -> Self {
+        Self { delivery, mtu }
+    }
+
+    /// Processes one frame inline; frames larger than the link's frame limit
+    /// are dropped, exactly as the worker's receive loop drops them.
+    pub fn deliver(&self, packet: AdmittedInbound) {
+        if packet.packet.msg.len() <= self.mtu {
+            self.delivery.deliver(packet);
+        }
+    }
+}
+
 /// Router-neutral worker endpoints. Streams/sinks are erased once, not per frame.
 /// The incoming sink receives `None` when the transport fails. Implementations
 /// must preserve backpressure; the shared workers add no extra message queues.
@@ -162,6 +206,10 @@ pub struct LinkIo {
     pub outgoing: Pin<Box<dyn Stream<Item = Outbound> + Send>>,
     /// Incoming frames or a terminal transport failure.
     pub incoming: Pin<Box<dyn Sink<Option<AdmittedInbound>, Error = io::Error> + Send>>,
+    /// Optional synchronous delivery for the same frames as `incoming`, offered
+    /// to the transport through [`Transport::attach_inbound`] when the
+    /// worker starts. Terminal failure is still reported through `incoming`.
+    pub direct: Option<InboundSink>,
     /// Cancellation owned by the registering network.
     pub cancel: CancellationToken,
     /// Largest accepted incoming physical frame.
@@ -171,6 +219,7 @@ pub struct LinkIo {
 impl fmt::Debug for LinkIo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinkIo")
+            .field("direct", &self.direct)
             .field("mtu", &self.mtu)
             .finish_non_exhaustive()
     }

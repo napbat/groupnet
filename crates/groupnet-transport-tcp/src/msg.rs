@@ -84,13 +84,45 @@ pub use connectivity::TcpPathChanges;
 mod endpoint;
 #[path = "msg_framing.rs"]
 mod framing;
-use framing::{read_frame, write_frame};
+use framing::{FrameReader, extend_ready, next_batch, write_frames};
 
 #[derive(Debug)]
 struct QueuedInbound {
     packet: Inbound,
     #[cfg(feature = "link")]
     session: Option<groupnet_transport::admission::SessionId>,
+}
+
+/// Where reader tasks hand inbound frames: the network's synchronous sink once
+/// a link worker attached one, otherwise the bounded inbox. Either way a reader
+/// reads no further input until its frame is handed over.
+#[derive(Clone, Debug)]
+struct InboundPath {
+    queue: mpsc::Sender<QueuedInbound>,
+    #[cfg(feature = "link")]
+    direct: Arc<std::sync::OnceLock<groupnet_transport::link::InboundSink>>,
+}
+
+impl InboundPath {
+    /// Hands over one frame; false once the transport's inbox is gone.
+    async fn deliver(&self, packet: QueuedInbound) -> bool {
+        #[cfg(feature = "link")]
+        if let Some(sink) = self.direct.get() {
+            if self.queue.is_closed() {
+                return false;
+            }
+            sink.deliver(groupnet_transport::link::AdmittedInbound {
+                packet: packet.packet,
+                session: packet.session,
+            });
+            // Charge the scheduler's cooperative budget as the queue send it
+            // replaces did: a reader on a busy socket otherwise runs on while
+            // the task its delivery woke waits, unstealable, behind it.
+            tokio::task::consume_budget().await;
+            return true;
+        }
+        self.queue.send(packet).await.is_ok()
+    }
 }
 
 /// Default allocation guard for an inbound payload; deployments may tune it
@@ -223,6 +255,9 @@ struct Inner {
     peers: RwLock<HashMap<NodeId, SocketAddr>>,
     pool: Mutex<Pool>,
     inbox: AsyncMutex<mpsc::Receiver<QueuedInbound>>,
+    /// The network's synchronous sink, attached once by a link worker.
+    #[cfg(feature = "link")]
+    direct: Arc<std::sync::OnceLock<groupnet_transport::link::InboundSink>>,
     #[cfg(feature = "link")]
     admission: Option<Arc<admitted::Managed>>,
     tasks: Arc<Tasks>,
@@ -301,6 +336,11 @@ impl TcpMsgTransport {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let (inbound_tx, inbound_rx) = mpsc::channel(config.inbound_queue.get());
+        let inbound = InboundPath {
+            queue: inbound_tx,
+            #[cfg(feature = "link")]
+            direct: Arc::default(),
+        };
         let read_idle = config.idle_timeout.saturating_mul(2);
         let intro = config
             .advertise
@@ -317,15 +357,17 @@ impl TcpMsgTransport {
             inbox: AsyncMutex::new(inbound_rx),
             tasks: Arc::new(Tasks::default()),
             #[cfg(feature = "link")]
+            direct: inbound.direct.clone(),
+            #[cfg(feature = "link")]
             admission,
         });
         #[cfg(feature = "link")]
         if let Some(managed) = &inner.admission {
-            managed.set_inbound(inbound_tx.clone());
+            managed.set_inbound(inbound.clone());
         }
         inner.tasks.spawn(accept_loop(
             listener,
-            inbound_tx,
+            inbound,
             read_idle,
             Arc::downgrade(&inner),
         ));
@@ -370,24 +412,26 @@ async fn write_loop(mut out: Outbound) {
     if let Ok(Ok(mut sock)) = timeout(CONNECT_TIMEOUT, TcpStream::connect(out.addr)).await {
         let _ = sock.set_nodelay(true); // latency is the point of eager frames
         if write_intro(&mut sock, &out.local, &out.intro).await.is_ok() {
+            let mut batch = Vec::with_capacity(framing::WRITE_BATCH);
             loop {
-                match timeout(out.idle, out.frames.recv()).await {
+                match timeout(out.idle, next_batch(&mut out.frames, &mut batch)).await {
                     // Idle: leave the pool first so a racing send re-dials,
                     // then flush the few frames that may have just landed.
                     Err(_elapsed) => {
                         out.leave_pool();
-                        while let Ok(frame) = out.frames.try_recv() {
-                            if write_frame(&mut sock, &frame).await.is_err() {
-                                break;
+                        loop {
+                            extend_ready(&mut out.frames, &mut batch);
+                            if batch.is_empty() || write_frames(&mut sock, &batch).await.is_err() {
+                                return;
                             }
+                            batch.clear();
                         }
-                        return;
                     }
                     // Sender gone: evicted from the pool or the transport was
                     // dropped — the entry is already out either way.
-                    Ok(None) => return,
-                    Ok(Some(frame)) => {
-                        if write_frame(&mut sock, &frame).await.is_err() {
+                    Ok(false) => return,
+                    Ok(true) => {
+                        if write_frames(&mut sock, &batch).await.is_err() {
                             break; // connection failed mid-write
                         }
                     }
@@ -404,7 +448,7 @@ async fn write_loop(mut out: Outbound) {
 /// listener fails or every transport handle is dropped.
 async fn accept_loop(
     listener: TcpListener,
-    inbound: mpsc::Sender<QueuedInbound>,
+    inbound: InboundPath,
     read_idle: Duration,
     inner: Weak<Inner>,
 ) {
@@ -430,7 +474,7 @@ async fn accept_loop(
                     inner.clone(),
                 ));
             }
-            () = inbound.closed() => return, // transport dropped
+            () = inbound.queue.closed() => return, // transport dropped
         }
     }
 }
@@ -439,7 +483,7 @@ async fn accept_loop(
 /// frame to the introduced peer id.
 async fn read_loop(
     mut sock: TcpStream,
-    inbound: mpsc::Sender<QueuedInbound>,
+    inbound: InboundPath,
     read_idle: Duration,
     inner: Weak<Inner>,
 ) {
@@ -462,10 +506,10 @@ async fn read_loop(
     let Some(endpoint) = inner.upgrade() else {
         return;
     };
-    let max_frame_bytes = endpoint.config.max_frame_bytes;
+    let mut reader = FrameReader::new(endpoint.config.max_frame_bytes);
     drop(endpoint);
     loop {
-        let Ok(read) = timeout(read_idle, read_frame(&mut sock, max_frame_bytes)).await else {
+        let Ok(read) = timeout(read_idle, reader.next(&mut sock)).await else {
             return; // silent past the reaper deadline: presumed half-open
         };
         let Ok(Some(msg)) = read else {
@@ -476,14 +520,13 @@ async fn read_loop(
             msg,
         };
         // recv() backpressure propagates here, and from here to the socket.
-        if inbound
-            .send(QueuedInbound {
+        if !inbound
+            .deliver(QueuedInbound {
                 packet: event,
                 #[cfg(feature = "link")]
                 session: None,
             })
             .await
-            .is_err()
         {
             return;
         }

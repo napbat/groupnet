@@ -1,20 +1,19 @@
 //! Path-vector learning, bounded replay suppression, and packet forwarding.
 
-use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::sync::{Arc, atomic::Ordering};
-use std::time::Instant;
 
 use bytes::{Buf, Bytes};
 use groupnet_core::NodeId;
 use groupnet_transport::Inbound;
+use groupnet_transport::admission::SessionId;
 use groupnet_transport::link::AdmittedInbound;
 use tokio::sync::mpsc;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{
-    AdvertisedRoute, ApplicationPacket, Candidate, Event, PacketBuffer, Queued, Route, Shared,
-    Table, TransportId, closed,
+    AdvertisedRoute, ApplicationPacket, Candidate, Event, PacketBuffer, Queued, Route,
+    RouterConfig, Shared, Table, TransportId, closed, replay::ReplayWindows,
 };
 use crate::wire::{self, Frame, PayloadKind, Reassembly};
 
@@ -84,19 +83,22 @@ impl Shared {
         from: NodeId,
         payload: Bytes,
     ) -> io::Result<()> {
-        if let PayloadKind::Application(id) = kind {
-            self.protocols
+        match kind {
+            PayloadKind::Application(id) => self
+                .protocols
                 .lock()
                 .map_err(|_| io::Error::other("protocol registry poisoned"))?
-                .deliver(id, ApplicationPacket { from, payload })
-        } else {
-            let queue = if kind == PayloadKind::Message {
-                &self.messages
-            } else {
-                &self.tunnels
-            };
-            let _ = queue.try_send(Inbound { from, msg: payload });
-            Ok(())
+                .deliver(id, ApplicationPacket { from, payload }),
+            PayloadKind::Message => {
+                let _ = self.messages.try_send(Inbound { from, msg: payload });
+                Ok(())
+            }
+            PayloadKind::Tunnel => {
+                if let Some(inbox) = self.tunnel.get() {
+                    inbox.deliver(from, payload);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -207,21 +209,34 @@ impl Shared {
     }
 }
 
+/// Reassembly and replay-suppression state shared by every link's inbound
+/// path. Each link worker processes its own frames inline; the lock covers only
+/// reassembly, decoding and the replay check, never delivery or forwarding.
+pub(super) struct InboundState {
+    fragments: Reassembly,
+    replay: ReplayWindows,
+}
+
+impl InboundState {
+    pub(super) fn new(config: &RouterConfig) -> Self {
+        Self {
+            fragments: Reassembly::new(config.reassembly.clone(), config.max_frame),
+            replay: ReplayWindows::new(config.replay_capacity),
+        }
+    }
+}
+
+/// Owns the announcement clock and link lifecycle events. Data frames never
+/// pass through here: link workers process them inline.
 pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>) {
     let mut clock = tokio::time::interval(shared.config.announce_interval);
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut fragments = Reassembly::new(shared.config.reassembly.clone(), shared.config.max_frame);
-    let mut seen = HashSet::new();
-    let mut order = VecDeque::new();
     loop {
         tokio::select! {
             biased;
             () = shared.cancel.cancelled() => break,
             _ = clock.tick() => shared.announce(),
             event = events.recv() => match event {
-                Some(Event::Received { link, packet }) => {
-                    process(&shared, link, packet, &mut fragments, &mut seen, &mut order);
-                }
                 Some(Event::Neighbors(link)) => shared.neighbors_changed(link),
                 Some(Event::Down(link)) => { shared.table.lock().expect("router table poisoned").remove(link); shared.announce(); }
                 Some(Event::Announce) => shared.announce(),
@@ -231,116 +246,121 @@ pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>
     }
 }
 
-fn admitted_cost(shared: &Shared, link: TransportId, admitted: &AdmittedInbound) -> Option<u32> {
-    if admitted.packet.from == shared.local {
-        return None;
+impl Shared {
+    fn admitted_cost(&self, link: TransportId, admitted: &AdmittedInbound) -> Option<u32> {
+        if admitted.packet.from == self.local {
+            return None;
+        }
+        let table = self.table.lock().expect("router table poisoned");
+        let adapter = table.links.get(&link)?;
+        adapter
+            .admits(&admitted.packet.from, admitted.session)
+            .then_some(adapter.config.cost)
     }
-    let table = shared.table.lock().expect("router table poisoned");
-    let adapter = table.links.get(&link)?;
-    adapter
-        .admits(&admitted.packet.from, admitted.session)
-        .then_some(adapter.config.cost)
-}
 
-fn process(
-    shared: &Shared,
-    link: TransportId,
-    admitted: AdmittedInbound,
-    fragments: &mut Reassembly,
-    seen: &mut HashSet<(NodeId, [u8; 16])>,
-    order: &mut VecDeque<(NodeId, [u8; 16])>,
-) {
-    let Some(cost) = admitted_cost(shared, link, &admitted) else {
-        return;
-    };
-    let AdmittedInbound { packet, session } = admitted;
-    let Some(bytes) = fragments.receive(link.0, session, &packet.from, packet.msg) else {
-        return;
-    };
-    let Ok(frame) = wire::decode_bounded(&bytes, shared.config.max_frame, shared.config.max_hops)
-    else {
-        return;
-    };
-    match frame {
-        Frame::Advert {
-            cost: advertised,
-            path,
-        } => {
-            if path.first() != Some(&packet.from)
-                || path.contains(&shared.local)
-                || path.len() >= shared.config.max_hops
-            {
-                return;
+    /// Processes one admitted physical frame on the link worker that read it:
+    /// reassembly, route learning, replay suppression, then local delivery or
+    /// forwarding. Every hand-off is a bounded `try_send`, so this never waits.
+    pub(super) fn receive(&self, link: TransportId, admitted: AdmittedInbound) {
+        let Some(cost) = self.admitted_cost(link, &admitted) else {
+            return;
+        };
+        let AdmittedInbound { packet, session } = admitted;
+        let mut inbound = self.inbound.lock().expect("router inbound state poisoned");
+        let Some(bytes) = inbound
+            .fragments
+            .receive(link.0, session, &packet.from, packet.msg)
+        else {
+            return;
+        };
+        let Ok(frame) = wire::decode_bounded(&bytes, self.config.max_frame, self.config.max_hops)
+        else {
+            return;
+        };
+        if let Frame::Data { from, id, .. } = &frame
+            && !inbound.replay.first_sighting(from, *id)
+        {
+            return;
+        }
+        drop(inbound);
+        match frame {
+            Frame::Advert {
+                cost: advertised,
+                path,
+            } => self.learn(link, packet.from, session, cost, advertised, path),
+            Frame::Data {
+                kind,
+                hops,
+                id: _,
+                from,
+                to,
+                payload,
+            } => {
+                if to == self.local {
+                    let offset = bytes.len() - payload.len();
+                    let mut bytes = bytes;
+                    bytes.advance(offset);
+                    let _ = self.deliver_owned(kind, from, bytes);
+                } else if self.config.forwarding && hops > 1 {
+                    let mut forwarded = bytes
+                        .try_into_mut()
+                        .unwrap_or_else(|shared| bytes::BytesMut::from(shared.as_ref()));
+                    wire::decrement_hops(&mut forwarded, kind);
+                    self.forward(&to, forwarded.freeze());
+                }
             }
-            let Some(cost) = cost.checked_add(advertised) else {
-                return;
-            };
-            let Some(destination) = path.last().cloned() else {
-                return;
-            };
-            let mut table = shared.table.lock().expect("router table poisoned");
-            if !table.candidates.contains_key(&destination)
-                && table.candidates.len() >= shared.config.max_routes
-            {
-                return;
-            }
-            let mut full_path = Vec::with_capacity(path.len() + 1);
-            full_path.push(shared.local.clone());
-            full_path.extend(path);
-            table
-                .candidates
-                .entry(destination.clone())
-                .or_default()
-                .insert(
-                    (link, packet.from.clone()),
-                    Candidate {
-                        route: Route {
-                            destination,
-                            next_hop: packet.from,
-                            transport: link,
-                            cost,
-                            path: full_path,
-                        },
-                        updated: Instant::now(),
-                        session,
+        }
+    }
+
+    fn learn(
+        &self,
+        link: TransportId,
+        neighbor: NodeId,
+        session: Option<SessionId>,
+        cost: u32,
+        advertised: u32,
+        path: Vec<NodeId>,
+    ) {
+        if path.first() != Some(&neighbor)
+            || path.contains(&self.local)
+            || path.len() >= self.config.max_hops
+        {
+            return;
+        }
+        let Some(cost) = cost.checked_add(advertised) else {
+            return;
+        };
+        let Some(destination) = path.last().cloned() else {
+            return;
+        };
+        let mut table = self.table.lock().expect("router table poisoned");
+        if !table.candidates.contains_key(&destination)
+            && table.candidates.len() >= self.config.max_routes
+        {
+            return;
+        }
+        let mut full_path = Vec::with_capacity(path.len() + 1);
+        full_path.push(self.local.clone());
+        full_path.extend(path);
+        table
+            .candidates
+            .entry(destination.clone())
+            .or_default()
+            .insert(
+                (link, neighbor.clone()),
+                Candidate {
+                    route: Route {
+                        destination,
+                        next_hop: neighbor,
+                        transport: link,
+                        cost,
+                        path: full_path,
                     },
-                );
-            drop(table);
-            shared.refresh_reachable();
-        }
-        Frame::Data {
-            kind,
-            hops,
-            id,
-            from,
-            to,
-            payload,
-        } => {
-            let key = (from.clone(), id);
-            if !seen.insert(key.clone()) {
-                return;
-            }
-            order.push_back(key);
-            if order.len() > shared.config.replay_capacity
-                && let Some(old) = order.pop_front()
-            {
-                seen.remove(&old);
-            }
-            if to == shared.local {
-                let offset = bytes.len() - payload.len();
-                deliver(shared, kind, from, bytes, offset);
-            } else if shared.config.forwarding && hops > 1 {
-                let mut forwarded = bytes
-                    .try_into_mut()
-                    .unwrap_or_else(|shared| bytes::BytesMut::from(shared.as_ref()));
-                wire::decrement_hops(&mut forwarded, kind);
-                shared.forward(&to, forwarded.freeze());
-            }
-        }
+                    updated: Instant::now(),
+                    session,
+                },
+            );
+        drop(table);
+        self.refresh_reachable();
     }
-}
-
-fn deliver(shared: &Shared, kind: PayloadKind, from: NodeId, mut bytes: Bytes, offset: usize) {
-    bytes.advance(offset);
-    let _ = shared.deliver_owned(kind, from, bytes);
 }

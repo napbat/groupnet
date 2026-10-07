@@ -1,12 +1,13 @@
 //! End-to-end TLS tunnels over real heterogeneous and deliberately impaired routers.
 
+mod budget;
 mod failover;
 mod fixtures;
 mod native;
 mod protocols;
 mod wan;
 
-use std::{io, num::NonZeroU16, sync::atomic::Ordering, time::Duration};
+use std::{io, num::NonZeroU32, sync::atomic::Ordering, time::Duration};
 
 use fixtures::{Fabric, credentials};
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
@@ -120,16 +121,18 @@ async fn retransmission_reordering_and_deduplication_across_multihop_router() {
 
 #[tokio::test]
 async fn different_receive_windows_exchange_streams_in_both_directions() {
+    // Four 16 KiB segments against the default 16 MiB window.
     let small = TunnelLimits {
-        window: NonZeroU16::new(8).unwrap(),
+        min_window: NonZeroU32::new(32 * 1024).unwrap(),
+        max_window: NonZeroU32::new(64 * 1024).unwrap(),
         setup_timeout: Duration::from_secs(2),
         ..TunnelLimits::default()
     };
     let large = TunnelLimits {
-        window: NonZeroU16::new(64).unwrap(),
-        ..small.clone()
+        setup_timeout: Duration::from_secs(2),
+        ..TunnelLimits::default()
     };
-    exchange_both_ways(small, large, 16 * 1024).await;
+    exchange_both_ways(small, large, 256 * 1024 + 5).await;
 }
 
 #[tokio::test]
@@ -280,7 +283,8 @@ async fn backpressure_and_close_cancel_blocked_io_and_accept() {
     .unwrap();
     let mut client = client.unwrap();
     let mut server = server.unwrap().1;
-    let large = vec![0xA5; 16 * 1024 * 1024];
+    // Three default windows: the unread receiver can hold only one.
+    let large = vec![0xA5; 48 * 1024 * 1024];
     assert!(
         timeout(Duration::from_millis(150), client.write_all(&large))
             .await

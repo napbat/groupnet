@@ -20,6 +20,9 @@ impl<T: Transport> Worker for Typed<T> {
 
     fn run(self: Arc<Self>, mut io: LinkIo) -> LinkFuture<'static, ()> {
         Box::pin(async move {
+            if let Some(sink) = io.direct.take() {
+                self.0.attach_inbound(sink);
+            }
             let send = async {
                 while let Some(packet) = io.outgoing.next().await {
                     let super::Outbound {

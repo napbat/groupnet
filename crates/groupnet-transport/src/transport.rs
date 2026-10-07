@@ -84,6 +84,18 @@ pub trait Transport: Send + Sync + 'static {
         }
     }
 
+    /// Offers the registering network's synchronous inbound sink when a link
+    /// worker starts. A transport whose reader tasks can call it may retain it
+    /// and deliver admitted frames directly, saving the worker's receive hop;
+    /// it must stop reading input while a delivery runs, so its own bounds
+    /// still apply, and it must keep the producing generation on every frame.
+    /// Frames still returned by [`recv_admitted`](Self::recv_admitted) keep
+    /// flowing through the worker. The default ignores the sink.
+    #[cfg(feature = "link")]
+    fn attach_inbound(&self, sink: crate::link::InboundSink) {
+        let _ = sink;
+    }
+
     /// Teaches the transport that `node` claims to be reachable at `addr` —
     /// the exact string the peer advertised (the runtime feeds gossiped
     /// `advertise_addr` values through here automatically, so only seeds need

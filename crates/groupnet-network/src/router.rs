@@ -2,11 +2,14 @@
 
 mod adapters;
 mod packet;
+mod pool;
 mod protocol;
+mod replay;
 mod routing;
 
 pub use crate::wire::ReassemblyConfig;
 pub use packet::PacketBuffer;
+pub(crate) use packet::TunnelBuffers;
 
 pub use protocol::{ProtocolId, ProtocolIo};
 
@@ -19,24 +22,22 @@ mod admission_tests;
 #[cfg(test)]
 mod outbound_tests;
 
-use routing::drive;
+use routing::{InboundState, drive};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicU64};
+use std::time::Duration;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{SessionId, SessionRegistry};
-use groupnet_transport::link::{AdmittedInbound, BoundLink, LinkConfig, LinkControl};
+use groupnet_transport::link::{BoundLink, LinkConfig, LinkControl};
 use groupnet_transport::{Inbound, QueueCapacity, Transport};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::time::Instant;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::wire::{self, PayloadKind};
@@ -47,11 +48,13 @@ pub struct TransportId(usize);
 
 /// Routing and resource policy for one node.
 ///
-/// Queue sizing: one bulk tunnel stream keeps about `2 × window` frames queued
-/// (a window of data plus its acknowledgements). Size `link_queue` for the bulk
-/// streams sharing a link and `tunnel_queue` for those terminating at this node;
-/// the defaults hold two and eight default-window (64-segment) streams. A full
-/// link or tunnel queue drops frames, which streams repair as loss.
+/// Queue sizing: one saturated tunnel stream keeps about
+/// [`TunnelLimits::stream_frames`](crate::tunnel::TunnelLimits::stream_frames)
+/// frames queued (a window of data plus its acknowledgements; 2,048 with
+/// default limits). Size `link_queue` for the bulk streams sharing a link; the
+/// default holds two default-window streams. Arriving tunnel packets go straight
+/// to their session's own bounded queue. A full queue drops frames, which
+/// streams repair as loss.
 #[derive(Clone, Debug)]
 pub struct RouterConfig {
     /// Whether this node forwards transit traffic between admitted peers.
@@ -79,14 +82,18 @@ pub struct RouterConfig {
     pub event_queue: QueueCapacity,
     /// Bounded coordination inbox capacity.
     pub message_queue: QueueCapacity,
-    /// Bounded tunnel inbox capacity shared by this node's tunnel sessions.
-    pub tunnel_queue: QueueCapacity,
     /// Bounded outbound queue capacity for each link.
     pub link_queue: QueueCapacity,
-    /// Number of recent routed identities retained for loop/replay suppression.
+    /// Recent routed identities retained for loop/replay suppression: each
+    /// origin stream remembers its last 64 packet sequences and rejects older
+    /// ones, and at most `replay_capacity / 64` (rounded up) streams are kept,
+    /// least recently active evicted first.
     pub replay_capacity: usize,
     /// Physical-send deadline shared by all fragments of a frame.
     pub send_timeout: Duration,
+    /// Bytes of idle packet storage kept for reuse by later packets of the
+    /// same size class; zero allocates every packet from the heap.
+    pub packet_pool: usize,
 }
 
 impl Default for RouterConfig {
@@ -104,10 +111,10 @@ impl Default for RouterConfig {
             protocol_queue: QueueCapacity::of(128),
             event_queue: QueueCapacity::of(256),
             message_queue: QueueCapacity::of(64),
-            tunnel_queue: QueueCapacity::of(1024),
-            link_queue: QueueCapacity::of(256),
+            link_queue: QueueCapacity::of(2 * crate::tunnel::DEFAULT_STREAM_FRAMES),
             replay_capacity: 4096,
             send_timeout: Duration::from_secs(5),
+            packet_pool: 2 << 20,
         }
     }
 }
@@ -241,13 +248,17 @@ impl Table {
 }
 
 enum Event {
-    Received {
-        link: TransportId,
-        packet: AdmittedInbound,
-    },
     Neighbors(TransportId),
     Down(TransportId),
     Announce,
+}
+
+/// The tunnel endpoint's synchronous inbound hook. Link workers call it for
+/// each locally addressed tunnel packet, so tunnel traffic crosses no router
+/// queue or task; implementations must only route to bounded per-session queues.
+pub(crate) trait TunnelInbox: Send + Sync + 'static {
+    /// Accepts or drops one opaque tunnel packet from its routed origin.
+    fn deliver(&self, from: NodeId, payload: Bytes);
 }
 
 struct AdvertisedRoute {
@@ -271,9 +282,10 @@ struct Shared {
     local: NodeId,
     config: RouterConfig,
     table: Mutex<Table>,
+    inbound: Mutex<InboundState>,
     events: mpsc::Sender<Event>,
     messages: mpsc::Sender<Inbound>,
-    tunnels: mpsc::Sender<Inbound>,
+    tunnel: OnceLock<Arc<dyn TunnelInbox>>,
     protocols: Mutex<protocol::Registry>,
     advertisements: watch::Sender<Arc<Vec<AdvertisedRoute>>>,
     reachable: watch::Sender<Arc<Vec<NodeId>>>,
@@ -281,13 +293,12 @@ struct Shared {
     tasks: TaskTracker,
     nonce: [u8; 8],
     sequence: AtomicU64,
+    pool: Arc<pool::PacketPool>,
 }
 
 struct Handle {
     shared: Arc<Shared>,
     messages: AsyncMutex<mpsc::Receiver<Inbound>>,
-    tunnels: AsyncMutex<mpsc::Receiver<Inbound>>,
-    tunnel_claimed: AtomicBool,
 }
 
 impl Drop for Handle {
@@ -299,7 +310,8 @@ impl Drop for Handle {
 /// A bounded, multi-hop router over any number of heterogeneous adapters.
 ///
 /// Adapters are generic at registration, then driven by typed tasks and bounded
-/// channels; the hot send path does not box futures. Adjacent peers and transit
+/// channels; each link worker processes its inbound frames inline, and the hot
+/// send path does not box futures. Adjacent peers and transit
 /// routers are trusted for raw message attribution. Use the tunnel layer for
 /// independent end-to-end authentication and confidentiality.
 #[derive(Clone)]
@@ -333,16 +345,17 @@ impl Router {
             .map_err(|_| io::Error::other("OS randomness unavailable"))?;
         let (events, receive) = mpsc::channel(config.event_queue.get());
         let (messages, message_rx) = mpsc::channel(config.message_queue.get());
-        let (tunnels, tunnel_rx) = mpsc::channel(config.tunnel_queue.get());
         let (advertisements, _) = watch::channel(Arc::new(Vec::new()));
         let (reachable, _) = watch::channel(Arc::new(Vec::new()));
         let shared = Arc::new(Shared {
             local,
+            inbound: Mutex::new(InboundState::new(&config)),
+            pool: Arc::new(pool::PacketPool::new(config.packet_pool, config.max_frame)),
             config,
             table: Mutex::new(Table::default()),
             events,
             messages,
-            tunnels,
+            tunnel: OnceLock::new(),
             advertisements,
             protocols: Mutex::new(protocol::Registry::default()),
             reachable,
@@ -356,8 +369,6 @@ impl Router {
             inner: Arc::new(Handle {
                 shared,
                 messages: AsyncMutex::new(message_rx),
-                tunnels: AsyncMutex::new(tunnel_rx),
-                tunnel_claimed: AtomicBool::new(false),
             }),
         })
     }
@@ -584,6 +595,11 @@ impl Router {
         PacketBuffer::new(&self.inner.shared, to, capacity, PayloadKind::Tunnel)
     }
 
+    /// Tunnel packet buffers toward `to` that do not keep this router alive.
+    pub(crate) fn tunnel_buffers(&self, to: &NodeId) -> TunnelBuffers {
+        TunnelBuffers::new(self.inner.shared.clone(), to.clone())
+    }
+
     pub(crate) fn send_tunnel_packet(&self, to: &NodeId, packet: PacketBuffer) -> io::Result<()> {
         self.inner
             .shared
@@ -628,21 +644,15 @@ impl Router {
         Ok(())
     }
 
-    pub(crate) async fn recv_tunnel(&self) -> io::Result<Inbound> {
-        receive(&self.inner.tunnels, &self.inner.shared.cancel).await
-    }
-
-    pub(crate) fn claim_tunnels(&self) -> io::Result<()> {
-        self.inner
-            .tunnel_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "router already owns a tunnel endpoint",
-                )
-            })
+    /// Installs this router's single tunnel endpoint. Link workers hand it every
+    /// locally addressed tunnel packet; unclaimed tunnel traffic is dropped.
+    pub(crate) fn claim_tunnels(&self, inbox: Arc<dyn TunnelInbox>) -> io::Result<()> {
+        self.inner.shared.tunnel.set(inbox).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "router already owns a tunnel endpoint",
+            )
+        })
     }
 
     /// Exclusively binds a bounded application protocol namespace.

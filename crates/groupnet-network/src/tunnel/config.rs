@@ -2,17 +2,35 @@
 
 use std::{
     io,
-    num::{NonZeroU16, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU32, NonZeroUsize},
     time::Duration,
 };
 
 use groupnet_transport::QueueCapacity;
 
-use super::wire::MAX_SEGMENT;
+use super::wire::{MAX_SEGMENT, cost};
 
 /// Control packets (open, heartbeat, close) queued per session beyond the
 /// window-derived data and acknowledgement allowance.
 const PACKET_QUEUE_SLACK: usize = 16;
+
+const DEFAULT_PAYLOAD: SegmentSize = SegmentSize::of(16 * 1024);
+
+const DEFAULT_MAX_WINDOW: NonZeroU32 = NonZeroU32::new(16 << 20).unwrap();
+
+/// Frames one saturated default stream keeps queued; router queue defaults are
+/// multiples of it.
+pub(crate) const DEFAULT_STREAM_FRAMES: usize = stream_frames(DEFAULT_MAX_WINDOW, DEFAULT_PAYLOAD);
+
+/// Segments of `payload` that fill `window`.
+const fn max_segments(window: NonZeroU32, payload: SegmentSize) -> usize {
+    (window.get() as usize).div_ceil(payload.get())
+}
+
+/// A window of data segments plus one acknowledgement per segment.
+const fn stream_frames(window: NonZeroU32, payload: SegmentSize) -> usize {
+    2 * max_segments(window, payload)
+}
 
 /// Ciphertext bytes carried by one reliability segment.
 ///
@@ -144,16 +162,12 @@ impl Default for RetransmitTimeouts {
 
 /// Resource bounds and reliability policy for pinned TLS tunnel sessions on one node.
 ///
-/// Defaults are bulk-capable: 16 KiB send segments and a 64-segment window keep
-/// up to 1 MiB in flight per stream direction (about 100 Mbit/s at 80 ms RTT).
-///
-/// Per session, retained ciphertext is bounded by `window × payload` awaiting
-/// acknowledgement, `window × SegmentSize::MAX` awaiting in-order delivery
-/// (`window × payload` of the sending peer when it uses these defaults), and
-/// `2 × stream_buffer` of TLS buffering. The inbound packet queue
-/// ([`packet_queue`](Self::packet_queue)) holds only traffic not yet assigned to
-/// those buffers. With defaults and default peers a saturated session retains
-/// about 2 MiB; `max_sessions` multiplies the node-wide bound.
+/// Defaults are sized for one stream over a 1 Gbit/s × 100 ms path: a 16 MiB
+/// window per direction (about 1.6 Gbit/s at 80 ms RTT). All retained
+/// ciphertext of a transport — unacknowledged sent segments and received
+/// segments awaiting reordering or delivery — is bounded by `memory_budget`.
+/// Each session direction holds a guaranteed `min_window` floor and grows
+/// opportunistically from the remaining budget up to `max_window`.
 #[derive(Clone, Debug)]
 pub struct TunnelLimits {
     /// Maximum admitted certificate pins.
@@ -170,11 +184,18 @@ pub struct TunnelLimits {
     /// It must also fit the router envelope to each admitted peer. Receiving
     /// accepts any peer segment up to [`SegmentSize::MAX`].
     pub payload: SegmentSize,
-    /// Receive window and congestion-window ceiling, in segments; advertised as
-    /// the wire's u16 credit.
-    pub window: NonZeroU16,
-    /// Initial congestion window in segments; at most `window`. Slow start
-    /// doubles it per round trip until loss or the window.
+    /// Guaranteed per-direction reservation of every session, in bytes of
+    /// segment cost (ciphertext plus 38-byte header); holds at least one
+    /// `payload` segment and at most `max_window`.
+    pub min_window: NonZeroU32,
+    /// Per-direction ceiling on retained ciphertext: unacknowledged sent bytes
+    /// and advertised receive credit, in bytes of segment cost.
+    pub max_window: NonZeroU32,
+    /// Node-wide bound on retained tunnel ciphertext of this transport; at
+    /// least `max_sessions × 2 × min_window`.
+    pub memory_budget: NonZeroUsize,
+    /// Initial congestion window in segments; at most `max_window / payload`.
+    /// Slow start doubles it per round trip until loss or that ceiling.
     pub initial_congestion: NonZeroU16,
     /// TLS setup and authenticated preamble deadline.
     pub setup_timeout: Duration,
@@ -183,7 +204,8 @@ pub struct TunnelLimits {
     /// Expiration after the last valid peer packet; longer than the heartbeat
     /// interval and the retransmission backoff cap.
     pub peer_timeout: Duration,
-    /// Interval between idle acknowledgement heartbeats.
+    /// Interval between idle acknowledgement heartbeats; also how long a sender
+    /// stays without new data before relinquishing its receive credit.
     pub heartbeat_interval: Duration,
 }
 
@@ -195,8 +217,10 @@ impl Default for TunnelLimits {
             sessions_per_peer: const { NonZeroUsize::new(8).unwrap() },
             accept_queue: QueueCapacity::of(32),
             stream_buffer: const { NonZeroUsize::new(32 * 1024).unwrap() },
-            payload: SegmentSize::of(16 * 1024),
-            window: const { NonZeroU16::new(64).unwrap() },
+            payload: DEFAULT_PAYLOAD,
+            min_window: const { NonZeroU32::new(128 * 1024).unwrap() },
+            max_window: DEFAULT_MAX_WINDOW,
+            memory_budget: const { NonZeroUsize::new(128 << 20).unwrap() },
             initial_congestion: const { NonZeroU16::new(4).unwrap() },
             setup_timeout: Duration::from_secs(10),
             retransmit: RetransmitTimeouts::default(),
@@ -211,14 +235,22 @@ impl TunnelLimits {
     /// carried by its type.
     ///
     /// # Errors
-    /// Rejects per-peer sessions above `max_sessions`, an initial congestion
-    /// window above `window`, an unaddressable stream buffer, or inconsistent
-    /// or unrepresentable deadlines.
+    /// Rejects per-peer sessions above `max_sessions`; a `min_window` below one
+    /// `payload` segment or above `max_window`; a budget below every session's
+    /// floors; an initial congestion window above `max_window / payload`; an
+    /// unaddressable stream buffer; or inconsistent or unrepresentable deadlines.
     pub fn validate(&self) -> io::Result<()> {
         let now = tokio::time::Instant::now();
         if self.sessions_per_peer > self.max_sessions
             || self.stream_buffer.get() > isize::MAX.unsigned_abs()
-            || self.initial_congestion > self.window
+            || (self.min_window.get() as usize) < cost(self.payload.get())
+            || self.min_window > self.max_window
+            || self
+                .max_sessions
+                .get()
+                .checked_mul(2 * self.min_window.get() as usize)
+                .is_none_or(|floors| floors > self.memory_budget.get())
+            || usize::from(self.initial_congestion.get()) > self.max_segments()
             || self.setup_timeout.is_zero()
             || self.heartbeat_interval.is_zero()
             || self.peer_timeout <= self.heartbeat_interval
@@ -232,14 +264,31 @@ impl TunnelLimits {
         Ok(())
     }
 
+    /// Segments of `payload` that fill `max_window`: the congestion-window cap.
+    #[must_use]
+    pub const fn max_segments(&self) -> usize {
+        max_segments(self.max_window, self.payload)
+    }
+
+    /// Frames one saturated stream keeps queued: a window of data segments plus
+    /// their acknowledgements. Size router link and tunnel queues in multiples
+    /// of it.
+    #[must_use]
+    pub const fn stream_frames(&self) -> usize {
+        stream_frames(self.max_window, self.payload)
+    }
+
     /// Per-session inbound packet queue, derived from the window: a window of
     /// peer data plus acknowledgements for a window of local data, with slack
     /// for control packets. Arrivals beyond it are dropped as packet loss.
     #[must_use]
     pub fn packet_queue(&self) -> QueueCapacity {
-        QueueCapacity::of(usize::from(self.window.get()))
-            .saturating_mul(2)
-            .saturating_add(PACKET_QUEUE_SLACK)
+        QueueCapacity::of(self.stream_frames()).saturating_add(PACKET_QUEUE_SLACK)
+    }
+
+    /// Bytes set aside so every possible session holds both direction floors.
+    pub(super) fn floor_budget(&self) -> usize {
+        self.max_sessions.get() * 2 * self.min_window.get() as usize
     }
 }
 
@@ -251,22 +300,29 @@ fn invalid(message: &'static str) -> io::Error {
 mod tests {
     use super::*;
 
-    fn sessions(value: usize) -> NonZeroUsize {
+    fn count(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap()
     }
 
-    fn segments(value: u16) -> NonZeroU16 {
-        NonZeroU16::new(value).unwrap()
+    fn bytes(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).unwrap()
     }
 
     #[test]
-    fn defaults_are_bulk_capable_and_valid() {
+    fn defaults_cover_a_gigabit_long_path_within_the_budget() {
         let limits = TunnelLimits::default();
         assert!(limits.validate().is_ok());
         assert_eq!(limits.payload.get(), 16 * 1024);
-        assert_eq!(limits.window.get(), 64);
+        assert_eq!(limits.max_window.get(), 16 << 20);
+        // 1 Gbit/s × 100 ms = 12.5 MB fits one window.
+        assert!(limits.max_window.get() as usize > 1_000_000_000 / 8 / 10);
+        assert_eq!(limits.floor_budget(), 16 << 20);
+        assert_eq!(limits.memory_budget.get(), 128 << 20);
         assert_eq!(limits.retransmit.min(), Duration::from_millis(200));
-        assert_eq!(limits.packet_queue().get(), 2 * 64 + PACKET_QUEUE_SLACK);
+        assert_eq!(limits.max_segments(), 1024);
+        assert_eq!(limits.stream_frames(), DEFAULT_STREAM_FRAMES);
+        assert_eq!(DEFAULT_STREAM_FRAMES, 2048);
+        assert_eq!(limits.packet_queue().get(), 2048 + PACKET_QUEUE_SLACK);
     }
 
     #[test]
@@ -298,41 +354,57 @@ mod tests {
     }
 
     #[test]
-    fn packet_queue_is_derived_from_the_window() {
+    fn packet_queue_and_stream_frames_derive_from_the_window() {
         let largest = TunnelLimits {
-            window: NonZeroU16::MAX,
+            payload: SegmentSize::of(1),
+            min_window: bytes(64 * 1024),
+            max_window: NonZeroU32::MAX,
             ..TunnelLimits::default()
         };
-        assert_eq!(
-            largest.packet_queue().get(),
-            2 * usize::from(u16::MAX) + PACKET_QUEUE_SLACK
-        );
+        assert_eq!(largest.stream_frames(), 2 * u32::MAX as usize);
         let smallest = TunnelLimits {
-            window: segments(1),
-            initial_congestion: segments(1),
+            min_window: bytes(16 * 1024 + 38),
+            max_window: bytes(16 * 1024 + 38),
+            initial_congestion: NonZeroU16::new(2).unwrap(),
             ..TunnelLimits::default()
         };
-        assert_eq!(smallest.packet_queue().get(), 2 + PACKET_QUEUE_SLACK);
+        assert!(smallest.validate().is_ok());
+        assert_eq!(smallest.max_segments(), 2);
+        assert_eq!(smallest.packet_queue().get(), 4 + PACKET_QUEUE_SLACK);
     }
 
     #[test]
     fn cross_field_relations_are_validated() {
         let larger = TunnelLimits {
-            max_peers: sessions(8192),
-            max_sessions: sessions(2048),
-            sessions_per_peer: sessions(16),
+            max_peers: count(8192),
+            max_sessions: count(2048),
+            sessions_per_peer: count(16),
             payload: SegmentSize::of(4096),
-            window: segments(1024),
+            min_window: bytes(64 * 1024),
+            max_window: bytes(4 << 20),
+            memory_budget: count(2048 * 2 * 64 * 1024),
             ..TunnelLimits::default()
         };
         assert!(larger.validate().is_ok());
         let rejected = [
             TunnelLimits {
-                sessions_per_peer: sessions(2049),
+                sessions_per_peer: count(2049),
                 ..larger.clone()
             },
             TunnelLimits {
-                initial_congestion: segments(1025),
+                min_window: bytes(4096 + 37),
+                ..larger.clone()
+            },
+            TunnelLimits {
+                min_window: bytes((4 << 20) + 1),
+                ..larger.clone()
+            },
+            TunnelLimits {
+                memory_budget: count(2048 * 2 * 64 * 1024 - 1),
+                ..larger.clone()
+            },
+            TunnelLimits {
+                initial_congestion: NonZeroU16::new(1025).unwrap(),
                 ..larger.clone()
             },
             TunnelLimits {

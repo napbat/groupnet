@@ -114,13 +114,17 @@ groupnet-sim = { workspace = true, optional = true }
 
 # The async examples drive the runtime, so they need a Tokio executor.
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+tokio-util = { workspace = true, features = ["compat"] }
 # The handoff facade test implements `SnapshotSource`/`SnapshotSink`, whose chunk
 # type is `bytes::Bytes`. The facade re-exports no `bytes`, so a consumer that
 # implements those two traits declares its own bytes dependency. This test uses
 # the workspace version. Dev-only: nothing enters the published graph.
 bytes = { workspace = true }
 rcgen = { workspace = true }
+# TLS-over-TCP baseline of the tunnel-throughput example; dev-only.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 futures-util = { workspace = true, features = ["io"] }
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,
 # so this never enters the published dependency graph. Do NOT add `version`.
@@ -161,6 +165,11 @@ required-features = ["runtime", "mem", "tcp-msg", "connectivity"]
 name = "packet-path"
 path = "examples/packet-path/main.rs"
 required-features = ["runtime", "mem", "udp", "tcp-msg", "connectivity"]
+
+[[example]]
+name = "tunnel-throughput"
+path = "examples/tunnel-throughput/main.rs"
+required-features = ["runtime", "tcp-msg"]
 
 [lints]
 workspace = true

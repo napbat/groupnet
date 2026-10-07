@@ -129,18 +129,33 @@ enforces its own limits.
 
 | Queue | Default | Holds |
 |---|---|---|
-| `link_queue` | 256 per link | Frames awaiting that link's worker |
-| `tunnel_queue` | 1024 per node | Tunnel packets awaiting session dispatch |
-| `event_queue` | 256 per node | Received frames and link events awaiting the routing actor (backpressured) |
+| `link_queue` | 4096 per link | Frames awaiting that link's worker |
+| `event_queue` | 256 per node | Link lifecycle and neighbor events awaiting the routing actor (backpressured) |
 | `message_queue` | 64 per node | Coordination messages awaiting the runtime |
 | `protocol_queue` | 128 per namespace | Application packets awaiting the bound protocol |
 
-Sizing rule: one bulk tunnel stream keeps about `2 × window` frames queued — a
-window of data plus its acknowledgements, 128 frames with the default 64-segment
-window. Size `link_queue` for the bulk streams sharing a link and `tunnel_queue`
-for the sessions terminating at the node; the defaults hold two and eight
-default-window streams. A full link or tunnel queue drops frames: streams repair
-the loss, but each loss halves the affected stream's congestion window.
+Each link worker processes the frames it reads inline — admission, reassembly,
+route learning, replay suppression, then delivery or forwarding — so a data
+frame crosses no routing-actor queue. A link worker also offers the transport
+a synchronous `InboundSink` (`Transport::attach_inbound`); admitted and raw
+`TcpMsgTransport` readers adopt it and run the same inline processing on the
+socket reader task, charging Tokio's cooperative budget per frame and reading
+no further input while a frame is processed. Locally addressed tunnel packets go
+straight to their session's own bounded queue (`TunnelLimits::packet_queue`).
+The routing actor keeps only the announcement clock and link lifecycle events.
+
+Replay suppression keeps a 64-sequence sliding window per `(origin, router
+nonce)` stream: a routed identity seen in the window, or older than it, is
+dropped. At most `replay_capacity / 64` streams (rounded up) are tracked, least
+recently active evicted first. Packet storage larger than 4 KiB comes from a
+per-size-class pool and returns to it when the last `Bytes` view of the sent
+packet drops; `RouterConfig::packet_pool` (default 2 MiB) bounds idle storage.
+
+Sizing rule: one saturated tunnel stream keeps about
+`TunnelLimits::stream_frames()` frames queued — a window of data plus its
+acknowledgements. Size `link_queue` for the bulk streams sharing a link; the
+default holds two default-window streams. A full link queue drops frames: streams
+repair the loss, but each loss halves the affected stream's congestion window.
 
 `ProtocolIo::packet_buffer(destination, capacity)` reserves routing headroom in
 one owned buffer. A protocol writes its typed header and payload, encrypts in
