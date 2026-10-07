@@ -24,7 +24,7 @@ use crate::{NetworkKey, PathPolicy, PeerPath};
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{
-    Inbound,
+    Inbound, QueueCapacity,
     admission::{SessionId, SessionLease, SessionRegistry},
     link::AdmittedInbound,
 };
@@ -37,12 +37,12 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, mpsc},
+    sync::{Mutex as AsyncMutex, mpsc, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
-pub use policy::{ControlRateLimit, RelayPacing, TcpRendezvousConfig};
+pub use policy::{ControlRateLimit, TcpRendezvousConfig};
 pub use server::TcpRendezvous;
 
 /// Maximum application payload in one native TCP frame.
@@ -88,7 +88,7 @@ pub struct TcpPunchConfig {
     /// Maximum concurrently admitted neighbors (an operational memory bound).
     pub max_peers: usize,
     /// Capacity of the endpoint's bounded packet, event and writer queues.
-    pub queue_capacity: usize,
+    pub queue_capacity: QueueCapacity,
 }
 
 impl TcpPunchConfig {
@@ -139,7 +139,7 @@ impl TcpPunchConfig {
             advertised_candidates: Vec::new(),
             gather_interfaces: true,
             max_peers: 128,
-            queue_capacity: 128,
+            queue_capacity: QueueCapacity::of(128),
         }
     }
 }
@@ -170,6 +170,55 @@ struct View {
     direct: Option<SocketAddr>,
 }
 
+/// Published neighbor views; every path mutation notifies [`TcpConnection::path_changes`].
+#[derive(Debug)]
+struct Views {
+    peers: Mutex<HashMap<NodeId, View>>,
+    changes: watch::Sender<()>,
+}
+
+impl Views {
+    fn new() -> Self {
+        Self {
+            peers: Mutex::new(HashMap::new()),
+            changes: watch::Sender::new(()),
+        }
+    }
+
+    fn read(&self) -> MutexGuard<'_, HashMap<NodeId, View>> {
+        lock(&self.peers)
+    }
+
+    fn insert(&self, node: NodeId, view: View) {
+        lock(&self.peers).insert(node, view);
+        self.changes.send_replace(());
+    }
+
+    fn remove(&self, node: &NodeId) {
+        if lock(&self.peers).remove(node).is_some() {
+            self.changes.send_replace(());
+        }
+    }
+
+    fn set_direct(&self, node: &NodeId, direct: Option<SocketAddr>) {
+        let changed = lock(&self.peers)
+            .get_mut(node)
+            .is_some_and(|view| std::mem::replace(&mut view.direct, direct) != direct);
+        if changed {
+            self.changes.send_replace(());
+        }
+    }
+
+    fn clear(&self) {
+        let mut peers = lock(&self.peers);
+        if !peers.is_empty() {
+            peers.clear();
+            drop(peers);
+            self.changes.send_replace(());
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Outgoing {
     to: NodeId,
@@ -185,7 +234,7 @@ struct Inner {
     addresses: Vec<SocketAddr>,
     observed: SocketAddr,
     candidates: Vec<SocketAddr>,
-    peers: Arc<Mutex<HashMap<NodeId, View>>>,
+    peers: Arc<Views>,
     outbound: mpsc::Sender<Outgoing>,
     inbound: AsyncMutex<mpsc::Receiver<AdmittedInbound>>,
     sessions: SessionRegistry,
@@ -256,7 +305,9 @@ impl TcpConnection {
         if self.inner.cancel.is_cancelled() {
             return None;
         }
-        lock(&self.inner.peers)
+        self.inner
+            .peers
+            .read()
             .get(node)
             .and_then(|peer| peer.direct)
     }
@@ -267,7 +318,9 @@ impl TcpConnection {
         if self.inner.cancel.is_cancelled() {
             return None;
         }
-        lock(&self.inner.peers)
+        self.inner
+            .peers
+            .read()
             .get(node)
             .filter(|peer| peer.lease.is_active())
             .map(|peer| {
@@ -282,7 +335,9 @@ impl TcpConnection {
     /// Returns live, rendezvous-admitted neighbors only.
     #[must_use]
     pub fn known_peers(&self) -> Vec<NodeId> {
-        lock(&self.inner.peers)
+        self.inner
+            .peers
+            .read()
             .iter()
             .filter(|(_, peer)| peer.lease.is_active())
             .map(|(node, _)| node.clone())
@@ -299,6 +354,15 @@ impl TcpConnection {
     #[must_use]
     pub fn sessions(&self) -> SessionRegistry {
         self.inner.sessions.clone()
+    }
+
+    /// Notifies whenever a neighbor view is admitted or removed, or its direct
+    /// path is established or lost. Read the new state through [`Self::path_to`],
+    /// [`Self::direct_addr_to`] and [`Self::known_peers`]; the sender outlives
+    /// shutdown, so observe closure through [`Self::sessions`].
+    #[must_use]
+    pub fn path_changes(&self) -> watch::Receiver<()> {
+        self.inner.peers.changes.subscribe()
     }
 
     /// Cancels owned I/O and invalidates all admitted sessions on every clone.
@@ -336,7 +400,7 @@ impl TcpConnection {
         if length > MAX_TCP_MESSAGE {
             return Err(invalid("TCP message exceeds MAX_TCP_MESSAGE"));
         }
-        let peers = lock(&self.inner.peers);
+        let peers = self.inner.peers.read();
         let Some(peer) = peers.get(to) else {
             return Ok(());
         };
@@ -455,15 +519,6 @@ impl TcpConnection {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-fn validate_capacity(capacity: usize) -> io::Result<()> {
-    if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
-        return Err(invalid(
-            "TCP capacity must be nonzero and fit the channel semaphore",
-        ));
-    }
-    Ok(())
 }
 
 fn closed() -> io::Error {

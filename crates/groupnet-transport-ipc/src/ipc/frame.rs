@@ -4,6 +4,7 @@ use std::io;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
+use groupnet_transport::framing::write_vectored;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zerocopy::byteorder::little_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -87,8 +88,8 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -
     let header = FrameHeader {
         length: U32::new(length),
     };
-    writer.write_all(header.as_bytes()).await?;
-    writer.write_all(frame).await
+    // One vectored write for header and payload, without joining them.
+    write_vectored(writer, &[header.as_bytes(), frame]).await
 }
 
 fn invalid(message: &'static str) -> io::Error {

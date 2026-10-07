@@ -11,7 +11,9 @@
 //!   module](self::msg)-level docs for the exact pooling behaviour.
 //! * **`bulk` — data plane.** `TcpBulkTransport` implements `BulkTransport`:
 //!   one reliable, ordered byte stream per `connect`, for replication and
-//!   bulk transfer.
+//!   bulk transfer. Both ends set `TCP_NODELAY`; inbound identity handshakes
+//!   run concurrently under a deadline (`TcpBulkConfig`), so a stalled client
+//!   never delays other accepts.
 //! * **`link` — router registration** (opt-in): `TcpLink` admits peers through
 //!   an explicit application policy (a configured-peer allowlist by default).
 //!   Managed sessions are full-duplex, bounded, and retained while connected;
@@ -22,10 +24,16 @@
 //!   Use `TcpMsgTransport::bind_connectivity` or `TcpLink::connectivity`; no separate
 //!   transport or link type is registered. Native paths retain their protocol MTU
 //!   and live admission generations across conversion into a managed link.
+//!   `TcpMsgTransport::path_changes` observes direct/relay path changes.
+//!
+//! `TcpMsgTransport::closed` resolves, stickily, once an endpoint shuts down.
 //!
 //! The low-level message and bulk APIs retain trusted-topology identity
 //! attribution. Managed message admission uses its own bounded wire exchange,
 //! with no downgrade to that raw handshake. Open admission is unauthenticated.
+//! Every handshake introduces a node id of 1 to
+//! `groupnet_transport::MAX_NODE_ID_BYTES` bytes, the bound session admission
+//! enforces.
 //!
 //! [`Transport`]: groupnet_transport::Transport
 
@@ -35,12 +43,14 @@ mod handshake;
 #[cfg(feature = "bulk")]
 mod bulk;
 #[cfg(feature = "bulk")]
-pub use bulk::TcpBulkTransport;
+pub use bulk::{TcpBulkConfig, TcpBulkTransport};
 
 #[cfg(feature = "msg")]
 pub mod msg;
 #[cfg(feature = "link")]
 pub use msg::TcpAdmissionConfig;
+#[cfg(feature = "connectivity")]
+pub use msg::TcpPathChanges;
 #[cfg(feature = "msg")]
 pub use msg::{TcpMsgConfig, TcpMsgTransport};
 

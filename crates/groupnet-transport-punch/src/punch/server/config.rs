@@ -7,7 +7,10 @@ use std::sync::Arc;
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{Admission, OpenAdmission};
 
-use super::super::{DEFAULT_MAX_PEERS, NetworkKey, invalid, validate_names_with_limit};
+use super::super::{
+    DEFAULT_MAX_PEERS, MAX_MESSAGE, NetworkKey, invalid, validate_names_with_limit,
+};
+use crate::RelayPacing;
 
 /// Operational rendezvous capacities, independent of wire and authentication bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,8 +53,12 @@ pub struct RendezvousConfig {
     pub peers: Option<Vec<NodeId>>,
     /// Application admission policy, evaluated only after return-routability.
     pub admission: Arc<dyn Admission>,
-    /// Operational capacities; rate limits and challenge/session deadlines stay fixed.
+    /// Operational capacities; control-rate limits and challenge/session deadlines stay fixed.
     pub limits: RendezvousLimits,
+    /// Optional per-identity byte budget for admitted relay data, which never
+    /// spends the control-rate budget. Datagrams over budget are dropped, so a
+    /// byte burst must hold at least one [`MAX_MESSAGE`] payload.
+    pub relay_pacing: RelayPacing,
 }
 
 impl fmt::Debug for RendezvousConfig {
@@ -63,6 +70,7 @@ impl fmt::Debug for RendezvousConfig {
             .field("peers", &self.peers)
             .field("admission", &"application policy")
             .field("limits", &self.limits)
+            .field("relay_pacing", &self.relay_pacing)
             .finish()
     }
 }
@@ -77,6 +85,7 @@ impl RendezvousConfig {
             peers: Some(peers),
             admission: Arc::new(OpenAdmission),
             limits: RendezvousLimits::default(),
+            relay_pacing: RelayPacing::Backpressure,
         }
     }
 
@@ -99,11 +108,19 @@ impl RendezvousConfig {
             peers: None,
             admission,
             limits: RendezvousLimits::default(),
+            relay_pacing: RelayPacing::Backpressure,
         }
     }
 
     pub(super) fn validate(&self) -> std::io::Result<()> {
         self.limits.validate()?;
+        if let RelayPacing::Bytes { burst_bytes, .. } = self.relay_pacing
+            && burst_bytes.get() < MAX_MESSAGE as u64
+        {
+            return Err(invalid(
+                "UDP relay pacing burst must hold one maximum relay message",
+            ));
+        }
         if self.bind.ip().is_multicast() {
             return Err(invalid("multicast rendezvous bind is not supported"));
         }

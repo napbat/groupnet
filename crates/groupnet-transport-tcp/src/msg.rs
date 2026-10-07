@@ -54,18 +54,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
-use groupnet_transport::Inbound;
+use groupnet_transport::{Inbound, QueueCapacity};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::handshake::{read_id, read_str, write_id, write_str};
+use crate::handshake::{check_id, read_intro, write_intro};
 use crate::tasks::Tasks;
 
 #[cfg(feature = "link")]
@@ -77,6 +78,8 @@ pub use admitted::TcpAdmissionConfig;
 #[cfg(feature = "connectivity")]
 #[path = "connectivity.rs"]
 mod connectivity;
+#[cfg(feature = "connectivity")]
+pub use connectivity::TcpPathChanges;
 #[path = "msg_endpoint.rs"]
 mod endpoint;
 #[path = "msg_framing.rs"]
@@ -91,43 +94,38 @@ struct QueuedInbound {
 }
 
 /// Default allocation guard for an inbound payload; deployments may tune it
-/// within the representable wire/allocation bounds.
+/// up to the shared stream frame ceiling.
 const DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
-
-/// Inbound frames buffered between the reader tasks and
-/// [`groupnet_transport::Transport::recv`]. When the consumer lags, readers stop pulling from
-/// their sockets and TCP backpressure does the rest.
-const INBOUND_QUEUE: usize = 1024;
 
 /// How long a dial may take before the connection attempt is abandoned.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Tuning for [`TcpMsgTransport`]. The default values suit a gossip control
-/// plane; zero outbound connection/queue values are lifted to one.
-#[derive(Clone, Debug)]
+/// Tuning for [`TcpMsgTransport`] and [`TcpLink`](crate::TcpLink). The default
+/// values suit a gossip control plane. Capacities are valid by type; the
+/// remaining bounds are checked once by [`validate`](Self::validate), which
+/// every binding and link builder calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpMsgConfig {
     /// Close an outbound connection after this long without a frame to send.
     /// The read side of an inbound connection allows twice this before
     /// presuming the peer gone, so a clean close normally comes from the
     /// sender and the reader timeout only reaps half-open sockets left by a
-    /// peer that died without a FIN. Default: 30s.
+    /// peer that died without a FIN. Must be nonzero. Default: 30s.
     pub idle_timeout: Duration,
     /// Most outbound connections pooled at once; dialing past the cap closes
     /// the oldest. Size it to cover the gossip/anti-entropy fanout — the pool
     /// follows who this node is currently talking to, not the cluster.
     /// Default: 64.
-    pub max_outbound: usize,
+    pub max_outbound: NonZeroUsize,
     /// Frames buffered per outbound connection while it dials or drains; a
-    /// full queue drops the frame (best-effort). Cannot exceed Tokio's
-    /// semaphore capacity. Default: 256.
-    pub outbound_queue: usize,
+    /// full queue drops the frame (best-effort). Default: 256.
+    pub outbound_queue: QueueCapacity,
     /// Frames buffered between socket readers and the consumer. Readers wait
-    /// when full, propagating TCP backpressure. Must be nonzero and no larger
-    /// than Tokio's semaphore capacity.
-    /// Default: 1024.
-    pub inbound_queue: usize,
+    /// when full, propagating TCP backpressure. Default: 1024.
+    pub inbound_queue: QueueCapacity,
     /// Maximum payload bytes per frame, checked before inbound allocation and
-    /// outbound queueing. Must fit the u32 wire length and a Rust allocation.
+    /// outbound queueing. Must be nonzero and at most the shared stream ceiling
+    /// [`MAX_FRAME_BYTES`](groupnet_transport::framing::MAX_FRAME_BYTES).
     /// Default: 16 MiB.
     pub max_frame_bytes: usize,
     /// The listener address to introduce ourselves with when dialing, so the
@@ -142,12 +140,32 @@ impl Default for TcpMsgConfig {
     fn default() -> Self {
         Self {
             idle_timeout: Duration::from_secs(30),
-            max_outbound: 64,
-            outbound_queue: 256,
-            inbound_queue: INBOUND_QUEUE,
+            max_outbound: NonZeroUsize::new(64).expect("nonzero literal"),
+            outbound_queue: QueueCapacity::of(256),
+            inbound_queue: QueueCapacity::of(1024),
             max_frame_bytes: DEFAULT_MAX_FRAME,
             advertise: None,
         }
+    }
+}
+
+impl TcpMsgConfig {
+    /// Checks the bounds the field types cannot express.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a zero idle timeout, or a frame limit that
+    /// is zero or above the shared stream frame ceiling.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.idle_timeout.is_zero()
+            || self.max_frame_bytes == 0
+            || self.max_frame_bytes > groupnet_transport::framing::MAX_FRAME_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid TCP message bounds",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -244,7 +262,9 @@ impl TcpMsgTransport {
     /// [`register_peer`](Self::register_peer) before sending.
     ///
     /// # Errors
-    /// Propagates any socket bind error.
+    /// Returns `InvalidInput` for a local id that is empty or longer than
+    /// [`MAX_NODE_ID_BYTES`](groupnet_transport::MAX_NODE_ID_BYTES), and
+    /// propagates any socket bind error.
     pub async fn bind(local: NodeId, addr: impl ToSocketAddrs) -> io::Result<Self> {
         Self::bind_with(local, addr, TcpMsgConfig::default()).await
     }
@@ -253,7 +273,8 @@ impl TcpMsgTransport {
     /// the accept loop and per-connection workers run as spawned tasks.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for invalid bounds and propagates socket bind errors.
+    /// Returns `InvalidInput` for invalid bounds or a local id outside the
+    /// handshake bound, and propagates socket bind errors.
     pub async fn bind_with(
         local: NodeId,
         addr: impl ToSocketAddrs,
@@ -272,26 +293,14 @@ impl TcpMsgTransport {
     async fn bind_inner(
         local: NodeId,
         addr: impl ToSocketAddrs,
-        mut config: TcpMsgConfig,
+        config: TcpMsgConfig,
         #[cfg(feature = "link")] admission: Option<Arc<admitted::Managed>>,
     ) -> io::Result<Self> {
-        config.max_outbound = config.max_outbound.max(1);
-        config.outbound_queue = config.outbound_queue.max(1);
-        if config.inbound_queue == 0
-            || config.inbound_queue > tokio::sync::Semaphore::MAX_PERMITS
-            || config.outbound_queue > tokio::sync::Semaphore::MAX_PERMITS
-            || config.max_frame_bytes == 0
-            || u32::try_from(config.max_frame_bytes).is_err()
-            || isize::try_from(config.max_frame_bytes).is_err()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid TCP message bounds",
-            ));
-        }
+        config.validate()?;
+        check_id(&local)?;
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
-        let (inbound_tx, inbound_rx) = mpsc::channel(config.inbound_queue);
+        let (inbound_tx, inbound_rx) = mpsc::channel(config.inbound_queue.get());
         let read_idle = config.idle_timeout.saturating_mul(2);
         let intro = config
             .advertise
@@ -360,9 +369,7 @@ impl Outbound {
 async fn write_loop(mut out: Outbound) {
     if let Ok(Ok(mut sock)) = timeout(CONNECT_TIMEOUT, TcpStream::connect(out.addr)).await {
         let _ = sock.set_nodelay(true); // latency is the point of eager frames
-        if write_id(&mut sock, &out.local).await.is_ok()
-            && write_str(&mut sock, &out.intro).await.is_ok()
-        {
+        if write_intro(&mut sock, &out.local, &out.intro).await.is_ok() {
             loop {
                 match timeout(out.idle, out.frames.recv()).await {
                     // Idle: leave the pool first so a racing send re-dials,
@@ -483,23 +490,17 @@ async fn read_loop(
     }
 }
 
-/// Reads the dialer's intro: its node id and its (possibly empty) listener
-/// address.
-async fn read_intro(sock: &mut TcpStream) -> io::Result<(NodeId, String)> {
-    let from = read_id(sock).await?;
-    let intro = read_str(sock).await?;
-    Ok((from, intro))
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::num::NonZeroUsize;
     use std::time::Duration;
 
     use groupnet_core::NodeId;
+    use groupnet_transport::framing::MAX_FRAME_BYTES;
     use groupnet_transport::{Inbound, Transport};
 
-    use super::{TcpMsgConfig, TcpMsgTransport};
+    use super::{QueueCapacity, TcpMsgConfig, TcpMsgTransport};
 
     /// Bind a loopback endpoint on an ephemeral port under the given id.
     async fn bind_as(id: &str) -> TcpMsgTransport {
@@ -656,7 +657,7 @@ mod tests {
             NodeId::new("cap-a"),
             "127.0.0.1:0",
             TcpMsgConfig {
-                max_outbound: 1,
+                max_outbound: NonZeroUsize::MIN,
                 ..TcpMsgConfig::default()
             },
         )
@@ -714,13 +715,34 @@ mod tests {
         b.close().await;
     }
 
+    /// `closed` waits for shutdown through any clone, then stays resolved.
+    #[tokio::test]
+    async fn closed_observes_shutdown_from_any_clone_and_is_sticky() {
+        let a = bind_as("closed-a").await;
+        let waiter = tokio::spawn({
+            let a = a.clone();
+            async move { a.closed().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "a running endpoint is not closed");
+        a.clone().shutdown();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("shutdown observed")
+            .expect("waiter");
+        tokio::time::timeout(Duration::from_secs(5), a.closed())
+            .await
+            .expect("closed is sticky");
+        a.close().await;
+    }
+
     #[tokio::test]
     async fn configured_inbox_backpressure_preserves_frames_in_order() {
         let receiver = TcpMsgTransport::bind_with(
             NodeId::new("bounded-receiver"),
             "127.0.0.1:0",
             TcpMsgConfig {
-                inbound_queue: 1,
+                inbound_queue: QueueCapacity::MIN,
                 max_frame_bytes: 4,
                 ..TcpMsgConfig::default()
             },
@@ -748,11 +770,7 @@ mod tests {
     async fn message_bounds_are_validated_before_binding() {
         let invalid = [
             TcpMsgConfig {
-                inbound_queue: 0,
-                ..TcpMsgConfig::default()
-            },
-            TcpMsgConfig {
-                inbound_queue: tokio::sync::Semaphore::MAX_PERMITS + 1,
+                idle_timeout: Duration::ZERO,
                 ..TcpMsgConfig::default()
             },
             TcpMsgConfig {
@@ -760,26 +778,39 @@ mod tests {
                 ..TcpMsgConfig::default()
             },
             TcpMsgConfig {
-                max_frame_bytes: usize::MAX,
+                max_frame_bytes: MAX_FRAME_BYTES + 1,
                 ..TcpMsgConfig::default()
             },
             TcpMsgConfig {
-                outbound_queue: tokio::sync::Semaphore::MAX_PERMITS + 1,
+                max_frame_bytes: usize::MAX,
                 ..TcpMsgConfig::default()
             },
         ];
         for config in invalid {
+            assert_eq!(
+                config.validate().expect_err("invalid bounds").kind(),
+                std::io::ErrorKind::InvalidInput
+            );
             let error = TcpMsgTransport::bind_with(NodeId::new("invalid"), "127.0.0.1:0", config)
                 .await
                 .expect_err("invalid bounds");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        for id in [
+            String::new(),
+            "x".repeat(groupnet_transport::MAX_NODE_ID_BYTES + 1),
+        ] {
+            let error = TcpMsgTransport::bind(NodeId::new(id), "127.0.0.1:0")
+                .await
+                .expect_err("local id outside the handshake bound");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
         let endpoint = TcpMsgTransport::bind_with(
             NodeId::new("larger"),
             "127.0.0.1:0",
             TcpMsgConfig {
-                inbound_queue: 2048,
-                max_frame_bytes: super::DEFAULT_MAX_FRAME + 1,
+                inbound_queue: QueueCapacity::of(2048),
+                max_frame_bytes: MAX_FRAME_BYTES,
                 ..TcpMsgConfig::default()
             },
         )
@@ -796,7 +827,7 @@ mod tests {
             "127.0.0.1:0",
             TcpMsgConfig {
                 max_frame_bytes: 4,
-                outbound_queue: 1,
+                outbound_queue: QueueCapacity::MIN,
                 ..TcpMsgConfig::default()
             },
         )

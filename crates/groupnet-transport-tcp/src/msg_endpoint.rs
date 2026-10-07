@@ -79,6 +79,19 @@ impl TcpMsgTransport {
         }
     }
 
+    /// Resolves once this endpoint has begun shutting down through any clone:
+    /// [`shutdown`](Self::shutdown), [`close`](Self::close), or link shutdown.
+    /// Sticky: awaiting it after shutdown resolves immediately. Native
+    /// connectivity endpoints resolve from their session registry's closed
+    /// state. Use [`close`](Self::close) to also wait for sockets to drain.
+    pub async fn closed(&self) {
+        match &self.backend {
+            Backend::Direct(inner) => inner.tasks.stopping().await,
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity { connection, .. } => connection.sessions().closed().await,
+        }
+    }
+
     #[cfg(feature = "link")]
     pub(crate) fn lifecycle(&self) -> Arc<dyn groupnet_transport::link::LinkLifecycle> {
         Arc::new(self.clone())
@@ -302,13 +315,13 @@ impl Inner {
     }
 
     fn dial_raw(self: &Arc<Self>, to: &NodeId, addr: SocketAddr, msg: Bytes) {
-        let (tx, rx) = mpsc::channel(self.config.outbound_queue);
+        let (tx, rx) = mpsc::channel(self.config.outbound_queue.get());
         tx.try_send(msg).expect("fresh queue has capacity");
         let generation;
         {
             let mut pool = self.pool.lock().expect("pool lock poisoned");
             // Closing the oldest writer keeps the pool bounded, not reliable.
-            while pool.conns.len() >= self.config.max_outbound {
+            while pool.conns.len() >= self.config.max_outbound.get() {
                 let Some((g, node)) = pool.order.pop_front() else {
                     break;
                 };

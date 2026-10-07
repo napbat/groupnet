@@ -148,6 +148,13 @@ impl ReceiptState {
         matches!(self.outcome, Some(Outcome::Applied | Outcome::Rejected(_)))
             || (self.delivery == Delivery::Delivered && self.outcome == Some(Outcome::Accepted))
     }
+
+    /// The millisecond instant at which this record next retires (pending) or
+    /// expires (terminal); refreshed by every action and replay.
+    #[must_use]
+    pub fn retain_until(&self) -> u64 {
+        self.retain_until
+    }
 }
 
 /// Returns whether a sender may resolve success/error for a matched receipt.
@@ -281,63 +288,87 @@ pub fn data(
     group: Option<&GroupId>,
     payload: &[u8],
 ) -> Result<Vec<u8>, DecodeError> {
-    let mut bytes = Vec::with_capacity(data_len(group, payload.len())?);
-    encode_data(id, delivery, retry_horizon_ms, group, payload, |part| {
-        bytes.extend_from_slice(part);
-    })?;
+    let frame = DataFrame::new(id, delivery, retry_horizon_ms, group, payload)?;
+    let mut bytes = Vec::with_capacity(frame.len());
+    frame.encode(|part| bytes.extend_from_slice(part));
     Ok(bytes)
 }
 
-pub(crate) fn data_len(group: Option<&GroupId>, payload_len: usize) -> Result<usize, DecodeError> {
-    if u32::try_from(payload_len).is_err()
-        || group.is_some_and(|g| g.as_str().is_empty() || g.as_str().len() > usize::from(u8::MAX))
-    {
-        return Err(DecodeError);
-    }
-    (size_of::<Header>() + size_of::<DataMetadata>())
-        .checked_add(group.map_or(0, |g| 1 + g.as_str().len()))
-        .and_then(|length| length.checked_add(payload_len))
-        .ok_or(DecodeError)
+/// One application data packet, validated once and re-encoded for each retry
+/// without repeating its group, buffer and retry-horizon checks.
+#[derive(Debug)]
+pub(crate) struct DataFrame<'a> {
+    header: Header,
+    metadata: DataMetadata,
+    /// Validated nonempty group name and its one-byte wire length.
+    group: Option<(u8, &'a str)>,
+    payload: &'a [u8],
+    len: usize,
 }
 
-pub(crate) fn encode_data(
-    id: MessageId,
-    delivery: Delivery,
-    retry_horizon_ms: u64,
-    group: Option<&GroupId>,
-    payload: &[u8],
-    mut append: impl FnMut(&[u8]),
-) -> Result<(), DecodeError> {
-    data_len(group, payload.len())?;
-    if (delivery == Delivery::BestEffort) != (retry_horizon_ms == 0) {
-        return Err(DecodeError);
-    }
-    append(
-        Header {
-            magic: MAGIC,
-            kind: 0,
-            id: id.0,
+impl<'a> DataFrame<'a> {
+    /// Validates group, buffer and retry-horizon representability.
+    pub(crate) fn new(
+        id: MessageId,
+        delivery: Delivery,
+        retry_horizon_ms: u64,
+        group: Option<&'a GroupId>,
+        payload: &'a [u8],
+    ) -> Result<Self, DecodeError> {
+        if u32::try_from(payload.len()).is_err()
+            || (delivery == Delivery::BestEffort) != (retry_horizon_ms == 0)
+        {
+            return Err(DecodeError);
         }
-        .as_bytes(),
-    );
-    append(
-        DataMetadata {
-            delivery: match delivery {
-                Delivery::BestEffort => 0,
-                Delivery::Delivered => 1,
-                Delivery::Applied => 2,
+        let group = group
+            .map(|group| {
+                let name = group.as_str();
+                match u8::try_from(name.len()) {
+                    Ok(length) if length != 0 => Ok((length, name)),
+                    _ => Err(DecodeError),
+                }
+            })
+            .transpose()?;
+        let len = (size_of::<Header>() + size_of::<DataMetadata>())
+            .checked_add(group.map_or(0, |(length, _)| 1 + usize::from(length)))
+            .and_then(|length| length.checked_add(payload.len()))
+            .ok_or(DecodeError)?;
+        Ok(Self {
+            header: Header {
+                magic: MAGIC,
+                kind: 0,
+                id: id.0,
             },
-            grouped: u8::from(group.is_some()),
-            retry_horizon_ms: U64::new(retry_horizon_ms),
-        }
-        .as_bytes(),
-    );
-    if let Some(group) = group {
-        append(&[u8::try_from(group.as_str().len()).map_err(|_| DecodeError)?]);
-        append(group.as_str().as_bytes());
+            metadata: DataMetadata {
+                delivery: match delivery {
+                    Delivery::BestEffort => 0,
+                    Delivery::Delivered => 1,
+                    Delivery::Applied => 2,
+                },
+                grouped: u8::from(group.is_some()),
+                retry_horizon_ms: U64::new(retry_horizon_ms),
+            },
+            group,
+            payload,
+            len,
+        })
     }
-    append(payload);
-    Ok(())
+
+    /// Exact encoded length, checked once at construction.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Appends the packet's parts in wire order.
+    pub(crate) fn encode(&self, mut append: impl FnMut(&[u8])) {
+        append(self.header.as_bytes());
+        append(self.metadata.as_bytes());
+        if let Some((length, name)) = self.group {
+            append(&[length]);
+            append(name.as_bytes());
+        }
+        append(self.payload);
+    }
 }
 
 /// Encodes a bounded progress/terminal acknowledgement.
@@ -435,7 +466,9 @@ mod tests {
         assert_eq!(receipt.replay(59_999), None);
         assert!(!receipt.expired(u64::MAX));
         receipt.act(Outcome::Applied, 90_000);
+        assert_eq!(receipt.retain_until(), 150_000);
         assert_eq!(receipt.replay(119_999), Some(Outcome::Applied));
+        assert_eq!(receipt.retain_until(), 179_999);
         assert!(!receipt.expired(179_998));
         assert!(receipt.expired(179_999));
     }

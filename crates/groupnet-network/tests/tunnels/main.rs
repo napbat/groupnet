@@ -4,8 +4,9 @@ mod failover;
 mod fixtures;
 mod native;
 mod protocols;
+mod wan;
 
-use std::{io, sync::atomic::Ordering, time::Duration};
+use std::{io, num::NonZeroU16, sync::atomic::Ordering, time::Duration};
 
 use fixtures::{Fabric, credentials};
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,7 +14,7 @@ use groupnet_core::NodeId;
 use groupnet_network as network;
 use groupnet_network::{
     Router, RouterConfig,
-    tunnel::{PeerIdentity, TunnelLimits, TunnelTransport},
+    tunnel::{PeerIdentity, SegmentSize, TunnelLimits, TunnelTransport},
 };
 use groupnet_transport::bulk::BulkTransport;
 use tokio::time::{interval, timeout};
@@ -24,6 +25,45 @@ fn binary(length: usize) -> Vec<u8> {
     (0..length)
         .map(|offset| u8::try_from((offset * 73 + offset / 17) % 256).unwrap())
         .collect()
+}
+
+/// Streams `length` bytes from `a` to `c` and then from `c` to `a`, each
+/// endpoint using its own limits.
+async fn exchange_both_ways(a_limits: TunnelLimits, c_limits: TunnelLimits, length: usize) {
+    let fabric = Fabric::new(false, false).await;
+    let (a, c, _) = credentials();
+    let ap = PeerIdentity::new(fabric.c.local_id().clone(), &c.leaf).unwrap();
+    let cp = PeerIdentity::new(fabric.a.local_id().clone(), &a.leaf).unwrap();
+    let a = TunnelTransport::with_limits(fabric.a.clone(), a.identity, vec![ap], a_limits).unwrap();
+    let c = TunnelTransport::with_limits(fabric.c.clone(), c.identity, vec![cp], c_limits).unwrap();
+    let payload = binary(length);
+    for (sender, receiver, target, origin) in [
+        (&a, &c, fabric.c.local_id(), fabric.a.local_id()),
+        (&c, &a, fabric.a.local_id(), fabric.c.local_id()),
+    ] {
+        timeout(DEADLINE, async {
+            let (outgoing, incoming) = tokio::join!(sender.connect(target), receiver.accept());
+            let mut outgoing = outgoing.unwrap();
+            let (peer, mut incoming) = incoming.unwrap();
+            assert_eq!(&peer, origin);
+            let sending = async {
+                outgoing.write_all(&payload).await.unwrap();
+                outgoing.close().await.unwrap();
+            };
+            let receiving = async {
+                let mut bytes = Vec::new();
+                incoming.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, payload);
+                incoming.close().await.unwrap();
+            };
+            tokio::join!(sending, receiving);
+        })
+        .await
+        .unwrap();
+    }
+    a.close().await;
+    c.close().await;
+    fabric.close().await;
 }
 
 async fn transfer(lossy: bool, tcp: bool) {
@@ -80,49 +120,30 @@ async fn retransmission_reordering_and_deduplication_across_multihop_router() {
 
 #[tokio::test]
 async fn different_receive_windows_exchange_streams_in_both_directions() {
-    let fabric = Fabric::new(false, false).await;
-    let (a, c, _) = credentials();
-    let ap = PeerIdentity::new(fabric.c.local_id().clone(), &c.leaf).unwrap();
-    let cp = PeerIdentity::new(fabric.a.local_id().clone(), &a.leaf).unwrap();
     let small = TunnelLimits {
-        window: 8,
+        window: NonZeroU16::new(8).unwrap(),
         setup_timeout: Duration::from_secs(2),
         ..TunnelLimits::default()
     };
     let large = TunnelLimits {
-        window: 64,
+        window: NonZeroU16::new(64).unwrap(),
         ..small.clone()
     };
-    let a = TunnelTransport::with_limits(fabric.a.clone(), a.identity, vec![ap], small).unwrap();
-    let c = TunnelTransport::with_limits(fabric.c.clone(), c.identity, vec![cp], large).unwrap();
-    let payload = binary(16 * 1024);
-    for (sender, receiver, target, origin) in [
-        (&a, &c, fabric.c.local_id(), fabric.a.local_id()),
-        (&c, &a, fabric.a.local_id(), fabric.c.local_id()),
-    ] {
-        timeout(DEADLINE, async {
-            let (outgoing, incoming) = tokio::join!(sender.connect(target), receiver.accept());
-            let mut outgoing = outgoing.unwrap();
-            let (peer, mut incoming) = incoming.unwrap();
-            assert_eq!(&peer, origin);
-            let sending = async {
-                outgoing.write_all(&payload).await.unwrap();
-                outgoing.close().await.unwrap();
-            };
-            let receiving = async {
-                let mut bytes = Vec::new();
-                incoming.read_to_end(&mut bytes).await.unwrap();
-                assert_eq!(bytes, payload);
-                incoming.close().await.unwrap();
-            };
-            tokio::join!(sending, receiving);
-        })
-        .await
-        .unwrap();
-    }
-    a.close().await;
-    c.close().await;
-    fabric.close().await;
+    exchange_both_ways(small, large, 16 * 1024).await;
+}
+
+#[tokio::test]
+async fn different_send_segments_exchange_streams_in_both_directions() {
+    // Each receiver accepts the protocol-wide bound, not its own send segment.
+    let small = TunnelLimits {
+        payload: SegmentSize::of(512),
+        ..TunnelLimits::default()
+    };
+    let large = TunnelLimits {
+        payload: SegmentSize::of(32 * 1024),
+        ..TunnelLimits::default()
+    };
+    exchange_both_ways(small, large, 256 * 1024 + 3).await;
 }
 
 #[tokio::test]

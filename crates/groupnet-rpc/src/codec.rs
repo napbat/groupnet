@@ -19,6 +19,8 @@
 use std::fmt;
 
 use bytes::Bytes;
+use zerocopy::byteorder::big_endian::{U16, U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::RpcStatus;
 
@@ -30,14 +32,37 @@ const KIND_REQUEST: u8 = 0;
 const KIND_RESPONSE: u8 = 1;
 const KIND_ERROR: u8 = 2;
 
+/// The fields every kind starts with; alone, a response's whole head.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Prefix {
+    version: u8,
+    kind: u8,
+    id: U64,
+}
+
+/// A request's head: the prefix and the caller's remaining budget.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct RequestHead {
+    prefix: Prefix,
+    deadline_ms: U32,
+}
+
+/// An error's head: the prefix and the status code.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct ErrorHead {
+    prefix: Prefix,
+    code: U16,
+}
+
 /// Head bytes of a request: version, kind, id, deadline.
-pub(crate) const REQUEST_HEAD: usize = 1 + 1 + 8 + 4;
+pub(crate) const REQUEST_HEAD: usize = size_of::<RequestHead>();
 /// Head bytes of a response: version, kind, id.
-pub(crate) const RESPONSE_HEAD: usize = 1 + 1 + 8;
+pub(crate) const RESPONSE_HEAD: usize = size_of::<Prefix>();
 /// Head bytes of an error: version, kind, id, code.
-pub(crate) const ERROR_HEAD: usize = 1 + 1 + 8 + 2;
-/// The longest head of any kind.
-const MAX_HEAD: usize = REQUEST_HEAD;
+pub(crate) const ERROR_HEAD: usize = size_of::<ErrorHead>();
 
 /// One decoded RPC frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,19 +92,30 @@ pub(crate) enum Frame {
     },
 }
 
-/// A frame ready to write: a fixed head followed by a body that is written
+/// A frame ready to write: a typed head followed by a body that is written
 /// from its own buffer, so a payload is never copied into a frame buffer.
 #[derive(Debug)]
 pub(crate) struct Encoded {
-    head: [u8; MAX_HEAD],
-    head_len: usize,
+    head: Head,
     body: Bytes,
+}
+
+/// The fixed fields of one encoded frame, by kind.
+#[derive(Debug)]
+enum Head {
+    Request(RequestHead),
+    Response(Prefix),
+    Error(ErrorHead),
 }
 
 impl Encoded {
     /// The version, kind and fixed fields.
     pub(crate) fn head(&self) -> &[u8] {
-        &self.head[..self.head_len]
+        match &self.head {
+            Head::Request(head) => head.as_bytes(),
+            Head::Response(head) => head.as_bytes(),
+            Head::Error(head) => head.as_bytes(),
+        }
     }
 
     /// The payload or error message.
@@ -90,7 +126,7 @@ impl Encoded {
     /// The data-plane frame length this encodes to.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.head_len + self.body.len()
+        self.head().len() + self.body.len()
     }
 }
 
@@ -104,39 +140,43 @@ impl fmt::Display for Malformed {
     }
 }
 
+impl Prefix {
+    fn new(kind: u8, id: u64) -> Self {
+        Self {
+            version: VERSION,
+            kind,
+            id: U64::new(id),
+        }
+    }
+}
+
 impl Frame {
     /// Encodes this frame without copying its payload.
     pub(crate) fn encode(self) -> Encoded {
-        let mut head = [0u8; MAX_HEAD];
-        head[0] = VERSION;
-        let (head_len, body) = match self {
+        let (head, body) = match self {
             Self::Request {
                 id,
                 deadline_ms,
                 payload,
-            } => {
-                head[1] = KIND_REQUEST;
-                head[2..10].copy_from_slice(&id.to_be_bytes());
-                head[10..14].copy_from_slice(&deadline_ms.to_be_bytes());
-                (REQUEST_HEAD, payload)
-            }
+            } => (
+                Head::Request(RequestHead {
+                    prefix: Prefix::new(KIND_REQUEST, id),
+                    deadline_ms: U32::new(deadline_ms),
+                }),
+                payload,
+            ),
             Self::Response { id, payload } => {
-                head[1] = KIND_RESPONSE;
-                head[2..10].copy_from_slice(&id.to_be_bytes());
-                (RESPONSE_HEAD, payload)
+                (Head::Response(Prefix::new(KIND_RESPONSE, id)), payload)
             }
-            Self::Error { id, status } => {
-                head[1] = KIND_ERROR;
-                head[2..10].copy_from_slice(&id.to_be_bytes());
-                head[10..12].copy_from_slice(&status.code.to_be_bytes());
-                (ERROR_HEAD, Bytes::from(status.message))
-            }
+            Self::Error { id, status } => (
+                Head::Error(ErrorHead {
+                    prefix: Prefix::new(KIND_ERROR, id),
+                    code: U16::new(status.code),
+                }),
+                Bytes::from(status.message),
+            ),
         };
-        Encoded {
-            head,
-            head_len,
-            body,
-        }
+        Encoded { head, body }
     }
 
     /// Decodes one data-plane frame. The payload is a zero-copy slice of
@@ -146,19 +186,16 @@ impl Frame {
     /// [`Malformed`] for anything but an exact frame of a known kind.
     pub(crate) fn decode(frame: &Bytes) -> Result<Self, Malformed> {
         let bytes = frame.as_ref();
-        if bytes.len() < RESPONSE_HEAD {
-            return Err(Malformed("short head"));
-        }
-        if bytes[0] != VERSION {
+        let (prefix, _) = Prefix::ref_from_prefix(bytes).map_err(|_| Malformed("short head"))?;
+        if prefix.version != VERSION {
             return Err(Malformed("unknown codec version"));
         }
-        let id = u64::from_be_bytes(read(&bytes[2..10])?);
-        match bytes[1] {
+        let id = prefix.id.get();
+        match prefix.kind {
             KIND_REQUEST => {
-                if bytes.len() < REQUEST_HEAD {
-                    return Err(Malformed("short request head"));
-                }
-                let deadline_ms = u32::from_be_bytes(read(&bytes[10..14])?);
+                let (head, _) = RequestHead::ref_from_prefix(bytes)
+                    .map_err(|_| Malformed("short request head"))?;
+                let deadline_ms = head.deadline_ms.get();
                 if deadline_ms == 0 {
                     return Err(Malformed("zero deadline"));
                 }
@@ -173,25 +210,18 @@ impl Frame {
                 payload: frame.slice(RESPONSE_HEAD..),
             }),
             KIND_ERROR => {
-                if bytes.len() < ERROR_HEAD {
-                    return Err(Malformed("short error head"));
-                }
-                let code = u16::from_be_bytes(read(&bytes[10..12])?);
-                let message = std::str::from_utf8(&bytes[ERROR_HEAD..])
+                let (head, message) =
+                    ErrorHead::ref_from_prefix(bytes).map_err(|_| Malformed("short error head"))?;
+                let message = std::str::from_utf8(message)
                     .map_err(|_| Malformed("non-UTF-8 error message"))?;
                 Ok(Self::Error {
                     id,
-                    status: RpcStatus::new(code, message),
+                    status: RpcStatus::new(head.code.get(), message),
                 })
             }
             _ => Err(Malformed("unknown kind")),
         }
     }
-}
-
-/// A fixed-width field out of a slice already checked to be long enough.
-fn read<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Malformed> {
-    bytes.try_into().map_err(|_| Malformed("short field"))
 }
 
 #[cfg(test)]
@@ -247,6 +277,8 @@ mod tests {
 
     #[test]
     fn the_layout_is_the_documented_one() {
+        // The typed heads are unaligned and padding-free: 1 + 1 + 8 (+ 4 | + 2).
+        assert_eq!((REQUEST_HEAD, RESPONSE_HEAD, ERROR_HEAD), (14, 10, 12));
         let bytes = wire(Frame::Request {
             id: 0x0102_0304_0506_0708,
             deadline_ms: 0x0A0B_0C0D,

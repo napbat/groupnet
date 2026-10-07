@@ -49,8 +49,24 @@ bytes. This is not a guarantee of availability through arbitrary outages.
 ### Reliable stream contract
 
 - Bounded ordered segments use cumulative acknowledgements and receive credit.
-- RTT-based retransmission deadlines and duplicate-ACK gap repair handle loss;
-  additive-increase/multiplicative-decrease controls congestion.
+- Each endpoint reads TLS ciphertext into segments of its own configured
+  `payload` (its send segment). Every receiver accepts any segment up to the
+  protocol-wide `SegmentSize::MAX` (64,939 bytes: the default 65,000-byte routing
+  envelope minus the smallest tunnel envelope and the 35-byte reliability
+  header), so peers may choose different segment sizes and receive windows.
+- Slow start opens the congestion window from `initial_congestion` by one
+  segment per acknowledged segment, doubling it every round trip, until the
+  slow-start threshold (initially the receive window). Loss — three duplicate
+  acknowledgements, which also trigger one fast retransmit, or a retransmission
+  timeout — sets the threshold and the window to half the congestion window;
+  from there the window grows by one segment per window acknowledged. A larger
+  advertised window at the same cumulative acknowledgement is a window update
+  sent as data is delivered, never a duplicate.
+- Retransmission timeouts follow RFC 6298: the first round-trip sample sets the
+  estimate, later samples smooth it, and retransmitted segments are never
+  sampled (Karn's rule). The timeout starts at one second, is floored at 200 ms
+  — over reliable links a spurious retransmit duplicates data and halves the
+  window — and backs off exponentially up to two seconds.
 - A retry keeps its tunnel sequence number but uses a fresh router packet ID.
   Router replay suppression therefore does not discard legitimate retries.
 - FIN closes one stream direction. The other remains usable until it closes
@@ -59,13 +75,48 @@ bytes. This is not a guarantee of availability through arbitrary outages.
   session. They do not terminate TLS or restart application delivery.
 
 `TunnelConfig::with_limits(TunnelLimits { .. })` configures peer/session admission,
-accept and packet queues, TLS buffering, segment payload, receive/congestion
+the accept queue, TLS buffering, send segment, receive/initial congestion
 windows and setup/retransmission/heartbeat deadlines. Standalone endpoints use
-`TunnelTransport::with_limits`. Wire credit and routing-frame bounds remain
-enforced. TLS ciphertext is initially read into routing-headroom storage;
-retransmissions retain ciphertext rather than re-encrypting application bytes.
-Receive windows may differ between peers: advertised credit describes the remote
+`TunnelTransport::with_limits`. Each field's range is its type: `QueueCapacity`
+for the accept queue, `SegmentSize` for the send segment, `NonZeroU16` for the
+windows (the wire's u16 credit), nonzero counts, and `RetransmitTimeouts`, whose
+constructor orders `min <= initial <= max` once. `TunnelLimits::validate` checks
+only cross-field relations: sessions per peer within `max_sessions`, initial
+congestion within the window, and a peer timeout longer than both the heartbeat
+interval and the retransmission cap. TLS ciphertext is initially read into
+routing-headroom storage; retransmissions retain ciphertext rather than
+re-encrypting application bytes. Advertised credit describes the remote
 receiver, while each sender still enforces its own congestion and memory bounds.
+
+| `TunnelLimits` field | Default |
+|---|---|
+| `payload` (send segment) | 16 KiB |
+| `window` / `initial_congestion` | 64 / 4 segments |
+| `retransmit` | 200 ms minimum, 1 s initial, 2 s maximum |
+| `stream_buffer` | 32 KiB per direction |
+| `max_peers` / `max_sessions` / `sessions_per_peer` | 128 / 64 / 8 |
+| `accept_queue` | 32 per namespace |
+| `setup_timeout` / `peer_timeout` / `heartbeat_interval` | 10 s / 20 s / 1 s |
+
+These defaults are bulk-capable: a stream keeps up to `window × payload` = 1 MiB
+in flight per direction, about 100 Mbit/s at an 80 ms round trip. A paused-clock
+regression test moves 1 MiB across an 80 ms round trip within eight round trips,
+which 512-byte segments in a 32-segment window cannot.
+
+Memory per session is bounded by:
+
+- `window × payload` of sent ciphertext awaiting acknowledgement (1 MiB);
+- `window × SegmentSize::MAX` of received ciphertext awaiting in-order delivery
+  (about 4 MiB; 1 MiB from a peer using the default send segment);
+- `2 × stream_buffer` of TLS buffering (64 KiB);
+- the inbound packet queue, `TunnelLimits::packet_queue()` = `2 × window + 16`
+  packets (144), derived from the window rather than configured, which holds
+  arrivals not yet moved into the buffers above. Arrivals beyond it are loss.
+
+With defaults and default peers a saturated session retains about 2 MiB, so 64
+saturated sessions retain about 132 MiB; size `max_sessions`, `window` and
+`payload` together. The router's `tunnel_queue` bounds packets awaiting session
+dispatch ([routing resource policy](routing.md#packet-storage-and-resource-policy)).
 
 ### Authenticated unordered sessions
 
@@ -236,7 +287,20 @@ independently; `RelayPacing::Bytes` optionally limits relay data by bytes per se
 and burst bytes. Waiting for data capacity or pacing is cancellation-aware.
 Choose `bind_config`, `bind_open_config`, or `bind_with_admission_config` to supply
 the policy. UDP rendezvous exposes `RendezvousConfig` / `RendezvousLimits` through
-`Rendezvous::bind_config`.
+`Rendezvous::bind_config`. `TcpRendezvous::closed()` resolves, stickily, once the
+server task stops (after `close()`, last-handle drop, or an unexpected stop); then
+`local_addr()` reports `NotConnected`. Endpoints expose the same sticky signal
+through `TcpMsgTransport::closed()` and `SessionRegistry::closed()`.
+
+The UDP rendezvous applies the same rule: its fixed 256-packet/second per-source
+budget covers control and rejected relay requests only (relay toward a missing
+or stale recipient session). Admitted relay data never spends it;
+`RendezvousConfig::relay_pacing` (the shared `RelayPacing`, default
+`Backpressure`) optionally limits it by bytes, dropping datagrams over budget, so
+`burst_bytes` must hold at least one `MAX_MESSAGE`. Native TCP streams (dialed,
+accepted direct and rendezvous) set `TCP_NODELAY`. `TcpRendezvousConfig`
+capacities and both endpoint `queue_capacity` fields are `QueueCapacity`;
+`TcpConnection::path_changes()` notifies neighbor/direct-path changes.
 
 The following path-selection flow applies with or without a provisioned key:
 

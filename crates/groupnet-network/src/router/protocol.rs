@@ -223,7 +223,7 @@ pub(super) fn bind(router: Router, id: ProtocolId) -> io::Result<ProtocolIo> {
         .checked_add(1)
         .ok_or_else(|| io::Error::other("protocol generation exhausted"))?;
     registry.generation = generation;
-    let (incoming, receiver) = mpsc::channel(router.inner.shared.config.protocol_queue);
+    let (incoming, receiver) = mpsc::channel(router.inner.shared.config.protocol_queue.get());
     let cancel = router.cancellation();
     registry.entries.insert(
         id,

@@ -26,7 +26,6 @@ pub struct SessionPeer {
 struct State {
     peers: BTreeMap<NodeId, SessionId>,
     next: u64,
-    closed: bool,
 }
 
 #[derive(Debug)]
@@ -34,6 +33,9 @@ struct Shared {
     max: usize,
     state: Mutex<State>,
     neighbors: watch::Sender<Arc<Vec<SessionPeer>>>,
+    /// Sticky: set (before the final empty neighbor snapshot is published)
+    /// exactly once, by [`SessionRegistry::close`].
+    closed: watch::Sender<bool>,
 }
 
 impl Shared {
@@ -61,6 +63,12 @@ impl Shared {
 
 /// Bounded registry of live admitted sessions, shared by adapter and router.
 /// Cloning retains registry state, not session leases or sockets.
+///
+/// Lifecycle is observable: an open registry with no peers and a closed one
+/// both publish an empty neighbor snapshot, so [`Self::is_closed`] and
+/// [`Self::closed`] distinguish them. Closing marks the registry closed
+/// *before* publishing that final empty snapshot, so a subscriber woken by it
+/// already observes `is_closed() == true`.
 #[derive(Clone, Debug)]
 pub struct SessionRegistry {
     shared: Arc<Shared>,
@@ -79,11 +87,13 @@ impl SessionRegistry {
             ));
         }
         let (neighbors, _) = watch::channel(Arc::new(Vec::new()));
+        let (closed, _) = watch::channel(false);
         Ok(Self {
             shared: Arc::new(Shared {
                 max: max_peers,
                 state: Mutex::new(State::default()),
                 neighbors,
+                closed,
             }),
         })
     }
@@ -96,14 +106,16 @@ impl SessionRegistry {
     /// # Panics
     /// Propagates a poisoned registry lock.
     pub fn try_admit(&self, accepted: AcceptedPeer) -> io::Result<SessionLease> {
-        if accepted.node.as_str().is_empty() || accepted.node.as_str().len() > 255 {
+        let length = accepted.node.as_str().len();
+        if length == 0 || length > crate::MAX_NODE_ID_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid admitted identity",
             ));
         }
         let mut state = self.shared.state.lock().expect("session registry poisoned");
-        if state.closed {
+        // `close` sets the flag under this lock, so the check is atomic with it.
+        if *self.shared.closed.borrow() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "session registry closed",
@@ -135,9 +147,29 @@ impl SessionRegistry {
     }
 
     /// Watches complete current neighbor snapshots, coalescing rapid churn.
+    /// An empty snapshot means "no peers"; pair it with [`Self::is_closed`]
+    /// (or await [`Self::closed`]) to tell an idle registry from a closed one.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<Arc<Vec<SessionPeer>>> {
         self.shared.neighbors.subscribe()
+    }
+
+    /// Whether [`Self::close`] has run. Sticky: once `true`, always `true`.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        *self.shared.closed.borrow()
+    }
+
+    /// Resolves once the registry is closed — immediately if it already is —
+    /// or once every registry handle has been dropped, which equally ends
+    /// admission. The future owns its subscription, so it may outlive `self`
+    /// and be polled from any task.
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut closed = self.shared.closed.subscribe();
+        async move {
+            // An error means the registry itself is gone: equally closed.
+            let _ = closed.wait_for(|closed| *closed).await;
+        }
     }
 
     /// Checks that both identity and generation remain admitted.
@@ -168,13 +200,13 @@ impl SessionRegistry {
 
     /// Permanently stops admission and withdraws every live generation.
     /// Idempotent; adapters should invoke this before draining shutdown tasks.
+    /// The closed state is published before the final empty neighbor snapshot.
     ///
     /// # Panics
     /// Propagates a poisoned registry lock.
     pub fn close(&self) {
         let mut state = self.shared.state.lock().expect("session registry poisoned");
-        if !state.closed {
-            state.closed = true;
+        if !self.shared.closed.send_replace(true) {
             state.peers.clear();
             self.shared.publish(&state);
         }

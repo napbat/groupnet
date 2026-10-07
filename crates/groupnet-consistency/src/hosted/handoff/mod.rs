@@ -166,7 +166,8 @@ pub trait SnapshotSource: Send + Sync + 'static {
 /// records, and note that the framing puts a hard ceiling on that: one chunk
 /// becomes one frame, and
 /// [`DataStream`](groupnet_transport::bulk::DataStream) refuses to *read* a
-/// frame past its **256 MiB** `MAX_FRAME`, so a chunk must stay under that less
+/// frame past [`MAX_FRAME_BYTES`](groupnet_transport::framing::MAX_FRAME_BYTES)
+/// (256 MiB), so a chunk must stay under that less
 /// the six-byte `GNHO` prefix it is written behind.
 ///
 /// Nothing checks that on the way out. An oversized chunk is sent perfectly

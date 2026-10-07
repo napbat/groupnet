@@ -110,3 +110,60 @@ fn shutdown_withdraws_leases_and_permanently_fails_closed() {
         io::ErrorKind::BrokenPipe
     );
 }
+
+#[test]
+fn closed_is_sticky_and_distinguishable_from_an_idle_registry() {
+    use futures::FutureExt;
+
+    let registry = SessionRegistry::new(1).unwrap();
+    let mut neighbors = registry.subscribe();
+    let mut pending = Box::pin(registry.closed());
+    // Open and empty: the snapshot alone cannot tell, the lifecycle API can.
+    assert!(neighbors.borrow_and_update().is_empty());
+    assert!(!registry.is_closed());
+    assert!(pending.as_mut().now_or_never().is_none());
+
+    let lease = registry
+        .try_admit(AcceptedPeer::new(NodeId::new("peer")))
+        .unwrap();
+    drop(lease);
+    assert!(!registry.is_closed());
+    assert!(pending.as_mut().now_or_never().is_none());
+
+    registry.close();
+    // A subscriber woken by the final empty snapshot already sees closed.
+    assert!(neighbors.has_changed().unwrap());
+    assert!(neighbors.borrow_and_update().is_empty());
+    assert!(registry.is_closed());
+    assert!(pending.now_or_never().is_some());
+    // Sticky: futures created after close resolve immediately.
+    assert!(registry.closed().now_or_never().is_some());
+    registry.close();
+    assert!(registry.clone().is_closed());
+}
+
+#[test]
+fn closed_future_ends_when_every_registry_handle_is_dropped() {
+    use futures::FutureExt;
+
+    let registry = SessionRegistry::new(1).unwrap();
+    let mut pending = Box::pin(registry.closed());
+    assert!(pending.as_mut().now_or_never().is_none());
+    drop(registry);
+    assert!(pending.now_or_never().is_some());
+}
+
+#[test]
+fn node_identity_bound_is_shared() {
+    let registry = SessionRegistry::new(2).unwrap();
+    let longest = NodeId::new("n".repeat(crate::MAX_NODE_ID_BYTES));
+    assert!(registry.try_admit(AcceptedPeer::new(longest)).is_ok());
+    let too_long = NodeId::new("n".repeat(crate::MAX_NODE_ID_BYTES + 1));
+    assert_eq!(
+        registry
+            .try_admit(AcceptedPeer::new(too_long))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+}

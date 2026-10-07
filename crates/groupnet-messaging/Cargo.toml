@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 groupnet-core.workspace = true
 groupnet-network.workspace = true
+groupnet-transport.workspace = true
 bytes.workspace = true
 ring.workspace = true
 zerocopy.workspace = true

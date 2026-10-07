@@ -7,11 +7,13 @@
 #![cfg(feature = "bulk")]
 
 use std::io;
+use std::num::NonZeroUsize;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
+use groupnet_transport::QueueCapacity;
 use groupnet_transport::bulk::{BulkTransport, DataPlane};
-use groupnet_transport_mem::MemBulkNet;
+use groupnet_transport_mem::{MemBulkConfig, MemBulkNet};
 
 /// A pair of connected data planes on one fabric, `(a, b)`.
 fn pair() -> (
@@ -177,45 +179,52 @@ async fn two_streams_between_one_pair_do_not_interleave() {
 }
 
 #[test]
-fn bulk_configuration_rejects_invalid_queue_and_pipe_capacities() {
-    use groupnet_transport_mem::MemBulkConfig;
+fn bulk_configuration_rejects_unaddressable_pipe_capacity() {
+    let config = MemBulkConfig {
+        pipe_buffer: NonZeroUsize::MAX,
+        ..MemBulkConfig::default()
+    };
+    assert_eq!(
+        MemBulkNet::with_config(config).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let largest = MemBulkConfig {
+        accept_queue: QueueCapacity::MAX,
+        pipe_buffer: NonZeroUsize::new(isize::MAX.unsigned_abs()).unwrap(),
+    };
+    assert!(MemBulkNet::with_config(largest).is_ok());
+}
 
-    for config in [
-        MemBulkConfig {
-            accept_queue: 0,
-            ..MemBulkConfig::default()
-        },
-        MemBulkConfig {
-            accept_queue: usize::MAX,
-            ..MemBulkConfig::default()
-        },
-        MemBulkConfig {
-            pipe_buffer: 0,
-            ..MemBulkConfig::default()
-        },
-        MemBulkConfig {
-            pipe_buffer: usize::MAX,
-            ..MemBulkConfig::default()
-        },
-    ] {
-        assert_eq!(
-            MemBulkNet::with_config(config).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
+#[tokio::test]
+async fn dropped_endpoint_is_unregistered_not_refused() {
+    let net = MemBulkNet::new();
+    let a = net.endpoint(NodeId::new("sender"));
+    let b = net.endpoint(NodeId::new("receiver"));
+    let target = b.local_id().clone();
+    drop(b);
+    assert_eq!(
+        a.connect(&target).await.unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    // A later endpoint under the same id is reachable again.
+    let b = net.endpoint(target.clone());
+    let _out = a.connect(&target).await.unwrap();
+    assert_eq!(b.accept().await.unwrap().0, *a.local_id());
+}
+
+fn tight(pipe_buffer: usize) -> MemBulkConfig {
+    MemBulkConfig {
+        accept_queue: QueueCapacity::MIN,
+        pipe_buffer: NonZeroUsize::new(pipe_buffer).unwrap(),
     }
 }
 
 #[tokio::test]
 async fn full_accept_queue_backpressures_connectors() {
-    use groupnet_transport_mem::MemBulkConfig;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
 
-    let net = MemBulkNet::with_config(MemBulkConfig {
-        accept_queue: 1,
-        pipe_buffer: 8,
-    })
-    .unwrap();
+    let net = MemBulkNet::with_config(tight(8)).unwrap();
     let a = net.endpoint(NodeId::new("sender"));
     let b = net.endpoint(NodeId::new("receiver"));
     let target = b.local_id().clone();
@@ -234,12 +243,11 @@ async fn full_accept_queue_backpressures_connectors() {
 
 #[tokio::test]
 async fn dropped_full_acceptor_unblocks_connect_with_refusal() {
-    use groupnet_transport_mem::MemBulkConfig;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
 
     let net = MemBulkNet::with_config(MemBulkConfig {
-        accept_queue: 1,
+        accept_queue: QueueCapacity::MIN,
         ..MemBulkConfig::default()
     })
     .unwrap();
@@ -262,17 +270,12 @@ async fn dropped_full_acceptor_unblocks_connect_with_refusal() {
 
 #[tokio::test]
 async fn replacement_preserves_waiting_connection_generation_and_open_streams() {
-    use groupnet_transport_mem::MemBulkConfig;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let net = MemBulkNet::with_config(MemBulkConfig {
-        accept_queue: 1,
-        pipe_buffer: 8,
-    })
-    .unwrap();
+    let net = MemBulkNet::with_config(tight(8)).unwrap();
     let a = net.endpoint(NodeId::new("sender"));
     let old = net.endpoint(NodeId::new("receiver"));
     let target = old.local_id().clone();
@@ -306,17 +309,12 @@ async fn replacement_preserves_waiting_connection_generation_and_open_streams() 
 
 #[tokio::test]
 async fn configured_pipe_buffer_backpressures_writes() {
-    use groupnet_transport_mem::MemBulkConfig;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let net = MemBulkNet::with_config(MemBulkConfig {
-        accept_queue: 1,
-        pipe_buffer: 1,
-    })
-    .unwrap();
+    let net = MemBulkNet::with_config(tight(1)).unwrap();
     let a = net.endpoint(NodeId::new("sender"));
     let b = net.endpoint(NodeId::new("receiver"));
     let mut out = a.connect(b.local_id()).await.unwrap().compat();

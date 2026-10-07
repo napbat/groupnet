@@ -86,11 +86,16 @@ impl MemBulkNet {
     /// last sender clone is gone. Streams already open across the old endpoint
     /// are untouched — they are pipes, and own no part of the table.
     ///
+    /// Dropping the endpoint unregisters `id` — unless a newer endpoint has
+    /// since replaced it, whose registration the older drop never removes —
+    /// so later connects report `NotFound` and the table never retains it.
+    ///
     /// # Panics
     /// If the fabric's queue table was poisoned by a panic in another thread.
     #[must_use]
     pub fn endpoint(&self, id: NodeId) -> MemBulkTransport {
-        let (tx, rx) = mpsc::channel(self.config.accept_queue);
+        let (tx, rx) = mpsc::channel(self.config.accept_queue.get());
+        let registration = tx.downgrade();
         self.queues
             .lock()
             .expect("bulk network mutex poisoned")
@@ -99,7 +104,8 @@ impl MemBulkNet {
             id,
             queues: self.queues.clone(),
             incoming: AsyncMutex::new(rx),
-            pipe_buffer: self.config.pipe_buffer,
+            registration,
+            pipe_buffer: self.config.pipe_buffer.get(),
         }
     }
 }
@@ -110,6 +116,8 @@ pub struct MemBulkTransport {
     id: NodeId,
     queues: Queues,
     incoming: AsyncMutex<mpsc::Receiver<Incoming>>,
+    // A strong sender here would keep a displaced endpoint's accept queue open.
+    registration: mpsc::WeakSender<Incoming>,
     pipe_buffer: usize,
 }
 
@@ -118,6 +126,21 @@ impl MemBulkTransport {
     #[must_use]
     pub fn local_id(&self) -> &NodeId {
         &self.id
+    }
+}
+
+impl Drop for MemBulkTransport {
+    fn drop(&mut self) {
+        let mut queues = self.queues.lock().expect("bulk network mutex poisoned");
+        // Only this endpoint's own generation is removed; a replacement
+        // registered under the same id stays reachable.
+        if queues.get(&self.id).is_some_and(|sender| {
+            self.registration
+                .upgrade()
+                .is_some_and(|registration| sender.same_channel(&registration))
+        }) {
+            queues.remove(&self.id);
+        }
     }
 }
 
@@ -151,5 +174,35 @@ impl BulkTransport for MemBulkTransport {
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "endpoint evicted"))?;
         Ok((from, stream.compat()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registered(net: &MemBulkNet) -> usize {
+        net.queues.lock().expect("queues").len()
+    }
+
+    #[test]
+    fn endpoint_drop_removes_its_accept_queue_registration() {
+        let net = MemBulkNet::new();
+        let endpoint = net.endpoint(NodeId::new("local"));
+        assert_eq!(registered(&net), 1);
+        drop(endpoint);
+        assert_eq!(registered(&net), 0);
+    }
+
+    #[test]
+    fn displaced_endpoint_drop_keeps_its_replacement_registered() {
+        let net = MemBulkNet::new();
+        let id = NodeId::new("local");
+        let old = net.endpoint(id.clone());
+        let replacement = net.endpoint(id);
+        drop(old);
+        assert_eq!(registered(&net), 1);
+        drop(replacement);
+        assert_eq!(registered(&net), 0);
     }
 }

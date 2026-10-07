@@ -61,6 +61,11 @@ Advertisements are not proof of cryptographic endpoint identity. Route inspectio
 through `route_to` reports local routing state, not a guarantee that the next
 packet will be delivered. A path can disappear immediately afterward.
 
+`Router::reachable()` is the route-readiness notification: a watch of the
+destinations that currently have a live route. Wait on it, for example
+`reachable().wait_for(|peers| peers.contains(&target))`, before sending or
+connecting instead of polling `route_to`.
+
 ## 3. Receiving and forwarding a packet
 
 The diagram combines the worker's physical-frame check with the routing actor's
@@ -116,9 +121,26 @@ The router neither decodes protocol bodies nor interprets their ACKs.
 
 `RouterConfig` controls complete-frame size, hop count, replay retention,
 reassembly bounds, protocol/inbox/link capacities and physical-send deadlines.
-Configuration is validated against wire representation and channel limits before
-workers start. Increasing a bound does not enlarge a physical link's MTU:
-fragmentation still applies, and every receiving router enforces its own limits.
+Configuration is validated against wire representation before workers start;
+every queue capacity is a `QueueCapacity`, which is nonzero and representable
+by Tokio channels by construction. Increasing a bound does not enlarge a
+physical link's MTU: fragmentation still applies, and every receiving router
+enforces its own limits.
+
+| Queue | Default | Holds |
+|---|---|---|
+| `link_queue` | 256 per link | Frames awaiting that link's worker |
+| `tunnel_queue` | 1024 per node | Tunnel packets awaiting session dispatch |
+| `event_queue` | 256 per node | Received frames and link events awaiting the routing actor (backpressured) |
+| `message_queue` | 64 per node | Coordination messages awaiting the runtime |
+| `protocol_queue` | 128 per namespace | Application packets awaiting the bound protocol |
+
+Sizing rule: one bulk tunnel stream keeps about `2 × window` frames queued — a
+window of data plus its acknowledgements, 128 frames with the default 64-segment
+window. Size `link_queue` for the bulk streams sharing a link and `tunnel_queue`
+for the sessions terminating at the node; the defaults hold two and eight
+default-window streams. A full link or tunnel queue drops frames: streams repair
+the loss, but each loss halves the affected stream's congestion window.
 
 `ProtocolIo::packet_buffer(destination, capacity)` reserves routing headroom in
 one owned buffer. A protocol writes its typed header and payload, encrypts in

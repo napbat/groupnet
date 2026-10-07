@@ -105,7 +105,7 @@ impl BulkLimits {
     /// Returns `Config` for zero, excessive transport, or inverted caps.
     pub fn validate(self) -> Result<Self, BulkError> {
         if self.wire.max_frame_bytes == 0
-            || self.wire.max_frame_bytes > 256 << 20
+            || self.wire.max_frame_bytes > groupnet_transport::framing::MAX_FRAME_BYTES
             || self.wire.max_scope_bytes == 0
             || self.wire.max_node_bytes == 0
             || self.wire.max_payload_bytes == 0

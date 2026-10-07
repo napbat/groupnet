@@ -70,7 +70,7 @@ impl Hub {
     pub(crate) fn new(router: &Router, config: MessagingConfig) -> io::Result<Self> {
         let sender = Messaging::with_config(router, config)?;
         Ok(Self {
-            node: Inbox::new(sender.cancellation(), sender.config().inbox_capacity),
+            node: Inbox::new(sender.cancellation(), sender.config().inbox_capacity.get()),
             sender,
             dispatcher: Mutex::new(None),
         })
@@ -89,7 +89,7 @@ impl Hub {
             sender: self.sender.clone(),
             inbox: Inbox::new(
                 self.sender.cancellation(),
-                self.sender.config().inbox_capacity,
+                self.sender.config().inbox_capacity.get(),
             ),
         }
     }

@@ -84,7 +84,7 @@ impl Admission for OpenAdmission {
         Box::pin(async move {
             if request.credential.len() > MAX_CREDENTIAL_BYTES
                 || request.claimed.as_str().is_empty()
-                || request.claimed.as_str().len() > 255
+                || request.claimed.as_str().len() > crate::MAX_NODE_ID_BYTES
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

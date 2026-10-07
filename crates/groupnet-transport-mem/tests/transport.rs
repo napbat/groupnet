@@ -4,8 +4,15 @@
 //! across every [`Network`] clone.
 
 use groupnet_core::NodeId;
-use groupnet_transport::Transport;
-use groupnet_transport_mem::Network;
+use groupnet_transport::{QueueCapacity, Transport};
+use groupnet_transport_mem::{Network, NetworkConfig};
+
+/// One slot per endpoint: the second send waits for receive capacity.
+fn single_slot() -> Network {
+    Network::with_config(NetworkConfig {
+        inbound_queue: QueueCapacity::MIN,
+    })
+}
 
 /// A frame reaches the addressed endpoint carrying the *sender's* id — the
 /// attribution every layer above (gossip, membership) is keyed on.
@@ -118,27 +125,12 @@ async fn dropping_replaced_endpoint_keeps_replacement_reachable() {
     );
 }
 
-#[test]
-fn configured_message_queues_reject_zero_and_unsupported_capacities() {
-    use groupnet_transport_mem::NetworkConfig;
-
-    for inbound_queue in [0, usize::MAX] {
-        assert_eq!(
-            Network::with_config(NetworkConfig { inbound_queue })
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::InvalidInput
-        );
-    }
-}
-
 #[tokio::test]
 async fn full_message_queue_waits_for_receive_capacity() {
-    use groupnet_transport_mem::NetworkConfig;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
 
-    let net = Network::with_config(NetworkConfig { inbound_queue: 1 }).unwrap();
+    let net = single_slot();
     let a = net.endpoint(NodeId::new("sender"));
     let b = net.endpoint(NodeId::new("receiver"));
     let target = b.local_id().clone();
@@ -156,11 +148,10 @@ async fn full_message_queue_waits_for_receive_capacity() {
 
 #[tokio::test]
 async fn dropping_full_target_unblocks_a_waiting_sender() {
-    use groupnet_transport_mem::NetworkConfig;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
 
-    let net = Network::with_config(NetworkConfig { inbound_queue: 1 }).unwrap();
+    let net = single_slot();
     let a = net.endpoint(NodeId::new("sender"));
     let b = net.endpoint(NodeId::new("receiver"));
     let target = b.local_id().clone();
@@ -179,11 +170,10 @@ async fn dropping_full_target_unblocks_a_waiting_sender() {
 
 #[tokio::test]
 async fn replacement_does_not_redirect_an_already_waiting_send() {
-    use groupnet_transport_mem::NetworkConfig;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
 
-    let net = Network::with_config(NetworkConfig { inbound_queue: 1 }).unwrap();
+    let net = single_slot();
     let a = net.endpoint(NodeId::new("sender"));
     let old = net.endpoint(NodeId::new("receiver"));
     let target = old.local_id().clone();

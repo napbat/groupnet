@@ -6,16 +6,17 @@ use groupnet_core::NodeId;
 use groupnet_network::RouterConfig;
 use groupnet_runtime::messaging::{Bytes, Delivery, MessagingConfig, SendOptions};
 use groupnet_runtime::{Messages, Node};
+use groupnet_transport::QueueCapacity;
 
 #[tokio::test]
 async fn managed_configuration_controls_payload_deadlines_and_node_inbox() -> io::Result<()> {
     let id = NodeId::new("configured");
     let config = MessagingConfig {
         max_payload: 70_000,
-        inbox_capacity: 1,
+        inbox_capacity: QueueCapacity::of(1),
         max_timeout: Duration::from_secs(90),
         dedup_retention: Duration::from_secs(91),
-        fanout_concurrency: 1,
+        fanout_concurrency: QueueCapacity::of(1),
         ..MessagingConfig::default()
     };
     let node = Node::builder(id.clone())

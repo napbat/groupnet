@@ -5,50 +5,65 @@ use std::sync::Mutex;
 use std::task::Poll;
 
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-#[derive(Debug, Default)]
-struct State {
-    stopped: bool,
-    tasks: JoinSet<()>,
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Tasks {
-    state: Mutex<State>,
+    running: Mutex<JoinSet<()>>,
+    // Sticky stop flag. Written only while `running` is locked so spawn's check
+    // and shutdown's abort stay atomic; the watch makes the stop observable.
+    stopped: watch::Sender<bool>,
     // JoinSet stores one join waker: serialize concurrent drain callers.
     drain: AsyncMutex<()>,
 }
 
+impl Default for Tasks {
+    fn default() -> Self {
+        Self {
+            running: Mutex::default(),
+            stopped: watch::Sender::new(false),
+            drain: AsyncMutex::default(),
+        }
+    }
+}
+
 impl Tasks {
     pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
-        let mut state = self.state.lock().expect("task lock poisoned");
-        if state.stopped {
+        let mut tasks = self.running.lock().expect("task lock poisoned");
+        if self.stopped() {
             return false;
         }
         // Reap completed sessions so long-lived endpoints retain only live tasks.
-        while state.tasks.try_join_next().is_some() {}
-        state.tasks.spawn(task);
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(task);
         true
     }
 
     pub(crate) fn stopped(&self) -> bool {
-        self.state.lock().expect("task lock poisoned").stopped
+        *self.stopped.borrow()
+    }
+
+    /// Resolves once shutdown has begun; sticky for every later caller.
+    pub(crate) async fn stopping(&self) {
+        let mut stopped = self.stopped.subscribe();
+        // The sender lives in `self`, so the wait can only end by stopping.
+        let _ = stopped.wait_for(|stopped| *stopped).await;
     }
 
     pub(crate) fn shutdown(&self) {
-        let mut state = self.state.lock().expect("task lock poisoned");
-        state.stopped = true;
-        state.tasks.abort_all();
+        let mut tasks = self.running.lock().expect("task lock poisoned");
+        self.stopped.send_replace(true);
+        tasks.abort_all();
     }
 
     pub(crate) async fn close(&self) {
         self.shutdown();
         let _drain = self.drain.lock().await;
         poll_fn(|cx| {
-            let mut state = self.state.lock().expect("task lock poisoned");
+            let mut tasks = self.running.lock().expect("task lock poisoned");
             loop {
-                match state.tasks.poll_join_next(cx) {
+                match tasks.poll_join_next(cx) {
                     Poll::Ready(Some(_)) => {}
                     Poll::Ready(None) => return Poll::Ready(()),
                     Poll::Pending => return Poll::Pending,
@@ -105,6 +120,25 @@ mod tests {
         .expect("concurrent close must not lose a drain waker");
         assert!(dropped.load(Ordering::SeqCst));
         assert!(!tasks.spawn(async { panic!("closed registry spawned a task") }));
-        assert!(tasks.state.lock().expect("state").tasks.is_empty());
+        assert!(tasks.running.lock().expect("tasks").is_empty());
+    }
+
+    #[tokio::test]
+    async fn stopping_is_sticky_and_observes_shutdown() {
+        let tasks = Arc::new(Tasks::default());
+        let waiter = tokio::spawn({
+            let tasks = tasks.clone();
+            async move { tasks.stopping().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tasks.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("stop observed")
+            .expect("waiter");
+        tokio::time::timeout(Duration::from_secs(5), tasks.stopping())
+            .await
+            .expect("a later caller sees the sticky stop");
     }
 }

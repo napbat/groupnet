@@ -2,8 +2,11 @@
 
 use std::{io, time::Duration};
 
+use groupnet_transport::QueueCapacity;
+
 use crate::{
-    DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, SendOptions,
+    DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, Delivery,
+    SendOptions,
 };
 
 /// Finite operational bounds shared by all handles of a messaging endpoint.
@@ -13,15 +16,15 @@ pub struct MessagingConfig {
     /// Maximum application payload, also limited by the destination's router envelope.
     pub max_payload: usize,
     /// Maximum frames queued in the dispatcher and each managed node/group inbox.
-    pub inbox_capacity: usize,
+    pub inbox_capacity: QueueCapacity,
     /// Maximum concurrently acknowledged sends.
-    pub pending_sends: usize,
+    pub pending_sends: QueueCapacity,
     /// Maximum retained acknowledged identities, including pending receipts.
-    pub received_records: usize,
+    pub received_records: QueueCapacity,
     /// Delay between retries of an acknowledged send.
     pub retry_interval: Duration,
     /// Maximum simultaneous recipient sends during managed group fanout.
-    pub fanout_concurrency: usize,
+    pub fanout_concurrency: QueueCapacity,
     /// Maximum local send deadline and admitted peer retry horizon.
     /// Frames exceeding the receiver's horizon fail closed without execution or ACK.
     pub max_timeout: Duration,
@@ -33,11 +36,11 @@ impl Default for MessagingConfig {
     fn default() -> Self {
         Self {
             max_payload: DEFAULT_MAX_MESSAGE_BYTES,
-            inbox_capacity: 64,
-            pending_sends: 256,
-            received_records: 1024,
+            inbox_capacity: QueueCapacity::of(64),
+            pending_sends: QueueCapacity::of(256),
+            received_records: QueueCapacity::of(1024),
             retry_interval: Duration::from_millis(200),
-            fanout_concurrency: 32,
+            fanout_concurrency: QueueCapacity::of(32),
             max_timeout: Duration::from_millis(DEFAULT_MAX_TIMEOUT_MS),
             dedup_retention: Duration::from_millis(DEFAULT_DEDUP_RETENTION_MS),
         }
@@ -45,17 +48,14 @@ impl Default for MessagingConfig {
 }
 
 impl MessagingConfig {
-    /// Checks capacities, wire representability and the retry-retention invariant.
+    /// Checks payload and wire representability and the retry-retention invariant.
+    /// Queue capacities are valid by construction.
     ///
     /// # Errors
     /// Returns `InvalidInput` for invalid bounds or unrepresentable timers.
     pub fn validate(&self) -> io::Result<()> {
         if self.max_payload == 0
             || u32::try_from(self.max_payload).is_err()
-            || !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.inbox_capacity)
-            || !(1..=isize::MAX as usize).contains(&self.fanout_concurrency)
-            || !(1..=isize::MAX as usize).contains(&self.pending_sends)
-            || !(1..=isize::MAX as usize).contains(&self.received_records)
             || self.retry_interval.is_zero()
             || self.max_timeout < self.retry_interval
             || self.dedup_retention <= self.max_timeout
@@ -79,17 +79,34 @@ impl MessagingConfig {
     /// # Errors
     /// Returns `InvalidInput` for oversized payloads or acknowledgement deadlines.
     pub fn validate_send(&self, options: SendOptions, payload_len: usize) -> io::Result<()> {
-        options.validate(payload_len)?;
-        if payload_len > self.max_payload
-            || (options.delivery != crate::Delivery::BestEffort
-                && options.timeout > self.max_timeout)
-        {
-            return Err(io::Error::new(
+        self.retry_horizon_ms(options, payload_len).map(drop)
+    }
+
+    /// Validates a send once against these (validated) bounds and returns its
+    /// wire retry horizon: zero for best effort, else the deadline rounded up
+    /// to milliseconds. Bounded by `max_payload`/`max_timeout`, a passing send
+    /// is wire-representable without re-checking.
+    pub(crate) fn retry_horizon_ms(
+        &self,
+        options: SendOptions,
+        payload_len: usize,
+    ) -> io::Result<u64> {
+        let invalid = || {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "application send exceeds messaging bounds",
-            ));
+            )
+        };
+        if payload_len > self.max_payload {
+            return Err(invalid());
         }
-        Ok(())
+        if options.delivery == Delivery::BestEffort {
+            return Ok(0);
+        }
+        if options.timeout.is_zero() || options.timeout > self.max_timeout {
+            return Err(invalid());
+        }
+        timeout_ms(options.timeout)
     }
 
     pub(crate) fn retention_ms(&self) -> u64 {
@@ -119,9 +136,9 @@ mod tests {
     fn operational_bounds_are_configurable_but_retention_covers_retries() {
         let mut config = MessagingConfig {
             max_payload: DEFAULT_MAX_MESSAGE_BYTES + 1,
-            inbox_capacity: 2048,
-            pending_sends: 2048,
-            received_records: 8192,
+            inbox_capacity: QueueCapacity::of(2048),
+            pending_sends: QueueCapacity::of(2048),
+            received_records: QueueCapacity::of(8192),
             max_timeout: Duration::from_secs(90),
             dedup_retention: Duration::from_secs(91),
             ..MessagingConfig::default()
@@ -130,7 +147,7 @@ mod tests {
         config
             .validate_send(
                 SendOptions {
-                    delivery: crate::Delivery::Applied,
+                    delivery: Delivery::Applied,
                     timeout: Duration::from_secs(90),
                 },
                 DEFAULT_MAX_MESSAGE_BYTES + 1,
@@ -139,7 +156,7 @@ mod tests {
         config.dedup_retention = config.max_timeout;
         assert!(config.validate().is_err());
         config.dedup_retention = Duration::from_secs(91);
-        config.inbox_capacity = 0;
+        config.max_payload = 0;
         assert!(config.validate().is_err());
     }
 
@@ -160,5 +177,46 @@ mod tests {
         assert!(config.validate().is_err());
         config.dedup_retention = Duration::from_millis(2);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn one_send_check_yields_the_wire_horizon_or_rejects() {
+        let config = MessagingConfig::default();
+        let send = |delivery, timeout| SendOptions { delivery, timeout };
+        assert_eq!(
+            config
+                .retry_horizon_ms(send(Delivery::BestEffort, Duration::ZERO), 0)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            config
+                .retry_horizon_ms(
+                    send(Delivery::Applied, Duration::from_micros(1_500)),
+                    config.max_payload
+                )
+                .unwrap(),
+            2
+        );
+        for (options, length) in [
+            (send(Delivery::Delivered, Duration::ZERO), 0),
+            (
+                send(
+                    Delivery::Applied,
+                    config.max_timeout + Duration::from_nanos(1),
+                ),
+                0,
+            ),
+            (
+                send(Delivery::BestEffort, Duration::ZERO),
+                config.max_payload + 1,
+            ),
+        ] {
+            assert_eq!(
+                config.retry_horizon_ms(options, length).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert!(config.validate_send(options, length).is_err());
+        }
     }
 }

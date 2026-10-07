@@ -11,32 +11,50 @@ use groupnet_core::NodeId;
 use groupnet_transport::admission::{
     Admission, JoinRequest, MAX_CREDENTIAL_BYTES, SessionLease, SessionRegistry,
 };
+use groupnet_transport::framing::{LengthHeader, write_vectored};
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkLifecycle};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use groupnet_transport::{MAX_NODE_ID_BYTES, QueueCapacity};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::timeout;
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::{Inner, QueuedInbound, TcpMsgConfig, TcpMsgTransport};
-use crate::handshake::{read_id, read_str, write_id, write_str};
+use crate::handshake::{
+    check_id, decode_id, field_header, read_addr, read_body, read_field, read_id, write_id,
+};
 
 const MAGIC: &[u8; 8] = b"GNJOIN01";
 
+/// Fixed prefix of a join hello: the protocol magic, then the claimed id's
+/// length. The id, intro address and credential follow as length-prefixed
+/// fields.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
+#[repr(C)]
+struct HelloPrefix {
+    magic: [u8; 8],
+    node: LengthHeader,
+}
+
 /// Bounds for policy work and established managed TCP sessions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpAdmissionConfig {
     /// Maximum handshakes executing concurrently, including custom policy work.
-    pub max_pending: usize,
+    /// Default: 64.
+    pub max_pending: QueueCapacity,
     /// Maximum live admitted identities. Duplicate live identities are rejected.
+    /// Must be nonzero. Default: 1024.
     pub max_peers: usize,
-    /// Deadline covering connection establishment, wire exchange, and policy work.
+    /// Deadline covering connection establishment, wire exchange, and policy
+    /// work. Must be nonzero. Default: 5s.
     pub handshake_timeout: Duration,
 }
 
 impl Default for TcpAdmissionConfig {
     fn default() -> Self {
         Self {
-            max_pending: 64,
+            max_pending: QueueCapacity::of(64),
             max_peers: 1024,
             handshake_timeout: Duration::from_secs(5),
         }
@@ -87,8 +105,9 @@ impl TcpMsgTransport {
     /// the raw transport's idle/oldest-first eviction does not revoke membership.
     ///
     /// # Errors
-    /// Returns invalid-input errors for invalid bounds or oversized credentials,
-    /// and propagates listener bind failures.
+    /// Returns invalid-input errors for invalid bounds, oversized credentials,
+    /// or a local id outside the handshake bound, and propagates listener bind
+    /// failures.
     pub async fn bind_admitted(
         local: NodeId,
         addr: impl ToSocketAddrs,
@@ -97,14 +116,7 @@ impl TcpMsgTransport {
         credential: Vec<u8>,
         admission: TcpAdmissionConfig,
     ) -> io::Result<Self> {
-        if credential.len() > MAX_CREDENTIAL_BYTES
-            || admission.max_pending == 0
-            || admission.max_pending > Semaphore::MAX_PERMITS
-            || admission.max_peers == 0
-            || admission.handshake_timeout.is_zero()
-            || local.as_str().is_empty()
-            || local.as_str().len() > 255
-        {
+        if credential.len() > MAX_CREDENTIAL_BYTES || admission.handshake_timeout.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid TCP admission configuration",
@@ -112,7 +124,7 @@ impl TcpMsgTransport {
         }
         let managed = Arc::new(Managed {
             sessions: SessionRegistry::new(admission.max_peers)?,
-            pending: Arc::new(Semaphore::new(admission.max_pending)),
+            pending: Arc::new(Semaphore::new(admission.max_pending.get())),
             policy,
             credential,
             config: admission,
@@ -203,7 +215,7 @@ impl TcpMsgTransport {
                     let _ = managed.send(&inner, peer, None);
                 }
                 // An unavailable prefix must not monopolize bounded dial slots.
-                first = (first + managed.config.max_pending.min(peers.len())) % peers.len();
+                first = (first + managed.config.max_pending.get().min(peers.len())) % peers.len();
             }
         });
     }
@@ -321,7 +333,7 @@ impl Managed {
         let Ok(permit) = self.pending.clone().try_acquire_owned() else {
             return Ok(());
         };
-        let (frames, receiver) = mpsc::channel(inner.config.outbound_queue);
+        let (frames, receiver) = mpsc::channel(inner.config.outbound_queue.get());
         if let Some(msg) = msg {
             let _ = frames.try_send(msg);
         }
@@ -471,7 +483,7 @@ impl Managed {
         self: &Arc<Self>,
         local: &NodeId,
         peer: &NodeId,
-        queue: usize,
+        queue: QueueCapacity,
     ) -> io::Result<(Owner, mpsc::Receiver<Bytes>, watch::Receiver<bool>)> {
         let mut connections = self.connections.lock().expect("connections lock poisoned");
         if let Some(existing) = connections.peers.get(peer) {
@@ -482,7 +494,7 @@ impl Managed {
             }
             let _ = existing.cancel.send(true);
         }
-        let (frames, receiver) = mpsc::channel(queue);
+        let (frames, receiver) = mpsc::channel(queue.get());
         let (cancel, cancelled) = watch::channel(false);
         let generation = connections.next_generation;
         connections.next_generation = generation
@@ -646,37 +658,47 @@ struct Hello {
     credential: Vec<u8>,
 }
 
+/// Writes the whole hello in one vectored write.
 async fn write_hello(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     local: &NodeId,
     intro: &str,
     credential: &[u8],
 ) -> io::Result<()> {
-    socket.write_all(MAGIC).await?;
-    write_id(socket, local).await?;
-    write_str(socket, intro).await?;
-    let len = u32::try_from(credential.len()).map_err(|_| denied())?;
-    socket.write_all(&len.to_be_bytes()).await?;
-    socket.write_all(credential).await
+    check_id(local)?;
+    let node = local.as_str().as_bytes();
+    let prefix = HelloPrefix {
+        magic: *MAGIC,
+        node: field_header(node)?,
+    };
+    let intro = intro.as_bytes();
+    write_vectored(
+        socket,
+        &[
+            prefix.as_bytes(),
+            node,
+            field_header(intro)?.as_bytes(),
+            intro,
+            field_header(credential)?.as_bytes(),
+            credential,
+        ],
+    )
+    .await
 }
 
-async fn read_hello(socket: &mut TcpStream) -> io::Result<Hello> {
-    let mut magic = [0; 8];
-    socket.read_exact(&mut magic).await?;
-    if &magic != MAGIC {
+async fn read_hello(socket: &mut (impl AsyncRead + Unpin)) -> io::Result<Hello> {
+    let mut prefix = HelloPrefix::new_zeroed();
+    // Check the magic before waiting for more bytes, so a foreign protocol
+    // (such as a raw intro) is rejected immediately rather than at the deadline.
+    let (magic, length) = prefix.as_mut_bytes().split_at_mut(MAGIC.len());
+    socket.read_exact(magic).await?;
+    if magic != MAGIC.as_slice() {
         return Err(denied());
     }
-    let node = read_id(socket).await?;
-    if node.as_str().is_empty() {
-        return Err(denied());
-    }
-    let intro = read_str(socket).await?;
-    let len = socket.read_u32().await? as usize;
-    if len > MAX_CREDENTIAL_BYTES {
-        return Err(denied());
-    }
-    let mut credential = vec![0; len];
-    socket.read_exact(&mut credential).await?;
+    socket.read_exact(length).await?;
+    let node = decode_id(read_body(socket, prefix.node, MAX_NODE_ID_BYTES).await?)?;
+    let intro = read_addr(socket).await?;
+    let credential = read_field(socket, MAX_CREDENTIAL_BYTES).await?;
     Ok(Hello {
         node,
         intro,

@@ -80,7 +80,7 @@ requirements, so they're separate traits bound to separate physical connections.
 | Crate | Plane | Deps | Role |
 |-------|-------|------|------|
 | [`groupnet-core`](crates/groupnet-core) | — | none | sans-IO state machine: engine, ids, wire codec, coordinator selection |
-| [`groupnet-transport`](crates/groupnet-transport) | both | core *(+bulk: futures-io, bytes, zerocopy; +link: tokio, tokio-util, futures-util)* | dependency-free `Transport`, optional `BulkTransport`, and shared object-safe link registration/lifecycle |
+| [`groupnet-transport`](crates/groupnet-transport) | both | core, bytes *(+framing: zerocopy, tokio I/O traits; +bulk: framing, futures-io; +link: tokio, tokio-util, futures-util)* | dependency-free `Transport` and validated `QueueCapacity`, shared length-prefix `framing`, optional `BulkTransport`, and shared object-safe link registration/lifecycle |
 | [`groupnet-transport-mem`](crates/groupnet-transport-mem) | both | transport, core, tokio(sync) *(+bulk feature: transport(bulk), tokio(io-util), tokio-util(compat))* | in-process bindings (tests, examples, single-process): datagrams always, `MemBulkNet` byte streams under feature `bulk` |
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
 | [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) | persistent TCP messages, TCP streams, and `TcpLink` registration |
@@ -862,7 +862,7 @@ let server = RpcServer::spawn(rpc_plane, |from: NodeId, request: Bytes| async mo
 });
 
 // Calling node: one cloneable client; every call carries its own deadline.
-let client = RpcClient::new(client_plane, RpcConfig::default());
+let client = RpcClient::new(client_plane, RpcConfig::default())?;
 match client.call(&owner, Bytes::from(key), Duration::from_millis(200)).await {
     Ok(value) => { /* ... */ }
     Err(RpcError::ConnectionLost | RpcError::Timeout) => { /* outcome unknown */ }

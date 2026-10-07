@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -12,36 +13,11 @@ use groupnet_core::NodeId;
 use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::AbortHandle;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout_at};
 
-use crate::codec::{Frame, REQUEST_HEAD};
-use crate::{DEFAULT_MAX_FRAME_BYTES, RpcError, RpcStatus, check_frame_limit, write_frames};
-
-/// Client limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RpcConfig {
-    /// How long opening a connection to a peer may take before the call
-    /// fails [`Unreachable`](RpcError::Unreachable). A call's own timeout
-    /// still bounds it (and then fails [`Timeout`](RpcError::Timeout)).
-    pub connect_timeout: Duration,
-    /// The largest RPC frame (head included) this client sends or accepts.
-    /// Match the server's [`RpcServerConfig::max_frame_bytes`](crate::RpcServerConfig::max_frame_bytes).
-    pub max_frame_bytes: usize,
-    /// Concurrent calls allowed to one peer; more wait for a slot within
-    /// their own timeout.
-    pub max_in_flight_per_peer: usize,
-}
-
-impl Default for RpcConfig {
-    /// 3 s to connect, 16 MiB frames, 1024 calls in flight per peer.
-    fn default() -> Self {
-        Self {
-            connect_timeout: Duration::from_secs(3),
-            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
-            max_in_flight_per_peer: 1024,
-        }
-    }
-}
+use crate::codec::{Encoded, Frame, REQUEST_HEAD};
+use crate::config::{FrameLimit, MAX_TIMEOUT, RpcConfig};
+use crate::{RpcError, RpcStatus, write_frames};
 
 /// The calling side of the RPC layer. Cheap to clone; every clone shares the
 /// same connections.
@@ -49,7 +25,9 @@ impl Default for RpcConfig {
 /// Connections are opened lazily, one per peer, on the first call to it, and
 /// reused by every later call. A connection that breaks fails each call in
 /// flight on it with [`RpcError::ConnectionLost`] and is replaced by the next
-/// call. Dropping the last clone closes every connection.
+/// call; one with no call waiting for [`RpcConfig::idle_timeout`] is closed.
+/// At most [`RpcConfig::max_peers`] destinations are tracked at once.
+/// Dropping the last clone closes every connection.
 pub struct RpcClient<B: BulkTransport> {
     inner: Arc<Inner<B>>,
 }
@@ -74,6 +52,8 @@ impl<B: BulkTransport> fmt::Debug for RpcClient<B> {
 struct Inner<B: BulkTransport> {
     plane: DataPlane<B>,
     config: RpcConfig,
+    /// Admitted destinations. A peer is in use while a call holds a clone of
+    /// its `Arc`; clones are only handed out under this lock.
     peers: Mutex<HashMap<NodeId, Arc<Peer>>>,
     next_id: AtomicU64,
     shut: AtomicBool,
@@ -90,22 +70,22 @@ struct Peer {
 /// One live connection: the writer's queue, the calls awaiting answers, and
 /// the task that drives both halves of the stream.
 struct Conn {
-    frames: mpsc::Sender<crate::codec::Encoded>,
+    frames: mpsc::Sender<Encoded>,
     calls: Arc<Calls>,
     task: AbortHandle,
 }
 
 /// The calls awaiting an answer on one connection.
-#[derive(Default)]
 struct Calls {
     state: Mutex<CallsState>,
 }
 
-#[derive(Default)]
 struct CallsState {
     /// Set once the connection is gone; nothing registers after it.
     closed: bool,
     waiting: HashMap<u64, oneshot::Sender<Result<Bytes, RpcStatus>>>,
+    /// When `waiting` last became empty (or the connection opened).
+    idle_since: Instant,
 }
 
 /// Locks a mutex whose data stays consistent across a panic: every critical
@@ -117,20 +97,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl<B: BulkTransport> RpcClient<B> {
     /// A client that opens its connections on `plane`.
     ///
-    /// # Panics
-    /// If `config.max_frame_bytes` cannot hold a request head or exceeds
-    /// [`MAX_FRAME_LIMIT`](crate::MAX_FRAME_LIMIT), or
-    /// `config.max_in_flight_per_peer` is zero or above
-    /// [`Semaphore::MAX_PERMITS`].
-    #[must_use]
-    pub fn new(plane: DataPlane<B>, config: RpcConfig) -> Self {
-        check_frame_limit(config.max_frame_bytes);
-        assert!(
-            (1..=Semaphore::MAX_PERMITS).contains(&config.max_in_flight_per_peer),
-            "max_in_flight_per_peer must be within 1..={}",
-            Semaphore::MAX_PERMITS
-        );
-        Self {
+    /// # Errors
+    /// `InvalidInput` if `config` fails [`RpcConfig::validate`].
+    pub fn new(plane: DataPlane<B>, config: RpcConfig) -> io::Result<Self> {
+        config.validate()?;
+        Ok(Self {
             inner: Arc::new(Inner {
                 plane,
                 config,
@@ -138,17 +109,19 @@ impl<B: BulkTransport> RpcClient<B> {
                 next_id: AtomicU64::new(0),
                 shut: AtomicBool::new(false),
             }),
-        }
+        })
     }
 
     /// Calls `to` with `payload` and waits up to `timeout` for its answer.
     ///
     /// The server receives the remaining budget as the request's deadline
-    /// and drops the work once it passes. Dropping the returned future
-    /// abandons the call (a late answer is discarded).
+    /// and drops the work once it passes. A timeout above
+    /// [`MAX_TIMEOUT`](crate::MAX_TIMEOUT) is clamped to it. Dropping the
+    /// returned future abandons the call (a late answer is discarded).
     ///
     /// # Errors
-    /// See [`RpcError`]: [`TooLarge`](RpcError::TooLarge) and
+    /// See [`RpcError`]: [`TooLarge`](RpcError::TooLarge),
+    /// [`Saturated`](RpcError::Saturated) and
     /// [`Unreachable`](RpcError::Unreachable) mean the request was not sent;
     /// [`Timeout`](RpcError::Timeout) and
     /// [`ConnectionLost`](RpcError::ConnectionLost) mean its outcome is
@@ -163,17 +136,15 @@ impl<B: BulkTransport> RpcClient<B> {
         if inner.is_shut() {
             return Err(RpcError::Shutdown);
         }
-        if payload.len() > inner.config.max_frame_bytes - REQUEST_HEAD {
+        if payload.len() > inner.config.max_frame_bytes.body(REQUEST_HEAD) {
             return Err(RpcError::TooLarge);
         }
-        // The deadline travels as u32 milliseconds; a longer timeout is
-        // clamped to it (~49 days).
-        let timeout = timeout.min(Duration::from_millis(u64::from(u32::MAX)));
+        let timeout = timeout.min(MAX_TIMEOUT);
         if timeout.is_zero() {
             return Err(RpcError::Timeout);
         }
         let deadline = Instant::now() + timeout;
-        let peer = inner.peer(to);
+        let peer = inner.peer(to)?;
         let _slot = match timeout_at(deadline, peer.in_flight.clone().acquire_owned()).await {
             Err(_) => return Err(RpcError::Timeout),
             Ok(Err(_closed)) => return Err(RpcError::Shutdown),
@@ -182,8 +153,8 @@ impl<B: BulkTransport> RpcClient<B> {
         loop {
             let conn = inner.connection(to, &peer, deadline).await?;
             let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
-            // A connection that died since it was handed out has not seen
-            // this request: dial again, within the same deadline.
+            // A connection that died (or idled out) since it was handed out
+            // has not seen this request: dial again, within the same deadline.
             let Some(answer) = conn.calls.register(id) else {
                 continue;
             };
@@ -227,10 +198,14 @@ impl<B: BulkTransport> RpcClient<B> {
         let peers: Vec<Arc<Peer>> = lock(&self.inner.peers).values().cloned().collect();
         for peer in peers {
             peer.in_flight.close();
-            if let Some(conn) = lock(&peer.conn).take() {
-                conn.close();
-            }
+            peer.close();
         }
+    }
+
+    /// Destinations currently admitted (each with at most one connection).
+    #[must_use]
+    pub fn peers(&self) -> usize {
+        lock(&self.inner.peers).len()
     }
 }
 
@@ -239,17 +214,33 @@ impl<B: BulkTransport> Inner<B> {
         self.shut.load(Ordering::SeqCst)
     }
 
-    fn peer(&self, to: &NodeId) -> Arc<Peer> {
-        lock(&self.peers)
-            .entry(to.clone())
-            .or_insert_with(|| {
-                Arc::new(Peer {
-                    in_flight: Arc::new(Semaphore::new(self.config.max_in_flight_per_peer)),
-                    dialing: tokio::sync::Mutex::new(()),
-                    conn: Mutex::new(None),
-                })
-            })
-            .clone()
+    /// The destination's slot, admitting it under the global `max_peers`
+    /// bound. At the bound, one destination no call is using is evicted —
+    /// preferably one without a live connection, else the one idle longest.
+    fn peer(&self, to: &NodeId) -> Result<Arc<Peer>, RpcError> {
+        let mut peers = lock(&self.peers);
+        if let Some(peer) = peers.get(to) {
+            return Ok(peer.clone());
+        }
+        if peers.len() >= self.config.max_peers.get() {
+            let victim = peers
+                .iter()
+                // Only this map holds an unused peer: no call can reach it.
+                .filter(|(_, peer)| Arc::strong_count(peer) == 1)
+                .min_by_key(|(_, peer)| peer.idle_since())
+                .map(|(id, _)| id.clone())
+                .ok_or(RpcError::Saturated)?;
+            if let Some(evicted) = peers.remove(&victim) {
+                evicted.close();
+            }
+        }
+        let peer = Arc::new(Peer {
+            in_flight: Arc::new(Semaphore::new(self.config.max_in_flight_per_peer.get())),
+            dialing: tokio::sync::Mutex::new(()),
+            conn: Mutex::new(None),
+        });
+        peers.insert(to.clone(), peer.clone());
+        Ok(peer)
     }
 
     /// The peer's live connection, dialing one if there is none.
@@ -271,6 +262,7 @@ impl<B: BulkTransport> Inner<B> {
         if self.is_shut() {
             return Err(RpcError::Shutdown);
         }
+        // Validated at construction to lie within `MAX_TIMEOUT`.
         let connect_by = Instant::now() + self.config.connect_timeout;
         let stream = match timeout_at(connect_by.min(deadline), self.plane.connect(to)).await {
             Ok(Ok(stream)) => stream,
@@ -305,6 +297,18 @@ impl Peer {
             None => None,
         }
     }
+
+    /// Eviction order: `None` (no live connection) first, then oldest idle.
+    fn idle_since(&self) -> Option<Instant> {
+        self.live().map(|conn| conn.calls.idle_since())
+    }
+
+    /// Closes the peer's connection, if any.
+    fn close(&self) {
+        if let Some(conn) = lock(&self.conn).take() {
+            conn.close();
+        }
+    }
 }
 
 impl Conn {
@@ -312,10 +316,16 @@ impl Conn {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let (frames, queue) = mpsc::channel(config.max_in_flight_per_peer);
-        let calls = Arc::new(Calls::default());
-        let task = tokio::spawn(drive(stream, queue, calls.clone(), config.max_frame_bytes))
-            .abort_handle();
+        let (frames, queue) = mpsc::channel(config.max_in_flight_per_peer.get());
+        let calls = Arc::new(Calls::new());
+        let task = tokio::spawn(drive(
+            stream,
+            queue,
+            calls.clone(),
+            config.max_frame_bytes,
+            config.idle_timeout,
+        ))
+        .abort_handle();
         Self {
             frames,
             calls,
@@ -337,6 +347,16 @@ impl Drop for Conn {
 }
 
 impl Calls {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CallsState {
+                closed: false,
+                waiting: HashMap::new(),
+                idle_since: Instant::now(),
+            }),
+        }
+    }
+
     /// Registers call `id`, unless the connection is already gone.
     fn register(&self, id: u64) -> Option<oneshot::Receiver<Result<Bytes, RpcStatus>>> {
         let mut state = lock(&self.state);
@@ -350,18 +370,39 @@ impl Calls {
 
     /// Hands call `id` its answer; an answer nobody waits for is discarded.
     fn answer(&self, id: u64, answer: Result<Bytes, RpcStatus>) {
-        let waiter = lock(&self.state).waiting.remove(&id);
+        let waiter = lock(&self.state).remove(id);
         if let Some(waiter) = waiter {
             let _ = waiter.send(answer);
         }
     }
 
     fn forget(&self, id: u64) {
-        lock(&self.state).waiting.remove(&id);
+        lock(&self.state).remove(id);
     }
 
     fn is_closed(&self) -> bool {
         lock(&self.state).closed
+    }
+
+    fn idle_since(&self) -> Instant {
+        lock(&self.state).idle_since
+    }
+
+    /// Closes the table once no call has waited on it for `idle`; otherwise
+    /// returns when to check again. Closing under the lock means no call can
+    /// register on a connection that is about to end.
+    fn close_if_idle(&self, idle: Duration) -> Option<Instant> {
+        let mut state = lock(&self.state);
+        let now = Instant::now();
+        if !state.waiting.is_empty() {
+            return Some(now + idle);
+        }
+        let due = state.idle_since + idle;
+        if now < due {
+            return Some(due);
+        }
+        state.closed = true;
+        None
     }
 
     /// Marks the connection gone and drops every waiter, which wakes each
@@ -373,6 +414,17 @@ impl Calls {
             std::mem::take(&mut state.waiting)
         };
         drop(waiting);
+    }
+}
+
+impl CallsState {
+    /// Removes a waiter, starting the idle clock when it was the last one.
+    fn remove(&mut self, id: u64) -> Option<oneshot::Sender<Result<Bytes, RpcStatus>>> {
+        let waiter = self.waiting.remove(&id);
+        if waiter.is_some() && self.waiting.is_empty() {
+            self.idle_since = Instant::now();
+        }
+        waiter
     }
 }
 
@@ -398,13 +450,28 @@ impl Drop for CloseOnExit {
     }
 }
 
+/// Resolves once the connection has had no call waiting for `idle`, having
+/// closed its call table.
+async fn idle_out(calls: &Calls, idle: Duration) {
+    let mut check = calls.idle_since() + idle;
+    loop {
+        sleep_until(check).await;
+        match calls.close_if_idle(idle) {
+            Some(next) => check = next,
+            None => return,
+        }
+    }
+}
+
 /// Drives one client connection: the writer drains the request queue while
-/// the reader routes answers to their calls. Either side failing ends both.
+/// the reader routes answers to their calls. Either side failing, or the
+/// connection idling out, ends both.
 async fn drive<S>(
     stream: DataStream<S>,
-    queue: mpsc::Receiver<crate::codec::Encoded>,
+    mut queue: mpsc::Receiver<Encoded>,
     calls: Arc<Calls>,
-    max_frame_bytes: usize,
+    max_frame_bytes: FrameLimit,
+    idle: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -415,7 +482,7 @@ async fn drive<S>(
     let read = async {
         // A clean end, a read error, a malformed frame or a request from
         // the server all end the connection.
-        while let Ok(Some(bytes)) = reader.recv_bounded(max_frame_bytes).await {
+        while let Ok(Some(bytes)) = reader.recv_bounded(max_frame_bytes.get()).await {
             match Frame::decode(&bytes) {
                 Ok(Frame::Response { id, payload }) => calls.answer(id, Ok(payload)),
                 Ok(Frame::Error { id, status }) => calls.answer(id, Err(status)),
@@ -425,6 +492,7 @@ async fn drive<S>(
     };
     tokio::select! {
         () = read => {}
-        () = write_frames(&mut writer, queue, max_frame_bytes) => {}
+        () = write_frames(&mut writer, &mut queue, max_frame_bytes) => {}
+        () = idle_out(&calls, idle) => {}
     }
 }

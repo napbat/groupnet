@@ -2,7 +2,6 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
@@ -12,10 +11,6 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use super::{IpcAddress, Session, State, frame, platform};
-
-const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub(super) struct Dial {
@@ -101,7 +96,7 @@ async fn dial(state: Arc<State>, command: Dial) {
     let stream = tokio::select! {
         biased;
         () = state.cancel.cancelled() => None,
-        result = timeout(SETUP_TIMEOUT, operation) => result.ok().and_then(Result::ok),
+        result = timeout(state.config.setup_timeout, operation) => result.ok().and_then(Result::ok),
     };
     if let Some(stream) = stream {
         session(&state, stream, node.clone(), frames).await;
@@ -114,12 +109,15 @@ async fn accept(state: Arc<State>, mut stream: platform::Stream, slot: OwnedSema
     let remote = tokio::select! {
         biased;
         () = state.cancel.cancelled() => None,
-        result = timeout(SETUP_TIMEOUT, frame::introduce(&mut stream, &state.local)) => {
+        result = timeout(
+            state.config.setup_timeout,
+            frame::introduce(&mut stream, &state.local),
+        ) => {
             result.ok().and_then(Result::ok)
         }
     };
     if let Some(remote) = remote.filter(|node| *node != state.local) {
-        let (sender, frames) = mpsc::channel(state.config.session_queue);
+        let (sender, frames) = mpsc::channel(state.config.session_queue.get());
         let generation = {
             let Ok(mut book) = state.book.lock() else {
                 return;
@@ -162,7 +160,7 @@ async fn session(
     let read = read_messages(state, &mut reader, remote);
     let write = async {
         while let Some(msg) = frames.recv().await {
-            timeout(WRITE_TIMEOUT, frame::write(&mut writer, &msg))
+            timeout(state.config.write_timeout, frame::write(&mut writer, &msg))
                 .await
                 .map_err(io::Error::other)??;
         }
@@ -182,7 +180,7 @@ async fn read_messages<R: tokio::io::AsyncRead + Unpin>(
     remote: NodeId,
 ) -> io::Result<()> {
     loop {
-        let msg = timeout(READ_TIMEOUT, frame::read(reader))
+        let msg = timeout(state.config.read_timeout, frame::read(reader))
             .await
             .map_err(io::Error::other)??;
         state

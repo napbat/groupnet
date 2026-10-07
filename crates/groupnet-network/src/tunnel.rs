@@ -2,9 +2,12 @@
 //!
 //! Each stream has a configured bounded ciphertext sliding window, cumulative
 //! acknowledgements, deduplication, reordering, receive credit and retransmission
-//! with congestion backoff. Routing changes may retransmit the same ciphertext
-//! through another adapter without changing the TLS identity. Node-wide
-//! [`TunnelLimits`](crate::tunnel::TunnelLimits) bound admission, setup, sessions, queues and idle expiry.
+//! with slow-start congestion control. Routing changes may retransmit the same
+//! ciphertext through another adapter without changing the TLS identity. Node-wide
+//! [`TunnelLimits`](crate::tunnel::TunnelLimits) bound admission, setup, sessions,
+//! queues and idle expiry. Each endpoint chooses its own send segment and window;
+//! every endpoint accepts segments up to the protocol-wide
+//! [`SegmentSize::MAX`](crate::tunnel::SegmentSize::MAX).
 //! Revocation invalidates active and queued streams. Re-admission creates a new
 //! admission generation and cannot restore an old stream's credentials.
 //!
@@ -19,7 +22,7 @@ mod stream;
 mod tls;
 mod wire;
 
-pub use config::TunnelLimits;
+pub use config::{RetransmitTimeouts, SegmentSize, TunnelLimits};
 
 #[cfg(test)]
 mod tests;
@@ -128,13 +131,13 @@ impl TunnelTransport {
         limits.validate()?;
         tokio::runtime::Handle::try_current()
             .map_err(|_| error(io::ErrorKind::NotConnected, "Tokio executor required"))?;
-        if peers.len() > limits.max_peers {
+        if peers.len() > limits.max_peers.get() {
             return Err(error(io::ErrorKind::InvalidInput, "too many TLS peers"));
         }
         let cancel = router.cancellation();
         let mut state = State::default();
         for peer in peers {
-            router.validate_tunnel_payload(&peer.node, limits.payload + wire::HEADER)?;
+            router.validate_tunnel_payload(&peer.node, limits.payload.get() + wire::HEADER)?;
             let node = peer.node.clone();
             if state
                 .peers
@@ -151,8 +154,8 @@ impl TunnelTransport {
             }
         }
         router.claim_tunnels()?;
-        let (incoming, accepts) = mpsc::channel(limits.accept_queue);
-        let (control_incoming, control_accepts) = mpsc::channel(limits.accept_queue);
+        let (incoming, accepts) = mpsc::channel(limits.accept_queue.get());
+        let (control_incoming, control_accepts) = mpsc::channel(limits.accept_queue.get());
         let inner = Arc::new(Inner {
             router: router.clone(),
             identity,
@@ -179,7 +182,7 @@ impl TunnelTransport {
     pub fn admit_peer(&self, peer: PeerIdentity) -> io::Result<()> {
         self.inner
             .router
-            .validate_tunnel_payload(&peer.node, self.inner.limits.payload + wire::HEADER)?;
+            .validate_tunnel_payload(&peer.node, self.inner.limits.payload.get() + wire::HEADER)?;
         let mut state = self.inner.state.lock().map_err(|_| poisoned())?;
         if self.inner.cancel.is_cancelled() {
             return Err(closed());
@@ -188,7 +191,7 @@ impl TunnelTransport {
             if old.identity.pin == peer.pin {
                 return Ok(());
             }
-        } else if state.peers.len() >= self.inner.limits.max_peers {
+        } else if state.peers.len() >= self.inner.limits.max_peers.get() {
             return Err(error(io::ErrorKind::WouldBlock, "TLS admission full"));
         }
         let node = peer.node.clone();
@@ -410,13 +413,13 @@ fn start_session(
     {
         return Err(closed());
     }
-    if state.sessions.len() >= inner.limits.max_sessions
+    if state.sessions.len() >= inner.limits.max_sessions.get()
         || state
             .sessions
             .keys()
             .filter(|(node, _)| node == &peer)
             .count()
-            >= inner.limits.sessions_per_peer
+            >= inner.limits.sessions_per_peer.get()
         || state.sessions.contains_key(&(peer.clone(), id))
     {
         return Err(error(
@@ -424,10 +427,10 @@ fn start_session(
             "TLS session capacity exceeded",
         ));
     }
-    let (packets, receiver) = mpsc::channel(inner.limits.packet_queue);
+    let (packets, receiver) = mpsc::channel(inner.limits.packet_queue().get());
     let cancel = admission.cancel.child_token();
     let sent = CancellationToken::new();
-    let (stream, raw) = tokio::io::duplex(inner.limits.stream_buffer);
+    let (stream, raw) = tokio::io::duplex(inner.limits.stream_buffer.get());
     state
         .sessions
         .insert((peer.clone(), id), Session { packets });
@@ -469,7 +472,7 @@ async fn dispatch(weak: Weak<Inner>, router: Router, cancel: CancellationToken) 
         let Some(inner) = weak.upgrade() else {
             break;
         };
-        let Some(packet) = Packet::decode(inbound.msg, &inner.limits) else {
+        let Some(packet) = Packet::decode(inbound.msg) else {
             continue;
         };
         let (existing, admission) = {

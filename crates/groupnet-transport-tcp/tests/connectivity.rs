@@ -1,5 +1,7 @@
-#![cfg(feature = "connectivity")]
 //! Real TCP-only traversal, relay, admission, and generation regressions.
+
+#![cfg(feature = "connectivity")]
+
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::{

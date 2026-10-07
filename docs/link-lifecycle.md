@@ -45,6 +45,13 @@ incoming frames at their producing session, and implement `send_admitted` to
 preserve the router-selected generation through queued physical writes.
 The default static send drops tagged traffic rather than silently retargeting it.
 
+`SessionRegistry` lifecycle is observable: `subscribe()` publishes neighbor
+snapshots, and `is_closed()` / the owned, sticky `closed()` future distinguish a
+closed registry from an open one with no peers. `close()` marks the registry
+closed before publishing its final empty snapshot, so a subscriber woken by that
+snapshot already observes the closed state. Every adapter bounds admitted
+identities by the shared `groupnet_transport::MAX_NODE_ID_BYTES` (255).
+
 ## 1. Successful managed-node startup
 
 `Node::builder(id).link(provider)` and `.links(providers)` populate one
@@ -156,6 +163,16 @@ Wire representability, authentication, replay protection, and memory admission
 remain enforced. Relay data traffic must not share an arbitrary fixed
 packets-per-second throttle with control traffic; data admission uses configurable
 bounded capacity and, when selected, byte-based pacing.
+
+Every bounded queue, channel, or semaphore capacity in a networking config is a
+`groupnet_transport::QueueCapacity`, valid by construction (`1..=` Tokio's
+`Semaphore::MAX_PERMITS`), so configs never re-validate it. Length-prefixed
+stream protocols share `groupnet_transport::framing` (feature `framing`): the
+256 MiB `MAX_FRAME_BYTES` ceiling that no per-protocol limit may exceed, the
+big-endian zerocopy `LengthHeader` checked against the receiver's limit before
+payload allocation, and `write_vectored`, which writes header and payload parts
+without joining them and resumes partial writes at the exact byte. Protocol
+headers, validation, and authentication stay in each protocol.
 
 
 ## 3. Startup failures and cancellation

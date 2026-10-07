@@ -328,7 +328,7 @@ fn typed_envelope_preserves_gnp4_bytes_and_decodes_unaligned_storage() {
     let length = encode_mode(packet(Body::Hello { nonce: [3; 16] }), None, &mut buffer).unwrap();
     let mut expected = Vec::from(&b"GNP4\x01\x05alpha"[..]);
     expected.extend_from_slice(&[2; 16]);
-    expected.extend_from_slice(&7_u64.to_be_bytes());
+    expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 7]);
     expected.extend_from_slice(&[3; 16]);
     assert_eq!(&buffer[..length], expected);
     storage[1..=length].copy_from_slice(&buffer[..length]);
@@ -345,4 +345,42 @@ fn typed_envelope_preserves_gnp4_bytes_and_decodes_unaligned_storage() {
     };
     let length = encode_mode(shorter, None, &mut buffer).unwrap();
     assert_eq!(decode_mode(&buffer[..length], None).unwrap().sender, "x");
+}
+
+#[test]
+fn typed_integer_fields_keep_big_endian_wire_bytes() {
+    let header_length = b"GNP4\x03\x05alpha".len() + std::mem::size_of::<SessionHeader>();
+    let mut buffer = [0; MAX_PACKET];
+    let register = Body::Register {
+        nonce: [3; 16],
+        cookie: [4; 16],
+        relay_only: false,
+        credential: b"ab",
+    };
+    let length = encode_mode(packet(register), None, &mut buffer).unwrap();
+    let mut expected = vec![3; 16];
+    expected.extend_from_slice(&[4; 16]);
+    expected.extend_from_slice(&[0, 0, 2, b'a', b'b']);
+    assert_eq!(&buffer[header_length..length], expected);
+    assert!(matches!(
+        decode_mode(&buffer[..length], None).unwrap().body,
+        Body::Register {
+            credential: b"ab",
+            relay_only: false,
+            ..
+        }
+    ));
+    let address = SocketAddr::from(([203, 0, 113, 7], 0x1234));
+    let observed = Body::Observed {
+        proof: [9; 16],
+        address,
+    };
+    let length = encode_mode(packet(observed), None, &mut buffer).unwrap();
+    let mut expected = vec![9; 16];
+    expected.extend_from_slice(&[1, 4, 203, 0, 113, 7, 0x12, 0x34]);
+    assert_eq!(&buffer[header_length..length], expected);
+    assert!(matches!(
+        decode_mode(&buffer[..length], None).unwrap().body,
+        Body::Observed { address: got, .. } if got == address
+    ));
 }

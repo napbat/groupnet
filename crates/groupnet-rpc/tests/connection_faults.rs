@@ -58,7 +58,10 @@ fn counting_client(net: &MemBulkNet, id: &str) -> (RpcClient<Counting>, Arc<Atom
         inner: net.endpoint(NodeId::new(id)),
         connects: connects.clone(),
     });
-    (RpcClient::new(plane, RpcConfig::default()), connects)
+    (
+        RpcClient::new(plane, RpcConfig::default()).expect("default limits are valid"),
+        connects,
+    )
 }
 
 /// A server on `net` as `id` (re-registering `id` evicts any earlier one):

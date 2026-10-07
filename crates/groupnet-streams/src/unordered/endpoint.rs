@@ -135,8 +135,8 @@ pub(super) fn new(
 ) -> UnorderedProtocol {
     let cancel = io.cancellation();
     // Global session admission bounds the combined queues, not each separately.
-    let (reliable_incoming, reliable_accepts) = mpsc::channel(config.max_sessions);
-    let (unreliable_incoming, unreliable_accepts) = mpsc::channel(config.max_sessions);
+    let (reliable_incoming, reliable_accepts) = mpsc::channel(config.max_sessions.get());
+    let (unreliable_incoming, unreliable_accepts) = mpsc::channel(config.max_sessions.get());
     let inner = Arc::new(Inner {
         io: io.clone(),
         tunnels: tunnels.clone(),
@@ -168,14 +168,14 @@ fn reserve(inner: &Arc<Inner>, peer: NodeId, id: Option<SessionId>) -> io::Resul
         return Err(invalid("duplicate unordered session id"));
     }
     if registry.sessions.len() + registry.setups.values().sum::<usize>()
-        >= inner.config.max_sessions
+        >= inner.config.max_sessions.get()
         || registry
             .sessions
             .keys()
             .filter(|(node, _)| node == &peer)
             .count()
             + registry.setups.get(&peer).copied().unwrap_or(0)
-            >= inner.config.sessions_per_peer
+            >= inner.config.sessions_per_peer.get()
     {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,

@@ -5,6 +5,7 @@ pub(super) use candidates::CandidateList;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use ring::hmac;
+use zerocopy::byteorder::big_endian::{U16, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::NetworkKey;
@@ -24,12 +25,12 @@ struct EnvelopeHeader {
     sender_len: u8,
 }
 
-/// The fixed session suffix after the sender; byte arrays preserve network order.
+/// The fixed session suffix after the sender, with a big-endian sequence.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct SessionHeader {
     session: Session,
-    sequence: [u8; 8],
+    sequence: U64,
 }
 
 #[derive(Clone, Copy)]
@@ -206,7 +207,7 @@ impl Writer<'_> {
                     self.put(&ip.octets())?;
                 }
             }
-            self.put(&address.port().to_be_bytes())?;
+            self.put(U16::new(address.port()).as_bytes())?;
         }
         Some(())
     }
@@ -217,6 +218,10 @@ impl Writer<'_> {
             self.address(Some(address))?;
         }
         Some(())
+    }
+
+    fn length(&mut self, length: usize) -> Option<()> {
+        self.put(U16::new(u16::try_from(length).ok()?).as_bytes())
     }
 
     fn message(&mut self, message: &[u8]) -> Option<()> {
@@ -248,6 +253,14 @@ impl<'a> Reader<'a> {
         self.take(16)?.try_into().ok()
     }
 
+    fn u16(&mut self) -> Option<u16> {
+        Some(
+            U16::read_from_bytes(self.take(size_of::<U16>())?)
+                .ok()?
+                .get(),
+        )
+    }
+
     fn name(&mut self) -> Option<&'a str> {
         let length = usize::from(self.byte()?);
         if length == 0 || length > 64 {
@@ -270,7 +283,7 @@ impl<'a> Reader<'a> {
             6 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(self.take(16)?).ok()?)),
             _ => return None,
         };
-        let port = u16::from_be_bytes(self.take(2)?.try_into().ok()?);
+        let port = self.u16()?;
         if !valid(SocketAddr::new(ip, port)) {
             return None;
         }
@@ -357,7 +370,7 @@ pub(super) fn encode_mode(
     writer.put(
         SessionHeader {
             session: packet.session,
-            sequence: packet.sequence.to_be_bytes(),
+            sequence: U64::new(packet.sequence),
         }
         .as_bytes(),
     )?;
@@ -391,7 +404,7 @@ fn encode_body(body: Body<'_>, writer: &mut Writer<'_>) -> Option<()> {
             if credential.len() > groupnet_transport::admission::MAX_CREDENTIAL_BYTES {
                 return None;
             }
-            writer.put(&u16::try_from(credential.len()).ok()?.to_be_bytes())?;
+            writer.length(credential.len())?;
             writer.put(credential)?;
         }
         Body::Registered { proof }
@@ -535,7 +548,7 @@ pub(super) fn decode_mode<'a>(bytes: &'a [u8], key: Option<&NetworkKey>) -> Opti
     let (session_header, body_bytes) =
         SessionHeader::ref_from_prefix(remaining.get(sender_len..)?).ok()?;
     let session = session_header.session;
-    let sequence = u64::from_be_bytes(session_header.sequence);
+    let sequence = session_header.sequence.get();
     let mut reader = Reader {
         bytes: body_bytes,
         position: 0,
@@ -568,7 +581,7 @@ fn decode_body<'a>(kind: u8, reader: &mut Reader<'a>) -> Option<Body<'a>> {
             let nonce = reader.token()?;
             let cookie = reader.token()?;
             let relay_only = reader.flag()?;
-            let length = usize::from(u16::from_be_bytes(reader.take(2)?.try_into().ok()?));
+            let length = usize::from(reader.u16()?);
             if length > groupnet_transport::admission::MAX_CREDENTIAL_BYTES {
                 return None;
             }
@@ -694,7 +707,7 @@ pub(super) fn check_proof(secret: Session, packet: Packet<'_>) -> Session {
     context.update(&[u8::try_from(packet.sender.len()).unwrap_or(0)]);
     context.update(packet.sender.as_bytes());
     context.update(&packet.session);
-    context.update(&packet.sequence.to_be_bytes());
+    context.update(U64::new(packet.sequence).as_bytes());
     match packet.body {
         Body::Probe { target, nonce, .. } => {
             context.update(&[1]);

@@ -149,17 +149,14 @@ async fn owned_admitted_send_drops_replaced_generation() {
 #[tokio::test]
 async fn operational_limits_are_validated_before_socket_binding() {
     let address = SocketAddr::from(([127, 0, 0, 1], 1234));
-    for (max_peers, queue_capacity) in
-        [(0, 1), (1, 0), (1, tokio::sync::Semaphore::MAX_PERMITS + 1)]
-    {
-        let mut config = PunchConfig::open("local".into(), address);
-        config.max_peers = max_peers;
-        config.queue_capacity = queue_capacity;
-        assert_eq!(
-            UdpConnection::bind(config).await.unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
+    // Queue capacities are valid by construction (`QueueCapacity`); the peer
+    // limit is still checked before any socket is bound.
+    let mut config = PunchConfig::open("local".into(), address);
+    config.max_peers = 0;
+    assert_eq!(
+        UdpConnection::bind(config).await.unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
     let mut config = PunchConfig::new(
         "local".into(),
         address,
@@ -188,7 +185,7 @@ async fn configured_capacities_apply_to_both_queues_and_admission_registry() {
     config.bind = SocketAddr::from(([127, 0, 0, 1], 0));
     config.gather_interfaces = false;
     config.max_peers = 2;
-    config.queue_capacity = 1;
+    config.queue_capacity = QueueCapacity::of(1);
     let connection = UdpConnection::bind(config).await.unwrap();
     assert_eq!(connection.inner.outbound.max_capacity(), 1);
     assert_eq!(connection.inner.inbound.lock().await.max_capacity(), 1);

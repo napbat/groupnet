@@ -60,12 +60,16 @@ pub use groupnet_core as core;
 /// the opt-in data-plane [`bulk`](transport::bulk) streams, and the concrete
 /// socket / in-memory bindings.
 pub mod transport {
-    pub use groupnet_transport::{Inbound, Transport};
+    pub use groupnet_transport::{Inbound, MAX_NODE_ID_BYTES, QueueCapacity, Transport};
 
     /// Data-plane stream transport: `BulkTransport`, `DataStream`, `DataPlane`
     /// *(feature `bulk`)*.
     #[cfg(feature = "bulk")]
     pub use groupnet_transport::bulk;
+
+    /// Shared length-prefixed framing limits and primitives *(feature `bulk`)*.
+    #[cfg(feature = "bulk")]
+    pub use groupnet_transport::framing;
 
     /// In-memory control-plane binding, for tests and single-process clusters
     /// *(feature `mem`)*.

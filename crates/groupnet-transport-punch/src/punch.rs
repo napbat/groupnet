@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
-use groupnet_transport::Inbound;
 use groupnet_transport::admission::{SessionLease, SessionRegistry};
 use groupnet_transport::link::AdmittedInbound;
+use groupnet_transport::{Inbound, QueueCapacity};
 use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
@@ -39,7 +39,7 @@ pub use server::{Rendezvous, RendezvousConfig, RendezvousLimits};
 /// Largest application message carried by one session-bound UDP datagram.
 pub const MAX_MESSAGE: usize = 960;
 const DEFAULT_MAX_PEERS: usize = 128;
-const DEFAULT_QUEUE_CAPACITY: usize = 128;
+const DEFAULT_QUEUE_CAPACITY: QueueCapacity = QueueCapacity::of(128);
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const LEASE: Duration = Duration::from_secs(6);
 const DIRECT_LEASE: Duration = Duration::from_secs(3);
@@ -137,9 +137,9 @@ pub struct PunchConfig {
     /// Maximum live admitted peers retained by this endpoint (must be nonzero).
     /// This operational limit does not change candidate or wire-format bounds.
     pub max_peers: usize,
-    /// Packet capacity of each incoming and outgoing queue (must be nonzero).
+    /// Packet capacity of each incoming and outgoing queue.
     /// Full queues drop best-effort packets without blocking.
-    pub queue_capacity: usize,
+    pub queue_capacity: QueueCapacity,
 }
 
 impl PunchConfig {
@@ -415,10 +415,6 @@ impl UdpConnection {
     /// timeout, and socket/random-source failures.
     pub async fn bind(config: PunchConfig) -> io::Result<Self> {
         validate_names_with_limit(&config.peers, config.max_peers)?;
-        if config.queue_capacity == 0 || config.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
-        {
-            return Err(invalid("invalid UDP queue capacity"));
-        }
         let sessions = SessionRegistry::new(config.max_peers)?;
         validate_name(&config.local)?;
         if config.credential.len() > groupnet_transport::admission::MAX_CREDENTIAL_BYTES {
@@ -445,8 +441,8 @@ impl UdpConnection {
         let nonce = random()?;
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let cancel = CancellationToken::new();
-        let (outbound, outgoing) = mpsc::channel(config.queue_capacity);
-        let (incoming, inbound) = mpsc::channel(config.queue_capacity);
+        let (outbound, outgoing) = mpsc::channel(config.queue_capacity.get());
+        let (incoming, inbound) = mpsc::channel(config.queue_capacity.get());
         let configured = config.peers.clone();
         let dynamic = config.dynamic;
         let local = config.local.clone();

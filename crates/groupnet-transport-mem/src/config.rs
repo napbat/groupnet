@@ -1,40 +1,22 @@
 //! Finite queue budgets for the in-process fabrics.
 
-use std::io;
+use groupnet_transport::QueueCapacity;
+#[cfg(feature = "bulk")]
+use std::{io, num::NonZeroUsize};
 
 /// Operational limits for the in-process message network.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetworkConfig {
     /// Messages buffered per endpoint before senders wait for receive capacity.
-    pub inbound_queue: usize,
+    pub inbound_queue: QueueCapacity,
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            inbound_queue: 1024,
+            inbound_queue: QueueCapacity::of(1024),
         }
     }
-}
-
-impl NetworkConfig {
-    /// Checks that the queue capacity is nonzero and supported by Tokio.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` for zero or unsupported capacities.
-    pub fn validate(&self) -> io::Result<()> {
-        validate_queue(self.inbound_queue)
-    }
-}
-
-pub(crate) fn validate_queue(capacity: usize) -> io::Result<()> {
-    if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "queue capacity must be nonzero and fit Tokio's semaphore limit",
-        ));
-    }
-    Ok(())
 }
 
 /// Operational limits for the in-process bulk network.
@@ -42,33 +24,34 @@ pub(crate) fn validate_queue(capacity: usize) -> io::Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemBulkConfig {
     /// Connections buffered per endpoint before connectors wait for acceptance.
-    pub accept_queue: usize,
-    /// Bytes buffered per direction of each pipe before writers wait for readers.
-    pub pipe_buffer: usize,
+    pub accept_queue: QueueCapacity,
+    /// Bytes buffered per direction of each pipe before writers wait for
+    /// readers; at most `isize::MAX` (addressable storage).
+    pub pipe_buffer: NonZeroUsize,
 }
 
 #[cfg(feature = "bulk")]
 impl Default for MemBulkConfig {
     fn default() -> Self {
         Self {
-            accept_queue: 64,
-            pipe_buffer: 64 * 1024,
+            accept_queue: QueueCapacity::of(64),
+            pipe_buffer: NonZeroUsize::new(64 * 1024).expect("nonzero default"),
         }
     }
 }
 
 #[cfg(feature = "bulk")]
 impl MemBulkConfig {
-    /// Checks the accept queue and finite, addressable pipe capacity.
+    /// Checks that the pipe capacity fits addressable storage; the accept
+    /// queue is valid by construction.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for zero or unsupported capacities.
+    /// Returns `InvalidInput` for a pipe buffer above `isize::MAX`.
     pub fn validate(&self) -> io::Result<()> {
-        validate_queue(self.accept_queue)?;
-        if self.pipe_buffer == 0 || self.pipe_buffer > isize::MAX.unsigned_abs() {
+        if self.pipe_buffer.get() > isize::MAX.unsigned_abs() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "pipe buffer must be nonzero and fit addressable storage",
+                "pipe buffer must fit addressable storage",
             ));
         }
         Ok(())

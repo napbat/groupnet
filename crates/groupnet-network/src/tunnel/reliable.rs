@@ -1,7 +1,9 @@
-//! Sliding-window reliability with bounded receive credit and additive-increase /
-//! multiplicative-decrease congestion control. Idle authenticated streams remain
-//! alive through bounded outer heartbeats; a blackholed peer expires independently
-//! of application activity. No plaintext is visible to this layer.
+//! Sliding-window reliability with bounded receive credit and slow-start /
+//! congestion-avoidance control: the congestion window doubles per round trip
+//! until loss sets a threshold at half the window, then grows additively.
+//! Idle authenticated streams remain alive through bounded outer heartbeats; a
+//! blackholed peer expires independently of application activity. No plaintext
+//! is visible to this layer.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -22,6 +24,9 @@ use super::{
 };
 use crate::{PacketBuffer, Router};
 use bytes::Bytes;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Role {
@@ -51,6 +56,38 @@ struct Segment {
     sampled_at: Option<Instant>,
 }
 
+/// RFC 6298 round-trip estimate, initialized by the first unambiguous sample.
+#[derive(Clone, Copy, Debug)]
+struct RoundTrip {
+    smoothed: Duration,
+    variation: Duration,
+}
+
+impl RoundTrip {
+    fn first(sample: Duration) -> Self {
+        Self {
+            smoothed: sample,
+            variation: sample / 2,
+        }
+    }
+
+    fn update(self, sample: Duration) -> Self {
+        Self {
+            smoothed: (self.smoothed.saturating_mul(7).saturating_add(sample)) / 8,
+            variation: (self
+                .variation
+                .saturating_mul(3)
+                .saturating_add(self.smoothed.abs_diff(sample)))
+                / 4,
+        }
+    }
+
+    fn timeout(self) -> Duration {
+        self.smoothed
+            .saturating_add(self.variation.saturating_mul(4))
+    }
+}
+
 #[derive(Debug)]
 struct Reliability {
     id: SessionId,
@@ -63,6 +100,7 @@ struct Reliability {
     offset: usize,
     credit: usize,
     congestion: usize,
+    threshold: usize,
     increase: usize,
     duplicate_acks: u8,
     local_fin: bool,
@@ -71,8 +109,7 @@ struct Reliability {
     last_send: Instant,
     retransmit_at: Instant,
     rto: Duration,
-    smoothed_rtt: Duration,
-    rtt_variation: Duration,
+    round_trip: Option<RoundTrip>,
     limits: TunnelLimits,
 }
 
@@ -92,25 +129,48 @@ impl Reliability {
             reordered: BTreeMap::new(),
             delivery: VecDeque::new(),
             offset: 0,
-            credit: limits.window,
-            congestion: limits.initial_congestion,
+            credit: usize::from(limits.window.get()),
+            congestion: usize::from(limits.initial_congestion.get()),
+            threshold: usize::from(limits.window.get()),
             increase: 0,
             duplicate_acks: 0,
             local_fin: false,
             remote_fin: false,
             last_peer: now,
             last_send: now,
-            retransmit_at: now + limits.initial_rto,
-            rto: limits.initial_rto,
-            smoothed_rtt: Duration::from_millis(50),
-            rtt_variation: Duration::from_millis(25),
+            retransmit_at: now + limits.retransmit.initial(),
+            rto: limits.retransmit.initial(),
+            round_trip: None,
             limits,
         }
     }
 
     fn window(&self) -> u16 {
-        u16::try_from(self.limits.window - self.reordered.len() - self.delivery.len())
-            .expect("validated receive window")
+        let retained = u16::try_from(self.reordered.len() + self.delivery.len())
+            .expect("receive retention bounded by the window");
+        self.limits.window.get() - retained
+    }
+
+    /// Slow start adds one segment per acknowledged segment below the
+    /// threshold; congestion avoidance adds one segment per window acknowledged.
+    fn grow(&mut self, acknowledged: usize) {
+        if self.congestion < self.threshold {
+            self.congestion = (self.congestion + acknowledged).min(self.threshold);
+        } else {
+            self.increase += acknowledged;
+            if self.increase >= self.congestion {
+                self.increase = 0;
+                self.congestion = (self.congestion + 1).min(usize::from(self.limits.window.get()));
+            }
+        }
+    }
+
+    /// Loss halves the window into the slow-start threshold; growth from there
+    /// is additive.
+    fn reduce(&mut self) {
+        self.threshold = (self.congestion / 2).max(1);
+        self.congestion = self.threshold;
+        self.increase = 0;
     }
 
     fn send(&mut self, router: &Router, peer: &NodeId, kind: Kind, sequence: u64, payload: &[u8]) {
@@ -170,6 +230,9 @@ impl Reliability {
         }
         self.last_peer = Instant::now();
         self.readiness = Readiness::Established;
+        // A larger window reopens credit after delivery; like TCP, such a
+        // window update is never evidence of a gap.
+        let window_update = usize::from(packet.window) > self.credit;
         self.credit = usize::from(packet.window);
         let before = self.outstanding.len();
         // Karn's rule: never sample retransmitted ciphertext, because the ACK
@@ -185,19 +248,18 @@ impl Reliability {
         if acknowledged != 0 {
             self.duplicate_acks = 0;
             if let Some(sample) = sample {
-                let deviation = self.smoothed_rtt.abs_diff(sample);
-                self.rtt_variation = (self.rtt_variation * 3 + deviation) / 4;
-                self.smoothed_rtt = (self.smoothed_rtt * 7 + sample) / 8;
+                self.round_trip = Some(
+                    self.round_trip
+                        .map_or_else(|| RoundTrip::first(sample), |rtt| rtt.update(sample)),
+                );
             }
-            self.rto = (self.smoothed_rtt + self.rtt_variation * 4)
-                .clamp(self.limits.min_rto, self.limits.max_rto);
+            if let Some(round_trip) = self.round_trip {
+                self.rto = self.limits.retransmit.clamp(round_trip.timeout());
+            }
             self.retransmit_at = Instant::now() + self.rto;
-            self.increase += acknowledged;
-            if self.increase >= self.congestion {
-                self.increase = 0;
-                self.congestion = (self.congestion + 1).min(self.limits.window);
-            }
+            self.grow(acknowledged);
         } else if packet.kind == Kind::Ack
+            && !window_update
             && self
                 .outstanding
                 .first_key_value()
@@ -207,8 +269,7 @@ impl Reliability {
             if self.duplicate_acks == 3 {
                 // Later packets arrived but the cumulative ACK still identifies
                 // a gap. Repair it once before falling back to the RTO.
-                self.congestion = (self.congestion / 2).max(1);
-                self.increase = 0;
+                self.reduce();
                 self.retransmit(router, peer, 1);
                 self.retransmit_at = Instant::now() + self.rto;
             }
@@ -220,9 +281,9 @@ impl Reliability {
             Kind::Data | Kind::Fin => {
                 if !self.remote_fin
                     && packet.sequence >= self.next_receive
-                    && packet.sequence - self.next_receive
-                        < u64::try_from(self.limits.window).expect("validated window")
-                    && self.reordered.len() + self.delivery.len() < self.limits.window
+                    && packet.sequence - self.next_receive < u64::from(self.limits.window.get())
+                    && self.reordered.len() + self.delivery.len()
+                        < usize::from(self.limits.window.get())
                 {
                     self.reordered.entry(packet.sequence).or_insert(Segment {
                         kind: packet.kind,
@@ -279,12 +340,11 @@ impl Reliability {
         if self.readiness == Readiness::Opening && now >= self.retransmit_at {
             self.control(router, peer, Kind::Open);
             self.retransmit_at = now + self.rto;
-            self.rto = (self.rto * 2).min(self.limits.max_rto);
+            self.rto = self.limits.retransmit.back_off(self.rto);
         } else if !self.outstanding.is_empty() && now >= self.retransmit_at {
-            self.congestion = (self.congestion / 2).max(1);
-            self.increase = 0;
+            self.reduce();
             self.retransmit(router, peer, self.congestion);
-            self.rto = (self.rto * 2).min(self.limits.max_rto);
+            self.rto = self.limits.retransmit.back_off(self.rto);
             self.retransmit_at = now + self.rto;
         }
         if now.duration_since(self.last_send) >= self.limits.heartbeat_interval
@@ -315,8 +375,8 @@ pub(super) async fn run(
         cancel,
         sent,
     } = io;
-    let mut timer = interval(limits.min_rto);
-    let payload_capacity = limits.payload;
+    let mut timer = interval(limits.retransmit.min());
+    let payload_capacity = limits.payload.get();
     let mut state = Reliability::new(id, role, limits);
     let (mut read, mut write) = tokio::io::split(raw);
     let Ok(mut buffer) = router.tunnel_packet_buffer(&peer, HEADER + payload_capacity) else {

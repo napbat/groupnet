@@ -31,15 +31,12 @@ impl Network {
     }
 
     /// Creates a network with bounded endpoint queues.
-    ///
-    /// # Errors
-    /// Rejects zero or unsupported queue capacities.
-    pub fn with_config(config: NetworkConfig) -> std::io::Result<Self> {
-        config.validate()?;
-        Ok(Self {
+    #[must_use]
+    pub fn with_config(config: NetworkConfig) -> Self {
+        Self {
             peers: Peers::default(),
             config,
-        })
+        }
     }
 
     /// Creates and registers a transport endpoint for `id`.
@@ -48,7 +45,7 @@ impl Network {
     /// If the fabric's routing table was poisoned by a panic in another thread.
     #[must_use]
     pub fn endpoint(&self, id: NodeId) -> MemTransport {
-        let (tx, rx) = mpsc::channel(self.config.inbound_queue);
+        let (tx, rx) = mpsc::channel(self.config.inbound_queue.get());
         let registration = tx.downgrade();
         self.peers
             .lock()

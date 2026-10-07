@@ -5,6 +5,7 @@ use std::{io, sync::atomic::Ordering, time::Duration};
 
 use bytes::Bytes;
 use groupnet_testkit::cluster::eventually;
+use groupnet_transport::QueueCapacity;
 use tokio::time::timeout;
 
 use super::{
@@ -101,18 +102,18 @@ fn size_failure_does_not_consume_nonce_and_retry_plaintext_stays_intact() {
 fn operational_capacities_do_not_override_the_security_horizon() {
     let mut bounds = config();
     bounds.max_payload = 96 * 1024;
-    bounds.inbox_capacity = 2048;
-    bounds.max_sessions = 2048;
-    bounds.sessions_per_peer = 1025;
+    bounds.inbox_capacity = QueueCapacity::of(2048);
+    bounds.max_sessions = QueueCapacity::of(2048);
+    bounds.sessions_per_peer = QueueCapacity::of(1025);
     bounds.max_attempts = 2000;
     bounds.setup_timeout = Duration::from_secs(7200);
     bounds.validate().unwrap();
-    bounds.pending_sends = wire::WINDOW;
+    bounds.pending_sends = QueueCapacity::of(wire::WINDOW);
     bounds.validate().unwrap();
-    bounds.pending_sends += 1;
+    bounds.pending_sends = bounds.pending_sends.saturating_add(1);
     assert!(bounds.validate().is_err());
-    bounds.pending_sends = 1;
-    bounds.inbox_capacity = 0;
+    bounds.pending_sends = QueueCapacity::MIN;
+    bounds.sessions_per_peer = bounds.max_sessions.saturating_add(1);
     assert!(bounds.validate().is_err());
 }
 
@@ -278,8 +279,8 @@ async fn replay_wrong_peer_and_cross_session_packets_fail_closed() {
 #[tokio::test]
 async fn reliable_ack_is_bounded_inbox_acceptance_and_retries_are_finite() {
     let mut bounds = config();
-    bounds.inbox_capacity = 1;
-    bounds.pending_sends = 1;
+    bounds.inbox_capacity = QueueCapacity::MIN;
+    bounds.pending_sends = QueueCapacity::MIN;
     bounds.max_attempts = 3;
     let fabric = Fabric::new(bounds).await;
     let (a, b) = fabric.pair(Reliable).await;
@@ -319,7 +320,7 @@ async fn reliable_ack_is_bounded_inbox_acceptance_and_retries_are_finite() {
 #[tokio::test]
 async fn dropping_sender_future_cancels_retries_and_releases_pending_capacity() {
     let mut bounds = config();
-    bounds.pending_sends = 1;
+    bounds.pending_sends = QueueCapacity::MIN;
     let fabric = Fabric::new(bounds).await;
     let (a, b) = fabric.pair(Reliable).await;
     fabric.faults.set(DROP_ALL);
@@ -347,8 +348,8 @@ async fn policy_rejection_and_session_capacity_cleanup_reuse_slots() {
     let a_config = config();
     let mut b_config = config();
     b_config.allow_unreliable = false;
-    b_config.max_sessions = 1;
-    b_config.sessions_per_peer = 1;
+    b_config.max_sessions = QueueCapacity::MIN;
+    b_config.sessions_per_peer = QueueCapacity::MIN;
     let fabric = Fabric::with_configs(a_config, b_config).await;
     let rejected = fabric
         .a
@@ -565,7 +566,7 @@ fn invalid_capacity_policy_and_timer_configuration_is_rejected() {
     bounds.allow_unreliable = false;
     assert!(bounds.validate().is_err());
     bounds = config();
-    bounds.inbox_capacity = 0;
+    bounds.sessions_per_peer = bounds.max_sessions.saturating_add(1);
     assert!(bounds.validate().is_err());
     bounds = config();
     bounds.idle_timeout = bounds.heartbeat_interval;
@@ -578,8 +579,8 @@ fn invalid_capacity_policy_and_timer_configuration_is_rejected() {
 #[tokio::test]
 async fn cancelled_setup_releases_admission_and_its_tls_control_session() {
     let mut bounds = config();
-    bounds.max_sessions = 1;
-    bounds.sessions_per_peer = 1;
+    bounds.max_sessions = QueueCapacity::MIN;
+    bounds.sessions_per_peer = QueueCapacity::MIN;
     let fabric = Fabric::new(bounds).await;
     fabric.b.shutdown();
     fabric.b.closed().await;

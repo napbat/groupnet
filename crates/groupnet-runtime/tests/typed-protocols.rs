@@ -12,7 +12,7 @@ use groupnet_runtime::{
     Unordered, UnorderedConfig, UnorderedDelivery,
 };
 use groupnet_testkit::cluster::eventually_within;
-use groupnet_transport::link::LinkConfig;
+use groupnet_transport::{QueueCapacity, link::LinkConfig};
 use groupnet_transport_mem::Network;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -449,8 +449,8 @@ async fn node_unordered_settings_are_fixed_before_endpoint_or_peer_creation() ->
         .await?;
     let config = UnorderedConfig {
         allow_unreliable: false,
-        max_sessions: 2,
-        sessions_per_peer: 1,
+        max_sessions: QueueCapacity::of(2),
+        sessions_per_peer: QueueCapacity::MIN,
         ..UnorderedConfig::default()
     };
     node.configure_unordered(config.clone())?;
@@ -466,7 +466,7 @@ async fn node_unordered_settings_are_fixed_before_endpoint_or_peer_creation() ->
     );
     node.configure_unordered(config.clone())?;
     let changed = UnorderedConfig {
-        max_sessions: 3,
+        max_sessions: QueueCapacity::of(3),
         ..config
     };
     assert_eq!(

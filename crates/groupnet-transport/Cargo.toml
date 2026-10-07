@@ -8,11 +8,18 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Default is the control-plane trait and its shared byte buffer.
+# Default is the control-plane trait, its shared byte buffer, and the
+# validated `QueueCapacity` (no runtime dependency).
+# `framing` adds the shared length-prefix header, frame ceiling and vectored
+# writer; it needs only Tokio's I/O traits (no runtime features).
+framing = ["dep:zerocopy", "dep:tokio"]
 # `bulk` adds the data-plane stream trait + framing and pulls its deps.
-bulk = ["dep:futures-util", "dep:zerocopy"]
+bulk = ["framing", "dep:futures-util"]
 # Object-safe link initialization with statically dispatched, bounded I/O workers.
-link = ["dep:tokio", "dep:tokio-util", "dep:futures-util", "futures-util/sink", "futures-util/async-await"]
+link = [
+    "dep:tokio", "tokio/rt", "tokio/sync", "tokio/time", "tokio/macros",
+    "dep:tokio-util", "dep:futures-util", "futures-util/sink", "futures-util/async-await",
+]
 
 [dependencies]
 groupnet-core = { workspace = true }
@@ -20,11 +27,13 @@ groupnet-core = { workspace = true }
 bytes.workspace = true
 futures-util = { workspace = true, features = ["io"], optional = true }
 zerocopy = { workspace = true, features = ["derive"], optional = true }
-tokio = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }
+tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["rt"], optional = true }
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
+# Pins `QueueCapacity::MAX` to the semaphore limit it restates.
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true

@@ -11,11 +11,12 @@ repository.workspace = true
 default = ["msg", "bulk"]
 # Control plane: `TcpMsgTransport`, best-effort messages over a bounded pool
 # of persistent connections. Needs tokio's task/sync/time slices for the
-# accept loop and per-connection workers.
-msg = ["tokio/rt", "tokio/sync", "tokio/time", "tokio/macros"]
+# accept loop and per-connection workers, and the shared stream framing.
+msg = ["groupnet-transport/framing", "tokio/rt", "tokio/sync", "tokio/time", "tokio/macros"]
 # Data plane: `TcpBulkTransport`, reliable byte streams. Pulls the `bulk`
-# trait surface plus the futures-io compat shim.
-bulk = ["groupnet-transport/bulk", "dep:tokio-util"]
+# trait surface plus the futures-io compat shim, and tokio's task/sync/time
+# slices for the listener task and deadline-bounded handshakes.
+bulk = ["groupnet-transport/bulk", "dep:tokio-util", "tokio/rt", "tokio/sync", "tokio/time"]
 # Router registration also needs the control-plane binding.
 link = ["msg", "groupnet-transport/link"]
 # Native rendezvous, candidate traversal, and relay fallback on the existing link.

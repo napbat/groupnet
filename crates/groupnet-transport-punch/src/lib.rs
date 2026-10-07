@@ -31,14 +31,16 @@
 //! Actual traversal depends on OS/NAT behavior; unsupported direct paths retain
 //! relay operation where that relay remains reachable.
 
+mod pacing;
 mod punch;
 mod tcp;
 
+pub use pacing::RelayPacing;
 pub use punch::{
     MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous, RendezvousConfig,
     RendezvousLimits, UdpConnection,
 };
 pub use tcp::{
-    ControlRateLimit, MAX_TCP_MESSAGE, RelayPacing, TcpConnection, TcpPunchConfig, TcpRendezvous,
+    ControlRateLimit, MAX_TCP_MESSAGE, TcpConnection, TcpPunchConfig, TcpRendezvous,
     TcpRendezvousConfig,
 };

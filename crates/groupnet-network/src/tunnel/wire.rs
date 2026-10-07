@@ -1,6 +1,5 @@
 //! Typed bounded reliability packets carrying only TLS ciphertext.
 
-use super::TunnelLimits;
 use crate::PacketBuffer;
 use bytes::Bytes;
 use zerocopy::{
@@ -19,6 +18,12 @@ struct Header {
 }
 
 pub(super) const HEADER: usize = size_of::<Header>();
+
+/// Protocol-wide segment ceiling: the ciphertext a default routing envelope
+/// carries between one-byte identities. Every receiver accepts segments up to
+/// this bound, independent of its own configured send segment.
+pub(super) const MAX_SEGMENT: usize =
+    crate::wire::MAX_FRAME - crate::wire::MIN_TUNNEL_HEADER - HEADER;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(super) struct SessionId(pub [u8; 16]);
@@ -43,9 +48,9 @@ pub(super) struct Packet {
 }
 
 impl Packet {
-    pub fn decode(bytes: Bytes, limits: &TunnelLimits) -> Option<Self> {
+    pub fn decode(bytes: Bytes) -> Option<Self> {
         let (header, payload) = Header::ref_from_prefix(bytes.as_ref()).ok()?;
-        if payload.len() > limits.payload {
+        if payload.len() > MAX_SEGMENT {
             return None;
         }
         let kind = match header.kind {
@@ -145,7 +150,7 @@ mod tests {
         assert_eq!(encoded.len(), HEADER + 512);
         let bytes = Bytes::copy_from_slice(encoded.payload());
         let ptr = bytes.as_ptr();
-        let packet = Packet::decode(bytes, &TunnelLimits::default()).unwrap();
+        let packet = Packet::decode(bytes).unwrap();
         assert_eq!(packet.encoded.as_ptr(), ptr);
         assert_eq!(
             (
@@ -158,18 +163,42 @@ mod tests {
             (SessionId([9; 16]), Kind::Data, u64::MAX, 42, 32)
         );
         assert_eq!(&packet.encoded[HEADER..], &[3; 512]);
-        let tight = TunnelLimits {
-            payload: 511,
-            ..TunnelLimits::default()
-        };
-        assert!(Packet::decode(packet.encoded, &tight).is_none());
+        assert!(Packet::decode(Bytes::from_static(&[0; HEADER - 1])).is_none());
+        router.close().await;
+    }
+
+    #[tokio::test]
+    async fn receive_bound_is_the_largest_segment_a_default_envelope_carries() {
+        let router = Router::new(NodeId::new("a"), RouterConfig::default()).unwrap();
+        let peer = NodeId::new("b");
         assert!(
-            Packet::decode(
-                Bytes::from_static(&[0; HEADER - 1]),
-                &TunnelLimits::default()
-            )
-            .is_none()
+            router
+                .validate_tunnel_payload(&peer, HEADER + MAX_SEGMENT)
+                .is_ok()
         );
+        assert!(
+            router
+                .validate_tunnel_payload(&peer, HEADER + MAX_SEGMENT + 1)
+                .is_err()
+        );
+        let mut encoded = router
+            .tunnel_packet_buffer(&peer, HEADER + MAX_SEGMENT)
+            .unwrap();
+        let segment = vec![5; MAX_SEGMENT];
+        Packet::encode(
+            SessionId([1; 16]),
+            Kind::Data,
+            7,
+            0,
+            1,
+            &segment,
+            &mut encoded,
+        );
+        let largest = Packet::decode(Bytes::copy_from_slice(encoded.payload())).unwrap();
+        assert_eq!(&largest.encoded[HEADER..], segment.as_slice());
+        let mut oversized = encoded.payload().to_vec();
+        oversized.push(5);
+        assert!(Packet::decode(Bytes::from(oversized)).is_none());
         router.close().await;
     }
 }

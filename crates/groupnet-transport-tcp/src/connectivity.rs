@@ -2,8 +2,72 @@
 
 use super::{Backend, TcpMsgTransport};
 use groupnet_core::NodeId;
+use groupnet_transport::admission::SessionPeer;
 use groupnet_transport_punch::{PeerPath, TcpConnection, TcpPunchConfig};
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, sync::Arc};
+use tokio::sync::watch;
+
+/// Observes the live peers' physical paths of an admitted or native endpoint,
+/// from [`TcpMsgTransport::path_changes`].
+///
+/// A change means a peer was admitted or withdrawn, or a native peer moved
+/// between its direct and relay path; [`paths`](Self::paths) reads the current
+/// view. Changes that land between two reads are never lost, only coalesced.
+/// It reads the endpoint's own session registry and native path state; it
+/// keeps no copy of either and does not extend the endpoint's lifetime.
+#[derive(Debug)]
+pub struct TcpPathChanges<'a> {
+    transport: &'a TcpMsgTransport,
+    sessions: watch::Receiver<Arc<Vec<SessionPeer>>>,
+    native: Option<watch::Receiver<()>>,
+}
+
+impl TcpPathChanges<'_> {
+    /// Waits until some peer's path may have changed since this watch was
+    /// created or last returned.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` once the endpoint has shut down; sticky.
+    pub async fn changed(&mut self) -> io::Result<()> {
+        let Self {
+            transport,
+            sessions,
+            native,
+        } = self;
+        let native = async {
+            match native {
+                Some(native) => native.changed().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = transport.closed() => Err(shut_down()),
+            changed = sessions.changed() => changed.map_err(|_| shut_down()),
+            changed = native => changed.map_err(|_| shut_down()),
+        }
+    }
+
+    /// The current path of every live peer; empty after shutdown.
+    ///
+    /// # Panics
+    /// If a direct session registry or connection pool lock was poisoned.
+    #[must_use]
+    pub fn paths(&self) -> Vec<(NodeId, PeerPath)> {
+        self.transport
+            .known_peers()
+            .into_iter()
+            .filter_map(|node| {
+                let path = self.transport.path_to(&node)?;
+                Some((node, path))
+            })
+            .collect()
+    }
+}
+
+fn shut_down() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "tcp msg transport shut down")
+}
 
 impl TcpMsgTransport {
     /// Binds a native TCP connection with rendezvous admission, retained candidate
@@ -148,17 +212,28 @@ impl TcpMsgTransport {
             Backend::Connectivity { connection, .. } => connection.known_peers(),
         }
     }
+
+    /// Watches peer path changes of an admitted or native endpoint, backed by
+    /// its live-session registry and, natively, the connection's path state.
+    /// Raw trusted endpoints have no admitted peers to observe and return
+    /// `None`; use [`sessions`](Self::sessions) for neighbor membership alone.
+    #[must_use]
+    pub fn path_changes(&self) -> Option<TcpPathChanges<'_>> {
+        let sessions = self.sessions()?.subscribe();
+        let native = match &self.backend {
+            Backend::Direct(_) => None,
+            Backend::Connectivity { connection, .. } => Some(connection.path_changes()),
+        };
+        Some(TcpPathChanges {
+            transport: self,
+            sessions,
+            native,
+        })
+    }
 }
 
 fn ensure_direct_open(stopped: bool) -> io::Result<()> {
-    if stopped {
-        Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "tcp msg transport shut down",
-        ))
-    } else {
-        Ok(())
-    }
+    if stopped { Err(shut_down()) } else { Ok(()) }
 }
 
 #[cfg(test)]
@@ -190,6 +265,7 @@ mod tests {
         let b = TcpMsgTransport::bind_connectivity(b_config)
             .await
             .expect("b");
+        let mut changes = a.path_changes().expect("native path watch");
         let sessions = a.sessions().expect("native registry");
         let live = sessions.subscribe();
         eventually_within("native adapter admission", SETTLE, || {
@@ -214,6 +290,11 @@ mod tests {
         assert_eq!(a.peer_addr(&b_id), None);
         assert_eq!(a.outbound_connections(), 0);
         assert_eq!(a.known_peers(), vec![b_id.clone()]);
+        tokio::time::timeout(SETTLE, changes.changed())
+            .await
+            .expect("admission notifies the path watch")
+            .expect("endpoint running");
+        assert_eq!(changes.paths(), vec![(b_id.clone(), PeerPath::Relay)]);
 
         let bound = a.clone().into_bound_link(7);
         assert!(
@@ -236,6 +317,14 @@ mod tests {
         tokio::time::timeout(SETTLE, bound.driver.close())
             .await
             .expect("drain native endpoint");
+        tokio::time::timeout(SETTLE, a.closed())
+            .await
+            .expect("native closed state observed");
+        assert_eq!(
+            changes.changed().await.expect_err("closed watch").kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert_eq!(changes.paths(), Vec::new());
         assert!(live.borrow().is_empty());
         assert!(!sessions.is_active(&b_id, generation));
         assert!(a.local_addrs().is_err());
@@ -246,5 +335,48 @@ mod tests {
             .expect("native listener released");
         b.close().await;
         relay.close().await;
+    }
+
+    #[tokio::test]
+    async fn direct_path_changes_follow_admitted_sessions_until_shutdown() {
+        use crate::{TcpAdmissionConfig, TcpMsgConfig};
+        use groupnet_transport::admission::OpenAdmission;
+
+        let raw = TcpMsgTransport::bind(NodeId::new("raw"), "127.0.0.1:0")
+            .await
+            .expect("raw");
+        assert!(raw.path_changes().is_none(), "raw endpoints admit no peers");
+        let admitted = |id: &str| {
+            TcpMsgTransport::bind_admitted(
+                NodeId::new(id),
+                "127.0.0.1:0",
+                TcpMsgConfig::default(),
+                Arc::new(OpenAdmission),
+                Vec::new(),
+                TcpAdmissionConfig::default(),
+            )
+        };
+        let a = admitted("paths-a").await.expect("a");
+        let b = admitted("paths-b").await.expect("b");
+        let mut changes = a.path_changes().expect("admitted path watch");
+        assert_eq!(changes.paths(), Vec::new());
+        b.register_peer(a.local_id().clone(), a.local_addr());
+        b.connect_peer(a.local_id()).expect("connect");
+        tokio::time::timeout(SETTLE, async {
+            while changes.paths() != vec![(b.local_id().clone(), PeerPath::Direct)] {
+                changes.changed().await.expect("endpoint running");
+            }
+        })
+        .await
+        .expect("admission observed through the path watch");
+        a.shutdown();
+        assert_eq!(
+            changes.changed().await.expect_err("closed watch").kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert_eq!(changes.paths(), Vec::new());
+        raw.close().await;
+        a.close().await;
+        b.close().await;
     }
 }

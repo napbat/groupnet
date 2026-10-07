@@ -298,7 +298,7 @@ async fn pending_policy_capacity_and_deadline_are_bounded_and_shutdown_drains() 
         policy.clone(),
         Vec::new(),
         TcpAdmissionConfig {
-            max_pending: 1,
+            max_pending: QueueCapacity::MIN,
             handshake_timeout: Duration::from_secs(1),
             ..TcpAdmissionConfig::default()
         },
@@ -385,10 +385,9 @@ async fn oversized_wire_credentials_are_rejected_before_policy_and_capacity_hold
         .await
         .expect("connect");
     malformed.write_all(MAGIC).await.expect("magic");
-    write_id(&mut malformed, &NodeId::new("bad"))
+    crate::handshake::write_intro(&mut malformed, &NodeId::new("bad"), "")
         .await
-        .expect("id");
-    write_str(&mut malformed, "").await.expect("intro");
+        .expect("id and intro");
     malformed
         .write_u32(u32::try_from(MAX_CREDENTIAL_BYTES + 1).expect("length"))
         .await
@@ -468,7 +467,7 @@ async fn idle_pool_settings_do_not_expire_admitted_sessions() {
         "127.0.0.1:0",
         TcpMsgConfig {
             idle_timeout: Duration::from_millis(1),
-            max_outbound: 1,
+            max_outbound: std::num::NonZeroUsize::MIN,
             ..TcpMsgConfig::default()
         },
         Arc::new(OpenAdmission),
@@ -509,10 +508,9 @@ async fn clean_cutover_rejects_raw_handshakes_and_invalid_local_bounds() {
     let mut raw = TcpStream::connect(server.local_addr())
         .await
         .expect("connect");
-    write_id(&mut raw, &NodeId::new("raw"))
+    crate::handshake::write_intro(&mut raw, &NodeId::new("raw"), "")
         .await
-        .expect("legacy id");
-    write_str(&mut raw, "").await.expect("legacy intro");
+        .expect("legacy intro");
     let mut byte = [0];
     assert!(matches!(
         timeout(Duration::from_secs(5), raw.read(&mut byte))
@@ -541,7 +539,7 @@ async fn clean_cutover_rejects_raw_handshakes_and_invalid_local_bounds() {
             Arc::new(OpenAdmission),
             Vec::new(),
             TcpAdmissionConfig {
-                max_pending: 0,
+                handshake_timeout: Duration::ZERO,
                 ..TcpAdmissionConfig::default()
             },
         )
@@ -777,4 +775,48 @@ async fn admitted_reader_applies_configured_frame_cap() {
     );
     client.close().await;
     server.close().await;
+}
+
+#[tokio::test]
+async fn hello_codec_round_trips_its_typed_network_layout() {
+    let mut wire = Vec::new();
+    write_hello(&mut wire, &NodeId::new("ab"), "c", b"de")
+        .await
+        .expect("write");
+    let expected = [
+        MAGIC.as_slice(),
+        &[0, 0, 0, 2],
+        b"ab",
+        &[0, 0, 0, 1],
+        b"c",
+        &[0, 0, 0, 2],
+        b"de",
+    ]
+    .concat();
+    assert_eq!(wire, expected);
+    let hello = read_hello(&mut wire.as_slice()).await.expect("read");
+    assert_eq!(hello.node, NodeId::new("ab"));
+    assert_eq!(hello.intro, "c");
+    assert_eq!(hello.credential, b"de");
+
+    let mut wrong_magic = wire.clone();
+    wrong_magic[0] ^= 1;
+    assert_eq!(
+        read_hello(&mut wrong_magic.as_slice())
+            .await
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::PermissionDenied)
+    );
+    // The shared identity bound applies before the claimed id is allocated.
+    let mut long_id = wire;
+    let length = u32::try_from(groupnet_transport::MAX_NODE_ID_BYTES + 1).expect("u32");
+    long_id[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&length.to_be_bytes());
+    assert_eq!(
+        read_hello(&mut long_id.as_slice())
+            .await
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidData)
+    );
 }

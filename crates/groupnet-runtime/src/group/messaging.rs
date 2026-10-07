@@ -156,7 +156,7 @@ async fn fanout(
     options: SendOptions,
 ) -> GroupSendReport {
     let mut tasks = JoinSet::new();
-    let concurrency = sender.config().fanout_concurrency;
+    let concurrency = sender.config().fanout_concurrency.get();
     let mut active = HashMap::with_capacity(concurrency.min(recipients.len()));
     let mut results: Vec<Option<io::Result<MessageId>>> = std::iter::repeat_with(|| None)
         .take(recipients.len())

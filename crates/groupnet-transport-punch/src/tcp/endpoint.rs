@@ -9,7 +9,7 @@ mod recovery_tests;
 mod pacing_tests;
 use super::{
     DEADLINE, IDLE, Inner, MAX_CANDIDATES, MAX_PEERS, Outgoing, TcpConnection, TcpPunchConfig,
-    View, closed, invalid, lock, random, server, sockets,
+    View, Views, closed, invalid, lock, random, server, sockets,
     wire::{self, Auth, Duplex, Message, Token},
 };
 use crate::PathPolicy;
@@ -28,7 +28,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::{TcpListener, TcpSocket, TcpStream},
+    net::{TcpListener, TcpStream},
     sync::{Semaphore, mpsc},
     task::JoinSet,
 };
@@ -40,7 +40,6 @@ struct ProofPeer {
     secret: Token,
 }
 type Proofs = Arc<Mutex<HashMap<NodeId, ProofPeer>>>;
-type Views = Arc<Mutex<HashMap<NodeId, View>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
@@ -136,10 +135,10 @@ pub(super) async fn bind(config: TcpPunchConfig) -> io::Result<TcpConnection> {
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP admission timed out"))??;
-    let peers = Arc::new(Mutex::new(HashMap::new()));
+    let peers = Arc::new(Views::new());
     let cancel = CancellationToken::new();
-    let (outbound, outgoing) = mpsc::channel(config.queue_capacity);
-    let (incoming, inbound) = mpsc::channel(config.queue_capacity);
+    let (outbound, outgoing) = mpsc::channel(config.queue_capacity.get());
+    let (incoming, inbound) = mpsc::channel(config.queue_capacity.get());
     let addresses = if sources.is_empty() {
         vec![address]
     } else {
@@ -179,8 +178,6 @@ pub(super) async fn bind(config: TcpPunchConfig) -> io::Result<TcpConnection> {
 }
 
 fn validate(config: &TcpPunchConfig) -> io::Result<()> {
-    super::validate_capacity(config.queue_capacity)?;
-    super::validate_capacity(config.max_peers)?;
     if config.peers.len() > config.max_peers || config.peers.len() > MAX_PEERS {
         return Err(invalid("TCP static peers exceed configured peer capacity"));
     }
@@ -212,13 +209,10 @@ async fn registration_socket(config: &TcpPunchConfig) -> io::Result<(TcpStream, 
         Ok((stream, true))
     } else {
         // Safe relay fallback, never claim a reusable/direct socket exists.
-        let socket = if config.bind.is_ipv4() {
-            TcpSocket::new_v4()?
-        } else {
-            TcpSocket::new_v6()?
-        };
-        socket.bind(config.bind)?;
-        Ok((socket.connect(config.rendezvous).await?, false))
+        Ok((
+            sockets::dial_exclusive(config.bind, config.rendezvous).await?,
+            false,
+        ))
     }
 }
 
@@ -266,7 +260,7 @@ struct Runtime {
     peers: HashMap<NodeId, Peer>,
     schedule: VecDeque<NodeId>,
     pending_checks: HashSet<(SocketAddr, SocketAddr)>,
-    views: Views,
+    views: Arc<Views>,
     proofs: Proofs,
     sessions: SessionRegistry,
     incoming: mpsc::Sender<AdmittedInbound>,
@@ -281,8 +275,8 @@ impl Runtime {
         listeners: Vec<TcpListener>,
         mut outgoing: mpsc::Receiver<Outgoing>,
     ) {
-        let (events, mut pending) = mpsc::channel(self.config.queue_capacity);
-        let (control, control_outgoing) = mpsc::channel(self.config.queue_capacity);
+        let (events, mut pending) = mpsc::channel(self.config.queue_capacity.get());
+        let (control, control_outgoing) = mpsc::channel(self.config.queue_capacity.get());
         let dials = Arc::new(Semaphore::new(16));
         let accepts = Arc::new(Semaphore::new(16));
         let mut tasks = JoinSet::new();
@@ -331,7 +325,7 @@ impl Runtime {
         }
         self.cancel.cancel();
         self.sessions.close();
-        lock(&self.views).clear();
+        self.views.clear();
         lock(&self.proofs).clear();
         drop(pending);
         let drained = tokio::time::timeout(DEADLINE + Duration::from_secs(1), async {
@@ -428,9 +422,7 @@ impl Runtime {
                     for check in &mut peer.checks {
                         check.rearm();
                     }
-                    if let Some(view) = lock(&self.views).get_mut(&node) {
-                        view.direct = None;
-                    }
+                    self.views.set_direct(&node, None);
                 }
                 if self.peers.get(&node).is_some_and(|peer| {
                     peer.session == session && !peer.relay_live && peer.direct.is_none()
@@ -488,7 +480,7 @@ impl Runtime {
             }
             peer.lease.revoke();
         }
-        lock(&self.views).remove(node);
+        self.views.remove(node);
         lock(&self.proofs).remove(node);
         self.schedule.retain(|scheduled| scheduled != node);
     }
@@ -517,7 +509,7 @@ impl Runtime {
         let secret = self.config.key.as_ref().map_or(secret, |key| {
             wire::proof(&key.to_bytes(), b"keyed pair", &[&secret])
         });
-        lock(&self.views).insert(
+        self.views.insert(
             node.clone(),
             View {
                 session,
@@ -626,7 +618,7 @@ impl Runtime {
         let Ok(address) = stream.peer_addr() else {
             return;
         };
-        let (writer, outgoing) = mpsc::channel(self.config.queue_capacity);
+        let (writer, outgoing) = mpsc::channel(self.config.queue_capacity.get());
         let cancel = self.cancel.child_token();
         if let Some(old) = peer.direct.take() {
             old.cancel.cancel();
@@ -636,9 +628,7 @@ impl Runtime {
             writer,
             cancel: cancel.clone(),
         });
-        if let Some(view) = lock(&self.views).get_mut(&node) {
-            view.direct = Some(address);
-        }
+        self.views.set_direct(&node, Some(address));
         tasks.spawn(direct::connection(
             stream,
             auth,
@@ -722,7 +712,7 @@ mod tests {
             peers: HashMap::new(),
             schedule: VecDeque::new(),
             pending_checks: HashSet::new(),
-            views: Arc::new(Mutex::new(HashMap::new())),
+            views: Arc::new(Views::new()),
             proofs: Arc::new(Mutex::new(HashMap::new())),
             sessions: SessionRegistry::new(8).unwrap(),
             incoming,
@@ -784,7 +774,7 @@ mod tests {
             &events,
             &mut tasks,
         );
-        assert!(lock(&views).get(&node).unwrap().direct.is_some());
+        assert!(views.read().get(&node).unwrap().direct.is_some());
         // Closing the actual winning socket yields its exact ranked Close event.
         drop(remote);
         let event = tokio::time::timeout(DEADLINE, pending.recv())
@@ -793,7 +783,7 @@ mod tests {
             .unwrap();
         assert!(matches!(event, Event::Closed { .. }));
         runtime.event(event, &events, &mut tasks);
-        assert!(lock(&views).get(&node).unwrap().direct.is_none());
+        assert!(views.read().get(&node).unwrap().direct.is_none());
         assert!(runtime.sessions.is_active(&node, generation));
         runtime.deliver(
             &node,
@@ -813,6 +803,65 @@ mod tests {
             &mut tasks,
         );
         assert!(runtime.peers.get(&node).unwrap().direct.is_none());
+        runtime.cancel.cancel();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn path_changes_follow_view_admission_direct_and_removal() {
+        let (mut runtime, _delivered) = runtime();
+        let mut changes = runtime.views.changes.subscribe();
+        let node = NodeId::from("peer");
+        let session = [3; 32];
+        runtime.intro(node.clone(), session, [4; 32], Vec::new());
+        assert!(changes.has_changed().unwrap(), "admission publishes a view");
+        changes.mark_unchanged();
+        let (events, mut pending) = mpsc::channel(32);
+        let mut tasks = JoinSet::new();
+        let winner = Rank {
+            direction: 0,
+            nonce: [1; 32],
+        };
+        let (winning, remote) = streams().await;
+        runtime.adopt(
+            (node.clone(), session, winner),
+            winning,
+            Duplex::plain(),
+            &events,
+            &mut tasks,
+        );
+        assert!(changes.has_changed().unwrap(), "direct adoption");
+        changes.mark_unchanged();
+        let (losing, _other) = streams().await;
+        let loser = Rank {
+            direction: 1,
+            nonce: [0; 32],
+        };
+        runtime.adopt(
+            (node.clone(), session, loser),
+            losing,
+            Duplex::plain(),
+            &events,
+            &mut tasks,
+        );
+        assert!(!changes.has_changed().unwrap(), "rejected loser is silent");
+        drop(remote);
+        let event = tokio::time::timeout(DEADLINE, pending.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.event(event, &events, &mut tasks);
+        assert!(runtime.views.read()[&node].direct.is_none());
+        assert!(changes.has_changed().unwrap(), "direct loss");
+        changes.mark_unchanged();
+        runtime.registration_gone(&node, session);
+        assert!(runtime.views.read().get(&node).is_none());
+        assert!(changes.has_changed().unwrap(), "removal");
+        changes.mark_unchanged();
+        runtime.intro(node, [5; 32], [4; 32], Vec::new());
+        changes.mark_unchanged();
+        runtime.views.clear();
+        assert!(changes.has_changed().unwrap(), "shutdown clear");
         runtime.cancel.cancel();
         while tasks.join_next().await.is_some() {}
     }

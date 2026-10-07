@@ -1,7 +1,8 @@
 use super::*;
-use crate::{PeerPath, TcpConnection, TcpPunchConfig};
+use crate::{PeerPath, RelayPacing, TcpConnection, TcpPunchConfig};
 use bytes::Bytes;
 use groupnet_testkit::cluster::eventually_within;
+use groupnet_transport::QueueCapacity;
 
 fn entry(
     node: &str,
@@ -143,8 +144,8 @@ async fn configured_rendezvous_forwards_data_bursts_without_revoking_admission()
     let rendezvous = TcpRendezvous::bind_open_config(
         "127.0.0.1:0".parse().unwrap(),
         TcpRendezvousConfig {
-            session_queue: 1024,
-            event_queue: 1024,
+            session_queue: QueueCapacity::of(1024),
+            event_queue: QueueCapacity::of(1024),
             control: super::super::ControlRateLimit {
                 frames_per_second: std::num::NonZeroU32::new(1).unwrap(),
                 burst_frames: std::num::NonZeroU32::new(1).unwrap(),
@@ -156,9 +157,9 @@ async fn configured_rendezvous_forwards_data_bursts_without_revoking_admission()
     .unwrap();
     let address = rendezvous.local_addr().unwrap();
     let mut a_config = TcpPunchConfig::open(NodeId::new("source"), address);
-    a_config.queue_capacity = 1024;
+    a_config.queue_capacity = QueueCapacity::of(1024);
     let mut b_config = TcpPunchConfig::open(NodeId::new("target"), address);
-    b_config.queue_capacity = 1024;
+    b_config.queue_capacity = QueueCapacity::of(1024);
     let a = TcpConnection::bind(a_config).await.unwrap();
     let b = TcpConnection::bind(b_config).await.unwrap();
     let target = b.local_id().clone();
@@ -199,8 +200,8 @@ async fn configured_session_cap_denies_excess_admission_without_revoking_incumbe
     let rendezvous = TcpRendezvous::bind_open_config(
         "127.0.0.1:0".parse().unwrap(),
         TcpRendezvousConfig {
-            max_sessions: 1,
-            session_queue: 1,
+            max_sessions: QueueCapacity::of(1),
+            session_queue: QueueCapacity::of(1),
             ..Default::default()
         },
     )
@@ -217,6 +218,70 @@ async fn configured_session_cap_denies_excess_admission_without_revoking_incumbe
     assert!(incumbent.local_addr().is_ok());
     incumbent.close().await;
     rendezvous.close().await;
+}
+
+async fn assert_pending(closed: &mut std::pin::Pin<&mut impl Future<Output = ()>>) {
+    tokio::select! {
+        biased;
+        () = closed.as_mut() => panic!("closed() resolved while the server runs"),
+        () = std::future::ready(()) => {},
+    }
+}
+
+#[tokio::test]
+async fn closed_resolves_stickily_after_close_drains_the_server() {
+    let rendezvous = TcpRendezvous::bind_open("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let closed = rendezvous.closed();
+    let mut closed = std::pin::pin!(closed);
+    assert_pending(&mut closed).await;
+    rendezvous.close().await;
+    // `close` drained the task, so the stop is already published.
+    tokio::select! {
+        biased;
+        () = closed => {},
+        () = std::future::ready(()) => panic!("closed() pending after close()"),
+    }
+    tokio::time::timeout(DEADLINE, rendezvous.closed())
+        .await
+        .expect("closed() is sticky for later callers");
+    assert_eq!(
+        rendezvous.local_addr().unwrap_err().kind(),
+        io::ErrorKind::NotConnected
+    );
+}
+
+#[tokio::test]
+async fn closed_resolves_when_the_server_task_stops_without_close() {
+    let rendezvous = TcpRendezvous::bind_open("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let closed = rendezvous.closed();
+    let mut closed = std::pin::pin!(closed);
+    assert_pending(&mut closed).await;
+    // An unexpected termination (panic or runtime abort) never runs `close`.
+    rendezvous.inner.task.lock().await.as_ref().unwrap().abort();
+    tokio::time::timeout(DEADLINE, closed)
+        .await
+        .expect("terminal server stop resolves closed()");
+    assert_eq!(
+        rendezvous.local_addr().unwrap_err().kind(),
+        io::ErrorKind::NotConnected
+    );
+    rendezvous.close().await;
+}
+
+#[tokio::test]
+async fn closed_outlives_and_resolves_after_the_last_handle_drops() {
+    let rendezvous = TcpRendezvous::bind_open("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let closed = rendezvous.closed();
+    drop(rendezvous);
+    tokio::time::timeout(DEADLINE, closed)
+        .await
+        .expect("dropping every handle stops the server");
 }
 
 #[tokio::test(start_paused = true)]

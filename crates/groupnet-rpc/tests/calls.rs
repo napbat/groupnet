@@ -20,8 +20,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
-use groupnet_rpc::{RpcClient, RpcConfig, RpcError, RpcServer, RpcServerConfig, RpcStatus};
+use groupnet_rpc::{
+    FrameLimit, RpcClient, RpcConfig, RpcError, RpcServer, RpcServerConfig, RpcStatus,
+};
 use groupnet_testkit::cluster::eventually;
+use groupnet_transport::QueueCapacity;
 use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_mem::bulk::{MemBulkNet, MemBulkTransport};
 use tokio::sync::Semaphore;
@@ -35,7 +38,7 @@ fn plane(net: &MemBulkNet, id: &str) -> DataPlane<MemBulkTransport> {
 }
 
 fn client(net: &MemBulkNet, id: &str) -> RpcClient<MemBulkTransport> {
-    RpcClient::new(plane(net, id), RpcConfig::default())
+    RpcClient::new(plane(net, id), RpcConfig::default()).expect("default limits are valid")
 }
 
 #[tokio::test]
@@ -159,17 +162,19 @@ async fn frame_limits_refuse_oversize_requests_unsent_and_oversize_responses_rem
             Ok::<_, RpcStatus>(request)
         },
         RpcServerConfig {
-            max_frame_bytes: LIMIT,
+            max_frame_bytes: FrameLimit::new(LIMIT).unwrap(),
             ..RpcServerConfig::default()
         },
-    );
+    )
+    .expect("valid limits");
     let client = RpcClient::new(
         plane(&net, "c"),
         RpcConfig {
-            max_frame_bytes: LIMIT,
+            max_frame_bytes: FrameLimit::new(LIMIT).unwrap(),
             ..RpcConfig::default()
         },
-    );
+    )
+    .expect("valid limits");
     let to = NodeId::new("s");
 
     assert_eq!(
@@ -223,10 +228,11 @@ async fn a_connection_runs_at_most_its_concurrency_limit_of_handlers() {
         plane(&net, "s"),
         handler,
         RpcServerConfig {
-            max_concurrent_per_connection: LIMIT,
+            max_concurrent_per_connection: QueueCapacity::of(LIMIT),
             ..RpcServerConfig::default()
         },
-    );
+    )
+    .expect("valid limits");
     let client = client(&net, "c");
 
     let mut calls = JoinSet::new();

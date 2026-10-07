@@ -1,14 +1,16 @@
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use tokio::io::AsyncWrite;
+
 use super::*;
 
+/// Accepts at most `chunk` bytes per write, across vectored slices.
 #[derive(Default)]
 struct ShortWriter {
     bytes: Vec<u8>,
     chunk: usize,
-    vectored: bool,
-    vectored_calls: usize,
 }
 
 impl AsyncWrite for ShortWriter {
@@ -27,7 +29,6 @@ impl AsyncWrite for ShortWriter {
         _: &mut Context<'_>,
         slices: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.vectored_calls += 1;
         let mut remaining = self.chunk;
         for slice in slices {
             let n = slice.len().min(remaining);
@@ -38,7 +39,7 @@ impl AsyncWrite for ShortWriter {
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.vectored
+        true
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -52,35 +53,31 @@ impl AsyncWrite for ShortWriter {
 
 #[tokio::test]
 async fn short_writes_preserve_network_endian_header_and_payload_boundaries() {
-    for vectored in [false, true] {
-        for chunk in 1..=9 {
-            let mut writer = ShortWriter {
-                chunk,
-                vectored,
-                ..ShortWriter::default()
-            };
-            for payload in [b"".as_slice(), b"abcdefg".as_slice(), b"next".as_slice()] {
-                write_frame(&mut writer, payload)
-                    .await
-                    .expect("write frame");
-            }
-            assert_eq!(writer.bytes, b"\0\0\0\0\0\0\0\x07abcdefg\0\0\0\x04next");
-            assert_eq!(writer.vectored_calls > 0, vectored);
-            let mut input = writer.bytes.as_slice();
-            assert_eq!(
-                read_frame(&mut input, 7).await.expect("empty"),
-                Some(Bytes::new())
-            );
-            assert_eq!(
-                read_frame(&mut input, 7).await.expect("body"),
-                Some(Bytes::from_static(b"abcdefg"))
-            );
-            assert_eq!(
-                read_frame(&mut input, 7).await.expect("next"),
-                Some(Bytes::from_static(b"next"))
-            );
-            assert_eq!(read_frame(&mut input, 7).await.expect("EOF"), None);
+    for chunk in 1..=9 {
+        let mut writer = ShortWriter {
+            chunk,
+            ..ShortWriter::default()
+        };
+        for payload in [b"".as_slice(), b"abcdefg".as_slice(), b"next".as_slice()] {
+            write_frame(&mut writer, payload)
+                .await
+                .expect("write frame");
         }
+        assert_eq!(writer.bytes, b"\0\0\0\0\0\0\0\x07abcdefg\0\0\0\x04next");
+        let mut input = writer.bytes.as_slice();
+        assert_eq!(
+            read_frame(&mut input, 7).await.expect("empty"),
+            Some(Bytes::new())
+        );
+        assert_eq!(
+            read_frame(&mut input, 7).await.expect("body"),
+            Some(Bytes::from_static(b"abcdefg"))
+        );
+        assert_eq!(
+            read_frame(&mut input, 7).await.expect("next"),
+            Some(Bytes::from_static(b"next"))
+        );
+        assert_eq!(read_frame(&mut input, 7).await.expect("EOF"), None);
     }
 }
 
@@ -113,18 +110,13 @@ async fn malformed_or_oversized_frames_fail_before_body_allocation() {
 }
 
 #[tokio::test]
-async fn zero_progress_is_an_error_in_both_writer_modes() {
-    for vectored in [false, true] {
-        let mut writer = ShortWriter {
-            vectored,
-            ..ShortWriter::default()
-        };
-        assert_eq!(
-            write_frame(&mut writer, b"x")
-                .await
-                .expect_err("no progress")
-                .kind(),
-            io::ErrorKind::WriteZero
-        );
-    }
+async fn zero_progress_is_an_error() {
+    let mut writer = ShortWriter::default();
+    assert_eq!(
+        write_frame(&mut writer, b"x")
+            .await
+            .expect_err("no progress")
+            .kind(),
+        io::ErrorKind::WriteZero
+    );
 }

@@ -248,7 +248,7 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
     let messages = Messaging::new(&router)?;
     let source = NodeId::new("source");
     let first = MessageId([0; 16]);
-    for n in 0..messages.config().received_records {
+    for n in 0..messages.config().received_records.get() {
         let mut id = [0; 16];
         id[8..].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
         let packet = codec::data(
@@ -275,7 +275,7 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
             .map_err(|_| poisoned())?
             .received
             .len(),
-        messages.config().received_records
+        messages.config().received_records.get()
     );
     let mut rejected_id = [0; 16];
     rejected_id[8..].copy_from_slice(&64_u64.to_be_bytes());
@@ -325,7 +325,7 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
             .map_err(|_| poisoned())?
             .received
             .len(),
-        messages.config().received_records
+        messages.config().received_records.get()
     );
     assert!(
         messages.inner.receiver.lock().await.try_recv().is_err(),
@@ -433,7 +433,7 @@ async fn invalid_bounds_no_route_and_outstanding_limit_fail_before_dispatch() ->
             io::ErrorKind::InvalidInput
         );
     }
-    for n in 0..messages.config().pending_sends {
+    for n in 0..messages.config().pending_sends.get() {
         let mut id = [0; 16];
         id[..8].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
         let (result, _) = oneshot::channel();
@@ -616,14 +616,15 @@ async fn asymmetric_retry_bounds_fail_closed_without_execution_and_admit_safe_ho
     .await?;
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     assert!(receiver.inner.receiver.lock().await.try_recv().is_err());
-    assert!(
+    assert_eq!(
         receiver
             .inner
             .state
             .lock()
             .map_err(|_| poisoned())?
             .received
-            .is_empty()
+            .len(),
+        0
     );
     let supported = SendOptions {
         delivery: Delivery::Delivered,
@@ -641,7 +642,12 @@ async fn asymmetric_retry_bounds_fail_closed_without_execution_and_admit_safe_ho
     assert_eq!(sent?, frame.id);
     {
         let now = receiver.inner.now();
-        let mut state = frame.receipt.record.state.lock().map_err(|_| poisoned())?;
+        let tracked = frame
+            .receipt
+            .tracked
+            .as_ref()
+            .expect("acknowledged frame record");
+        let mut state = tracked.record.state.lock().map_err(|_| poisoned())?;
         assert_eq!(state.act(Outcome::Applied, now), Some(Outcome::Accepted));
         assert!(!state.expired(now + 59));
         assert!(state.expired(now + 60));
@@ -669,9 +675,11 @@ async fn message_payload_slices_share_storage_without_mutating_unique_or_shared_
             )
             .unwrap(),
         );
-        let expected_pointer = encoded
-            .as_ptr()
-            .wrapping_add(codec::data_len(None, 0).unwrap());
+        let expected_pointer = encoded.as_ptr().wrapping_add(
+            codec::DataFrame::new(MessageId([0; 16]), Delivery::BestEffort, 0, None, &[])
+                .unwrap()
+                .len(),
+        );
         let alias = shared.then(|| encoded.clone());
         worker::process(
             &messages.inner,
@@ -683,6 +691,20 @@ async fn message_payload_slices_share_storage_without_mutating_unique_or_shared_
         let frame = messages.recv().await?;
         assert_eq!(frame.payload.as_ref(), b"payload");
         assert_eq!(frame.payload.as_ptr(), expected_pointer);
+        // Best effort retains no receive record, duplicate state or receipt.
+        assert!(frame.receipt.tracked.is_none());
+        assert_eq!(frame.delivery(), Delivery::BestEffort);
+        frame.receipt().applied()?;
+        assert_eq!(
+            messages
+                .inner
+                .state
+                .lock()
+                .map_err(|_| poisoned())?
+                .received
+                .len(),
+            0
+        );
         if let Some(alias) = alias {
             assert!(
                 matches!(codec::decode(&alias), Ok(Packet::Data { payload, .. }) if payload == b"payload")

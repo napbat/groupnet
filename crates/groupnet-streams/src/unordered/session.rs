@@ -220,8 +220,8 @@ pub(super) fn create(
     keys: &[u8; 64],
     initiator: bool,
 ) -> io::Result<(Arc<State>, UnorderedSession)> {
-    let (inbox, receiver) = mpsc::channel(params.config.inbox_capacity);
-    let slots = Arc::new(Semaphore::new(params.config.pending_sends));
+    let (inbox, receiver) = mpsc::channel(params.config.inbox_capacity.get());
+    let slots = Arc::new(Semaphore::new(params.config.pending_sends.get()));
     let (tx, rx) = wire::crypto(keys, initiator)?;
     let state = Arc::new(State {
         peer: params.peer,

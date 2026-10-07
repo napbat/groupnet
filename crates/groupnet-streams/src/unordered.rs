@@ -15,6 +15,7 @@ use std::{io, sync::Arc, time::Duration};
 
 use groupnet_core::NodeId;
 use groupnet_network::{Router, tunnel::TunnelTransport};
+use groupnet_transport::QueueCapacity;
 
 pub use session::UnorderedSession;
 
@@ -28,7 +29,8 @@ pub enum UnorderedDelivery {
 }
 
 /// Endpoint bounds and policy admission. All buffers and retry lifetimes are finite.
-/// Timers must fit the platform's monotonic clock; queue capacities must fit Tokio.
+/// Timers must fit the platform's monotonic clock; queue capacities are valid by
+/// construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnorderedConfig {
     /// Whether to accept reliable sessions.
@@ -38,13 +40,13 @@ pub struct UnorderedConfig {
     /// Maximum message size, negotiated down to the peer's bound.
     pub max_payload: usize,
     /// Maximum queued messages per session.
-    pub inbox_capacity: usize,
+    pub inbox_capacity: QueueCapacity,
     /// Maximum simultaneous reliable sends, at most the fixed 1024-ID dedup horizon.
-    pub pending_sends: usize,
+    pub pending_sends: QueueCapacity,
     /// Maximum sessions, including setup and queued accepts.
-    pub max_sessions: usize,
-    /// Maximum sessions per authenticated peer, including setup.
-    pub sessions_per_peer: usize,
+    pub max_sessions: QueueCapacity,
+    /// Maximum sessions per authenticated peer, including setup; at most `max_sessions`.
+    pub sessions_per_peer: QueueCapacity,
     /// Deadline for reliable send acceptance. Timeout leaves delivery unknown.
     pub send_timeout: Duration,
     /// Delay between independent reliable retransmissions.
@@ -65,10 +67,10 @@ impl Default for UnorderedConfig {
             allow_reliable: true,
             allow_unreliable: true,
             max_payload: 48 * 1024,
-            inbox_capacity: 32,
-            pending_sends: 32,
-            max_sessions: 64,
-            sessions_per_peer: 8,
+            inbox_capacity: QueueCapacity::of(32),
+            pending_sends: QueueCapacity::of(32),
+            max_sessions: QueueCapacity::of(64),
+            sessions_per_peer: QueueCapacity::of(8),
             send_timeout: Duration::from_secs(10),
             retry_interval: Duration::from_millis(100),
             max_attempts: 100,
@@ -83,7 +85,7 @@ impl UnorderedConfig {
     /// Checks that every endpoint bound and timer is finite and admissible.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for unsupported sizes, capacities or timers.
+    /// Returns `InvalidInput` for unsupported sizes, relative capacities or timers.
     pub fn validate(&self) -> io::Result<()> {
         if (!self.allow_reliable && !self.allow_unreliable)
             || self.max_payload == 0
@@ -92,10 +94,8 @@ impl UnorderedConfig {
                 .max_payload
                 .checked_add(wire::HEADER + wire::TAG)
                 .is_none()
-            || !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.inbox_capacity)
-            || !(1..=wire::WINDOW).contains(&self.pending_sends)
-            || !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_sessions)
-            || !(1..=self.max_sessions).contains(&self.sessions_per_peer)
+            || self.pending_sends.get() > wire::WINDOW
+            || self.sessions_per_peer > self.max_sessions
             || self.max_attempts == 0
             || self.retry_interval.is_zero()
             || self.send_timeout < self.retry_interval

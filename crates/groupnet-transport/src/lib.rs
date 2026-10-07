@@ -9,6 +9,11 @@
 //!   byte *streams* for replication and bulk transfer. Opt-in, because it adds
 //!   `futures-io` / `zerocopy` — neither of which the control plane needs.
 //!
+//! Shared by every binding: [`QueueCapacity`] (always available) types every
+//! bounded queue capacity, and the `framing` module (feature `framing`, implied
+//! by `bulk`) owns the stream-frame ceiling, the typed length prefix and the
+//! partial-write-safe vectored writer.
+//!
 //! Bindings for either live in their own `groupnet-transport-*` crates.
 //!
 //! ## Contract
@@ -35,6 +40,17 @@
 mod transport;
 
 pub use transport::{Inbound, Transport};
+
+pub mod capacity;
+
+pub use capacity::QueueCapacity;
+
+#[cfg(feature = "framing")]
+pub mod framing;
+
+/// Largest routing identity ([`NodeId`]) any adapter admits or introduces,
+/// in bytes. An empty identity is never valid either.
+pub const MAX_NODE_ID_BYTES: usize = 255;
 
 /// Data-plane stream transport (feature `bulk`): `BulkTransport`, `DataStream`,
 /// `DataPlane`.

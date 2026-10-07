@@ -24,7 +24,8 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+# Reliability transitions and the WAN regression run on a paused clock.
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 groupnet-transport-mem.workspace = true
 groupnet-transport-tcp = { workspace = true, features = ["msg", "link", "connectivity"] }
 groupnet-transport-ipc.workspace = true

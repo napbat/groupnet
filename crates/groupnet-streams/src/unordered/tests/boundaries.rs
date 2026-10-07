@@ -3,6 +3,7 @@ use std::{io, sync::atomic::Ordering, time::Duration};
 use bytes::Bytes;
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_testkit::cluster::eventually;
+use groupnet_transport::QueueCapacity;
 use tokio::time::timeout;
 
 use super::{
@@ -15,8 +16,8 @@ use crate::unordered::wire::{self, Kind, WINDOW};
 async fn stalled_authenticated_controls_do_not_serialize_other_peers() {
     for waiting_for_ready in [false, true] {
         let mut remote = config();
-        remote.max_sessions = 2;
-        remote.sessions_per_peer = 1;
+        remote.max_sessions = QueueCapacity::of(2);
+        remote.sessions_per_peer = QueueCapacity::MIN;
         let setup_timeout = remote.setup_timeout;
         let (fabric, malicious) = Fabric::with_stalling_peer(config(), remote).await;
         let started = tokio::time::Instant::now();
@@ -90,7 +91,7 @@ enum Resolution {
 
 async fn exercise_horizon(kind: Kind, resolution: Resolution) {
     let mut bounds = config();
-    bounds.pending_sends = 3;
+    bounds.pending_sends = QueueCapacity::of(3);
     if matches!(resolution, Resolution::Timeout) {
         bounds.max_attempts = 1;
     }

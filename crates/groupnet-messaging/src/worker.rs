@@ -1,6 +1,6 @@
 //! Adapter worker for the pure codec/receipt state, with bounded reservations.
 
-use super::{Delivery, Frame, Inner, Receipt, Record, error};
+use super::{Delivery, Frame, Inner, Receipt, Record, Tracked, error};
 use crate::codec::{self, MessageId, Outcome, Packet, ReceiptState, Rejection};
 use bytes::Buf;
 use groupnet_core::{GroupId, NodeId};
@@ -90,94 +90,101 @@ pub(super) fn process(inner: &Arc<Inner>, packet: ApplicationPacket) {
                 return;
             }
             let offset = packet.payload.len() - payload.len();
-            let fingerprint: [u8; 32] = if delivery == Delivery::BestEffort {
-                [0; 32]
+            // Best effort has no receipt, duplicate or retention state:
+            // the frame moves straight into the inbox without a record.
+            let receipt = if delivery == Delivery::BestEffort {
+                Receipt { tracked: None }
             } else {
-                digest::digest(&digest::SHA256, payload)
+                let fingerprint: [u8; 32] = digest::digest(&digest::SHA256, payload)
                     .as_ref()
                     .try_into()
-                    .expect("SHA256 digest length")
-            };
-            let record = if delivery == Delivery::BestEffort {
-                Arc::new(Record {
-                    from: packet.from.clone(),
+                    .expect("SHA256 digest length");
+                let Some(record) = track(
+                    inner,
+                    &packet.from,
                     id,
                     delivery,
                     retry_horizon_ms,
-                    group: None,
+                    group.as_ref(),
                     fingerprint,
-                    state: std::sync::Mutex::new(ReceiptState::new(
-                        delivery,
-                        inner.now(),
-                        inner.retention_ms,
-                    )),
-                })
-            } else {
-                let key = (packet.from.clone(), id);
-                let Ok(mut state) = inner.state.lock() else {
+                ) else {
                     return;
                 };
-                let now = inner.now();
-                state.received.retain(|_, record| {
-                    record.state.lock().map_or(true, |mut receipt| {
-                        receipt.retire(now);
-                        !receipt.expired(now)
-                    })
-                });
-                if let Some(record) = state.received.get(&key) {
-                    // Same identity with a different body is malformed, not a
-                    // new operation and not eligible for a success receipt.
-                    if record.delivery != delivery
-                        || record.retry_horizon_ms != retry_horizon_ms
-                        || record.group != group
-                        || record.fingerprint != fingerprint
-                    {
-                        return;
-                    }
-                    let outcome = record
-                        .state
-                        .lock()
-                        .ok()
-                        .and_then(|mut receipt| receipt.replay(now));
-                    drop(state);
-                    if let Some(outcome) = outcome {
-                        let _ = inner.acknowledge(&packet.from, id, outcome);
-                    }
-                    return;
+                Receipt {
+                    tracked: Some(Tracked {
+                        owner: Arc::downgrade(inner),
+                        record,
+                    }),
                 }
-                // Never evict a live identity to admit more work. Without room
-                // for a rejection record, fail closed rather than emit a
-                // terminal receipt that could later be contradicted by a retry.
-                if state.received.len() >= inner.config.received_records {
-                    return;
-                }
-                let record = Arc::new(Record {
-                    from: packet.from.clone(),
-                    id,
-                    delivery,
-                    retry_horizon_ms,
-                    group: group.clone(),
-                    fingerprint,
-                    state: std::sync::Mutex::new(ReceiptState::new(
-                        delivery,
-                        now,
-                        inner.retention_ms,
-                    )),
-                });
-                state.received.insert(key, record.clone());
-                record
             };
-            enqueue(inner, packet, group, id, record, offset);
+            enqueue(inner, packet, group, id, receipt, offset);
         }
     }
 }
 
+/// Admits a new acknowledged identity, or replays a duplicate's receipt and
+/// returns `None` so the application never sees the same operation twice.
+fn track(
+    inner: &Inner,
+    from: &NodeId,
+    id: MessageId,
+    delivery: Delivery,
+    retry_horizon_ms: u64,
+    group: Option<&GroupId>,
+    fingerprint: [u8; 32],
+) -> Option<Arc<Record>> {
+    let key = (from.clone(), id);
+    let Ok(mut state) = inner.state.lock() else {
+        return None;
+    };
+    let now = inner.now();
+    state.received.sweep(now);
+    if let Some(record) = state.received.get(&key) {
+        // Same identity with a different body is malformed, not a
+        // new operation and not eligible for a success receipt.
+        if record.delivery != delivery
+            || record.retry_horizon_ms != retry_horizon_ms
+            || record.group.as_ref() != group
+            || record.fingerprint != fingerprint
+        {
+            return None;
+        }
+        let outcome = record
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut receipt| receipt.replay(now));
+        drop(state);
+        if let Some(outcome) = outcome {
+            let _ = inner.acknowledge(from, id, outcome);
+        }
+        return None;
+    }
+    // Never evict a live identity to admit more work. Without room
+    // for a rejection record, fail closed rather than emit a
+    // terminal receipt that could later be contradicted by a retry.
+    if state.received.len() >= inner.config.received_records.get() {
+        return None;
+    }
+    let record = Arc::new(Record {
+        from: from.clone(),
+        id,
+        delivery,
+        retry_horizon_ms,
+        group: group.cloned(),
+        fingerprint,
+        state: std::sync::Mutex::new(ReceiptState::new(delivery, now, inner.retention_ms)),
+    });
+    state.received.insert(key, record.clone());
+    Some(record)
+}
+
 fn enqueue(
-    inner: &Arc<Inner>,
+    inner: &Inner,
     mut packet: ApplicationPacket,
     group: Option<GroupId>,
     id: MessageId,
-    record: Arc<Record>,
+    receipt: Receipt,
     offset: usize,
 ) {
     packet.payload.advance(offset);
@@ -186,10 +193,7 @@ fn enqueue(
         from: packet.from,
         group,
         payload: packet.payload,
-        receipt: Receipt {
-            owner: Arc::downgrade(inner),
-            record,
-        },
+        receipt,
     };
     if let Err(error) = inner.incoming.try_send(frame) {
         let kind = if matches!(&error, mpsc::error::TrySendError::Full(_)) {

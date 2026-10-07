@@ -97,7 +97,8 @@ impl Drop for Handle {
 /// A cloneable, persistent, full-duplex native IPC message transport.
 ///
 /// By default there are at most 128 registered peers, 64 sessions (including
-/// setup), 16 queued messages per session, and 64 queued inbound messages;
+/// setup), 16 queued messages per session, and 64 queued inbound messages,
+/// with 5 s setup and per-frame write deadlines and a 60 s idle read deadline;
 /// [`IpcConfig`] selects other finite limits. Unknown peers, busy connections
 /// and full outbound queues drop messages under the best-effort [`Transport`]
 /// contract. Each session introduces its node ID
@@ -133,15 +134,15 @@ impl IpcTransport {
         frame::validate_id(&local)?;
         tokio::runtime::Handle::try_current()
             .map_err(|_| io::Error::other("IPC requires a Tokio runtime"))?;
-        let listener = platform::Listener::bind(address, config.max_sessions)?;
-        let (incoming, inbox) = mpsc::channel(config.inbound_queue);
-        let (commands, receiver) = mpsc::channel(config.max_sessions);
+        let listener = platform::Listener::bind(address, config.max_sessions.get())?;
+        let (incoming, inbox) = mpsc::channel(config.inbound_queue.get());
+        let (commands, receiver) = mpsc::channel(config.max_sessions.get());
         let (finished, done) = watch::channel(false);
         let state = Arc::new(State {
             local,
             config,
             book: Mutex::new(Book::default()),
-            slots: Arc::new(Semaphore::new(config.max_sessions)),
+            slots: Arc::new(Semaphore::new(config.max_sessions.get())),
             inbox: AsyncMutex::new(inbox),
             incoming,
             commands,
@@ -184,7 +185,7 @@ impl IpcTransport {
             .book
             .lock()
             .map_err(|_| io::Error::other("IPC book poisoned"))?;
-        if !book.peers.contains_key(&node) && book.peers.len() >= state.config.max_peers {
+        if !book.peers.contains_key(&node) && book.peers.len() >= state.config.max_peers.get() {
             return Err(io::Error::other("IPC peer limit reached"));
         }
         if book.peers.get(&node) != Some(&address) {
@@ -243,7 +244,7 @@ impl IpcTransport {
         let Ok(command) = state.commands.try_reserve() else {
             return Ok(());
         };
-        let (sender, frames) = mpsc::channel(state.config.session_queue);
+        let (sender, frames) = mpsc::channel(state.config.session_queue.get());
         let generation = book.generation();
         // The newly allocated queue is empty, so reservation cannot fail.
         sender

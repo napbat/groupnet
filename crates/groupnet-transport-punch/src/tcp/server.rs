@@ -1,11 +1,10 @@
 //! Bounded TCP admission, pair introductions, and independent relay writers.
 use super::{
-    DEADLINE, IDLE, MAX_CANDIDATES, NetworkKey, RelayPacing, TcpRendezvousConfig, closed, invalid,
-    lock,
-    policy::Budget,
-    random, sockets,
+    DEADLINE, IDLE, MAX_CANDIDATES, NetworkKey, TcpRendezvousConfig, closed, invalid, lock, random,
+    sockets,
     wire::{self, Auth, Duplex, Message, Token},
 };
+use crate::pacing::Budget;
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{Admission, JoinRequest, OpenAdmission};
 use std::{
@@ -26,6 +25,8 @@ use tokio_util::sync::CancellationToken;
 struct Inner {
     address: SocketAddr,
     cancel: CancellationToken,
+    /// Cancelled exactly once, after the server task has stopped for any reason.
+    stopped: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -130,18 +131,28 @@ impl TcpRendezvous {
         let listener = TcpListener::bind(bind).await?;
         let address = listener.local_addr()?;
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run(
+        let stopped = CancellationToken::new();
+        let server = run(
             listener,
             wire::auth(key.as_ref()),
             admission,
             allowed,
             cancel.clone(),
             config,
-        ));
+        );
+        // Armed before spawning, so even a task aborted before its first poll
+        // publishes the stop. Tuple fields drop in order: the endpoint reports
+        // shutdown before `closed()` waiters observe the stop.
+        let guards = (cancel.clone().drop_guard(), stopped.clone().drop_guard());
+        let task = tokio::spawn(async move {
+            let _guards = guards;
+            server.await;
+        });
         Ok(Self {
             inner: Arc::new(Inner {
                 address,
                 cancel,
+                stopped,
                 task: Mutex::new(Some(task)),
             }),
         })
@@ -167,6 +178,13 @@ impl TcpRendezvous {
             let _ = running.await;
         }
         task.take();
+    }
+
+    /// Resolves once the server task has stopped, whether through [`Self::close`],
+    /// dropping every handle, or an unexpected termination. Sticky: it resolves
+    /// immediately after the stop, and the future outlives this handle.
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.inner.stopped.clone().cancelled_owned()
     }
 }
 
@@ -278,8 +296,8 @@ async fn run(
     cancel: CancellationToken,
     config: TcpRendezvousConfig,
 ) {
-    let pending = Arc::new(Semaphore::new(config.max_pending));
-    let (events, mut incoming) = mpsc::channel(config.event_queue);
+    let pending = Arc::new(Semaphore::new(config.max_pending.get()));
+    let (events, mut incoming) = mpsc::channel(config.event_queue.get());
     let mut tasks = JoinSet::new();
     let entries: Entries = Arc::new(std::sync::Mutex::new(HashMap::new()));
     loop {
@@ -291,8 +309,8 @@ async fn run(
                 Event::Closed(node, session) => remove(&mut lock(&entries), &node, session),
             },
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-            Ok((stream, address)) = listener.accept() => {
-                if tasks.len() >= config.max_sessions + config.max_pending { continue; }
+            Ok((stream, address)) = sockets::accept(&listener) => {
+                if tasks.len() >= config.max_sessions.get() + config.max_pending.get() { continue; }
                 let Ok(permit) = pending.clone().try_acquire_owned() else { continue; };
                 let events = events.clone(); let auth = wire::fresh(&auth); let admission = admission.clone(); let allowed = allowed.clone();
                 tasks.spawn(async move {
@@ -344,7 +362,7 @@ fn join(
 ) {
     let (stream, auth) = socket;
     let mut entries = lock(shared);
-    if entries.contains_key(&registration.node) || entries.len() >= config.max_sessions {
+    if entries.contains_key(&registration.node) || entries.len() >= config.max_sessions.get() {
         let auth = auth.clone();
         tasks.spawn(async move {
             let mut stream = stream;
@@ -356,8 +374,8 @@ fn join(
         });
         return;
     }
-    let (writer, control_outgoing) = mpsc::channel(config.control_queue);
-    let (data_writer, data_outgoing) = mpsc::channel(config.session_queue);
+    let (writer, control_outgoing) = mpsc::channel(config.control_queue.get());
+    let (data_writer, data_outgoing) = mpsc::channel(config.session_queue.get());
     let peer_cancel = cancel.child_token();
     let node = registration.node.clone();
     let session = registration.session;
@@ -557,13 +575,7 @@ async fn read_client<R: tokio::io::AsyncRead + Unpin>(
         u64::from(config.control.burst_frames.get()),
         now,
     );
-    let mut data = match config.relay_pacing {
-        RelayPacing::Backpressure => None,
-        RelayPacing::Bytes {
-            bytes_per_second,
-            burst_bytes,
-        } => Some(Budget::new(bytes_per_second.get(), burst_bytes.get(), now)),
-    };
+    let mut data = config.relay_pacing.budget(now);
     loop {
         let message = tokio::time::timeout(IDLE, wire::read(reader, auth))
             .await

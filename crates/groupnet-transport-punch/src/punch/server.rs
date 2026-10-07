@@ -20,9 +20,12 @@ use tokio_util::sync::CancellationToken;
 use super::candidates::Candidates;
 use super::wire::{self, Body, MAX_PACKET, Packet, Session};
 use super::{LEASE, NetworkKey, closed, random, transient};
+use crate::RelayPacing;
+use crate::pacing::Budget;
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(3);
 const RATE_INTERVAL: Duration = Duration::from_secs(1);
+/// Fixed control/rejected-request budget per source; admitted relay data is exempt.
 const PACKETS_PER_INTERVAL: u16 = 256;
 
 #[derive(Clone, Copy)]
@@ -50,18 +53,21 @@ struct Entry {
     admitting: Option<(Session, Instant)>,
     rate_start: Instant,
     rate_count: u16,
+    relay: Option<Budget>,
 }
 
 impl Entry {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, pacing: RelayPacing) -> Self {
         Self {
             active: None,
             admitting: None,
             rate_start: now,
             rate_count: 0,
+            relay: pacing.budget(now),
         }
     }
 
+    /// Spends one unit of the fixed control/rejected-request budget.
     fn admit(&mut self, now: Instant) -> bool {
         if now.duration_since(self.rate_start) >= RATE_INTERVAL {
             self.rate_start = now;
@@ -79,8 +85,9 @@ impl Entry {
             .filter(|registration| now.duration_since(registration.seen) < LEASE)
     }
 
-    fn authenticate(
-        &mut self,
+    /// Checks a fresh request from the live registration without spending or committing.
+    fn verify(
+        &self,
         packet: Packet<'_>,
         address: SocketAddr,
         now: Instant,
@@ -93,13 +100,35 @@ impl Entry {
         {
             return None;
         }
+        registration.sequence = packet.sequence;
+        registration.seen = now;
+        Some(registration)
+    }
+
+    /// Admits a verified control or rejected request against the control budget.
+    fn authenticate(
+        &mut self,
+        packet: Packet<'_>,
+        address: SocketAddr,
+        now: Instant,
+    ) -> Option<Registration> {
+        let registration = self.verify(packet, address, now)?;
         if !self.admit(now) {
             return None;
         }
-        registration.sequence = packet.sequence;
-        registration.seen = now;
         self.active = Some(registration);
         Some(registration)
+    }
+
+    /// Admits verified relay data for a live recipient; only byte pacing applies.
+    fn forward(&mut self, registration: Registration, bytes: usize, now: Instant) -> bool {
+        if let Some(budget) = &mut self.relay
+            && !budget.try_take(now, u64::try_from(bytes).expect("bounded UDP payload"))
+        {
+            return false;
+        }
+        self.active = Some(registration);
+        true
     }
 
     fn permits_registration(&self, packet: Packet<'_>, address: SocketAddr, now: Instant) -> bool {
@@ -231,8 +260,10 @@ impl Drop for Inner {
 /// fresh traffic. Live duplicate identities are rejected, never replaced.
 /// Defaults retain at most 128 established identities, 128 evictable address
 /// challenges, and 32 concurrent policy evaluations; configuration may tune these.
-/// Unproven traffic has a separate
-/// 256-packet/second budget; each live session has its own 256-packet/second budget.
+/// Unproven traffic has a separate 256-packet/second budget; each live session
+/// has its own 256-packet/second budget for control and rejected relay requests.
+/// Admitted relay data never spends that budget: it is bounded only by socket
+/// backpressure or the configured [`RelayPacing`] byte budget.
 #[derive(Debug)]
 pub struct Rendezvous {
     inner: Arc<Inner>,
@@ -272,8 +303,8 @@ impl Rendezvous {
 
     /// Binds a rendezvous with explicit operational capacities and admission policy.
     ///
-    /// Authentication, replay protection, fixed rate budgets, and challenge/session
-    /// deadlines are unaffected by capacity tuning.
+    /// Authentication, replay protection, fixed control-rate budgets, and
+    /// challenge/session deadlines are unaffected by capacity or pacing tuning.
     ///
     /// # Errors
     /// Rejects zero capacities, malformed allowlists, multicast binds, and socket errors.
@@ -294,6 +325,7 @@ impl Rendezvous {
             config.admission,
             allowed,
             config.limits,
+            config.relay_pacing,
             cancel.clone(),
         ));
         Ok(Self {
@@ -340,6 +372,7 @@ struct ServerState {
     decisions: JoinSet<Decision>,
     pre_admission: Entry,
     limits: RendezvousLimits,
+    relay_pacing: RelayPacing,
 }
 
 async fn serve(
@@ -348,6 +381,7 @@ async fn serve(
     admission: Arc<dyn Admission>,
     allowed: Option<HashSet<String>>,
     limits: RendezvousLimits,
+    relay_pacing: RelayPacing,
     cancel: CancellationToken,
 ) {
     let mut state = ServerState {
@@ -357,8 +391,9 @@ async fn serve(
             capacity: limits.max_challenges,
         },
         decisions: JoinSet::new(),
-        pre_admission: Entry::new(Instant::now()),
+        pre_admission: Entry::new(Instant::now(), RelayPacing::Backpressure),
         limits,
+        relay_pacing,
     };
     let mut buffer = [0; MAX_PACKET + 1];
     let mut maintenance = tokio::time::interval(RATE_INTERVAL);
@@ -473,9 +508,44 @@ async fn handle_established(
     address: SocketAddr,
     now: Instant,
 ) {
+    // Relay data for a live recipient session is admitted data, not control:
+    // it spends only optional byte pacing. Every other established request,
+    // including relay toward a missing or stale session, spends the control budget.
+    let recipient = match packet.body {
+        Body::Relay { peer, target, .. } if peer != packet.sender => entries
+            .get(peer)
+            .and_then(|entry| entry.live(now))
+            .filter(|recipient| recipient.session == target),
+        _ => None,
+    };
     let Some(entry) = entries.get_mut(packet.sender) else {
         return;
     };
+    if let (Some(recipient), Body::Relay { peer, message, .. }) = (recipient, packet.body) {
+        let Some(registration) = entry.verify(packet, address, now) else {
+            return;
+        };
+        if entry.forward(registration, message.len(), now) {
+            transmit(
+                socket,
+                key,
+                recipient.address,
+                Packet {
+                    sender: peer,
+                    session: recipient.session,
+                    sequence: packet.sequence,
+                    body: Body::Delivered {
+                        proof: recipient.proof,
+                        peer: packet.sender,
+                        session: packet.session,
+                        message,
+                    },
+                },
+            )
+            .await;
+        }
+        return;
+    }
     let Some(registration) = entry.authenticate(packet, address, now) else {
         return;
     };
@@ -516,36 +586,6 @@ async fn handle_established(
         }
         Body::Discover { .. } | Body::Query { .. } => {
             discover(socket, key, entries, &packet, &registration, address, now).await;
-        }
-        Body::Relay {
-            peer,
-            target,
-            message,
-            ..
-        } if peer != packet.sender => {
-            let Some(recipient) = entries.get(peer).and_then(|entry| entry.live(now)) else {
-                return;
-            };
-            if recipient.session != target {
-                return;
-            }
-            transmit(
-                socket,
-                key,
-                recipient.address,
-                Packet {
-                    sender: peer,
-                    session: recipient.session,
-                    sequence: packet.sequence,
-                    body: Body::Delivered {
-                        proof: recipient.proof,
-                        peer: packet.sender,
-                        session: packet.session,
-                        message,
-                    },
-                },
-            )
-            .await;
         }
         _ => {}
     }
@@ -673,7 +713,7 @@ async fn register(
     let entry = state
         .entries
         .entry(packet.sender.to_owned())
-        .or_insert_with(|| Entry::new(now));
+        .or_insert_with(|| Entry::new(now, state.relay_pacing));
     entry.admitting = Some((packet.session, now));
     spawn_admission(
         &mut state.decisions,
@@ -808,12 +848,7 @@ mod tests {
     use super::*;
 
     fn entry(now: Instant) -> Entry {
-        Entry {
-            active: None,
-            rate_start: now,
-            admitting: None,
-            rate_count: 0,
-        }
+        Entry::new(now, RelayPacing::Backpressure)
     }
 
     #[test]
@@ -901,3 +936,6 @@ mod admission_regressions;
 
 #[cfg(test)]
 mod config_tests;
+
+#[cfg(test)]
+mod relay_budget_tests;

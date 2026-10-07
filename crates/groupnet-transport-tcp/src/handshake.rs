@@ -1,88 +1,141 @@
-//! The one-line node-id handshake shared by both planes: the dialing side
+//! Length-prefixed handshake fields shared by both planes: the dialing side
 //! introduces itself first, because a TCP source address (its port is
 //! ephemeral) cannot identify a peer the way a bound UDP source address can.
+//!
+//! Every field is a typed [`LengthHeader`] followed by its bytes. Node ids
+//! obey the one identity bound, [`MAX_NODE_ID_BYTES`] and nonempty, on both
+//! the write and the read side; readers check a length before allocating.
 
 use std::io;
 
 use groupnet_core::NodeId;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use groupnet_transport::MAX_NODE_ID_BYTES;
+use groupnet_transport::framing::{LengthHeader, write_vectored};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use zerocopy::{FromZeros, IntoBytes};
 
-/// Longest accepted peer id, bounding the handshake allocation.
-const MAX_ID_LEN: usize = 1024;
-
-/// Longest accepted advertised address in the msg-plane intro.
+/// Longest accepted advertised address in an intro.
 #[cfg(feature = "msg")]
-const MAX_ADDR_LEN: usize = 256;
+pub(crate) const MAX_ADDR_LEN: usize = 256;
 
-/// Sends a length-prefixed UTF-8 string (the msg-plane intro address; empty
-/// means "nothing dialable to advertise").
-#[cfg(feature = "msg")]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the length prefix is a u32 on the wire; the only value written is an \
-              intro address, which the reader caps at MAX_ADDR_LEN anyway"
-)]
-pub(crate) async fn write_str(sock: &mut TcpStream, s: &str) -> io::Result<()> {
-    let bytes = s.as_bytes();
-    sock.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-    sock.write_all(bytes).await?;
-    Ok(())
-}
-
-/// Reads a length-prefixed UTF-8 string (the msg-plane intro address).
-#[cfg(feature = "msg")]
-pub(crate) async fn read_str(sock: &mut TcpStream) -> io::Result<String> {
-    let mut len_bytes = [0u8; 4];
-    sock.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_ADDR_LEN {
+/// Checks `id` against the identity bound every adapter shares.
+///
+/// # Errors
+/// Returns `InvalidInput` for an empty or overlong id.
+pub(crate) fn check_id(id: &NodeId) -> io::Result<()> {
+    let len = id.as_str().len();
+    if len == 0 || len > MAX_NODE_ID_BYTES {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "intro address too long",
+            io::ErrorKind::InvalidInput,
+            "node id outside the handshake identity bound",
         ));
     }
-    let mut bytes = vec![0u8; len];
-    sock.read_exact(&mut bytes).await?;
-    String::from_utf8(bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "intro address not utf-8"))
+    Ok(())
 }
 
-/// Sends our node id as a length-prefixed handshake so the peer can attribute
+/// The typed length prefix of one field.
+pub(crate) fn field_header(bytes: &[u8]) -> io::Result<LengthHeader> {
+    LengthHeader::new(bytes.len())
+}
+
+/// Sends our node id as one length-prefixed field so the peer can attribute
 /// the connection.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the length prefix is a u32 on the wire; a node id is an in-memory \
-              string, and the reader caps it at MAX_ID_LEN regardless"
-)]
-pub(crate) async fn write_id(sock: &mut TcpStream, id: &NodeId) -> io::Result<()> {
-    let bytes = id.as_str().as_bytes();
-    sock.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-    sock.write_all(bytes).await?;
-    Ok(())
+pub(crate) async fn write_id(sock: &mut (impl AsyncWrite + Unpin), id: &NodeId) -> io::Result<()> {
+    check_id(id)?;
+    let id = id.as_str().as_bytes();
+    write_vectored(sock, &[field_header(id)?.as_bytes(), id]).await
+}
+
+/// Sends the raw msg-plane intro, node id then (possibly empty) listener
+/// address, in one vectored write.
+#[cfg(feature = "msg")]
+pub(crate) async fn write_intro(
+    sock: &mut (impl AsyncWrite + Unpin),
+    id: &NodeId,
+    addr: &str,
+) -> io::Result<()> {
+    check_id(id)?;
+    let id = id.as_str().as_bytes();
+    let addr = addr.as_bytes();
+    write_vectored(
+        sock,
+        &[
+            field_header(id)?.as_bytes(),
+            id,
+            field_header(addr)?.as_bytes(),
+            addr,
+        ],
+    )
+    .await
+}
+
+/// Reads one typed length prefix.
+async fn read_header(sock: &mut (impl AsyncRead + Unpin)) -> io::Result<LengthHeader> {
+    let mut header = LengthHeader::new_zeroed();
+    sock.read_exact(header.as_mut_bytes()).await?;
+    Ok(header)
+}
+
+/// Reads the body announced by `header`, rejecting it above `max` before
+/// allocating.
+pub(crate) async fn read_body(
+    sock: &mut (impl AsyncRead + Unpin),
+    header: LengthHeader,
+    max: usize,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = vec![0; header.length_within(max)?];
+    sock.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+
+/// Reads one length-prefixed field of at most `max` bytes.
+pub(crate) async fn read_field(
+    sock: &mut (impl AsyncRead + Unpin),
+    max: usize,
+) -> io::Result<Vec<u8>> {
+    let header = read_header(sock).await?;
+    read_body(sock, header, max).await
+}
+
+/// Decodes a node id body: nonempty UTF-8 within the identity bound.
+pub(crate) fn decode_id(bytes: Vec<u8>) -> io::Result<NodeId> {
+    if bytes.is_empty() || bytes.len() > MAX_NODE_ID_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handshake id outside the identity bound",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(NodeId::new)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "handshake id not utf-8"))
 }
 
 /// Reads the peer's handshake node id.
-pub(crate) async fn read_id(sock: &mut TcpStream) -> io::Result<NodeId> {
-    let mut len_bytes = [0u8; 4];
-    sock.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_ID_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "handshake id too long",
-        ));
-    }
-    let mut id_bytes = vec![0u8; len];
-    sock.read_exact(&mut id_bytes).await?;
-    let id = std::str::from_utf8(&id_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "handshake id not utf-8"))?;
-    Ok(NodeId::new(id))
+pub(crate) async fn read_id(sock: &mut (impl AsyncRead + Unpin)) -> io::Result<NodeId> {
+    decode_id(read_field(sock, MAX_NODE_ID_BYTES).await?)
+}
+
+/// Reads an intro address field: UTF-8 of at most [`MAX_ADDR_LEN`] bytes,
+/// empty meaning "nothing dialable to advertise".
+#[cfg(feature = "msg")]
+pub(crate) async fn read_addr(sock: &mut (impl AsyncRead + Unpin)) -> io::Result<String> {
+    String::from_utf8(read_field(sock, MAX_ADDR_LEN).await?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "intro address not utf-8"))
+}
+
+/// Reads the raw msg-plane intro written by [`write_intro`].
+#[cfg(feature = "msg")]
+pub(crate) async fn read_intro(
+    sock: &mut (impl AsyncRead + Unpin),
+) -> io::Result<(NodeId, String)> {
+    let id = read_id(sock).await?;
+    Ok((id, read_addr(sock).await?))
 }
 
 #[cfg(test)]
 mod tests {
-    use tokio::net::TcpListener;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
 
@@ -119,12 +172,12 @@ mod tests {
         );
     }
 
-    /// The length cap is inclusive: an id of exactly `MAX_ID_LEN` bytes is
-    /// still a legal handshake.
+    /// The length cap is inclusive and shared with session admission: an id
+    /// of exactly `MAX_NODE_ID_BYTES` bytes is still a legal handshake.
     #[tokio::test]
     async fn an_id_at_the_length_cap_is_accepted() {
         let (mut dialer, mut acceptor) = pair().await;
-        let long = "x".repeat(MAX_ID_LEN);
+        let long = "x".repeat(MAX_NODE_ID_BYTES);
 
         write_id(&mut dialer, &NodeId::new(long.clone()))
             .await
@@ -135,18 +188,31 @@ mod tests {
         );
     }
 
-    /// A length prefix past the cap is rejected on the prefix alone — the
-    /// reader never allocates the advertised body.
+    /// An id the peer would reject is refused locally before any byte is sent.
     #[tokio::test]
-    async fn an_oversized_length_prefix_is_rejected() {
-        let (mut dialer, mut acceptor) = pair().await;
-        let len = u32::try_from(MAX_ID_LEN + 1).expect("fits in u32");
-        dialer.write_all(&len.to_be_bytes()).await.expect("write");
+    async fn ids_outside_the_bound_are_never_written() {
+        let mut sink = Vec::new();
+        for id in [String::new(), "x".repeat(MAX_NODE_ID_BYTES + 1)] {
+            let err = write_id(&mut sink, &NodeId::new(id))
+                .await
+                .expect_err("invalid id refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(sink, Vec::<u8>::new());
+    }
 
-        let err = read_id(&mut acceptor)
-            .await
-            .expect_err("oversized id rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    /// A length prefix past the cap is rejected on the prefix alone — the
+    /// reader never allocates the advertised body — and so is an empty id.
+    #[tokio::test]
+    async fn oversized_or_empty_ids_are_rejected() {
+        for len in [MAX_NODE_ID_BYTES + 1, 0] {
+            let (mut dialer, mut acceptor) = pair().await;
+            let len = u32::try_from(len).expect("fits in u32");
+            dialer.write_all(&len.to_be_bytes()).await.expect("write");
+
+            let err = read_id(&mut acceptor).await.expect_err("id rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     /// Non-UTF-8 bytes are a protocol error, not a lossy conversion.
@@ -162,27 +228,41 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// The msg-plane intro address round trips, and the empty string — "I have
+    /// The field layout is a big-endian u32 length then the bytes.
+    #[tokio::test]
+    async fn id_field_keeps_the_network_layout() {
+        let mut wire = Vec::new();
+        write_id(&mut wire, &NodeId::new("ab"))
+            .await
+            .expect("write");
+        assert_eq!(wire, [0, 0, 0, 2, b'a', b'b']);
+    }
+
+    /// The msg-plane intro round trips, and the empty address — "I have
     /// nothing dialable to advertise" — is a valid value, not a missing field.
     #[cfg(feature = "msg")]
     #[tokio::test]
-    async fn intro_address_round_trips_including_the_empty_advertisement() {
+    async fn intro_round_trips_including_the_empty_advertisement() {
         let (mut dialer, mut acceptor) = pair().await;
+        let id = NodeId::new("node-a");
 
-        write_str(&mut dialer, "127.0.0.1:7000")
+        write_intro(&mut dialer, &id, "127.0.0.1:7000")
             .await
             .expect("write");
         assert_eq!(
-            read_str(&mut acceptor).await.expect("read"),
-            "127.0.0.1:7000"
+            read_intro(&mut acceptor).await.expect("read"),
+            (id.clone(), "127.0.0.1:7000".to_owned())
         );
 
-        write_str(&mut dialer, "").await.expect("write");
-        assert_eq!(read_str(&mut acceptor).await.expect("read"), "");
+        write_intro(&mut dialer, &id, "").await.expect("write");
+        assert_eq!(
+            read_intro(&mut acceptor).await.expect("read"),
+            (id, String::new())
+        );
     }
 
-    /// The intro address has its own, tighter cap; overshooting it is an error
-    /// rather than an unbounded allocation.
+    /// The intro address has its own cap; overshooting it is an error rather
+    /// than an unbounded allocation.
     #[cfg(feature = "msg")]
     #[tokio::test]
     async fn an_oversized_intro_address_is_rejected() {
@@ -190,7 +270,7 @@ mod tests {
         let len = u32::try_from(MAX_ADDR_LEN + 1).expect("fits in u32");
         dialer.write_all(&len.to_be_bytes()).await.expect("write");
 
-        let err = read_str(&mut acceptor)
+        let err = read_addr(&mut acceptor)
             .await
             .expect_err("oversized address rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

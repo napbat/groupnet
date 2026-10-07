@@ -1,15 +1,16 @@
 use super::*;
+use groupnet_transport::QueueCapacity;
 
 fn transport(config: IpcConfig) -> (IpcTransport, mpsc::Receiver<runtime::Dial>) {
     config.validate().unwrap();
-    let (incoming, inbox) = mpsc::channel(config.inbound_queue);
-    let (commands, receiver) = mpsc::channel(config.max_sessions);
+    let (incoming, inbox) = mpsc::channel(config.inbound_queue.get());
+    let (commands, receiver) = mpsc::channel(config.max_sessions.get());
     let (_, done) = watch::channel(false);
     let state = Arc::new(State {
         local: NodeId::new("local"),
         config,
         book: Mutex::new(Book::default()),
-        slots: Arc::new(Semaphore::new(config.max_sessions)),
+        slots: Arc::new(Semaphore::new(config.max_sessions.get())),
         inbox: AsyncMutex::new(inbox),
         incoming,
         commands,
@@ -37,12 +38,12 @@ fn address() -> IpcAddress {
 #[tokio::test]
 async fn owned_packets_keep_storage_and_full_queue_drops_without_copying() {
     let config = IpcConfig {
-        session_queue: 1,
+        session_queue: QueueCapacity::MIN,
         ..IpcConfig::default()
     };
     let (transport, _commands) = transport(config);
     let remote = NodeId::new("remote");
-    let (sender, mut frames) = mpsc::channel(config.session_queue);
+    let (sender, mut frames) = mpsc::channel(config.session_queue.get());
     transport
         .handle
         .state
@@ -77,8 +78,8 @@ async fn owned_packets_keep_storage_and_full_queue_drops_without_copying() {
 #[tokio::test]
 async fn setup_limit_and_session_queue_follow_configuration() {
     let config = IpcConfig {
-        max_sessions: 1,
-        session_queue: 2,
+        max_sessions: QueueCapacity::MIN,
+        session_queue: QueueCapacity::of(2),
         ..IpcConfig::default()
     };
     let (transport, mut commands) = transport(config);

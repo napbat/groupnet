@@ -300,7 +300,7 @@ pub(super) async fn accept_loop(
             biased;
             () = cancel.cancelled() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-            Ok((stream, _)) = listener.accept() => {
+            Ok((stream, _)) = sockets::accept(&listener) => {
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 let local = local.clone(); let proofs = proofs.clone(); let events = events.clone();
                 tasks.spawn(async move {
@@ -564,6 +564,58 @@ mod tests {
             .await
             .unwrap();
         assert!(worker.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn dialed_and_accepted_direct_streams_disable_nagle() {
+        let (listener, address) = sockets::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (local, remote) = (NodeId::from("a"), NodeId::from("b"));
+        let (local_session, remote_session, secret) = ([1; 32], [2; 32], [3; 32]);
+        let proofs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            remote.clone(),
+            ProofPeer {
+                session: remote_session,
+                secret,
+            },
+        )])));
+        let (events, mut ready) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let accepting = tokio::spawn(accept_loop(
+            listener,
+            local.clone(),
+            local_session,
+            proofs,
+            Arc::new(Semaphore::new(1)),
+            events,
+            cancel.clone(),
+        ));
+        let dialed = tokio::time::timeout(
+            DEADLINE,
+            dial(
+                remote,
+                remote_session,
+                local,
+                ProofPeer {
+                    session: local_session,
+                    secret,
+                },
+                "127.0.0.1:0".parse().unwrap(),
+                address,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let Event::Ready { stream, .. } = dialed else {
+            panic!("dialed direct stream");
+        };
+        assert!(stream.nodelay().unwrap());
+        let Some(Event::Ready { stream, .. }) = ready.recv().await else {
+            panic!("accepted direct stream");
+        };
+        assert!(stream.nodelay().unwrap());
+        cancel.cancel();
+        accepting.await.unwrap();
     }
 }
 

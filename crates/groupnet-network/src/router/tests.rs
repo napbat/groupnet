@@ -343,7 +343,7 @@ async fn configured_protocol_and_queue_capacities_replace_operational_constants(
 {
     let config = RouterConfig {
         max_protocols: 40,
-        protocol_queue: 2,
+        protocol_queue: QueueCapacity::of(2),
         max_frame: 70_000,
         ..RouterConfig::default()
     };
@@ -387,7 +387,7 @@ fn routing_policy_rejects_only_invalid_resource_or_wire_bounds() {
     );
     assert!(
         RouterConfig {
-            protocol_queue: 0,
+            replay_capacity: 0,
             ..RouterConfig::default()
         }
         .validate()

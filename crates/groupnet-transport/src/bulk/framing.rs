@@ -8,20 +8,22 @@
 
 use std::fmt;
 use std::io;
+use std::pin::Pin;
 
 use bytes::Bytes;
 use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+use crate::framing::{LengthHeader, MAX_FRAME_BYTES, write_parts};
+
 /// A fixed-layout frame header, parsed and emitted with no copies and no
-/// `unsafe` via [`mod@zerocopy`]. Length is network byte order so it's stable
-/// across machines.
+/// `unsafe` via [`mod@zerocopy`]: the shared big-endian [`LengthHeader`]
+/// followed by this protocol's kind and padding.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
 #[repr(C)]
 struct FrameHeader {
     /// Payload length in bytes.
-    len: U32,
+    len: LengthHeader,
     /// Frame kind; only [`FRAME_KIND_DATA`] today. Any other kind, like any
     /// nonzero reserved byte, is rejected as malformed.
     kind: u8,
@@ -33,9 +35,6 @@ const HEADER_SIZE: usize = core::mem::size_of::<FrameHeader>();
 
 /// The only [`FrameHeader::kind`] so far: an application data frame.
 const FRAME_KIND_DATA: u8 = 0;
-
-/// Rejects absurd frame lengths from a corrupt/hostile header (256 MiB cap).
-const MAX_FRAME: usize = 256 << 20;
 
 /// Length-delimited message framing over a raw byte stream.
 ///
@@ -71,7 +70,7 @@ impl<S: AsyncWrite + Unpin> DataStream<S> {
     /// # Errors
     /// Propagates any write error.
     pub async fn send(&mut self, payload: Bytes) -> io::Result<()> {
-        self.send_bounded(payload, MAX_FRAME).await
+        self.send_bounded(payload, MAX_FRAME_BYTES).await
     }
 
     /// Sends a frame only if it fits the caller's finite operation budget.
@@ -108,27 +107,26 @@ impl<S: AsyncWrite + Unpin> DataStream<S> {
         max_bytes: usize,
     ) -> io::Result<()> {
         let total = head.len().checked_add(body.len());
-        if max_bytes == 0 || max_bytes > MAX_FRAME || total.is_none_or(|total| total > max_bytes) {
+        if max_bytes == 0
+            || max_bytes > MAX_FRAME_BYTES
+            || total.is_none_or(|total| total > max_bytes)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "frame exceeds caller's bounded send limit",
             ));
         }
-        let len = total
-            .and_then(|total| u32::try_from(total).ok())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "frame length exceeds u32")
-            })?;
         let header = FrameHeader {
-            len: U32::new(len),
+            len: LengthHeader::for_parts(&[head, body])?,
             kind: FRAME_KIND_DATA,
             reserved: [0; 3],
         };
-        self.inner.write_all(header.as_bytes()).await?;
-        self.inner.write_all(head).await?;
-        self.inner.write_all(body).await?;
-        self.inner.flush().await?;
-        Ok(())
+        let inner = &mut self.inner;
+        write_parts(&[header.as_bytes(), head, body], |cx, slices| {
+            Pin::new(&mut *inner).poll_write_vectored(cx, slices)
+        })
+        .await?;
+        self.inner.flush().await
     }
 
     /// Requests write-half shutdown after a complete protocol terminator.
@@ -147,10 +145,10 @@ impl<S: AsyncRead + Unpin> DataStream<S> {
     /// Reads one framed message, or `None` at a clean end of stream.
     ///
     /// # Errors
-    /// Propagates read errors, and rejects a header whose length exceeds the
-    /// 256 MiB cap.
+    /// Propagates read errors, and rejects a header whose length exceeds
+    /// [`MAX_FRAME_BYTES`].
     pub async fn recv(&mut self) -> io::Result<Option<Bytes>> {
-        self.recv_bounded(MAX_FRAME).await
+        self.recv_bounded(MAX_FRAME_BYTES).await
     }
 
     /// Reads a frame only if its header fits the caller's operation budget.
@@ -161,7 +159,7 @@ impl<S: AsyncRead + Unpin> DataStream<S> {
     /// Rejects zero/oversized limits, malformed or excessive frames, and
     /// propagates read errors.
     pub async fn recv_bounded(&mut self, max_bytes: usize) -> io::Result<Option<Bytes>> {
-        if max_bytes == 0 || max_bytes > MAX_FRAME {
+        if max_bytes == 0 || max_bytes > MAX_FRAME_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid bounded receive limit",
@@ -182,18 +180,7 @@ impl<S: AsyncRead + Unpin> DataStream<S> {
                 "unsupported frame header",
             ));
         }
-        let len = usize::try_from(header.len.get()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame length is unrepresentable",
-            )
-        })?;
-        if len > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame exceeds caller's bounded receive limit",
-            ));
-        }
+        let len = header.len.length_within(max_bytes)?;
 
         let mut payload = Vec::new();
         payload
@@ -238,7 +225,7 @@ mod tests {
     fn bounded_receive_rejects_header_before_payload_allocation() {
         futures::executor::block_on(async {
             let header = FrameHeader {
-                len: U32::new(10_000),
+                len: LengthHeader::new(10_000).unwrap(),
                 kind: FRAME_KIND_DATA,
                 reserved: [0; 3],
             };
@@ -268,7 +255,7 @@ mod tests {
         futures::executor::block_on(async {
             for (kind, reserved) in [(7, [0; 3]), (FRAME_KIND_DATA, [1, 0, 0])] {
                 let header = FrameHeader {
-                    len: U32::new(1),
+                    len: LengthHeader::new(1).unwrap(),
                     kind,
                     reserved,
                 };
@@ -285,7 +272,7 @@ mod tests {
     fn declared_payload_truncation_is_an_error() {
         futures::executor::block_on(async {
             let header = FrameHeader {
-                len: U32::new(3),
+                len: LengthHeader::new(3).unwrap(),
                 kind: FRAME_KIND_DATA,
                 reserved: [0; 3],
             };
@@ -352,6 +339,68 @@ mod tests {
             );
             assert!(reader.recv_bounded(8).await.unwrap().unwrap().is_empty());
             assert!(reader.recv_bounded(8).await.unwrap().is_none());
+        });
+    }
+
+    /// A `futures-io` writer accepting at most three bytes per vectored call.
+    struct Trickle(Vec<u8>);
+
+    impl AsyncWrite for Trickle {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.poll_write_vectored(cx, &[io::IoSlice::new(buf)])
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            slices: &[io::IoSlice<'_>],
+        ) -> std::task::Poll<io::Result<usize>> {
+            let mut budget = 3;
+            let mut written = 0;
+            for slice in slices {
+                let take = budget.min(slice.len());
+                self.0.extend_from_slice(&slice[..take]);
+                written += take;
+                budget -= take;
+            }
+            std::task::Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn partial_vectored_writes_still_emit_one_exact_frame() {
+        futures::executor::block_on(async {
+            let mut stream = DataStream::new(Trickle(Vec::new()));
+            stream
+                .send_bounded_parts(b"head", b"body-bytes", 64)
+                .await
+                .unwrap();
+            let bytes = stream.into_inner().0;
+            assert_eq!(&bytes[..4], &14u32.to_be_bytes());
+            let mut reader = DataStream::new(futures::io::Cursor::new(bytes));
+            assert_eq!(
+                reader.recv().await.unwrap().unwrap(),
+                &b"headbody-bytes"[..]
+            );
+            assert!(reader.recv().await.unwrap().is_none());
         });
     }
 }

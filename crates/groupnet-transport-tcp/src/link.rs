@@ -15,6 +15,8 @@ use crate::{TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
 ///
 /// Available with the `link` feature, which also activates `msg`. Binding owns
 /// the listener and all session tasks; link shutdown cancels and drains them.
+/// Direct links bind with the link's [`TcpMsgConfig`] (default until replaced
+/// through [`with_msg_config`](Self::with_msg_config), which validates it).
 /// With `connectivity`, `Self::connectivity` uses native rendezvous admission,
 /// candidate-path maintenance, and relay fallback through this same link type.
 pub struct TcpLink {
@@ -22,6 +24,7 @@ pub struct TcpLink {
     peers: Vec<NodeId>,
     addresses: Vec<SocketAddr>,
     cost: u32,
+    msg_config: TcpMsgConfig,
     admission: Option<Arc<dyn Admission>>,
     credential: Credential,
     admission_config: TcpAdmissionConfig,
@@ -37,6 +40,7 @@ impl std::fmt::Debug for TcpLink {
             .field("peers", &self.peers)
             .field("addresses", &self.addresses)
             .field("cost", &self.cost)
+            .field("msg_config", &self.msg_config)
             .field("custom_admission", &self.admission.is_some())
             .field("credential", &self.credential)
             .field("admission_config", &self.admission_config);
@@ -59,6 +63,7 @@ impl TcpLink {
             peers,
             addresses,
             cost: 1,
+            msg_config: TcpMsgConfig::default(),
             admission: None,
             credential: Credential(Vec::new()),
             admission_config: TcpAdmissionConfig::default(),
@@ -104,6 +109,19 @@ impl TcpLink {
         self
     }
 
+    /// Sets the message transport tuning (idle timeout, pool and queue
+    /// capacities, frame limit, advertised address), validated here so binding
+    /// cannot fail on it. Applies only to direct links; native connectivity
+    /// carries its own protocol limits.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when [`TcpMsgConfig::validate`] rejects `config`.
+    pub fn with_msg_config(mut self, config: TcpMsgConfig) -> io::Result<Self> {
+        config.validate()?;
+        self.msg_config = config;
+        Ok(self)
+    }
+
     /// Sets the routing cost of this link (default: one).
     #[must_use]
     pub const fn with_cost(mut self, cost: u32) -> Self {
@@ -139,6 +157,7 @@ impl LinkProvider for TcpLink {
                 peers,
                 addresses,
                 cost,
+                msg_config,
                 admission,
                 credential,
                 admission_config,
@@ -148,7 +167,7 @@ impl LinkProvider for TcpLink {
             let transport = TcpMsgTransport::bind_admitted(
                 local,
                 bind,
-                TcpMsgConfig::default(),
+                msg_config,
                 policy,
                 credential.0,
                 admission_config,
@@ -216,6 +235,38 @@ mod tests {
             .await
             .expect("drain listener");
         let _replacement = std::net::TcpListener::bind(address).expect("listener released");
+    }
+
+    #[tokio::test]
+    async fn link_validates_and_binds_its_message_config() {
+        let invalid = TcpMsgConfig {
+            max_frame_bytes: 0,
+            ..TcpMsgConfig::default()
+        };
+        assert_eq!(
+            TcpLink::new("127.0.0.1:0".parse().expect("address"), Vec::new())
+                .with_msg_config(invalid)
+                .expect_err("invalid config rejected by the builder")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let link = TcpLink::new("127.0.0.1:0".parse().expect("address"), Vec::new())
+            .with_msg_config(TcpMsgConfig {
+                max_frame_bytes: 512,
+                ..TcpMsgConfig::default()
+            })
+            .expect("valid config");
+        let bound = Box::new(link)
+            .bind(NodeId::new("tcp-local"))
+            .await
+            .expect("bind");
+        assert_eq!(
+            bound.config.mtu, 512,
+            "the stored config reached the transport"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), bound.driver.close())
+            .await
+            .expect("drain listener");
     }
 
     #[tokio::test]

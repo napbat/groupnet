@@ -1,6 +1,8 @@
-//! [`RpcServer`]: the answering side — owns a plane's `accept`, runs one
-//! bounded task set per connection.
+//! [`RpcServer`]: the answering side — owns a plane's `accept`, admits a
+//! bounded number of connections and runs one bounded task set per
+//! connection.
 
+use std::io;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,34 +17,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Instant, timeout_at};
 
-use crate::codec::{ERROR_HEAD, Frame, RESPONSE_HEAD};
-use crate::{DEFAULT_MAX_FRAME_BYTES, RpcStatus, check_frame_limit, write_frames};
+use crate::codec::{ERROR_HEAD, Encoded, Frame, RESPONSE_HEAD};
+use crate::config::{FrameLimit, RpcServerConfig};
+use crate::{RpcStatus, write_frames};
 
 /// The first pause after a failed `accept`, doubled per consecutive failure.
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
 /// The longest pause between `accept` retries.
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
-
-/// Server limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RpcServerConfig {
-    /// The largest RPC frame (head included) this server accepts or sends.
-    /// Match the clients' [`RpcConfig::max_frame_bytes`](crate::RpcConfig::max_frame_bytes).
-    pub max_frame_bytes: usize,
-    /// Handlers run concurrently for one connection; at the limit the server
-    /// stops reading that connection until one finishes.
-    pub max_concurrent_per_connection: usize,
-}
-
-impl Default for RpcServerConfig {
-    /// 16 MiB frames, 64 concurrent handlers per connection.
-    fn default() -> Self {
-        Self {
-            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
-            max_concurrent_per_connection: 64,
-        }
-    }
-}
 
 /// Spawns RPC servers; see [`spawn`](Self::spawn).
 #[derive(Debug)]
@@ -62,45 +44,50 @@ impl RpcServer {
         H: Fn(NodeId, Bytes) -> F + Clone + Send + 'static,
         F: Future<Output = Result<Bytes, RpcStatus>> + Send + 'static,
     {
-        Self::spawn_with(plane, handler, RpcServerConfig::default())
+        start(plane, handler, RpcServerConfig::default())
     }
 
     /// [`spawn`](Self::spawn) with explicit limits.
     ///
-    /// Each request runs as its own task, at most
-    /// `max_concurrent_per_connection` per connection, and is abandoned at
-    /// its deadline (answered [`RpcStatus::DEADLINE_EXCEEDED`]). A handler
-    /// that panics is answered [`RpcStatus::HANDLER_PANICKED`]. Answers are
-    /// written by one writer per connection, so frames never interleave.
+    /// At most `max_connections` connections are served at once; at the
+    /// limit the server stops accepting until one ends. Each request runs as
+    /// its own task, at most `max_concurrent_per_connection` per connection,
+    /// and is abandoned at its deadline (answered
+    /// [`RpcStatus::DEADLINE_EXCEEDED`]). A handler that panics is answered
+    /// [`RpcStatus::HANDLER_PANICKED`]. Answers are written by one writer per
+    /// connection, so frames never interleave. A connection with no request
+    /// read and no handler running for `idle_timeout` is closed once its
+    /// answers are written.
     ///
-    /// # Panics
-    /// If `config.max_frame_bytes` cannot hold a request head or exceeds
-    /// [`MAX_FRAME_LIMIT`](crate::MAX_FRAME_LIMIT), or
-    /// `config.max_concurrent_per_connection` is zero or above
-    /// [`Semaphore::MAX_PERMITS`].
-    #[must_use = "dropping the handle shuts the server down"]
+    /// # Errors
+    /// `InvalidInput` if `config` fails [`RpcServerConfig::validate`].
     pub fn spawn_with<B, H, F>(
         plane: DataPlane<B>,
         handler: H,
         config: RpcServerConfig,
-    ) -> RpcServerHandle
+    ) -> io::Result<RpcServerHandle>
     where
         B: BulkTransport,
         H: Fn(NodeId, Bytes) -> F + Clone + Send + 'static,
         F: Future<Output = Result<Bytes, RpcStatus>> + Send + 'static,
     {
-        check_frame_limit(config.max_frame_bytes);
-        assert!(
-            (1..=Semaphore::MAX_PERMITS).contains(&config.max_concurrent_per_connection),
-            "max_concurrent_per_connection must be within 1..={}",
-            Semaphore::MAX_PERMITS
-        );
-        let connections = Arc::new(AtomicUsize::new(0));
-        let task = tokio::spawn(accept_loop(plane, handler, config, connections.clone()));
-        RpcServerHandle {
-            task: task.abort_handle(),
-            connections,
-        }
+        config.validate()?;
+        Ok(start(plane, handler, config))
+    }
+}
+
+/// Spawns the accept loop for an already validated configuration.
+fn start<B, H, F>(plane: DataPlane<B>, handler: H, config: RpcServerConfig) -> RpcServerHandle
+where
+    B: BulkTransport,
+    H: Fn(NodeId, Bytes) -> F + Clone + Send + 'static,
+    F: Future<Output = Result<Bytes, RpcStatus>> + Send + 'static,
+{
+    let connections = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn(accept_loop(plane, handler, config, connections.clone()));
+    RpcServerHandle {
+        task: task.abort_handle(),
+        connections,
     }
 }
 
@@ -133,25 +120,34 @@ impl Drop for RpcServerHandle {
     }
 }
 
-/// Counts one live connection for as long as it exists — including a task
-/// aborted before its first poll, since the guard is moved into the future.
-struct Live(Arc<AtomicUsize>);
+/// Counts one live connection and holds its admission slot for as long as
+/// it exists — including a task aborted before its first poll, since the
+/// guard is moved into the future.
+struct Live {
+    count: Arc<AtomicUsize>,
+    _slot: OwnedSemaphorePermit,
+}
 
 impl Live {
-    fn enter(count: &Arc<AtomicUsize>) -> Self {
+    fn enter(count: &Arc<AtomicUsize>, slot: OwnedSemaphorePermit) -> Self {
         count.fetch_add(1, Ordering::SeqCst);
-        Self(count.clone())
+        Self {
+            count: count.clone(),
+            _slot: slot,
+        }
     }
 }
 
 impl Drop for Live {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.count.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-/// Accepts connections until aborted. Every connection task lives in the
-/// set, so aborting this task (dropping the set) aborts them all.
+/// Accepts connections until aborted, admitting at most `max_connections`
+/// at once: a slot is taken before `accept`, so a full server pushes back on
+/// dialers through the transport. Every connection task lives in the set, so
+/// aborting this task (dropping the set) aborts them all.
 async fn accept_loop<B, H, F>(
     plane: DataPlane<B>,
     handler: H,
@@ -162,16 +158,21 @@ async fn accept_loop<B, H, F>(
     H: Fn(NodeId, Bytes) -> F + Clone + Send + 'static,
     F: Future<Output = Result<Bytes, RpcStatus>> + Send + 'static,
 {
+    let admission = Arc::new(Semaphore::new(config.max_connections.get()));
     let mut served = JoinSet::new();
     let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
         // Reap finished connections; the set stays bounded by the live ones.
         while served.try_join_next().is_some() {}
+        let Ok(slot) = admission.clone().acquire_owned().await else {
+            return;
+        };
         if let Ok((from, stream)) = plane.accept().await {
             backoff = ACCEPT_BACKOFF_MIN;
-            let live = Live::enter(&connections);
+            let live = Live::enter(&connections, slot);
             served.spawn(serve(from, stream, handler.clone(), config, live));
         } else {
+            drop(slot);
             // A failed handshake from one peer must not end the server; a
             // transport that keeps failing is retried at a bounded rate.
             tokio::time::sleep(backoff).await;
@@ -180,9 +181,19 @@ async fn accept_loop<B, H, F>(
     }
 }
 
+/// How a connection's request reader ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadEnd {
+    /// A clean end, a read error, or a frame that is not a request.
+    Closed,
+    /// No request and no running handler for the idle timeout.
+    Idle,
+}
+
 /// Serves one connection: requests are read and dispatched, answers flow
 /// through a single writer. Either side ending ends the connection, and with
-/// it every handler still running for it.
+/// it every handler still running for it; an idle connection first writes
+/// the answers its finished handlers queued.
 async fn serve<S, H, F>(
     from: NodeId,
     stream: DataStream<S>,
@@ -197,27 +208,41 @@ async fn serve<S, H, F>(
     let (read_half, write_half) = stream.into_inner().split();
     let mut reader = DataStream::new(read_half);
     let mut writer = DataStream::new(write_half);
-    let (answers, queue) = mpsc::channel(config.max_concurrent_per_connection);
-    tokio::select! {
-        () = read_requests(&mut reader, from, handler, config, answers) => {}
-        () = write_frames(&mut writer, queue, config.max_frame_bytes) => {}
+    let (answers, mut queue) = mpsc::channel(config.max_concurrent_per_connection.get());
+    let end = tokio::select! {
+        end = read_requests(&mut reader, from, handler, config, answers) => end,
+        () = write_frames(&mut writer, &mut queue, config.max_frame_bytes) => ReadEnd::Closed,
+    };
+    if end == ReadEnd::Idle {
+        // Every handler has finished and every answer sender is gone, so the
+        // writer drains the queue and returns.
+        write_frames(&mut writer, &mut queue, config.max_frame_bytes).await;
     }
 }
 
+/// Resolves once every running handler has finished and `idle` has then
+/// passed with nothing new to do.
+async fn idle_out(work: &mut JoinSet<()>, idle: Duration) {
+    while work.join_next().await.is_some() {}
+    tokio::time::sleep(idle).await;
+}
+
 /// Reads requests and spawns one bounded task per request. Returns on a
-/// clean end, a read error, or any frame that is not a well-formed request.
+/// clean end, a read error, any frame that is not a well-formed request, or
+/// idleness.
 async fn read_requests<R, H, F>(
     reader: &mut DataStream<R>,
     from: NodeId,
     handler: H,
     config: RpcServerConfig,
-    answers: mpsc::Sender<crate::codec::Encoded>,
-) where
+    answers: mpsc::Sender<Encoded>,
+) -> ReadEnd
+where
     R: AsyncRead + Unpin,
     H: Fn(NodeId, Bytes) -> F + Clone + Send + 'static,
     F: Future<Output = Result<Bytes, RpcStatus>> + Send + 'static,
 {
-    let permits = Arc::new(Semaphore::new(config.max_concurrent_per_connection));
+    let permits = Arc::new(Semaphore::new(config.max_concurrent_per_connection.get()));
     // Dropped with this future, which aborts every handler still running.
     let mut work = JoinSet::new();
     loop {
@@ -225,10 +250,14 @@ async fn read_requests<R, H, F>(
         // Take a slot before reading, so a saturated connection stops being
         // read and the caller feels the back-pressure.
         let Ok(permit) = permits.clone().acquire_owned().await else {
-            return;
+            return ReadEnd::Closed;
         };
-        let Ok(Some(bytes)) = reader.recv_bounded(config.max_frame_bytes).await else {
-            return;
+        let read = tokio::select! {
+            read = reader.recv_bounded(config.max_frame_bytes.get()) => read,
+            () = idle_out(&mut work, config.idle_timeout) => return ReadEnd::Idle,
+        };
+        let Ok(Some(bytes)) = read else {
+            return ReadEnd::Closed;
         };
         let received = Instant::now();
         let Ok(Frame::Request {
@@ -237,7 +266,7 @@ async fn read_requests<R, H, F>(
             payload,
         }) = Frame::decode(&bytes)
         else {
-            return;
+            return ReadEnd::Closed;
         };
         let deadline = received + Duration::from_millis(u64::from(deadline_ms));
         work.spawn(answer(
@@ -267,9 +296,9 @@ struct Request {
 async fn answer<H, F>(
     request: Request,
     handler: H,
-    answers: mpsc::Sender<crate::codec::Encoded>,
+    answers: mpsc::Sender<Encoded>,
     _permit: OwnedSemaphorePermit,
-    max_frame_bytes: usize,
+    max_frame_bytes: FrameLimit,
 ) where
     H: Fn(NodeId, Bytes) -> F + Send + 'static,
     F: Future<Output = Result<Bytes, RpcStatus>> + Send + 'static,
@@ -296,8 +325,9 @@ async fn answer<H, F>(
             Ok(Ok(outcome)) => outcome,
         }
     };
+    let max_message = max_frame_bytes.body(ERROR_HEAD);
     let frame = match outcome {
-        Ok(body) if body.len() <= max_frame_bytes - RESPONSE_HEAD => {
+        Ok(body) if body.len() <= max_frame_bytes.body(RESPONSE_HEAD) => {
             Frame::Response { id, payload: body }
         }
         Ok(body) => Frame::Error {
@@ -305,15 +335,16 @@ async fn answer<H, F>(
             status: RpcStatus::new(
                 RpcStatus::RESPONSE_TOO_LARGE,
                 format!(
-                    "response of {} bytes exceeds the {max_frame_bytes}-byte frame limit",
-                    body.len()
+                    "response of {} bytes exceeds the {}-byte frame limit",
+                    body.len(),
+                    max_frame_bytes.get()
                 ),
             )
-            .truncated(max_frame_bytes - ERROR_HEAD),
+            .truncated(max_message),
         },
         Err(status) => Frame::Error {
             id,
-            status: status.truncated(max_frame_bytes - ERROR_HEAD),
+            status: status.truncated(max_message),
         },
     };
     // The writer is gone only when the connection is; nobody to tell.

@@ -34,7 +34,7 @@ use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{SessionId, SessionRegistry};
 use groupnet_transport::link::{AdmittedInbound, BoundLink, LinkConfig, LinkControl};
-use groupnet_transport::{Inbound, Transport};
+use groupnet_transport::{Inbound, QueueCapacity, Transport};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -46,6 +46,12 @@ use crate::wire::{self, PayloadKind};
 pub struct TransportId(usize);
 
 /// Routing and resource policy for one node.
+///
+/// Queue sizing: one bulk tunnel stream keeps about `2 × window` frames queued
+/// (a window of data plus its acknowledgements). Size `link_queue` for the bulk
+/// streams sharing a link and `tunnel_queue` for those terminating at this node;
+/// the defaults hold two and eight default-window (64-segment) streams. A full
+/// link or tunnel queue drops frames, which streams repair as loss.
 #[derive(Clone, Debug)]
 pub struct RouterConfig {
     /// Whether this node forwards transit traffic between admitted peers.
@@ -68,15 +74,15 @@ pub struct RouterConfig {
     /// Maximum exclusive application namespaces; must fit u16 IDs.
     pub max_protocols: usize,
     /// Bounded inbox capacity for each application namespace.
-    pub protocol_queue: usize,
+    pub protocol_queue: QueueCapacity,
     /// Bounded router event queue capacity.
-    pub event_queue: usize,
+    pub event_queue: QueueCapacity,
     /// Bounded coordination inbox capacity.
-    pub message_queue: usize,
-    /// Bounded tunnel inbox capacity.
-    pub tunnel_queue: usize,
+    pub message_queue: QueueCapacity,
+    /// Bounded tunnel inbox capacity shared by this node's tunnel sessions.
+    pub tunnel_queue: QueueCapacity,
     /// Bounded outbound queue capacity for each link.
-    pub link_queue: usize,
+    pub link_queue: QueueCapacity,
     /// Number of recent routed identities retained for loop/replay suppression.
     pub replay_capacity: usize,
     /// Physical-send deadline shared by all fragments of a frame.
@@ -95,11 +101,11 @@ impl Default for RouterConfig {
             max_hops: wire::MAX_HOPS,
             reassembly: ReassemblyConfig::default(),
             max_protocols: 32,
-            protocol_queue: 128,
-            event_queue: 256,
-            message_queue: 64,
-            tunnel_queue: 256,
-            link_queue: 64,
+            protocol_queue: QueueCapacity::of(128),
+            event_queue: QueueCapacity::of(256),
+            message_queue: QueueCapacity::of(64),
+            tunnel_queue: QueueCapacity::of(1024),
+            link_queue: QueueCapacity::of(256),
             replay_capacity: 4096,
             send_timeout: Duration::from_secs(5),
         }
@@ -107,17 +113,11 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
-    /// Validates wire representability and bounded channel/resource policy.
+    /// Validates wire representability and bounded resource policy; queue
+    /// capacities carry their own range.
     /// # Errors
-    /// Rejects zero capacities, impossible wire bounds, or invalid timers.
+    /// Rejects zero bounds, impossible wire bounds, or invalid timers.
     pub fn validate(&self) -> io::Result<()> {
-        let queues = [
-            self.protocol_queue,
-            self.event_queue,
-            self.message_queue,
-            self.tunnel_queue,
-            self.link_queue,
-        ];
         let now = tokio::time::Instant::now();
         let timers = [
             self.reassembly.timeout,
@@ -133,9 +133,6 @@ impl RouterConfig {
             || !(2..=usize::from(u8::MAX)).contains(&self.max_hops)
             || self.max_protocols == 0
             || self.max_protocols > usize::from(u16::MAX) + 1
-            || queues
-                .iter()
-                .any(|capacity| *capacity == 0 || *capacity > tokio::sync::Semaphore::MAX_PERMITS)
             || self.replay_capacity == 0
             || self.reassembly.max_pending == 0
             || self.reassembly.max_fragments == 0
@@ -334,9 +331,9 @@ impl Router {
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| io::Error::other("OS randomness unavailable"))?;
-        let (events, receive) = mpsc::channel(config.event_queue);
-        let (messages, message_rx) = mpsc::channel(config.message_queue);
-        let (tunnels, tunnel_rx) = mpsc::channel(config.tunnel_queue);
+        let (events, receive) = mpsc::channel(config.event_queue.get());
+        let (messages, message_rx) = mpsc::channel(config.message_queue.get());
+        let (tunnels, tunnel_rx) = mpsc::channel(config.tunnel_queue.get());
         let (advertisements, _) = watch::channel(Arc::new(Vec::new()));
         let (reachable, _) = watch::channel(Arc::new(Vec::new()));
         let shared = Arc::new(Shared {
@@ -366,7 +363,10 @@ impl Router {
     }
 
     /// Watches currently reachable destinations, including newly admitted peers.
-    /// This is discovery, not additional link admission.
+    ///
+    /// This is the route-readiness notification: wait here for a destination to
+    /// appear before sending or connecting, rather than polling
+    /// [`route_to`](Self::route_to). It is discovery, not additional link admission.
     #[must_use]
     pub fn reachable(&self) -> watch::Receiver<Arc<Vec<NodeId>>> {
         self.inner.shared.reachable.subscribe()
@@ -434,7 +434,7 @@ impl Router {
         };
         let id = TransportId(table.next_link);
         table.next_link = next;
-        let (send, outgoing) = mpsc::channel(shared.config.link_queue);
+        let (send, outgoing) = mpsc::channel(shared.config.link_queue.get());
         let cancel = shared.cancel.child_token();
         let BoundLink {
             config,

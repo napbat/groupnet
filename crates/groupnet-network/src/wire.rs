@@ -53,6 +53,11 @@ pub(crate) const MAX_DATA_HEADER: usize = size_of::<Prefix>()
     + size_of::<U16>()
     + 2 * (size_of::<u8>() + u8::MAX as usize);
 
+/// Smallest tunnel envelope: one-byte origin and destination identities. With
+/// [`MAX_FRAME`] it fixes the largest tunnel packet any default router emits.
+pub(crate) const MIN_TUNNEL_HEADER: usize =
+    size_of::<Prefix>() + size_of::<DataHeader>() + 2 * (size_of::<u8>() + 1);
+
 pub(crate) fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -484,6 +489,16 @@ mod tests {
                 assert!(decode(&envelope).is_err());
             }
         }
+    }
+
+    #[test]
+    fn minimal_tunnel_envelope_uses_one_byte_identities() {
+        let one = NodeId::new("a");
+        assert_eq!(
+            PayloadKind::Tunnel.header_len(&one, &NodeId::new("b")),
+            MIN_TUNNEL_HEADER
+        );
+        assert!(PayloadKind::Tunnel.header_len(&one, &NodeId::new("bb")) > MIN_TUNNEL_HEADER);
     }
 
     #[test]

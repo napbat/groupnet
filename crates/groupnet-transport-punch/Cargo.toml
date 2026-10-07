@@ -9,9 +9,9 @@ repository.workspace = true
 
 [dependencies]
 groupnet-core.workspace = true
-groupnet-transport = { workspace = true, features = ["link"] }
+groupnet-transport = { workspace = true, features = ["link", "framing"] }
 bytes.workspace = true
-zerocopy.workspace = true
+zerocopy = { workspace = true, features = ["derive"] }
 ring.workspace = true
 socket2.workspace = true
 if-addrs.workspace = true

@@ -43,7 +43,7 @@ async fn concurrent_large_calls_share_one_tcp_stream_and_survive_a_server_restar
     transport.register_peer(server_id.clone(), addr);
     // Keep a handle on the plane: its transport is where addresses are taught.
     let plane = DataPlane::new(transport);
-    let client = RpcClient::new(plane.clone(), RpcConfig::default());
+    let client = RpcClient::new(plane.clone(), RpcConfig::default()).expect("valid default limits");
 
     let mut calls = JoinSet::new();
     for n in 0..CALLS {

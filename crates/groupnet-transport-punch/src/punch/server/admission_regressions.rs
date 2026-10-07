@@ -22,11 +22,15 @@ fn registration(now: Instant, address: SocketAddr) -> Registration {
     }
 }
 
+fn unpaced(now: Instant) -> Entry {
+    Entry::new(now, RelayPacing::Backpressure)
+}
+
 #[test]
 fn invalid_session_traffic_never_spends_any_established_session_allowance() {
     let now = Instant::now();
     let address: SocketAddr = ([127, 0, 0, 1], 1234).into();
-    let mut entry = Entry::new(now);
+    let mut entry = unpaced(now);
     entry.active = Some(registration(now, address));
     let packet = Packet {
         sender: "incumbent",
@@ -92,8 +96,9 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
         entries: HashMap::new(),
         challenges: Challenges::default(),
         decisions: JoinSet::new(),
-        pre_admission: Entry::new(now),
+        pre_admission: unpaced(now),
         limits: RendezvousLimits::default(),
+        relay_pacing: RelayPacing::Backpressure,
     };
     for sequence in [1, 2] {
         let issued = now + Duration::from_secs(sequence - 1);
@@ -163,12 +168,12 @@ async fn late_completion_with_reused_wire_session_cannot_clear_a_new_attempt() {
     let old_issued = now - CHALLENGE_TTL - Duration::from_secs(1);
     let new_issued = now - Duration::from_secs(1);
     let mut entries = HashMap::new();
-    let mut old = Entry::new(old_issued);
+    let mut old = unpaced(old_issued);
     old.admitting = Some(([7; 16], old_issued));
     entries.insert("same-id".to_owned(), old);
     expire_entries(&mut entries, old_issued + CHALLENGE_TTL);
     assert!(entries.is_empty());
-    let mut replacement = Entry::new(new_issued);
+    let mut replacement = unpaced(new_issued);
     replacement.admitting = Some(([7; 16], new_issued));
     entries.insert("same-id".to_owned(), replacement);
     let old_decision = Decision {
@@ -248,10 +253,10 @@ async fn public_session_and_spoofed_source_do_not_authorize_depart_relay_or_sequ
     let address = incumbent.local_addr().unwrap();
     let now = Instant::now();
     let mut entries = HashMap::new();
-    let mut entry = Entry::new(now);
+    let mut entry = unpaced(now);
     entry.active = Some(registration(now, address));
     entries.insert("incumbent".to_owned(), entry);
-    let mut target = Entry::new(now);
+    let mut target = unpaced(now);
     target.active = Some(Registration {
         session: [8; 16],
         proof: [10; 16],
@@ -342,13 +347,13 @@ async fn discovery_only_discloses_addresses_when_both_participants_allow_direct_
         for peer_relay in [false, true] {
             let now = Instant::now();
             let mut entries = HashMap::new();
-            let mut entry = Entry::new(now);
+            let mut entry = unpaced(now);
             entry.active = Some(Registration {
                 relay_only: requester_relay,
                 ..registration(now, requester.local_addr().unwrap())
             });
             entries.insert("requester".to_owned(), entry);
-            let mut peer = Entry::new(now);
+            let mut peer = unpaced(now);
             peer.active = Some(Registration {
                 session: [8; 16],
                 proof: [10; 16],
@@ -414,8 +419,9 @@ async fn configured_peer_and_pending_policy_limits_independently_reject_overflow
                 capacity: limits.max_challenges,
             },
             decisions: JoinSet::new(),
-            pre_admission: Entry::new(now),
+            pre_admission: unpaced(now),
             limits,
+            relay_pacing: RelayPacing::Backpressure,
         };
         let policy: Arc<dyn Admission> = Arc::new(Block);
         let registration = registration(now, recipient.local_addr().unwrap());

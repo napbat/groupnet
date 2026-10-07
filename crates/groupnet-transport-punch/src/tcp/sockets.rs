@@ -1,4 +1,7 @@
-//! Safe pre-bind socket options and retained candidate listeners.
+//! Safe pre-bind socket options, per-stream options, and retained candidate listeners.
+//!
+//! Every dialed and accepted stream passes through [`configure`], so latency-
+//! sensitive small frames are never delayed by Nagle coalescing on any path.
 use super::{MAX_CANDIDATES, TcpPunchConfig, invalid};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
@@ -50,13 +53,33 @@ pub(super) fn source(bind: SocketAddr) -> io::Result<TcpSocket> {
     Ok(TcpSocket::from_std_stream(stream))
 }
 
+/// Applies the options every dialed and accepted TCP stream carries.
+fn configure(stream: TcpStream) -> io::Result<TcpStream> {
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
 pub(super) async fn dial(bind: SocketAddr, target: SocketAddr) -> io::Result<TcpStream> {
     if bind.is_ipv4() != target.is_ipv4() || !valid(target) {
         return Err(invalid("invalid TCP dial candidate"));
     }
-    let stream = source(bind)?.connect(target).await?;
-    stream.set_nodelay(true)?;
-    Ok(stream)
+    configure(source(bind)?.connect(target).await?)
+}
+
+/// Connects from an ordinary, non-reusable source when reusable binding fails.
+pub(super) async fn dial_exclusive(bind: SocketAddr, target: SocketAddr) -> io::Result<TcpStream> {
+    let socket = if bind.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.bind(bind)?;
+    configure(socket.connect(target).await?)
+}
+
+pub(super) async fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
+    let (stream, address) = listener.accept().await?;
+    Ok((configure(stream)?, address))
 }
 
 pub(super) fn listen(bind: SocketAddr) -> io::Result<(TcpListener, SocketAddr)> {
@@ -98,4 +121,26 @@ pub(super) fn gather(config: &TcpPunchConfig, binds: &[SocketAddr]) -> io::Resul
         }
     }
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dialed_and_accepted_streams_disable_nagle() {
+        let (listener, address) = listen("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (dialed, accepted) = tokio::join!(
+            dial("127.0.0.1:0".parse().unwrap(), address),
+            accept(&listener)
+        );
+        assert!(dialed.unwrap().nodelay().unwrap());
+        assert!(accepted.unwrap().0.nodelay().unwrap());
+        let (exclusive, accepted) = tokio::join!(
+            dial_exclusive("127.0.0.1:0".parse().unwrap(), address),
+            accept(&listener)
+        );
+        assert!(exclusive.unwrap().nodelay().unwrap());
+        assert!(accepted.unwrap().0.nodelay().unwrap());
+    }
 }

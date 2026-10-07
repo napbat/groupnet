@@ -1,13 +1,14 @@
 //! Real local-IPC integration tests; no mocked streams or fixed names.
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
 use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
-use groupnet_transport::Transport;
 use groupnet_transport::link::{LinkLifecycle, LinkProvider, PeerEndpoint};
+use groupnet_transport::{QueueCapacity, Transport};
 use groupnet_transport_ipc::{IpcAddress, IpcConfig, IpcLink, IpcTransport, MAX_FRAME};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -532,7 +533,7 @@ async fn configured_peer_limit_allows_replacement_but_rejects_growth() {
     let peer_address = Address::new();
     let another_address = Address::new();
     let config = IpcConfig {
-        max_peers: 1,
+        max_peers: NonZeroUsize::MIN,
         ..IpcConfig::default()
     };
     let transport =
@@ -555,7 +556,7 @@ async fn configured_peer_limit_allows_replacement_but_rejects_growth() {
 async fn invalid_limits_do_not_reserve_native_listener() {
     let address = Address::new();
     let config = IpcConfig {
-        session_queue: 0,
+        setup_timeout: Duration::ZERO,
         ..IpcConfig::default()
     };
     assert_eq!(
@@ -584,10 +585,11 @@ async fn owned_packets_cross_native_ipc_with_small_configured_queues() {
     let left_address = Address::new();
     let right_address = Address::new();
     let config = IpcConfig {
-        max_peers: 1,
-        max_sessions: 1,
-        session_queue: 1,
-        inbound_queue: 1,
+        max_peers: NonZeroUsize::MIN,
+        max_sessions: QueueCapacity::MIN,
+        session_queue: QueueCapacity::MIN,
+        inbound_queue: QueueCapacity::MIN,
+        ..IpcConfig::default()
     };
     let left =
         IpcTransport::bind_with_config(NodeId::new("left"), &left_address.ipc, config).unwrap();
@@ -602,4 +604,89 @@ async fn owned_packets_cross_native_ipc_with_small_configured_queues() {
     assert_eq!(receive(&right).await.msg, payload);
     left.close().await;
     right.close().await;
+}
+
+// The deadline tests configure deadlines far below the test's own `DEADLINE`
+// (which equals the 5 s setup default), so a session closing in time proves
+// the configured value — not a hard-coded one — was applied.
+
+#[tokio::test]
+async fn configured_setup_deadline_closes_a_silent_connection() {
+    let address = Address::new();
+    let config = IpcConfig {
+        setup_timeout: Duration::from_millis(100),
+        ..IpcConfig::default()
+    };
+    let transport =
+        IpcTransport::bind_with_config(NodeId::new("listener"), &address.ipc, config).unwrap();
+    let mut stream = raw_connect(&address.ipc).await;
+    // No introduction is ever sent; the listener gives up at its deadline.
+    assert_closed(&mut stream).await;
+    transport.close().await;
+}
+
+#[tokio::test]
+async fn configured_read_deadline_closes_an_idle_session() {
+    let address = Address::new();
+    let config = IpcConfig {
+        read_timeout: Duration::from_millis(100),
+        ..IpcConfig::default()
+    };
+    let transport =
+        IpcTransport::bind_with_config(NodeId::new("listener"), &address.ipc, config).unwrap();
+    let mut stream = raw_connect(&address.ipc).await;
+    introduction(&mut stream).await;
+    // The session is established but never carries a frame.
+    assert_closed(&mut stream).await;
+    transport.close().await;
+}
+
+/// Whether the listener admits a fresh connection: it introduces itself only
+/// when a session slot is free, and drops the connection otherwise.
+async fn admitted(address: &IpcAddress) -> bool {
+    let mut probe = raw_connect(address).await;
+    if probe.write_all(b"GNI1\x05probe").await.is_err() {
+        return false;
+    }
+    let mut header = [0_u8; 5];
+    probe.read_exact(&mut header).await.is_ok()
+}
+
+#[tokio::test]
+async fn configured_write_deadline_ends_a_session_whose_peer_stops_reading() {
+    let address = Address::new();
+    let config = IpcConfig {
+        max_sessions: QueueCapacity::MIN,
+        write_timeout: Duration::from_millis(100),
+        ..IpcConfig::default()
+    };
+    let transport =
+        IpcTransport::bind_with_config(NodeId::new("listener"), &address.ipc, config).unwrap();
+    let mut stream = raw_connect(&address.ipc).await;
+    introduction(&mut stream).await;
+    // A delivered inbound frame proves the session is registered for sends.
+    stream.write_u32_le(2).await.unwrap();
+    stream.write_all(b"up").await.unwrap();
+    assert_eq!(receive(&transport).await.msg.as_ref(), b"up");
+    // The single slot is held by the live session.
+    assert!(!admitted(&address.ipc).await);
+
+    let raw = NodeId::new("raw");
+    let frame = vec![0x5a; MAX_FRAME];
+    // Far more than any OS buffer holds while `stream` is never read: the
+    // writer blocks, and full-queue sends are best-effort drops meanwhile.
+    for _ in 0..256 {
+        transport.send(&raw, &frame).await.unwrap();
+        tokio::task::yield_now().await;
+    }
+    // The write deadline ends the stalled session and frees its slot.
+    timeout(DEADLINE, async {
+        while !admitted(&address.ipc).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the write deadline must end the stalled session");
+    drop(stream);
+    transport.close().await;
 }

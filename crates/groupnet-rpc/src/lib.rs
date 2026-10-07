@@ -22,7 +22,7 @@
 //! });
 //!
 //! // On a calling node: one client, cloned freely.
-//! let client = RpcClient::new(client_plane, RpcConfig::default());
+//! let client = RpcClient::new(client_plane, RpcConfig::default()).expect("valid limits");
 //! let reply = client
 //!     .call(&NodeId::new("node-b"), Bytes::from_static(b"ping"), Duration::from_secs(1))
 //!     .await;
@@ -54,8 +54,8 @@
 //! ## Wire format
 //!
 //! Each RPC frame is one data-plane frame (so it inherits the data plane's
-//! length prefix); its payload is version byte, kind byte and fixed fields,
-//! big-endian:
+//! length prefix); its payload is a typed big-endian head — version byte,
+//! kind byte and fixed fields — followed by the body:
 //!
 //! | Kind | Fields after `version = 1`, `kind` |
 //! |------|------------------------------------|
@@ -71,22 +71,42 @@
 //!
 //! ## Limits
 //!
+//! Limits are typed: frame bounds are a [`FrameLimit`], queue and admission
+//! bounds a [`QueueCapacity`](groupnet_transport::QueueCapacity), and the
+//! timers are checked once, when the client or server is built
+//! ([`RpcConfig::validate`], [`RpcServerConfig::validate`]).
+//!
 //! * `max_frame_bytes` caps one whole RPC frame (head included) on both
-//!   sides; give the client's [`RpcConfig`] and the server's
-//!   [`RpcServerConfig`] the same value. A request over the client's limit is
-//!   refused before it is sent ([`RpcError::TooLarge`]); a response over the
-//!   server's limit is replaced by an [`RpcStatus::RESPONSE_TOO_LARGE`] error.
+//!   sides, at most the data plane's
+//!   [`MAX_FRAME_BYTES`](groupnet_transport::framing::MAX_FRAME_BYTES); give
+//!   the client's [`RpcConfig`] and the server's [`RpcServerConfig`] the same
+//!   value. A request over the client's limit is refused before it is sent
+//!   ([`RpcError::TooLarge`]); a response over the server's limit is replaced
+//!   by an [`RpcStatus::RESPONSE_TOO_LARGE`] error.
 //! * A client allows `max_in_flight_per_peer` concurrent calls to each peer;
 //!   further calls wait for a slot within their own timeout.
+//! * A client tracks at most `max_peers` destinations. A call to a new one
+//!   at the limit evicts a destination no call is using (closing its
+//!   connection), or fails [`RpcError::Saturated`] if every destination is
+//!   busy.
+//! * A server serves at most `max_connections` connections; at the limit it
+//!   stops accepting until one ends.
 //! * A server runs at most `max_concurrent_per_connection` handlers per
 //!   connection; past that it stops reading the connection, which pushes
 //!   back on the caller through the transport.
+//! * Idle connections are closed: by the client after its `idle_timeout`
+//!   with no call waiting, by the server after its `idle_timeout` with no
+//!   request and no handler running. Keep the server's longer than the
+//!   clients', so the side that knows nothing is in flight closes first.
+//!   Call timeouts and timers are bounded by [`MAX_TIMEOUT`], the
+//!   wire deadline's `u32` milliseconds.
 //!
 //! [`DataPlane::accept`]: groupnet_transport::bulk::DataPlane::accept
 //! [`DataPlane::transport`]: groupnet_transport::bulk::DataPlane::transport
 
 mod client;
 mod codec;
+mod config;
 mod server;
 
 use std::error::Error;
@@ -96,17 +116,11 @@ use futures_util::io::AsyncWrite;
 use groupnet_transport::bulk::DataStream;
 use tokio::sync::mpsc;
 
-pub use client::{RpcClient, RpcConfig};
-pub use server::{RpcServer, RpcServerConfig, RpcServerHandle};
+pub use client::RpcClient;
+pub use config::{FrameLimit, MAX_TIMEOUT, RpcConfig, RpcServerConfig};
+pub use server::{RpcServer, RpcServerHandle};
 
 use codec::Encoded;
-
-/// The largest frame the data plane carries (256 MiB); the ceiling for every
-/// `max_frame_bytes`.
-pub const MAX_FRAME_LIMIT: usize = 256 << 20;
-
-/// The default `max_frame_bytes` on both sides: 16 MiB.
-pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 << 20;
 
 /// A failure a handler (or the server on its behalf) reports to the caller.
 ///
@@ -178,6 +192,10 @@ pub enum RpcError {
     Remote(RpcStatus),
     /// The request exceeds the client's `max_frame_bytes`; it was not sent.
     TooLarge,
+    /// The client already tracks `max_peers` destinations, each with a call
+    /// in progress, so a new destination cannot be admitted; the request was
+    /// not sent.
+    Saturated,
     /// The client was shut down.
     Shutdown,
 }
@@ -190,6 +208,7 @@ impl fmt::Display for RpcError {
             Self::ConnectionLost => f.write_str("rpc connection lost with the call in flight"),
             Self::Remote(status) => write!(f, "remote error: {status}"),
             Self::TooLarge => f.write_str("rpc request exceeds the frame limit"),
+            Self::Saturated => f.write_str("rpc client destination limit reached"),
             Self::Shutdown => f.write_str("rpc client shut down"),
         }
     }
@@ -204,30 +223,17 @@ impl Error for RpcError {
     }
 }
 
-/// Checks a configured frame limit.
-///
-/// # Panics
-/// If `max_frame_bytes` cannot hold a request head or exceeds
-/// [`MAX_FRAME_LIMIT`].
-fn check_frame_limit(max_frame_bytes: usize) {
-    assert!(
-        (codec::REQUEST_HEAD..=MAX_FRAME_LIMIT).contains(&max_frame_bytes),
-        "max_frame_bytes must be within {}..={MAX_FRAME_LIMIT}, got {max_frame_bytes}",
-        codec::REQUEST_HEAD
-    );
-}
-
 /// A connection's single writer: the only code that writes to its stream, so
 /// frames never interleave. Returns when every sender is gone or a write
 /// fails (the connection is then torn down by its owner).
 async fn write_frames<W: AsyncWrite + Unpin>(
     writer: &mut DataStream<W>,
-    mut frames: mpsc::Receiver<Encoded>,
-    max_frame_bytes: usize,
+    frames: &mut mpsc::Receiver<Encoded>,
+    max_frame_bytes: FrameLimit,
 ) {
     while let Some(frame) = frames.recv().await {
         if writer
-            .send_bounded_parts(frame.head(), frame.body(), max_frame_bytes)
+            .send_bounded_parts(frame.head(), frame.body(), max_frame_bytes.get())
             .await
             .is_err()
         {

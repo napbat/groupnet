@@ -18,10 +18,11 @@ bytes = { workspace = true }
 # catching a handler's panic).
 futures-util = { workspace = true, features = ["io"] }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+zerocopy = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 groupnet-transport-mem = { workspace = true, features = ["bulk"] }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,
 # so this never enters the published dependency graph. Do NOT add `version`.
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
