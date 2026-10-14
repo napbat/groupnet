@@ -464,5 +464,4 @@ impl SessionEngine {
 }
 
 #[cfg(test)]
-#[path = "ack_wait_tests.rs"]
 mod tests;

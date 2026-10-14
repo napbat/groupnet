@@ -932,7 +932,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod admission_regressions;
+mod admission_tests;
 
 #[cfg(test)]
 mod config_tests;

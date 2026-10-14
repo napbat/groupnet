@@ -152,10 +152,10 @@ Five more live with the layers they exercise:
 
 ```bash
 cargo run -p groupnet-sim --example partition              # partition -> detect -> heal -> rejoin, bit-for-bit reproducible
-cargo run -p groupnet-consistency --example read_your_writes   # write feed + applied-frontier barrier, and a gap surfacing
-cargo run -p groupnet-consistency --example fenced_ownership --features hosted   # elected host, majority-committed claims, and a store refusing a fenced-out writer
-cargo run -p groupnet-consistency --example anchored_ownership --features hosted   # the same claims, with the epoch won by one conditional PUT against a CAS object
-cargo run -p groupnet-consistency --example hosted_handoff --features handoff   # a late joiner past the ring: the honest gap, a covering snapshot over the data plane, and a contiguous resume
+cargo run -p groupnet-consistency --example read-your-writes   # write feed + applied-frontier barrier, and a gap surfacing
+cargo run -p groupnet-consistency --example fenced-ownership --features hosted   # elected host, majority-committed claims, and a store refusing a fenced-out writer
+cargo run -p groupnet-consistency --example anchored-ownership --features hosted   # the same claims, with the epoch won by one conditional PUT against a CAS object
+cargo run -p groupnet-consistency --example hosted-handoff --features handoff   # a late joiner past the ring: the honest gap, a covering snapshot over the data plane, and a contiguous resume
 ```
 
 ```rust
@@ -742,7 +742,7 @@ Neither implementation is ICE/STUN/TURN or guarantees traversal through arbitrar
 NATs. Open admission proves no identity ownership; transport MACs are not payload
 encryption. Use application-defined admission and pinned tunnels where required.
 
-The [connectivity bridge example](crates/groupnet/examples/connectivity-bridge.rs)
+The [connectivity bridge example](crates/groupnet/examples/connectivity-bridge/main.rs)
 demonstrates memory-only A talking bidirectionally to TCP-only C through B,
 group convergence, and route withdrawal without breaking the memory adjacency.
 With `--upgrade`, A explicitly gains a TCP adapter; routing promotes its admitted

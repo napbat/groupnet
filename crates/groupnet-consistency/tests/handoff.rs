@@ -19,10 +19,10 @@
 //! of the split: a hostless group stamps `(0, None)` at both ends, the staleness
 //! rule passes that, and no test in this file pays for an election it is not
 //! about. The fence-sensitive half — the two staleness checks and `donors()` —
-//! needs real epochs and lives in `handoff_fence.rs`, which carries its own copy
+//! needs real epochs and lives in `handoff-fence.rs`, which carries its own copy
 //! of the source and sink below. Duplicated helpers across sibling test files is
-//! the house pattern (`groupnet-sim`'s `election_quorum*`, this crate's
-//! `hosted_dst*`).
+//! the house pattern (`groupnet-sim`'s `election-quorum*`, this crate's
+//! `hosted-dst*`).
 //!
 //! Every wait is a bounded poll on a predicate (`eventually_within`), never a
 //! bare sleep.
@@ -159,7 +159,7 @@ impl SnapshotChunks for TestChunks {
             && self.handed == *after
         {
             // The borrow of the watch ends with the condition, so nothing is
-            // held across the await — `hosted_migration.rs`'s gate, verbatim.
+            // held across the await — `hosted-migration.rs`'s gate, verbatim.
             while !*gate.borrow_and_update() {
                 if gate.changed().await.is_err() {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gate dropped"));

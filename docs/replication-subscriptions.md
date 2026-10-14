@@ -339,9 +339,9 @@ backpressure as subscriber and stream counts rise.
 Evidence entry points:
 [core subscription transitions](../crates/groupnet-core/src/replication/session/subscription.rs),
 [terminal transitions](../crates/groupnet-core/src/replication/session/subscription/terminal.rs),
-[seeded delivery schedules](../crates/groupnet-sim/tests/replication_subscription_delivery.rs),
-[queued fault schedules](../crates/groupnet-sim/tests/replication_subscription_faults.rs),
-and [runtime adapter scenarios](../crates/groupnet-consistency/tests/replication_event_complete.rs).
+[seeded delivery schedules](../crates/groupnet-sim/tests/replication-subscription-delivery.rs),
+[queued fault schedules](../crates/groupnet-sim/tests/replication-subscription-faults.rs),
+and [runtime adapter scenarios](../crates/groupnet-consistency/tests/replication-event-complete/main.rs).
 They do not establish retention or atomic sink behavior for a production
 consumer adapter.
 
@@ -481,7 +481,7 @@ starts. This implementation does not supply a production lease-holder adapter.
 References: [public acknowledgement API](../crates/groupnet-consistency/src/replication/ack_api.rs),
 [runtime driver](../crates/groupnet-consistency/src/replication/shell/driver/ack.rs),
 [core wait transitions](../crates/groupnet-core/src/replication/session/ack_wait.rs),
-[core scenarios](../crates/groupnet-core/src/replication/session/ack_wait_tests.rs),
-[seeded waits](../crates/groupnet-sim/tests/replication_ack_wait.rs),
-[wait fault schedules](../crates/groupnet-sim/tests/replication_ack_wait_faults.rs),
-and [runtime scenarios](../crates/groupnet-consistency/tests/replication_ack.rs).
+[core scenarios](../crates/groupnet-core/src/replication/session/ack_wait/tests.rs),
+[seeded waits](../crates/groupnet-sim/tests/replication-ack-wait.rs),
+[wait fault schedules](../crates/groupnet-sim/tests/replication-ack-wait-faults.rs),
+and [runtime scenarios](../crates/groupnet-consistency/tests/replication-ack.rs).

@@ -52,45 +52,45 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    there. (Largest today, and the only ones still within ~50 lines of the
    limit, so the next addition to them splits them *first*:
    `groupnet-consistency`'s `src/replication/shell/driver.rs` ~967,
-   `tests/lease_dst.rs` ~971, `tests/replication.rs` ~944 and
-   `tests/volatile_bootstrap_runtime/scenarios.rs` ~951 (new runtime
-   scenarios go in their own `volatile_bootstrap_runtime/` children, as
-   `follower_progress.rs` does; the parent, ~711 since `PeerDonor` moved to
-   `peer_donor.rs`, keeps the shared fakes);
+   `tests/lease-dst.rs` ~971, `tests/replication.rs` ~944 and
+   `tests/volatile-bootstrap-runtime/scenarios.rs` ~951 (new runtime
+   scenarios go in their own `volatile-bootstrap-runtime/` children, as
+   `follower_progress.rs` does; the parent `main.rs`, ~705 since `PeerDonor`
+   moved to `peer_donor.rs`, keeps the shared fakes);
    `groupnet-runtime`'s `src/driver.rs` ~960 and `src/group.rs` ~960. The
    band under them, with ~60–150 lines of room: `groupnet-core`'s
    `src/volatile_recovery/tests.rs` ~930 (the next lapse-arm test goes in a
-   sibling file, as `tests_peer.rs` and `tests_seal.rs` did),
+   sibling file, as `peer_tests.rs` and `seal_tests.rs` did),
    `tests/election.rs` ~909,
    `src/volatile_bootstrap/transfer/tests.rs` ~904,
    `src/volatile_bootstrap/engine.rs` ~931 (the next recapture state goes in
    `engine/recapture.rs`, ~426),
    `src/volatile_bootstrap/engine/participation.rs` ~883,
-   `src/engine/election/mod.rs` ~873,
+   `src/engine/election.rs` ~873,
    `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861,
    `src/engine/election/quorum.rs` ~859 and
    `src/volatile_recovery/engine.rs` ~865 (its fallback paths moved to
    `engine/fallback.rs`, its head evidence to `engine/evidence.rs`);
    `groupnet-sim`'s
-   `tests/election_external_skew.rs` ~910, `tests/election_quorum.rs` ~896
+   `tests/election-external-skew.rs` ~910, `tests/election-quorum.rs` ~896
    and `src/simulation.rs` ~894; `groupnet-consistency`'s
    `src/replication/shell.rs` ~914,
-   `tests/hosted_dst_liveness.rs` ~875, `tests/volatile_bootstrap_bulk_adapter.rs`
+   `tests/hosted-dst-liveness.rs` ~875, `tests/volatile-bootstrap-bulk-adapter.rs`
    ~864, `src/volatile_recovery/bootstrap/session/run.rs` ~862,
-   `tests/lease_dst_liveness.rs` ~876,
+   `tests/lease-dst-liveness.rs` ~876,
    `src/replication/shell/driver/snapshot.rs` ~844 and
-   `tests/replication_snapshot.rs` ~840.
+   `tests/replication-snapshot.rs` ~840.
    With room still: `groupnet-runtime`'s `src/node.rs` ~803,
-   `tests/external_faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
+   `tests/external-faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
    ~754 and `tests/external.rs` ~706; `groupnet-consistency`'s
-   `src/hosted/writes/mod.rs` ~795, `src/hosted/handoff/stream.rs` ~775,
+   `src/hosted/writes.rs` ~795, `src/hosted/handoff/stream.rs` ~775,
    `src/lease/core.rs` ~827, `src/lease/shell.rs` ~794 (a coherent write's
    wait lives in `lease/shell/writes.rs`),
-   `tests/handoff_fence.rs` ~761, `src/hosted/lineage.rs` ~800,
-   `tests/handoff_migration.rs` ~757, `tests/hosted_migration.rs` ~752,
+   `tests/handoff-fence.rs` ~761, `src/hosted/lineage.rs` ~800,
+   `tests/handoff-migration.rs` ~757, `tests/hosted-migration.rs` ~752,
    `src/hosted/ledger.rs` ~725, `src/hosted/handoff/wire.rs` ~717 and
-   `tests/handoff_resync.rs` ~702; `groupnet-sim/tests/election_external.rs`
-   ~786; `groupnet-core`'s `tests/state.rs` ~774 and `src/wire/mod.rs` ~701.
+   `tests/handoff-resync.rs` ~702; `groupnet-sim/tests/election-external.rs`
+   ~786; `groupnet-core`'s `tests/state.rs` ~774 and `src/wire.rs` ~701.
    `simulation.rs` has now absorbed three subsystems' event kinds —
    **the next addition to it splits the probe/liveness dispatch out** rather
    than growing it again.) Four splits worth copying:
@@ -98,25 +98,25 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
      `hosted/lineage.rs` decides and is unit-tested without a runtime);
    - a **DST harness** splits by *schedule family*, each file carrying its own
      copy of the harness and asserting the floors its own schedule earns — the
-     house pattern `groupnet-sim`'s `election_quorum*` and this crate's
-     `hosted_dst*` suites both follow, and `groupnet-runtime`'s `external.rs` /
-     `external_faults.rs` (the tier, and the same tier with its store broken)
+     house pattern `groupnet-sim`'s `election-quorum*` and this crate's
+     `hosted-dst*` suites both follow, and `groupnet-runtime`'s `external.rs` /
+     `external-faults.rs` (the tier, and the same tier with its store broken)
      applies to an integration suite;
    - a **shaped-scenario suite** splits by the *rule* each scenario prices, not
-     by size: `election_external_failover.rs` keeps the availability-axis
-     scenarios and the failover budget, `election_external_rank.rs` takes the
-     three the rank gate pays for; `election_quorum.rs` keeps the voter ledger
-     and the grant round, `election_quorum_renewal.rs` takes renewal, fencing
+     by size: `election-external-failover.rs` keeps the availability-axis
+     scenarios and the failover budget, `election-external-rank.rs` takes the
+     three the rank gate pays for; `election-quorum.rs` keeps the voter ledger
+     and the grant round, `election-quorum-renewal.rs` takes renewal, fencing
      and the recovered-grant posture. Every test is self-contained, so the
      move costs nothing;
-   - a **big inline `#[cfg(test)] mod tests`** moves to a sibling file —
-     `wire.rs` becomes `wire/mod.rs` + `wire/tests.rs` behind
-     `#[cfg(test)] mod tests;` (likewise `hosted/writes/`), which keeps every
+   - a **big inline `#[cfg(test)] mod tests`** moves to a child file —
+     `wire.rs` keeps `#[cfg(test)] mod tests;` and the body moves to
+     `wire/tests.rs` (likewise `hosted/writes.rs`), which keeps every
      `wire::tests::…` path byte-identical. And when a DST file is *already*
      one schedule family (one `#[test]`, one seed loop) it cannot split by
      family without moving seeds and floors, so it splits its harness into a
-     `#[path]`-included child instead: `tests/hosted_dst.rs` keeps the model
-     and the property suite, `tests/hosted_dst/harness.rs` holds the cluster
+     target-local child instead: `tests/hosted-dst/main.rs` keeps the model
+     and the property suite, `tests/hosted-dst/harness.rs` holds the cluster
      harness and the schedule. The child sees the parent's private items, so
      only the scenario entry point needs `pub(crate)` and the binary's output
      does not move a byte.
@@ -144,12 +144,23 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 
 - Follow [Cargo's project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html):
   libraries in `src/lib.rs`, binaries in `src/main.rs` or `src/bin/`,
-  and targets in `examples/`, `benches/`, and `tests/`. Multi-file targets use
-  `<target-name>/main.rs` plus target-local modules. New target names use
-  kebab-case; Rust module names use snake_case.
+  and targets in `examples/`, `benches/`, and `tests/`. Binary, example, bench
+  and integration-test names are kebab-case (`tests/hosted-dst-liveness.rs`,
+  `examples/fenced-ownership.rs`); a multi-file target is `<target-name>/main.rs`
+  plus snake_case target-local modules (`tests/hosted-dst/harness.rs`).
+- Library modules are `foo.rs` with their children in `foo/`, never
+  `foo/mod.rs`. Module files and directories are snake_case and do not repeat
+  their parent's name (`msg/endpoint.rs`, not `msg_endpoint.rs`). `#[path]` is
+  reserved for platform-selected modules (`ipc/platform.rs`) and fixtures
+  shared between unit and integration tests; never use it to flatten a module
+  tree or stitch a target together.
 - Unit tests: inline `#[cfg(test)] mod tests` at the bottom of the file they
-  test. Integration tests are noun-named by behavior. Reusable cross-suite
-  helpers belong in `groupnet-testkit` (never `tests/common/mod.rs`).
+  test; a large one moves to `foo/tests.rs`. Further suites for the same module
+  are behavior-named `<topic>_tests.rs` children declared by that module
+  (`punch/endpoint/candidate_state_tests.rs`), sharing helpers through
+  `pub(super)` items in its `tests.rs`. Integration tests are noun-named by
+  behavior. Reusable cross-suite helpers belong in `groupnet-testkit` (never
+  `tests/common/mod.rs`).
 - Keep public configuration and lifecycle APIs separate from adapter workers,
   routing state transitions, and wire codecs. Split by responsibility rather
   than adding wrappers or weakening lints to accommodate oversized functions.

@@ -62,7 +62,7 @@
 //! the [`owner`](groupnet_core::placement::owner) of the group id among the two
 //! hosts wins. That tiebreak reads nothing but the group id and the two host
 //! ids, so it is view-independent: every node, on either side of a heal, picks
-//! the same survivor without exchanging anything (`engine/election/mod.rs`). A
+//! the same survivor without exchanging anything (`engine/election.rs`). A
 //! handoff could apply the very same rule and accept a donor whose host is the
 //! one that will win.
 //!

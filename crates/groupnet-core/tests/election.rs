@@ -873,7 +873,7 @@ fn an_eventual_group_runs_no_election() {
 /// leadership, never arms a lease, and never puts a grant on the wire (its own
 /// self-grant is counted, not sent). Unavailable, never unsafe — which is the
 /// whole point of the CP posture. The grant rows themselves live in
-/// `tests/election_quorum.rs`.
+/// `tests/election-quorum.rs`.
 #[test]
 fn a_quorum_group_without_a_voter_majority_never_activates() {
     // Under Quorum the lease is also the claim window and the boot guard.

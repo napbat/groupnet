@@ -127,19 +127,19 @@ groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
 # `hosted` module. Declared here only — every other example stays
 # auto-discovered.
 [[example]]
-name = "fenced_ownership"
+name = "fenced-ownership"
 required-features = ["hosted"]
 
 # The External activation's example — same docres shape, epoch closed at a CAS
 # object instead of by a voter majority.
 [[example]]
-name = "anchored_ownership"
+name = "anchored-ownership"
 required-features = ["hosted"]
 
 # The handoff tier's example — the only one that needs both planes, so it also
 # needs the `bulk` half of the dev-dependency above.
 [[example]]
-name = "hosted_handoff"
+name = "hosted-handoff"
 required-features = ["handoff"]
 
 [lints]

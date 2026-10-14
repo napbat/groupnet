@@ -215,11 +215,11 @@ first protocol uses one short-lived request stream per operation, while the
 donor journal retains and serves the continuous bounded suffix. It is not an
 unbounded open socket per follower.
 
-`volatile_bootstrap_bulk_adapter.rs` exercises the real `MemBulkNet` mapping
+`volatile-bootstrap-bulk-adapter.rs` exercises the real `MemBulkNet` mapping
 and all nine generic donor-journal request branches, including nonempty C→B
 and B2, reservation/ack readback, and exact wrong-operation refusal.
-`volatile_bootstrap_journal_readback.rs` checks seeded lost, duplicate, and
-reordered source replies; `volatile_bootstrap_runtime.rs` checks worker
+`volatile-bootstrap-journal-readback.rs` checks seeded lost, duplicate, and
+reordered source replies; the `volatile-bootstrap-runtime` suite checks worker
 expiry, stale install, cancellation, and donor withdrawal. The earlier bulk
 client/listener tests cover correlation and listener identity rotation.
 These are reusable protocol boundaries, not a claim that a connected S3

@@ -163,12 +163,10 @@ required-features = ["runtime", "mem", "tcp-msg", "connectivity"]
 
 [[example]]
 name = "packet-path"
-path = "examples/packet-path/main.rs"
 required-features = ["runtime", "mem", "udp", "tcp-msg", "connectivity"]
 
 [[example]]
 name = "tunnel-throughput"
-path = "examples/tunnel-throughput/main.rs"
 required-features = ["runtime", "tcp-msg"]
 
 [lints]

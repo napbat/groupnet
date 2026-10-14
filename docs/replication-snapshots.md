@@ -188,8 +188,8 @@ Implementation and evidence references:
   [snapshot runtime driver](../crates/groupnet-consistency/src/replication/shell/driver/snapshot.rs),
   and [core transitions](../crates/groupnet-core/src/replication/session/snapshot.rs);
 - [core recovery scenarios](../crates/groupnet-core/src/replication/snapshot_tests.rs),
-  [seeded snapshot schedules](../crates/groupnet-sim/tests/replication_snapshot.rs),
-  and [runtime adapter scenarios](../crates/groupnet-consistency/tests/replication_snapshot.rs).
+  [seeded snapshot schedules](../crates/groupnet-sim/tests/replication-snapshot.rs),
+  and [runtime adapter scenarios](../crates/groupnet-consistency/tests/replication-snapshot.rs).
 
 These references cover the generic implementation and its test adapters.
 They do not certify a real native checkpoint store, origin LIST scan, or

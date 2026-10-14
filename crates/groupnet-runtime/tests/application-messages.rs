@@ -1,5 +1,5 @@
 //! Application routing, frozen group fanout, queue failures, and buffer limits.
-//! Callback execution/ownership regressions live in `message_callbacks.rs`.
+//! Callback execution/ownership regressions live in `message-callbacks.rs`.
 
 use std::io;
 use std::time::Duration;

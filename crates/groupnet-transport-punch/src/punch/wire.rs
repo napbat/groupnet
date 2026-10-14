@@ -777,5 +777,4 @@ pub(super) fn sign_check(mut packet: Packet<'_>) -> Packet<'_> {
 mod tests;
 
 #[cfg(test)]
-#[path = "wire/candidate_tests.rs"]
 mod candidate_tests;

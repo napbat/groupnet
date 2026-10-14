@@ -369,10 +369,10 @@ protocol refines the sketch above in ways that are now contract:
   write still reports `TimedOut` — no guarantee, and a consumer must not
   report it to its client as coherent — when a reader that may serve has not
   shown it counts the writer, inside the writer's warm-up window, and after
-  the writer departed. Proven in virtual time by `tests/lease_dst.rs` (224
+  the writer departed. Proven in virtual time by `tests/lease-dst.rs` (224
   chaos seeds: the Gray–Cheriton lapse contract, no-unconfirmed-extension,
-  previous-life ghosts never serve), `tests/lease_dst_liveness.rs` (64
-  liveness seeds) and `tests/lease_dst_divergence.rs` (96 seeds of
+  previous-life ghosts never serve), `tests/lease-dst-liveness.rs` (64
+  liveness seeds) and `tests/lease-dst-divergence.rs` (96 seeds of
   partitions past the reap horizon, departures and clock-rate skew within the
   margin: no serving reader ever misses a write any node completed).
 
@@ -651,7 +651,7 @@ refine the sketch above and are now contract:
   `HostedError::NotHost { host: None }` when this node is not host and sees
   none, or `NotHost { host: Some(peer) }` as a redirect.
 
-Proven at this layer by `groupnet-core/tests/election_quorum.rs` (the grant
+Proven at this layer by `groupnet-core/tests/election-quorum.rs` (the grant
 rules and round arithmetic), the Quorum DST seeds in `groupnet-sim`, and
 `groupnet-runtime/tests/quorum.rs` — which is where the *driver* half is
 falsifiable: a majority of real stores holding the winning pair, a voter whose
@@ -705,7 +705,7 @@ comparison).
 Status: **delivered (pending review)** — both sans-IO cores, the `HostedWrites`
 / `HostedReads` / `CommitLedger` shells, the DST, and the runnable
 fenced-ownership example
-(`crates/groupnet-consistency/examples/fenced_ownership.rs`) are built.
+(`crates/groupnet-consistency/examples/fenced-ownership.rs`) are built.
 Everything below is the contract of record for them: it amends, and in three
 places narrows, the sketch above.
 
@@ -1078,10 +1078,10 @@ Status: **Delivered (pending review).** What shipped, by layer:
   per-node wall-clock skew and ambiguous writes in **both** readings (applied
   but unreported, and never applied and unreported), all orthogonal to fabric
   partitions.
-* **tests** — `groupnet-core/tests/election_external.rs`, the
-  `groupnet-sim/tests/election_external*.rs` suites,
-  `groupnet-runtime/tests/external.rs` and `external_faults.rs`, and a runnable
-  example (`cargo run -p groupnet-consistency --example anchored_ownership
+* **tests** — `groupnet-core/tests/election-external.rs`, the
+  `groupnet-sim/tests/election-external*.rs` suites,
+  `groupnet-runtime/tests/external.rs` and `external-faults.rs`, and a runnable
+  example (`cargo run -p groupnet-consistency --example anchored-ownership
   --features hosted`).
 
 Everything below is the contract of record for what is built.
@@ -1128,7 +1128,7 @@ steals at `expires + steal_margin` and two nodes host **with perfect clocks**.
 floor puts renewal rounds at least half a lease apart, so a renewal always
 stamps a strictly later expiry than the one it replaces. Both DST and the
 runtime suite carry the fault (`X-ambiguity-b`, and the write-throttled fixture
-in `groupnet-runtime/tests/external_faults.rs`).
+in `groupnet-runtime/tests/external-faults.rs`).
 Anything richer — a lock service with sessions, a lease API, a compare-and-swap
 with a callback — would be a second protocol to write per backend. This one is
 written **once**, and a consumer with etcd or ZooKeeper adapts *down* to it
@@ -1276,7 +1276,7 @@ anchor access at all*, so nobody replaces it and the group is left **hostless
 despite having a working, willing host**. That is the compound price of the two
 gates together (`X-rank` × row X7), it is the CP posture being honest rather
 than a bug, and it is pinned by `X-rank-compound` in
-`election_external_rank.rs`, which asserts both halves: the incumbent
+`election-external-rank.rs`, which asserts both halves: the incumbent
 lapses, and the group stays hostless past the instant its record became
 stealable until the top-ranked node's anchor heals.
 
@@ -1401,13 +1401,13 @@ allowed to depend on a courtesy.
 | Where | What it pins |
 |---|---|
 | `groupnet-core/src/anchor.rs` (unit) | the decision rules as tables: absent/held-by-self/live-other/stealable at the exact millisecond, the hint as a floor, saturating arithmetic, the ambiguous-write truth table — including the renewal that did **not** apply and must not be mistaken for the record it meant to replace |
-| `groupnet-core/tests/election_external.rs` | the `X`-rows against a real engine, including the rank-gated X7, the fail-closed step-down, and the leave that no in-flight anchor round may undo; **X-purity** asserted over each run's *whole* effect stream |
-| `groupnet-sim/tests/election_external.rs` | **X-S1** over 128 chaos seeds (crashes, amnesiac restarts, partitions, anchor outages, loss, reorder, arbitrary skew) — unconditional, with no storage anywhere; X-S2/S4b sampled after every round; **L1-external** (one host, it is the register's holder *and* the rendezvous owner of the live set) |
-| `groupnet-sim/tests/election_external_failover.rs` | **X-part** (partition-irrelevance, with the `Quorum` inversion on the identical schedule), **X-closed** (no anchor, no host), and **X-budget** — 32 seeds against an itemized virtual-time budget with no fudge term |
-| `groupnet-sim/tests/election_external_rank.rs` | **X-rank** (the rank-pinned-hostless cost), **X-rank-compound** (that cost composed with rank-gated renewal: a working host lapses and nobody replaces it), and **X-handback** |
-| `groupnet-sim/tests/election_external_skew.rs` | **X-skew-a** (96 seeds, `hosts() ≤ 1` after *every scheduled event*), **X-skew-b** (64 seeds, each producing a real overlap: bounded by the excess, always cross-epoch, always resolved), **X-ambiguity-a** (64 seeds with a fifth to a half of writes applying and reporting `Unknown`), **X-ambiguity-b** (32 seeds of the store that swallows every write and still says `Unknown`: the lease lapses at exactly the instant the last landed round bought it, with perfect clocks and no overlap) |
+| `groupnet-core/tests/election-external.rs` | the `X`-rows against a real engine, including the rank-gated X7, the fail-closed step-down, and the leave that no in-flight anchor round may undo; **X-purity** asserted over each run's *whole* effect stream |
+| `groupnet-sim/tests/election-external.rs` | **X-S1** over 128 chaos seeds (crashes, amnesiac restarts, partitions, anchor outages, loss, reorder, arbitrary skew) — unconditional, with no storage anywhere; X-S2/S4b sampled after every round; **L1-external** (one host, it is the register's holder *and* the rendezvous owner of the live set) |
+| `groupnet-sim/tests/election-external-failover.rs` | **X-part** (partition-irrelevance, with the `Quorum` inversion on the identical schedule), **X-closed** (no anchor, no host), and **X-budget** — 32 seeds against an itemized virtual-time budget with no fudge term |
+| `groupnet-sim/tests/election-external-rank.rs` | **X-rank** (the rank-pinned-hostless cost), **X-rank-compound** (that cost composed with rank-gated renewal: a working host lapses and nobody replaces it), and **X-handback** |
+| `groupnet-sim/tests/election-external-skew.rs` | **X-skew-a** (96 seeds, `hosts() ≤ 1` after *every scheduled event*), **X-skew-b** (64 seeds, each producing a real overlap: bounded by the excess, always cross-epoch, always resolved), **X-ambiguity-a** (64 seeds with a fifth to a half of writes applying and reporting `Unknown`), **X-ambiguity-b** (32 seeds of the store that swallows every write and still says `Unknown`: the lease lapses at exactly the instant the last landed round bought it, with perfect clocks and no overlap) |
 | `groupnet-runtime/tests/external.rs` | the driver half over the async runtime and a real `Anchor`: elect, steal, the two inert postures, release-on-leave |
-| `groupnet-runtime/tests/external_faults.rs` | the same fixture with the store broken: unreachable-anchor availability, the incumbent-only cut, ambiguous-write read-back, and the write-throttled store whose failed renewals must lapse the lease instead of extending it |
+| `groupnet-runtime/tests/external-faults.rs` | the same fixture with the store broken: unreachable-anchor availability, the incumbent-only cut, ambiguous-write read-back, and the write-throttled store whose failed renewals must lapse the lease instead of extending it |
 
 Every seeded family prints its own floors on success (round tallies, steal
 counts, slack), so a schedule that has drifted *towards* its floor reports it
@@ -1446,11 +1446,11 @@ Status: **Delivered (pending review).** What shipped, by layer:
   `fetch_on`, `donors`, `seed`. The consumer supplies both ends of the *data*
   via `SnapshotSource` and `SnapshotSink`; this module never interprets a chunk.
 * **Tests** — `handoff.rs` (the ordered exchange over a plain group),
-  `handoff_fence.rs` (the two staleness re-verifications and `donors()` against
-  real epochs), `handoff_resync.rs` (a late joiner beyond the ring),
-  `handoff_migration.rs` (a recovering host completing through a transfer), the
-  facade smoke `groupnet/tests/consistency_handoff.rs`, and the runnable example
-  `crates/groupnet-consistency/examples/hosted_handoff.rs`.
+  `handoff-fence.rs` (the two staleness re-verifications and `donors()` against
+  real epochs), `handoff-resync.rs` (a late joiner beyond the ring),
+  `handoff-migration.rs` (a recovering host completing through a transfer), the
+  facade smoke `groupnet/tests/consistency-handoff.rs`, and the runnable example
+  `crates/groupnet-consistency/examples/hosted-handoff.rs`.
 
 The tier is **optional and additive**: `hosted` is complete without it, the
 `handoff` feature is off in every build that does not ask for it. Both it and
@@ -1471,7 +1471,7 @@ Two consequences fall straight out of that, and both are load-bearing:
 
 * **The live stream resumes contiguously.** After the transfer, the next write
   the subscriber is handed is the one after its cursor. There is no second
-  `Gap`, because nothing was ever missed a second time. `handoff_resync.rs`
+  `Gap`, because nothing was ever missed a second time. `handoff-resync.rs`
   asserts the arriving tokens are contiguous *and* that the **total** gap count
   over the whole run is still exactly one — the arrival gap — rather than
   comparing against a snapshot taken after the transfer, which would say nothing
@@ -1596,7 +1596,7 @@ than it has to be, deliberately. The fencing order is total over `(epoch, host)`
 pairs: epoch-major, and at equal epochs the `placement::owner` of the group id
 among the two hosts wins — a tiebreak that reads nothing but the group id and the
 two host ids, so every node on either side of a heal picks the same survivor
-without exchanging anything (`groupnet-core`'s `engine/election/mod.rs`). A
+without exchanging anything (`groupnet-core`'s `engine/election.rs`). A
 handoff could apply the same rule and accept a donor whose host is the one that
 will win. It does not, because it is fail-closed and its refusals are transient:
 the requester is about to adopt a whole image on the strength of this one verdict,
@@ -1657,7 +1657,7 @@ recovering — but a follower's applied state can include the previous host's
 un-replicated tail, which is precisely the state no surviving host will hold. The
 host's state is the one state definitionally survivable; a follower's is a
 best-effort second choice, taken when the host cannot serve, and it inherits the
-drain-window paragraph above rather than escaping it. `handoff_migration.rs` is
+drain-window paragraph above rather than escaping it. `handoff-migration.rs` is
 the case where the host *is* the requester, so the caught-up voter is next — a
 follower donor, chosen knowingly.
 
@@ -1685,8 +1685,8 @@ decisions do not depend on a downstream migration being complete.
 
 * **Host-scoped registers: DEFERRED.** The clause was "*plus host-scoped
   registers if fence tokens prove insufficient for docres locks*". They are
-  sufficient. The two runnable examples — `fenced_ownership` (Quorum) and
-  `anchored_ownership` (External) — **are** the docres lock shape end to end: an
+  sufficient. The two runnable examples — `fenced-ownership` (Quorum) and
+  `anchored-ownership` (External) — **are** the docres lock shape end to end: an
   ownership record committed through the host's serialized feed, then written to
   the store under the fence that authorized it, with the store refusing the
   deposed writer. Nothing in that path wants a register: the record lives where
@@ -1810,9 +1810,9 @@ Followers use `HostedReads` and `CommitLedger`, with `Frontier` for applied
 barriers; the T2 `AckLedger` is not the hosted commit ledger. The binding,
 apply-before-record and refresh requirements in the deployment contract above
 remain mandatory. See the maintained
-[`fenced_ownership` example](../crates/groupnet-consistency/examples/fenced_ownership.rs)
+[`fenced-ownership` example](../crates/groupnet-consistency/examples/fenced-ownership.rs)
 for the Quorum path and
-[`anchored_ownership`](../crates/groupnet-consistency/examples/anchored_ownership.rs)
+[`anchored-ownership`](../crates/groupnet-consistency/examples/anchored-ownership.rs)
 for the External/store-fence path.
 
 ## 5. Testing strategy
@@ -1892,11 +1892,11 @@ one. Four suites split by harness family, the house pattern:
 | Suite | What it earns |
 |---|---|
 | `groupnet-consistency/tests/handoff.rs` | the ordered exchange over a plain (hostless) group: a covering snapshot crossing whole and seeding the receiver, an early refusal that reads no byte of the donor's image, a mid-stream death installing nothing, and `is_request` demuxing a shared plane |
-| `groupnet-consistency/tests/handoff_fence.rs` | the fence-sensitive half, against real epochs: refusal at the **offer** for a donor behind us, refusal at the **terminator** for one deposed mid-stream, refusal at the terminator again for a donor whose *own* leadership moved while it streamed (the re-stamp, seen from the donor's side), and `donors()` over real gossiped ledgers — host first, short members out, and the caller out even when its own reading covers |
-| `groupnet-consistency/tests/handoff_resync.rs` | the laggard, over one steady hostship: a late joiner past the ring gets one `Gap`, fetches from the host `donors()` names, seeds, and **resumes contiguously with no second `Gap`** |
-| `groupnet-consistency/tests/handoff_migration.rs` | the ring-bound recovery, walked out of: an heir beyond the ring sits in `Recovering`, fetches from the caught-up voter (`donors()` excludes the requester itself), seeds, and the latch fires — then a `QuorumApplied` round resolves behind it |
+| `groupnet-consistency/tests/handoff-fence.rs` | the fence-sensitive half, against real epochs: refusal at the **offer** for a donor behind us, refusal at the **terminator** for one deposed mid-stream, refusal at the terminator again for a donor whose *own* leadership moved while it streamed (the re-stamp, seen from the donor's side), and `donors()` over real gossiped ledgers — host first, short members out, and the caller out even when its own reading covers |
+| `groupnet-consistency/tests/handoff-resync.rs` | the laggard, over one steady hostship: a late joiner past the ring gets one `Gap`, fetches from the host `donors()` names, seeds, and **resumes contiguously with no second `Gap`** |
+| `groupnet-consistency/tests/handoff-migration.rs` | the ring-bound recovery, walked out of: an heir beyond the ring sits in `Recovering`, fetches from the caught-up voter (`donors()` excludes the requester itself), seeds, and the latch fires — then a `QuorumApplied` round resolves behind it |
 
-`groupnet/tests/consistency_handoff.rs` is the facade smoke: the tier's
+`groupnet/tests/consistency-handoff.rs` is the facade smoke: the tier's
 vocabulary reachable through `groupnet::consistency::hosted::handoff`, and one
 real transfer over `groupnet::transport::mem`'s **both** planes — which is what
 fails if the manifest's `groupnet-transport-mem?/bulk` edge is ever removed.
@@ -1984,7 +1984,7 @@ the following surfaces; consumers still own policy and migration:
 
 Source evidence: `groupnet-runtime/src/group.rs`, `node.rs` and `capability.rs`,
 and `groupnet-consistency/src/floor.rs`. The runtime `capabilities.rs` and
-`status_duration.rs` integration suites cover the corresponding public surfaces.
+`status-duration.rs` integration suites cover the corresponding public surfaces.
 Section 2 records why they were requested; it does not certify that either
 consumer has replaced its bespoke code.
 

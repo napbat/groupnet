@@ -22,7 +22,7 @@
 //! What the driver does when the **store itself** is broken — unreachable for
 //! everybody, cut for the incumbent alone, applying writes it reports `Unknown`
 //! for, or refusing writes while its reads keep working — is
-//! `external_faults.rs`, which carries its own copy of this fixture and its own
+//! `external-faults.rs`, which carries its own copy of this fixture and its own
 //! fault knobs. The split is by schedule family, the same way the DST suites
 //! split.
 //!
@@ -166,7 +166,7 @@ enum Call {
 /// prove the driver *asked* — the shape `quorum.rs`'s `RecordingStore` uses,
 /// for the same reason. The knobs stay wired up here and are simply never
 /// turned on: every schedule that cripples a store lives in
-/// `external_faults.rs`, which carries the same fixture and the mutators for
+/// `external-faults.rs`, which carries the same fixture and the mutators for
 /// them.
 #[derive(Debug)]
 struct FakeAnchor {

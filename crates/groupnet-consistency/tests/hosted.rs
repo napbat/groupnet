@@ -17,9 +17,9 @@
 //!
 //! The **migration** family — the lineage a hand-over produces, the successor's
 //! recovery gate, and the cut a serving host takes on its predecessor — is next
-//! door in `hosted_migration.rs`, on its own copy of this file's `Voter`
+//! door in `hosted-migration.rs`, on its own copy of this file's `Voter`
 //! harness: duplicated helpers across sibling test files is the house pattern
-//! (`groupnet-sim`'s `election.rs` / `election_failover.rs`).
+//! (`groupnet-sim`'s `election.rs` / `election-failover.rs`).
 //!
 //! Every wait is a bounded poll on a predicate (`eventually_within`), never a
 //! bare sleep. The groups here run the **storage-free** Quorum posture (no

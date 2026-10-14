@@ -327,7 +327,7 @@ depends on the ordinary recovery, lease, and application gates.
 
 The optional recovery transitions, `BootstrapSession` worker composition,
 shared byte admission, `NativeClaimSource`, and `BulkDonorPort` exist.
-`volatile_bootstrap_runtime.rs` and its scenario children exercise baseline
+`volatile-bootstrap-runtime/main.rs` and its scenario children exercise baseline
 acquisition, expiry, stale install, cancellation, donor withdrawal, slow build
 progress, presence maintenance, and roster recapture. Core receipt types bind
 the exact outer recovery operation and child handoff. Bulk adapter tests
@@ -487,7 +487,7 @@ cancellation. Connect, request, reply and send use the original correlated
 deadline; only the core decides retry/readback. No claim, response, EOF, or
 matching head grants reads.
 
-`volatile_native_claims.rs` exercises actor-backed native publication,
+`volatile-native-claims.rs` exercises actor-backed native publication,
 participation, expiry, malformed-present versus absent, exact withdrawal,
 and restarted identities. Runtime, bulk codec/fault, and adapter suites
 exercise correlation, cancellation and admission ownership. Those suites

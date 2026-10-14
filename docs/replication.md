@@ -696,8 +696,8 @@ and all associated permits.
 Evidence: [idle policy and arithmetic](../crates/groupnet-core/src/replication/idle.rs),
 [session integration](../crates/groupnet-core/src/replication/session/idle.rs),
 [core scenarios](../crates/groupnet-core/src/replication/session/idle_tests.rs),
-[seeded schedules](../crates/groupnet-sim/tests/replication_idle.rs), and
-[runtime scenarios](../crates/groupnet-consistency/tests/replication_idle.rs).
+[seeded schedules](../crates/groupnet-sim/tests/replication-idle.rs), and
+[runtime scenarios](../crates/groupnet-consistency/tests/replication-idle.rs).
 These are implementation/test references, not a claim that this documentation
 cleanup reran those suites.
 
@@ -714,7 +714,7 @@ cannot introduce storage or a durable startup requirement.
 ### Virtual-time source-call measurements
 
 The effects-driven
-[`replication_idle_scale` test](../crates/groupnet-sim/tests/replication_idle_scale.rs)
+[`replication-idle-scale` test](../crates/groupnet-sim/tests/replication-idle-scale.rs)
 compares unchanged sources for 0 through 100 logical milliseconds, with a
 10 ms freshness/hot interval, one unchanged check before backoff, an 80 ms
 maximum idle interval, and no jitter. Active scopes receive activity every
@@ -805,6 +805,6 @@ Source and evidence: [reader core](../crates/groupnet-core/src/replication/admis
 [writer core](../crates/groupnet-core/src/replication/admission/writer.rs),
 [checked expiry arithmetic](../crates/groupnet-core/src/replication/admission/timing.rs),
 [core scenarios](../crates/groupnet-core/src/replication/admission/tests.rs), and
-[seeded admission/intent races](../crates/groupnet-sim/tests/replication_admission.rs).
+[seeded admission/intent races](../crates/groupnet-sim/tests/replication-admission.rs).
 They establish the decision-core boundary, not a production control-store
 adapter or authority for s3cache's default volatile mode.

@@ -4,7 +4,7 @@
 //!
 //! One suite here ([`dst_settle_chaos_holds_safety_and_converges`]); the
 //! failover, split-brain and same-epoch-collision suites live in
-//! `election_failover.rs`, and mode invariance in `dst.rs` — whose every
+//! `election-failover.rs`, and mode invariance in `dst.rs` — whose every
 //! scenario asserts an `Eventual` group carries no election frame and logs no
 //! leadership change.
 //!
