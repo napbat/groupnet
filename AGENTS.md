@@ -51,49 +51,51 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 1. **No Rust source file over 1000 lines.** Split modules before they get
    there. (Largest today, and the only ones still within ~50 lines of the
    limit, so the next addition to them splits them *first*:
-   `groupnet-consistency`'s `src/replication/shell/driver.rs` ~967,
-   `tests/lease-dst.rs` ~971, `tests/replication.rs` ~944 and
+   `groupnet-consistency`'s `tests/lease-dst.rs` ~979, `tests/replication.rs`
+   ~969, `src/replication/shell/driver.rs` ~967 and
    `tests/volatile-bootstrap-runtime/scenarios.rs` ~951 (new runtime
    scenarios go in their own `volatile-bootstrap-runtime/` children, as
-   `follower_progress.rs` does; the parent `main.rs`, ~705 since `PeerDonor`
-   moved to `peer_donor.rs`, keeps the shared fakes);
-   `groupnet-runtime`'s `src/driver.rs` ~960 and `src/group.rs` ~960. The
-   band under them, with ~60–150 lines of room: `groupnet-core`'s
-   `src/volatile_recovery/tests.rs` ~930 (the next lapse-arm test goes in a
+   `follower_progress.rs` does; the parent `main.rs`, ~650, keeps the shared
+   fakes); `groupnet-runtime`'s `src/driver.rs` ~960. The band under them,
+   with ~60–150 lines of room: `groupnet-core`'s
+   `src/volatile_recovery/tests.rs` ~940 (the next lapse-arm test goes in a
    sibling file, as `peer_tests.rs` and `seal_tests.rs` did),
-   `tests/election.rs` ~909,
-   `src/volatile_bootstrap/transfer/tests.rs` ~904,
-   `src/volatile_bootstrap/engine.rs` ~931 (the next recapture state goes in
-   `engine/recapture.rs`, ~426),
+   `src/volatile_bootstrap/engine.rs` ~933 (the next recapture state goes in
+   `engine/recapture.rs`, ~426), `tests/election.rs` ~928,
+   `src/volatile_bootstrap/transfer/tests.rs` ~906,
    `src/volatile_bootstrap/engine/participation.rs` ~883,
-   `src/engine/election.rs` ~873,
-   `src/replication/session/subscription.rs` ~863, `src/config.rs` ~861,
-   `src/engine/election/quorum.rs` ~859 and
-   `src/volatile_recovery/engine.rs` ~865 (its fallback paths moved to
-   `engine/fallback.rs`, its head evidence to `engine/evidence.rs`);
-   `groupnet-sim`'s
-   `tests/election-external-skew.rs` ~910, `tests/election-quorum.rs` ~896
-   and `src/simulation.rs` ~894; `groupnet-consistency`'s
-   `src/replication/shell.rs` ~914,
-   `tests/hosted-dst-liveness.rs` ~875, `tests/volatile-bootstrap-bulk-adapter.rs`
-   ~864, `src/volatile_recovery/bootstrap/session/run.rs` ~862,
-   `tests/lease-dst-liveness.rs` ~876,
-   `src/replication/shell/driver/snapshot.rs` ~844 and
-   `tests/replication-snapshot.rs` ~840.
-   With room still: `groupnet-runtime`'s `src/node.rs` ~803,
-   `tests/external-faults.rs` ~781, `src/anchor.rs` ~773, `tests/quorum.rs`
-   ~754 and `tests/external.rs` ~706; `groupnet-consistency`'s
-   `src/hosted/writes.rs` ~795, `src/hosted/handoff/stream.rs` ~775,
-   `src/lease/core.rs` ~827, `src/lease/shell.rs` ~794 (a coherent write's
-   wait lives in `lease/shell/writes.rs`),
-   `tests/handoff-fence.rs` ~761, `src/hosted/lineage.rs` ~800,
-   `tests/handoff-migration.rs` ~757, `tests/hosted-migration.rs` ~752,
-   `src/hosted/ledger.rs` ~725, `src/hosted/handoff/wire.rs` ~717 and
-   `tests/handoff-resync.rs` ~702; `groupnet-sim/tests/election-external.rs`
-   ~786; `groupnet-core`'s `tests/state.rs` ~774 and `src/wire.rs` ~701.
-   `simulation.rs` has now absorbed three subsystems' event kinds —
-   **the next addition to it splits the probe/liveness dispatch out** rather
-   than growing it again.) Four splits worth copying:
+   `src/engine/election.rs` ~872, `src/volatile_recovery/engine.rs` ~870 (its
+   fallback paths moved to `engine/fallback.rs`, its head evidence to
+   `engine/evidence.rs`), `src/replication/session/subscription.rs` ~864 and
+   `src/engine/election/quorum.rs` ~863; `groupnet-sim`'s
+   `tests/election-external-skew.rs` ~909 and `tests/election-quorum.rs` ~892;
+   `groupnet-consistency`'s `tests/volatile-bootstrap-bulk-adapter.rs` ~910,
+   `src/replication/shell.rs` ~895, `src/lease/core.rs` ~885,
+   `tests/lease-dst-liveness.rs` ~882, `tests/hosted-dst-liveness.rs` ~880,
+   `tests/replication-snapshot.rs` ~869, `tests/replication-ack.rs` ~864,
+   `src/volatile_recovery/bootstrap/session/run.rs` ~863 and
+   `src/lease/shell.rs` ~861 (a coherent write's wait lives in
+   `lease/shell/writes.rs`); `groupnet-transport-punch`'s `src/punch/server.rs`
+   ~902; `groupnet-transport-tcp`'s `src/msg.rs` ~871.
+   With room still: `groupnet-runtime`'s `src/group.rs` ~810 (membership and
+   status reads live in `group/roster.rs`), `tests/typed-protocols.rs` ~791,
+   `tests/external-faults.rs` ~782, `src/anchor.rs` ~773, `tests/quorum.rs`
+   ~771, `tests/application-messages.rs` ~755, `tests/external.rs` ~708 and
+   `src/node.rs` ~701; `groupnet-consistency`'s
+   `src/replication/shell/driver/snapshot.rs` ~843, `src/hosted/writes.rs`
+   ~839, `src/hosted/handoff/stream.rs` ~828, `src/hosted/lineage.rs` ~818,
+   `src/volatile_recovery/shell.rs` ~765, `tests/handoff-fence.rs` ~763,
+   `tests/handoff-migration.rs` ~757, `tests/hosted-migration.rs` ~749,
+   `tests/handoff.rs` ~742, `src/hosted/ledger.rs` ~732,
+   `src/hosted/handoff/wire.rs` ~721 and `tests/handoff-resync.rs` ~715;
+   `groupnet-core`'s `src/volatile_bootstrap/journal/tests.rs` ~840 and
+   `tests/state.rs` ~778; `groupnet-transport-punch`'s `src/tcp/endpoint.rs`
+   ~841; `groupnet-transport-tcp`'s `src/msg/admitted/tests.rs` ~828;
+   `groupnet-sim/tests/election-external.rs` ~785. `groupnet-sim`'s
+   `simulation.rs` (~558) delegates probe/liveness dispatch to
+   `simulation/liveness.rs` and the anchor driver to `simulation/external.rs`;
+   a new subsystem's event kinds get their own child the same way.) Four splits
+   worth copying:
    - a **shell** splits from its sans-IO core (`hosted/reads.rs` drives,
      `hosted/lineage.rs` decides and is unit-tested without a runtime);
    - a **DST harness** splits by *schedule family*, each file carrying its own
@@ -139,6 +141,59 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 4. **Separate functions with a blank line**, including methods and trait method
    declarations. Put the separator before the next function's doc comments and
    attributes, not between those comments/attributes and the function.
+
+## Public API conventions
+
+These hold in every published crate; a change that breaks one is a defect.
+
+- **Configuration** values are plain structs with public fields and
+  `Default`, built with struct-update syntax (no `#[non_exhaustive]`). A config
+  with bounds or cross-field rules exposes `validate(&self) -> Result<(), XError>`
+  where `XError` is a typed enum with one variant per violated rule naming the
+  field, implementing `Display` + `Error`, plus `From<XError> for io::Error`
+  (`InvalidInput`, error kept as the inner error) where the API returns
+  `io::Result`. Constructors, binders and builders validate once, before any
+  side effect, and never clamp, correct or ignore a value. A setting that
+  cannot apply in some mode must not exist in that mode: model the mode in the
+  type (`TcpLink<TcpDirect>` vs `TcpLink<TcpConnectivity>`).
+- **Bounds**: queue capacities are `QueueCapacity`; other counts that must be
+  nonzero are `NonZero*`; async-layer timers are `Duration`. The sans-IO core
+  keeps integer milliseconds because its clock is `u64` ms.
+- **Errors**: `io::Error` only at I/O boundaries. Validation and domain
+  failures are typed enums (never unit-struct errors) that keep their cause as
+  `source()`. Fallible input validation returns `Result`; it never panics.
+- **Construction**: socket-owning endpoints use `bind(..)` / `bind_with(.., config)`;
+  in-memory and pure values use `new()` / `with_config(config)`; `*Builder`
+  types use bare-noun setters and a terminal `start` / `build` / `bind`; other
+  values are refined by consuming `with_*` methods. No more than ~4 positional
+  arguments: bundle policy, credentials and limits into an options value
+  (`TcpAdmission`).
+- **Getters**: addresses fixed at bind are cached plain values that stay valid
+  after shutdown; live state is an `Option`/`bool` query named as such.
+- **Re-exports**: a crate re-exports every non-core type its public signatures
+  require callers to name — sibling-crate types, `bytes::Bytes`, and (under
+  `connectivity`) the punch types TCP/UDP links take. `groupnet-core`'s shared
+  vocabulary (`NodeId`, `GroupId`, `Config`, `Role`, `Status`, …) is never
+  re-exported: consumers depend on `groupnet-core` or the facade. Consistency
+  tiers re-export the tier-specific core domain types their adapters need.
+  Nothing else gets a second path.
+- **Async traits**: statically dispatched adapter traits use
+  `fn … -> impl Future<Output = …> + Send`; boxed futures only where object
+  safety requires them (`LinkProvider`, `Admission`, `BootstrapDriver`).
+- **Gossip entry keys** are injective: build them with the consistency crate's
+  `entry` layout (`<base>/d` or `<base>/n<len>:<name>`, then `/<key>`), never by
+  joining user-chosen names with a separator.
+- **Facade** (`groupnet`): one module per crate and nothing re-exported twice at
+  the root. Features are bindings (`mem`, `tcp`, `udp`, `ipc`) and capabilities
+  (`runtime`, `bulk`, `connectivity`) joined by weak `?/` edges, so every
+  selected binding carries every selected plane; layered features (`rpc`,
+  `consistency-*`) imply only the capabilities they need. Documentation names
+  each type through its owning crate's module and payloads as
+  `groupnet::transport::Bytes`. Every README Rust snippet is complete, visible
+  code compiled as a doctest (`ReadmeDoctests`): no `ignore`, no hidden lines.
+- **docs.rs**: a crate with optional features declares
+  `#![cfg_attr(docsrs, feature(doc_cfg))]` and
+  `[package.metadata.docs.rs] all-features = true, rustdoc-args = ["--cfg", "docsrs"]`.
 
 ## Testing conventions
 
@@ -188,8 +243,14 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
   Public unsealed binding and message/session traits support custom static
   implementations; do not introduce a protocol enum or boxed per-call futures.
   Managed message receives always use the existing single-owner node/group inbox,
-  never the raw messaging worker queue. Ordered/unordered setup queues remain
-  isolated, and unordered accepts must respect the selected policy.
+  never the raw messaging worker queue: built-in descriptors bind `ManagedProtocol`
+  views that send, connect, accept and observe `closed()` but cannot receive from
+  the dispatcher's queue or shut the shared engine down (only `Node::close` does).
+  A custom message binding receives through `ReceiveBinding` over that same inbox;
+  without it a binding is send-only at the handle layer. `MessageProtocol` itself is
+  send-only. Ordered/unordered setup queues remain isolated, node-wide unordered
+  policy is fixed by `NodeBuilder::unordered`, and unordered accepts must respect
+  the selected policy.
   Keep the lossless buffer/context and frame APIs equivalent, with explicit
   `BestEffort` (default), `Delivered`, and `Applied` boundaries.
 - Packet hot paths use typed `zerocopy` headers with explicit byte order, not
@@ -226,13 +287,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo check -p groupnet --no-default-features --all-targets
 cargo check -p groupnet-transport --no-default-features
-cargo test -p groupnet --features tcp-msg
+cargo test -p groupnet --features tcp
 cargo test -p groupnet-runtime --features dns
 cargo clippy -p groupnet-runtime -p groupnet --all-targets --features groupnet-runtime/dns,groupnet/dns,groupnet/udp -- -D warnings
 cargo test -p groupnet-streams -p groupnet-messaging -p groupnet-network -p groupnet-runtime
 cargo clippy -p groupnet-streams -p groupnet-messaging -p groupnet-network -p groupnet-runtime -p groupnet --all-targets -- -D warnings
-cargo test --workspace --features groupnet/ipc,groupnet/connectivity,groupnet/udp,groupnet/tcp-msg
-cargo clippy --workspace --all-targets --features groupnet/ipc,groupnet/connectivity,groupnet/udp,groupnet/tcp-msg -- -D warnings
+cargo test --workspace --features groupnet/ipc,groupnet/connectivity,groupnet/udp,groupnet/tcp
+cargo clippy --workspace --all-targets --features groupnet/ipc,groupnet/connectivity,groupnet/udp,groupnet/tcp -- -D warnings
+cargo clippy -p groupnet-transport-tcp --all-targets --no-default-features --features msg -- -D warnings
+cargo clippy -p groupnet-transport-udp --all-targets --no-default-features -- -D warnings
 cargo test -p groupnet-consistency --features acks
 cargo test -p groupnet-consistency --features leases
 cargo test -p groupnet-consistency --features hosted
@@ -273,7 +336,10 @@ the `hosted` runs either. `Handoff` and `volatile-bootstrap-bulk` each pull in
 the data plane, so both have distinct feature graphs that need explicit gates.
 `groupnet-rpc` itself is a plain workspace member (the workspace runs cover
 it); the facade's `rpc` feature is off by default, so its re-export and the
-real-TCP facade test need the `rpc,tcp` runs.
+real-TCP facade test need the `rpc,tcp` runs. The two transport-only Clippy
+runs cover the planes no other gate builds alone (TCP messages without bulk or
+link; UDP without link). `cargo test --workspace --all-features --doc` also
+compiles every README snippet.
 
 Benches (dev-only): `cargo bench -p groupnet-core` (smoke: `-- --test`) — the
 optional performance command; it is not a correctness gate.
