@@ -110,7 +110,7 @@ fn data_variants(message: &[u8]) -> [Body<'_>; 6] {
 
 #[test]
 fn every_typed_variant_round_trips_and_truncation_fails_closed() {
-    let message = [6; super::super::MAX_MESSAGE];
+    let message = [6; super::super::MAX_UDP_MESSAGE];
     for body in control_variants()
         .into_iter()
         .chain(data_variants(&message))
@@ -198,7 +198,7 @@ fn authenticated_malformed_payloads_unknown_kinds_flags_and_utf8_fail_closed() {
 #[test]
 fn exact_limits_accept_unicode_and_reject_oversized_messages_and_names() {
     let name = "é".repeat(32);
-    let message = [0; super::super::MAX_MESSAGE];
+    let message = [0; super::super::MAX_UDP_MESSAGE];
     let mut buffer = [0; MAX_PACKET];
     let value = Packet {
         sender: &name,
@@ -213,7 +213,7 @@ fn exact_limits_accept_unicode_and_reject_oversized_messages_and_names() {
     };
     let length = encode(value, &key(), &mut buffer).unwrap();
     assert_eq!(decode(&buffer[..length], &key()).unwrap().sender, name);
-    let oversized = [0; super::super::MAX_MESSAGE + 1];
+    let oversized = [0; super::super::MAX_UDP_MESSAGE + 1];
     assert!(
         encode(
             packet(Body::Direct {
@@ -274,7 +274,7 @@ fn clean_wire_cutover_and_keyed_parsing_never_downgrade() {
 #[test]
 fn maximum_identity_and_payload_fit_all_data_paths_in_both_modes() {
     let name = "x".repeat(64);
-    let message = [42; super::super::MAX_MESSAGE];
+    let message = [42; super::super::MAX_UDP_MESSAGE];
     let bodies = [
         Body::Direct {
             peer: &name,

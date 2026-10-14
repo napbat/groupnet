@@ -12,10 +12,17 @@
 //! own a native UDP connection from `groupnet-transport-punch`: admission,
 //! candidate checks, maintained direct paths and relay fallback all use that
 //! connection's actual leased sockets. Use `UdpTransport::bind_connectivity` or
-//! `UdpLink::connectivity`; transfer an already-bound endpoint with
-//! `UdpTransport::into_bound_link` to retain sessions, native MTU and task cleanup.
+//! `UdpLink::connectivity` (a `UdpLink<UdpConnectivity>`, distinct from the
+//! direct `UdpLink<UdpDirect>` built by `UdpLink::new`); transfer an
+//! already-bound endpoint with `UdpTransport::into_bound_link` to retain
+//! sessions, native MTU and task cleanup.
 //! Connected mode never admits peers from `register_peer`, advertisements or raw
-//! datagram self-attribution.
+//! datagram self-attribution. The configuration, connection and path types
+//! these signatures name (`UdpPunchConfig`, `UdpPunchConfigError`,
+//! `UdpConnection`, `NetworkKey`, `PathPolicy`, `PeerPath`) are re-exported
+//! here, so standalone users need no direct `groupnet-transport-punch`
+//! dependency; only a self-hosted rendezvous (`UdpRendezvous`) comes from that
+//! crate.
 //!
 //! ## Raw datagram behavior
 //!
@@ -39,7 +46,14 @@ mod udp;
 
 pub use udp::UdpTransport;
 
+#[cfg(feature = "connectivity")]
+pub use groupnet_transport_punch::{
+    NetworkKey, PathPolicy, PeerPath, UdpConnection, UdpPunchConfig, UdpPunchConfigError,
+};
+
 #[cfg(feature = "link")]
 mod link;
+#[cfg(feature = "connectivity")]
+pub use link::UdpConnectivity;
 #[cfg(feature = "link")]
-pub use link::UdpLink;
+pub use link::{UdpDirect, UdpLink};

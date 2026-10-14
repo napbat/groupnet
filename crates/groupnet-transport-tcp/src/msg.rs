@@ -1,70 +1,15 @@
-//! Control-plane messaging over **persistent** TCP connections.
-//!
-//! [`TcpMsgTransport`] implements the best-effort, message-oriented
-//! [`Transport`](groupnet_transport::Transport) contract on pooled, long-lived connections instead of
-//! datagrams — the constant-connection option for clusters that want frames
-//! (gossip, eager delta push) delivered at network latency over reliable
-//! links, without changing the engine or the protocol:
-//!
-//! * **Lazy.** A connection is dialed the first time a frame is addressed to
-//!   a peer, and reused for every frame after that.
-//! * **Bounded.** At most [`TcpMsgConfig::max_outbound`] outbound connections
-//!   exist at once (dialing past the cap closes the oldest), and a connection
-//!   with nothing to send for [`TcpMsgConfig::idle_timeout`] closes itself.
-//!   The pool therefore follows the peers this node is *actively* exchanging
-//!   with — on a large cluster that is the rotating gossip/anti-entropy
-//!   fanout, a handful of warm sockets, never one per member. Persistent
-//!   connections are a per-deployment choice made here at the transport
-//!   layer; nothing forces them on a deployment that prefers datagrams.
-//! * **Still best-effort.** TCP orders bytes *within* one connection, but the
-//!   transport keeps the datagram contract: frames to an unknown or dead peer
-//!   are dropped, a full per-peer queue drops the frame, and a connection
-//!   failure drops whatever was queued behind it. The engine's anti-entropy
-//!   repairs all of it — do not add reliability on top.
-//!
-//! ## Address learning
-//!
-//! Only seed addresses need registering up front
-//! ([`register_peer`](TcpMsgTransport::register_peer)). The rest of the book
-//! fills itself in two ways: the dial handshake carries the dialer's own
-//! listener address, so the accepting side can dial back a peer nobody
-//! registered on it (a joiner reaching a seed); and gossiped `advertise_addr`
-//! values arrive through [`groupnet_transport::Transport::learn_peer`] (the runtime feeds them
-//! automatically), which resolves third parties. Between them, a cluster
-//! bootstraps from seed addresses alone.
-//!
-//! ## Trusted low-level endpoint
-//!
-//! A connection's claimed id and listener address are trusted as-is — the
-//! same trust model as UDP source-address attribution. Inbound and outbound
-//! are separate sockets — two mutually chatty nodes hold two connections,
-//! not one full-duplex one. A failed dial drops the frames queued behind it
-//! and the next send re-dials, which self-limits to one connect attempt per
-//! burst of sends.
-//!
-//! With `link`, `bind_admitted` instead uses bounded application admission and
-//! a full-duplex socket for each live identity. Managed sockets are not subject
-//! to raw idle/oldest-first eviction: dropping an idle writer must not withdraw
-//! an admitted neighbor or prevent a server from reaching a joiner behind NAT.
-//! Its handshake and gossip-learned addresses share a bounded book capped by
-//! `TcpAdmissionConfig::max_peers`; learning refreshes contact age and evicts the
-//! least recently learned contact. Explicitly registered bootstrap contacts are
-//! retained separately and cannot be overwritten by learned addresses.
-//!
-//! With `connectivity`, `TcpMsgTransport::bind_connectivity` owns a native
-//! TCP connection with admitted candidate traversal and relay fallback instead
-//! of a raw connection pool. Address hints cannot bypass native admission.
+//! Control-plane messaging over persistent TCP connections; the public
+//! contract is documented on [`TcpMsgTransport`].
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
-use groupnet_transport::{Inbound, QueueCapacity};
+use groupnet_transport::Inbound;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
@@ -76,6 +21,7 @@ use crate::tasks::Tasks;
 mod addresses;
 #[cfg(feature = "link")]
 mod admitted;
+mod config;
 #[cfg(feature = "connectivity")]
 mod connectivity;
 mod endpoint;
@@ -83,7 +29,8 @@ mod framing;
 
 use addresses::AddressBook;
 #[cfg(feature = "link")]
-pub use admitted::TcpAdmissionConfig;
+pub use admitted::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError};
+pub use config::{TcpMsgConfig, TcpMsgConfigError};
 #[cfg(feature = "connectivity")]
 pub use connectivity::TcpPathChanges;
 use framing::{FrameReader, extend_ready, next_batch, write_frames};
@@ -127,81 +74,8 @@ impl InboundPath {
     }
 }
 
-/// Default allocation guard for an inbound payload; deployments may tune it
-/// up to the shared stream frame ceiling.
-const DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
-
 /// How long a dial may take before the connection attempt is abandoned.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Tuning for [`TcpMsgTransport`] and [`TcpLink`](crate::TcpLink). The default
-/// values suit a gossip control plane. Capacities are valid by type; the
-/// remaining bounds are checked once by [`validate`](Self::validate), which
-/// every binding and link builder calls.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TcpMsgConfig {
-    /// Close an outbound connection after this long without a frame to send.
-    /// The read side of an inbound connection allows twice this before
-    /// presuming the peer gone, so a clean close normally comes from the
-    /// sender and the reader timeout only reaps half-open sockets left by a
-    /// peer that died without a FIN. Must be nonzero. Default: 30s.
-    pub idle_timeout: Duration,
-    /// Most outbound connections pooled at once; dialing past the cap closes
-    /// the oldest. Size it to cover the gossip/anti-entropy fanout — the pool
-    /// follows who this node is currently talking to, not the cluster.
-    /// Default: 64.
-    pub max_outbound: NonZeroUsize,
-    /// Frames buffered per outbound connection while it dials or drains; a
-    /// full queue drops the frame (best-effort). Default: 256.
-    pub outbound_queue: QueueCapacity,
-    /// Frames buffered between socket readers and the consumer. Readers wait
-    /// when full, propagating TCP backpressure. Default: 1024.
-    pub inbound_queue: QueueCapacity,
-    /// Maximum payload bytes per frame, checked before inbound allocation and
-    /// outbound queueing. Must be nonzero and at most the shared stream ceiling
-    /// [`MAX_FRAME_BYTES`](groupnet_transport::framing::MAX_FRAME_BYTES).
-    /// Default: 16 MiB.
-    pub max_frame_bytes: usize,
-    /// The listener address to introduce ourselves with when dialing, so the
-    /// accepting side can dial back without prior registration. `None`
-    /// introduces the bound address unless it is unspecified (`0.0.0.0`);
-    /// set it when peers must reach this node somewhere else (NAT, container
-    /// networking). Default: `None`.
-    pub advertise: Option<SocketAddr>,
-}
-
-impl Default for TcpMsgConfig {
-    fn default() -> Self {
-        Self {
-            idle_timeout: Duration::from_secs(30),
-            max_outbound: NonZeroUsize::new(64).expect("nonzero literal"),
-            outbound_queue: QueueCapacity::of(256),
-            inbound_queue: QueueCapacity::of(1024),
-            max_frame_bytes: DEFAULT_MAX_FRAME,
-            advertise: None,
-        }
-    }
-}
-
-impl TcpMsgConfig {
-    /// Checks the bounds the field types cannot express.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` for a zero idle timeout, or a frame limit that
-    /// is zero or above the shared stream frame ceiling.
-    pub fn validate(&self) -> io::Result<()> {
-        if self.idle_timeout.is_zero()
-            || self.max_frame_bytes == 0
-            || self.max_frame_bytes > groupnet_transport::framing::MAX_FRAME_BYTES
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid TCP message bounds",
-            ));
-        }
-        Ok(())
-    }
-}
 
 /// An outbound connection's handle in the pool: the frame queue plus a
 /// generation stamp so a writer task only ever removes *its own* entry.
@@ -273,6 +147,66 @@ impl Drop for Inner {
 
 /// A persistent-connection TCP endpoint for the control plane.
 ///
+/// It implements the best-effort, message-oriented
+/// [`Transport`](groupnet_transport::Transport) contract on pooled,
+/// long-lived connections instead of datagrams — the constant-connection
+/// option for clusters that want frames (gossip, eager delta push) delivered
+/// at network latency over reliable links, without changing the engine or
+/// the protocol:
+///
+/// * **Lazy.** A connection is dialed the first time a frame is addressed to
+///   a peer, and reused for every frame after that.
+/// * **Bounded.** At most [`TcpMsgConfig::max_outbound`] outbound connections
+///   exist at once (dialing past the cap closes the oldest), and a connection
+///   with nothing to send for [`TcpMsgConfig::idle_timeout`] closes itself.
+///   The pool therefore follows the peers this node is *actively* exchanging
+///   with — on a large cluster that is the rotating gossip/anti-entropy
+///   fanout, a handful of warm sockets, never one per member. Persistent
+///   connections are a per-deployment choice made here at the transport
+///   layer; nothing forces them on a deployment that prefers datagrams.
+/// * **Still best-effort.** TCP orders bytes *within* one connection, but the
+///   transport keeps the datagram contract: frames to an unknown or dead peer
+///   are dropped, a full per-peer queue drops the frame, and a connection
+///   failure drops whatever was queued behind it. The engine's anti-entropy
+///   repairs all of it — do not add reliability on top.
+///
+/// # Address learning
+///
+/// Only seed addresses need registering up front
+/// ([`register_peer`](Self::register_peer)). The rest of the book fills
+/// itself in two ways: the dial handshake carries the dialer's own listener
+/// address, so the accepting side can dial back a peer nobody registered on
+/// it (a joiner reaching a seed); and gossiped `advertise_addr` values arrive
+/// through [`Transport::learn_peer`](groupnet_transport::Transport::learn_peer)
+/// (the runtime feeds them automatically), which resolves third parties.
+/// Between them, a cluster bootstraps from seed addresses alone.
+///
+/// # Trusted low-level endpoint
+///
+/// A connection's claimed id and listener address are trusted as-is — the
+/// same trust model as UDP source-address attribution. Inbound and outbound
+/// are separate sockets — two mutually chatty nodes hold two connections,
+/// not one full-duplex one. A failed dial drops the frames queued behind it
+/// and the next send re-dials, which self-limits to one connect attempt per
+/// burst of sends.
+///
+/// With `link`, `bind_admitted` (configured by a `TcpAdmission`) instead uses
+/// bounded application admission and a full-duplex socket for each live
+/// identity. Managed sockets are not subject to raw idle/oldest-first
+/// eviction: dropping an idle writer must not withdraw an admitted neighbor
+/// or prevent a server from reaching a joiner behind NAT. Its handshake and
+/// gossip-learned addresses share a bounded book capped by
+/// `TcpAdmissionConfig::max_peers`; learning refreshes contact age and evicts
+/// the least recently learned contact. Explicitly registered bootstrap
+/// contacts are retained separately and cannot be overwritten by learned
+/// addresses.
+///
+/// With `connectivity`, `bind_connectivity` owns a native TCP connection with
+/// admitted candidate traversal and relay fallback instead of a raw
+/// connection pool. Address hints cannot bypass native admission.
+///
+/// # Handles
+///
 /// Cheap to [`Clone`]: clones share the listener, the address book, and the
 /// connection pool, so a [`register_peer`](Self::register_peer) through any
 /// handle is visible to all.
@@ -289,7 +223,6 @@ enum Backend {
     #[cfg(feature = "connectivity")]
     Connectivity {
         connection: groupnet_transport_punch::TcpConnection,
-        address: SocketAddr,
     },
 }
 
@@ -350,7 +283,9 @@ impl TcpMsgTransport {
             .map(|a| a.to_string())
             .unwrap_or_default();
         #[cfg(feature = "link")]
-        let learned_capacity = admission.as_ref().map(|managed| managed.config.max_peers);
+        let learned_capacity = admission
+            .as_ref()
+            .map(|managed| managed.config.max_peers.get());
         #[cfg(not(feature = "link"))]
         let learned_capacity = None;
         let inner = Arc::new(Inner {
@@ -543,9 +478,9 @@ mod tests {
 
     use groupnet_core::NodeId;
     use groupnet_transport::framing::MAX_FRAME_BYTES;
-    use groupnet_transport::{Inbound, Transport};
+    use groupnet_transport::{Inbound, QueueCapacity, Transport};
 
-    use super::{QueueCapacity, TcpMsgConfig, TcpMsgTransport};
+    use super::{TcpMsgConfig, TcpMsgConfigError, TcpMsgTransport};
 
     /// Bind a loopback endpoint on an ephemeral port under the given id.
     async fn bind_as(id: &str) -> TcpMsgTransport {
@@ -831,15 +766,29 @@ mod tests {
                 ..TcpMsgConfig::default()
             },
         ];
-        for config in invalid {
-            assert_eq!(
-                config.validate().expect_err("invalid bounds").kind(),
-                std::io::ErrorKind::InvalidInput
-            );
+        let expected = [
+            TcpMsgConfigError::ZeroIdleTimeout,
+            TcpMsgConfigError::ZeroMaxFrameBytes,
+            TcpMsgConfigError::MaxFrameBytesAboveCeiling {
+                max_frame_bytes: MAX_FRAME_BYTES + 1,
+            },
+            TcpMsgConfigError::MaxFrameBytesAboveCeiling {
+                max_frame_bytes: usize::MAX,
+            },
+        ];
+        for (config, expected) in invalid.into_iter().zip(expected) {
+            assert_eq!(config.validate(), Err(expected));
             let error = TcpMsgTransport::bind_with(NodeId::new("invalid"), "127.0.0.1:0", config)
                 .await
                 .expect_err("invalid bounds");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<TcpMsgConfigError>()),
+                Some(&expected),
+                "binding surfaces the field-specific error"
+            );
         }
         for id in [
             String::new(),

@@ -1,8 +1,8 @@
 //! Local resource budgets and deadlines, independent of immutable framing bounds.
 
-use std::io;
 use std::num::NonZeroUsize;
 use std::time::Duration;
+use std::{fmt, io};
 
 use groupnet_transport::QueueCapacity;
 
@@ -55,26 +55,62 @@ impl IpcConfig {
     /// listener is bound; capacities are valid by construction.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for a zero deadline or, on Windows, more than
-    /// 252 sessions.
-    pub fn validate(&self) -> io::Result<()> {
-        if [self.setup_timeout, self.write_timeout, self.read_timeout]
-            .iter()
-            .any(Duration::is_zero)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IPC deadlines must be nonzero",
-            ));
+    /// Returns the [`IpcConfigError`] naming the first violated field.
+    pub const fn validate(&self) -> Result<(), IpcConfigError> {
+        if self.setup_timeout.is_zero() {
+            return Err(IpcConfigError::ZeroSetupTimeout);
+        }
+        if self.write_timeout.is_zero() {
+            return Err(IpcConfigError::ZeroWriteTimeout);
+        }
+        if self.read_timeout.is_zero() {
+            return Err(IpcConfigError::ZeroReadTimeout);
         }
         #[cfg(windows)]
         if self.max_sessions.get() > MAX_WINDOWS_SESSIONS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Windows IPC supports at most 252 concurrent sessions",
-            ));
+            return Err(IpcConfigError::TooManyWindowsSessions {
+                max_sessions: self.max_sessions,
+            });
         }
         Ok(())
+    }
+}
+
+/// A violated [`IpcConfig`] bound, from [`IpcConfig::validate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcConfigError {
+    /// `setup_timeout` is zero.
+    ZeroSetupTimeout,
+    /// `write_timeout` is zero.
+    ZeroWriteTimeout,
+    /// `read_timeout` is zero.
+    ZeroReadTimeout,
+    /// `max_sessions` exceeds the 252 named-pipe instances Windows allows.
+    TooManyWindowsSessions {
+        /// The configured session capacity.
+        max_sessions: QueueCapacity,
+    },
+}
+
+impl fmt::Display for IpcConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroSetupTimeout => f.write_str("setup_timeout must be nonzero"),
+            Self::ZeroWriteTimeout => f.write_str("write_timeout must be nonzero"),
+            Self::ZeroReadTimeout => f.write_str("read_timeout must be nonzero"),
+            Self::TooManyWindowsSessions { max_sessions } => write!(
+                f,
+                "max_sessions {max_sessions} exceeds the 252 concurrent sessions Windows IPC supports"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IpcConfigError {}
+
+impl From<IpcConfigError> for io::Error {
+    fn from(error: IpcConfigError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
     }
 }
 
@@ -83,19 +119,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_each_zero_deadline() {
-        assert!(IpcConfig::default().validate().is_ok());
-        for field in 0..3 {
-            let mut config = IpcConfig::default();
-            match field {
-                0 => config.setup_timeout = Duration::ZERO,
-                1 => config.write_timeout = Duration::ZERO,
-                _ => config.read_timeout = Duration::ZERO,
-            }
-            assert_eq!(
-                config.validate().unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
-            );
+    fn rejects_each_zero_deadline_by_name() {
+        assert_eq!(IpcConfig::default().validate(), Ok(()));
+        let cases = [
+            (
+                IpcConfig {
+                    setup_timeout: Duration::ZERO,
+                    ..IpcConfig::default()
+                },
+                IpcConfigError::ZeroSetupTimeout,
+            ),
+            (
+                IpcConfig {
+                    write_timeout: Duration::ZERO,
+                    ..IpcConfig::default()
+                },
+                IpcConfigError::ZeroWriteTimeout,
+            ),
+            (
+                IpcConfig {
+                    read_timeout: Duration::ZERO,
+                    ..IpcConfig::default()
+                },
+                IpcConfigError::ZeroReadTimeout,
+            ),
+        ];
+        for (config, expected) in cases {
+            assert_eq!(config.validate(), Err(expected));
+            assert!(expected.to_string().contains("timeout"), "{expected}");
         }
         let longest = IpcConfig {
             setup_timeout: Duration::MAX,
@@ -103,27 +154,29 @@ mod tests {
             read_timeout: Duration::MAX,
             ..IpcConfig::default()
         };
-        assert!(longest.validate().is_ok());
+        assert_eq!(longest.validate(), Ok(()));
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_session_limit_never_uses_unlimited_instance_sentinel() {
-        assert!(
+        assert_eq!(
             IpcConfig {
                 max_sessions: QueueCapacity::of(252),
                 ..IpcConfig::default()
             }
-            .validate()
-            .is_ok()
+            .validate(),
+            Ok(())
         );
-        assert!(
+        assert_eq!(
             IpcConfig {
                 max_sessions: QueueCapacity::of(253),
                 ..IpcConfig::default()
             }
-            .validate()
-            .is_err()
+            .validate(),
+            Err(IpcConfigError::TooManyWindowsSessions {
+                max_sessions: QueueCapacity::of(253)
+            })
         );
     }
 }

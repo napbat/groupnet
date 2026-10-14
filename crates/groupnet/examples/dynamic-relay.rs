@@ -8,7 +8,9 @@
 use std::io;
 use std::time::Duration;
 
-use groupnet::connectivity::{PathPolicy, PeerPath, PunchConfig, Rendezvous};
+use groupnet::connectivity::{
+    PathPolicy, PeerPath, UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
+};
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
 use groupnet::transport::udp::UdpTransport;
@@ -26,9 +28,11 @@ async fn main() -> io::Result<()> {
     } else {
         PeerPath::Relay
     };
-    let relay =
-        Rendezvous::bind_open("127.0.0.1:0".parse().expect("literal loopback address")).await?;
-    let address = relay.local_addr()?;
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(
+        "127.0.0.1:0".parse().expect("literal loopback address"),
+    ))
+    .await?;
+    let address = relay.local_addr();
     let ids = [
         NodeId::new("peer-a"),
         NodeId::new("peer-b"),
@@ -37,7 +41,7 @@ async fn main() -> io::Result<()> {
     let mut nodes = Vec::with_capacity(ids.len());
     let mut transports = Vec::with_capacity(ids.len());
     for id in &ids {
-        let mut config = PunchConfig::open(id.clone(), address);
+        let mut config = UdpPunchConfig::open(id.clone(), address);
         config.policy = policy;
         let transport = UdpTransport::bind_connectivity(config).await?;
         nodes.push(

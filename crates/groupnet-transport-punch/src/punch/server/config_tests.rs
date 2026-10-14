@@ -1,31 +1,13 @@
 //! Configurable capacities remain independent of authentication and wire bounds.
 
+use std::num::NonZeroUsize;
+
+use groupnet_transport::NodeIdError;
+
 use super::*;
 
-#[tokio::test]
-async fn zero_operational_limits_fail_before_socket_binding() {
-    let bind = SocketAddr::from(([127, 0, 0, 1], 0));
-    for limits in [
-        RendezvousLimits {
-            max_peers: 0,
-            ..RendezvousLimits::default()
-        },
-        RendezvousLimits {
-            max_challenges: 0,
-            ..RendezvousLimits::default()
-        },
-        RendezvousLimits {
-            max_pending_admissions: 0,
-            ..RendezvousLimits::default()
-        },
-    ] {
-        let mut config = RendezvousConfig::open(bind);
-        config.limits = limits;
-        assert_eq!(
-            Rendezvous::bind_config(config).await.unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
+fn nonzero(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).unwrap()
 }
 
 #[test]
@@ -34,20 +16,74 @@ fn configured_allowlist_capacity_is_not_a_protocol_peer_bound() {
     let peers = (0..129)
         .map(|index| NodeId::from(format!("peer-{index}")))
         .collect();
-    let mut config = RendezvousConfig::new(bind, NetworkKey::from_bytes([1; 32]), peers);
-    assert!(config.validate().is_err());
-    config.limits.max_peers = 129;
+    let mut config = UdpRendezvousConfig::new(bind, NetworkKey::from_bytes([1; 32]), peers);
+    assert_eq!(
+        config.validate(),
+        Err(UdpRendezvousConfigError::PeersExceedMaxPeers {
+            peers: 129,
+            max_peers: nonzero(128)
+        })
+    );
+    config.limits.max_peers = nonzero(129);
     config.validate().unwrap();
-    config.limits.max_peers = 5000;
-    config.limits.max_challenges = 5000;
-    config.limits.max_pending_admissions = 5000;
+    config.limits.max_peers = nonzero(5000);
+    config.limits.max_challenges = nonzero(5000);
+    config.limits.max_pending_admissions = nonzero(5000);
     config.validate().unwrap();
     config
         .peers
         .as_mut()
         .unwrap()
         .push(NodeId::from("x".repeat(65)));
-    assert!(config.validate().is_err());
+    assert_eq!(
+        config.validate(),
+        Err(UdpRendezvousConfigError::Peer {
+            index: 129,
+            error: NodeIdError::TooLong { len: 65, max: 64 }
+        })
+    );
+}
+
+#[test]
+fn allowlist_and_bind_rules_name_their_field() {
+    let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    let key = NetworkKey::from_bytes([1; 32]);
+    let config = UdpRendezvousConfig::new(bind, key.clone(), vec!["a".into(), "a".into()]);
+    assert_eq!(
+        config.validate(),
+        Err(UdpRendezvousConfigError::DuplicatePeer { index: 1 })
+    );
+    let config = UdpRendezvousConfig::new(bind, key, vec!["".into()]);
+    assert_eq!(
+        config.validate(),
+        Err(UdpRendezvousConfigError::Peer {
+            index: 0,
+            error: NodeIdError::Empty
+        })
+    );
+    let config = UdpRendezvousConfig::open(SocketAddr::from(([224, 0, 0, 1], 0)));
+    assert_eq!(
+        config.validate(),
+        Err(UdpRendezvousConfigError::MulticastBind)
+    );
+    assert!(
+        UdpRendezvousConfigError::MulticastBind
+            .to_string()
+            .starts_with("bind")
+    );
+}
+
+#[tokio::test]
+async fn bind_surfaces_the_typed_error_as_invalid_input() {
+    let config = UdpRendezvousConfig::open(SocketAddr::from(([224, 0, 0, 1], 0)));
+    let error = UdpRendezvous::bind(config).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<UdpRendezvousConfigError>()),
+        Some(&UdpRendezvousConfigError::MulticastBind)
+    );
 }
 
 #[test]
@@ -116,16 +152,18 @@ fn configured_challenge_pool_evicts_without_consuming_peer_or_policy_slots() {
 async fn configured_open_and_keyed_rendezvous_bind_with_custom_capacities() {
     let bind = SocketAddr::from(([127, 0, 0, 1], 0));
     for mut config in [
-        RendezvousConfig::open(bind),
-        RendezvousConfig::new(bind, NetworkKey::from_bytes([1; 32]), vec!["peer".into()]),
+        UdpRendezvousConfig::open(bind),
+        UdpRendezvousConfig::new(bind, NetworkKey::from_bytes([1; 32]), vec!["peer".into()]),
     ] {
-        config.limits = RendezvousLimits {
-            max_peers: 1,
-            max_challenges: 2,
-            max_pending_admissions: 1,
+        config.limits = UdpRendezvousLimits {
+            max_peers: nonzero(1),
+            max_challenges: nonzero(2),
+            max_pending_admissions: nonzero(1),
         };
-        let rendezvous = Rendezvous::bind_config(config).await.unwrap();
-        assert_ne!(rendezvous.local_addr().unwrap().port(), 0);
+        let rendezvous = UdpRendezvous::bind(config).await.unwrap();
+        let address = rendezvous.local_addr();
+        assert_ne!(address.port(), 0);
         rendezvous.close().await;
+        assert_eq!(rendezvous.local_addr(), address);
     }
 }

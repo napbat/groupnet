@@ -11,7 +11,7 @@ use groupnet::network::{
 };
 use groupnet::transport::admission::OpenAdmission;
 use groupnet::transport::bulk::BulkTransport;
-use groupnet::transport::tcp::{TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
+use groupnet::transport::tcp::{TcpAdmission, TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -171,11 +171,12 @@ impl Tunnel {
                         outbound_queue: frames,
                         ..TcpMsgConfig::default()
                     },
-                    Arc::new(OpenAdmission),
-                    Vec::new(),
-                    TcpAdmissionConfig {
-                        max_peers: 1,
-                        ..TcpAdmissionConfig::default()
+                    TcpAdmission {
+                        config: TcpAdmissionConfig {
+                            max_peers: NonZeroUsize::MIN,
+                            ..TcpAdmissionConfig::default()
+                        },
+                        ..TcpAdmission::new(Arc::new(OpenAdmission))
                     },
                 )
                 .await?,

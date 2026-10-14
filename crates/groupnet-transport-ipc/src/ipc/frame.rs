@@ -27,14 +27,9 @@ struct FrameHeader {
     length: U32,
 }
 
+/// Checks `id` against the 64-byte introduction field.
 pub(super) fn validate_id(id: &NodeId) -> io::Result<()> {
-    if id.as_str().is_empty() || id.as_str().len() > MAX_ID {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IPC node ID must contain 1..=64 bytes",
-        ));
-    }
-    Ok(())
+    Ok(groupnet_transport::validate_node_id(id, MAX_ID)?)
 }
 
 pub(super) async fn introduce<S: AsyncRead + AsyncWrite + Unpin>(

@@ -12,6 +12,10 @@ use crate::{IpcAddress, IpcConfig, IpcTransport, MAX_FRAME};
 ///
 /// Binding registers every peer before returning a link. Failed peer
 /// registration closes and drains the newly created listener before returning.
+///
+/// Setters only store their values; binding is the one validation point and
+/// fails with `InvalidInput` carrying the [`IpcConfigError`](crate::IpcConfigError)
+/// before opening a listener. Preflight with [`IpcConfig::validate`].
 #[derive(Debug)]
 pub struct IpcLink {
     bind: IpcAddress,
@@ -38,7 +42,7 @@ impl IpcLink {
         }
     }
 
-    /// Selects listener resource budgets, validated before binding.
+    /// Selects listener resource budgets, validated when the link binds.
     #[must_use]
     pub const fn with_config(mut self, config: IpcConfig) -> Self {
         self.config = config;
@@ -67,7 +71,7 @@ impl LinkProvider for IpcLink {
                 cost,
                 config,
             } = *self;
-            let transport = IpcTransport::bind_with_config(local, &bind, config)?;
+            let transport = IpcTransport::bind_with(local, &bind, config)?;
             for (peer, address) in peers.iter().zip(addresses) {
                 if let Err(error) = transport.register_peer(peer.clone(), address) {
                     transport.close().await;

@@ -10,7 +10,9 @@
 use std::{io, net::SocketAddr, time::Duration};
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
-use groupnet::connectivity::{PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous};
+use groupnet::connectivity::{
+    PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig,
+};
 use groupnet::core::NodeId;
 use groupnet::network::TunnelConfig;
 use groupnet::network::tunnel::{PeerIdentity, TlsIdentity};
@@ -44,8 +46,11 @@ async fn main() -> io::Result<()> {
     } else {
         PathPolicy::DirectPreferred
     };
-    let relay = TcpRendezvous::bind_open("127.0.0.1:0".parse().map_err(io::Error::other)?).await?;
-    let address = relay.local_addr()?;
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(
+        "127.0.0.1:0".parse().map_err(io::Error::other)?,
+    ))
+    .await?;
+    let address = relay.local_addr();
     let b_tcp = TcpMsgTransport::bind_connectivity(config("edge-b", address, policy)).await?;
     let c_tcp = TcpMsgTransport::bind_connectivity(config("remote-c", address, policy)).await?;
     let expected = if policy == PathPolicy::DirectPreferred {

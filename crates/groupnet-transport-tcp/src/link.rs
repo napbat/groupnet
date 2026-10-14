@@ -1,57 +1,135 @@
 //! TCP control-plane link configuration and binding.
 
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest};
-
 use groupnet_core::NodeId;
+use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest};
 use groupnet_transport::link::{BoundLink, LinkFuture, LinkProvider, PeerEndpoint};
 
-use crate::{TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
+use crate::{TcpAdmission, TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
 
-/// A TCP control-plane link with bootstrap endpoints and application admission.
+/// A TCP control-plane link, registered with a router through [`LinkProvider`].
 ///
 /// Available with the `link` feature, which also activates `msg`. Binding owns
 /// the listener and all session tasks; link shutdown cancels and drains them.
-/// Direct links bind with the link's [`TcpMsgConfig`] (default until replaced
-/// through [`with_msg_config`](Self::with_msg_config), which validates it).
-/// With `connectivity`, `Self::connectivity` uses native rendezvous admission,
-/// candidate-path maintenance, and relay fallback through this same link type.
-pub struct TcpLink {
+///
+/// The mode parameter makes each link's settings explicit:
+///
+/// * [`TcpLink::new`] builds a direct link (`TcpLink<TcpDirect>`, the
+///   default) with bootstrap endpoints, application admission, credentials
+///   and message tuning;
+/// * with `connectivity`, `TcpLink::connectivity` builds a native link
+///   (`TcpLink<TcpConnectivity>`) whose admission, credential, discovery and
+///   path policy all come from its `TcpPunchConfig`. Direct-only setters do
+///   not exist on it, so a setting the native link would ignore cannot be
+///   written.
+///
+/// Both modes are this one link type; no separate link is registered.
+///
+/// # Validation
+///
+/// Setters only store their values. Binding is the one validation point: it
+/// fails with `InvalidInput` carrying the typed cause
+/// ([`TcpMsgConfigError`](crate::TcpMsgConfigError),
+/// [`TcpAdmissionError`](crate::TcpAdmissionError) or the native
+/// configuration's error) before opening any socket. Preflight with
+/// [`TcpMsgConfig::validate`] and [`TcpAdmission::validate`].
+#[cfg_attr(
+    feature = "connectivity",
+    doc = r#"
+# Modes
+
+Direct-only settings are rejected at compile time on a native link:
+
+```compile_fail
+use groupnet_core::NodeId;
+use groupnet_transport_tcp::{NetworkKey, TcpLink, TcpPunchConfig};
+
+let config = TcpPunchConfig::new(
+    NodeId::new("a"),
+    "127.0.0.1:7000".parse().unwrap(),
+    NetworkKey::from_bytes([7; 32]),
+    vec![NodeId::new("b")],
+);
+let _ = TcpLink::connectivity(config).with_credentials(b"ignored".to_vec());
+```
+
+while both modes share the mode-independent settings:
+
+```
+use groupnet_core::NodeId;
+use groupnet_transport_tcp::{NetworkKey, TcpLink, TcpPunchConfig};
+
+let config = TcpPunchConfig::new(
+    NodeId::new("a"),
+    "127.0.0.1:7000".parse().unwrap(),
+    NetworkKey::from_bytes([7; 32]),
+    vec![NodeId::new("b")],
+);
+let _native = TcpLink::connectivity(config).with_cost(2);
+let _direct = TcpLink::new("127.0.0.1:0".parse().unwrap(), Vec::new())
+    .with_credentials(b"token".to_vec())
+    .with_cost(2);
+```
+"#
+)]
+#[derive(Debug)]
+pub struct TcpLink<M = TcpDirect> {
+    mode: M,
+    cost: u32,
+}
+
+/// The direct mode of a [`TcpLink`]: a listener, bootstrap endpoints,
+/// application admission and message tuning. Built by [`TcpLink::new`].
+pub struct TcpDirect {
     bind: SocketAddr,
     peers: Vec<NodeId>,
     addresses: Vec<SocketAddr>,
-    cost: u32,
     msg_config: TcpMsgConfig,
     admission: Option<Arc<dyn Admission>>,
-    credential: Credential,
+    credential: Vec<u8>,
     admission_config: TcpAdmissionConfig,
-    #[cfg(feature = "connectivity")]
-    connectivity: Option<groupnet_transport_punch::TcpPunchConfig>,
 }
 
-impl std::fmt::Debug for TcpLink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut debug = f.debug_struct("TcpLink");
-        debug
+impl fmt::Debug for TcpDirect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Neither the credential nor a custom policy (which may hold secrets) is printed.
+        f.debug_struct("TcpDirect")
             .field("bind", &self.bind)
             .field("peers", &self.peers)
             .field("addresses", &self.addresses)
-            .field("cost", &self.cost)
             .field("msg_config", &self.msg_config)
             .field("custom_admission", &self.admission.is_some())
-            .field("credential", &self.credential)
-            .field("admission_config", &self.admission_config);
-        #[cfg(feature = "connectivity")]
-        debug.field("connectivity", &self.connectivity);
-        debug.finish()
+            .field("admission_config", &self.admission_config)
+            .finish_non_exhaustive()
     }
 }
 
-impl TcpLink {
+/// The native mode of a [`TcpLink`] (feature `connectivity`): rendezvous
+/// admission, candidate traversal and relay fallback, all configured by one
+/// `TcpPunchConfig`. Built by `TcpLink::connectivity`.
+#[cfg(feature = "connectivity")]
+#[derive(Debug)]
+pub struct TcpConnectivity {
+    config: crate::TcpPunchConfig,
+}
+
+impl<M> TcpLink<M> {
+    /// Sets the routing cost of this link (default: one).
+    #[must_use]
+    pub fn with_cost(mut self, cost: u32) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl TcpLink<TcpDirect> {
     /// Configures the listener address and directly reachable peer endpoints.
+    /// Peers are admitted through a configured-peer allowlist unless
+    /// [`with_admission`](Self::with_admission) selects another policy.
     #[must_use]
     pub fn new(bind: SocketAddr, peers: Vec<PeerEndpoint<SocketAddr>>) -> Self {
         let (peers, addresses) = peers
@@ -59,120 +137,92 @@ impl TcpLink {
             .map(|peer| (peer.node, peer.address))
             .unzip();
         Self {
-            bind,
-            peers,
-            addresses,
+            mode: TcpDirect {
+                bind,
+                peers,
+                addresses,
+                msg_config: TcpMsgConfig::default(),
+                admission: None,
+                credential: Vec::new(),
+                admission_config: TcpAdmissionConfig::default(),
+            },
             cost: 1,
-            msg_config: TcpMsgConfig::default(),
-            admission: None,
-            credential: Credential(Vec::new()),
-            admission_config: TcpAdmissionConfig::default(),
-            #[cfg(feature = "connectivity")]
-            connectivity: None,
         }
-    }
-
-    #[cfg(feature = "connectivity")]
-    /// Configures a native TCP connection. `config.local` must match the binding
-    /// node identity. Admission, credentials, discovery, and path policy come from
-    /// this configuration; direct-link admission setters have no effect on it.
-    #[must_use]
-    pub fn connectivity(config: groupnet_transport_punch::TcpPunchConfig) -> Self {
-        let mut link = Self::new(config.bind, Vec::new());
-        link.connectivity = Some(config);
-        link
     }
 
     /// Selects the application policy, enabling peers absent from the bootstrap list.
     /// `OpenAdmission` is an explicit unauthenticated membership choice.
-    /// Applies only to direct links; native links use rendezvous admission.
     #[must_use]
     pub fn with_admission(mut self, admission: Arc<dyn Admission>) -> Self {
-        self.admission = Some(admission);
+        self.mode.admission = Some(admission);
         self
     }
 
-    /// Supplies bounded opaque credentials presented to the remote admission policy.
-    /// Credentials are omitted from debug output. Binding rejects oversized values.
-    /// Applies only to direct links; native links use their configuration credential.
+    /// Supplies opaque credentials presented to the remote admission policy,
+    /// at most `MAX_CREDENTIAL_BYTES`. Credentials are omitted from debug output.
     #[must_use]
     pub fn with_credentials(mut self, credential: Vec<u8>) -> Self {
-        self.credential = Credential(credential);
+        self.mode.credential = credential;
         self
     }
 
     /// Sets handshake concurrency, established-peer capacity, and handshake deadline.
-    /// Applies only to direct links; native connectivity has its own bounded protocol.
     #[must_use]
     pub fn with_admission_config(mut self, config: TcpAdmissionConfig) -> Self {
-        self.admission_config = config;
+        self.mode.admission_config = config;
         self
     }
 
     /// Sets the message transport tuning (idle timeout, pool and queue
-    /// capacities, frame limit, advertised address), validated here so binding
-    /// cannot fail on it. Applies only to direct links; native connectivity
-    /// carries its own protocol limits.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` when [`TcpMsgConfig::validate`] rejects `config`.
-    pub fn with_msg_config(mut self, config: TcpMsgConfig) -> io::Result<Self> {
-        config.validate()?;
-        self.msg_config = config;
-        Ok(self)
-    }
-
-    /// Sets the routing cost of this link (default: one).
+    /// capacities, frame limit, advertised address).
     #[must_use]
-    pub const fn with_cost(mut self, cost: u32) -> Self {
-        self.cost = cost;
+    pub fn with_msg_config(mut self, config: TcpMsgConfig) -> Self {
+        self.mode.msg_config = config;
         self
     }
 }
 
-impl LinkProvider for TcpLink {
-    fn peers(&self) -> &[NodeId] {
-        #[cfg(feature = "connectivity")]
-        if let Some(config) = &self.connectivity {
-            return &config.peers;
+#[cfg(feature = "connectivity")]
+impl TcpLink<TcpConnectivity> {
+    /// Configures a native TCP connection. `config.local` must match the binding
+    /// node identity. Admission, credentials, discovery, and path policy come from
+    /// `config`.
+    #[must_use]
+    pub const fn connectivity(config: crate::TcpPunchConfig) -> Self {
+        Self {
+            mode: TcpConnectivity { config },
+            cost: 1,
         }
-        &self.peers
+    }
+}
+
+impl LinkProvider for TcpLink<TcpDirect> {
+    fn peers(&self) -> &[NodeId] {
+        &self.mode.peers
     }
 
     fn bind(self: Box<Self>, local: NodeId) -> LinkFuture<'static, io::Result<BoundLink>> {
         Box::pin(async move {
-            #[cfg(feature = "connectivity")]
-            if let Some(config) = self.connectivity {
-                if config.local != local {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "TCP connectivity identity differs from node identity",
-                    ));
-                }
-                let transport = TcpMsgTransport::bind_connectivity(config).await?;
-                return Ok(transport.into_bound_link(self.cost));
-            }
             let Self {
-                bind,
-                peers,
-                addresses,
+                mode:
+                    TcpDirect {
+                        bind,
+                        peers,
+                        addresses,
+                        msg_config,
+                        admission,
+                        credential,
+                        admission_config,
+                    },
                 cost,
-                msg_config,
-                admission,
-                credential,
-                admission_config,
-                ..
             } = *self;
-            let policy = admission.unwrap_or_else(|| Arc::new(ConfiguredAdmission(peers.clone())));
-            let transport = TcpMsgTransport::bind_admitted(
-                local,
-                bind,
-                msg_config,
-                policy,
-                credential.0,
-                admission_config,
-            )
-            .await?;
+            let admission = TcpAdmission {
+                policy: admission.unwrap_or_else(|| Arc::new(ConfiguredAdmission(peers.clone()))),
+                credential,
+                config: admission_config,
+            };
+            let transport =
+                TcpMsgTransport::bind_admitted(local, bind, msg_config, admission).await?;
             for (node, address) in peers.iter().zip(addresses) {
                 transport.register_peer(node.clone(), address);
             }
@@ -182,28 +232,50 @@ impl LinkProvider for TcpLink {
     }
 }
 
-struct Credential(Vec<u8>);
+#[cfg(feature = "connectivity")]
+impl LinkProvider for TcpLink<TcpConnectivity> {
+    fn peers(&self) -> &[NodeId] {
+        &self.mode.config.peers
+    }
 
-impl std::fmt::Debug for Credential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Credential([redacted])")
+    fn bind(self: Box<Self>, local: NodeId) -> LinkFuture<'static, io::Result<BoundLink>> {
+        Box::pin(async move {
+            let Self {
+                mode: TcpConnectivity { config },
+                cost,
+            } = *self;
+            if config.local != local {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "TcpPunchConfig.local {} differs from the binding node {local}",
+                        config.local
+                    ),
+                ));
+            }
+            let transport = TcpMsgTransport::bind_connectivity(config).await?;
+            Ok(transport.into_bound_link(cost))
+        })
     }
 }
 
+/// The default direct-link policy: admit exactly the configured peers.
 #[derive(Debug)]
 struct ConfiguredAdmission(Vec<NodeId>);
 
 impl Admission for ConfiguredAdmission {
     fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
         Box::pin(async move {
+            request.validate()?;
             if self.0.contains(request.claimed) {
-                Ok(AcceptedPeer {
-                    node: request.claimed.clone(),
-                })
+                Ok(AcceptedPeer::new(request.claimed.clone()))
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "unconfigured TCP peer",
+                    format!(
+                        "{} is not a configured peer of this TCP link",
+                        request.claimed
+                    ),
                 ))
             }
         })
@@ -211,202 +283,4 @@ impl Admission for ConfiguredAdmission {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn provider_drains_listener_on_close() {
-        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        let address = reservation.local_addr().expect("address");
-        drop(reservation);
-        let peer = NodeId::new("tcp-peer");
-        let link = TcpLink::new(
-            address,
-            vec![PeerEndpoint::new(
-                peer,
-                "127.0.0.1:12345".parse().expect("peer address"),
-            )],
-        )
-        .with_cost(7);
-        let provider: Box<dyn LinkProvider> = Box::new(link);
-        let bound = provider.bind(NodeId::new("tcp-local")).await.expect("bind");
-        assert!(std::net::TcpListener::bind(address).is_err());
-        tokio::time::timeout(std::time::Duration::from_secs(5), bound.driver.close())
-            .await
-            .expect("drain listener");
-        let _replacement = std::net::TcpListener::bind(address).expect("listener released");
-    }
-
-    #[tokio::test]
-    async fn link_validates_and_binds_its_message_config() {
-        let invalid = TcpMsgConfig {
-            max_frame_bytes: 0,
-            ..TcpMsgConfig::default()
-        };
-        assert_eq!(
-            TcpLink::new("127.0.0.1:0".parse().expect("address"), Vec::new())
-                .with_msg_config(invalid)
-                .expect_err("invalid config rejected by the builder")
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        let link = TcpLink::new("127.0.0.1:0".parse().expect("address"), Vec::new())
-            .with_msg_config(TcpMsgConfig {
-                max_frame_bytes: 512,
-                ..TcpMsgConfig::default()
-            })
-            .expect("valid config");
-        let bound = Box::new(link)
-            .bind(NodeId::new("tcp-local"))
-            .await
-            .expect("bind");
-        assert_eq!(
-            bound.config.mtu, 512,
-            "the stored config reached the transport"
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(5), bound.driver.close())
-            .await
-            .expect("drain listener");
-    }
-
-    #[tokio::test]
-    async fn provider_propagates_listener_bind_errors() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let link = TcpLink::new(listener.local_addr().expect("address"), Vec::new());
-        assert!(Box::new(link).bind(NodeId::new("tcp-local")).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn dropping_unregistered_link_cancels_listener() {
-        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        let address = reservation.local_addr().expect("address");
-        drop(reservation);
-        let bound = Box::new(TcpLink::new(address, Vec::new()))
-            .bind(NodeId::new("tcp-local"))
-            .await
-            .expect("bind");
-        drop(bound);
-        let _replacement = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                match tokio::net::TcpListener::bind(address).await {
-                    Ok(listener) => break listener,
-                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => panic!("rebind failed: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("dropped provider released listener");
-    }
-
-    async fn dial_finished(transport: &TcpMsgTransport) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while transport.outbound_connections() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("dial attempt drained");
-    }
-
-    #[tokio::test]
-    async fn static_admission_rejects_unknown_and_bootstrap_recovers_late_listener() {
-        use groupnet_transport::Transport;
-        use groupnet_transport::admission::OpenAdmission;
-        use std::time::Duration;
-
-        let a_id = NodeId::new("static-a");
-        let b_id = NodeId::new("static-b");
-        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve");
-        let b_addr = reservation.local_addr().expect("address");
-        drop(reservation);
-        let a = TcpMsgTransport::bind_admitted(
-            a_id.clone(),
-            "127.0.0.1:0",
-            TcpMsgConfig::default(),
-            Arc::new(ConfiguredAdmission(vec![b_id.clone()])),
-            Vec::new(),
-            TcpAdmissionConfig::default(),
-        )
-        .await
-        .expect("a");
-        a.register_peer(b_id.clone(), b_addr);
-        a.connect_peer(&b_id)
-            .expect("best-effort unavailable bootstrap");
-        // Observe the refused attempt before bringing up the configured peer.
-        dial_finished(&a).await;
-        a.bootstrap(vec![b_id.clone()]);
-        let b = TcpMsgTransport::bind_admitted(
-            b_id.clone(),
-            b_addr,
-            TcpMsgConfig::default(),
-            Arc::new(ConfiguredAdmission(vec![a_id])),
-            Vec::new(),
-            TcpAdmissionConfig::default(),
-        )
-        .await
-        .expect("late b");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while a
-                .sessions()
-                .expect("sessions")
-                .subscribe()
-                .borrow()
-                .is_empty()
-                || b.sessions()
-                    .expect("sessions")
-                    .subscribe()
-                    .borrow()
-                    .is_empty()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("late bootstrap connected");
-        b.send(a.local_id(), b"static topology")
-            .await
-            .expect("send");
-        assert_eq!(
-            (tokio::time::timeout(Duration::from_secs(5), a.recv())
-                .await
-                .expect("receive")
-                .expect("frame")
-                .msg)
-                .as_ref(),
-            b"static topology"
-        );
-        let unknown = TcpMsgTransport::bind_admitted(
-            NodeId::new("unknown"),
-            "127.0.0.1:0",
-            TcpMsgConfig::default(),
-            Arc::new(OpenAdmission),
-            Vec::new(),
-            TcpAdmissionConfig::default(),
-        )
-        .await
-        .expect("unknown");
-        unknown.register_peer(a.local_id().clone(), a.local_addr());
-        unknown.connect_peer(a.local_id()).expect("attempt");
-        dial_finished(&unknown).await;
-        assert!(
-            unknown
-                .sessions()
-                .expect("sessions")
-                .subscribe()
-                .borrow()
-                .is_empty()
-        );
-        assert_eq!(
-            a.sessions().expect("sessions").subscribe().borrow().len(),
-            1
-        );
-        unknown.close().await;
-        a.close().await;
-        b.close().await;
-    }
-}
+mod tests;

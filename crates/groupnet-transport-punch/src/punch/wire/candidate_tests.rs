@@ -243,7 +243,7 @@ fn confirmation_proof_binds_its_sequence() {
 #[test]
 fn maximum_direct_payload_and_identity_names_still_fit_with_pair_and_fabric_macs() {
     let name = "x".repeat(64);
-    let message = [0; super::super::MAX_MESSAGE];
+    let message = [0; super::super::MAX_UDP_MESSAGE];
     let key = NetworkKey::from_bytes([8; 32]);
     let value = sign_check(Packet {
         sender: &name,

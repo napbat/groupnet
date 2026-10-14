@@ -6,7 +6,7 @@ use std::time::Duration;
 use groupnet_core::NodeId;
 use groupnet_transport::Transport;
 use groupnet_transport::admission::{SessionId, SessionRegistry};
-use groupnet_transport_punch::{PunchConfig, Rendezvous};
+use groupnet_transport_punch::{UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig};
 
 use super::UdpTransport;
 use super::framing::SendBuffer;
@@ -26,7 +26,7 @@ async fn admitted(registry: &SessionRegistry, peer: &NodeId) -> SessionId {
 }
 
 async fn connect(id: &NodeId, rendezvous: SocketAddr) -> UdpTransport {
-    let mut config = PunchConfig::open(id.clone(), rendezvous);
+    let mut config = UdpPunchConfig::open(id.clone(), rendezvous);
     config.bind = "127.0.0.1:0".parse().expect("bind address");
     config.gather_interfaces = false;
     UdpTransport::bind_connectivity(config)
@@ -36,19 +36,21 @@ async fn connect(id: &NodeId, rendezvous: SocketAddr) -> UdpTransport {
 
 #[tokio::test]
 async fn managed_connection_preserves_socket_sessions_and_tagged_io() {
-    let server = Rendezvous::bind_open("127.0.0.1:0".parse().expect("server address"))
-        .await
-        .expect("rendezvous");
+    let server = UdpRendezvous::bind(UdpRendezvousConfig::open(
+        "127.0.0.1:0".parse().expect("server address"),
+    ))
+    .await
+    .expect("rendezvous");
     let receiver_id = NodeId::new("connected-receiver");
     let sender_id = NodeId::new("connected-sender");
-    let receiver = connect(&receiver_id, server.local_addr().expect("server address")).await;
-    let receiver_addr = receiver.local_addr().expect("actual socket address");
+    let receiver = connect(&receiver_id, server.local_addr()).await;
+    let receiver_addr = receiver.local_addr();
     let observer = receiver.clone();
     let receiver_sessions = observer.sessions().expect("native sessions");
     let bound = receiver.into_bound_link(7);
     assert!(std::net::UdpSocket::bind(receiver_addr).is_err());
 
-    let sender = connect(&sender_id, server.local_addr().expect("server address")).await;
+    let sender = connect(&sender_id, server.local_addr()).await;
     let receiver_generation = admitted(&receiver_sessions, &sender_id).await;
     assert!(
         bound
@@ -92,10 +94,9 @@ async fn managed_connection_preserves_socket_sessions_and_tagged_io() {
 
     bound.driver.close().await;
     assert!(!receiver_sessions.is_active(&sender_id, receiver_generation));
-    assert_eq!(
-        observer.local_addr().expect_err("closed").kind(),
-        std::io::ErrorKind::NotConnected
-    );
+    assert_eq!(observer.local_addr(), receiver_addr);
+    assert_eq!(observer.local_addrs(), [receiver_addr]);
+    assert_eq!(observer.observed_addr(), None);
     let _replacement = std::net::UdpSocket::bind(receiver_addr).expect("actual socket released");
     sender.into_bound_link(1).driver.close().await;
     server.close().await;
@@ -103,12 +104,14 @@ async fn managed_connection_preserves_socket_sessions_and_tagged_io() {
 
 #[tokio::test]
 async fn connected_mode_ignores_address_hints_and_raw_self_attribution() {
-    let server = Rendezvous::bind_open("127.0.0.1:0".parse().expect("server address"))
-        .await
-        .expect("rendezvous");
+    let server = UdpRendezvous::bind(UdpRendezvousConfig::open(
+        "127.0.0.1:0".parse().expect("server address"),
+    ))
+    .await
+    .expect("rendezvous");
     let receiver_id = NodeId::new("fenced-receiver");
     let attacker_id = NodeId::new("unadmitted");
-    let receiver = connect(&receiver_id, server.local_addr().expect("server address")).await;
+    let receiver = connect(&receiver_id, server.local_addr()).await;
     let raw = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("raw socket");
@@ -121,7 +124,7 @@ async fn connected_mode_ignores_address_hints_and_raw_self_attribution() {
     let mut buffer = SendBuffer::new(&attacker_id).expect("raw sender prefix");
     raw.send_to(
         buffer.frame(b"forged raw payload").expect("raw payload"),
-        receiver.local_addr().expect("socket"),
+        receiver.local_addr(),
     )
     .await
     .expect("raw datagram");

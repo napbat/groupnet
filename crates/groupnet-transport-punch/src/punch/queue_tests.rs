@@ -4,7 +4,7 @@ use super::*;
 use groupnet_transport::admission::AcceptedPeer;
 
 fn connection() -> (UdpConnection, mpsc::Receiver<Outbound>) {
-    let sessions = SessionRegistry::new(1).unwrap();
+    let sessions = SessionRegistry::new(NonZeroUsize::MIN);
     let node = NodeId::from("remote");
     let lease = sessions
         .try_admit(AcceptedPeer { node: node.clone() })
@@ -50,7 +50,7 @@ async fn owned_queue_preserves_storage_and_full_queue_skips_borrowed_copy() {
     let (connection, mut outgoing) = connection();
     let remote = NodeId::from("remote");
     let session = lock(&connection.inner.peers)["remote"].lease.id();
-    let payload = Bytes::from(vec![42; MAX_MESSAGE]);
+    let payload = Bytes::from(vec![42; MAX_UDP_MESSAGE]);
     let pointer = payload.as_ptr();
     connection
         .send_owned_admitted(&remote, payload, Some(session))
@@ -67,7 +67,7 @@ async fn owned_queue_preserves_storage_and_full_queue_skips_borrowed_copy() {
         .unwrap();
     let queued = outgoing.try_recv().unwrap();
     assert_eq!(queued.message.as_ptr(), pointer);
-    assert_eq!(queued.message.len(), MAX_MESSAGE);
+    assert_eq!(queued.message.len(), MAX_UDP_MESSAGE);
     assert_eq!(queued.session, session);
     assert_eq!(queued.target, [3; 16]);
     assert!(outgoing.try_recv().is_err());
@@ -87,7 +87,7 @@ async fn owned_sends_reject_oversize_missing_generation_and_closed_connection() 
     let remote = NodeId::from("remote");
     assert_eq!(
         connection
-            .send_owned(&remote, Bytes::from(vec![0; MAX_MESSAGE + 1]))
+            .send_owned(&remote, Bytes::from(vec![0; MAX_UDP_MESSAGE + 1]))
             .await
             .unwrap_err()
             .kind(),
@@ -147,36 +147,41 @@ async fn owned_admitted_send_drops_replaced_generation() {
 }
 
 #[tokio::test]
-async fn operational_limits_are_validated_before_socket_binding() {
+async fn bind_addresses_stay_cached_after_shutdown() {
     let address = SocketAddr::from(([127, 0, 0, 1], 1234));
-    // Queue capacities are valid by construction (`QueueCapacity`); the peer
-    // limit is still checked before any socket is bound.
-    let mut config = PunchConfig::open("local".into(), address);
-    config.max_peers = 0;
-    assert_eq!(
-        UdpConnection::bind(config).await.unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
-    let mut config = PunchConfig::new(
+    let defaults = UdpPunchConfig::open("local".into(), address);
+    assert_eq!(defaults.max_peers, DEFAULT_MAX_PEERS);
+    assert_eq!(defaults.queue_capacity, DEFAULT_QUEUE_CAPACITY);
+    let mut config = UdpPunchConfig::new(
         "local".into(),
         address,
         NetworkKey::from_bytes([1; 32]),
-        vec!["a".into(), "b".into()],
+        Vec::new(),
     );
-    config.max_peers = 1;
-    assert_eq!(
-        UdpConnection::bind(config).await.unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
-    let defaults = PunchConfig::open("local".into(), address);
-    assert_eq!(defaults.max_peers, DEFAULT_MAX_PEERS);
-    assert_eq!(defaults.queue_capacity, DEFAULT_QUEUE_CAPACITY);
+    config.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    config.candidate_binds = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
+    config.gather_interfaces = false;
+    let connection = UdpConnection::bind(config).await.unwrap();
+    let primary = connection.local_addr();
+    let addresses = connection.local_addrs().to_vec();
+    let candidates = connection.local_candidates();
+    assert_ne!(primary.port(), 0);
+    assert_eq!(addresses.len(), 2);
+    assert_eq!(addresses[0], primary);
+    assert!(candidates.contains(&primary));
+    assert!(!connection.is_closed());
+    connection.close().await;
+    assert!(connection.is_closed());
+    assert_eq!(connection.local_addr(), primary);
+    assert_eq!(connection.local_addrs(), addresses.as_slice());
+    assert_eq!(connection.local_candidates(), candidates);
+    assert_eq!(connection.observed_addr(), None);
 }
 
 #[tokio::test]
 async fn configured_capacities_apply_to_both_queues_and_admission_registry() {
     let address = SocketAddr::from(([127, 0, 0, 1], 1234));
-    let mut config = PunchConfig::new(
+    let mut config = UdpPunchConfig::new(
         "local".into(),
         address,
         NetworkKey::from_bytes([1; 32]),
@@ -184,7 +189,7 @@ async fn configured_capacities_apply_to_both_queues_and_admission_registry() {
     );
     config.bind = SocketAddr::from(([127, 0, 0, 1], 0));
     config.gather_interfaces = false;
-    config.max_peers = 2;
+    config.max_peers = NonZeroUsize::new(2).unwrap();
     config.queue_capacity = QueueCapacity::of(1);
     let connection = UdpConnection::bind(config).await.unwrap();
     assert_eq!(connection.inner.outbound.max_capacity(), 1);

@@ -9,7 +9,9 @@ use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::link::{LinkLifecycle, LinkProvider, PeerEndpoint};
 use groupnet_transport::{QueueCapacity, Transport};
-use groupnet_transport_ipc::{IpcAddress, IpcConfig, IpcLink, IpcTransport, MAX_FRAME};
+use groupnet_transport_ipc::{
+    IpcAddress, IpcConfig, IpcConfigError, IpcLink, IpcTransport, MAX_FRAME,
+};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -536,8 +538,7 @@ async fn configured_peer_limit_allows_replacement_but_rejects_growth() {
         max_peers: NonZeroUsize::MIN,
         ..IpcConfig::default()
     };
-    let transport =
-        IpcTransport::bind_with_config(NodeId::new("local"), &address.ipc, config).unwrap();
+    let transport = IpcTransport::bind_with(NodeId::new("local"), &address.ipc, config).unwrap();
     transport
         .register_peer(NodeId::new("peer"), peer_address.ipc.clone())
         .unwrap();
@@ -559,22 +560,27 @@ async fn invalid_limits_do_not_reserve_native_listener() {
         setup_timeout: Duration::ZERO,
         ..IpcConfig::default()
     };
+    let error = IpcTransport::bind_with(NodeId::new("local"), &address.ipc, config).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        IpcTransport::bind_with_config(NodeId::new("local"), &address.ipc, config)
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcConfigError>()),
+        Some(&IpcConfigError::ZeroSetupTimeout)
     );
     let transport = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap();
     transport.close().await;
     let provider = IpcLink::new(address.ipc.clone(), Vec::new()).with_config(config);
+    let error = Box::new(provider)
+        .bind(NodeId::new("local"))
+        .await
+        .unwrap_err();
     assert_eq!(
-        Box::new(provider)
-            .bind(NodeId::new("local"))
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcConfigError>()),
+        Some(&IpcConfigError::ZeroSetupTimeout),
+        "the link validates once, at bind"
     );
     let replacement = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap();
     replacement.close().await;
@@ -591,10 +597,8 @@ async fn owned_packets_cross_native_ipc_with_small_configured_queues() {
         inbound_queue: QueueCapacity::MIN,
         ..IpcConfig::default()
     };
-    let left =
-        IpcTransport::bind_with_config(NodeId::new("left"), &left_address.ipc, config).unwrap();
-    let right =
-        IpcTransport::bind_with_config(NodeId::new("right"), &right_address.ipc, config).unwrap();
+    let left = IpcTransport::bind_with(NodeId::new("left"), &left_address.ipc, config).unwrap();
+    let right = IpcTransport::bind_with(NodeId::new("right"), &right_address.ipc, config).unwrap();
     left.register_peer(NodeId::new("right"), right_address.ipc.clone())
         .unwrap();
     let payload = bytes::Bytes::from(vec![0x5a; MAX_FRAME]);
@@ -617,8 +621,7 @@ async fn configured_setup_deadline_closes_a_silent_connection() {
         setup_timeout: Duration::from_millis(100),
         ..IpcConfig::default()
     };
-    let transport =
-        IpcTransport::bind_with_config(NodeId::new("listener"), &address.ipc, config).unwrap();
+    let transport = IpcTransport::bind_with(NodeId::new("listener"), &address.ipc, config).unwrap();
     let mut stream = raw_connect(&address.ipc).await;
     // No introduction is ever sent; the listener gives up at its deadline.
     assert_closed(&mut stream).await;
@@ -632,8 +635,7 @@ async fn configured_read_deadline_closes_an_idle_session() {
         read_timeout: Duration::from_millis(100),
         ..IpcConfig::default()
     };
-    let transport =
-        IpcTransport::bind_with_config(NodeId::new("listener"), &address.ipc, config).unwrap();
+    let transport = IpcTransport::bind_with(NodeId::new("listener"), &address.ipc, config).unwrap();
     let mut stream = raw_connect(&address.ipc).await;
     introduction(&mut stream).await;
     // The session is established but never carries a frame.
@@ -660,8 +662,7 @@ async fn configured_write_deadline_ends_a_session_whose_peer_stops_reading() {
         write_timeout: Duration::from_millis(100),
         ..IpcConfig::default()
     };
-    let transport =
-        IpcTransport::bind_with_config(NodeId::new("listener"), &address.ipc, config).unwrap();
+    let transport = IpcTransport::bind_with(NodeId::new("listener"), &address.ipc, config).unwrap();
     let mut stream = raw_connect(&address.ipc).await;
     introduction(&mut stream).await;
     // A delivered inbound frame proves the session is registered for sends.

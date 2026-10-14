@@ -1,7 +1,7 @@
 //! Bounded address-verified admission, discovery, and session-bound UDP relay.
 
 mod config;
-pub use config::{RendezvousConfig, RendezvousLimits};
+pub use config::{UdpRendezvousConfig, UdpRendezvousConfigError, UdpRendezvousLimits};
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::candidates::Candidates;
 use super::wire::{self, Body, MAX_PACKET, Packet, Session};
-use super::{LEASE, NetworkKey, closed, random, transient};
+use super::{LEASE, NetworkKey, random, transient};
 use crate::RelayPacing;
 use crate::pacing::Budget;
 
@@ -151,7 +151,7 @@ impl Default for Challenges {
     fn default() -> Self {
         Self {
             pending: HashMap::new(),
-            capacity: RendezvousLimits::default().max_challenges,
+            capacity: UdpRendezvousLimits::default().max_challenges.get(),
         }
     }
 }
@@ -265,50 +265,21 @@ impl Drop for Inner {
 /// Admitted relay data never spends that budget: it is bounded only by socket
 /// backpressure or the configured [`RelayPacing`] byte budget.
 #[derive(Debug)]
-pub struct Rendezvous {
+pub struct UdpRendezvous {
     inner: Arc<Inner>,
 }
 
-impl Rendezvous {
-    /// Binds an explicitly keyed rendezvous with a fixed identity allowlist.
-    ///
-    /// # Errors
-    /// Rejects malformed allowlists or socket binding failures.
-    pub async fn bind(bind: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> io::Result<Self> {
-        Self::bind_config(RendezvousConfig::new(bind, key, peers)).await
-    }
-
-    /// Binds explicitly keyless discovery and relay, permitting requested direct paths.
-    ///
-    /// # Errors
-    /// Propagates socket binding errors and rejects multicast bind addresses.
-    pub async fn bind_open(bind: SocketAddr) -> io::Result<Self> {
-        Self::bind_config(RendezvousConfig::open(bind)).await
-    }
-
-    /// Binds dynamic discovery with application admission and optional fabric HMAC.
-    ///
-    /// Keyed datagrams never fall back to keyless parsing. Policies run only
-    /// after address return-routability, with bounded time and concurrency.
-    ///
-    /// # Errors
-    /// Propagates socket binding errors and rejects multicast bind addresses.
-    pub async fn bind_with_admission(
-        bind: SocketAddr,
-        key: Option<NetworkKey>,
-        admission: Arc<dyn Admission>,
-    ) -> io::Result<Self> {
-        Self::bind_config(RendezvousConfig::with_admission(bind, key, admission)).await
-    }
-
-    /// Binds a rendezvous with explicit operational capacities and admission policy.
+impl UdpRendezvous {
+    /// Binds a rendezvous from its full configuration: allowlist or dynamic
+    /// admission, optional fabric key, operational capacities and relay pacing.
     ///
     /// Authentication, replay protection, fixed control-rate budgets, and
     /// challenge/session deadlines are unaffected by capacity or pacing tuning.
     ///
     /// # Errors
-    /// Rejects zero capacities, malformed allowlists, multicast binds, and socket errors.
-    pub async fn bind_config(config: RendezvousConfig) -> io::Result<Self> {
+    /// Rejects invalid configuration as `InvalidInput` wrapping its
+    /// [`UdpRendezvousConfigError`], and propagates socket errors.
+    pub async fn bind(config: UdpRendezvousConfig) -> io::Result<Self> {
         config.validate()?;
         let allowed = config.peers.map(|peers| {
             peers
@@ -337,26 +308,16 @@ impl Rendezvous {
         })
     }
 
-    /// Returns the actual bind address.
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        if self.inner.cancel.is_cancelled() {
-            Err(closed())
-        } else {
-            Ok(self.inner.address)
-        }
+    /// Returns the actual bind address, cached at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.address
     }
 
     /// Cancels socket I/O and drains all pending policy evaluations.
     pub async fn close(&self) {
         self.inner.cancel.cancel();
-        let mut task = self.inner.task.lock().await;
-        if let Some(task) = task.as_mut() {
-            let _ = task.await;
-        }
-        task.take();
+        crate::common::join(&self.inner.task).await;
     }
 }
 
@@ -371,7 +332,7 @@ struct ServerState {
     challenges: Challenges,
     decisions: JoinSet<Decision>,
     pre_admission: Entry,
-    limits: RendezvousLimits,
+    limits: UdpRendezvousLimits,
     relay_pacing: RelayPacing,
 }
 
@@ -380,7 +341,7 @@ async fn serve(
     key: Option<NetworkKey>,
     admission: Arc<dyn Admission>,
     allowed: Option<HashSet<String>>,
-    limits: RendezvousLimits,
+    limits: UdpRendezvousLimits,
     relay_pacing: RelayPacing,
     cancel: CancellationToken,
 ) {
@@ -388,7 +349,7 @@ async fn serve(
         entries: HashMap::new(),
         challenges: Challenges {
             pending: HashMap::new(),
-            capacity: limits.max_challenges,
+            capacity: limits.max_challenges.get(),
         },
         decisions: JoinSet::new(),
         pre_admission: Entry::new(Instant::now(), RelayPacing::Backpressure),
@@ -695,8 +656,8 @@ async fn register(
         return;
     }
     expire_entries(&mut state.entries, now);
-    if state.entries.len() >= state.limits.max_peers
-        || state.decisions.len() >= state.limits.max_pending_admissions
+    if state.entries.len() >= state.limits.max_peers.get()
+        || state.decisions.len() >= state.limits.max_pending_admissions.get()
     {
         respond(
             socket,

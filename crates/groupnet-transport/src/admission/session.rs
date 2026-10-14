@@ -1,13 +1,73 @@
 //! Bounded, atomic live-neighbor ownership.
 
 use super::AcceptedPeer;
+use crate::identity::{MAX_NODE_ID_BYTES, NodeIdError, validate_node_id};
 use groupnet_core::NodeId;
 use std::{
     collections::BTreeMap,
-    io,
+    fmt, io,
+    num::NonZeroUsize,
     sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::watch;
+
+/// Why [`SessionRegistry::try_admit`] refused an authorized identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionError {
+    /// The accepted identity is outside the shared identity bound.
+    Identity(NodeIdError),
+    /// [`SessionRegistry::close`] has run; admission is permanently over.
+    Closed,
+    /// The identity already holds a live session; incumbents are never evicted.
+    AlreadyAdmitted(NodeId),
+    /// Every one of the registry's `max_peers` slots is live.
+    CapacityReached {
+        /// The registry's established-peer bound.
+        max_peers: NonZeroUsize,
+    },
+    /// The registry issued its last session generation.
+    GenerationsExhausted,
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity(error) => write!(f, "admitted identity rejected: {error}"),
+            Self::Closed => f.write_str("session registry closed"),
+            Self::AlreadyAdmitted(node) => write!(f, "identity {node} is already admitted"),
+            Self::CapacityReached { max_peers } => {
+                write!(f, "all {max_peers} session slots (max_peers) are live")
+            }
+            Self::GenerationsExhausted => f.write_str("session generations exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Identity(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<SessionError> for io::Error {
+    /// Maps each refusal to the kind adapters report it with: invalid input,
+    /// broken pipe after close, already-exists for a duplicate, otherwise
+    /// `Other`; the typed error stays the inner error.
+    fn from(error: SessionError) -> Self {
+        let kind = match &error {
+            SessionError::Identity(_) => io::ErrorKind::InvalidInput,
+            SessionError::Closed => io::ErrorKind::BrokenPipe,
+            SessionError::AlreadyAdmitted(_) => io::ErrorKind::AlreadyExists,
+            SessionError::CapacityReached { .. } | SessionError::GenerationsExhausted => {
+                io::ErrorKind::Other
+            }
+        };
+        Self::new(kind, error)
+    }
+}
 
 /// Opaque generation of one admitted adjacent-peer lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,7 +90,7 @@ struct State {
 
 #[derive(Debug)]
 struct Shared {
-    max: usize,
+    max: NonZeroUsize,
     state: Mutex<State>,
     neighbors: watch::Sender<Arc<Vec<SessionPeer>>>,
     /// Sticky: set (before the final empty neighbor snapshot is published)
@@ -75,65 +135,49 @@ pub struct SessionRegistry {
 }
 
 impl SessionRegistry {
-    /// Creates a registry with an explicit established-peer bound.
-    ///
-    /// # Errors
-    /// Rejects zero capacity or an unrepresentable neighbor snapshot allocation.
-    pub fn new(max_peers: usize) -> io::Result<Self> {
-        if max_peers == 0 || max_peers > (isize::MAX as usize) / size_of::<SessionPeer>() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid session capacity",
-            ));
-        }
+    /// Creates a registry holding at most `max_peers` live sessions.
+    #[must_use]
+    pub fn new(max_peers: NonZeroUsize) -> Self {
         let (neighbors, _) = watch::channel(Arc::new(Vec::new()));
         let (closed, _) = watch::channel(false);
-        Ok(Self {
+        Self {
             shared: Arc::new(Shared {
                 max: max_peers,
                 state: Mutex::new(State::default()),
                 neighbors,
                 closed,
             }),
-        })
+        }
     }
 
     /// Atomically reserves an authorized identity without evicting an incumbent.
     /// The adapter must first check the policy result matches the remote claim.
     ///
     /// # Errors
-    /// Rejects invalid IDs, duplicate live identities, exhausted capacity/generations.
+    /// Returns the [`SessionError`] naming why: an invalid identity, a closed
+    /// registry, a duplicate live identity, exhausted capacity or generations.
+    ///
     /// # Panics
     /// Propagates a poisoned registry lock.
-    pub fn try_admit(&self, accepted: AcceptedPeer) -> io::Result<SessionLease> {
-        let length = accepted.node.as_str().len();
-        if length == 0 || length > crate::MAX_NODE_ID_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid admitted identity",
-            ));
-        }
+    pub fn try_admit(&self, accepted: AcceptedPeer) -> Result<SessionLease, SessionError> {
+        validate_node_id(&accepted.node, MAX_NODE_ID_BYTES).map_err(SessionError::Identity)?;
         let mut state = self.shared.state.lock().expect("session registry poisoned");
         // `close` sets the flag under this lock, so the check is atomic with it.
         if *self.shared.closed.borrow() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "session registry closed",
-            ));
+            return Err(SessionError::Closed);
         }
         if state.peers.contains_key(&accepted.node) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "identity already admitted",
-            ));
+            return Err(SessionError::AlreadyAdmitted(accepted.node));
         }
-        if state.peers.len() >= self.shared.max {
-            return Err(io::Error::other("session capacity reached"));
+        if state.peers.len() >= self.shared.max.get() {
+            return Err(SessionError::CapacityReached {
+                max_peers: self.shared.max,
+            });
         }
         state.next = state
             .next
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("session generation exhausted"))?;
+            .ok_or(SessionError::GenerationsExhausted)?;
         let id = SessionId(state.next);
         state.peers.insert(accepted.node.clone(), id);
         self.shared.publish(&state);
@@ -274,17 +318,5 @@ impl SessionLease {
         if let Some(shared) = self.inner.shared.upgrade() {
             shared.remove(&self.inner.node, self.inner.id);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn established_peer_capacity_has_no_arbitrary_routing_ceiling() {
-        assert!(SessionRegistry::new(8192).is_ok());
-        assert!(SessionRegistry::new(0).is_err());
-        assert!(SessionRegistry::new(usize::MAX).is_err());
     }
 }

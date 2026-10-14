@@ -48,7 +48,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
     let peer = NodeId::new("previously-unknown");
     let beyond = NodeId::new("beyond");
     let router = Router::new(local, RouterConfig::default())?;
-    let registry = SessionRegistry::new(2)?;
+    let registry = SessionRegistry::new(std::num::NonZeroUsize::new(2).expect("nonzero"));
     let (incoming, receive) = mpsc::channel(16);
     let (sent, mut recipients) = mpsc::channel(32);
     router
@@ -130,7 +130,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
 
 #[test]
 fn fragment_assemblies_do_not_cross_session_generations() {
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
     let peer = NodeId::new("peer");
     let old = registry.try_admit(AcceptedPeer::new(peer.clone())).unwrap();
     let old_id = old.id();

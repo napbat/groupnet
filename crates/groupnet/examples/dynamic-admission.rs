@@ -14,7 +14,7 @@ use groupnet::core::NodeId;
 use groupnet::runtime::{Group, Node};
 use groupnet::transport::admission::{AcceptedPeer, Admission, JoinRequest, OpenAdmission};
 use groupnet::transport::link::{LinkFuture, PeerEndpoint};
-use groupnet::transport::tcp::{TcpAdmissionConfig, TcpLink, TcpMsgConfig, TcpMsgTransport};
+use groupnet::transport::tcp::{TcpAdmission, TcpLink, TcpMsgConfig, TcpMsgTransport};
 
 #[derive(Debug)]
 struct Invitation;
@@ -88,9 +88,7 @@ async fn main() -> io::Result<()> {
         server_id.clone(),
         "127.0.0.1:0",
         TcpMsgConfig::default(),
-        policy,
-        Vec::new(),
-        TcpAdmissionConfig::default(),
+        TcpAdmission::new(policy),
     )
     .await?;
     let address = transport.local_addr();

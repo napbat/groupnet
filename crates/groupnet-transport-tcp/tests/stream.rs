@@ -82,8 +82,9 @@ async fn hostname_book_resolves_each_connect_under_caller_deadline() {
 async fn a_dial_only_endpoint_calls_out_and_never_accepts() {
     let client = TcpBulkTransport::dial_only(NodeId::new("client-a"));
     assert_eq!(
-        client.local_addr().expect_err("no listener").kind(),
-        std::io::ErrorKind::NotConnected
+        client.local_addr(),
+        None,
+        "a dial-only endpoint has no listener"
     );
     let server = TcpBulkTransport::bind(NodeId::new("server-b"), "127.0.0.1:0")
         .await

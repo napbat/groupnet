@@ -9,8 +9,8 @@
 use std::io;
 
 use groupnet_core::NodeId;
-use groupnet_transport::MAX_NODE_ID_BYTES;
 use groupnet_transport::framing::{LengthHeader, write_vectored};
+use groupnet_transport::{MAX_NODE_ID_BYTES, validate_node_id};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use zerocopy::{FromZeros, IntoBytes};
 
@@ -21,16 +21,9 @@ pub(crate) const MAX_ADDR_LEN: usize = 256;
 /// Checks `id` against the identity bound every adapter shares.
 ///
 /// # Errors
-/// Returns `InvalidInput` for an empty or overlong id.
+/// Returns `InvalidInput` carrying the [`NodeIdError`](groupnet_transport::NodeIdError).
 pub(crate) fn check_id(id: &NodeId) -> io::Result<()> {
-    let len = id.as_str().len();
-    if len == 0 || len > MAX_NODE_ID_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "node id outside the handshake identity bound",
-        ));
-    }
-    Ok(())
+    Ok(validate_node_id(id, MAX_NODE_ID_BYTES)?)
 }
 
 /// The typed length prefix of one field.

@@ -24,7 +24,7 @@ pub(super) async fn endpoint(
 ) {
     let relay = UdpSocket::bind(loopback()).await.unwrap();
     let remote = UdpSocket::bind(loopback()).await.unwrap();
-    let mut config = PunchConfig::open("local".into(), relay.local_addr().unwrap());
+    let mut config = UdpPunchConfig::open("local".into(), relay.local_addr().unwrap());
     config.policy = policy;
     let (incoming, receiver) = mpsc::channel(4);
     let mut endpoint = Endpoint {
@@ -43,7 +43,7 @@ pub(super) async fn endpoint(
         discovery: 7,
         heartbeat: 0,
         registered: Some(Instant::now()),
-        sessions: SessionRegistry::new(4).unwrap(),
+        sessions: SessionRegistry::new(std::num::NonZeroUsize::new(4).unwrap()),
         ready: None,
         peers: Arc::new(Mutex::new(HashMap::new())),
         incoming,
@@ -699,7 +699,7 @@ async fn direct_expiry_routes_the_next_message_to_the_relay_without_a_new_key_or
 #[tokio::test]
 async fn configured_peer_cap_preserves_existing_peer_and_reclaims_revoked_slot() {
     let (mut endpoint, _, _, _) = endpoint(PathPolicy::RelayOnly).await;
-    endpoint.config.max_peers = 1;
+    endpoint.config.max_peers = std::num::NonZeroUsize::MIN;
     let offer = control(7, Body::Discover { proof: [2; 16] });
     endpoint.accept_offer(
         offer,

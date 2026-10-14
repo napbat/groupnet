@@ -31,10 +31,7 @@ async fn three_nodes_converge_over_udp() {
             .expect("bind");
         transports.push(t);
     }
-    let addrs: Vec<_> = transports
-        .iter()
-        .map(|t| t.local_addr().expect("addr"))
-        .collect();
+    let addrs: Vec<_> = transports.iter().map(UdpTransport::local_addr).collect();
     for (i, t) in transports.iter().enumerate() {
         for (j, id) in ids.iter().enumerate() {
             if i != j {

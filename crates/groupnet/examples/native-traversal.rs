@@ -9,7 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use groupnet::connectivity::{
-    PathPolicy, PeerPath, PunchConfig, Rendezvous, TcpPunchConfig, TcpRendezvous,
+    PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig, UdpPunchConfig,
+    UdpRendezvous, UdpRendezvousConfig,
 };
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
@@ -121,9 +122,9 @@ async fn membership(left: Node, right: Node) -> io::Result<()> {
 }
 
 async fn udp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
-    let relay = Rendezvous::bind_open(bind).await?;
-    let address = relay.local_addr()?;
-    let mut left = PunchConfig::open(NodeId::new("native-a"), address);
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(bind)).await?;
+    let address = relay.local_addr();
+    let mut left = UdpPunchConfig::open(NodeId::new("native-a"), address);
     left.candidate_binds = vec![bind];
     left.policy = policy;
     let mut right = left.clone();
@@ -137,7 +138,7 @@ async fn udp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
     .await?;
     println!(
         "UDP candidates: {:?}; selected {:?} at {:?}",
-        left.local_candidates()?,
+        left.local_candidates(),
         left.path_to(&NodeId::new("native-b")),
         left.direct_addr_to(&NodeId::new("native-b"))
     );
@@ -158,8 +159,8 @@ async fn udp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
 }
 
 async fn tcp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
-    let relay = TcpRendezvous::bind_open(bind).await?;
-    let address = relay.local_addr()?;
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(bind)).await?;
+    let address = relay.local_addr();
     let mut left = TcpPunchConfig::open(NodeId::new("native-a"), address);
     left.candidate_binds = vec![bind];
     left.policy = policy;
@@ -174,7 +175,7 @@ async fn tcp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
     .await?;
     println!(
         "TCP candidates: {:?}; selected {:?} at {:?}",
-        left.local_candidates()?,
+        left.local_candidates(),
         left.path_to(&NodeId::new("native-b")),
         left.direct_addr_to(&NodeId::new("native-b"))
     );

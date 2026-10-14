@@ -25,6 +25,9 @@ use crate::handshake::{
     check_id, decode_id, field_header, read_addr, read_body, read_field, read_id, write_id,
 };
 
+mod config;
+pub use config::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError};
+
 const MAGIC: &[u8; 8] = b"GNJOIN01";
 
 /// Fixed prefix of a join hello: the protocol magic, then the claimed id's
@@ -35,32 +38,6 @@ const MAGIC: &[u8; 8] = b"GNJOIN01";
 struct HelloPrefix {
     magic: [u8; 8],
     node: LengthHeader,
-}
-
-/// Bounds for policy work and established managed TCP sessions.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TcpAdmissionConfig {
-    /// Maximum handshakes executing concurrently per direction, including custom
-    /// policy work. Inbound and outbound each have this capacity. Default: 64.
-    pub max_pending: QueueCapacity,
-    /// Maximum live admitted identities and dynamically learned dial addresses.
-    /// Duplicate live identities are rejected. Registered bootstrap addresses
-    /// are retained separately and cannot be overwritten by learning.
-    /// Must be nonzero. Default: 1024.
-    pub max_peers: usize,
-    /// Deadline covering connection establishment, wire exchange, and policy
-    /// work. Must be nonzero. Default: 5s.
-    pub handshake_timeout: Duration,
-}
-
-impl Default for TcpAdmissionConfig {
-    fn default() -> Self {
-        Self {
-            max_pending: QueueCapacity::of(64),
-            max_peers: 1024,
-            handshake_timeout: Duration::from_secs(5),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -108,30 +85,30 @@ impl TcpMsgTransport {
     /// the raw transport's idle/oldest-first eviction does not revoke membership.
     ///
     /// # Errors
-    /// Returns invalid-input errors for invalid bounds, oversized credentials,
-    /// or a local id outside the handshake bound, and propagates listener bind
-    /// failures.
+    /// Returns `InvalidInput` carrying the typed cause — a
+    /// [`TcpAdmissionError`] for `admission`, a
+    /// [`TcpMsgConfigError`](crate::TcpMsgConfigError) for `config`, or a
+    /// [`NodeIdError`](groupnet_transport::NodeIdError) for `local` — before
+    /// any socket opens, and propagates listener bind failures.
     pub async fn bind_admitted(
         local: NodeId,
         addr: impl ToSocketAddrs,
         config: TcpMsgConfig,
-        policy: Arc<dyn Admission>,
-        credential: Vec<u8>,
-        admission: TcpAdmissionConfig,
+        admission: TcpAdmission,
     ) -> io::Result<Self> {
-        if credential.len() > MAX_CREDENTIAL_BYTES || admission.handshake_timeout.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid TCP admission configuration",
-            ));
-        }
-        let managed = Arc::new(Managed {
-            sessions: SessionRegistry::new(admission.max_peers)?,
-            pending_inbound: Arc::new(Semaphore::new(admission.max_pending.get())),
-            pending_outbound: Arc::new(Semaphore::new(admission.max_pending.get())),
+        admission.validate()?;
+        let TcpAdmission {
             policy,
             credential,
-            config: admission,
+            config: bounds,
+        } = admission;
+        let managed = Arc::new(Managed {
+            sessions: SessionRegistry::new(bounds.max_peers),
+            pending_inbound: Arc::new(Semaphore::new(bounds.max_pending.get())),
+            pending_outbound: Arc::new(Semaphore::new(bounds.max_pending.get())),
+            policy,
+            credential,
+            config: bounds,
             connections: Mutex::new(Connections::default()),
             inbound: Mutex::new(None),
         });
@@ -151,7 +128,13 @@ impl TcpMsgTransport {
     pub fn connect_peer(&self, node: &NodeId) -> io::Result<()> {
         #[cfg(feature = "connectivity")]
         if let super::Backend::Connectivity { connection, .. } = &self.backend {
-            return connection.local_addr().map(|_| ());
+            if connection.is_closed() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "tcp msg transport shut down",
+                ));
+            }
+            return Ok(());
         }
         let Some(inner) = self.direct() else {
             return Err(io::Error::new(

@@ -39,7 +39,7 @@ impl TcpMsgTransport {
         match &self.backend {
             Backend::Direct(inner) => inner.local_addr,
             #[cfg(feature = "connectivity")]
-            Backend::Connectivity { address, .. } => *address,
+            Backend::Connectivity { connection } => connection.local_addr(),
         }
     }
 

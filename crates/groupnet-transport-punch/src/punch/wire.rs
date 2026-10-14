@@ -225,7 +225,7 @@ impl Writer<'_> {
     }
 
     fn message(&mut self, message: &[u8]) -> Option<()> {
-        if message.len() > super::MAX_MESSAGE {
+        if message.len() > super::MAX_UDP_MESSAGE {
             return None;
         }
         self.put(message)
@@ -310,7 +310,7 @@ impl<'a> Reader<'a> {
 
     fn message(&mut self) -> Option<&'a [u8]> {
         let remaining = self.bytes.len().checked_sub(self.position)?;
-        if remaining > super::MAX_MESSAGE {
+        if remaining > super::MAX_UDP_MESSAGE {
             return None;
         }
         self.take(remaining)
