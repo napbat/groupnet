@@ -38,8 +38,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use groupnet_core::NodeId;
-use groupnet_runtime::{CommandRejected, Group, Status};
+use groupnet_core::{NodeId, Status};
+use groupnet_runtime::{CommandRejected, Group};
 
 use crate::publish::{Recorded, enqueue};
 use crate::token::WriteToken;

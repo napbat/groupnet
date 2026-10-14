@@ -37,10 +37,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_core::anchor::AnchorRecord;
-use groupnet_core::{Activation, HostedConfig, NodeId, placement};
+use groupnet_core::{Activation, HostedConfig, NodeId, Role, placement};
 use groupnet_runtime::{
     Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf, Group, GroupEvent, GroupProfile,
-    Leadership, Node, Role,
+    Leadership, Node,
 };
 use groupnet_testkit::cluster::{
     MemCluster, NodeOpts, converged_within, eventually_within, spawn_mem_node,

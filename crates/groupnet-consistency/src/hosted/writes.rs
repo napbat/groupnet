@@ -296,7 +296,7 @@ impl<K> fmt::Debug for HostedWrites<K> {
 /// | is not | `None` | — | [`HostedError::NotHost`] `{ epoch, host }` |
 ///
 /// "Is the host" is the adopted pair naming this node, which is exactly what
-/// [`Role::Host`](groupnet_runtime::Role) means observer-locally.
+/// [`Role::Host`](groupnet_core::Role) means observer-locally.
 ///
 /// The `Deposed` row is the one that needs the memory: `(e, None)` — a host that
 /// lapsed and stepped down — and `(e′, Some(peer))` — a successor — are both

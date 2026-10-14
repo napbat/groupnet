@@ -66,8 +66,8 @@ use groupnet_consistency::{
     ChunkLimit, CommitLedger, Handoff, HandoffError, Snapshot, SnapshotChunks, SnapshotSink,
     SnapshotSource, WriteToken,
 };
-use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster};
-use groupnet_runtime::{Group, GroupProfile, Leadership, Node, Role};
+use groupnet_core::{Activation, HostedConfig, NodeId, Role, VoterRoster};
+use groupnet_runtime::{Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::{MemBulkNet, Network};
 use tokio::sync::watch;

@@ -378,7 +378,7 @@ impl Group {
     ///
     /// ```no_run
     /// # fn demo(group: &groupnet_runtime::Group) {
-    /// use groupnet_runtime::Role;
+    /// use groupnet_core::Role;
     /// let lead = group.leadership();
     /// if lead.role == Role::Host {
     ///     // We hold the group for `lead.epoch` — until our lease lapses or a

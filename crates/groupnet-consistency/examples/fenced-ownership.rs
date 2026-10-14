@@ -33,8 +33,8 @@ use std::time::Duration;
 use groupnet_consistency::{
     Commit, CommitLedger, Group, HostedError, HostedRead, HostedReads, HostedWrites,
 };
-use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster};
-use groupnet_runtime::{GroupProfile, Node, Role};
+use groupnet_core::{Activation, HostedConfig, NodeId, Role, VoterRoster};
+use groupnet_runtime::{GroupProfile, Node};
 use groupnet_transport_mem::{MemLink, Network};
 use tokio::task::JoinHandle;
 

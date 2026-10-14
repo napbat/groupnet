@@ -84,7 +84,6 @@ pub use group::{
     EntryMutationError, EntryMutationLimits, EntryRevision, Group, InspectedEntries,
     InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
-pub use groupnet_core::{RecoveredGrant, Role, Status};
 pub use groupnet_network::tunnel::{PeerIdentity, TlsIdentity, TunnelTransport, TunneledStream};
 pub use groupnet_network::{LinkProvider, Router, RouterConfig, TunnelConfig};
 pub use groupnet_streams::{

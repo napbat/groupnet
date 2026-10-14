@@ -39,8 +39,8 @@ use groupnet_consistency::{
     CAP_HOSTED, Commit, CommitLedger, CommitOutcome, Completeness, HostedError, HostedRead,
     HostedReads, HostedWrites, WriteToken,
 };
-use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster, placement};
-use groupnet_runtime::{Group, GroupProfile, Leadership, Node, Role};
+use groupnet_core::{Activation, HostedConfig, NodeId, Role, VoterRoster, placement};
+use groupnet_runtime::{Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
 use tokio::sync::watch;

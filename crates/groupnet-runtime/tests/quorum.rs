@@ -33,10 +33,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_core::{
-    Activation, HostedConfig, NodeId, RecoveredGrant, VoterRoster, placement, wire,
+    Activation, HostedConfig, NodeId, RecoveredGrant, Role, VoterRoster, placement, wire,
 };
 use groupnet_network::{RouterConfig, testing::message_payload};
-use groupnet_runtime::{GrantStore, Group, GroupProfile, Leadership, Node, Role};
+use groupnet_runtime::{GrantStore, Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{
     MemCluster, NodeOpts, converged_within, eventually_within, spawn_mem_node,
 };

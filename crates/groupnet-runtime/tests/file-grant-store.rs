@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Activation, HostedConfig, NodeId, RecoveredGrant, VoterRoster};
-use groupnet_runtime::{FileGrantStore, Group, GroupProfile, Leadership, Node, Role};
+use groupnet_core::{Activation, HostedConfig, NodeId, RecoveredGrant, Role, VoterRoster};
+use groupnet_runtime::{FileGrantStore, Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
 

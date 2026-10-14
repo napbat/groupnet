@@ -40,9 +40,9 @@ use std::time::Duration;
 
 use groupnet_consistency::{Group, HostedWrites};
 use groupnet_core::anchor::AnchorRecord;
-use groupnet_core::{Activation, HostedConfig, NodeId};
+use groupnet_core::{Activation, HostedConfig, NodeId, Role};
 use groupnet_runtime::{
-    Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf, GroupProfile, Node, Role,
+    Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf, GroupProfile, Node,
 };
 use groupnet_transport_mem::{MemLink, Network};
 

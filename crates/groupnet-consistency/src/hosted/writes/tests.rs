@@ -1,8 +1,8 @@
 //! The shell's pure corpus: the admission table, the feed entries, the setup
 //! errors.
 
-use groupnet_core::NodeId;
-use groupnet_runtime::{Leadership, Role};
+use groupnet_core::{NodeId, Role};
+use groupnet_runtime::Leadership;
 
 use super::{HostedSetupError, admit, feed_entry_key};
 use crate::hosted::HostedError;
