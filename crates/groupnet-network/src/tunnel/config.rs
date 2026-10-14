@@ -1,7 +1,7 @@
 //! Node-wide bounded tunnel resource and reliability policy.
 
 use std::{
-    io,
+    fmt, io,
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
     time::Duration,
 };
@@ -79,12 +79,13 @@ impl SegmentSize {
 }
 
 impl TryFrom<usize> for SegmentSize {
-    type Error = io::Error;
+    type Error = TunnelLimitsError;
 
     /// # Errors
-    /// Returns `InvalidInput` for zero or a value above [`SegmentSize::MAX`].
-    fn try_from(bytes: usize) -> io::Result<Self> {
-        Self::new(bytes).ok_or_else(|| invalid("segment size must be within 1..=SegmentSize::MAX"))
+    /// Returns [`TunnelLimitsError::PayloadOutOfRange`] for zero or a value
+    /// above [`SegmentSize::MAX`].
+    fn try_from(bytes: usize) -> Result<Self, TunnelLimitsError> {
+        Self::new(bytes).ok_or(TunnelLimitsError::PayloadOutOfRange)
     }
 }
 
@@ -105,17 +106,18 @@ impl RetransmitTimeouts {
     /// Validates ordered retransmission timeouts.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for a zero minimum, unordered bounds, or a
-    /// maximum that cannot extend the current Tokio instant.
-    pub fn new(min: Duration, initial: Duration, max: Duration) -> io::Result<Self> {
-        if min.is_zero()
-            || initial < min
-            || max < initial
-            || tokio::time::Instant::now().checked_add(max).is_none()
-        {
-            return Err(invalid(
-                "retransmission timeouts must satisfy 0 < min <= initial <= max",
-            ));
+    /// Returns [`TunnelLimitsError::RetransmitUnordered`] unless
+    /// `0 < min <= initial <= max`, or
+    /// [`TunnelLimitsError::UnrepresentableTimer`] for a maximum that cannot
+    /// extend the current Tokio instant.
+    pub fn new(min: Duration, initial: Duration, max: Duration) -> Result<Self, TunnelLimitsError> {
+        if min.is_zero() || initial < min || max < initial {
+            return Err(TunnelLimitsError::RetransmitUnordered);
+        }
+        if tokio::time::Instant::now().checked_add(max).is_none() {
+            return Err(TunnelLimitsError::UnrepresentableTimer {
+                field: "retransmit.max",
+            });
         }
         Ok(Self { min, initial, max })
     }
@@ -235,31 +237,51 @@ impl TunnelLimits {
     /// carried by its type.
     ///
     /// # Errors
-    /// Rejects per-peer sessions above `max_sessions`; a `min_window` below one
-    /// `payload` segment or above `max_window`; a budget below every session's
-    /// floors; an initial congestion window above `max_window / payload`; an
-    /// unaddressable stream buffer; or inconsistent or unrepresentable deadlines.
-    pub fn validate(&self) -> io::Result<()> {
-        let now = tokio::time::Instant::now();
-        if self.sessions_per_peer > self.max_sessions
-            || self.stream_buffer.get() > isize::MAX.unsigned_abs()
-            || (self.min_window.get() as usize) < cost(self.payload.get())
-            || self.min_window > self.max_window
-            || self
-                .max_sessions
-                .get()
-                .checked_mul(2 * self.min_window.get() as usize)
-                .is_none_or(|floors| floors > self.memory_budget.get())
-            || usize::from(self.initial_congestion.get()) > self.max_segments()
-            || self.setup_timeout.is_zero()
-            || self.heartbeat_interval.is_zero()
-            || self.peer_timeout <= self.heartbeat_interval
-            || self.peer_timeout <= self.retransmit.max()
-            || [self.setup_timeout, self.peer_timeout]
-                .iter()
-                .any(|duration| now.checked_add(*duration).is_none())
+    /// Returns the first violated [`TunnelLimitsError`] rule.
+    pub fn validate(&self) -> Result<(), TunnelLimitsError> {
+        if self.sessions_per_peer > self.max_sessions {
+            return Err(TunnelLimitsError::SessionsPerPeerAboveMaxSessions);
+        }
+        if self.stream_buffer.get() > isize::MAX.unsigned_abs() {
+            return Err(TunnelLimitsError::StreamBufferUnaddressable);
+        }
+        if (self.min_window.get() as usize) < cost(self.payload.get()) {
+            return Err(TunnelLimitsError::MinWindowBelowPayloadSegment);
+        }
+        if self.min_window > self.max_window {
+            return Err(TunnelLimitsError::MinWindowAboveMaxWindow);
+        }
+        if self
+            .max_sessions
+            .get()
+            .checked_mul(2 * self.min_window.get() as usize)
+            .is_none_or(|floors| floors > self.memory_budget.get())
         {
-            return Err(invalid("invalid tunnel limits"));
+            return Err(TunnelLimitsError::MemoryBudgetBelowSessionFloors);
+        }
+        if usize::from(self.initial_congestion.get()) > self.max_segments() {
+            return Err(TunnelLimitsError::InitialCongestionAboveMaxSegments);
+        }
+        if self.setup_timeout.is_zero() {
+            return Err(TunnelLimitsError::ZeroSetupTimeout);
+        }
+        if self.heartbeat_interval.is_zero() {
+            return Err(TunnelLimitsError::ZeroHeartbeatInterval);
+        }
+        if self.peer_timeout <= self.heartbeat_interval {
+            return Err(TunnelLimitsError::PeerTimeoutNotAboveHeartbeat);
+        }
+        if self.peer_timeout <= self.retransmit.max() {
+            return Err(TunnelLimitsError::PeerTimeoutNotAboveRetransmitMax);
+        }
+        let now = tokio::time::Instant::now();
+        for (field, timer) in [
+            ("setup_timeout", self.setup_timeout),
+            ("peer_timeout", self.peer_timeout),
+        ] {
+            if now.checked_add(timer).is_none() {
+                return Err(TunnelLimitsError::UnrepresentableTimer { field });
+            }
         }
         Ok(())
     }
@@ -292,8 +314,84 @@ impl TunnelLimits {
     }
 }
 
-fn invalid(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
+/// A violated [`TunnelLimits`], [`RetransmitTimeouts`] or [`SegmentSize`]
+/// rule, naming the offending field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelLimitsError {
+    /// `payload` is zero or above [`SegmentSize::MAX`].
+    PayloadOutOfRange,
+    /// `retransmit` violates `0 < min <= initial <= max`.
+    RetransmitUnordered,
+    /// `sessions_per_peer` exceeds `max_sessions`.
+    SessionsPerPeerAboveMaxSessions,
+    /// `stream_buffer` exceeds the addressable `isize::MAX` bytes.
+    StreamBufferUnaddressable,
+    /// `min_window` cannot hold one `payload` segment and its header.
+    MinWindowBelowPayloadSegment,
+    /// `min_window` exceeds `max_window`.
+    MinWindowAboveMaxWindow,
+    /// `memory_budget` is below `max_sessions × 2 × min_window`.
+    MemoryBudgetBelowSessionFloors,
+    /// `initial_congestion` exceeds `max_window / payload` segments.
+    InitialCongestionAboveMaxSegments,
+    /// `setup_timeout` is zero.
+    ZeroSetupTimeout,
+    /// `heartbeat_interval` is zero.
+    ZeroHeartbeatInterval,
+    /// `peer_timeout` does not exceed `heartbeat_interval`.
+    PeerTimeoutNotAboveHeartbeat,
+    /// `peer_timeout` does not exceed the `retransmit` backoff cap.
+    PeerTimeoutNotAboveRetransmitMax,
+    /// A timer cannot extend the current monotonic instant.
+    UnrepresentableTimer {
+        /// The offending field.
+        field: &'static str,
+    },
+}
+
+impl fmt::Display for TunnelLimitsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::PayloadOutOfRange => "tunnel payload must be within 1..=SegmentSize::MAX",
+            Self::RetransmitUnordered => {
+                "tunnel retransmit timeouts must satisfy 0 < min <= initial <= max"
+            }
+            Self::SessionsPerPeerAboveMaxSessions => {
+                "tunnel sessions_per_peer must not exceed max_sessions"
+            }
+            Self::StreamBufferUnaddressable => "tunnel stream_buffer exceeds isize::MAX bytes",
+            Self::MinWindowBelowPayloadSegment => {
+                "tunnel min_window must hold one payload segment and its header"
+            }
+            Self::MinWindowAboveMaxWindow => "tunnel min_window must not exceed max_window",
+            Self::MemoryBudgetBelowSessionFloors => {
+                "tunnel memory_budget must cover max_sessions x 2 x min_window"
+            }
+            Self::InitialCongestionAboveMaxSegments => {
+                "tunnel initial_congestion must not exceed max_window / payload"
+            }
+            Self::ZeroSetupTimeout => "tunnel setup_timeout must be nonzero",
+            Self::ZeroHeartbeatInterval => "tunnel heartbeat_interval must be nonzero",
+            Self::PeerTimeoutNotAboveHeartbeat => {
+                "tunnel peer_timeout must exceed heartbeat_interval"
+            }
+            Self::PeerTimeoutNotAboveRetransmitMax => {
+                "tunnel peer_timeout must exceed the retransmit backoff cap"
+            }
+            Self::UnrepresentableTimer { field } => {
+                return write!(f, "tunnel {field} exceeds the monotonic clock");
+            }
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for TunnelLimitsError {}
+
+impl From<TunnelLimitsError> for io::Error {
+    fn from(error: TunnelLimitsError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
 }
 
 #[cfg(test)]
@@ -331,8 +429,8 @@ mod tests {
         assert_eq!(SegmentSize::new(MAX_SEGMENT), Some(SegmentSize::MAX));
         assert_eq!(SegmentSize::new(MAX_SEGMENT + 1), None);
         assert_eq!(
-            SegmentSize::try_from(MAX_SEGMENT + 1).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
+            SegmentSize::try_from(MAX_SEGMENT + 1),
+            Err(TunnelLimitsError::PayloadOutOfRange)
         );
         assert_eq!(SegmentSize::try_from(512).unwrap().get(), 512);
     }
@@ -341,10 +439,22 @@ mod tests {
     fn retransmit_timeouts_are_ordered_and_representable() {
         let ms = Duration::from_millis;
         assert!(RetransmitTimeouts::new(ms(200), ms(200), ms(200)).is_ok());
-        assert!(RetransmitTimeouts::new(Duration::ZERO, ms(200), ms(400)).is_err());
-        assert!(RetransmitTimeouts::new(ms(300), ms(200), ms(400)).is_err());
-        assert!(RetransmitTimeouts::new(ms(200), ms(500), ms(400)).is_err());
-        assert!(RetransmitTimeouts::new(ms(200), ms(500), Duration::MAX).is_err());
+        for (min, initial, max) in [
+            (Duration::ZERO, ms(200), ms(400)),
+            (ms(300), ms(200), ms(400)),
+            (ms(200), ms(500), ms(400)),
+        ] {
+            assert_eq!(
+                RetransmitTimeouts::new(min, initial, max),
+                Err(TunnelLimitsError::RetransmitUnordered)
+            );
+        }
+        assert_eq!(
+            RetransmitTimeouts::new(ms(200), ms(500), Duration::MAX),
+            Err(TunnelLimitsError::UnrepresentableTimer {
+                field: "retransmit.max"
+            })
+        );
         let timeouts = RetransmitTimeouts::new(ms(200), ms(500), ms(800)).unwrap();
         assert_eq!(timeouts.clamp(ms(10)), ms(200));
         assert_eq!(timeouts.clamp(ms(5000)), ms(800));
@@ -374,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_field_relations_are_validated() {
+    fn cross_field_relations_are_validated_by_field() {
         let larger = TunnelLimits {
             max_peers: count(8192),
             max_sessions: count(2048),
@@ -387,52 +497,88 @@ mod tests {
         };
         assert!(larger.validate().is_ok());
         let rejected = [
-            TunnelLimits {
-                sessions_per_peer: count(2049),
-                ..larger.clone()
-            },
-            TunnelLimits {
-                min_window: bytes(4096 + 37),
-                ..larger.clone()
-            },
-            TunnelLimits {
-                min_window: bytes((4 << 20) + 1),
-                ..larger.clone()
-            },
-            TunnelLimits {
-                memory_budget: count(2048 * 2 * 64 * 1024 - 1),
-                ..larger.clone()
-            },
-            TunnelLimits {
-                initial_congestion: NonZeroU16::new(1025).unwrap(),
-                ..larger.clone()
-            },
-            TunnelLimits {
-                setup_timeout: Duration::ZERO,
-                ..larger.clone()
-            },
-            TunnelLimits {
-                setup_timeout: Duration::MAX,
-                ..larger.clone()
-            },
-            TunnelLimits {
-                heartbeat_interval: Duration::ZERO,
-                ..larger.clone()
-            },
-            TunnelLimits {
-                peer_timeout: larger.heartbeat_interval,
-                ..larger.clone()
-            },
-            TunnelLimits {
-                peer_timeout: larger.retransmit.max(),
-                ..larger.clone()
-            },
+            (
+                TunnelLimits {
+                    sessions_per_peer: count(2049),
+                    ..larger.clone()
+                },
+                TunnelLimitsError::SessionsPerPeerAboveMaxSessions,
+            ),
+            (
+                TunnelLimits {
+                    min_window: bytes(4096 + 37),
+                    ..larger.clone()
+                },
+                TunnelLimitsError::MinWindowBelowPayloadSegment,
+            ),
+            (
+                TunnelLimits {
+                    min_window: bytes((4 << 20) + 1),
+                    ..larger.clone()
+                },
+                TunnelLimitsError::MinWindowAboveMaxWindow,
+            ),
+            (
+                TunnelLimits {
+                    memory_budget: count(2048 * 2 * 64 * 1024 - 1),
+                    ..larger.clone()
+                },
+                TunnelLimitsError::MemoryBudgetBelowSessionFloors,
+            ),
+            (
+                TunnelLimits {
+                    initial_congestion: NonZeroU16::new(1025).unwrap(),
+                    ..larger.clone()
+                },
+                TunnelLimitsError::InitialCongestionAboveMaxSegments,
+            ),
+            (
+                TunnelLimits {
+                    setup_timeout: Duration::ZERO,
+                    ..larger.clone()
+                },
+                TunnelLimitsError::ZeroSetupTimeout,
+            ),
+            (
+                TunnelLimits {
+                    setup_timeout: Duration::MAX,
+                    ..larger.clone()
+                },
+                TunnelLimitsError::UnrepresentableTimer {
+                    field: "setup_timeout",
+                },
+            ),
+            (
+                TunnelLimits {
+                    heartbeat_interval: Duration::ZERO,
+                    ..larger.clone()
+                },
+                TunnelLimitsError::ZeroHeartbeatInterval,
+            ),
+            (
+                TunnelLimits {
+                    peer_timeout: larger.heartbeat_interval,
+                    ..larger.clone()
+                },
+                TunnelLimitsError::PeerTimeoutNotAboveHeartbeat,
+            ),
+            (
+                TunnelLimits {
+                    peer_timeout: larger.retransmit.max(),
+                    ..larger.clone()
+                },
+                TunnelLimitsError::PeerTimeoutNotAboveRetransmitMax,
+            ),
         ];
-        for limits in rejected {
+        for (limits, expected) in rejected {
+            assert_eq!(limits.validate(), Err(expected), "{limits:?}");
+            let error = io::Error::from(expected);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(
-                limits.validate().unwrap_err().kind(),
-                io::ErrorKind::InvalidInput,
-                "{limits:?}"
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<TunnelLimitsError>()),
+                Some(&expected)
             );
         }
     }

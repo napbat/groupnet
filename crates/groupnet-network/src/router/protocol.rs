@@ -212,7 +212,7 @@ pub(super) fn bind(router: Router, id: ProtocolId) -> io::Result<ProtocolIo> {
     registry
         .entries
         .retain(|_, entry| !entry.cancel.is_cancelled());
-    if registry.entries.len() >= router.inner.shared.config.max_protocols {
+    if registry.entries.len() >= router.inner.shared.config.max_protocols.get() {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "application namespace capacity reached",

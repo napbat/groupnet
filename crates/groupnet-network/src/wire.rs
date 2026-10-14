@@ -3,12 +3,14 @@
 use bytes::{Bytes, BytesMut};
 use groupnet_core::NodeId;
 use groupnet_transport::admission::SessionId;
-use std::{collections::HashMap, io, time::Duration};
+use std::{collections::HashMap, io};
 use tokio::time::Instant;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
     byteorder::network_endian::{U16, U32},
 };
+
+use crate::router::ReassemblyConfig;
 
 pub(crate) const MAX_FRAME: usize = 65_000;
 pub(crate) const MAX_HOPS: usize = 16;
@@ -279,27 +281,6 @@ pub(crate) fn data(
     bytes
 }
 
-/// Bounds for retained, generation-scoped fragment assemblies.
-#[derive(Clone, Debug)]
-pub struct ReassemblyConfig {
-    /// Maximum simultaneous incomplete frames across all admitted links.
-    pub max_pending: usize,
-    /// Maximum fragments retained for one frame; must fit the wire's u16 count.
-    pub max_fragments: usize,
-    /// Expiration of an incomplete frame.
-    pub timeout: Duration,
-}
-
-impl Default for ReassemblyConfig {
-    fn default() -> Self {
-        Self {
-            max_pending: 64,
-            max_fragments: 1024,
-            timeout: Duration::from_secs(3),
-        }
-    }
-}
-
 struct Assembly {
     created: Instant,
     total: usize,
@@ -351,7 +332,7 @@ impl Reassembly {
         let count = usize::from(header.count.get());
         let total = usize::try_from(header.total.get()).ok()?;
         if count == 0
-            || count > self.config.max_fragments
+            || count > usize::from(self.config.max_fragments.get())
             || index >= count
             || total > self.max_frame
             || total < count
@@ -359,7 +340,7 @@ impl Reassembly {
             return None;
         }
         let key = (link, session, from.clone(), header.id);
-        if !self.pending.contains_key(&key) && self.pending.len() >= self.config.max_pending {
+        if !self.pending.contains_key(&key) && self.pending.len() >= self.config.max_pending.get() {
             return None;
         }
         let entry = self.pending.entry(key.clone()).or_insert_with(|| Assembly {
@@ -578,7 +559,7 @@ mod tests {
         let ptr = first[FRAGMENT..].as_ptr();
         let mut bounded = Reassembly::new(
             ReassemblyConfig {
-                max_pending: 1,
+                max_pending: std::num::NonZeroUsize::MIN,
                 ..ReassemblyConfig::default()
             },
             MAX_FRAME,
@@ -600,7 +581,7 @@ mod tests {
         );
         let mut tight = Reassembly::new(
             ReassemblyConfig {
-                max_fragments: 2,
+                max_fragments: std::num::NonZeroU16::new(2).unwrap(),
                 ..ReassemblyConfig::default()
             },
             MAX_FRAME,

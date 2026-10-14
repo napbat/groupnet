@@ -122,8 +122,11 @@ The router neither decodes protocol bodies nor interprets their ACKs.
 `RouterConfig` controls complete-frame size, hop count, replay retention,
 reassembly bounds, protocol/inbox/link capacities and physical-send deadlines.
 Configuration is validated against wire representation before workers start;
-every queue capacity is a `QueueCapacity`, which is nonzero and representable
-by Tokio channels by construction. Increasing a bound does not enlarge a
+`RouterConfig::validate` names each violated rule as a `RouterConfigError`
+variant (wrapped as an `InvalidInput` `io::Error` by `Router::new` and
+`NetworkBuilder::bind`). Every queue capacity is a `QueueCapacity`, and route,
+transport, protocol, replay and reassembly counts are `NonZero*` types, so
+they are nonzero by construction. Increasing a bound does not enlarge a
 physical link's MTU: fragmentation still applies, and every receiving router
 enforces its own limits.
 

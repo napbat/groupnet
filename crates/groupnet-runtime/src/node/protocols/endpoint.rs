@@ -1,7 +1,7 @@
 //! A typed view over node-owned protocol state and receive ownership.
 
-use super::{Messages, Node, PeerImplementation, closed};
-use crate::messaging::{Frame, MessageContext, ReceiveHandle};
+use super::{Node, PeerImplementation, ReceiveBinding, closed};
+use crate::messaging::{Frame, MessageContext};
 use groupnet_core::NodeId;
 use groupnet_messaging::{Bytes, MessageId, MessageProtocol};
 use groupnet_streams::SessionProtocol;
@@ -55,7 +55,10 @@ impl<I: PeerImplementation> Endpoint<I> {
         }
     }
 
-    /// The shared concrete implementation, including its low-level lifecycle API.
+    /// The shared protocol this endpoint binds. Built-ins return a restricted
+    /// [`ManagedProtocol`](super::ManagedProtocol) view: protocol operations
+    /// and shutdown observation, never the dispatcher-owned raw receive or
+    /// engine shutdown.
     #[must_use]
     pub fn protocol(&self) -> &I::Protocol {
         &self.protocol
@@ -127,47 +130,68 @@ where
     }
 }
 
-impl Endpoint<Messages> {
-    /// Receives owned bytes and context from this node's existing inbox.
-    /// Shares receive ownership with node receives and callbacks, not raw
-    /// `Messaging::recv`, which is reserved for the node's dispatcher.
+impl<I: PeerImplementation> Endpoint<I>
+where
+    I::Protocol: ReceiveBinding,
+{
+    /// Receives owned bytes and their complete context from the protocol's
+    /// single receive owner: this node's existing inbox for [`Messages`](super::Messages).
+    /// Shares receive ownership with node receives and callbacks, never the
+    /// raw messaging worker queue the node dispatcher owns.
     ///
     /// # Errors
     /// Returns `WouldBlock` for a competing receive owner or shutdown errors.
-    pub async fn recv(&self) -> io::Result<(MessageContext, Bytes)> {
-        self.node.recv().await
+    pub async fn recv(
+        &self,
+    ) -> io::Result<(
+        MessageContext<<I::Protocol as MessageProtocol>::Receipt>,
+        Bytes,
+    )> {
+        Ok(self.recv_frame().await?.into_parts())
     }
 
-    /// Receives a complete frame from the same node-owned inbox as [`Self::recv`].
+    /// Receives a complete frame from the same receive owner as [`Self::recv`].
     ///
     /// # Errors
     /// Returns `WouldBlock` for a competing receive owner or shutdown errors.
-    pub async fn recv_frame(&self) -> io::Result<Frame> {
-        self.node.recv_frame().await
+    pub async fn recv_frame(&self) -> io::Result<Frame<<I::Protocol as MessageProtocol>::Receipt>> {
+        self.protocol.recv_frame(&self.node).await
     }
 
-    /// Installs the exclusive serial buffer receiver on this node's inbox.
-    /// Successful callback completion acknowledges application.
+    /// Installs the exclusive serial buffer receiver on the protocol's receive
+    /// owner. For [`Messages`](super::Messages), successful callback completion
+    /// acknowledges application.
     ///
     /// # Errors
     /// Returns competing receive ownership or shutdown errors.
-    pub fn on_recv<F, Fut>(&self, callback: F) -> io::Result<ReceiveHandle>
+    pub fn on_recv<F, Fut>(
+        &self,
+        mut callback: F,
+    ) -> io::Result<<I::Protocol as ReceiveBinding>::Handle>
     where
-        F: FnMut(MessageContext, Bytes) -> Fut + Send + 'static,
+        F: FnMut(MessageContext<<I::Protocol as MessageProtocol>::Receipt>, Bytes) -> Fut
+            + Send
+            + 'static,
         Fut: Future<Output = io::Result<()>> + Send + 'static,
     {
-        self.node.on_recv(callback)
+        self.protocol.on_frame(&self.node, move |frame| {
+            let (context, payload) = frame.into_parts();
+            callback(context, payload)
+        })
     }
 
-    /// Installs the exclusive serial frame receiver on this node's inbox.
+    /// Installs the exclusive serial frame receiver on the protocol's receive owner.
     ///
     /// # Errors
     /// Returns competing receive ownership or shutdown errors.
-    pub fn on_frame<F, Fut>(&self, callback: F) -> io::Result<ReceiveHandle>
+    pub fn on_frame<F, Fut>(
+        &self,
+        callback: F,
+    ) -> io::Result<<I::Protocol as ReceiveBinding>::Handle>
     where
-        F: FnMut(Frame) -> Fut + Send + 'static,
+        F: FnMut(Frame<<I::Protocol as MessageProtocol>::Receipt>) -> Fut + Send + 'static,
         Fut: Future<Output = io::Result<()>> + Send + 'static,
     {
-        self.node.on_frame(callback)
+        self.protocol.on_frame(&self.node, callback)
     }
 }

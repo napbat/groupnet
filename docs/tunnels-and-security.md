@@ -9,9 +9,12 @@ to open a protected resource.
 ## 1. Authenticated streams across a bridge
 
 Both endpoints configure a `TlsIdentity` and explicit `PeerIdentity` certificate
-pins. `Node` and standalone `Network` implement `BulkTransport` through
-this tunnel endpoint. Without tunnel configuration, `connect` and `accept` return
-`Unsupported`; there is no plaintext fallback.
+pins. Applications open ordered streams with `node.endpoint(Ordered::new())`
+(or `node.peer(id, Ordered::new())`); `Node` also implements `BulkTransport` as
+an adapter over that same endpoint for code generic over bulk transports, and a
+standalone `Network` implements it directly over this tunnel endpoint. Without
+tunnel configuration, `connect` and `accept` return `Unsupported`; there is no
+plaintext fallback.
 
 ```mermaid
 sequenceDiagram
@@ -164,7 +167,11 @@ once. `TunnelLimits::validate` checks only cross-field relations: sessions per
 peer within `max_sessions`; `payload + 38 <= min_window <= max_window`; the
 budget covering every floor; initial congestion within `max_window / payload`
 segments; and a peer timeout longer than both the heartbeat interval and the
-retransmission cap. TLS ciphertext is initially read into routing-headroom
+retransmission cap. Each violated rule is its own `TunnelLimitsError` variant
+naming the field (also returned by `RetransmitTimeouts::new` and
+`SegmentSize::try_from`); I/O entry points wrap it in an `InvalidInput`
+`io::Error`. `NetworkBuilder::bind` and `NodeBuilder::start` validate the limits
+before binding any link. TLS ciphertext is initially read into routing-headroom
 storage; retransmissions retain ciphertext rather than re-encrypting application
 bytes.
 

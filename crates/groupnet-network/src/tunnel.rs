@@ -26,7 +26,7 @@ mod tls;
 mod wire;
 
 pub(crate) use config::DEFAULT_STREAM_FRAMES;
-pub use config::{RetransmitTimeouts, SegmentSize, TunnelLimits};
+pub use config::{RetransmitTimeouts, SegmentSize, TunnelLimits, TunnelLimitsError};
 
 #[cfg(test)]
 mod tests;

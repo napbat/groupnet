@@ -2,13 +2,16 @@
 
 mod endpoint;
 mod implementations;
+mod managed;
 pub use endpoint::Endpoint;
 pub use implementations::{Messages, Ordered, Unordered};
+pub use managed::ManagedProtocol;
 
 use super::Node;
+use crate::messaging::Frame;
 use groupnet_core::NodeId;
-use groupnet_messaging::{Bytes, MessageId, MessageProtocol, Messaging};
-use groupnet_streams::{OrderedProtocol, SessionProtocol, UnorderedConfig, UnorderedProtocol};
+use groupnet_messaging::{Bytes, MessageId, MessageProtocol};
+use groupnet_streams::{OrderedProtocol, SessionProtocol, UnorderedProtocol};
 use std::{fmt, io};
 
 /// Resolves a protocol implementation and its options against a managed node.
@@ -17,6 +20,8 @@ use std::{fmt, io};
 /// concrete message or session implementations without boxing or dynamic dispatch.
 /// Binding must not establish a connection or start per-peer workers. A built-in
 /// may initialize the node's shared protocol worker on its first binding.
+/// Built-ins resolve to a [`ManagedProtocol`] view, which a custom
+/// implementation may wrap.
 pub trait PeerImplementation {
     /// Concrete shared protocol used for this binding.
     type Protocol: Send + Sync;
@@ -31,9 +36,46 @@ pub trait PeerImplementation {
     fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)>;
 }
 
+/// Managed receives for a [`MessageProtocol`], through one single-owner inbox.
+///
+/// [`Endpoint`] exposes `recv`, `recv_frame`, `on_recv` and `on_frame` for any
+/// bound protocol implementing this trait, with the protocol's own
+/// [`Receipt`](MessageProtocol::Receipt). A message protocol that does not
+/// implement it is send-only at the handle layer.
+///
+/// Implementations must deliver from exactly one receive owner per node, so a
+/// manual receive and an installed callback can never both take frames: the
+/// built-in [`Messages`] binding uses the node inbox ([`Node::recv_frame`],
+/// [`Node::on_frame`]), which also refuses competing owners with `WouldBlock`.
+/// A protocol wrapping a built-in view delegates to it; one that owns a
+/// separate router namespace owns that namespace's single receive queue.
+/// Never read a raw messaging worker queue that the node dispatcher owns.
+pub trait ReceiveBinding: MessageProtocol {
+    /// Exclusive callback ownership returned by [`Self::on_frame`].
+    type Handle;
+
+    /// Receives the next complete frame from the protocol's receive owner.
+    ///
+    /// # Errors
+    /// Returns competing receive ownership or shutdown errors.
+    fn recv_frame(
+        &self,
+        node: &Node,
+    ) -> impl Future<Output = io::Result<Frame<Self::Receipt>>> + Send;
+
+    /// Installs the exclusive serial frame receiver on the protocol's receive owner.
+    ///
+    /// # Errors
+    /// Returns competing receive ownership or shutdown errors.
+    fn on_frame<F, Fut>(&self, node: &Node, callback: F) -> io::Result<Self::Handle>
+    where
+        F: FnMut(Frame<Self::Receipt>) -> Fut + Send + 'static,
+        Fut: Future<Output = io::Result<()>> + Send + 'static;
+}
+
 impl Node {
-    fn cached_messages(&self) -> Messaging {
-        self.inner.messaging.sender().clone()
+    fn cached_messages(&self) -> ManagedProtocol<groupnet_messaging::Messaging> {
+        ManagedProtocol::new(self.inner.messaging.sender().clone())
     }
 
     fn cached_ordered(&self) -> io::Result<OrderedProtocol> {
@@ -51,52 +93,26 @@ impl Node {
         Ok(ordered)
     }
 
-    /// Fixes node-wide unordered admission, capacity and timer settings.
-    /// Does not initialize the protocol or open a connection. Repeating the same
-    /// configuration is allowed; conflicting settings never mutate live policy.
-    /// Call before the first unordered peer or endpoint binding.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` for invalid or conflicting settings, or
-    /// `NotConnected` after node shutdown.
-    pub fn configure_unordered(&self, config: UnorderedConfig) -> io::Result<()> {
-        config.validate()?;
-        let mut state = self
-            .inner
-            .unordered
-            .lock()
-            .map_err(|_| io::Error::other("unordered protocol cache poisoned"))?;
-        self.ensure_protocols_open()?;
-        if let Some((existing, _)) = state.as_ref() {
-            if existing != &config {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unordered protocol configuration already fixed",
-                ));
-            }
-        } else {
-            *state = Some((config, None));
-        }
-        Ok(())
-    }
-
+    /// Resolves the shared unordered engine with the node-wide
+    /// [`UnorderedConfig`](groupnet_streams::UnorderedConfig) validated at
+    /// [`NodeBuilder::start`](crate::NodeBuilder::start).
     fn cached_unordered(&self) -> io::Result<UnorderedProtocol> {
-        let mut state = self
+        let mut protocol = self
             .inner
             .unordered
             .lock()
             .map_err(|_| io::Error::other("unordered protocol cache poisoned"))?;
         self.ensure_protocols_open()?;
-        if let Some((_, Some(protocol))) = state.as_ref() {
+        if let Some(protocol) = protocol.as_ref() {
             return Ok(protocol.clone());
         }
-        let config = state
-            .as_ref()
-            .map_or_else(UnorderedConfig::default, |(config, _)| config.clone());
-        let protocol =
-            UnorderedProtocol::new(self.router(), self.tunnels()?.clone(), config.clone())?;
-        *state = Some((config, Some(protocol.clone())));
-        Ok(protocol)
+        let unordered = UnorderedProtocol::new(
+            self.router(),
+            self.tunnels()?.clone(),
+            self.inner.unordered_config.clone(),
+        )?;
+        *protocol = Some(unordered.clone());
+        Ok(unordered)
     }
 
     /// Binds a typed endpoint and immutable options to this node's shared protocol.
@@ -137,14 +153,14 @@ impl Node {
     }
 
     pub(crate) fn shutdown_protocols(&self) {
-        self.cached_messages().shutdown();
+        self.inner.messaging.sender().shutdown();
         if let Ok(ordered) = self.inner.ordered.lock()
             && let Some(ordered) = ordered.as_ref()
         {
             ordered.shutdown();
         }
         if let Ok(unordered) = self.inner.unordered.lock()
-            && let Some((_, Some(unordered))) = unordered.as_ref()
+            && let Some(unordered) = unordered.as_ref()
         {
             unordered.shutdown();
         }
@@ -162,7 +178,7 @@ impl Node {
             .unordered
             .lock()
             .ok()
-            .and_then(|state| state.as_ref().and_then(|(_, protocol)| protocol.clone()));
+            .and_then(|protocol| protocol.clone());
         if let Some(ordered) = ordered {
             ordered.closed().await;
         }
@@ -213,7 +229,8 @@ impl<I: PeerImplementation> Peer<I> {
         &self.id
     }
 
-    /// The concrete shared protocol implementation.
+    /// The shared protocol this peer binds: a restricted [`ManagedProtocol`]
+    /// view for built-ins.
     #[must_use]
     pub fn protocol(&self) -> &I::Protocol {
         self.endpoint.protocol()

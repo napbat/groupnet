@@ -1,13 +1,14 @@
 //! Router lifecycle, typed links, path-vector learning, and packet forwarding.
 
 mod adapters;
+mod config;
 mod packet;
 mod pool;
 mod protocol;
 mod replay;
 mod routing;
 
-pub use crate::wire::ReassemblyConfig;
+pub use config::{ReassemblyConfig, RouterConfig, RouterConfigError};
 pub use packet::PacketBuffer;
 pub(crate) use packet::TunnelBuffers;
 
@@ -34,7 +35,7 @@ use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{SessionId, SessionRegistry};
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkControl};
-use groupnet_transport::{Inbound, QueueCapacity, Transport};
+use groupnet_transport::{Inbound, Transport};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio::time::Instant;
@@ -45,118 +46,6 @@ use crate::wire::{self, PayloadKind};
 /// A local, opaque transport registration identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransportId(usize);
-
-/// Routing and resource policy for one node.
-///
-/// Queue sizing: one saturated tunnel stream keeps about
-/// [`TunnelLimits::stream_frames`](crate::tunnel::TunnelLimits::stream_frames)
-/// frames queued (a window of data plus its acknowledgements; 2,048 with
-/// default limits). Size `link_queue` for the bulk streams sharing a link; the
-/// default holds two default-window streams. Arriving tunnel packets go straight
-/// to their session's own bounded queue. A full queue drops frames, which
-/// streams repair as loss.
-#[derive(Clone, Debug)]
-pub struct RouterConfig {
-    /// Whether this node forwards transit traffic between admitted peers.
-    /// Enabled by default; set to `false` for an endpoint-only node.
-    pub forwarding: bool,
-    /// Maximum learned destinations and configured neighbors per transport.
-    pub max_routes: usize,
-    /// Maximum simultaneous registered transport adapters.
-    pub max_transports: usize,
-    /// Expiration time for an unrefreshed route.
-    pub route_ttl: Duration,
-    /// Interval between bounded path-vector announcements.
-    pub announce_interval: Duration,
-    /// Largest complete routing envelope; must fit the fragment u32 total.
-    pub max_frame: usize,
-    /// Maximum path length and data hop budget; must fit u8.
-    pub max_hops: usize,
-    /// Retained incomplete-fragment bounds.
-    pub reassembly: ReassemblyConfig,
-    /// Maximum exclusive application namespaces; must fit u16 IDs.
-    pub max_protocols: usize,
-    /// Bounded inbox capacity for each application namespace.
-    pub protocol_queue: QueueCapacity,
-    /// Bounded router event queue capacity.
-    pub event_queue: QueueCapacity,
-    /// Bounded coordination inbox capacity.
-    pub message_queue: QueueCapacity,
-    /// Bounded outbound queue capacity for each link.
-    pub link_queue: QueueCapacity,
-    /// Recent routed identities retained for loop/replay suppression: each
-    /// origin stream remembers its last 64 packet sequences and rejects older
-    /// ones, and at most `replay_capacity / 64` (rounded up) streams are kept,
-    /// least recently active evicted first.
-    pub replay_capacity: usize,
-    /// Physical-send deadline shared by all fragments of a frame.
-    pub send_timeout: Duration,
-    /// Bytes of idle packet storage kept for reuse by later packets of the
-    /// same size class; zero allocates every packet from the heap.
-    pub packet_pool: usize,
-}
-
-impl Default for RouterConfig {
-    fn default() -> Self {
-        Self {
-            forwarding: true,
-            max_routes: 128,
-            max_transports: 16,
-            route_ttl: Duration::from_secs(6),
-            announce_interval: Duration::from_secs(1),
-            max_frame: wire::MAX_FRAME,
-            max_hops: wire::MAX_HOPS,
-            reassembly: ReassemblyConfig::default(),
-            max_protocols: 32,
-            protocol_queue: QueueCapacity::of(128),
-            event_queue: QueueCapacity::of(256),
-            message_queue: QueueCapacity::of(64),
-            link_queue: QueueCapacity::of(2 * crate::tunnel::DEFAULT_STREAM_FRAMES),
-            replay_capacity: 4096,
-            send_timeout: Duration::from_secs(5),
-            packet_pool: 2 << 20,
-        }
-    }
-}
-
-impl RouterConfig {
-    /// Validates wire representability and bounded resource policy; queue
-    /// capacities carry their own range.
-    /// # Errors
-    /// Rejects zero bounds, impossible wire bounds, or invalid timers.
-    pub fn validate(&self) -> io::Result<()> {
-        let now = tokio::time::Instant::now();
-        let timers = [
-            self.reassembly.timeout,
-            self.send_timeout,
-            self.announce_interval,
-            self.route_ttl,
-        ];
-        if self.max_routes == 0
-            || self.max_transports == 0
-            || self.max_frame < wire::MAX_DATA_HEADER
-            || u32::try_from(self.max_frame).is_err()
-            || self.max_frame > isize::MAX as usize
-            || !(2..=usize::from(u8::MAX)).contains(&self.max_hops)
-            || self.max_protocols == 0
-            || self.max_protocols > usize::from(u16::MAX) + 1
-            || self.replay_capacity == 0
-            || self.reassembly.max_pending == 0
-            || self.reassembly.max_fragments == 0
-            || self.reassembly.max_fragments > usize::from(u16::MAX)
-            || self.reassembly.timeout.is_zero()
-            || self.send_timeout.is_zero()
-            || self.announce_interval.is_zero()
-            || self.route_ttl <= self.announce_interval
-            || timers
-                .iter()
-                .any(|duration| now.checked_add(*duration).is_none())
-        {
-            return Err(wire::invalid("invalid router configuration"));
-        }
-        Ok(())
-    }
-}
 
 /// A currently reachable destination and its selected forwarding path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,7 +308,7 @@ impl Router {
         let shared = &self.inner.shared;
         let config = &link.config;
         if config.cost == 0
-            || config.peers.len() > shared.config.max_routes
+            || config.peers.len() > shared.config.max_routes.get()
             || config
                 .peers
                 .iter()
@@ -429,7 +318,7 @@ impl Router {
                 .config
                 .max_frame
                 .div_ceil(config.mtu.saturating_sub(wire::FRAGMENT).max(1))
-                > shared.config.reassembly.max_fragments
+                > usize::from(shared.config.reassembly.max_fragments.get())
         {
             return Err((wire::invalid("invalid link configuration"), link));
         }
@@ -437,7 +326,7 @@ impl Router {
         if shared.cancel.is_cancelled() {
             return Err((closed(), link));
         }
-        if table.links.len() >= shared.config.max_transports {
+        if table.links.len() >= shared.config.max_transports.get() {
             return Err((io::Error::other("transport capacity reached"), link));
         }
         let Some(next) = table.next_link.checked_add(1) else {

@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 
 pub use groupnet_messaging::{
     Bytes, DEFAULT_MAX_MESSAGE_BYTES, Delivery, Frame, MessageContext, MessageId, MessageProtocol,
-    Messaging, MessagingConfig, Receipt, SendOptions,
+    Messaging, MessagingConfig, MessagingConfigError, ProtocolId, Receipt, SendOptions,
 };
 pub use inbox::ReceiveHandle;
 

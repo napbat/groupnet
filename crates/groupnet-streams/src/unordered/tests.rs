@@ -1,7 +1,7 @@
 mod boundaries;
 mod fabric;
 
-use std::{io, sync::atomic::Ordering, time::Duration};
+use std::{io, num::NonZeroUsize, sync::atomic::Ordering, time::Duration};
 
 use bytes::Bytes;
 use groupnet_testkit::cluster::eventually;
@@ -9,6 +9,7 @@ use groupnet_transport::QueueCapacity;
 use tokio::time::timeout;
 
 use super::{
+    UnorderedConfigError,
     UnorderedDelivery::{Reliable, Unreliable},
     UnorderedOptions,
     wire::{self, Kind, TxCrypto, Window},
@@ -101,20 +102,26 @@ fn size_failure_does_not_consume_nonce_and_retry_plaintext_stays_intact() {
 #[test]
 fn operational_capacities_do_not_override_the_security_horizon() {
     let mut bounds = config();
-    bounds.max_payload = 96 * 1024;
+    bounds.max_payload = NonZeroUsize::new(96 * 1024).unwrap();
     bounds.inbox_capacity = QueueCapacity::of(2048);
     bounds.max_sessions = QueueCapacity::of(2048);
     bounds.sessions_per_peer = QueueCapacity::of(1025);
-    bounds.max_attempts = 2000;
+    bounds.max_attempts = NonZeroUsize::new(2000).unwrap();
     bounds.setup_timeout = Duration::from_secs(7200);
     bounds.validate().unwrap();
     bounds.pending_sends = QueueCapacity::of(wire::WINDOW);
     bounds.validate().unwrap();
     bounds.pending_sends = bounds.pending_sends.saturating_add(1);
-    assert!(bounds.validate().is_err());
+    assert_eq!(
+        bounds.validate(),
+        Err(UnorderedConfigError::PendingSendsAboveWindow)
+    );
     bounds.pending_sends = QueueCapacity::MIN;
     bounds.sessions_per_peer = bounds.max_sessions.saturating_add(1);
-    assert!(bounds.validate().is_err());
+    assert_eq!(
+        bounds.validate(),
+        Err(UnorderedConfigError::SessionsPerPeerAboveMaxSessions)
+    );
 }
 
 #[test]
@@ -142,7 +149,7 @@ async fn reliable_loss_does_not_block_a_later_message() {
     let mut bounds = config();
     bounds.retry_interval = Duration::from_secs(1);
     bounds.send_timeout = Duration::from_secs(4);
-    bounds.max_attempts = 4;
+    bounds.max_attempts = NonZeroUsize::new(4).unwrap();
     let fabric = Fabric::new(bounds).await;
     let (a, b) = fabric.pair(Reliable).await;
     fabric.faults.set(DROP_FIRST);
@@ -281,7 +288,7 @@ async fn reliable_ack_is_bounded_inbox_acceptance_and_retries_are_finite() {
     let mut bounds = config();
     bounds.inbox_capacity = QueueCapacity::MIN;
     bounds.pending_sends = QueueCapacity::MIN;
-    bounds.max_attempts = 3;
+    bounds.max_attempts = NonZeroUsize::new(3).unwrap();
     let fabric = Fabric::new(bounds).await;
     let (a, b) = fabric.pair(Reliable).await;
     a.send(Bytes::from_static(b"fills inbox")).await.unwrap();
@@ -530,7 +537,7 @@ async fn last_endpoint_drop_cancels_sessions_and_releases_only_its_namespace() {
 #[tokio::test]
 async fn pinned_admission_and_negotiated_payload_bounds_are_enforced() {
     let mut remote = config();
-    remote.max_payload = 4;
+    remote.max_payload = NonZeroUsize::new(4).unwrap();
     let fabric = Fabric::with_configs(config(), remote).await;
     let unadmitted = fabric
         .a
@@ -560,20 +567,64 @@ async fn pinned_admission_and_negotiated_payload_bounds_are_enforced() {
 }
 
 #[test]
-fn invalid_capacity_policy_and_timer_configuration_is_rejected() {
-    let mut bounds = config();
-    bounds.allow_reliable = false;
-    bounds.allow_unreliable = false;
-    assert!(bounds.validate().is_err());
-    bounds = config();
-    bounds.sessions_per_peer = bounds.max_sessions.saturating_add(1);
-    assert!(bounds.validate().is_err());
-    bounds = config();
-    bounds.idle_timeout = bounds.heartbeat_interval;
-    assert!(bounds.validate().is_err());
-    bounds = config();
-    bounds.send_timeout = Duration::MAX;
-    assert!(bounds.validate().is_err());
+fn invalid_capacity_policy_and_timer_configuration_is_rejected_by_field() {
+    type Mutation = fn(&mut super::UnorderedConfig);
+    let cases: [(Mutation, UnorderedConfigError); 9] = [
+        (
+            |bounds| {
+                bounds.allow_reliable = false;
+                bounds.allow_unreliable = false;
+            },
+            UnorderedConfigError::NoPolicyAllowed,
+        ),
+        (
+            |bounds| bounds.max_payload = NonZeroUsize::new(usize::MAX).unwrap(),
+            UnorderedConfigError::MaxPayloadAboveWire,
+        ),
+        (
+            |bounds| bounds.sessions_per_peer = bounds.max_sessions.saturating_add(1),
+            UnorderedConfigError::SessionsPerPeerAboveMaxSessions,
+        ),
+        (
+            |bounds| bounds.retry_interval = Duration::ZERO,
+            UnorderedConfigError::ZeroRetryInterval,
+        ),
+        (
+            |bounds| bounds.send_timeout = bounds.retry_interval / 2,
+            UnorderedConfigError::SendTimeoutBelowRetryInterval,
+        ),
+        (
+            |bounds| bounds.heartbeat_interval = Duration::ZERO,
+            UnorderedConfigError::ZeroHeartbeatInterval,
+        ),
+        (
+            |bounds| bounds.idle_timeout = bounds.heartbeat_interval,
+            UnorderedConfigError::IdleTimeoutNotAboveHeartbeat,
+        ),
+        (
+            |bounds| bounds.setup_timeout = Duration::ZERO,
+            UnorderedConfigError::ZeroSetupTimeout,
+        ),
+        (
+            |bounds| bounds.send_timeout = Duration::MAX,
+            UnorderedConfigError::UnrepresentableTimer {
+                field: "send_timeout",
+            },
+        ),
+    ];
+    for (mutate, expected) in cases {
+        let mut bounds = config();
+        mutate(&mut bounds);
+        assert_eq!(bounds.validate(), Err(expected));
+        let error = io::Error::from(expected);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<UnorderedConfigError>()),
+            Some(&expected)
+        );
+    }
 }
 
 #[tokio::test]

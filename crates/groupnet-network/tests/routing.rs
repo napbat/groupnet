@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_network::{Router, RouterConfig, TransportId};
+// The link contract types the router takes come from this crate's re-exports.
+use groupnet_network::{LinkConfig, Router, RouterConfig, TransportId};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
-use groupnet_transport::link::LinkConfig;
 use groupnet_transport_ipc::{IpcAddress, IpcTransport};
 use groupnet_transport_mem::Network;
 use groupnet_transport_tcp::TcpMsgTransport;

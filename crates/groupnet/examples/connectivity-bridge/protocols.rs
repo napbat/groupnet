@@ -7,7 +7,6 @@ use groupnet::core::NodeId;
 use groupnet::messaging::Bytes;
 use groupnet::runtime::{Endpoint, Messages, Node, Ordered, Unordered};
 use groupnet::streams::{UnorderedDelivery, UnorderedOptions, UnorderedSession};
-use groupnet::transport::bulk::BulkTransport;
 
 use super::WAIT;
 
@@ -58,8 +57,10 @@ async fn messages(a: &Node, c: &Node) -> io::Result<()> {
 
 async fn ordered(a: &Node, c: &Node) -> io::Result<()> {
     let peer = a.peer(c.id().clone(), Ordered::new())?;
-    // Ordinary Node::accept remains the ordered API, not an unordered handshake reader.
-    let (mut outgoing, (origin, mut incoming)) = tokio::try_join!(peer.connect(), c.accept())?;
+    // The ordered endpoint accepts only ordered streams, never an unordered handshake.
+    let incoming = c.endpoint(Ordered::new())?;
+    let (mut outgoing, (origin, mut incoming)) =
+        tokio::try_join!(peer.connect(), incoming.accept())?;
     require(origin == *a.id(), "ordered TLS origin changed")?;
     let payload: Vec<_> = (0_u8..=250).cycle().take(131_072).collect();
     let uploading = async {

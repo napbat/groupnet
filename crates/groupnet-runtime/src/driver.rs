@@ -81,7 +81,7 @@ pub(crate) fn coordinator_key(group: &GroupId) -> String {
 pub(crate) type MetaSnapshot = Arc<BTreeMap<String, String>>;
 
 /// A published, read-only snapshot of a group's live members (id order).
-pub(crate) type MembersSnapshot = Arc<Vec<NodeId>>;
+pub(crate) type MembersSnapshot = Arc<[NodeId]>;
 
 /// A published, read-only snapshot of every known member's status (Alive/Suspect,
 /// plus not-yet-reaped Dead tombstones), so readers can route *around* a suspected
@@ -524,8 +524,8 @@ fn publish_actor_views(
         let _ = publishers.metadata.send(Arc::new(snapshot));
     }
     if members_dirty {
-        let snapshot: Vec<NodeId> = engine.members().cloned().collect();
-        let _ = publishers.members.send(Arc::new(snapshot));
+        let snapshot: MembersSnapshot = engine.members().cloned().collect();
+        let _ = publishers.members.send(snapshot);
         let _ = publishers.statuses.send(statuses_snapshot(engine));
         announce_coordinator(engine, routing, announced_coordinator);
     }

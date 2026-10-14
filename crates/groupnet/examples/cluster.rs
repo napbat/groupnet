@@ -4,24 +4,38 @@
 //! Every node uses the same builder. Replace `MemLink` with a socket link, or
 //! register several links, without changing the node type or group operations.
 //!
+//! Observation is event-driven: subscribe to a group's events *before* the
+//! first snapshot read, then re-read the snapshots (the shared `roster`,
+//! `coordinator`, `metadata`) after every edge. The event stream is bounded;
+//! a subscriber that falls behind sees `Lagged` and resyncs from the snapshots,
+//! which are always current.
+//!
 //! ```text
 //! cargo run --example cluster
 //! ```
 
+use std::io;
 use std::time::Duration;
 
 use groupnet::core::NodeId;
-use groupnet::runtime::{Group, Node};
+use groupnet::runtime::{Group, GroupEvent, Node};
 use groupnet::transport::mem::{MemLink, Network};
+use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::mpsc;
 
 const GROUP: &str = "shard-42";
 const NODE_IDS: [&str; 3] = ["node-a", "node-b", "node-c"];
+/// A generous bound for in-memory gossip to converge.
+const DEADLINE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> io::Result<()> {
     // One shared in-memory fabric; every endpoint created from it can reach the
     // others.
     let net = Network::new();
+    // One wake-up channel fed by every group's event stream. Capacity one
+    // coalesces bursts: a pending wake already means "re-read the snapshots".
+    let (wake, mut wakes) = mpsc::channel(1);
 
     // Adjacent peers also seed membership. Keep each node alive for the run.
     let mut cluster: Vec<(NodeId, Node, Group)> = Vec::with_capacity(NODE_IDS.len());
@@ -37,31 +51,29 @@ async fn main() -> std::io::Result<()> {
             .start()
             .await?;
         let group = node.join_group(GROUP);
+        // Subscribe before any snapshot read, so no change can fall between them.
+        forward(group.events(), wake.clone());
         cluster.push((me, node, group));
     }
+    drop(wake);
 
     // Gossip converges the membership and the derived coordinator. Every node
     // computes the same coordinator from the same live-member set.
-    if !wait_until(|| {
+    settle(&mut wakes, "membership", || {
         let coordinator = cluster[0].2.coordinator();
         coordinator.is_some()
             && cluster.iter().all(|(_, _, group)| {
-                group.members().len() == NODE_IDS.len() && group.coordinator() == coordinator
+                group.roster().len() == NODE_IDS.len() && group.coordinator() == coordinator
             })
     })
-    .await
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "membership did not converge",
-        ));
-    }
+    .await?;
     println!("== membership converged ==");
     for (id, _, group) in &cluster {
         let coord = group
             .coordinator()
             .map_or_else(|| "?".to_string(), |c| c.to_string());
-        let members: Vec<String> = group.members().iter().map(NodeId::to_string).collect();
+        // `roster` shares the published snapshot instead of cloning it.
+        let members: Vec<String> = group.roster().iter().map(NodeId::to_string).collect();
         println!("  {id}: coordinator={coord}  members={members:?}");
     }
 
@@ -73,18 +85,12 @@ async fn main() -> std::io::Result<()> {
         group.sync(|ctx| ctx.update_metadata("leader", id.to_string()));
     }
 
-    if !wait_until(|| {
+    settle(&mut wakes, "metadata", || {
         cluster
             .iter()
             .all(|(_, _, g)| g.metadata("leader").is_some())
     })
-    .await
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "metadata did not converge",
-        ));
-    }
+    .await?;
     println!("\n== metadata converged ==");
     for (id, _, group) in &cluster {
         println!(
@@ -95,15 +101,47 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Polls `cond` until it holds or a generous deadline elapses. Gossip is
-/// eventually consistent, so a demo waits rather than assumes instant delivery.
-/// Returns whether the condition ultimately held.
-async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
-    for _ in 0..200 {
-        if cond() {
-            return true;
+/// Turns one group's bounded event stream into wake-ups for the snapshot reader.
+fn forward(mut events: broadcast::Receiver<GroupEvent>, wake: mpsc::Sender<()>) {
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                // `Lagged` means some edges were dropped. Snapshots are always
+                // current, so one re-read resyncs exactly like a delivered edge.
+                Ok(_) | Err(RecvError::Lagged(_)) => {
+                    if wake.try_send(()).is_err() && wake.is_closed() {
+                        return;
+                    }
+                }
+                // The group actor is gone; there is nothing left to observe.
+                Err(RecvError::Closed) => return,
+            }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+}
+
+/// Re-reads the snapshots behind `converged` now and after every change, until
+/// it holds or [`DEADLINE`] elapses.
+async fn settle(
+    wakes: &mut mpsc::Receiver<()>,
+    what: &str,
+    mut converged: impl FnMut() -> bool,
+) -> io::Result<()> {
+    let settled = tokio::time::timeout(DEADLINE, async {
+        while !converged() {
+            if wakes.recv().await.is_none() {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    if settled == Ok(true) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{what} did not converge"),
+        ))
     }
-    cond()
 }

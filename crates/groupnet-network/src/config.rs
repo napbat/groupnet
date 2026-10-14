@@ -1,4 +1,4 @@
-//! Typed adapter configuration and a node-owned network lifecycle.
+//! Tunnel credentials, the managed-network builder and its node-owned lifecycle.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -38,47 +38,47 @@ impl TunnelConfig {
     }
 }
 
-/// A managed group network: intrinsic routing over a collection of link providers.
+/// Builds a managed group network: intrinsic routing over a collection of link
+/// providers.
 ///
-/// [`with_link`](Self::with_link) and [`with_links`](Self::with_links) register any
-/// implementation through the same contract, in insertion order. Protocol crates
-/// own their configuration and binding. Configure [`with_tunnels`](Self::with_tunnels)
-/// for confidential streams; link admission never authorizes application resources.
+/// [`link`](Self::link) and [`links`](Self::links) register any implementation
+/// through the same contract, in insertion order. Protocol crates own their
+/// configuration and binding. Configure [`tunnels`](Self::tunnels) for
+/// confidential streams; link admission never authorizes application resources.
+/// [`bind`](Self::bind) validates the router policy, binds every provider and
+/// starts routing.
 #[derive(Debug, Default)]
-pub struct NetworkConfig {
+pub struct NetworkBuilder {
     router: RouterConfig,
     links: Vec<Box<dyn LinkProvider>>,
     tunnels: Option<TunnelConfig>,
 }
 
-impl NetworkConfig {
+impl NetworkBuilder {
     /// Sets routing limits and forwarding policy; forwarding is enabled by default.
     #[must_use]
-    pub fn with_router(mut self, config: RouterConfig) -> Self {
+    pub fn routing(mut self, config: RouterConfig) -> Self {
         self.router = config;
         self
     }
 
     /// Adds a configured link implementation, subject to routing capacity limits.
     #[must_use]
-    pub fn with_link(mut self, provider: impl LinkProvider) -> Self {
+    pub fn link(mut self, provider: impl LinkProvider) -> Self {
         self.links.push(Box::new(provider));
         self
     }
 
     /// Adds heterogeneous link implementations in iteration order.
     #[must_use]
-    pub fn with_links(
-        mut self,
-        providers: impl IntoIterator<Item = Box<dyn LinkProvider>>,
-    ) -> Self {
+    pub fn links(mut self, providers: impl IntoIterator<Item = Box<dyn LinkProvider>>) -> Self {
         self.links.extend(providers);
         self
     }
 
     /// Enables pinned, mutually authenticated TLS streams over the routed fabric.
     #[must_use]
-    pub fn with_tunnels(mut self, config: TunnelConfig) -> Self {
+    pub fn tunnels(mut self, config: TunnelConfig) -> Self {
         self.tunnels = Some(config);
         self
     }
@@ -93,13 +93,21 @@ impl NetworkConfig {
         peers.into_iter().collect()
     }
 
-    /// Binds adapters in insertion order and starts routing, rolling back on failure.
+    /// Validates the router policy and tunnel limits, then binds adapters in
+    /// insertion order and starts routing, rolling back on failure. Nothing
+    /// binds when a policy is invalid.
     ///
     /// # Errors
-    /// Propagates invalid configuration, bind/initialization errors, and TLS errors.
+    /// Returns `InvalidInput` wrapping a [`RouterConfigError`](crate::RouterConfigError)
+    /// or [`TunnelLimitsError`](crate::tunnel::TunnelLimitsError) before binding;
+    /// propagates bind/initialization errors and TLS errors.
     /// # Panics
     /// Requires a Tokio runtime. Propagates an earlier poisoned adapter lock.
     pub async fn bind(self, local: NodeId) -> io::Result<Network> {
+        self.router.validate()?;
+        if let Some(tunnels) = &self.tunnels {
+            tunnels.limits.validate()?;
+        }
         let mut network = NetworkInner {
             router: Router::new(local.clone(), self.router)?,
             tunnels: None,
@@ -155,7 +163,8 @@ impl Drop for NetworkInner {
 }
 
 /// Shared network lifetime, also usable directly as a secure [`BulkTransport`].
-/// Dropping the final clone initiates shutdown; [`close`](Self::close) drains tasks.
+/// Start one with [`Network::builder`]. Dropping the final clone initiates
+/// shutdown; [`close`](Self::close) drains tasks.
 /// Owned link workers drain each provider's lifecycle through the shared contract.
 #[derive(Clone, Debug)]
 pub struct Network {
@@ -163,6 +172,13 @@ pub struct Network {
 }
 
 impl Network {
+    /// Starts configuring a managed network; nothing binds until
+    /// [`NetworkBuilder::bind`].
+    #[must_use]
+    pub fn builder() -> NetworkBuilder {
+        NetworkBuilder::default()
+    }
+
     /// The initialized router, also usable for registering additional typed adapters.
     #[must_use]
     pub fn router(&self) -> &Router {

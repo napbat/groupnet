@@ -4,24 +4,29 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use groupnet_core::{Config, GroupId, NodeId};
-use groupnet_network::{NetworkConfig, RouterConfig, TunnelConfig};
-use groupnet_transport::link::LinkProvider;
+use groupnet_network::{LinkProvider, NetworkBuilder, RouterConfig, TunnelConfig};
+use groupnet_streams::UnorderedConfig;
 
 use super::{GroupProfile, Inner, Node, ROUTING_GROUP, recv_loop, sync_peer_addrs};
 use crate::seeds::{NamedSeeds, resolve_named_seeds};
 
-/// Configures a managed [`Node`]'s protocol links and group memberships.
+/// Configures a managed [`Node`]'s protocol links, group memberships and
+/// node-wide protocol policies.
 ///
 /// Link providers bind their endpoints at [`start`](Self::start); adjacent
-/// admitted peers also become initial membership seeds.
+/// admitted peers also become initial membership seeds. Node-wide messaging
+/// and unordered-session policies are validated by `start` and fixed for the
+/// node's life; per-operation delivery options stay on the protocol
+/// descriptors.
 pub struct NodeBuilder {
     id: NodeId,
-    network: NetworkConfig,
+    network: NetworkBuilder,
     seeds: Vec<NodeId>,
     config: Config,
     advertise_addr: Option<String>,
     named_seeds: Option<NamedSeeds>,
     messaging: crate::messaging::MessagingConfig,
+    unordered: UnorderedConfig,
 }
 
 impl std::fmt::Debug for NodeBuilder {
@@ -31,6 +36,8 @@ impl std::fmt::Debug for NodeBuilder {
             .field("network", &self.network)
             .field("seeds", &self.seeds)
             .field("named_seeds", &self.named_seeds)
+            .field("messaging", &self.messaging)
+            .field("unordered", &self.unordered)
             .finish_non_exhaustive()
     }
 }
@@ -39,47 +46,61 @@ impl NodeBuilder {
     pub(super) fn new(id: NodeId) -> Self {
         Self {
             id,
-            network: NetworkConfig::default(),
+            network: NetworkBuilder::default(),
             seeds: Vec::new(),
             config: Config::default(),
             advertise_addr: None,
             named_seeds: None,
             messaging: crate::messaging::MessagingConfig::default(),
+            unordered: UnorderedConfig::default(),
         }
     }
 
     /// Registers one configured protocol implementation.
     #[must_use]
     pub fn link(mut self, provider: impl LinkProvider) -> Self {
-        self.network = self.network.with_link(provider);
+        self.network = self.network.link(provider);
         self
     }
 
     /// Registers a heterogeneous collection of configured protocol implementations.
     #[must_use]
     pub fn links(mut self, providers: impl IntoIterator<Item = Box<dyn LinkProvider>>) -> Self {
-        self.network = self.network.with_links(providers);
+        self.network = self.network.links(providers);
         self
     }
 
     /// Sets routing limits and transit policy, independently of link protocols.
     #[must_use]
     pub fn routing(mut self, config: RouterConfig) -> Self {
-        self.network = self.network.with_router(config);
+        self.network = self.network.routing(config);
         self
     }
 
     /// Enables pinned, end-to-end TLS streams over routed paths.
     #[must_use]
     pub fn tunnels(mut self, config: TunnelConfig) -> Self {
-        self.network = self.network.with_tunnels(config);
+        self.network = self.network.tunnels(config);
         self
     }
 
     /// Configures shared message payloads, inboxes, retries and group fanout bounds.
+    /// [`start`](Self::start) rejects an invalid configuration.
     #[must_use]
     pub fn messaging(mut self, config: crate::messaging::MessagingConfig) -> Self {
         self.messaging = config;
+        self
+    }
+
+    /// Configures node-wide unordered-session admission (`allow_reliable` /
+    /// `allow_unreliable`), capacities and timers for every
+    /// [`Unordered`](crate::Unordered) endpoint and peer of this node.
+    /// [`start`](Self::start) rejects an invalid configuration; the policy
+    /// cannot change once the node runs. Configuring it does not open the
+    /// protocol, which the first unordered binding initializes.
+    #[must_use]
+    pub fn unordered(mut self, config: UnorderedConfig) -> Self {
+        self.unordered = config;
         self
     }
 
@@ -180,17 +201,23 @@ impl NodeBuilder {
         self
     }
 
-    /// Binds all links, then starts routing and group coordination.
+    /// Validates node-wide policies, binds all links, then starts routing and
+    /// group coordination.
     /// Every ordinary [`Node`] clone retains network ownership; dropping the
     /// last initiates shutdown. Name resolution runs in the background and
     /// never delays startup.
     ///
     /// # Errors
-    /// Propagates invalid configuration, binding, registration, or security setup failures.
+    /// Returns `InvalidInput` wrapping a
+    /// [`MessagingConfigError`](crate::messaging::MessagingConfigError) or
+    /// [`UnorderedConfigError`](crate::UnorderedConfigError) before binding
+    /// anything; propagates invalid routing configuration, binding,
+    /// registration, or security setup failures.
     /// # Panics
     /// Requires a Tokio runtime; propagates poisoned internal locks.
     pub async fn start(self) -> io::Result<Node> {
         self.messaging.validate()?;
+        self.unordered.validate()?;
         let mut seeds = self.seeds;
         seeds.extend(self.network.peers());
         if let Some(named) = &self.named_seeds {
@@ -205,6 +232,7 @@ impl NodeBuilder {
             config: self.config,
             messaging,
             ordered: Mutex::new(None),
+            unordered_config: self.unordered,
             unordered: Mutex::new(None),
             routes: Mutex::new(HashMap::new()),
             start: Instant::now(),

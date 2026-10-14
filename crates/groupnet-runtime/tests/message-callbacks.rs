@@ -5,7 +5,7 @@ use std::{io, sync::Arc, time::Duration};
 use groupnet_core::NodeId;
 use groupnet_runtime::{
     Messages, Node,
-    messaging::{Bytes, Delivery, SendOptions},
+    messaging::{Bytes, Delivery, MessageProtocol, SendOptions},
 };
 use tokio::{sync::Notify, time::timeout};
 
@@ -257,7 +257,7 @@ async fn full_application_inbox_rejects_delivery_without_blocking_metadata_or_lo
 }
 
 #[tokio::test]
-async fn endpoint_shutdown_wakes_blocked_node_and_group_manual_receives() {
+async fn node_close_wakes_blocked_node_and_group_manual_receives() {
     let node = Node::builder(NodeId::new("endpoint-manual"))
         .start()
         .await
@@ -275,10 +275,7 @@ async fn endpoint_shutdown_wakes_blocked_node_and_group_manual_receives() {
             .await
             .is_err()
     );
-    node.endpoint(Messages::best_effort())
-        .unwrap()
-        .protocol()
-        .shutdown();
+    node.close().await;
     assert_eq!(
         timeout(WAIT, &mut node_recv)
             .await
@@ -316,12 +313,10 @@ async fn endpoint_shutdown_wakes_blocked_node_and_group_manual_receives() {
         new_group.recv().await.unwrap_err().kind(),
         io::ErrorKind::NotConnected
     );
-    assert!(!node.router().is_closed());
-    node.close().await;
 }
 
 #[tokio::test]
-async fn endpoint_shutdown_cancels_inflight_node_and_group_callbacks_without_applying() {
+async fn node_close_cancels_inflight_node_and_group_callbacks_without_applying() {
     let node = Node::builder(NodeId::new("endpoint-callback"))
         .start()
         .await
@@ -365,7 +360,7 @@ async fn endpoint_shutdown_cancels_inflight_node_and_group_callbacks_without_app
             }).await.unwrap();
         } => {}
     }
-    messages.protocol().shutdown();
+    node.close().await;
     for handle in [node_handle, group_handle] {
         assert_eq!(
             timeout(WAIT, handle.wait())
@@ -400,6 +395,4 @@ async fn endpoint_shutdown_cancels_inflight_node_and_group_callbacks_without_app
         group.on_recv(|_, _| async { Ok(()) }).unwrap_err().kind(),
         io::ErrorKind::NotConnected
     );
-    assert!(!node.router().is_closed());
-    node.close().await;
 }

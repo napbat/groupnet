@@ -86,7 +86,9 @@ pub(super) fn process(inner: &Arc<Inner>, packet: ApplicationPacket) {
         } => {
             // A peer may not extend this receiver's finite retry/retention bound.
             // Fail closed without queueing or acknowledging application work.
-            if payload.len() > inner.config.max_payload || retry_horizon_ms > inner.max_timeout_ms {
+            if payload.len() > inner.config.max_payload.get()
+                || retry_horizon_ms > inner.max_timeout_ms
+            {
                 return;
             }
             let offset = packet.payload.len() - payload.len();
