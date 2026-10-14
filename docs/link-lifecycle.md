@@ -105,20 +105,22 @@ policy, presented credential and bounds bundled as one `TcpAdmission`.
 `Node::builder(id).link(provider)` and `.links(providers)` populate one
 heterogeneous collection. Membership settings live on that same builder.
 Providers bind in insertion order; their explicit adjacent peers become initial
-membership seeds. `NetworkConfig::with_link` / `with_links` configure standalone
-networks without coordination actors.
+membership seeds. `Network::builder().link(..)` / `.links(..)` configure
+standalone networks without coordination actors; `NetworkBuilder::bind(id)`
+validates the router policy and tunnel limits before binding any provider.
 
 ```mermaid
 sequenceDiagram
     participant App as Application
     participant Node as Node initialization
-    participant Config as NetworkConfig
+    participant Config as NetworkBuilder
     participant Provider as LinkProvider
     participant Router as Router
     participant Worker as LinkDriver
     App->>Node: builder(id).link(...).start()
     Node->>Config: peers() — deduplicate membership seeds
     Node->>Config: bind(local_id)
+    Config->>Config: Validate RouterConfig and TunnelLimits
     Config->>Router: Create router
     loop Each provider in insertion order
         Config->>Provider: bind(local_id)
@@ -139,7 +141,9 @@ sequenceDiagram
 ```
 
 The single `NodeBuilder` exposes `.config(...)`, `.seed(...)`, `.named_seeds(...)`,
-and timing setters alongside link/routing/tunnel settings. Startup is fallible
+and timing setters alongside link/routing/tunnel settings and the node-wide
+`.messaging(...)` and `.unordered(...)` protocol policies, which `start` validates
+before binding anything. Startup is fallible
 and asynchronous; there is no direct-transport or blocking node constructor.
 
 ## 2. Where dynamic dispatch stops
@@ -150,7 +154,7 @@ The router's existing queues provide the bounded scheduling boundary.
 
 ```mermaid
 flowchart TB
-    Config["NetworkConfig\nVec of boxed LinkProvider objects"]
+    Config["NetworkBuilder\nVec of boxed LinkProvider objects"]
     Provider["Concrete provider\nTyped protocol configuration"]
     Bound["BoundLink\nLinkConfig + LinkDriver"]
     Scheduler["Router scheduler\nQueues, announcements, fragmentation"]

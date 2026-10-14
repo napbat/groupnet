@@ -221,7 +221,7 @@ impl InboundState {
     pub(super) fn new(config: &RouterConfig) -> Self {
         Self {
             fragments: Reassembly::new(config.reassembly.clone(), config.max_frame),
-            replay: ReplayWindows::new(config.replay_capacity),
+            replay: ReplayWindows::new(config.replay_capacity.get()),
         }
     }
 }
@@ -335,7 +335,7 @@ impl Shared {
         };
         let mut table = self.table.lock().expect("router table poisoned");
         if !table.candidates.contains_key(&destination)
-            && table.candidates.len() >= self.config.max_routes
+            && table.candidates.len() >= self.config.max_routes.get()
         {
             return;
         }

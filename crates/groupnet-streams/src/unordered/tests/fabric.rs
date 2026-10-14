@@ -1,5 +1,6 @@
 use std::{
     io,
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
@@ -303,7 +304,7 @@ pub(super) fn config() -> UnorderedConfig {
     UnorderedConfig {
         retry_interval: Duration::from_millis(200),
         send_timeout: Duration::from_secs(2),
-        max_attempts: 10,
+        max_attempts: NonZeroUsize::new(10).unwrap(),
         heartbeat_interval: Duration::from_millis(100),
         idle_timeout: Duration::from_secs(1),
         ..UnorderedConfig::default()

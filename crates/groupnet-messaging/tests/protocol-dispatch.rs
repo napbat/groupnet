@@ -1,10 +1,12 @@
 //! Public custom implementations and lossless generic receipt/context ownership.
 
 use groupnet_core::{GroupId, NodeId};
+// The router types this crate's signatures take come from its own re-exports.
 use groupnet_messaging::{
-    Bytes, Delivery, Frame, MessageId, MessageProtocol, Messaging, SendOptions, codec,
+    Bytes, Delivery, Frame, MessageId, MessageProtocol, Messaging, ProtocolId, ProtocolIo, Router,
+    SendOptions, codec,
 };
-use groupnet_network::{ProtocolId, ProtocolIo, Router, RouterConfig};
+use groupnet_network::RouterConfig;
 use std::io;
 
 #[derive(Debug)]
@@ -33,7 +35,10 @@ impl MessageProtocol for CustomProtocol {
                 .map(|()| id),
         )
     }
+}
 
+/// Receiving and shutdown are owner operations, outside the shared send contract.
+impl CustomProtocol {
     async fn recv(&self) -> io::Result<Frame<CustomReceipt>> {
         let packet = self.0.recv().await?;
         let codec::Packet::Data {
@@ -97,7 +102,7 @@ async fn custom_and_default_protocols_share_routes_without_inbox_stealing() -> i
     assert_eq!(context.from, local);
     assert_eq!(context.group, Some(group.clone()));
     assert_eq!(context.receipt.0, 9);
-    let ordinary_frame = MessageProtocol::recv(&messages).await?;
+    let ordinary_frame = messages.recv().await?;
     assert_eq!(ordinary_frame.id, ordinary);
     assert_eq!(ordinary_frame.group, Some(group));
     assert_eq!(ordinary_frame.payload.as_ref(), b"ordinary");

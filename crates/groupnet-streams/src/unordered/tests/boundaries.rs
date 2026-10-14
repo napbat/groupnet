@@ -1,4 +1,4 @@
-use std::{io, sync::atomic::Ordering, time::Duration};
+use std::{io, num::NonZeroUsize, sync::atomic::Ordering, time::Duration};
 
 use bytes::Bytes;
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,7 +93,7 @@ async fn exercise_horizon(kind: Kind, resolution: Resolution) {
     let mut bounds = config();
     bounds.pending_sends = QueueCapacity::of(3);
     if matches!(resolution, Resolution::Timeout) {
-        bounds.max_attempts = 1;
+        bounds.max_attempts = NonZeroUsize::new(1).unwrap();
     }
     let fabric = Fabric::new(bounds).await;
     let (a, b) = fabric.pair(Reliable).await;

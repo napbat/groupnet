@@ -42,9 +42,10 @@ impl Drop for Inner {
 
 /// A cheap, clone-backed ordered session endpoint using pinned TLS tunnels.
 ///
-/// Clones share endpoint shutdown and established-session ownership. The
-/// default node bulk APIs and this endpoint share the ordered accept queue;
-/// neither can receive an unordered session's authenticated setup channel.
+/// Clones share endpoint shutdown and established-session ownership. Bulk
+/// accepts on the same tunnel transport and this endpoint share the ordered
+/// accept queue; neither can receive an unordered session's authenticated
+/// setup channel.
 /// Shutting down or dropping the last endpoint handle cancels its own sessions
 /// and blocked calls, not the shared node, tunnel transport or other endpoints.
 #[derive(Clone, Debug)]

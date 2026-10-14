@@ -152,7 +152,7 @@ impl UnorderedSession {
             message,
         };
         let deadline = Instant::now() + state.config.send_timeout;
-        for _ in 0..state.config.max_attempts {
+        for _ in 0..state.config.max_attempts.get() {
             state.ensure_open()?;
             if Instant::now() >= deadline {
                 return Err(send_timeout());

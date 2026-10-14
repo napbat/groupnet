@@ -13,7 +13,7 @@
 //! ```no_run
 //! use groupnet_runtime::Node;
 //! use groupnet_core::NodeId;
-//! use groupnet_transport::link::LinkProvider;
+//! use groupnet_runtime::LinkProvider;
 //!
 //! # async fn demo(link: impl LinkProvider) -> std::io::Result<()> {
 //! let node = Node::builder(NodeId::new("node-a"))
@@ -29,14 +29,37 @@
 //! # }
 //! ```
 //!
+//! Application protocols bind through [`Node::endpoint`] and [`Node::peer`]
+//! with a descriptor — [`Messages`], [`Ordered`] or [`Unordered`] — or a custom
+//! [`PeerImplementation`]. Ordered streams need configured
+//! [`tunnels`](NodeBuilder::tunnels):
+//!
+//! ```no_run
+//! use groupnet_core::NodeId;
+//! use groupnet_runtime::{Node, Ordered};
+//!
+//! # async fn demo(node: Node, peer: NodeId) -> std::io::Result<()> {
+//! let ordered = node.endpoint(Ordered::new())?;
+//! let outgoing = ordered.connect(&peer).await?;
+//! let (origin, incoming) = ordered.accept().await?;
+//! # let _ = (outgoing, origin, incoming);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Coordination protocol logic lives entirely in the sans-IO [`groupnet-core`];
 //! [`groupnet-messaging`] owns opaque application frames and their delivery
 //! receipts. This crate drives both through the managed network. Swap the
 //! transport (or drive the same core with [`groupnet-sim`]) without touching
 //! coordination logic.
 //!
+//! The sibling-crate types this crate's signatures take or return are
+//! re-exported: routing and tunnel types ([`Router`], [`RouterConfig`],
+//! [`TunnelConfig`], [`TunnelTransport`], [`LinkProvider`]) and session types
+//! ([`OrderedProtocol`], [`TunneledStream`], [`UnorderedProtocol`],
+//! [`UnorderedSession`], …) at the root, and message types in [`messaging`].
+//!
 //! [`GroupEngine`]: groupnet_core::GroupEngine
-//! [`Transport`]: groupnet_transport::Transport
 //! [`join_group`]: Node::join_group
 //! [`groupnet-core`]: groupnet_core
 //! [`groupnet-messaging`]: groupnet_messaging
@@ -61,13 +84,15 @@ pub use group::{
     InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
 pub use groupnet_core::{RecoveredGrant, Role, Status};
-pub use groupnet_messaging::{MessageProtocol, Messaging, MessagingConfig};
+pub use groupnet_network::tunnel::{PeerIdentity, TlsIdentity, TunnelTransport, TunneledStream};
+pub use groupnet_network::{LinkProvider, Router, RouterConfig, TunnelConfig};
 pub use groupnet_streams::{
-    SessionProtocol, UnorderedConfig, UnorderedDelivery, UnorderedOptions, UnorderedSession,
+    OrderedProtocol, SessionProtocol, UnorderedConfig, UnorderedConfigError, UnorderedDelivery,
+    UnorderedOptions, UnorderedProtocol, UnorderedSession,
 };
 pub use node::{
-    Endpoint, GroupProfile, Messages, Node, NodeBuilder, Ordered, Peer, PeerImplementation,
-    Unordered,
+    Endpoint, GroupProfile, ManagedProtocol, Messages, Node, NodeBuilder, Ordered, Peer,
+    PeerImplementation, ReceiveBinding, Unordered,
 };
 pub use routing::Routing;
 #[cfg(feature = "dns")]

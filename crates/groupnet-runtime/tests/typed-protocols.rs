@@ -2,17 +2,20 @@
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
-use groupnet_network::{
-    TunnelConfig,
-    tunnel::{PeerIdentity, TlsIdentity},
+use groupnet_runtime::messaging::{
+    Bytes, Delivery, Frame, MessageId, MessageProtocol, Messaging, ProtocolId, Receipt,
+    ReceiveHandle, SendOptions,
 };
-use groupnet_runtime::messaging::{Bytes, Delivery, SendOptions};
 use groupnet_runtime::{
-    MessageProtocol, Messages, Messaging, Node, Ordered, PeerImplementation, SessionProtocol,
-    Unordered, UnorderedConfig, UnorderedDelivery,
+    ManagedProtocol, Messages, Node, Ordered, OrderedProtocol, PeerIdentity, PeerImplementation,
+    ReceiveBinding, SessionProtocol, TlsIdentity, TunnelConfig, TunneledStream, Unordered,
+    UnorderedConfig, UnorderedConfigError, UnorderedDelivery,
 };
 use groupnet_testkit::cluster::eventually_within;
-use groupnet_transport::{QueueCapacity, link::LinkConfig};
+use groupnet_transport::{
+    QueueCapacity,
+    link::{BoundLink, LinkConfig, LinkFuture},
+};
 use groupnet_transport_mem::Network;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -22,7 +25,7 @@ use std::{
     io,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -82,24 +85,15 @@ async fn typed_message_peer_retains_node_and_existing_receive_owner() -> io::Res
 }
 
 #[tokio::test]
-async fn cached_session_endpoints_reject_policy_changes_and_wake_on_node_close() -> io::Result<()> {
+async fn cached_session_endpoints_wake_on_node_close() -> io::Result<()> {
     let node = Node::builder(NodeId::new("sessions-local"))
         .tunnels(TunnelConfig::new(identities(1).remove(0).0, []))
         .start()
         .await?;
     let ordered = node.endpoint(Ordered::new())?;
     let ordered_again = node.endpoint(Ordered::new())?;
-    let config = UnorderedConfig::default();
-    node.configure_unordered(config.clone())?;
     let unordered = node.endpoint(Unordered::reliable())?;
     let unordered_again = node.endpoint(Unordered::reliable())?;
-    node.configure_unordered(config.clone())?;
-    let mut changed = config;
-    changed.allow_unreliable = false;
-    assert_eq!(
-        node.configure_unordered(changed).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
     let ordered_recv = tokio::spawn(async move { ordered.accept().await });
     let unordered_recv = tokio::spawn(async move { unordered.accept().await });
     tokio::time::timeout(WAIT, node.close()).await?;
@@ -251,9 +245,10 @@ async fn messaging_nodes() -> io::Result<(Node, Node)> {
 }
 
 #[tokio::test]
-async fn messaging_shutdown_keeps_coordination_and_existing_and_new_ordered_streams_usable()
+async fn managed_views_leave_dispatcher_receive_ownership_and_shared_engines_running()
 -> io::Result<()> {
     let (a, b) = messaging_nodes().await?;
+    let a_id = a.id().clone();
     let b_id = b.id().clone();
     let a_group = a.join_group("independent");
     let b_group = b.join_group("independent");
@@ -269,52 +264,47 @@ async fn messaging_shutdown_keeps_coordination_and_existing_and_new_ordered_stre
     .await?;
     let mut outgoing = outgoing?;
     let mut incoming = incoming?.1;
-    let node_callback = a.on_recv(|_, _| async {
-        panic!("idle node callback unexpectedly received a frame");
+    let (node_seen, mut node_frames) = tokio::sync::mpsc::unbounded_channel();
+    let node_callback = a.on_recv(move |context, payload| {
+        let _ = node_seen.send((context.from, payload));
+        async { Ok(()) }
     })?;
-    let group_callback = a_group.on_frame(|_| async {
-        panic!("idle group callback unexpectedly received a frame");
+    let (group_seen, mut group_frames) = tokio::sync::mpsc::unbounded_channel();
+    let group_callback = a_group.on_frame(move |frame| {
+        let _ = group_seen.send((frame.from, frame.payload));
+        async { Ok(()) }
     })?;
+    // Every managed handle shares the dispatcher-fed inbox, never the raw queue:
+    // its receive competes with the installed owner instead of stealing frames.
+    let messages = a.endpoint(Messages::best_effort())?;
     assert_eq!(
-        a.recv().await.unwrap_err().kind(),
+        messages.recv().await.unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
-    assert_eq!(
-        a_group.recv_frame().await.unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
+    // Views of the shared engines carry no shutdown; dropping them stops nothing.
+    let views = (
+        messages.protocol().clone(),
+        a_ordered.protocol().clone(),
+        a.endpoint(Unordered::reliable())?.protocol().clone(),
     );
-    let mut node_wait = Box::pin(node_callback.wait());
-    let mut group_wait = Box::pin(group_callback.wait());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut node_wait)
-            .await
-            .is_err()
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut group_wait)
-            .await
-            .is_err()
-    );
-    a.endpoint(Messages::best_effort())?.protocol().shutdown();
-    assert_eq!(
-        tokio::time::timeout(WAIT, &mut node_wait)
-            .await?
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::NotConnected
-    );
-    assert_eq!(
-        tokio::time::timeout(WAIT, &mut group_wait)
-            .await?
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::NotConnected
-    );
-    assert!(!a.router().is_closed());
-    a_group.sync(|state| state.update_metadata("after-messaging", "alive"));
-    eventually_within("coordination after messaging shutdown", WAIT, || {
-        a_group.metadata("after-messaging").as_deref() == Some("alive")
-            && b_group.metadata("after-messaging").as_deref() == Some("alive")
+    drop((messages, views));
+    b.peer(a_id.clone(), Messages::applied(WAIT))?
+        .send(Bytes::from_static(b"node"))
+        .await?;
+    let report = b_group.send(b"group").await?;
+    assert!(report.all_succeeded(), "{report:?}");
+    let (from, payload) = tokio::time::timeout(WAIT, node_frames.recv())
+        .await?
+        .expect("node callback alive");
+    assert_eq!((from, payload.as_ref()), (b_id.clone(), &b"node"[..]));
+    let (from, payload) = tokio::time::timeout(WAIT, group_frames.recv())
+        .await?
+        .expect("group callback alive");
+    assert_eq!((from, payload.as_ref()), (b_id.clone(), &b"group"[..]));
+    a_group.sync(|state| state.update_metadata("after-views", "alive"));
+    eventually_within("coordination after dropped views", WAIT, || {
+        a_group.metadata("after-views").as_deref() == Some("alive")
+            && b_group.metadata("after-views").as_deref() == Some("alive")
     })
     .await;
     tokio::time::timeout(WAIT, async {
@@ -337,6 +327,8 @@ async fn messaging_shutdown_keeps_coordination_and_existing_and_new_ordered_stre
     .await??;
     drop(outgoing);
     drop(incoming);
+    node_callback.close().await?;
+    group_callback.close().await?;
     a.close().await;
     b.close().await;
     Ok(())
@@ -385,6 +377,51 @@ async fn bound_message_policies_preserve_node_inbox_and_application_boundary() -
     assert_eq!(context.id, delivered_id);
     assert_eq!(bytes.as_ref(), b"delivered");
     node.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_adapter_shares_the_ordered_endpoint_queue_and_node_lifetime() -> io::Result<()> {
+    use groupnet_transport::bulk::BulkTransport;
+    let (a, b) = messaging_nodes().await?;
+    let b_id = b.id().clone();
+    let b_ordered = b.endpoint(Ordered::new())?;
+    // Adapter connect, endpoint accept.
+    let (outgoing, incoming) = tokio::time::timeout(WAIT, async {
+        tokio::join!(BulkTransport::connect(&a, &b_id), b_ordered.accept())
+    })
+    .await?;
+    let (mut outgoing, (origin, mut incoming)) = (outgoing?, incoming?);
+    assert_eq!(origin, *a.id());
+    // Endpoint connect, adapter accept.
+    let b_peer = b.peer(a.id().clone(), Ordered::new())?;
+    let (reverse_out, reverse_in) = tokio::time::timeout(WAIT, async {
+        tokio::join!(b_peer.connect(), BulkTransport::accept(&a))
+    })
+    .await?;
+    let (mut reverse_out, (reverse_origin, mut reverse_in)) = (reverse_out?, reverse_in?);
+    assert_eq!(reverse_origin, b_id);
+    tokio::time::timeout(WAIT, async {
+        outgoing.write_all(b"adapter").await?;
+        outgoing.flush().await?;
+        let mut bytes = [0; 7];
+        incoming.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"adapter");
+        reverse_out.write_all(b"endpoint").await?;
+        reverse_out.flush().await?;
+        let mut bytes = [0; 8];
+        reverse_in.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"endpoint");
+        Ok::<_, io::Error>(())
+    })
+    .await??;
+    drop((outgoing, incoming, reverse_out, reverse_in));
+    a.close().await;
+    assert_eq!(
+        BulkTransport::connect(&a, &b_id).await.unwrap_err().kind(),
+        io::ErrorKind::NotConnected
+    );
+    b.close().await;
     Ok(())
 }
 
@@ -442,18 +479,17 @@ async fn unordered_bindings_share_node_settings_and_accept_only_the_selected_pol
 }
 
 #[tokio::test]
-async fn node_unordered_settings_are_fixed_before_endpoint_or_peer_creation() -> io::Result<()> {
+async fn node_unordered_settings_are_fixed_by_the_builder() -> io::Result<()> {
     let node = Node::builder(NodeId::new("configured-policy"))
         .tunnels(TunnelConfig::new(identities(1).remove(0).0, []))
+        .unordered(UnorderedConfig {
+            allow_unreliable: false,
+            max_sessions: QueueCapacity::of(2),
+            sessions_per_peer: QueueCapacity::MIN,
+            ..UnorderedConfig::default()
+        })
         .start()
         .await?;
-    let config = UnorderedConfig {
-        allow_unreliable: false,
-        max_sessions: QueueCapacity::of(2),
-        sessions_per_peer: QueueCapacity::MIN,
-        ..UnorderedConfig::default()
-    };
-    node.configure_unordered(config.clone())?;
     // No route or admitted remote exists; binding still succeeds without connecting.
     let peer = node.peer(NodeId::new("absent"), Unordered::reliable())?;
     let ordered = node.peer(NodeId::new("absent"), Ordered::new())?;
@@ -464,15 +500,11 @@ async fn node_unordered_settings_are_fixed_before_endpoint_or_peer_creation() ->
             .kind(),
         io::ErrorKind::InvalidInput,
     );
-    node.configure_unordered(config.clone())?;
-    let changed = UnorderedConfig {
-        max_sessions: QueueCapacity::of(3),
-        ..config
+    let unreliable = groupnet_runtime::UnorderedOptions {
+        delivery: UnorderedDelivery::Unreliable,
+        ..groupnet_runtime::UnorderedOptions::default()
     };
-    assert_eq!(
-        node.configure_unordered(changed).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
+    assert!(peer.protocol().validate_options(&unreliable).is_err());
     node.close().await;
     assert_eq!(
         ordered.connect().await.unwrap_err().kind(),
@@ -481,16 +513,76 @@ async fn node_unordered_settings_are_fixed_before_endpoint_or_peer_creation() ->
     Ok(())
 }
 
+/// Records whether start ever tried to bind it.
+#[derive(Debug)]
+struct BindProbe {
+    peers: Vec<NodeId>,
+    bound: Arc<AtomicBool>,
+}
+
+impl groupnet_runtime::LinkProvider for BindProbe {
+    fn peers(&self) -> &[NodeId] {
+        &self.peers
+    }
+
+    fn bind(self: Box<Self>, _local: NodeId) -> LinkFuture<'static, io::Result<BoundLink>> {
+        self.bound.store(true, Ordering::SeqCst);
+        Box::pin(async { Err(io::Error::other("probe never binds")) })
+    }
+}
+
+#[tokio::test]
+async fn start_rejects_invalid_unordered_settings_by_field_before_binding() {
+    let bound = Arc::new(AtomicBool::new(false));
+    let error = Node::builder(NodeId::new("invalid-policy"))
+        .link(BindProbe {
+            peers: vec![NodeId::new("peer")],
+            bound: bound.clone(),
+        })
+        .unordered(UnorderedConfig {
+            allow_reliable: false,
+            allow_unreliable: false,
+            ..UnorderedConfig::default()
+        })
+        .start()
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<UnorderedConfigError>()),
+        Some(&UnorderedConfigError::NoPolicyAllowed)
+    );
+    assert!(!bound.load(Ordering::SeqCst), "validation precedes binding");
+}
+
 #[derive(Debug)]
 struct CustomMessages {
     bindings: Arc<AtomicUsize>,
     sends: Arc<AtomicUsize>,
 }
 
+/// Wraps the built-in managed view: sends are counted and received frames
+/// carry a protocol-specific receipt.
 #[derive(Clone, Debug)]
 struct CountingMessages {
-    protocol: Messaging,
+    protocol: ManagedProtocol<Messaging>,
     sends: Arc<AtomicUsize>,
+}
+
+/// A protocol-specific receipt over the node inbox's receipt.
+#[derive(Debug)]
+struct Tagged(Receipt);
+
+fn tagged(frame: Frame) -> Frame<Tagged> {
+    Frame {
+        id: frame.id,
+        from: frame.from,
+        group: frame.group,
+        payload: frame.payload,
+        receipt: Tagged(frame.receipt),
+    }
 }
 
 impl PeerImplementation for CustomMessages {
@@ -510,9 +602,9 @@ impl PeerImplementation for CustomMessages {
 }
 
 impl MessageProtocol for CountingMessages {
-    const ID: groupnet_network::ProtocolId = Messaging::ID;
+    const ID: ProtocolId = Messaging::ID;
     type SendOptions = SendOptions;
-    type Receipt = groupnet_runtime::messaging::Receipt;
+    type Receipt = Tagged;
 
     fn send(
         &self,
@@ -520,23 +612,28 @@ impl MessageProtocol for CountingMessages {
         group: Option<&groupnet_core::GroupId>,
         payload: Bytes,
         options: SendOptions,
-    ) -> impl Future<Output = io::Result<groupnet_runtime::messaging::MessageId>> + Send {
+    ) -> impl Future<Output = io::Result<MessageId>> + Send {
         // Intentionally eager: peer cancellation must win before constructing
         // this future, not merely before polling it.
         self.sends.fetch_add(1, Ordering::SeqCst);
         self.protocol.send(to, group, payload, options)
     }
+}
 
-    async fn recv(&self) -> io::Result<groupnet_runtime::messaging::Frame<Self::Receipt>> {
-        self.protocol.recv().await
+impl ReceiveBinding for CountingMessages {
+    type Handle = ReceiveHandle;
+
+    async fn recv_frame(&self, node: &Node) -> io::Result<Frame<Tagged>> {
+        Ok(tagged(self.protocol.recv_frame(node).await?))
     }
 
-    fn shutdown(&self) {
-        self.protocol.shutdown();
-    }
-
-    async fn closed(&self) {
-        self.protocol.closed().await;
+    fn on_frame<F, Fut>(&self, node: &Node, mut callback: F) -> io::Result<ReceiveHandle>
+    where
+        F: FnMut(Frame<Tagged>) -> Fut + Send + 'static,
+        Fut: Future<Output = io::Result<()>> + Send + 'static,
+    {
+        self.protocol
+            .on_frame(node, move |frame| callback(tagged(frame)))
     }
 }
 
@@ -547,7 +644,7 @@ struct CustomOrdered {
 
 #[derive(Clone, Debug)]
 struct CountingOrdered {
-    protocol: groupnet_streams::OrderedProtocol,
+    protocol: ManagedProtocol<OrderedProtocol>,
     connects: Arc<AtomicUsize>,
 }
 
@@ -567,7 +664,7 @@ impl PeerImplementation for CustomOrdered {
 }
 
 impl SessionProtocol for CountingOrdered {
-    type Session = groupnet_streams::TunneledStream;
+    type Session = TunneledStream;
     type ConnectOptions = ();
 
     fn connect(
@@ -636,5 +733,59 @@ async fn custom_binding_resolves_once_and_closed_node_prevents_eager_protocol_ca
         .is_err()
     );
     assert_eq!(bindings.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_message_binding_receives_its_own_receipts_through_the_node_inbox() -> io::Result<()>
+{
+    let node = Node::builder(NodeId::new("custom-receive")).start().await?;
+    let custom = node.endpoint(CustomMessages {
+        bindings: Arc::new(AtomicUsize::new(0)),
+        sends: Arc::new(AtomicUsize::new(0)),
+    })?;
+    let applied = node.peer(node.id().clone(), Messages::applied(WAIT))?;
+    let mut sent = Box::pin(applied.send(Bytes::from_static(b"tagged")));
+    let (context, payload) = tokio::time::timeout(WAIT, async {
+        tokio::select! {
+            result = &mut sent => panic!("applied before the custom receipt: {result:?}"),
+            frame = custom.recv() => frame,
+        }
+    })
+    .await??;
+    assert_eq!(payload.as_ref(), b"tagged");
+    assert_eq!(context.from, *node.id());
+    let Tagged(receipt) = context.receipt;
+    receipt.applied()?;
+    assert_eq!(tokio::time::timeout(WAIT, sent).await??, context.id);
+
+    // The custom callback owns the same single node inbox as every other receiver.
+    let (seen, mut frames) = tokio::sync::mpsc::unbounded_channel();
+    let handle = custom.on_frame(move |frame: Frame<Tagged>| {
+        let _ = seen.send(frame.payload);
+        async { Ok(()) }
+    })?;
+    assert_eq!(
+        node.recv().await.unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        node.endpoint(Messages::best_effort())?
+            .recv()
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    tokio::time::timeout(WAIT, applied.send(Bytes::from_static(b"callback"))).await??;
+    assert_eq!(
+        tokio::time::timeout(WAIT, frames.recv())
+            .await?
+            .expect("callback alive")
+            .as_ref(),
+        b"callback"
+    );
+    handle.close().await?;
+    node.close().await;
     Ok(())
 }

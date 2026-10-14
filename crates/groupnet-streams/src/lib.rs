@@ -5,6 +5,10 @@
 //! or unreliable delivery without imposing head-of-line ordering. Session
 //! protocols need not implement byte-oriented IO, and callers can implement
 //! [`SessionProtocol`] for their own concrete endpoints without boxing.
+//!
+//! The network, transport and buffer types this crate's signatures take
+//! ([`Router`], [`TunnelTransport`], [`TunneledStream`], [`QueueCapacity`],
+//! [`Bytes`]) are re-exported here.
 
 use std::{future::Future, io};
 
@@ -13,10 +17,14 @@ use groupnet_core::NodeId;
 mod ordered;
 pub mod unordered;
 
-pub use groupnet_network::tunnel::TunneledStream;
+pub use bytes::Bytes;
+pub use groupnet_network::Router;
+pub use groupnet_network::tunnel::{TunnelTransport, TunneledStream};
+pub use groupnet_transport::QueueCapacity;
 pub use ordered::OrderedProtocol;
 pub use unordered::{
-    UnorderedConfig, UnorderedDelivery, UnorderedOptions, UnorderedProtocol, UnorderedSession,
+    UnorderedConfig, UnorderedConfigError, UnorderedDelivery, UnorderedOptions, UnorderedProtocol,
+    UnorderedSession,
 };
 
 /// A statically dispatched protocol establishing sessions with logical peers.

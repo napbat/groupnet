@@ -1,6 +1,6 @@
 //! Configurations that resolve the node's cached concrete protocols once.
 
-use super::{Node, PeerImplementation};
+use super::{ManagedProtocol, Node, PeerImplementation};
 use groupnet_messaging::{Delivery, Messaging, SendOptions};
 use groupnet_streams::{OrderedProtocol, UnorderedDelivery, UnorderedOptions, UnorderedProtocol};
 use std::{io, time::Duration};
@@ -45,12 +45,12 @@ impl Messages {
 }
 
 impl PeerImplementation for Messages {
-    type Protocol = Messaging;
+    type Protocol = ManagedProtocol<Messaging>;
     type Options = SendOptions;
 
     fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
         let protocol = node.cached_messages();
-        protocol.validate_send(self.options, 0)?;
+        protocol.config().validate_send(self.options, 0)?;
         Ok((protocol, self.options))
     }
 }
@@ -68,17 +68,18 @@ impl Ordered {
 }
 
 impl PeerImplementation for Ordered {
-    type Protocol = OrderedProtocol;
+    type Protocol = ManagedProtocol<OrderedProtocol>;
     type Options = ();
 
     fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
-        Ok((node.cached_ordered()?, ()))
+        Ok((ManagedProtocol::new(node.cached_ordered()?), ()))
     }
 }
 
 /// Encrypted unordered messages with an explicit session delivery policy.
-/// Node-wide admission and capacity are configured separately with
-/// [`Node::configure_unordered`]. Neither policy guarantees ordered delivery.
+/// Node-wide admission and capacity are fixed when the node starts, with
+/// [`NodeBuilder::unordered`](crate::NodeBuilder::unordered). Neither policy
+/// guarantees ordered delivery.
 #[derive(Clone, Debug)]
 pub struct Unordered {
     options: UnorderedOptions,
@@ -108,12 +109,12 @@ impl Unordered {
 }
 
 impl PeerImplementation for Unordered {
-    type Protocol = UnorderedProtocol;
+    type Protocol = ManagedProtocol<UnorderedProtocol>;
     type Options = UnorderedOptions;
 
     fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
         let protocol = node.cached_unordered()?;
         protocol.validate_options(&self.options)?;
-        Ok((protocol, self.options))
+        Ok((ManagedProtocol::new(protocol), self.options))
     }
 }

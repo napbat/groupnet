@@ -12,12 +12,18 @@
 //!
 //! The [`codec`] module is pure sans-IO; this crate owns all acknowledgement,
 //! retry and duplicate state. The network router carries its packets opaquely.
+//!
+//! [`MessageProtocol`] is the send-side contract a handle may share. Receiving
+//! and shutdown belong to the engine owner ([`Messaging::recv`],
+//! [`Messaging::shutdown`]): a managed runtime keeps them for its dispatcher.
+//! The network and transport types this crate's signatures take ([`Router`],
+//! [`ProtocolIo`], [`ProtocolId`], [`QueueCapacity`]) are re-exported here.
 
 /// Sans-IO application message identities, receipt transitions and bounded codec.
 pub mod codec;
 
 mod config;
-pub use config::MessagingConfig;
+pub use config::{MessagingConfig, MessagingConfigError};
 mod received;
 mod worker;
 
@@ -25,7 +31,8 @@ mod worker;
 mod tests;
 
 use groupnet_core::{GroupId, NodeId};
-use groupnet_network::{ProtocolId, ProtocolIo, Router};
+pub use groupnet_network::{ProtocolId, ProtocolIo, Router};
+pub use groupnet_transport::QueueCapacity;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::HashMap,
@@ -46,16 +53,21 @@ pub use codec::{
     destination_valid,
 };
 
-/// Static-dispatch application messaging with protocol-specific delivery receipts.
+/// Static-dispatch application message sends with protocol-specific receipts.
 ///
-/// Implementations own a single shared inbox; cloning an endpoint must not create
-/// a competing dispatcher. Receipt semantics belong to the implementation.
+/// This is the send-side contract shared by handles: it names the router
+/// namespace, the send policy and the receipt type that receivers retain.
+/// Receiving and shutdown are owner operations of the concrete engine, so a
+/// shared handle can never compete with the engine's single receive owner or
+/// tear the engine down. Receipt semantics belong to the implementation.
 pub trait MessageProtocol: Send + Sync {
     /// Exclusive application namespace carried by the router.
     const ID: ProtocolId;
+
     /// Explicit protocol-specific send policy.
     type SendOptions: Send;
-    /// Owned receipt retained independently of payload ownership.
+
+    /// Owned receipt retained by received frames independently of payload ownership.
     type Receipt: Send;
 
     /// Sends owned bytes to a logical destination and optional group.
@@ -66,16 +78,8 @@ pub trait MessageProtocol: Send + Sync {
         payload: Bytes,
         options: Self::SendOptions,
     ) -> impl Future<Output = io::Result<MessageId>> + Send;
-
-    /// Receives the complete owned frame, including its receipt.
-    fn recv(&self) -> impl Future<Output = io::Result<Frame<Self::Receipt>>> + Send;
-
-    /// Initiates endpoint-local shutdown.
-    fn shutdown(&self);
-
-    /// Waits for shutdown and owned worker termination.
-    fn closed(&self) -> impl Future<Output = ()> + Send;
 }
+
 /// Delivery boundary and finite acknowledgement deadline.
 #[derive(Clone, Copy, Debug)]
 pub struct SendOptions {
@@ -549,7 +553,10 @@ impl Messaging {
         }
     }
 
-    /// Receives frames for runtime dispatch; receipt acceptance is explicit.
+    /// Receives frames for the engine's single receive owner; receipt
+    /// acceptance is explicit. Not part of [`MessageProtocol`]: a managed
+    /// runtime reserves this for its dispatcher.
+    ///
     /// # Errors
     /// Returns `NotConnected` after messaging/router cancellation.
     pub async fn recv(&self) -> io::Result<Frame> {
@@ -606,18 +613,6 @@ impl MessageProtocol for Messaging {
         options: SendOptions,
     ) -> io::Result<MessageId> {
         Self::send(self, to, group, payload, options).await
-    }
-
-    async fn recv(&self) -> io::Result<Frame> {
-        Self::recv(self).await
-    }
-
-    fn shutdown(&self) {
-        Self::shutdown(self);
-    }
-
-    async fn closed(&self) {
-        Self::closed(self).await;
     }
 }
 

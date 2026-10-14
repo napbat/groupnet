@@ -5,10 +5,11 @@ use std::{io, time::Duration};
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
 use groupnet_network::{
-    Router, RouterConfig,
-    tunnel::{PeerIdentity, TlsIdentity, TunnelTransport},
+    RouterConfig,
+    tunnel::{PeerIdentity, TlsIdentity},
 };
-use groupnet_streams::{OrderedProtocol, SessionProtocol, TunneledStream};
+// The network types this crate's signatures take come from its own re-exports.
+use groupnet_streams::{OrderedProtocol, Router, SessionProtocol, TunnelTransport, TunneledStream};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::{bulk::BulkTransport, link::LinkConfig};
 use groupnet_transport_mem::Network;

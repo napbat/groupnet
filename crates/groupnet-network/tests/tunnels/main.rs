@@ -1,6 +1,7 @@
 //! End-to-end TLS tunnels over real heterogeneous and deliberately impaired routers.
 
 mod budget;
+mod builder;
 mod failover;
 mod fixtures;
 mod native;

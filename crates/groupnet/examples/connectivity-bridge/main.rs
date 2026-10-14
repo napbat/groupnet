@@ -16,8 +16,7 @@ use groupnet::connectivity::{
 use groupnet::core::NodeId;
 use groupnet::network::TunnelConfig;
 use groupnet::network::tunnel::{PeerIdentity, TlsIdentity};
-use groupnet::runtime::Node;
-use groupnet::transport::bulk::BulkTransport;
+use groupnet::runtime::{Node, Ordered};
 use groupnet::transport::mem::{MemLink, Network};
 use groupnet::transport::tcp::TcpMsgTransport;
 use rcgen::{
@@ -170,8 +169,10 @@ async fn demonstrate(
 }
 
 async fn exchange(a: &Node, c: &Node, payload: &[u8]) -> io::Result<()> {
+    let outgoing = a.peer(c.router().local_id().clone(), Ordered::new())?;
+    let incoming = c.endpoint(Ordered::new())?;
     tokio::time::timeout(WAIT, async {
-        let (outgoing, incoming) = tokio::join!(a.connect(c.router().local_id()), c.accept());
+        let (outgoing, incoming) = tokio::join!(outgoing.connect(), incoming.accept());
         let mut outgoing = outgoing?;
         let (peer, mut incoming) = incoming?;
         if &peer != a.router().local_id() {

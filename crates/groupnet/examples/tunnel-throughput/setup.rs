@@ -6,7 +6,7 @@ use std::{fmt, io, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration
 
 use groupnet::core::NodeId;
 use groupnet::network::{
-    Network, NetworkConfig, RouterConfig, TunnelConfig,
+    Network, RouterConfig, TunnelConfig,
     tunnel::{PeerIdentity, SegmentSize, TlsIdentity, TunnelLimits},
 };
 use groupnet::transport::admission::OpenAdmission;
@@ -188,14 +188,14 @@ impl Tunnel {
         let mut networks = Vec::with_capacity(2);
         for (index, id) in ids.iter().enumerate() {
             networks.push(
-                NetworkConfig::default()
-                    .with_router(RouterConfig {
+                Network::builder()
+                    .routing(RouterConfig {
                         forwarding: false,
                         link_queue: frames,
                         ..RouterConfig::default()
                     })
-                    .with_link(links[index].clone().into_bound_link(1))
-                    .with_tunnels(credentials.tunnel(index, &limits)?)
+                    .link(links[index].clone().into_bound_link(1))
+                    .tunnels(credentials.tunnel(index, &limits)?)
                     .bind(id.clone())
                     .await?,
             );

@@ -24,7 +24,10 @@ mod discovery;
 mod messaging;
 mod protocols;
 pub use builder::NodeBuilder;
-pub use protocols::{Endpoint, Messages, Ordered, Peer, PeerImplementation, Unordered};
+pub use protocols::{
+    Endpoint, ManagedProtocol, Messages, Ordered, Peer, PeerImplementation, ReceiveBinding,
+    Unordered,
+};
 
 /// The reserved group every node joins to disseminate the inter-group routing
 /// table. Its metadata holds `owner:<resource>` and `coord:<group>` entries.
@@ -286,12 +289,9 @@ struct Inner {
     config: Config,
     messaging: crate::messaging::Hub,
     ordered: Mutex<Option<groupnet_streams::OrderedProtocol>>,
-    unordered: Mutex<
-        Option<(
-            groupnet_streams::UnorderedConfig,
-            Option<groupnet_streams::UnorderedProtocol>,
-        )>,
-    >,
+    /// Node-wide unordered policy, validated at start and fixed for the node's life.
+    unordered_config: groupnet_streams::UnorderedConfig,
+    unordered: Mutex<Option<groupnet_streams::UnorderedProtocol>>,
     /// Joined groups (handle + inbox). Holding the `Group` makes `join_group`
     /// idempotent: a repeat join returns the existing handle instead of
     /// spawning a second, orphaned actor for the same group.
@@ -545,8 +545,8 @@ impl Node {
         let (lead_tx, lead_rx) =
             watch::channel(Leadership::observed(epoch, host.cloned(), &self.inner.id));
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
-        let initial_members: Vec<NodeId> = engine.members().cloned().collect();
-        let (members_tx, members_rx) = watch::channel(Arc::new(initial_members));
+        let initial_members: Arc<[NodeId]> = engine.members().cloned().collect();
+        let (members_tx, members_rx) = watch::channel(initial_members);
         let (statuses_tx, statuses_rx) = watch::channel(statuses_snapshot(&engine));
         let (entries_tx, entries_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());

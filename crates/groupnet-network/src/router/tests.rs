@@ -1,5 +1,6 @@
 use super::*;
 use groupnet_testkit::cluster::eventually_within;
+use groupnet_transport::QueueCapacity;
 use groupnet_transport::link::{LinkFuture, LinkLifecycle};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -412,7 +413,7 @@ async fn owned_protocol_send_and_receive_preserve_headroom_allocation() -> io::R
 async fn configured_protocol_and_queue_capacities_replace_operational_constants() -> io::Result<()>
 {
     let config = RouterConfig {
-        max_protocols: 40,
+        max_protocols: std::num::NonZeroUsize::new(40).unwrap(),
         protocol_queue: QueueCapacity::of(2),
         max_frame: 70_000,
         ..RouterConfig::default()
@@ -445,59 +446,95 @@ async fn configured_protocol_and_queue_capacities_replace_operational_constants(
 }
 
 #[test]
-fn routing_policy_rejects_only_invalid_resource_or_wire_bounds() {
+fn routing_policy_rejects_each_invalid_wire_or_timer_bound_by_field() {
+    use std::num::NonZeroUsize;
     assert!(
         RouterConfig {
-            max_routes: 8192,
-            max_transports: 4097,
+            max_routes: NonZeroUsize::new(8192).unwrap(),
+            max_transports: NonZeroUsize::new(4097).unwrap(),
+            max_protocols: NonZeroUsize::new(65_536).unwrap(),
             ..RouterConfig::default()
         }
         .validate()
         .is_ok()
     );
-    assert!(
-        RouterConfig {
-            replay_capacity: 0,
-            ..RouterConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        RouterConfig {
-            max_hops: 256,
-            ..RouterConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        RouterConfig {
-            max_frame: wire::MAX_DATA_HEADER - 1,
-            ..RouterConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        RouterConfig {
-            reassembly: ReassemblyConfig {
-                max_fragments: 65_536,
-                ..ReassemblyConfig::default()
+    let cases = [
+        (
+            RouterConfig {
+                max_hops: 256,
+                ..RouterConfig::default()
             },
-            ..RouterConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        RouterConfig {
-            send_timeout: Duration::MAX,
-            ..RouterConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
+            RouterConfigError::MaxHopsOutOfRange,
+        ),
+        (
+            RouterConfig {
+                max_frame: wire::MAX_DATA_HEADER - 1,
+                ..RouterConfig::default()
+            },
+            RouterConfigError::MaxFrameOutOfRange,
+        ),
+        (
+            RouterConfig {
+                max_protocols: NonZeroUsize::new(65_537).unwrap(),
+                ..RouterConfig::default()
+            },
+            RouterConfigError::MaxProtocolsAboveIdSpace,
+        ),
+        (
+            RouterConfig {
+                reassembly: ReassemblyConfig {
+                    timeout: Duration::ZERO,
+                    ..ReassemblyConfig::default()
+                },
+                ..RouterConfig::default()
+            },
+            RouterConfigError::ZeroReassemblyTimeout,
+        ),
+        (
+            RouterConfig {
+                send_timeout: Duration::ZERO,
+                ..RouterConfig::default()
+            },
+            RouterConfigError::ZeroSendTimeout,
+        ),
+        (
+            RouterConfig {
+                announce_interval: Duration::ZERO,
+                ..RouterConfig::default()
+            },
+            RouterConfigError::ZeroAnnounceInterval,
+        ),
+        (
+            RouterConfig {
+                route_ttl: Duration::from_secs(1),
+                ..RouterConfig::default()
+            },
+            RouterConfigError::RouteTtlNotAboveAnnounceInterval,
+        ),
+        (
+            RouterConfig {
+                send_timeout: Duration::MAX,
+                ..RouterConfig::default()
+            },
+            RouterConfigError::UnrepresentableTimer {
+                field: "send_timeout",
+            },
+        ),
+    ];
+    for (config, expected) in cases {
+        assert_eq!(config.validate(), Err(expected));
+        let error = Router::new(NodeId::new("local"), config).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .into_inner()
+                .unwrap()
+                .downcast::<RouterConfigError>()
+                .ok()
+                .map(|e| *e),
+            Some(expected)
+        );
+    }
 }
 
 #[tokio::test]

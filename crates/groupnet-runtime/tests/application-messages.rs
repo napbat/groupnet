@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use groupnet_core::{GroupId, NodeId};
 use groupnet_messaging::Messaging;
-use groupnet_network::NetworkConfig;
+use groupnet_network::Network;
 use groupnet_runtime::messaging::{Bytes, DEFAULT_MAX_MESSAGE_BYTES, Delivery, SendOptions};
 use groupnet_runtime::{Group, Node};
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
@@ -360,8 +360,8 @@ async fn dispatcher_rejects_unjoined_groups_and_unknown_group_sources() {
         .await
         .unwrap();
     let group = receiver.join_group("joined");
-    let network = NetworkConfig::default()
-        .with_link(MemLink::new(net.endpoint(b), vec![a.clone()]))
+    let network = Network::builder()
+        .link(MemLink::new(net.endpoint(b), vec![a.clone()]))
         .bind(NodeId::new("b"))
         .await
         .unwrap();

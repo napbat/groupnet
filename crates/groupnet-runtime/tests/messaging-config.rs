@@ -1,18 +1,19 @@
 //! Managed message settings reach node/group queues and descriptor validation.
 
-use std::{io, time::Duration};
+use std::{io, num::NonZeroUsize, time::Duration};
 
 use groupnet_core::NodeId;
-use groupnet_network::RouterConfig;
-use groupnet_runtime::messaging::{Bytes, Delivery, MessagingConfig, SendOptions};
-use groupnet_runtime::{Messages, Node};
+use groupnet_runtime::messaging::{
+    Bytes, Delivery, MessagingConfig, MessagingConfigError, SendOptions,
+};
+use groupnet_runtime::{Messages, Node, RouterConfig};
 use groupnet_transport::QueueCapacity;
 
 #[tokio::test]
 async fn managed_configuration_controls_payload_deadlines_and_node_inbox() -> io::Result<()> {
     let id = NodeId::new("configured");
     let config = MessagingConfig {
-        max_payload: 70_000,
+        max_payload: NonZeroUsize::new(70_000).unwrap(),
         inbox_capacity: QueueCapacity::of(1),
         max_timeout: Duration::from_secs(90),
         dedup_retention: Duration::from_secs(91),
@@ -83,13 +84,20 @@ async fn managed_configuration_controls_payload_deadlines_and_node_inbox() -> io
 
 #[tokio::test]
 async fn managed_start_rejects_retention_that_cannot_cover_send_horizon() {
-    let result = Node::builder(NodeId::new("invalid"))
+    let error = Node::builder(NodeId::new("invalid"))
         .messaging(MessagingConfig {
             max_timeout: Duration::from_secs(90),
             dedup_retention: Duration::from_secs(90),
             ..MessagingConfig::default()
         })
         .start()
-        .await;
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<MessagingConfigError>()),
+        Some(&MessagingConfigError::RetentionNotAboveMaxTimeout)
+    );
 }

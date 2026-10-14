@@ -234,7 +234,7 @@ pub(super) async fn connect(
         .fill(&mut id)
         .map_err(|_| io::Error::other("session randomness unavailable"))?;
     let lease = reserve(inner, to.clone(), Some(id))?;
-    let maximum = inner.config.max_payload.min(
+    let maximum = inner.config.max_payload.get().min(
         inner
             .io
             .max_payload(to)
@@ -412,7 +412,7 @@ async fn receive_control(
     let id = request.identity.session;
     let remote_max = payload_bound(request.max_payload)?;
     let inner = owner.upgrade().ok_or_else(aborted)?;
-    let maximum = remote_max.min(inner.config.max_payload).min(
+    let maximum = remote_max.min(inner.config.max_payload.get()).min(
         inner
             .io
             .max_payload(&peer)
