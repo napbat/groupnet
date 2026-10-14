@@ -38,13 +38,13 @@ fn plane(net: &MemBulkNet, id: &str) -> DataPlane<MemBulkTransport> {
 }
 
 fn client(net: &MemBulkNet, id: &str) -> RpcClient<MemBulkTransport> {
-    RpcClient::new(plane(net, id), RpcConfig::default()).expect("default limits are valid")
+    RpcClient::new(plane(net, id))
 }
 
 #[tokio::test]
 async fn an_echo_round_trips() {
     let net = MemBulkNet::new();
-    let _server = RpcServer::spawn(
+    let _server = RpcServer::bind(
         plane(&net, "s"),
         |_from: NodeId, request: Bytes| async move { Ok::<_, RpcStatus>(request) },
     );
@@ -71,7 +71,7 @@ async fn concurrent_calls_from_several_clients_pair_with_their_answers() {
     const CALLS: usize = 100;
 
     let net = MemBulkNet::new();
-    let server = RpcServer::spawn(
+    let server = RpcServer::bind(
         plane(&net, "s"),
         |from: NodeId, request: Bytes| async move {
             let n: u64 = std::str::from_utf8(&request)
@@ -113,7 +113,7 @@ async fn concurrent_calls_from_several_clients_pair_with_their_answers() {
 #[tokio::test]
 async fn handler_errors_and_panics_are_answered_and_leave_the_connection_up() {
     let net = MemBulkNet::new();
-    let server = RpcServer::spawn(
+    let server = RpcServer::bind(
         plane(&net, "s"),
         |_from: NodeId, request: Bytes| async move {
             match &request[..] {
@@ -153,7 +153,7 @@ async fn frame_limits_refuse_oversize_requests_unsent_and_oversize_responses_rem
     const MAX_REQUEST: usize = LIMIT - 14;
 
     let net = MemBulkNet::new();
-    let server = RpcServer::spawn_with(
+    let server = RpcServer::bind_with(
         plane(&net, "s"),
         |_from: NodeId, request: Bytes| async move {
             if &request[..] == b"big" {
@@ -167,7 +167,7 @@ async fn frame_limits_refuse_oversize_requests_unsent_and_oversize_responses_rem
         },
     )
     .expect("valid limits");
-    let client = RpcClient::new(
+    let client = RpcClient::with_config(
         plane(&net, "c"),
         RpcConfig {
             max_frame_bytes: FrameLimit::new(LIMIT).unwrap(),
@@ -224,7 +224,7 @@ async fn a_connection_runs_at_most_its_concurrency_limit_of_handlers() {
             }
         }
     };
-    let _server = RpcServer::spawn_with(
+    let _server = RpcServer::bind_with(
         plane(&net, "s"),
         handler,
         RpcServerConfig {

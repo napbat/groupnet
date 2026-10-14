@@ -7,10 +7,8 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use groupnet::core::NodeId;
-use groupnet::rpc::{RpcClient, RpcConfig, RpcError, RpcServer, RpcServerHandle, RpcStatus};
-use groupnet::transport::bulk::DataPlane;
+use groupnet::rpc::{Bytes, DataPlane, RpcClient, RpcError, RpcServer, RpcServerHandle, RpcStatus};
 use groupnet::transport::tcp::TcpBulkTransport;
 use tokio::task::JoinSet;
 
@@ -23,7 +21,7 @@ async fn echo_server(id: &NodeId) -> (RpcServerHandle, std::net::SocketAddr) {
         .await
         .expect("bind server");
     let addr = transport.local_addr().expect("server addr");
-    let server = RpcServer::spawn(
+    let server = RpcServer::bind(
         DataPlane::new(transport),
         |_from: NodeId, request: Bytes| async move { Ok::<_, RpcStatus>(request) },
     );
@@ -43,7 +41,7 @@ async fn concurrent_large_calls_share_one_tcp_stream_and_survive_a_server_restar
     transport.register_peer(server_id.clone(), addr);
     // Keep a handle on the plane: its transport is where addresses are taught.
     let plane = DataPlane::new(transport);
-    let client = RpcClient::new(plane.clone(), RpcConfig::default()).expect("valid default limits");
+    let client = RpcClient::new(plane.clone());
 
     let mut calls = JoinSet::new();
     for n in 0..CALLS {

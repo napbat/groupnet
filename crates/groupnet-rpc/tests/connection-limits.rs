@@ -5,16 +5,16 @@
 //!   the next call reconnects;
 //! * a server closes a connection with no request and no handler for its idle
 //!   timeout, but never while a handler runs;
-//! * a server serves at most `max_connections` connections and admits the
-//!   next once one ends;
+//! * a bound server serves at most `max_connections` connections and admits
+//!   the next once one ends;
 //! * a client tracks at most `max_peers` destinations: an unused one is
 //!   evicted for a new one, and with every destination busy a new one is
 //!   refused `Saturated`, unsent;
-//! * invalid timers are refused when the client or server is built.
+//! * invalid timers are refused, by the field they violate, when the client
+//!   or server is built.
 //!
 //! All waiting is virtual time or a bounded poll (`eventually`).
 
-use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,7 +22,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_rpc::{
-    RpcClient, RpcConfig, RpcError, RpcServer, RpcServerConfig, RpcServerHandle, RpcStatus,
+    RpcClient, RpcConfig, RpcConfigError, RpcError, RpcServer, RpcServerConfig,
+    RpcServerConfigError, RpcServerHandle, RpcStatus,
 };
 use groupnet_testkit::cluster::eventually;
 use groupnet_transport::QueueCapacity;
@@ -45,7 +46,7 @@ fn plane(net: &MemBulkNet, id: &str) -> DataPlane<MemBulkTransport> {
 }
 
 fn client(net: &MemBulkNet, id: &str, config: RpcConfig) -> RpcClient<MemBulkTransport> {
-    RpcClient::new(plane(net, id), config).expect("valid client limits")
+    RpcClient::with_config(plane(net, id), config).expect("valid client limits")
 }
 
 /// Holds `b"block"` handlers until released, counting the ones started.
@@ -79,7 +80,7 @@ fn gated_echo(
     config: RpcServerConfig,
 ) -> RpcServerHandle {
     let gate = gate.clone();
-    RpcServer::spawn_with(
+    RpcServer::bind_with(
         plane(net, id),
         move |_from: NodeId, request: Bytes| {
             let gate = gate.clone();
@@ -258,7 +259,7 @@ async fn a_client_evicts_an_unused_destination_and_refuses_when_all_are_busy() {
 #[tokio::test]
 async fn invalid_timers_are_refused_when_built() {
     let net = MemBulkNet::new();
-    let error = RpcClient::new(
+    let error = RpcClient::with_config(
         plane(&net, "c"),
         RpcConfig {
             connect_timeout: Duration::ZERO,
@@ -266,15 +267,15 @@ async fn invalid_timers_are_refused_when_built() {
         },
     )
     .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    let error = RpcServer::spawn_with(
-        plane(&net, "s"),
-        |_from: NodeId, request: Bytes| async move { Ok::<_, RpcStatus>(request) },
-        RpcServerConfig {
-            idle_timeout: groupnet_rpc::MAX_TIMEOUT + Duration::from_millis(1),
-            ..RpcServerConfig::default()
-        },
-    )
-    .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(error, RpcConfigError::ZeroConnectTimeout);
+    let over = groupnet_rpc::MAX_TIMEOUT + Duration::from_millis(1);
+    let config = RpcServerConfig {
+        idle_timeout: over,
+        ..RpcServerConfig::default()
+    };
+    let echo = |_from: NodeId, request: Bytes| async move { Ok::<_, RpcStatus>(request) };
+    let error = RpcServer::bind_with(plane(&net, "s"), echo, config).unwrap_err();
+    assert_eq!(error, RpcServerConfigError::IdleTimeoutAboveMax(over));
+    let error = RpcServer::with_config(echo, config).unwrap_err();
+    assert_eq!(error, RpcServerConfigError::IdleTimeoutAboveMax(over));
 }

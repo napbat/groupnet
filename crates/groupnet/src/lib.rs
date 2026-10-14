@@ -143,12 +143,15 @@ pub use groupnet_streams::{
 
 /// Request/response RPC over the data plane: an
 /// [`RpcClient`](rpc::RpcClient) multiplexes concurrent calls onto one
-/// [`DataStream`](transport::bulk::DataStream) per peer (lazily connected,
-/// replaced after a failure), and an [`RpcServer`](rpc::RpcServer) answers
-/// them with an async handler, bounded per connection and by each request's
-/// deadline. The server **owns `accept`** of the plane it serves, so give it
-/// its own bulk transport unless nothing else accepts streams; peer addresses
-/// are registered on the transport by the caller *(feature `rpc`)*.
+/// [`DataStream`](rpc::DataStream) per peer (lazily connected, replaced after
+/// a failure), and an [`RpcServer`](rpc::RpcServer) answers them with an
+/// async handler, bounded per connection and by each request's deadline.
+/// The server composes with other stream consumers: the application owns
+/// `accept` and hands each RPC stream to
+/// [`RpcServer::serve`](rpc::RpcServer::serve), or
+/// [`RpcServer::bind`](rpc::RpcServer::bind) runs the accept loop of a plane
+/// that carries only RPC. Peer addresses are registered on the transport by
+/// the caller *(feature `rpc`)*.
 #[cfg(feature = "rpc")]
 pub use groupnet_rpc as rpc;
 
