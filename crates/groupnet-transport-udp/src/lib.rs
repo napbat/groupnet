@@ -41,6 +41,7 @@
 //! [`Transport`]: groupnet_transport::Transport
 
 //! [`NodeId`]: groupnet_core::NodeId
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod udp;
 

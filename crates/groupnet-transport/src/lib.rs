@@ -59,6 +59,7 @@
 //! boxing.
 //!
 //! [`GroupEngine`]: groupnet_core::GroupEngine
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use bytes::Bytes;
 

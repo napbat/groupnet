@@ -33,3 +33,8 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time",
 
 [lints]
 workspace = true
+
+# Render every optional API with per-item feature badges.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

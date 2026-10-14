@@ -45,6 +45,7 @@
 //! enforces.
 //!
 //! [`Transport`]: groupnet_transport::Transport
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(any(feature = "bulk", feature = "msg"))]
 mod handshake;

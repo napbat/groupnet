@@ -31,6 +31,7 @@
 //! ```
 //!
 //! [`Transport`]: groupnet_transport::Transport
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "bulk")]
 pub mod bulk;

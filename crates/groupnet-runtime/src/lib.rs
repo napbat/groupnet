@@ -64,6 +64,7 @@
 //! [`groupnet-core`]: groupnet_core
 //! [`groupnet-messaging`]: groupnet_messaging
 //! [`groupnet-sim`]: https://docs.rs/groupnet-sim
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod anchor;
 mod capability;

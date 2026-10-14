@@ -19,6 +19,7 @@
 //! types this crate's signatures take ([`LinkProvider`], [`BoundLink`],
 //! [`LinkConfig`]) and the [`QueueCapacity`] bound are re-exported here. The
 //! sans-IO coordination core remains dependency-free.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod config;
 mod router;

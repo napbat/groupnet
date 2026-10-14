@@ -37,3 +37,8 @@ tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true
+
+# Render every optional API with per-item feature badges.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
