@@ -209,7 +209,7 @@ mod tasks;
 mod wire;
 
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use groupnet_core::NodeId;
 
@@ -465,15 +465,6 @@ impl CoherenceOutcome {
     pub fn is_coherent(&self) -> bool {
         !matches!(self, CoherenceOutcome::TimedOut { .. })
     }
-}
-
-/// The wall clock as a lease epoch, mirroring
-/// [`WriteFeed`](crate::WriteFeed): strictly increasing across restarts unless
-/// the clock steps backwards.
-fn wall_clock_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

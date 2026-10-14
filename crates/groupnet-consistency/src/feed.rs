@@ -156,10 +156,11 @@ impl Ring {
     }
 }
 
-/// The wall clock as a feed epoch: strictly increasing across restarts
-/// unless the clock steps backwards (prefer [`WriteFeed::with_epoch`] with a
-/// durable counter when that matters).
-fn wall_clock_epoch() -> u64 {
+/// The wall clock as an epoch for a feed or a lease set: strictly increasing
+/// across restarts unless the clock steps backwards (prefer an explicit durable
+/// counter — [`WriteFeed::with_epoch`], `LeasesBuilder::epoch` — when that
+/// matters).
+pub(crate) fn wall_clock_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))

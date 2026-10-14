@@ -96,7 +96,8 @@ use super::wire::{
     GrantMap, RenewalId, decode_grants, decode_renewal, encode_grants, encode_renewal,
     grant_entry_key, renewal_entry_key,
 };
-use super::{CAP_LEASE, LeaseConfig, LeaseConfigError, LeaseState, wall_clock_epoch};
+use super::{CAP_LEASE, LeaseConfig, LeaseConfigError, LeaseState};
+use crate::feed::wall_clock_epoch;
 
 mod writes;
 
