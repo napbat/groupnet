@@ -343,7 +343,7 @@ where
         manager: &Manager<S, A, M>,
         deadline: Instant,
     ) -> Option<OwnedSemaphorePermit> {
-        let count = u32::try_from(manager.limits.core.max_batch_bytes).ok()?;
+        let count = u32::try_from(manager.limits.core.max_batch_bytes.get()).ok()?;
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             Arc::clone(&manager.bytes).acquire_many_owned(count),
@@ -537,8 +537,8 @@ where
             return self.step(Event::Failed { op });
         };
         let limit = TailLimit {
-            events: self.manager.limits.core.max_batch_events,
-            bytes: self.manager.limits.core.max_batch_bytes,
+            events: self.manager.limits.core.max_batch_events.get(),
+            bytes: self.manager.limits.core.max_batch_bytes.get(),
         };
         self.tail_request_started = Some(Instant::now());
         self.tail_authority_epoch = self.shared.authority_epoch.load(Ordering::Acquire);

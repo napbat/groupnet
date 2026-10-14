@@ -1,13 +1,16 @@
 //! Validated client and server limits: frame bounds, queue capacities,
 //! destination/connection admission and idle eviction timers.
 
-use std::io;
+mod error;
+
 use std::time::Duration;
 
 use groupnet_transport::QueueCapacity;
 use groupnet_transport::framing::MAX_FRAME_BYTES;
 
 use crate::codec::REQUEST_HEAD;
+
+pub use error::{FrameLimitError, RpcConfigError, RpcServerConfigError};
 
 /// The longest timer the RPC layer represents. A request's deadline travels
 /// as `u32` milliseconds (~49.7 days): a call's timeout is clamped to it, and
@@ -24,19 +27,25 @@ pub struct FrameLimit(usize);
 impl FrameLimit {
     /// The smallest limit: a request head with an empty payload.
     pub const MIN: Self = Self(REQUEST_HEAD);
+
     /// The data plane's frame ceiling.
     pub const MAX: Self = Self(MAX_FRAME_BYTES);
+
     /// The default on both sides: 16 MiB.
     pub const DEFAULT: Self = Self(16 << 20);
 
-    /// Validates a limit, returning `None` outside
-    /// [`MIN`](Self::MIN)`..=`[`MAX`](Self::MAX).
-    #[must_use]
-    pub const fn new(bytes: usize) -> Option<Self> {
-        if bytes < Self::MIN.0 || bytes > Self::MAX.0 {
-            None
+    /// Validates a limit of `bytes`.
+    ///
+    /// # Errors
+    /// [`FrameLimitError::BelowMin`] under [`MIN`](Self::MIN),
+    /// [`FrameLimitError::AboveMax`] over [`MAX`](Self::MAX).
+    pub const fn new(bytes: usize) -> Result<Self, FrameLimitError> {
+        if bytes < Self::MIN.0 {
+            Err(FrameLimitError::BelowMin(bytes))
+        } else if bytes > Self::MAX.0 {
+            Err(FrameLimitError::AboveMax(bytes))
         } else {
-            Some(Self(bytes))
+            Ok(Self(bytes))
         }
     }
 
@@ -60,25 +69,19 @@ impl Default for FrameLimit {
 }
 
 impl TryFrom<usize> for FrameLimit {
-    type Error = io::Error;
+    type Error = FrameLimitError;
 
+    /// [`FrameLimit::new`] as a conversion.
+    ///
     /// # Errors
-    /// Returns `InvalidInput` outside [`FrameLimit::MIN`]`..=`[`FrameLimit::MAX`].
-    fn try_from(bytes: usize) -> io::Result<Self> {
-        Self::new(bytes).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "rpc frame limit must be within {}..={}, got {bytes}",
-                    Self::MIN.0,
-                    Self::MAX.0
-                ),
-            )
-        })
+    /// As [`FrameLimit::new`].
+    fn try_from(bytes: usize) -> Result<Self, FrameLimitError> {
+        Self::new(bytes)
     }
 }
 
-/// Client limits, validated once by [`RpcClient::new`](crate::RpcClient::new).
+/// Client limits, validated once by
+/// [`RpcClient::with_config`](crate::RpcClient::with_config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RpcConfig {
     /// How long opening a connection to a peer may take before the call
@@ -124,15 +127,28 @@ impl RpcConfig {
     /// Checks the timers; frame and queue bounds are valid by construction.
     ///
     /// # Errors
-    /// `InvalidInput` for a zero timer or one above [`MAX_TIMEOUT`].
-    pub fn validate(&self) -> io::Result<()> {
-        timer("connect_timeout", self.connect_timeout)?;
-        timer("idle_timeout", self.idle_timeout)
+    /// The first violated rule, naming its field: a zero timer or one above
+    /// [`MAX_TIMEOUT`].
+    pub fn validate(&self) -> Result<(), RpcConfigError> {
+        if self.connect_timeout.is_zero() {
+            return Err(RpcConfigError::ZeroConnectTimeout);
+        }
+        if self.connect_timeout > MAX_TIMEOUT {
+            return Err(RpcConfigError::ConnectTimeoutAboveMax(self.connect_timeout));
+        }
+        if self.idle_timeout.is_zero() {
+            return Err(RpcConfigError::ZeroIdleTimeout);
+        }
+        if self.idle_timeout > MAX_TIMEOUT {
+            return Err(RpcConfigError::IdleTimeoutAboveMax(self.idle_timeout));
+        }
+        Ok(())
     }
 }
 
 /// Server limits, validated once by
-/// [`RpcServer::spawn_with`](crate::RpcServer::spawn_with).
+/// [`RpcServer::with_config`](crate::RpcServer::with_config) (or
+/// [`RpcServer::bind_with`](crate::RpcServer::bind_with), which builds on it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RpcServerConfig {
     /// The largest RPC frame (head included) this server accepts or sends.
@@ -141,8 +157,11 @@ pub struct RpcServerConfig {
     /// Handlers run concurrently for one connection; at the limit the server
     /// stops reading that connection until one finishes.
     pub max_concurrent_per_connection: QueueCapacity,
-    /// Connections served at once across all peers; at the limit the server
-    /// stops accepting until one ends (idle eviction ends unused ones).
+    /// Connections served at once across all peers. At the limit
+    /// [`RpcServer::serve`](crate::RpcServer::serve) refuses a connection
+    /// ([`RpcServeError::AtCapacity`](crate::RpcServeError::AtCapacity)) and
+    /// [`RpcServer::reserve`](crate::RpcServer::reserve) waits until one
+    /// ends (idle eviction ends unused ones).
     pub max_connections: QueueCapacity,
     /// How long a connection with no request read and no handler running
     /// stays open; answers already produced are written before it closes.
@@ -169,21 +188,17 @@ impl RpcServerConfig {
     /// construction.
     ///
     /// # Errors
-    /// `InvalidInput` for a zero idle timeout or one above [`MAX_TIMEOUT`].
-    pub fn validate(&self) -> io::Result<()> {
-        timer("idle_timeout", self.idle_timeout)
+    /// [`RpcServerConfigError::ZeroIdleTimeout`] or
+    /// [`RpcServerConfigError::IdleTimeoutAboveMax`].
+    pub fn validate(&self) -> Result<(), RpcServerConfigError> {
+        if self.idle_timeout.is_zero() {
+            return Err(RpcServerConfigError::ZeroIdleTimeout);
+        }
+        if self.idle_timeout > MAX_TIMEOUT {
+            return Err(RpcServerConfigError::IdleTimeoutAboveMax(self.idle_timeout));
+        }
+        Ok(())
     }
-}
-
-/// A configured timer must be nonzero and representable as a wire deadline.
-fn timer(name: &str, value: Duration) -> io::Result<()> {
-    if value.is_zero() || value > MAX_TIMEOUT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("rpc {name} must be within (0, {MAX_TIMEOUT:?}], got {value:?}"),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -192,48 +207,84 @@ mod tests {
 
     #[test]
     fn frame_limits_span_the_longest_head_to_the_data_plane_ceiling() {
-        assert_eq!(FrameLimit::new(REQUEST_HEAD - 1), None);
-        assert_eq!(FrameLimit::new(MAX_FRAME_BYTES + 1), None);
-        assert_eq!(FrameLimit::new(REQUEST_HEAD), Some(FrameLimit::MIN));
-        assert_eq!(FrameLimit::new(MAX_FRAME_BYTES), Some(FrameLimit::MAX));
+        assert_eq!(
+            FrameLimit::new(REQUEST_HEAD - 1),
+            Err(FrameLimitError::BelowMin(REQUEST_HEAD - 1))
+        );
+        assert_eq!(
+            FrameLimit::new(MAX_FRAME_BYTES + 1),
+            Err(FrameLimitError::AboveMax(MAX_FRAME_BYTES + 1))
+        );
+        assert_eq!(FrameLimit::new(REQUEST_HEAD), Ok(FrameLimit::MIN));
+        assert_eq!(FrameLimit::new(MAX_FRAME_BYTES), Ok(FrameLimit::MAX));
         assert_eq!(FrameLimit::default().get(), 16 << 20);
         assert_eq!(FrameLimit::MIN.body(REQUEST_HEAD), 0);
-        assert_eq!(
-            FrameLimit::try_from(0).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
+        assert_eq!(FrameLimit::try_from(0), Err(FrameLimitError::BelowMin(0)));
     }
 
     #[test]
-    fn timers_must_be_nonzero_and_wire_representable() {
+    fn each_client_timer_rule_is_rejected_by_name() {
         RpcConfig::default().validate().unwrap();
-        RpcServerConfig::default().validate().unwrap();
-        for bad in [Duration::ZERO, MAX_TIMEOUT + Duration::from_nanos(1)] {
-            for config in [
+        let over = MAX_TIMEOUT + Duration::from_nanos(1);
+        let cases = [
+            (
                 RpcConfig {
-                    connect_timeout: bad,
+                    connect_timeout: Duration::ZERO,
                     ..RpcConfig::default()
                 },
+                RpcConfigError::ZeroConnectTimeout,
+            ),
+            (
                 RpcConfig {
-                    idle_timeout: bad,
+                    connect_timeout: over,
                     ..RpcConfig::default()
                 },
-            ] {
-                assert_eq!(
-                    config.validate().unwrap_err().kind(),
-                    io::ErrorKind::InvalidInput
-                );
-            }
-            let server = RpcServerConfig {
-                idle_timeout: bad,
-                ..RpcServerConfig::default()
-            };
-            assert!(server.validate().is_err());
+                RpcConfigError::ConnectTimeoutAboveMax(over),
+            ),
+            (
+                RpcConfig {
+                    idle_timeout: Duration::ZERO,
+                    ..RpcConfig::default()
+                },
+                RpcConfigError::ZeroIdleTimeout,
+            ),
+            (
+                RpcConfig {
+                    idle_timeout: over,
+                    ..RpcConfig::default()
+                },
+                RpcConfigError::IdleTimeoutAboveMax(over),
+            ),
+        ];
+        for (config, expected) in cases {
+            assert_eq!(config.validate(), Err(expected));
         }
         RpcConfig {
             connect_timeout: MAX_TIMEOUT,
             idle_timeout: MAX_TIMEOUT,
             ..RpcConfig::default()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn each_server_timer_rule_is_rejected_by_name() {
+        RpcServerConfig::default().validate().unwrap();
+        let over = MAX_TIMEOUT + Duration::from_nanos(1);
+        for (idle_timeout, expected) in [
+            (Duration::ZERO, RpcServerConfigError::ZeroIdleTimeout),
+            (over, RpcServerConfigError::IdleTimeoutAboveMax(over)),
+        ] {
+            let config = RpcServerConfig {
+                idle_timeout,
+                ..RpcServerConfig::default()
+            };
+            assert_eq!(config.validate(), Err(expected));
+        }
+        RpcServerConfig {
+            idle_timeout: MAX_TIMEOUT,
+            ..RpcServerConfig::default()
         }
         .validate()
         .unwrap();

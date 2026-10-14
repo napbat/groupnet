@@ -10,10 +10,6 @@ use super::effect::Effect;
 use super::state::GroupEngine;
 
 impl GroupEngine {
-    pub(super) fn anti_entropy_interval(&self) -> u64 {
-        self.config.anti_entropy_interval_ms.max(1)
-    }
-
     /// Brings the next anti-entropy round forward to now, so a fresh membership
     /// change or local write disseminates on the next tick rather than waiting a
     /// whole interval — restoring the "state change rides the next frame"
@@ -67,7 +63,7 @@ impl GroupEngine {
             // changed since the last digest built for this peer. The cursor
             // advances on build, not delivery: anything a dropped frame loses
             // stays divergent only until this peer's next full digest.
-            let every = self.config.full_digest_every.max(1);
+            let every = self.config.full_digest_every.get();
             let visit = self.digest_visits.entry(to.clone()).or_insert(0);
             let full = (*visit).is_multiple_of(every);
             *visit += 1;
@@ -95,7 +91,7 @@ impl GroupEngine {
         effects
     }
 
-    /// Picks `anti_entropy_fanout` distinct peers, rotating a cursor so every
+    /// Picks `gossip_fanout` distinct peers, rotating a cursor so every
     /// peer is covered over successive rounds.
     pub(super) fn select_fanout_targets(&mut self) -> Vec<NodeId> {
         let candidates = self.dissemination_targets();
@@ -103,7 +99,7 @@ impl GroupEngine {
         if n == 0 {
             return Vec::new();
         }
-        let k = self.config.anti_entropy_fanout.max(1).min(n);
+        let k = self.config.gossip_fanout.get().min(n);
         let mut out = Vec::with_capacity(k);
         for i in 0..k {
             out.push(candidates[(self.gossip_cursor + i) % n].clone());
@@ -124,7 +120,7 @@ impl GroupEngine {
         now: Time,
         since: Option<u64>,
     ) -> (Vec<Vec<u8>>, usize) {
-        let budget = self.config.max_delta_frame_bytes;
+        let budget = self.config.max_delta_frame_bytes.get();
         let summaries: Vec<wire::NodeDigest> = self
             .members
             .iter()
@@ -269,7 +265,7 @@ impl GroupEngine {
     }
 
     pub(super) fn send_delta_request(&mut self, to: NodeId, wants: Vec<wire::NodeWant>) -> Effect {
-        let budget = self.config.max_delta_frame_bytes;
+        let budget = self.config.max_delta_frame_bytes.get();
         let base = 1 + 1 + (4 + self.group.as_str().len()) + 1 + 4;
         let mut size = base;
         let mut kept: Vec<wire::NodeWant> = Vec::new();
@@ -303,7 +299,7 @@ impl GroupEngine {
     /// requester is still included so the recipient can advance past a reaped
     /// tail. Returns `None` when there is nothing to send.
     pub(super) fn build_delta_frame(&self, wants: &[(NodeId, u64)], now: Time) -> Option<Vec<u8>> {
-        let budget = self.config.max_delta_frame_bytes;
+        let budget = self.config.max_delta_frame_bytes.get();
         let mut size = wire::delta_frame_overhead(&self.group);
         let mut members: Vec<wire::MemberDelta> = Vec::new();
 

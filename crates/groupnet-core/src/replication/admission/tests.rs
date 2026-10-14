@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use crate::Time;
 use crate::replication::{
     BoundComparison, Comparison, Coverage, Cursor, ProofId, Scope, SourceHistory, SourceProof,
@@ -5,8 +7,8 @@ use crate::replication::{
 };
 
 use super::{
-    AckReceipt, AdmissionId, AdmissionPolicy, AdmissionRef, ReaderCore, ReaderError, RecordBinding,
-    RosterEntry, RosterReceipt, SourceReceipt, WriterCore, WriterError,
+    AckReceipt, AdmissionId, AdmissionPolicy, AdmissionRef, PolicyError, ReaderCore, ReaderError,
+    RecordBinding, RosterEntry, RosterReceipt, SourceReceipt, WriterCore, WriterError,
 };
 
 fn scope() -> Scope {
@@ -31,8 +33,8 @@ fn policy() -> AdmissionPolicy {
         rate_numerator: 11,
         rate_denominator: 10,
         clock_margin_ms: 1,
-        max_waiters: 4,
-        max_cursor_bytes: 64,
+        max_waiters: NonZeroUsize::new(4).unwrap(),
+        max_cursor_bytes: NonZeroUsize::new(64).unwrap(),
     }
 }
 
@@ -275,7 +277,7 @@ fn writer_requires_exact_acks_or_conservative_global_wait() {
 #[test]
 fn roster_overflow_and_mismatched_policy_fail_closed() {
     let mut p = policy();
-    p.max_waiters = 1;
+    p.max_waiters = NonZeroUsize::MIN;
     let mut writer = WriterCore::new(scope(), p, 9, "op".into()).unwrap();
     let append = writer.begin(Time(0)).unwrap();
     writer
@@ -302,12 +304,59 @@ fn policy_rejects_rate_overflow_instead_of_wrapping() {
     p.max_duration_ms = u64::MAX;
     p.rate_numerator = u64::MAX;
     p.rate_denominator = 1;
-    assert!(p.validate().is_err());
+    assert_eq!(p.validate(), Err(PolicyError::Overflow));
     let mut zero = policy();
     zero.rate_denominator = 0;
-    assert!(zero.expiry_wait_ms().is_err());
+    assert_eq!(zero.expiry_wait_ms(), Err(PolicyError::ZeroRateDenominator));
     let mut exact_rates = policy();
     exact_rates.rate_numerator = 1;
     exact_rates.rate_denominator = 1;
     assert_eq!(exact_rates.expiry_wait_ms().unwrap(), 101);
+}
+
+#[test]
+fn policy_validate_names_each_identity_and_cap_rule() {
+    assert_eq!(policy().validate(), Ok(()));
+    let mut p = policy();
+    p.history.source.clear();
+    assert_eq!(p.validate(), Err(PolicyError::EmptyHistorySource));
+    let mut p = policy();
+    p.history.source = "x".repeat(65);
+    assert_eq!(p.validate(), Err(PolicyError::HistorySourceTooLarge));
+    let mut p = policy();
+    p.fingerprint.clear();
+    assert_eq!(p.validate(), Err(PolicyError::EmptyFingerprint));
+    let mut p = policy();
+    p.fingerprint = vec![1; 257];
+    assert_eq!(p.validate(), Err(PolicyError::FingerprintTooLarge));
+    let mut p = policy();
+    p.max_waiters = NonZeroUsize::new(4097).unwrap();
+    assert_eq!(p.validate(), Err(PolicyError::TooManyWaiters));
+    let mut p = policy();
+    p.max_cursor_bytes = NonZeroUsize::new(4097).unwrap();
+    assert_eq!(p.validate(), Err(PolicyError::CursorBytesTooLarge));
+}
+
+#[test]
+fn reader_and_writer_expose_policy_cause() {
+    let mut p = policy();
+    p.fingerprint.clear();
+    let error = ReaderCore::new(scope(), p.clone(), "r".into(), 1).unwrap_err();
+    assert_eq!(error, ReaderError::Policy(PolicyError::EmptyFingerprint));
+    assert_eq!(
+        std::error::Error::source(&error).map(ToString::to_string),
+        Some("admission policy fingerprint must be nonempty".to_owned())
+    );
+    assert_eq!(error.to_string(), "invalid admission policy");
+    let error = WriterCore::new(scope(), p, 1, "op".into()).unwrap_err();
+    assert_eq!(error, WriterError::Policy(PolicyError::EmptyFingerprint));
+    assert!(std::error::Error::source(&error).is_some());
+    assert_eq!(
+        ReaderCore::new(scope(), policy(), String::new(), 1).unwrap_err(),
+        ReaderError::Identity
+    );
+    assert_eq!(
+        WriterCore::new(scope(), policy(), 0, "op".into()).unwrap_err(),
+        WriterError::Identity
+    );
 }

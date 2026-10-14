@@ -63,9 +63,8 @@ async fn effective_config_and_alive_duration_are_readable_from_a_group() {
             Config::default().gossip_interval_ms,
             "the fixture is only meaningful if the override differs from the default"
         );
-        // The knob sets the anti-entropy cadence in step, and the detector
-        // timings are untouched — so the window is computable from here.
-        assert_eq!(cfg.anti_entropy_interval_ms, OVERRIDDEN_GOSSIP_MS);
+        // The detector timings are untouched — so the window is computable
+        // from here.
         assert_eq!(
             cfg.detection_window_ms(3),
             2 * (cfg.probe_interval_ms + 2 * cfg.probe_timeout_ms) + cfg.suspect_timeout_ms
@@ -275,7 +274,6 @@ async fn a_reaped_tombstone_stops_reporting_a_duration() {
 fn detector_config(dead_timeout_ms: u64) -> Config {
     Config {
         gossip_interval_ms: 20,
-        anti_entropy_interval_ms: 20,
         probe_interval_ms: 20,
         probe_timeout_ms: 20,
         suspect_timeout_ms: 60,

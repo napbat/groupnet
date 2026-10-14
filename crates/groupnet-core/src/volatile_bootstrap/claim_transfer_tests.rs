@@ -1,5 +1,7 @@
 //! Composite claim and child-transfer correlation tests.
 
+use std::num::{NonZeroU32, NonZeroUsize};
+
 use super::journal::{
     AttachToken, BarrierReceipt, CaptureId, JournalCursor, NativeCut, ReservationId,
 };
@@ -13,9 +15,9 @@ use crate::{NodeId, Status, Time, placement};
 
 fn config() -> BootstrapConfig {
     BootstrapConfig {
-        max_members: 2,
-        max_member_bytes: 16,
-        max_scope_bytes: 32,
+        max_members: NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: NonZeroUsize::new(16).unwrap(),
+        max_scope_bytes: NonZeroUsize::new(32).unwrap(),
         settle_ms: 3,
         renew_ms: 4,
         claim_ttl_ms: 12,
@@ -27,18 +29,18 @@ fn config() -> BootstrapConfig {
 
 fn transfer_config() -> TransferConfig {
     TransferConfig {
-        expected_schema: 1,
-        max_metadata_bytes: 128,
-        max_encoded_bytes: 16,
-        max_decoded_bytes: 16,
-        max_chunk_bytes: 8,
-        max_chunks: 4,
-        max_batch_bytes: 16,
-        max_batch_events: 4,
-        max_replay_events: 8,
-        max_native_buffer_bytes: 16,
-        max_members: 2,
-        max_cuts: 2,
+        expected_schema: NonZeroU32::MIN,
+        max_metadata_bytes: NonZeroUsize::new(128).unwrap(),
+        max_encoded_bytes: NonZeroUsize::new(16).unwrap(),
+        max_decoded_bytes: NonZeroUsize::new(16).unwrap(),
+        max_chunk_bytes: NonZeroUsize::new(8).unwrap(),
+        max_chunks: NonZeroUsize::new(4).unwrap(),
+        max_batch_bytes: NonZeroUsize::new(16).unwrap(),
+        max_batch_events: NonZeroUsize::new(4).unwrap(),
+        max_replay_events: NonZeroUsize::new(8).unwrap(),
+        max_native_buffer_bytes: NonZeroUsize::new(16).unwrap(),
+        max_members: NonZeroUsize::new(2).unwrap(),
+        max_cuts: NonZeroUsize::new(2).unwrap(),
         coverage_poll_ms: 2,
     }
 }

@@ -73,10 +73,10 @@ fn comparison(a: u8, b: u8) -> BoundComparison {
 fn policy() -> RetentionPolicy {
     RetentionPolicy {
         fingerprint: vec![7],
-        max_bytes: 1024,
-        max_events: 100,
+        max_bytes: std::num::NonZeroU64::new(1024).unwrap(),
+        max_events: std::num::NonZeroU64::new(100).unwrap(),
         max_age_ms: 1000,
-        max_lag_events: 100,
+        max_lag_events: std::num::NonZeroU64::new(100).unwrap(),
     }
 }
 
@@ -152,7 +152,7 @@ impl Model {
         let config = Config {
             tail_check_ms: 4,
             retry_ms: 2,
-            max_retries: 100,
+            max_retries: std::num::NonZeroU32::new(100).unwrap(),
             attempt_timeout_ms: 12,
             ..Config::default()
         };

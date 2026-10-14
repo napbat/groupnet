@@ -21,7 +21,13 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 zerocopy = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
-groupnet-transport-mem = { workspace = true, features = ["bulk"] }
+groupnet-transport-mem = { workspace = true, features = ["bulk", "link"] }
+# `shared-node-plane` serves RPC over a runtime `Node`'s tunnel streams next
+# to another consumer: a routed in-memory network with pinned TLS tunnels,
+# whose certificates are generated locally.
+groupnet-runtime = { workspace = true }
+groupnet-network = { workspace = true }
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
 # Path-only and publish = false: cargo strips path-only dev-deps at publish,
 # so this never enters the published dependency graph. Do NOT add `version`.

@@ -11,6 +11,7 @@
 //! of attempts before the test fails.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use groupnet_core::{GroupId, NodeId};
@@ -87,8 +88,7 @@ pub async fn converged_within(groups: &[&Group], timeout: Duration) {
 pub struct NodeOpts {
     group: GroupId,
     gossip_interval_ms: Option<u64>,
-    anti_entropy_interval_ms: Option<u64>,
-    max_delta_frame_bytes: Option<usize>,
+    max_delta_frame_bytes: Option<NonZeroUsize>,
     advertise_addr: Option<String>,
     group_profile: Option<GroupProfile>,
 }
@@ -100,35 +100,25 @@ impl NodeOpts {
         Self {
             group: group.into(),
             gossip_interval_ms: None,
-            anti_entropy_interval_ms: None,
             max_delta_frame_bytes: None,
             advertise_addr: None,
             group_profile: None,
         }
     }
 
-    /// Overrides the gossip interval — see
+    /// Overrides the gossip round's cadence — see
     /// [`NodeBuilder::gossip_interval_ms`](groupnet_runtime::NodeBuilder::gossip_interval_ms).
+    /// The fixture also paces the router's route announcements on it.
     #[must_use]
     pub fn gossip_interval_ms(mut self, ms: u64) -> Self {
         self.gossip_interval_ms = Some(ms);
         self
     }
 
-    /// Overrides just the anti-entropy cadence — see
-    /// [`NodeBuilder::anti_entropy_interval_ms`](groupnet_runtime::NodeBuilder::anti_entropy_interval_ms).
-    /// Applied after the gossip interval (which sets both), whatever order the
-    /// two are set here.
-    #[must_use]
-    pub fn anti_entropy_interval_ms(mut self, ms: u64) -> Self {
-        self.anti_entropy_interval_ms = Some(ms);
-        self
-    }
-
     /// Overrides the maximum encoded gossip frame size — see
     /// [`NodeBuilder::max_delta_frame_bytes`](groupnet_runtime::NodeBuilder::max_delta_frame_bytes).
     #[must_use]
-    pub fn max_delta_frame_bytes(mut self, bytes: usize) -> Self {
+    pub fn max_delta_frame_bytes(mut self, bytes: NonZeroUsize) -> Self {
         self.max_delta_frame_bytes = Some(bytes);
         self
     }
@@ -203,8 +193,7 @@ fn join(node: &Node, opts: &NodeOpts) -> Group {
 }
 
 /// The one place a `Node` is actually built, so every fixture applies the same
-/// knobs in the same order (`anti_entropy_interval_ms` must land *after*
-/// `gossip_interval_ms`, which sets both cadences).
+/// knobs.
 async fn build_node(net: &Network, id: NodeId, seeds: Vec<NodeId>, opts: &NodeOpts) -> Node {
     let announce_interval = Duration::from_millis(opts.gossip_interval_ms.unwrap_or(20));
     let mut builder = Node::builder(id.clone())
@@ -221,9 +210,6 @@ async fn build_node(net: &Network, id: NodeId, seeds: Vec<NodeId>, opts: &NodeOp
     }
     if let Some(ms) = opts.gossip_interval_ms {
         builder = builder.gossip_interval_ms(ms);
-    }
-    if let Some(ms) = opts.anti_entropy_interval_ms {
-        builder = builder.anti_entropy_interval_ms(ms);
     }
     if let Some(bytes) = opts.max_delta_frame_bytes {
         builder = builder.max_delta_frame_bytes(bytes);
@@ -301,14 +287,6 @@ impl MemClusterBuilder {
     #[must_use]
     pub fn gossip_interval_ms(mut self, ms: u64) -> Self {
         self.opts = self.opts.gossip_interval_ms(ms);
-        self
-    }
-
-    /// Overrides every node's anti-entropy cadence — see
-    /// [`NodeOpts::anti_entropy_interval_ms`].
-    #[must_use]
-    pub fn anti_entropy_interval_ms(mut self, ms: u64) -> Self {
-        self.opts = self.opts.anti_entropy_interval_ms(ms);
         self
     }
 

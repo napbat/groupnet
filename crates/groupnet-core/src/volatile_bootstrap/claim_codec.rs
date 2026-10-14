@@ -22,6 +22,18 @@ pub enum ClaimCodecError {
     Mismatch,
 }
 
+impl std::fmt::Display for ClaimCodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Bound => "bootstrap claim field exceeds its bound",
+            Self::Malformed => "bootstrap claim bytes are malformed",
+            Self::Mismatch => "bootstrap claim version, scope, policy, or author mismatch",
+        })
+    }
+}
+
+impl std::error::Error for ClaimCodecError {}
+
 /// Collision-free reserved key for one complete bootstrap scope.
 ///
 /// # Errors
@@ -72,9 +84,9 @@ pub fn encode_claim_value(
     max_bytes: usize,
 ) -> Result<Vec<u8>, ClaimCodecError> {
     let size = encoded_claim_len(scope, policy, claim, max_bytes)?;
-    let domain = bounded_name(&scope.domain, policy.max_scope_bytes)?;
-    let partition = bounded_name(&scope.partition, policy.max_scope_bytes)?;
-    let node = bounded_name(claim.identity.node.as_str(), policy.max_member_bytes)?;
+    let domain = bounded_name(&scope.domain, policy.max_scope_bytes.get())?;
+    let partition = bounded_name(&scope.partition, policy.max_scope_bytes.get())?;
+    let node = bounded_name(claim.identity.node.as_str(), policy.max_member_bytes.get())?;
     let policy_fields = policy_fields(policy)?;
     let mut out = Vec::new();
     out.try_reserve_exact(size)
@@ -109,14 +121,14 @@ pub fn encoded_claim_len(
     claim: &BootstrapClaim,
     max_bytes: usize,
 ) -> Result<usize, ClaimCodecError> {
-    let domain = bounded_name(&scope.domain, policy.max_scope_bytes)?;
-    let partition = bounded_name(&scope.partition, policy.max_scope_bytes)?;
-    let node = bounded_name(claim.identity.node.as_str(), policy.max_member_bytes)?;
+    let domain = bounded_name(&scope.domain, policy.max_scope_bytes.get())?;
+    let partition = bounded_name(&scope.partition, policy.max_scope_bytes.get())?;
+    let node = bounded_name(claim.identity.node.as_str(), policy.max_member_bytes.get())?;
     let scope_bytes = domain
         .len()
         .checked_add(partition.len())
         .ok_or(ClaimCodecError::Bound)?;
-    if scope_bytes > policy.max_scope_bytes || !valid_identity(claim) {
+    if scope_bytes > policy.max_scope_bytes.get() || !valid_identity(claim) {
         return Err(ClaimCodecError::Bound);
     }
     let _ = policy_fields(policy)?;
@@ -153,8 +165,8 @@ pub fn decode_claim_value(
     if reader.take(4)? != MAGIC {
         return Err(ClaimCodecError::Mismatch);
     }
-    if reader.name(policy.max_scope_bytes)? != scope.domain.as_bytes()
-        || reader.name(policy.max_scope_bytes)? != scope.partition.as_bytes()
+    if reader.name(policy.max_scope_bytes.get())? != scope.domain.as_bytes()
+        || reader.name(policy.max_scope_bytes.get())? != scope.partition.as_bytes()
     {
         return Err(ClaimCodecError::Mismatch);
     }
@@ -163,7 +175,7 @@ pub fn decode_claim_value(
             return Err(ClaimCodecError::Mismatch);
         }
     }
-    if reader.name(policy.max_member_bytes)? != observed_node.as_str().as_bytes() {
+    if reader.name(policy.max_member_bytes.get())? != observed_node.as_str().as_bytes() {
         return Err(ClaimCodecError::Mismatch);
     }
     let incarnation = BootId(u128::from_le_bytes(reader.array()?));
@@ -245,14 +257,17 @@ pub fn encoded_presence_len(
     presence: &BootstrapPresence,
     max_bytes: usize,
 ) -> Result<usize, ClaimCodecError> {
-    let domain = bounded_name(&scope.domain, policy.max_scope_bytes)?;
-    let partition = bounded_name(&scope.partition, policy.max_scope_bytes)?;
-    let node = bounded_name(presence.identity.node.as_str(), policy.max_member_bytes)?;
+    let domain = bounded_name(&scope.domain, policy.max_scope_bytes.get())?;
+    let partition = bounded_name(&scope.partition, policy.max_scope_bytes.get())?;
+    let node = bounded_name(
+        presence.identity.node.as_str(),
+        policy.max_member_bytes.get(),
+    )?;
     let scope_bytes = domain
         .len()
         .checked_add(partition.len())
         .ok_or(ClaimCodecError::Bound)?;
-    if scope_bytes > policy.max_scope_bytes
+    if scope_bytes > policy.max_scope_bytes.get()
         || presence.identity.boot.0 == 0
         || presence.identity.session == 0
         || presence.renewal == 0
@@ -319,8 +334,8 @@ pub fn decode_presence_value(
     if reader.take(4)? != PRESENCE_MAGIC {
         return Err(ClaimCodecError::Mismatch);
     }
-    if reader.name(policy.max_scope_bytes)? != scope.domain.as_bytes()
-        || reader.name(policy.max_scope_bytes)? != scope.partition.as_bytes()
+    if reader.name(policy.max_scope_bytes.get())? != scope.domain.as_bytes()
+        || reader.name(policy.max_scope_bytes.get())? != scope.partition.as_bytes()
     {
         return Err(ClaimCodecError::Mismatch);
     }
@@ -329,7 +344,7 @@ pub fn decode_presence_value(
             return Err(ClaimCodecError::Mismatch);
         }
     }
-    if reader.name(policy.max_member_bytes)? != observed_node.as_str().as_bytes() {
+    if reader.name(policy.max_member_bytes.get())? != observed_node.as_str().as_bytes() {
         return Err(ClaimCodecError::Mismatch);
     }
     let boot = BootId(u128::from_le_bytes(reader.array()?));
@@ -365,9 +380,9 @@ fn valid_identity(claim: &BootstrapClaim) -> bool {
 
 fn policy_fields(policy: BootstrapConfig) -> Result<[u64; 9], ClaimCodecError> {
     Ok([
-        u64::try_from(policy.max_members).map_err(|_| ClaimCodecError::Bound)?,
-        u64::try_from(policy.max_member_bytes).map_err(|_| ClaimCodecError::Bound)?,
-        u64::try_from(policy.max_scope_bytes).map_err(|_| ClaimCodecError::Bound)?,
+        u64::try_from(policy.max_members.get()).map_err(|_| ClaimCodecError::Bound)?,
+        u64::try_from(policy.max_member_bytes.get()).map_err(|_| ClaimCodecError::Bound)?,
+        u64::try_from(policy.max_scope_bytes.get()).map_err(|_| ClaimCodecError::Bound)?,
         policy.settle_ms,
         policy.renew_ms,
         policy.claim_ttl_ms,
@@ -432,9 +447,9 @@ mod tests {
 
     fn policy() -> BootstrapConfig {
         BootstrapConfig {
-            max_members: 8,
-            max_member_bytes: 32,
-            max_scope_bytes: 64,
+            max_members: std::num::NonZeroUsize::new(8).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
             settle_ms: 20,
             renew_ms: 50,
             claim_ttl_ms: 200,
@@ -569,5 +584,14 @@ mod tests {
             decode_presence_value(&scope(), wrong_policy, &presence.identity.node, &bytes, 256,),
             Err(ClaimCodecError::Mismatch)
         );
+    }
+
+    #[test]
+    fn codec_errors_display() {
+        assert_eq!(
+            ClaimCodecError::Malformed.to_string(),
+            "bootstrap claim bytes are malformed"
+        );
+        assert!(std::error::Error::source(&ClaimCodecError::Bound).is_none());
     }
 }

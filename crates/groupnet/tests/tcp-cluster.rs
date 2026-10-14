@@ -39,15 +39,13 @@ async fn nodes_gossip_and_sync_entries_over_persistent_tcp() {
 
     let a = Node::builder(a_id.clone())
         .link(BoundLink::new(ta, LinkConfig::new(vec![b_id.clone()])))
-        .gossip_interval_ms(20)
-        .anti_entropy_interval_ms(50)
+        .gossip_interval_ms(50)
         .start()
         .await
         .expect("start a");
     let b = Node::builder(b_id.clone())
         .link(BoundLink::new(tb, LinkConfig::new(vec![a_id.clone()])))
-        .gossip_interval_ms(20)
-        .anti_entropy_interval_ms(50)
+        .gossip_interval_ms(50)
         .start()
         .await
         .expect("start b");
@@ -103,8 +101,7 @@ async fn seed_only_bootstrap_resolves_every_address_dynamically() {
             LinkConfig::new(vec![b_id.clone(), c_id.clone()]),
         ))
         .advertise_addr(a_book.local_addr().to_string())
-        .gossip_interval_ms(20)
-        .anti_entropy_interval_ms(50)
+        .gossip_interval_ms(50)
         .start()
         .await
         .expect("start a");
@@ -114,8 +111,7 @@ async fn seed_only_bootstrap_resolves_every_address_dynamically() {
             LinkConfig::new(vec![a_id.clone(), c_id.clone()]),
         ))
         .advertise_addr(tb.local_addr().to_string())
-        .gossip_interval_ms(20)
-        .anti_entropy_interval_ms(50)
+        .gossip_interval_ms(50)
         .start()
         .await
         .expect("start b");
@@ -125,8 +121,7 @@ async fn seed_only_bootstrap_resolves_every_address_dynamically() {
             LinkConfig::new(vec![a_id.clone(), b_id.clone()]),
         ))
         .advertise_addr(c_book.local_addr().to_string())
-        .gossip_interval_ms(20)
-        .anti_entropy_interval_ms(50)
+        .gossip_interval_ms(50)
         .start()
         .await
         .expect("start c");

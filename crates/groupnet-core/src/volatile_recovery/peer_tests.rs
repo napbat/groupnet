@@ -13,9 +13,9 @@ use crate::{NodeId, Status, Time};
 
 fn config() -> RecoveryConfig {
     RecoveryConfig {
-        max_members: 2,
-        max_member_bytes: 16,
-        max_barrier_rounds: 2,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
         total_ms: 30,
         attempt_ms: 5,
         settle_ms: 2,

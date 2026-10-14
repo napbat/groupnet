@@ -45,6 +45,7 @@
 //! [`Effect::PersistGrant`]: groupnet_core::Effect::PersistGrant
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::{
     Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId,
@@ -70,19 +71,14 @@ fn cfg(voters: &BTreeSet<NodeId>) -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_INTERVAL_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::Quorum {
                 voters: VoterRoster::new(voters.iter().cloned()),
             },
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
@@ -193,12 +189,11 @@ fn durability_run(seed: u64, mode: Durability) -> Run {
     let mut alive: BTreeSet<NodeId> = topo.booted.clone();
     for id in &topo.booted {
         let seeds = topo.booted.iter().filter(|x| *x != id).cloned();
-        sim.add(GroupEngine::new(
-            topo.group.clone(),
-            id.clone(),
-            seeds,
-            cfg(&topo.voters),
-        ));
+        sim.add(
+            GroupEngine::new(topo.group.clone(), id.clone(), seeds, cfg(&topo.voters))
+                .expect("valid config"),
+        )
+        .expect("distinct node");
     }
 
     let mut reboots = Vec::new();
@@ -212,7 +207,7 @@ fn durability_run(seed: u64, mode: Durability) -> Run {
         match rng.below(7) {
             0 | 1 if alive.len() > 1 => {
                 let victim = pick(&alive, &mut rng);
-                sim.crash(&victim);
+                sim.crash(&victim).expect("live node");
                 alive.remove(&victim);
             }
             2 | 3 if alive.len() < topo.booted.len() => {
@@ -225,7 +220,8 @@ fn durability_run(seed: u64, mode: Durability) -> Run {
                 let node = pick(&down, &mut rng);
                 alive.insert(node.clone());
                 let recovered = sim.persisted_grant_of(&node);
-                sim.add(reboot(&topo, &node, &alive, mode, recovered.clone()));
+                sim.add(reboot(&topo, &node, &alive, mode, recovered.clone()))
+                    .expect("distinct node");
                 restarts.entry(node.clone()).or_default().push(Time(now));
                 reboots.push(Reboot {
                     node,
@@ -251,7 +247,8 @@ fn durability_run(seed: u64, mode: Durability) -> Run {
                         value: format!("v{now}").into_bytes(),
                         ttl_ms: None,
                     },
-                );
+                )
+                .expect("live node");
             }
         }
     }
@@ -283,7 +280,9 @@ fn reboot(
     let seeds: Vec<NodeId> = peers.iter().filter(|x| *x != node).cloned().collect();
     let config = cfg(&topo.voters);
     match mode {
-        Durability::Blackout => GroupEngine::new(topo.group.clone(), node.clone(), seeds, config),
+        Durability::Blackout => {
+            GroupEngine::new(topo.group.clone(), node.clone(), seeds, config).expect("valid config")
+        }
         Durability::Recovered => GroupEngine::with_recovered(
             topo.group.clone(),
             node.clone(),
@@ -293,7 +292,8 @@ fn reboot(
                 None => RecoveredGrant::none(),
                 Some((epoch, claimant)) => RecoveredGrant::granted(epoch, claimant),
             },
-        ),
+        )
+        .expect("valid config"),
     }
 }
 

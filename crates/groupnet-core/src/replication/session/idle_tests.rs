@@ -72,7 +72,7 @@ fn respond_tail(engine: &mut SessionEngine, op: Operation, head: u8) -> Step {
 fn make_engine() -> SessionEngine {
     let config = Config {
         idle: Some(IdlePolicy {
-            unchanged_checks: 1,
+            unchanged_checks: std::num::NonZeroU32::MIN,
             max_interval_ms: 80,
             jitter_ms: 0,
         }),
@@ -93,20 +93,7 @@ fn policy_bounds_are_explicit() {
     assert_eq!(
         Config {
             idle: Some(IdlePolicy {
-                unchanged_checks: 0,
-                max_interval_ms: 20,
-                jitter_ms: 0,
-            }),
-            tail_check_ms: 10,
-            ..Config::default()
-        }
-        .validate(),
-        Err(ConfigError::Zero)
-    );
-    assert_eq!(
-        Config {
-            idle: Some(IdlePolicy {
-                unchanged_checks: 1,
+                unchanged_checks: std::num::NonZeroU32::MIN,
                 max_interval_ms: 9,
                 jitter_ms: 0,
             }),
@@ -114,7 +101,9 @@ fn policy_bounds_are_explicit() {
             ..Config::default()
         }
         .validate(),
-        Err(ConfigError::Zero)
+        Err(ConfigError::Idle(
+            crate::replication::IdlePolicyError::MaxIntervalBelowTailCheck
+        ))
     );
 }
 

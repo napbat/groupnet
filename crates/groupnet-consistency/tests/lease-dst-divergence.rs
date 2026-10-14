@@ -46,6 +46,7 @@
 #![cfg(feature = "leases")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use groupnet_consistency::WriteToken;
@@ -102,14 +103,9 @@ fn cfg() -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: LEASE_MS,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: 40,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Eventual,
+        ..Config::default()
     }
 }
 
@@ -122,7 +118,7 @@ fn reap_horizon_ms() -> u64 {
 
 fn engine(group: &GroupId, id: &NodeId, peers: &[NodeId]) -> GroupEngine {
     let seeds = peers.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(group.clone(), id.clone(), seeds, cfg())
+    GroupEngine::new(group.clone(), id.clone(), seeds, cfg()).expect("valid config")
 }
 
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
@@ -235,7 +231,7 @@ impl Harness {
         let mut nodes = BTreeMap::new();
         let span = u32::try_from(2 * SKEW_PPM + 1).expect("small");
         for id in &all {
-            sim.add(engine(&group, id, &all));
+            sim.add(engine(&group, id, &all)).expect("distinct node");
             let ppm = i64::from(rng.below(span)) - SKEW_PPM;
             let phase = u64::from(rng.below(u32::try_from(RENEW_MS).expect("small")));
             let node = Node {
@@ -284,7 +280,8 @@ impl Harness {
 
     fn set(&mut self, node: &NodeId, key: String, value: Vec<u8>, ttl_ms: Option<u64>) {
         self.sim
-            .command(node, Command::SetLocalEntry { key, value, ttl_ms });
+            .command(node, Command::SetLocalEntry { key, value, ttl_ms })
+            .expect("live node");
     }
 
     fn step_to(&mut self, now: u64) {
@@ -311,6 +308,7 @@ impl Harness {
     fn visible_renewals(&self, id: &NodeId) -> Vec<(NodeId, RenewalId)> {
         self.sim
             .entries_snapshot(id)
+            .expect("live node is in the simulation")
             .iter()
             .filter(|(peer, _)| *peer != id && self.lease_live(id, peer))
             .filter_map(|(peer, entries)| {
@@ -325,7 +323,10 @@ impl Harness {
     fn publish(&mut self) {
         let now = self.now;
         for id in self.live_ids() {
-            let view = self.sim.entries_snapshot(&id);
+            let view = self
+                .sim
+                .entries_snapshot(&id)
+                .expect("live node is in the simulation");
             let visible = self.visible_renewals(&id);
             let applied = |reader: &NodeId, writer: &NodeId| {
                 view.get(reader)
@@ -379,7 +380,10 @@ impl Harness {
     fn ingest_and_serve(&mut self) {
         let now = self.now;
         for id in self.live_ids() {
-            let view = self.sim.entries_snapshot(&id);
+            let view = self
+                .sim
+                .entries_snapshot(&id)
+                .expect("live node is in the simulation");
             let known: BTreeSet<NodeId> = self
                 .all
                 .iter()
@@ -448,7 +452,10 @@ impl Harness {
             let Some(inflight) = self.nodes[&id].inflight else {
                 continue;
             };
-            let view = self.sim.entries_snapshot(&id);
+            let view = self
+                .sim
+                .entries_snapshot(&id)
+                .expect("live node is in the simulation");
             let mut members: BTreeSet<NodeId> = self
                 .visible_renewals(&id)
                 .into_iter()
@@ -495,7 +502,7 @@ impl Harness {
                 self.completed.push((id.clone(), inflight.token, now));
             }
             if departing {
-                self.sim.crash(&id);
+                self.sim.crash(&id).expect("live node");
                 self.nodes.remove(&id);
             }
         }
@@ -543,14 +550,16 @@ impl Harness {
         let idle = node.inflight.is_none();
         let key = self.grant_key.clone();
         self.set(victim, key, farewell, None);
-        self.sim.command(
-            victim,
-            Command::DeleteLocalEntry {
-                key: self.renewal_key.clone(),
-            },
-        );
+        self.sim
+            .command(
+                victim,
+                Command::DeleteLocalEntry {
+                    key: self.renewal_key.clone(),
+                },
+            )
+            .expect("live node");
         if idle {
-            self.sim.crash(victim);
+            self.sim.crash(victim).expect("live node");
             self.nodes.remove(victim);
         }
     }

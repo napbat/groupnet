@@ -103,13 +103,13 @@ fn idle_backoff_revokes_stale_serving_and_discovers_silent_commit() {
         let partitioned = seed % 5 == 0;
         let config = Config {
             idle: Some(IdlePolicy {
-                unchanged_checks: 1,
+                unchanged_checks: std::num::NonZeroU32::new(1).unwrap(),
                 max_interval_ms: 40,
                 jitter_ms: 5,
             }),
             tail_check_ms: 10,
             retry_ms: 2,
-            max_retries: 8,
+            max_retries: std::num::NonZeroU32::new(8).unwrap(),
             ..Config::default()
         };
         let mut engine = SessionEngine::new(scope(), Mode::StateSync, config, seed + 1).unwrap();

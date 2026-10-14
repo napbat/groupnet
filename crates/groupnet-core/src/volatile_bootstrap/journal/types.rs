@@ -1,8 +1,12 @@
 //! Bounded donor-local index transfer journal contract.
 
+use std::fmt;
+use std::num::NonZeroUsize;
+
 use crate::Time;
 
 use super::super::{BootstrapMemberIdentity, BootstrapScope, ClaimIdentity};
+use super::DonorJournal;
 
 /// A capture identity that cannot be reused by the same donor session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,79 +22,125 @@ pub struct CaptureId {
 }
 
 /// Finite donor storage and per-follower transfer limits.
+///
+/// Every count and byte cap is nonzero by type; [`JournalConfig::validate`]
+/// checks the millisecond lifetimes, the caps' relations to each other, and
+/// that [`DonorJournal::storage_bound`] is representable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalConfig {
     /// Maximum encoded image bytes reserved before capture.
-    pub max_encoded_bytes: usize,
+    pub max_encoded_bytes: NonZeroUsize,
     /// Maximum decoded/private image bytes reserved before capture.
-    pub max_decoded_bytes: usize,
+    pub max_decoded_bytes: NonZeroUsize,
     /// Maximum retained delta events for the candidate.
-    pub max_events: usize,
+    pub max_events: NonZeroUsize,
     /// Maximum retained delta identity plus effect bytes.
-    pub max_suffix_bytes: usize,
-    /// Maximum bytes of one identity plus effect.
-    pub max_event_bytes: usize,
-    /// Maximum bytes of one stable mutation identity.
-    pub max_identity_bytes: usize,
+    pub max_suffix_bytes: NonZeroUsize,
+    /// Maximum bytes of one identity plus effect; at most `max_suffix_bytes`
+    /// and `max_batch_bytes`.
+    pub max_event_bytes: NonZeroUsize,
+    /// Maximum bytes of one stable mutation identity; at most `max_event_bytes`.
+    pub max_identity_bytes: NonZeroUsize,
     /// Maximum simultaneous follower reservations.
-    pub max_followers: usize,
+    pub max_followers: NonZeroUsize,
     /// Maximum bytes in one follower node identity.
-    pub max_follower_id_bytes: usize,
+    pub max_follower_id_bytes: NonZeroUsize,
     /// Maximum native writer cut entries.
-    pub max_cuts: usize,
+    pub max_cuts: NonZeroUsize,
     /// Maximum total bytes of native writer IDs.
-    pub max_cut_bytes: usize,
+    pub max_cut_bytes: NonZeroUsize,
     /// Maximum exact member identities in the captured roster.
-    pub max_members: usize,
+    pub max_members: NonZeroUsize,
     /// Maximum total bytes of the exact source-observed membership roster.
-    pub max_membership_bytes: usize,
+    pub max_membership_bytes: NonZeroUsize,
     /// Maximum combined bytes of the scope names.
-    pub max_scope_bytes: usize,
+    pub max_scope_bytes: NonZeroUsize,
     /// Maximum events in one returned batch.
-    pub max_batch_events: usize,
-    /// Maximum bytes in one returned batch.
-    pub max_batch_bytes: usize,
+    pub max_batch_events: NonZeroUsize,
+    /// Maximum bytes in one returned batch; at most `max_inflight_bytes`.
+    pub max_batch_bytes: NonZeroUsize,
     /// Maximum total bytes held by returned, unacked batches.
-    pub max_inflight_bytes: usize,
-    /// Maximum lifetime of a capture candidate.
+    pub max_inflight_bytes: NonZeroUsize,
+    /// Maximum lifetime of a capture candidate, in logical milliseconds; nonzero.
     pub max_total_ms: u64,
-    /// Maximum lifetime of one follower reservation.
+    /// Maximum lifetime of one follower reservation, in logical milliseconds;
+    /// nonzero and at most `max_total_ms`.
     pub max_follower_ms: u64,
 }
+
+/// Invalid [`JournalConfig`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalConfigError {
+    /// [`JournalConfig::max_total_ms`] is zero.
+    ZeroMaxTotal,
+    /// [`JournalConfig::max_follower_ms`] is zero.
+    ZeroMaxFollower,
+    /// [`JournalConfig::max_follower_ms`] exceeds [`JournalConfig::max_total_ms`].
+    FollowerExceedsTotal,
+    /// [`JournalConfig::max_event_bytes`] exceeds [`JournalConfig::max_suffix_bytes`].
+    EventExceedsSuffix,
+    /// [`JournalConfig::max_event_bytes`] exceeds [`JournalConfig::max_batch_bytes`].
+    EventExceedsBatch,
+    /// [`JournalConfig::max_batch_bytes`] exceeds [`JournalConfig::max_inflight_bytes`].
+    BatchExceedsInflight,
+    /// [`JournalConfig::max_identity_bytes`] exceeds [`JournalConfig::max_event_bytes`].
+    IdentityExceedsEvent,
+    /// The caps' product, [`DonorJournal::storage_bound`], overflows `usize`.
+    StorageBoundOverflow,
+}
+
+impl fmt::Display for JournalConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroMaxTotal => "journal max_total_ms must be nonzero",
+            Self::ZeroMaxFollower => "journal max_follower_ms must be nonzero",
+            Self::FollowerExceedsTotal => "journal max_follower_ms must not exceed max_total_ms",
+            Self::EventExceedsSuffix => "journal max_event_bytes must not exceed max_suffix_bytes",
+            Self::EventExceedsBatch => "journal max_event_bytes must not exceed max_batch_bytes",
+            Self::BatchExceedsInflight => {
+                "journal max_batch_bytes must not exceed max_inflight_bytes"
+            }
+            Self::IdentityExceedsEvent => {
+                "journal max_identity_bytes must not exceed max_event_bytes"
+            }
+            Self::StorageBoundOverflow => "journal storage bound overflows usize",
+        })
+    }
+}
+
+impl std::error::Error for JournalConfigError {}
 
 impl JournalConfig {
     /// Validate finite, internally compatible budgets.
     ///
     /// # Errors
-    /// Returns [`JournalError::InvalidConfig`] for zero or inverted bounds.
-    pub fn validate(self) -> Result<Self, JournalError> {
-        if self.max_encoded_bytes == 0
-            || self.max_decoded_bytes == 0
-            || self.max_events == 0
-            || self.max_suffix_bytes == 0
-            || self.max_event_bytes == 0
-            || self.max_identity_bytes == 0
-            || self.max_followers == 0
-            || self.max_follower_id_bytes == 0
-            || self.max_cuts == 0
-            || self.max_cut_bytes == 0
-            || self.max_members == 0
-            || self.max_membership_bytes == 0
-            || self.max_scope_bytes == 0
-            || self.max_batch_events == 0
-            || self.max_batch_bytes == 0
-            || self.max_inflight_bytes == 0
-            || self.max_total_ms == 0
-            || self.max_follower_ms == 0
-            || self.max_event_bytes > self.max_suffix_bytes
-            || self.max_event_bytes > self.max_batch_bytes
-            || self.max_batch_bytes > self.max_inflight_bytes
-            || self.max_identity_bytes > self.max_event_bytes
-            || self.max_follower_ms > self.max_total_ms
-        {
-            return Err(JournalError::InvalidConfig);
+    /// Returns the [`JournalConfigError`] variant naming the first violated rule.
+    pub fn validate(&self) -> Result<(), JournalConfigError> {
+        if self.max_total_ms == 0 {
+            return Err(JournalConfigError::ZeroMaxTotal);
         }
-        Ok(self)
+        if self.max_follower_ms == 0 {
+            return Err(JournalConfigError::ZeroMaxFollower);
+        }
+        if self.max_follower_ms > self.max_total_ms {
+            return Err(JournalConfigError::FollowerExceedsTotal);
+        }
+        if self.max_event_bytes > self.max_suffix_bytes {
+            return Err(JournalConfigError::EventExceedsSuffix);
+        }
+        if self.max_event_bytes > self.max_batch_bytes {
+            return Err(JournalConfigError::EventExceedsBatch);
+        }
+        if self.max_batch_bytes > self.max_inflight_bytes {
+            return Err(JournalConfigError::BatchExceedsInflight);
+        }
+        if self.max_identity_bytes > self.max_event_bytes {
+            return Err(JournalConfigError::IdentityExceedsEvent);
+        }
+        if DonorJournal::checked_storage_bound(self).is_none() {
+            return Err(JournalConfigError::StorageBoundOverflow);
+        }
+        Ok(())
     }
 }
 
@@ -226,8 +276,10 @@ pub enum Invalidation {
 /// Fail-closed journal error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalError {
-    /// Invalid construction or budget configuration.
-    InvalidConfig,
+    /// The [`JournalConfig`] is invalid.
+    Config(JournalConfigError),
+    /// The [`CaptureId`] has an empty, zero, or oversized field.
+    InvalidIdentity,
     /// Wrong candidate phase.
     Stage,
     /// Wrong capture, follower reservation, operation, or cursor.
@@ -242,6 +294,31 @@ pub enum JournalError {
     Exhausted,
     /// Candidate total lifetime elapsed.
     Expired,
+}
+
+impl fmt::Display for JournalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Config(_) => "invalid journal config",
+            Self::InvalidIdentity => "invalid journal capture identity",
+            Self::Stage => "wrong journal candidate phase",
+            Self::Stale => "stale journal capture, reservation, operation, or cursor",
+            Self::Capacity => "journal resource limit reached",
+            Self::Conflict => "conflicting journal duplicate or writer progression",
+            Self::BackwardTime => "journal time moved backward",
+            Self::Exhausted => "journal checked arithmetic exhausted",
+            Self::Expired => "journal candidate lifetime elapsed",
+        })
+    }
+}
+
+impl std::error::Error for JournalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// One bounded reservation's current attachment and batch state.

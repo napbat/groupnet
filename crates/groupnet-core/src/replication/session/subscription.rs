@@ -60,7 +60,7 @@ impl SessionEngine {
                 IdentityError::WrongScope,
             )));
         }
-        if let Err(error) = request.validate(self.config.max_cursor_bytes, limits) {
+        if let Err(error) = request.validate(self.config.max_cursor_bytes.get(), limits) {
             return Step::reject(Reject::Subscription(error));
         }
         let Ok(op) = self.issue(Stage::Registering) else {
@@ -104,7 +104,7 @@ impl SessionEngine {
                 IdentityError::WrongScope,
             )));
         }
-        if let Err(error) = request.validate(self.config.max_cursor_bytes, limits) {
+        if let Err(error) = request.validate(self.config.max_cursor_bytes.get(), limits) {
             return Step::reject(Reject::Subscription(error));
         }
         let Ok(op) = self.issue(Stage::ReadingCurrentSubscriber) else {
@@ -153,7 +153,7 @@ impl SessionEngine {
             return Step::reject(Reject::Subscription(SubscriptionError::HistoryUnavailable));
         };
         if let Err(error) =
-            state.validate_against(resume, self.config.max_cursor_bytes, progress.limits)
+            state.validate_against(resume, self.config.max_cursor_bytes.get(), progress.limits)
         {
             if error == SubscriptionError::HistoryUnavailable {
                 self.state.stage = Stage::IrrecoverableGap;
@@ -250,7 +250,7 @@ impl SessionEngine {
             return Step::reject(Reject::Stage);
         };
         if let Err(error) =
-            receipt.validate_against(request, self.config.max_cursor_bytes, progress.limits)
+            receipt.validate_against(request, self.config.max_cursor_bytes.get(), progress.limits)
         {
             return Step::reject(Reject::Subscription(error));
         }
@@ -328,7 +328,8 @@ impl SessionEngine {
         else {
             return Step::reject(Reject::Stage);
         };
-        if let Err(error) = checkpoint.validate_against(registration, self.config.max_cursor_bytes)
+        if let Err(error) =
+            checkpoint.validate_against(registration, self.config.max_cursor_bytes.get())
         {
             return Step::reject(Reject::Subscription(error));
         }
@@ -388,7 +389,7 @@ impl SessionEngine {
             self.operation_due = None;
             return Some(Step::reject(Reject::Exhausted));
         };
-        if retries > self.config.max_retries {
+        if retries > self.config.max_retries.get() {
             self.state.stage = Stage::RetryExhausted;
             self.outstanding = None;
             self.operation_due = None;
@@ -533,10 +534,10 @@ mod tests {
             start: cursor(1),
             policy: RetentionPolicy {
                 fingerprint: vec![7],
-                max_bytes: 1024,
-                max_events: 100,
+                max_bytes: NonZeroU64::new(1024).unwrap(),
+                max_events: NonZeroU64::new(100).unwrap(),
                 max_age_ms: 1000,
-                max_lag_events: 100,
+                max_lag_events: NonZeroU64::new(100).unwrap(),
             },
             request_id: vec![4],
             expected_prior_ordinal: None,

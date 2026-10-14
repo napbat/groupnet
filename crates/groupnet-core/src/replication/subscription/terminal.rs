@@ -50,13 +50,13 @@ impl TerminalRequest {
             .scope
             .validate(max_cursor_bytes)
             .map_err(SubscriptionError::Identity)?;
-        if !limits.valid()
-            || self.key.subscriber.name.is_empty()
-            || self.key.subscriber.name.len() > limits.max_subscriber_bytes
+        limits.validate().map_err(SubscriptionError::Limits)?;
+        if self.key.subscriber.name.is_empty()
+            || self.key.subscriber.name.len() > limits.max_subscriber_bytes.get()
             || self.epoch.native.is_empty()
-            || self.epoch.native.len() > limits.max_epoch_bytes
+            || self.epoch.native.len() > limits.max_epoch_bytes.get()
             || self.request_id.is_empty()
-            || self.request_id.len() > limits.max_request_bytes
+            || self.request_id.len() > limits.max_request_bytes.get()
         {
             return Err(SubscriptionError::Bounds);
         }

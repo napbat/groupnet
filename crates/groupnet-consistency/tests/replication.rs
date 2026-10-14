@@ -385,8 +385,8 @@ fn limits() -> Limits {
     limits.core.tail_check_ms = 30;
     limits.core.attempt_timeout_ms = 500;
     limits.core.retry_ms = 20;
-    limits.core.max_batch_events = 2;
-    limits.core.max_batch_bytes = 8;
+    limits.core.max_batch_events = std::num::NonZeroUsize::new(2).unwrap();
+    limits.core.max_batch_bytes = std::num::NonZeroUsize::new(8).unwrap();
     limits.max_inflight_bytes = 8;
     limits
 }
@@ -773,7 +773,7 @@ async fn slow_scope_cannot_hold_global_admission_forever() {
     *source.held_partition.lock().expect("partition lock") = Some("slow".into());
     let mut bounded = limits();
     bounded.core.attempt_timeout_ms = 80;
-    bounded.core.max_retries = 10;
+    bounded.core.max_retries = std::num::NonZeroU32::new(10).unwrap();
     bounded.max_parallel_ops = 2;
     let manager = Replication::new(
         cluster.groups[0].clone(),

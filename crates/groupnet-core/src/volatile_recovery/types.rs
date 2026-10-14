@@ -1,5 +1,8 @@
 //! Bounded facts and effects for recovery from a volatile coherence feed.
 
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroUsize};
+
 use crate::volatile_bootstrap::BootstrapMemberIdentity;
 use crate::volatile_bootstrap::transfer::NativeHandoffReceipt;
 use crate::{NodeId, Time};
@@ -14,52 +17,109 @@ pub enum RecoveryMode {
 }
 
 /// Finite recovery, roster, and operation limits supplied by the consumer.
+///
+/// Roster caps are nonzero by type; [`RecoveryConfig::validate`] checks the
+/// millisecond timers, their relation to `total_ms`, and the roster byte
+/// product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryConfig {
     /// Maximum peer identities in any observation or retained recovery roster.
-    pub max_members: usize,
+    pub max_members: NonZeroUsize,
     /// Maximum UTF-8 bytes in one peer identity.
-    pub max_member_bytes: usize,
+    pub max_member_bytes: NonZeroUsize,
     /// Maximum source-head resamples after a reached frontier moves.
-    pub max_barrier_rounds: u32,
+    pub max_barrier_rounds: NonZeroU32,
     /// Liveness budget for one recovery episode: time allowed since the
     /// episode began or since its long-running rebuild or baseline operation
     /// last reported progress. A progressing operation is never failed over.
+    /// Nonzero.
     pub total_ms: u64,
     /// Duration one adapter operation may run without completing or, for an
-    /// origin rebuild, without reporting progress. Bounded by `total_ms`.
+    /// origin rebuild, without reporting progress. Nonzero and at most
+    /// `total_ms`.
     pub attempt_ms: u64,
-    /// Delay after all per-granter renewals advance.
+    /// Delay after all per-granter renewals advance; nonzero and at most
+    /// `total_ms`.
     pub settle_ms: u64,
-    /// Delay between unsuccessful grant or affirmation observations.
+    /// Delay between unsuccessful grant or affirmation observations; nonzero
+    /// and at most `total_ms`.
     pub poll_ms: u64,
 }
+
+/// Invalid [`RecoveryConfig`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryConfigError {
+    /// [`RecoveryConfig::total_ms`] is zero.
+    ZeroTotal,
+    /// [`RecoveryConfig::attempt_ms`] is zero.
+    ZeroAttempt,
+    /// [`RecoveryConfig::settle_ms`] is zero.
+    ZeroSettle,
+    /// [`RecoveryConfig::poll_ms`] is zero.
+    ZeroPoll,
+    /// [`RecoveryConfig::attempt_ms`] exceeds [`RecoveryConfig::total_ms`].
+    AttemptExceedsTotal,
+    /// [`RecoveryConfig::settle_ms`] exceeds [`RecoveryConfig::total_ms`].
+    SettleExceedsTotal,
+    /// [`RecoveryConfig::poll_ms`] exceeds [`RecoveryConfig::total_ms`].
+    PollExceedsTotal,
+    /// [`RecoveryConfig::max_members`] times
+    /// [`RecoveryConfig::max_member_bytes`] overflows `usize`.
+    RosterBytesOverflow,
+}
+
+impl fmt::Display for RecoveryConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroTotal => "recovery total_ms must be nonzero",
+            Self::ZeroAttempt => "recovery attempt_ms must be nonzero",
+            Self::ZeroSettle => "recovery settle_ms must be nonzero",
+            Self::ZeroPoll => "recovery poll_ms must be nonzero",
+            Self::AttemptExceedsTotal => "recovery attempt_ms must not exceed total_ms",
+            Self::SettleExceedsTotal => "recovery settle_ms must not exceed total_ms",
+            Self::PollExceedsTotal => "recovery poll_ms must not exceed total_ms",
+            Self::RosterBytesOverflow => "recovery max_members * max_member_bytes overflows usize",
+        })
+    }
+}
+
+impl std::error::Error for RecoveryConfigError {}
 
 impl RecoveryConfig {
     /// Validates every finite limit before any effect is emitted.
     ///
     /// # Errors
-    /// Returns [`RecoveryError::InvalidConfig`] for an absent bound or a
-    /// duration longer than the total recovery budget.
-    pub fn validate(self) -> Result<Self, RecoveryError> {
-        if self.max_members == 0
-            || self.max_member_bytes == 0
-            || self.max_barrier_rounds == 0
-            || self.total_ms == 0
-            || self.attempt_ms == 0
-            || self.settle_ms == 0
-            || self.poll_ms == 0
-            || self.attempt_ms > self.total_ms
-            || self.settle_ms > self.total_ms
-            || self.poll_ms > self.total_ms
-            || self
-                .max_members
-                .checked_mul(self.max_member_bytes)
-                .is_none()
-        {
-            return Err(RecoveryError::InvalidConfig);
+    /// Returns the [`RecoveryConfigError`] variant naming the first violated rule.
+    pub fn validate(&self) -> Result<(), RecoveryConfigError> {
+        if self.total_ms == 0 {
+            return Err(RecoveryConfigError::ZeroTotal);
         }
-        Ok(self)
+        if self.attempt_ms == 0 {
+            return Err(RecoveryConfigError::ZeroAttempt);
+        }
+        if self.settle_ms == 0 {
+            return Err(RecoveryConfigError::ZeroSettle);
+        }
+        if self.poll_ms == 0 {
+            return Err(RecoveryConfigError::ZeroPoll);
+        }
+        if self.attempt_ms > self.total_ms {
+            return Err(RecoveryConfigError::AttemptExceedsTotal);
+        }
+        if self.settle_ms > self.total_ms {
+            return Err(RecoveryConfigError::SettleExceedsTotal);
+        }
+        if self.poll_ms > self.total_ms {
+            return Err(RecoveryConfigError::PollExceedsTotal);
+        }
+        if self
+            .max_members
+            .checked_mul(self.max_member_bytes)
+            .is_none()
+        {
+            return Err(RecoveryConfigError::RosterBytesOverflow);
+        }
+        Ok(())
     }
 }
 
@@ -67,22 +127,45 @@ impl RecoveryConfig {
 /// Individual operations inside an episode still retry on `RecoveryConfig::poll_ms`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryRearm {
-    /// Delay after the first exhausted episode.
+    /// Delay after the first exhausted episode, in logical milliseconds; nonzero.
     pub initial_ms: u64,
-    /// Inclusive cap on later doubled delays.
+    /// Inclusive cap on later doubled delays; at least `initial_ms`.
     pub max_ms: u64,
 }
+
+/// Invalid [`RecoveryRearm`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryRearmError {
+    /// [`RecoveryRearm::initial_ms`] is zero.
+    ZeroInitial,
+    /// [`RecoveryRearm::max_ms`] is below [`RecoveryRearm::initial_ms`].
+    MaxBelowInitial,
+}
+
+impl fmt::Display for RecoveryRearmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroInitial => "recovery rearm initial_ms must be nonzero",
+            Self::MaxBelowInitial => "recovery rearm max_ms must be at least initial_ms",
+        })
+    }
+}
+
+impl std::error::Error for RecoveryRearmError {}
 
 impl RecoveryRearm {
     /// Rejects absent or inverted delay bounds before a recovery event starts.
     ///
     /// # Errors
-    /// Returns [`RecoveryError::InvalidConfig`] for an invalid policy.
-    pub fn validate(self) -> Result<Self, RecoveryError> {
-        if self.initial_ms == 0 || self.max_ms < self.initial_ms {
-            return Err(RecoveryError::InvalidConfig);
+    /// Returns the [`RecoveryRearmError`] variant naming the violated rule.
+    pub fn validate(&self) -> Result<(), RecoveryRearmError> {
+        if self.initial_ms == 0 {
+            return Err(RecoveryRearmError::ZeroInitial);
         }
-        Ok(self)
+        if self.max_ms < self.initial_ms {
+            return Err(RecoveryRearmError::MaxBelowInitial);
+        }
+        Ok(())
     }
 }
 
@@ -425,8 +508,12 @@ pub enum RecoveryFallback {
 /// Reason a recovery input or bounded proof was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryError {
-    /// A required configured bound is invalid.
-    InvalidConfig,
+    /// The [`RecoveryConfig`] is invalid.
+    Config(RecoveryConfigError),
+    /// The [`RecoveryRearm`] policy is invalid.
+    Rearm(RecoveryRearmError),
+    /// The local node identity is empty or oversized, or the session is zero.
+    InvalidIdentity,
     /// Wrong stage for this event.
     Stage,
     /// A stale generation, session, or operation token.
@@ -441,6 +528,32 @@ pub enum RecoveryError {
     InvalidEvidence,
 }
 
+impl fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Config(_) => "invalid recovery config",
+            Self::Rearm(_) => "invalid recovery rearm policy",
+            Self::InvalidIdentity => "invalid recovery node identity or session",
+            Self::Stage => "wrong recovery stage for this event",
+            Self::StaleOperation => "stale recovery generation, session, or operation",
+            Self::Capacity => "recovery roster, identity, or head bound would overflow",
+            Self::Exhausted => "recovery time or operation token would wrap",
+            Self::BackwardTime => "recovery time moved backwards",
+            Self::InvalidEvidence => "recovery observation was contradictory",
+        })
+    }
+}
+
+impl std::error::Error for RecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Rearm(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// Effects and a typed refusal from one deterministic transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryStep {
@@ -448,4 +561,121 @@ pub struct RecoveryStep {
     pub effects: Vec<RecoveryEffect>,
     /// No state advancement on a rejected response, except fail-closed limits.
     pub rejection: Option<RecoveryError>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> RecoveryConfig {
+        RecoveryConfig {
+            max_members: NonZeroUsize::new(4).unwrap(),
+            max_member_bytes: NonZeroUsize::new(32).unwrap(),
+            max_barrier_rounds: NonZeroU32::new(3).unwrap(),
+            total_ms: 100,
+            attempt_ms: 20,
+            settle_ms: 5,
+            poll_ms: 2,
+        }
+    }
+
+    #[test]
+    fn config_validate_names_each_rule() {
+        assert_eq!(config().validate(), Ok(()));
+        let cases = [
+            (
+                RecoveryConfig {
+                    total_ms: 0,
+                    ..config()
+                },
+                RecoveryConfigError::ZeroTotal,
+            ),
+            (
+                RecoveryConfig {
+                    attempt_ms: 0,
+                    ..config()
+                },
+                RecoveryConfigError::ZeroAttempt,
+            ),
+            (
+                RecoveryConfig {
+                    settle_ms: 0,
+                    ..config()
+                },
+                RecoveryConfigError::ZeroSettle,
+            ),
+            (
+                RecoveryConfig {
+                    poll_ms: 0,
+                    ..config()
+                },
+                RecoveryConfigError::ZeroPoll,
+            ),
+            (
+                RecoveryConfig {
+                    attempt_ms: 101,
+                    ..config()
+                },
+                RecoveryConfigError::AttemptExceedsTotal,
+            ),
+            (
+                RecoveryConfig {
+                    settle_ms: 101,
+                    ..config()
+                },
+                RecoveryConfigError::SettleExceedsTotal,
+            ),
+            (
+                RecoveryConfig {
+                    poll_ms: 101,
+                    ..config()
+                },
+                RecoveryConfigError::PollExceedsTotal,
+            ),
+            (
+                RecoveryConfig {
+                    max_members: NonZeroUsize::MAX,
+                    max_member_bytes: NonZeroUsize::new(2).unwrap(),
+                    ..config()
+                },
+                RecoveryConfigError::RosterBytesOverflow,
+            ),
+        ];
+        for (config, expected) in cases {
+            assert_eq!(config.validate(), Err(expected));
+        }
+        let error = RecoveryError::Config(RecoveryConfigError::ZeroPoll);
+        assert_eq!(error.to_string(), "invalid recovery config");
+        assert_eq!(
+            std::error::Error::source(&error).map(ToString::to_string),
+            Some("recovery poll_ms must be nonzero".to_owned())
+        );
+    }
+
+    #[test]
+    fn rearm_validate_names_each_rule() {
+        let rearm = RecoveryRearm {
+            initial_ms: 5,
+            max_ms: 5,
+        };
+        assert_eq!(rearm.validate(), Ok(()));
+        assert_eq!(
+            RecoveryRearm {
+                initial_ms: 0,
+                ..rearm
+            }
+            .validate(),
+            Err(RecoveryRearmError::ZeroInitial)
+        );
+        assert_eq!(
+            RecoveryRearm { max_ms: 4, ..rearm }.validate(),
+            Err(RecoveryRearmError::MaxBelowInitial)
+        );
+        let error = RecoveryError::Rearm(RecoveryRearmError::MaxBelowInitial);
+        assert_eq!(
+            std::error::Error::source(&error).map(ToString::to_string),
+            Some("recovery rearm max_ms must be at least initial_ms".to_owned())
+        );
+        assert!(std::error::Error::source(&RecoveryError::Stage).is_none());
+    }
 }

@@ -1,3 +1,5 @@
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+
 use super::*;
 use crate::Time;
 
@@ -48,11 +50,11 @@ fn compare(p: &SourceProof, left: u8, right: u8) -> BoundComparison {
 fn config() -> Config {
     Config {
         snapshot: Some(SnapshotConfig {
-            max_metadata_bytes: 128,
-            max_snapshot_bytes: 16,
-            max_chunks: 4,
-            max_chunk_bytes: 4,
-            max_candidate_bytes: 32,
+            max_metadata_bytes: NonZeroUsize::new(128).unwrap(),
+            max_snapshot_bytes: NonZeroU64::new(16).unwrap(),
+            max_chunks: NonZeroU32::new(4).unwrap(),
+            max_chunk_bytes: NonZeroUsize::new(4).unwrap(),
+            max_candidate_bytes: NonZeroU64::new(32).unwrap(),
             max_total_ms: 100,
         }),
         attempt_timeout_ms: 20,

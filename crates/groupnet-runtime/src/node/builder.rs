@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -110,41 +111,32 @@ impl NodeBuilder {
         self
     }
 
-    /// Overrides the gossip interval (milliseconds). Lower is faster to
-    /// converge but chattier. Since G3 the round runs digest/delta anti-entropy,
-    /// so this also sets the anti-entropy cadence in step (override it separately
-    /// afterwards with [`anti_entropy_interval_ms`](Self::anti_entropy_interval_ms)).
+    /// Overrides the gossip round's cadence (milliseconds) — see
+    /// [`Config::gossip_interval_ms`]. Every round sends a digest/delta
+    /// anti-entropy exchange to [`gossip_fanout`](Self::gossip_fanout) peers.
+    /// Lower is faster to converge but chattier. Stored as given;
+    /// [`start`](Self::start) rejects zero.
     #[must_use]
     pub fn gossip_interval_ms(mut self, ms: u64) -> Self {
-        let ms = ms.max(1);
         self.config.gossip_interval_ms = ms;
-        self.config.anti_entropy_interval_ms = ms;
         self
     }
 
-    /// Overrides just the anti-entropy digest cadence (milliseconds), leaving the
-    /// gossip interval as set. Call after [`gossip_interval_ms`](Self::gossip_interval_ms),
-    /// which sets both.
+    /// Overrides how many peers each gossip round sends a digest to
+    /// (default 2) — see [`Config::gossip_fanout`]. Targets rotate
+    /// round-robin so every peer is covered over successive rounds.
     #[must_use]
-    pub fn anti_entropy_interval_ms(mut self, ms: u64) -> Self {
-        self.config.anti_entropy_interval_ms = ms.max(1);
-        self
-    }
-
-    /// Overrides how many peers each anti-entropy round sends a digest to
-    /// (default 2). Fanout rotates round-robin so every peer is covered over
-    /// successive rounds.
-    #[must_use]
-    pub fn anti_entropy_fanout(mut self, peers: usize) -> Self {
-        self.config.anti_entropy_fanout = peers.max(1);
+    pub fn gossip_fanout(mut self, peers: NonZeroUsize) -> Self {
+        self.config.gossip_fanout = peers;
         self
     }
 
     /// Overrides the soft per-frame byte cap for digests and deltas (default
-    /// `60_000`). Larger deltas are split across successive anti-entropy rounds.
+    /// `60_000`) — see [`Config::max_delta_frame_bytes`]. Larger deltas are
+    /// split across successive gossip rounds.
     #[must_use]
-    pub fn max_delta_frame_bytes(mut self, bytes: usize) -> Self {
-        self.config.max_delta_frame_bytes = bytes.max(1);
+    pub fn max_delta_frame_bytes(mut self, bytes: NonZeroUsize) -> Self {
+        self.config.max_delta_frame_bytes = bytes;
         self
     }
 
@@ -153,14 +145,15 @@ impl NodeBuilder {
     /// digests keep the steady-state round proportional to recent churn
     /// instead of membership size — see [`Config::full_digest_every`].
     #[must_use]
-    pub fn full_digest_every(mut self, n: u64) -> Self {
-        self.config.full_digest_every = n.max(1);
+    pub fn full_digest_every(mut self, n: NonZeroU64) -> Self {
+        self.config.full_digest_every = n;
         self
     }
 
-    /// Replaces the full protocol [`Config`] (probe/suspect/dead timings,
-    /// fanout, indirect probes, anti-entropy cadence/fanout/frame cap). The
-    /// narrow per-knob setters remain for the common cases.
+    /// Replaces the full protocol [`Config`] (gossip cadence and fanout,
+    /// probe/suspect/dead timings, indirect probes, frame cap, digest
+    /// cadence, node-wide mode). The narrow per-knob setters remain for the
+    /// common cases. Stored as given; [`start`](Self::start) validates it.
     #[must_use]
     pub fn config(mut self, config: Config) -> Self {
         self.config = config;
@@ -187,9 +180,13 @@ impl NodeBuilder {
     ///
     /// # Errors
     /// Propagates invalid configuration, binding, registration, or security setup failures.
+    /// A group [`Config`] that fails [`Config::validate`] is rejected first, as an
+    /// [`io::ErrorKind::InvalidInput`] error wrapping the
+    /// [`ConfigError`](groupnet_core::ConfigError) that names the field.
     /// # Panics
     /// Requires a Tokio runtime; propagates poisoned internal locks.
     pub async fn start(self) -> io::Result<Node> {
+        self.config.validate()?;
         self.messaging.validate()?;
         let mut seeds = self.seeds;
         seeds.extend(self.network.peers());

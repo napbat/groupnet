@@ -175,7 +175,7 @@ impl ClaimEngine {
         BootstrapError,
     > {
         self.validate_roster(members, claims)?;
-        if participants.len() > self.config.max_members || roster.len() != members.len() {
+        if participants.len() > self.config.max_members.get() || roster.len() != members.len() {
             return Err(BootstrapError::InvalidObservation);
         }
         for (index, (member, exact)) in members.iter().zip(roster).enumerate() {
@@ -202,7 +202,7 @@ impl ClaimEngine {
             };
             let node = &participant.member.node;
             if node.as_str().is_empty()
-                || node.as_str().len() > self.config.max_member_bytes
+                || node.as_str().len() > self.config.max_member_bytes.get()
                 || identity.boot.0 == 0
                 || identity.session == 0
                 || participant.renewal == 0
@@ -230,7 +230,7 @@ impl ClaimEngine {
                 }
                 _ => expiry,
             };
-            if expiry <= self.now || observed.len() >= self.config.max_members {
+            if expiry <= self.now || observed.len() >= self.config.max_members.get() {
                 return Err(BootstrapError::InvalidObservation);
             }
             observed.insert(
@@ -279,9 +279,9 @@ mod tests {
     fn engine() -> ClaimEngine {
         let mut engine = ClaimEngine::new(
             BootstrapConfig {
-                max_members: 2,
-                max_member_bytes: 8,
-                max_scope_bytes: 16,
+                max_members: std::num::NonZeroUsize::new(2).unwrap(),
+                max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                max_scope_bytes: std::num::NonZeroUsize::new(16).unwrap(),
                 settle_ms: 2,
                 renew_ms: 3,
                 claim_ttl_ms: 10,

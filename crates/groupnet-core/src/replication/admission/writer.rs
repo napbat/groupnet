@@ -6,7 +6,7 @@ use crate::Time;
 use crate::replication::{BoundComparison, Comparison, Coverage, Cursor, Scope, SourceProof};
 
 use super::types::{valid_receipt, valid_scope};
-use super::{AdmissionPolicy, AdmissionRef, RecordBinding, SourceReceipt};
+use super::{AdmissionPolicy, AdmissionRef, PolicyError, RecordBinding, SourceReceipt};
 
 /// Durable intent append requested before any origin mutation is dispatched.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,8 +57,10 @@ pub struct AckReceipt {
 /// Rejected writer transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriterError {
-    /// Invalid fleet policy or intent identity.
-    Policy,
+    /// The fleet [`AdmissionPolicy`] is invalid.
+    Policy(PolicyError),
+    /// Operation ID, scope, or session is empty, zero, or oversized.
+    Identity,
     /// The transition is too early or already completed.
     Stage,
     /// Delayed or previous-process message or backward clock.
@@ -69,6 +71,29 @@ pub enum WriterError {
     Backpressure,
     /// Local deadline or token cannot be represented.
     Exhausted,
+}
+
+impl std::fmt::Display for WriterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Policy(_) => "invalid admission policy",
+            Self::Identity => "invalid writer operation ID, scope, or session",
+            Self::Stage => "writer transition is too early or already completed",
+            Self::Stale => "delayed or previous-process message or backward clock",
+            Self::Proof => "invalid source identity, comparison, or certification",
+            Self::Backpressure => "admission roster exceeds its finite bound",
+            Self::Exhausted => "local deadline or token cannot be represented",
+        })
+    }
+}
+
+impl std::error::Error for WriterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Policy(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -106,20 +131,21 @@ impl WriterCore {
     /// core with a new session and repeat the full expiry wait after readback.
     ///
     /// # Errors
-    /// Returns invalid-policy error for empty identity or zero session.
+    /// Returns [`WriterError::Policy`] for an invalid policy or
+    /// [`WriterError::Identity`] for an empty identity or zero session.
     pub fn new(
         scope: Scope,
         policy: AdmissionPolicy,
         session: u64,
         op_id: String,
     ) -> Result<Self, WriterError> {
-        policy.validate().map_err(|_| WriterError::Policy)?;
+        policy.validate().map_err(WriterError::Policy)?;
         if session == 0
             || op_id.is_empty()
-            || op_id.len() > policy.max_cursor_bytes
-            || !valid_scope(&scope, policy.max_cursor_bytes)
+            || op_id.len() > policy.max_cursor_bytes.get()
+            || !valid_scope(&scope, policy.max_cursor_bytes.get())
         {
-            return Err(WriterError::Policy);
+            return Err(WriterError::Identity);
         }
         Ok(Self {
             scope,
@@ -196,23 +222,23 @@ impl WriterCore {
         if roster.is_some() {
             return Err(WriterError::Stage);
         }
-        if receipt.entries.len() > self.policy.max_waiters {
+        if receipt.entries.len() > self.policy.max_waiters.get() {
             return Err(WriterError::Backpressure);
         }
         if receipt
             .proof
-            .validate(&self.scope, self.policy.max_cursor_bytes)
+            .validate(&self.scope, self.policy.max_cursor_bytes.get())
             .is_err()
             || receipt.proof.head.history != self.policy.history
             || receipt.coverage.through != *intent
             || receipt.coverage.proof != receipt.proof.id
             || receipt.coverage.certificate.is_empty()
-            || receipt.coverage.certificate.len() > self.policy.max_cursor_bytes
+            || receipt.coverage.certificate.len() > self.policy.max_cursor_bytes.get()
             || receipt.coverage.from.history != self.policy.history
             || receipt
                 .coverage
                 .from
-                .validate(&self.scope, self.policy.max_cursor_bytes)
+                .validate(&self.scope, self.policy.max_cursor_bytes.get())
                 .is_err()
             || !matches!(
                 receipt.prefix_to_intent.for_operands(
@@ -236,13 +262,13 @@ impl WriterCore {
         for entry in &receipt.entries {
             let admission = &entry.admission;
             if admission.id.reader.is_empty()
-                || admission.id.reader.len() > self.policy.max_cursor_bytes
+                || admission.id.reader.len() > self.policy.max_cursor_bytes.get()
                 || admission.id.incarnation == 0
                 || admission.policy_fingerprint != self.policy.fingerprint
                 || admission.cursor.history != self.policy.history
                 || admission
                     .cursor
-                    .validate(&self.scope, self.policy.max_cursor_bytes)
+                    .validate(&self.scope, self.policy.max_cursor_bytes.get())
                     .is_err()
                 || entry
                     .before_intent

@@ -1,12 +1,14 @@
+use std::num::NonZeroUsize;
+
 use super::*;
 use crate::NodeId;
 use crate::placement;
 
 fn config() -> BootstrapConfig {
     BootstrapConfig {
-        max_members: 8,
-        max_member_bytes: 32,
-        max_scope_bytes: 64,
+        max_members: NonZeroUsize::new(8).unwrap(),
+        max_member_bytes: NonZeroUsize::new(32).unwrap(),
+        max_scope_bytes: NonZeroUsize::new(64).unwrap(),
         settle_ms: 3,
         renew_ms: 4,
         claim_ttl_ms: 12,
@@ -80,21 +82,129 @@ fn scope_encoding_and_constructor_bounds_are_unambiguous() {
     );
     assert_eq!(
         ClaimEngine::new(config(), scope(), NodeId::from("me"), BootId(0), 1).err(),
-        Some(BootstrapError::InvalidConfig)
+        Some(BootstrapError::InvalidIdentity)
     );
+    let error = ClaimEngine::new(
+        BootstrapConfig {
+            max_members: NonZeroUsize::MAX,
+            ..config()
+        },
+        scope(),
+        NodeId::from("me"),
+        BootId(1),
+        1,
+    )
+    .unwrap_err();
     assert_eq!(
-        ClaimEngine::new(
+        error,
+        BootstrapError::Config(BootstrapConfigError::UnboundedMaxMembers)
+    );
+    assert_eq!(error.to_string(), "invalid bootstrap config");
+    assert_eq!(
+        std::error::Error::source(&error).map(ToString::to_string),
+        Some("bootstrap max_members must be below usize::MAX".to_owned())
+    );
+}
+
+#[test]
+fn config_validate_names_each_timer_rule() {
+    assert_eq!(config().validate(), Ok(()));
+    let cases = [
+        (
             BootstrapConfig {
-                max_members: usize::MAX,
+                settle_ms: 0,
                 ..config()
             },
-            scope(),
-            NodeId::from("me"),
-            BootId(1),
-            1
-        )
-        .err(),
-        Some(BootstrapError::InvalidConfig)
+            BootstrapConfigError::ZeroSettle,
+        ),
+        (
+            BootstrapConfig {
+                renew_ms: 0,
+                ..config()
+            },
+            BootstrapConfigError::ZeroRenew,
+        ),
+        (
+            BootstrapConfig {
+                claim_ttl_ms: 4,
+                ..config()
+            },
+            BootstrapConfigError::ClaimTtlNotAboveRenew,
+        ),
+        (
+            BootstrapConfig {
+                observe_ms: 0,
+                ..config()
+            },
+            BootstrapConfigError::ZeroObserve,
+        ),
+        (
+            BootstrapConfig {
+                donor_wait_ms: 0,
+                ..config()
+            },
+            BootstrapConfigError::ZeroDonorWait,
+        ),
+        (
+            BootstrapConfig {
+                total_ms: 0,
+                ..config()
+            },
+            BootstrapConfigError::ZeroTotal,
+        ),
+        (
+            BootstrapConfig {
+                settle_ms: 30,
+                ..config()
+            },
+            BootstrapConfigError::SettleNotBelowTotal,
+        ),
+        (
+            BootstrapConfig {
+                observe_ms: 31,
+                ..config()
+            },
+            BootstrapConfigError::ObserveExceedsTotal,
+        ),
+        (
+            BootstrapConfig {
+                donor_wait_ms: 31,
+                ..config()
+            },
+            BootstrapConfigError::DonorWaitExceedsTotal,
+        ),
+    ];
+    for (config, expected) in cases {
+        assert_eq!(config.validate(), Err(expected));
+    }
+}
+
+#[test]
+fn invalid_transfer_config_is_exposed_as_source() {
+    let mut engine = node("me", 1);
+    let transfer = transfer::TransferConfig {
+        expected_schema: std::num::NonZeroU32::MIN,
+        max_metadata_bytes: NonZeroUsize::new(128).unwrap(),
+        max_encoded_bytes: NonZeroUsize::new(16).unwrap(),
+        max_decoded_bytes: NonZeroUsize::new(16).unwrap(),
+        max_chunk_bytes: NonZeroUsize::new(8).unwrap(),
+        max_chunks: NonZeroUsize::new(4).unwrap(),
+        max_batch_bytes: NonZeroUsize::new(16).unwrap(),
+        max_batch_events: NonZeroUsize::new(4).unwrap(),
+        max_replay_events: NonZeroUsize::new(8).unwrap(),
+        max_native_buffer_bytes: NonZeroUsize::new(16).unwrap(),
+        max_members: NonZeroUsize::new(2).unwrap(),
+        max_cuts: NonZeroUsize::new(2).unwrap(),
+        coverage_poll_ms: 0,
+    };
+    let error = engine.enable_transfer(transfer).unwrap_err();
+    assert_eq!(
+        error,
+        BootstrapError::TransferConfig(transfer::TransferConfigError::ZeroCoveragePoll)
+    );
+    assert_eq!(
+        std::error::Error::source(&error).map(ToString::to_string),
+        Some("transfer coverage_poll_ms must be nonzero".to_owned())
     );
 }
 

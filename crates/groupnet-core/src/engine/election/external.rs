@@ -324,7 +324,8 @@ mod tests {
 
     /// A started engine for `id` in `config`, alone in its group.
     fn started(id: &str, config: Config) -> GroupEngine {
-        let mut engine = GroupEngine::new(GroupId::new(GROUP), n(id), [], config);
+        let mut engine =
+            GroupEngine::new(GroupId::new(GROUP), n(id), [], config).expect("valid config");
         engine.start(Time::ZERO);
         engine
     }

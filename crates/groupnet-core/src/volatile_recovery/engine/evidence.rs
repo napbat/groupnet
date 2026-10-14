@@ -36,8 +36,8 @@ impl RecoveryEngine {
                 }
             }
         }
-        if self.known_heads.len() > self.config.max_members
-            || self.seals.len() > self.config.max_members
+        if self.known_heads.len() > self.config.max_members.get()
+            || self.seals.len() > self.config.max_members.get()
         {
             return Err(RecoveryError::Capacity);
         }

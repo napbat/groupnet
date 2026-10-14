@@ -1,31 +1,109 @@
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Barrier, Mutex};
+
 use super::*;
 use crate::volatile_bootstrap::{
     BootstrapMemberIdentity, BootstrapScope, ClaimIdentity, PresenceIdentity,
 };
 use crate::{NodeId, Status, Time};
-use std::sync::{Arc, Barrier, Mutex};
+
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap()
+}
 
 fn config() -> JournalConfig {
     JournalConfig {
-        max_encoded_bytes: 128,
-        max_decoded_bytes: 128,
-        max_events: 4,
-        max_suffix_bytes: 32,
-        max_event_bytes: 12,
-        max_identity_bytes: 8,
-        max_followers: 2,
-        max_follower_id_bytes: 8,
-        max_cuts: 2,
-        max_cut_bytes: 16,
-        max_members: 3,
-        max_membership_bytes: 24,
-        max_scope_bytes: 16,
-        max_batch_events: 2,
-        max_batch_bytes: 16,
-        max_inflight_bytes: 32,
+        max_encoded_bytes: nz(128),
+        max_decoded_bytes: nz(128),
+        max_events: nz(4),
+        max_suffix_bytes: nz(32),
+        max_event_bytes: nz(12),
+        max_identity_bytes: nz(8),
+        max_followers: nz(2),
+        max_follower_id_bytes: nz(8),
+        max_cuts: nz(2),
+        max_cut_bytes: nz(16),
+        max_members: nz(3),
+        max_membership_bytes: nz(24),
+        max_scope_bytes: nz(16),
+        max_batch_events: nz(2),
+        max_batch_bytes: nz(16),
+        max_inflight_bytes: nz(32),
         max_total_ms: 30,
         max_follower_ms: 12,
     }
+}
+
+#[test]
+fn config_validate_names_each_rule() {
+    assert_eq!(config().validate(), Ok(()));
+    let cases = [
+        (
+            JournalConfig {
+                max_total_ms: 0,
+                ..config()
+            },
+            JournalConfigError::ZeroMaxTotal,
+        ),
+        (
+            JournalConfig {
+                max_follower_ms: 0,
+                ..config()
+            },
+            JournalConfigError::ZeroMaxFollower,
+        ),
+        (
+            JournalConfig {
+                max_follower_ms: 31,
+                ..config()
+            },
+            JournalConfigError::FollowerExceedsTotal,
+        ),
+        (
+            JournalConfig {
+                max_suffix_bytes: nz(11),
+                ..config()
+            },
+            JournalConfigError::EventExceedsSuffix,
+        ),
+        (
+            JournalConfig {
+                max_batch_bytes: nz(11),
+                ..config()
+            },
+            JournalConfigError::EventExceedsBatch,
+        ),
+        (
+            JournalConfig {
+                max_inflight_bytes: nz(15),
+                ..config()
+            },
+            JournalConfigError::BatchExceedsInflight,
+        ),
+        (
+            JournalConfig {
+                max_identity_bytes: nz(13),
+                ..config()
+            },
+            JournalConfigError::IdentityExceedsEvent,
+        ),
+        (
+            JournalConfig {
+                max_followers: NonZeroUsize::MAX,
+                ..config()
+            },
+            JournalConfigError::StorageBoundOverflow,
+        ),
+    ];
+    for (config, expected) in cases {
+        assert_eq!(config.validate(), Err(expected));
+    }
+    let error = JournalError::Config(JournalConfigError::ZeroMaxTotal);
+    assert_eq!(error.to_string(), "invalid journal config");
+    assert_eq!(
+        std::error::Error::source(&error).map(ToString::to_string),
+        Some("journal max_total_ms must be nonzero".to_owned())
+    );
 }
 
 fn identity(name: &str, session: u64) -> ClaimIdentity {
@@ -138,7 +216,7 @@ fn encoding_phase_overflow_or_cancel_cannot_finish_or_advertise() {
             Time(2),
             2,
             local("x"),
-            vec![1; config().max_event_bytes + 1]
+            vec![1; config().max_event_bytes.get() + 1]
         ),
         Err(JournalError::Capacity)
     );
@@ -178,16 +256,18 @@ fn encoding_phase_overflow_or_cancel_cannot_finish_or_advertise() {
 #[test]
 fn whole_journal_charge_is_finite_and_rejects_oversized_retained_vectors() {
     let bound = DonorJournal::storage_bound(config()).unwrap();
-    assert!(bound > config().max_suffix_bytes);
+    assert!(bound > config().max_suffix_bytes.get());
     let mut impossible = config();
-    impossible.max_followers = usize::MAX;
+    impossible.max_followers = NonZeroUsize::MAX;
     assert_eq!(
         DonorJournal::storage_bound(impossible),
-        Err(JournalError::InvalidConfig)
+        Err(JournalError::Config(
+            JournalConfigError::StorageBoundOverflow
+        ))
     );
 
     let mut journal = DonorJournal::new(config(), capture_id()).unwrap();
-    let mut oversized_members = Vec::with_capacity(2 * config().max_members + 1);
+    let mut oversized_members = Vec::with_capacity(2 * config().max_members.get() + 1);
     oversized_members.extend(members());
     assert_eq!(
         journal.begin_capture(Time(1), 1, 1, oversized_members, cuts()),
@@ -196,16 +276,16 @@ fn whole_journal_charge_is_finite_and_rejects_oversized_retained_vectors() {
     assert_eq!(journal.state(), JournalState::Invalidated);
 
     let mut oversized_scope = capture_id();
-    let mut domain = String::with_capacity(config().max_scope_bytes + 1);
+    let mut domain = String::with_capacity(config().max_scope_bytes.get() + 1);
     domain.push('o');
     oversized_scope.scope.domain = domain;
     assert!(matches!(
         DonorJournal::new(config(), oversized_scope),
-        Err(JournalError::InvalidConfig)
+        Err(JournalError::InvalidIdentity)
     ));
 
     let mut journal = DonorJournal::new(config(), capture_id()).unwrap();
-    let mut oversized_writer = Vec::with_capacity(config().max_cut_bytes + 1);
+    let mut oversized_writer = Vec::with_capacity(config().max_cut_bytes.get() + 1);
     oversized_writer.push(b'w');
     assert_eq!(
         journal.begin_capture(
@@ -224,7 +304,7 @@ fn whole_journal_charge_is_finite_and_rejects_oversized_retained_vectors() {
     assert_eq!(journal.state(), JournalState::Invalidated);
 
     let (mut journal, _) = captured();
-    let mut oversized_effect = Vec::with_capacity(config().max_event_bytes + 1);
+    let mut oversized_effect = Vec::with_capacity(config().max_event_bytes.get() + 1);
     oversized_effect.push(1);
     assert_eq!(
         journal.append(

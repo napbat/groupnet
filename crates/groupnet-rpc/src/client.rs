@@ -2,9 +2,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,8 +15,8 @@ use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::codec::{Encoded, Frame, REQUEST_HEAD};
-use crate::config::{FrameLimit, MAX_TIMEOUT, RpcConfig};
-use crate::{RpcError, RpcStatus, write_frames};
+use crate::config::{FrameLimit, MAX_TIMEOUT, RpcConfig, RpcConfigError};
+use crate::{RpcError, RpcStatus, lock, write_frames};
 
 /// The calling side of the RPC layer. Cheap to clone; every clone shares the
 /// same connections.
@@ -88,20 +87,30 @@ struct CallsState {
     idle_since: Instant,
 }
 
-/// Locks a mutex whose data stays consistent across a panic: every critical
-/// section here is a single map or flag update.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 impl<B: BulkTransport> RpcClient<B> {
-    /// A client that opens its connections on `plane`.
+    /// A client that opens its connections on `plane` under
+    /// [`RpcConfig::default`].
+    ///
+    /// The client is a value over a shared plane, not a socket owner: it
+    /// never calls [`DataPlane::accept`], so `plane` (or a clone of it) stays
+    /// free for any other connecting or accepting consumer on the node.
+    #[must_use]
+    pub fn new(plane: DataPlane<B>) -> Self {
+        Self::validated(plane, RpcConfig::default())
+    }
+
+    /// [`new`](Self::new) with explicit limits.
     ///
     /// # Errors
-    /// `InvalidInput` if `config` fails [`RpcConfig::validate`].
-    pub fn new(plane: DataPlane<B>, config: RpcConfig) -> io::Result<Self> {
+    /// The [`RpcConfigError`] naming the field `config` violates; nothing is
+    /// clamped.
+    pub fn with_config(plane: DataPlane<B>, config: RpcConfig) -> Result<Self, RpcConfigError> {
         config.validate()?;
-        Ok(Self {
+        Ok(Self::validated(plane, config))
+    }
+
+    fn validated(plane: DataPlane<B>, config: RpcConfig) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 plane,
                 config,
@@ -109,7 +118,7 @@ impl<B: BulkTransport> RpcClient<B> {
                 next_id: AtomicU64::new(0),
                 shut: AtomicBool::new(false),
             }),
-        })
+        }
     }
 
     /// Calls `to` with `payload` and waits up to `timeout` for its answer.

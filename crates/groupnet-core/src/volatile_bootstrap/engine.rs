@@ -107,7 +107,9 @@ impl ClaimEngine {
     /// fresh across process restarts for the same node and nonzero.
     ///
     /// # Errors
-    /// Rejects invalid limits, scope/identity bytes, or zero correlation IDs.
+    /// Returns [`BootstrapError::Config`] for invalid limits or
+    /// [`BootstrapError::InvalidIdentity`] for invalid scope/identity bytes or
+    /// zero correlation IDs.
     pub fn new(
         config: BootstrapConfig,
         scope: BootstrapScope,
@@ -115,21 +117,21 @@ impl ClaimEngine {
         boot_incarnation: BootId,
         session: u64,
     ) -> Result<Self, BootstrapError> {
-        let config = config.validate()?;
+        config.validate().map_err(BootstrapError::Config)?;
         let names = scope
             .domain
             .len()
             .checked_add(scope.partition.len())
-            .ok_or(BootstrapError::InvalidConfig)?;
+            .ok_or(BootstrapError::InvalidIdentity)?;
         if scope.domain.is_empty()
             || scope.partition.is_empty()
-            || names > config.max_scope_bytes
+            || names > config.max_scope_bytes.get()
             || me.as_str().is_empty()
-            || me.as_str().len() > config.max_member_bytes
+            || me.as_str().len() > config.max_member_bytes.get()
             || boot_incarnation.0 == 0
             || session == 0
         {
-            return Err(BootstrapError::InvalidConfig);
+            return Err(BootstrapError::InvalidIdentity);
         }
         Ok(Self {
             config,
@@ -429,8 +431,8 @@ impl ClaimEngine {
         }
         effects.push(BootstrapEffect::ObserveClaims {
             op,
-            max_members: self.config.max_members,
-            max_member_bytes: self.config.max_member_bytes,
+            max_members: self.config.max_members.get(),
+            max_member_bytes: self.config.max_member_bytes.get(),
         });
         self.ok(effects)
     }
@@ -535,8 +537,8 @@ impl ClaimEngine {
         claims: &[BootstrapClaim],
     ) -> Result<(), BootstrapError> {
         if members.is_empty()
-            || members.len() > self.config.max_members
-            || claims.len() > self.config.max_members
+            || members.len() > self.config.max_members.get()
+            || claims.len() > self.config.max_members.get()
         {
             return Err(BootstrapError::InvalidObservation);
         }
@@ -544,7 +546,7 @@ impl ClaimEngine {
         let mut all = BTreeSet::new();
         for member in members {
             if member.node.as_str().is_empty()
-                || member.node.as_str().len() > self.config.max_member_bytes
+                || member.node.as_str().len() > self.config.max_member_bytes.get()
                 || !all.insert(member.node.clone())
             {
                 return Err(BootstrapError::InvalidObservation);
@@ -561,7 +563,7 @@ impl ClaimEngine {
         for claim in claims {
             let id = &claim.identity;
             if id.node.as_str().is_empty()
-                || id.node.as_str().len() > self.config.max_member_bytes
+                || id.node.as_str().len() > self.config.max_member_bytes.get()
                 || id.incarnation.0 == 0
                 || id.session == 0
                 || id.attempt == 0
@@ -623,7 +625,7 @@ impl ClaimEngine {
             }
             None => new_expiry,
         };
-        if !self.observed.contains_key(id) && self.observed.len() >= self.config.max_members {
+        if !self.observed.contains_key(id) && self.observed.len() >= self.config.max_members.get() {
             return Err(BootstrapError::InvalidObservation);
         }
         self.observed.insert(
@@ -701,7 +703,7 @@ impl ClaimEngine {
                 && let Some(selected) = self.selected.clone()
             {
                 let released = self.release_stalled(selected);
-                if self.excluded.len() > self.config.max_members {
+                if self.excluded.len() > self.config.max_members.get() {
                     let mut ended = self.terminate();
                     ended.effects.insert(0, released);
                     return ended;

@@ -311,22 +311,22 @@ struct OriginDonor {
 
 fn journal_config() -> JournalConfig {
     JournalConfig {
-        max_encoded_bytes: 8,
-        max_decoded_bytes: 8,
-        max_events: 8,
-        max_suffix_bytes: 64,
-        max_event_bytes: 8,
-        max_identity_bytes: 4,
-        max_followers: 2,
-        max_follower_id_bytes: 8,
-        max_cuts: 1,
-        max_cut_bytes: 8,
-        max_members: 1,
-        max_membership_bytes: 8,
-        max_scope_bytes: 8,
-        max_batch_events: 2,
-        max_batch_bytes: 8,
-        max_inflight_bytes: 8,
+        max_encoded_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_decoded_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_events: std::num::NonZeroUsize::new(8).unwrap(),
+        max_suffix_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        max_event_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_identity_bytes: std::num::NonZeroUsize::new(4).unwrap(),
+        max_followers: std::num::NonZeroUsize::new(2).unwrap(),
+        max_follower_id_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_cuts: std::num::NonZeroUsize::new(1).unwrap(),
+        max_cut_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_members: std::num::NonZeroUsize::new(1).unwrap(),
+        max_membership_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_scope_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_batch_events: std::num::NonZeroUsize::new(2).unwrap(),
+        max_batch_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_inflight_bytes: std::num::NonZeroUsize::new(8).unwrap(),
         max_total_ms: 1_000,
         max_follower_ms: 500,
     }
@@ -444,8 +444,8 @@ impl DonorPort for OriginDonor {
                 .reserve(AdmissionClass::Decoded, 1)
                 .map_err(|_| AdapterError)?;
             let config = JournalConfig {
-                max_members: 2,
-                max_membership_bytes: 128,
+                max_members: std::num::NonZeroUsize::new(2).unwrap(),
+                max_membership_bytes: std::num::NonZeroUsize::new(128).unwrap(),
                 ..journal_config()
             };
             let suffix = admission
@@ -642,9 +642,9 @@ impl RecoveryAdapter for ReadAdapter {
 fn bootstrap_config() -> BootstrapRuntimeConfig {
     BootstrapRuntimeConfig {
         claim: BootstrapConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_scope_bytes: 8,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             settle_ms: 3,
             renew_ms: 100,
             claim_ttl_ms: 500,
@@ -653,18 +653,18 @@ fn bootstrap_config() -> BootstrapRuntimeConfig {
             total_ms: 800,
         },
         transfer: TransferConfig {
-            expected_schema: 1,
-            max_metadata_bytes: 128,
-            max_encoded_bytes: 8,
-            max_decoded_bytes: 8,
-            max_chunk_bytes: 8,
-            max_chunks: 2,
-            max_batch_bytes: 8,
-            max_batch_events: 2,
-            max_replay_events: 8,
-            max_native_buffer_bytes: 8,
-            max_members: 2,
-            max_cuts: 1,
+            expected_schema: std::num::NonZeroU32::new(1).unwrap(),
+            max_metadata_bytes: std::num::NonZeroUsize::new(128).unwrap(),
+            max_encoded_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_decoded_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_chunk_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_chunks: std::num::NonZeroUsize::new(2).unwrap(),
+            max_batch_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_batch_events: std::num::NonZeroUsize::new(2).unwrap(),
+            max_replay_events: std::num::NonZeroUsize::new(8).unwrap(),
+            max_native_buffer_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_cuts: std::num::NonZeroUsize::new(1).unwrap(),
             coverage_poll_ms: 5,
         },
         max_claim_metadata_bytes: 128,

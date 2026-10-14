@@ -40,9 +40,9 @@ fn peer(sequence: u64) -> Peer {
 fn ready_local(seed: u64) -> (RecoveryEngine, RecoveryOperation) {
     let mut engine = RecoveryEngine::new(
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 30,
             attempt_ms: 10,
             settle_ms: 2,

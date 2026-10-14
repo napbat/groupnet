@@ -43,9 +43,9 @@ async fn progressing_local_build_outlives_fixed_bounds_and_keeps_its_claim_live(
     let handle = RecoveryHandle::open_with_bootstrap_and_rearm(
         Arc::clone(&adapter),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 600,
             attempt_ms: 300,
             settle_ms: 5,

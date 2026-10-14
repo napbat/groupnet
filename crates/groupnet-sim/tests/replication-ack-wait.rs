@@ -55,10 +55,10 @@ fn request() -> AckWaitRequest {
 
 fn limits() -> AckWaitLimits {
     AckWaitLimits {
-        max_required: 2,
-        max_identity_bytes: 64,
-        max_certificate_bytes: 64,
-        max_metadata_bytes: 512,
+        max_required: std::num::NonZeroUsize::new(2).unwrap(),
+        max_identity_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        max_certificate_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        max_metadata_bytes: std::num::NonZeroUsize::new(512).unwrap(),
         max_wait_ms: 40,
         poll_ms: 3,
     }

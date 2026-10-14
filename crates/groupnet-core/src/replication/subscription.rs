@@ -1,6 +1,7 @@
 //! Bounded, source-native identities and receipts for durable subscriptions.
 
-use std::num::NonZeroU64;
+use std::fmt;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use super::{
     BoundComparison, Comparison, Cursor, IdentityError, Scope, SourceHistory, SourceProof,
@@ -28,68 +29,130 @@ pub struct SubscriberKey {
 }
 
 /// Source-enforced finite retention promise for one named subscriber.
+///
+/// Byte and event budgets are nonzero by type; [`RetentionPolicy::validate`]
+/// checks the fingerprint and the age budget. A request additionally bounds
+/// every field by the session's [`SubscriptionLimits`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetentionPolicy {
-    /// Stable canonical fingerprint of the source's configured policy.
+    /// Stable canonical fingerprint of the source's configured policy; nonempty.
     pub fingerprint: Vec<u8>,
     /// Maximum protected suffix bytes before explicit terminal expiry.
-    pub max_bytes: u64,
+    pub max_bytes: NonZeroU64,
     /// Maximum protected native events before explicit terminal expiry.
-    pub max_events: u64,
-    /// Maximum age of an unacknowledged native event, in logical milliseconds.
+    pub max_events: NonZeroU64,
+    /// Maximum age of an unacknowledged native event, in logical
+    /// milliseconds; nonzero.
     pub max_age_ms: u64,
     /// Maximum native event lag before explicit terminal expiry.
-    pub max_lag_events: u64,
+    pub max_lag_events: NonZeroU64,
+}
+
+/// Invalid [`RetentionPolicy`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionPolicyError {
+    /// [`RetentionPolicy::fingerprint`] is empty.
+    EmptyFingerprint,
+    /// [`RetentionPolicy::max_age_ms`] is zero.
+    ZeroMaxAge,
+}
+
+impl fmt::Display for RetentionPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EmptyFingerprint => "retention policy fingerprint must be nonempty",
+            Self::ZeroMaxAge => "retention policy max_age_ms must be nonzero",
+        })
+    }
+}
+
+impl std::error::Error for RetentionPolicyError {}
+
+impl RetentionPolicy {
+    /// Checks the policy's own rules, independent of session limits.
+    ///
+    /// # Errors
+    /// Returns the [`RetentionPolicyError`] variant naming the first violated rule.
+    pub fn validate(&self) -> Result<(), RetentionPolicyError> {
+        if self.fingerprint.is_empty() {
+            return Err(RetentionPolicyError::EmptyFingerprint);
+        }
+        if self.max_age_ms == 0 {
+            return Err(RetentionPolicyError::ZeroMaxAge);
+        }
+        Ok(())
+    }
 }
 
 /// Finite identity and retained-history bounds for one subscription session.
+///
+/// Byte and event caps are nonzero by type; [`SubscriptionLimits::validate`]
+/// checks the age cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubscriptionLimits {
     /// Maximum UTF-8 subscriber name bytes.
-    pub max_subscriber_bytes: usize,
+    pub max_subscriber_bytes: NonZeroUsize,
     /// Maximum stable request identifier bytes.
-    pub max_request_bytes: usize,
+    pub max_request_bytes: NonZeroUsize,
     /// Maximum source-native opaque epoch bytes.
-    pub max_epoch_bytes: usize,
+    pub max_epoch_bytes: NonZeroUsize,
     /// Maximum canonical retention-policy fingerprint bytes.
-    pub max_policy_bytes: usize,
+    pub max_policy_bytes: NonZeroUsize,
     /// Maximum protected suffix bytes advertised in a policy.
-    pub max_retained_bytes: u64,
+    pub max_retained_bytes: NonZeroU64,
     /// Maximum protected event count advertised in a policy.
-    pub max_retained_events: u64,
-    /// Maximum protected event age advertised in a policy.
+    pub max_retained_events: NonZeroU64,
+    /// Maximum protected event age advertised in a policy, in logical
+    /// milliseconds; nonzero.
     pub max_retained_age_ms: u64,
     /// Maximum event lag advertised in a policy.
-    pub max_lag_events: u64,
+    pub max_lag_events: NonZeroU64,
 }
 
 impl Default for SubscriptionLimits {
     fn default() -> Self {
         Self {
-            max_subscriber_bytes: 256,
-            max_request_bytes: 256,
-            max_epoch_bytes: 256,
-            max_policy_bytes: 256,
-            max_retained_bytes: 64 * 1024 * 1024,
-            max_retained_events: 1_000_000,
+            max_subscriber_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_request_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_epoch_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_policy_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_retained_bytes: const { NonZeroU64::new(64 * 1024 * 1024).unwrap() },
+            max_retained_events: const { NonZeroU64::new(1_000_000).unwrap() },
             max_retained_age_ms: 24 * 60 * 60 * 1000,
-            max_lag_events: 1_000_000,
+            max_lag_events: const { NonZeroU64::new(1_000_000).unwrap() },
         }
     }
 }
 
+/// Invalid [`SubscriptionLimits`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionLimitsError {
+    /// [`SubscriptionLimits::max_retained_age_ms`] is zero.
+    ZeroMaxRetainedAge,
+}
+
+impl fmt::Display for SubscriptionLimitsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroMaxRetainedAge => {
+                f.write_str("subscription max_retained_age_ms must be nonzero")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubscriptionLimitsError {}
+
 impl SubscriptionLimits {
-    /// Returns whether every bound is positive and usable.
-    #[must_use]
-    pub fn valid(self) -> bool {
-        self.max_subscriber_bytes > 0
-            && self.max_request_bytes > 0
-            && self.max_epoch_bytes > 0
-            && self.max_policy_bytes > 0
-            && self.max_retained_bytes > 0
-            && self.max_retained_events > 0
-            && self.max_retained_age_ms > 0
-            && self.max_lag_events > 0
+    /// Checks that the retained-age cap admits a policy.
+    ///
+    /// # Errors
+    /// Returns [`SubscriptionLimitsError::ZeroMaxRetainedAge`] for a zero age cap.
+    pub fn validate(&self) -> Result<(), SubscriptionLimitsError> {
+        if self.max_retained_age_ms == 0 {
+            return Err(SubscriptionLimitsError::ZeroMaxRetainedAge);
+        }
+        Ok(())
     }
 }
 
@@ -100,20 +163,16 @@ fn validate_request_metadata(
     max_cursor_bytes: usize,
     limits: SubscriptionLimits,
 ) -> Result<(), SubscriptionError> {
-    if !limits.valid()
-        || key.subscriber.name.is_empty()
-        || key.subscriber.name.len() > limits.max_subscriber_bytes
+    limits.validate().map_err(SubscriptionError::Limits)?;
+    policy.validate().map_err(SubscriptionError::Retention)?;
+    if key.subscriber.name.is_empty()
+        || key.subscriber.name.len() > limits.max_subscriber_bytes.get()
         || request_id.is_empty()
-        || request_id.len() > limits.max_request_bytes
-        || policy.fingerprint.is_empty()
-        || policy.fingerprint.len() > limits.max_policy_bytes
-        || policy.max_bytes == 0
+        || request_id.len() > limits.max_request_bytes.get()
+        || policy.fingerprint.len() > limits.max_policy_bytes.get()
         || policy.max_bytes > limits.max_retained_bytes
-        || policy.max_events == 0
         || policy.max_events > limits.max_retained_events
-        || policy.max_age_ms == 0
         || policy.max_age_ms > limits.max_retained_age_ms
-        || policy.max_lag_events == 0
         || policy.max_lag_events > limits.max_lag_events
     {
         return Err(SubscriptionError::Bounds);
@@ -128,7 +187,11 @@ fn validate_request_metadata(
 pub enum SubscriptionError {
     /// Scope or native cursor has invalid identity or exceeds its bound.
     Identity(IdentityError),
-    /// A required finite field is empty, zero, or too large.
+    /// The session's [`SubscriptionLimits`] are invalid.
+    Limits(SubscriptionLimitsError),
+    /// The requested [`RetentionPolicy`] is invalid on its own.
+    Retention(RetentionPolicyError),
+    /// A required finite field is empty, zero, or exceeds its limit.
     Bounds,
     /// Source-native history differs from the registered history.
     History,
@@ -146,6 +209,36 @@ pub enum SubscriptionError {
     Expired,
     /// Durable fence ordinal history was lost, reused, or exhausted.
     FenceLost,
+}
+
+impl fmt::Display for SubscriptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Identity(_) => "invalid subscription scope or cursor identity",
+            Self::Limits(_) => "invalid subscription limits",
+            Self::Retention(_) => "invalid retention policy",
+            Self::Bounds => "a subscription field is empty, zero, or exceeds its limit",
+            Self::History => "source history differs from the registered history",
+            Self::Binding => "reply does not bind the exact request, policy, or key",
+            Self::Unsupported => "source cannot protect the requested retained suffix",
+            Self::HistoryUnavailable => "requested native history is unavailable",
+            Self::Backpressured => "source or sink cannot admit the retention budget",
+            Self::ConditionalMismatch => "conditional registration found a different prior epoch",
+            Self::Expired => "source expired this subscriber before the requested cursor",
+            Self::FenceLost => "durable fence ordinal history was lost, reused, or exhausted",
+        })
+    }
+}
+
+impl std::error::Error for SubscriptionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Identity(error) => Some(error),
+            Self::Limits(error) => Some(error),
+            Self::Retention(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// Exact request that must be read back by the same stable ID after ambiguity.
@@ -349,15 +442,15 @@ impl SourceSubscriberState {
         if self.key != *key {
             return Err(SubscriptionError::Binding);
         }
-        if !limits.valid()
-            || key.subscriber.name.is_empty()
-            || key.subscriber.name.len() > limits.max_subscriber_bytes
+        limits.validate().map_err(SubscriptionError::Limits)?;
+        if key.subscriber.name.is_empty()
+            || key.subscriber.name.len() > limits.max_subscriber_bytes.get()
             || self.policy_fingerprint.is_empty()
-            || self.policy_fingerprint.len() > limits.max_policy_bytes
+            || self.policy_fingerprint.len() > limits.max_policy_bytes.get()
         {
             return Err(SubscriptionError::Bounds);
         }
-        if self.epoch.native.is_empty() || self.epoch.native.len() > limits.max_epoch_bytes {
+        if self.epoch.native.is_empty() || self.epoch.native.len() > limits.max_epoch_bytes.get() {
             return Err(SubscriptionError::Bounds);
         }
         self.acknowledged
@@ -412,7 +505,7 @@ impl RegisterReceipt {
         {
             return Err(SubscriptionError::Binding);
         }
-        if self.epoch.native.is_empty() || self.epoch.native.len() > limits.max_epoch_bytes {
+        if self.epoch.native.is_empty() || self.epoch.native.len() > limits.max_epoch_bytes.get() {
             return Err(SubscriptionError::Bounds);
         }
         if request
@@ -534,10 +627,10 @@ mod tests {
             },
             policy: RetentionPolicy {
                 fingerprint: vec![9],
-                max_bytes: 100,
-                max_events: 10,
+                max_bytes: NonZeroU64::new(100).unwrap(),
+                max_events: NonZeroU64::new(10).unwrap(),
                 max_age_ms: 1000,
-                max_lag_events: 10,
+                max_lag_events: NonZeroU64::new(10).unwrap(),
             },
             request_id: vec![3],
             expected_prior_ordinal: None,
@@ -599,6 +692,56 @@ mod tests {
         assert_eq!(
             receipt.validate_against(&request, 256, limits),
             Err(SubscriptionError::History)
+        );
+    }
+
+    #[test]
+    fn limits_and_policy_validate_their_own_rules() {
+        let limits = SubscriptionLimits::default();
+        assert_eq!(limits.validate(), Ok(()));
+        let zero_age = SubscriptionLimits {
+            max_retained_age_ms: 0,
+            ..limits
+        };
+        assert_eq!(
+            zero_age.validate(),
+            Err(SubscriptionLimitsError::ZeroMaxRetainedAge)
+        );
+        let request = request();
+        assert_eq!(
+            request.validate(256, zero_age),
+            Err(SubscriptionError::Limits(
+                SubscriptionLimitsError::ZeroMaxRetainedAge
+            ))
+        );
+        let error = SubscriptionError::Limits(SubscriptionLimitsError::ZeroMaxRetainedAge);
+        let source = std::error::Error::source(&error).expect("nested limits error");
+        assert_eq!(
+            source.to_string(),
+            "subscription max_retained_age_ms must be nonzero"
+        );
+        assert_eq!(error.to_string(), "invalid subscription limits");
+
+        let mut policy = request.policy.clone();
+        assert_eq!(policy.validate(), Ok(()));
+        policy.max_age_ms = 0;
+        assert_eq!(policy.validate(), Err(RetentionPolicyError::ZeroMaxAge));
+        policy.max_age_ms = 1000;
+        policy.fingerprint.clear();
+        assert_eq!(
+            policy.validate(),
+            Err(RetentionPolicyError::EmptyFingerprint)
+        );
+        let mut empty = request.clone();
+        empty.policy = policy;
+        let error = empty.validate(256, limits).expect_err("empty fingerprint");
+        assert_eq!(
+            error,
+            SubscriptionError::Retention(RetentionPolicyError::EmptyFingerprint)
+        );
+        assert_eq!(
+            std::error::Error::source(&error).map(ToString::to_string),
+            Some("retention policy fingerprint must be nonempty".to_owned())
         );
     }
 }

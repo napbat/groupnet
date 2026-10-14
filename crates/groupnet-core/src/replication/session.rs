@@ -77,7 +77,8 @@ impl SessionEngine {
     /// responses from an earlier incarnation can still arrive.
     ///
     /// # Errors
-    /// Returns [`ConfigError::Zero`] for zero budgets/session incarnation or
+    /// Returns the [`ConfigError`] from [`Config::validate`],
+    /// [`ConfigError::ZeroSession`] for a zero `session_id`, or
     /// [`ConfigError::Identity`] for an invalid scope.
     pub fn new(
         scope: Scope,
@@ -85,12 +86,12 @@ impl SessionEngine {
         config: Config,
         session_id: u64,
     ) -> Result<Self, ConfigError> {
-        let config = config.validate()?;
+        config.validate()?;
         if session_id == 0 {
-            return Err(ConfigError::Zero);
+            return Err(ConfigError::ZeroSession);
         }
         scope
-            .validate(config.max_cursor_bytes)
+            .validate(config.max_cursor_bytes.get())
             .map_err(ConfigError::Identity)?;
         Ok(Self {
             session_id,
@@ -375,8 +376,8 @@ impl SessionEngine {
             Effect::Scan {
                 op,
                 from,
-                max_events: self.config.max_batch_events,
-                max_bytes: self.config.max_batch_bytes,
+                max_events: self.config.max_batch_events.get(),
+                max_bytes: self.config.max_batch_bytes.get(),
             },
             Effect::ArmTimer(self.next_deadline().expect("issued deadline")),
         ])

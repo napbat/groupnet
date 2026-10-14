@@ -1,3 +1,5 @@
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+
 use super::*;
 use crate::replication::{SourceHistory, Stream};
 
@@ -62,10 +64,10 @@ fn make_request() -> AckWaitRequest {
 
 fn limits() -> AckWaitLimits {
     AckWaitLimits {
-        max_required: 2,
-        max_identity_bytes: 64,
-        max_certificate_bytes: 64,
-        max_metadata_bytes: 1024,
+        max_required: NonZeroUsize::new(2).unwrap(),
+        max_identity_bytes: NonZeroUsize::new(64).unwrap(),
+        max_certificate_bytes: NonZeroUsize::new(64).unwrap(),
+        max_metadata_bytes: NonZeroUsize::new(1024).unwrap(),
         max_wait_ms: 20,
         poll_ms: 3,
     }
@@ -228,6 +230,19 @@ fn roster_is_bounded_and_cannot_change_target_or_reuse_name() {
     assert_eq!(
         AckWait::new(&scope(), op(), request, limits(), Time(0)).unwrap_err(),
         AckWaitError::Deadline
+    );
+    let invalid = AckWaitLimits {
+        poll_ms: 21,
+        ..limits()
+    };
+    let error = AckWait::new(&scope(), op(), make_request(), invalid, Time(0)).unwrap_err();
+    assert_eq!(
+        error,
+        AckWaitError::Limits(super::super::super::AckWaitLimitsError::PollExceedsMaxWait)
+    );
+    assert_eq!(
+        std::error::Error::source(&error).map(ToString::to_string),
+        Some("ack wait poll_ms must not exceed max_wait_ms".to_owned())
     );
 }
 
@@ -446,11 +461,11 @@ fn simultaneous_ack_poll_and_snapshot_deadlines_process_both() {
     let mut config = super::super::super::Config {
         attempt_timeout_ms: 5,
         snapshot: Some(super::super::super::SnapshotConfig {
-            max_metadata_bytes: 512,
-            max_snapshot_bytes: 16,
-            max_chunks: 4,
-            max_chunk_bytes: 4,
-            max_candidate_bytes: 32,
+            max_metadata_bytes: NonZeroUsize::new(512).unwrap(),
+            max_snapshot_bytes: NonZeroU64::new(16).unwrap(),
+            max_chunks: NonZeroU32::new(4).unwrap(),
+            max_chunk_bytes: NonZeroUsize::new(4).unwrap(),
+            max_candidate_bytes: NonZeroU64::new(32).unwrap(),
             max_total_ms: 5,
         }),
         ..super::super::super::Config::default()

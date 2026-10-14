@@ -12,7 +12,7 @@
 //! cargo bench -p groupnet-core --bench placement
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use divan::Bencher;
 
@@ -40,7 +40,7 @@ fn member_set(members: usize) -> BTreeSet<NodeId> {
     (0..members).map(node).collect()
 }
 
-fn weighted(members: usize, weight: u32) -> Vec<(NodeId, u32)> {
+fn weighted(members: usize, weight: u32) -> BTreeMap<NodeId, u32> {
     (0..members).map(|i| (node(i), weight)).collect()
 }
 

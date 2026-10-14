@@ -133,13 +133,13 @@ where
         };
         let source = Arc::clone(&self.manager.source);
         let limit = TailLimit {
-            events: self.manager.limits.core.max_batch_events,
-            bytes: self.manager.limits.core.max_batch_bytes,
+            events: self.manager.limits.core.max_batch_events.get(),
+            bytes: self.manager.limits.core.max_batch_bytes.get(),
         };
         let result = self
             .source_call_charged(
                 due,
-                self.manager.limits.core.max_batch_bytes,
+                self.manager.limits.core.max_batch_bytes.get(),
                 source.subscriber_tail(registration, position, limit),
             )
             .await;
@@ -246,9 +246,9 @@ where
             native,
         } = source_batch;
         if events == 0
-            || events > self.manager.limits.core.max_batch_events
+            || events > self.manager.limits.core.max_batch_events.get()
             || bytes == 0
-            || bytes > self.manager.limits.core.max_batch_bytes
+            || bytes > self.manager.limits.core.max_batch_bytes.get()
         {
             self.conclusive(op, SubscriptionError::Backpressured);
             return;

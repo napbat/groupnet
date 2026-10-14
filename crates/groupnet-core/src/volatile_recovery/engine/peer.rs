@@ -21,11 +21,11 @@ impl RecoveryEngine {
         let reservation = &coverage.barrier.reservation;
         let capture = &reservation.capture;
         handoff.recovery == op
-            && coverage.members.len() <= self.config.max_members.saturating_add(1)
+            && coverage.members.len() <= self.config.max_members.get().saturating_add(1)
             && coverage
                 .members
                 .iter()
-                .all(|identity| identity.valid_bounded(self.config.max_member_bytes))
+                .all(|identity| identity.valid_bounded(self.config.max_member_bytes.get()))
             && coverage
                 .members
                 .windows(2)
@@ -74,11 +74,11 @@ impl RecoveryEngine {
         peers: &[Peer],
         identities: &[BootstrapMemberIdentity],
     ) -> bool {
-        if identities.len() > self.config.max_members.saturating_add(1)
+        if identities.len() > self.config.max_members.get().saturating_add(1)
             || !same_membership(identities, &self.peer_members)
             || identities
                 .iter()
-                .any(|identity| !identity.valid_bounded(self.config.max_member_bytes))
+                .any(|identity| !identity.valid_bounded(self.config.max_member_bytes.get()))
             || identities
                 .windows(2)
                 .any(|pair| pair[0].node >= pair[1].node)

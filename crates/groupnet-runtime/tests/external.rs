@@ -82,7 +82,8 @@ fn external_profile(lease_ms: u64) -> GroupProfile {
 /// claim guard reads, so `ranked(..)[0]` is the only node that ever prompts
 /// while all of them are alive.
 fn ranked(group: &str, ids: &[&str]) -> Vec<NodeId> {
-    let members: Vec<(NodeId, u32)> = ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
+    let members: std::collections::BTreeMap<NodeId, u32> =
+        ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
     placement::owners(group, &members, ids.len())
 }
 

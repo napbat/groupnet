@@ -85,9 +85,9 @@ fn volatile_recovery_reaches_applied_heads_or_fences_full_fallback() {
         let disappear = seed % 7 == 0;
         let advance_once = seed % 3 == 0;
         let config = RecoveryConfig {
-            max_members: 4,
-            max_member_bytes: 32,
-            max_barrier_rounds: 3,
+            max_members: std::num::NonZeroUsize::new(4).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(3).unwrap(),
             total_ms: 60,
             attempt_ms: 12,
             settle_ms: 3,

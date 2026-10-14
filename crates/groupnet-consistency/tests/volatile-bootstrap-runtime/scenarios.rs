@@ -139,9 +139,9 @@ async fn one_worker_builds_origin_once_before_advertising_donor() {
     let handle = RecoveryHandle::open_with_bootstrap_and_rearm(
         Arc::clone(&reads),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,
@@ -215,9 +215,9 @@ async fn completed_origin_without_donor_capture_serves_without_a_second_scan() {
     let handle = RecoveryHandle::open_with_bootstrap(
         Arc::clone(&reads),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,
@@ -266,9 +266,9 @@ async fn required_participation_keeps_local_origin_and_declines_claim_only_donor
     let handle = RecoveryHandle::open_with_bootstrap(
         Arc::clone(&reads),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,
@@ -351,9 +351,9 @@ async fn one_coalesced_wake_serves_a_bounded_burst_without_waiting_for_renewal()
     let handle = RecoveryHandle::open_with_bootstrap(
         Arc::new(ReadAdapter::default()),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,
@@ -423,9 +423,9 @@ async fn stalled_ready_renewal_cannot_serve_a_request_after_capture_expiry() {
     let handle = RecoveryHandle::open_with_bootstrap(
         Arc::new(ReadAdapter::default()),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,
@@ -508,9 +508,9 @@ async fn cancel_while_capture_is_private_retires_charge_without_publication() {
     let handle = RecoveryHandle::open_with_bootstrap(
         reads,
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,
@@ -565,9 +565,9 @@ async fn expired_builder_permit_cannot_publish_after_child_timeout() {
     let handle = RecoveryHandle::open_with_bootstrap(
         Arc::clone(&reads),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,
@@ -621,9 +621,9 @@ async fn donor_only_invalidation_withdraws_ready_without_revoking_local_reads() 
     let handle = RecoveryHandle::open_with_bootstrap(
         Arc::new(ReadAdapter::default()),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,
@@ -729,9 +729,9 @@ fn follower_setup_with_mode(
         config,
         mode,
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,

@@ -70,7 +70,7 @@ impl NativeClaimSource {
             .len()
             .checked_add(scope.partition.len())
             .ok_or(AdapterError)?
-            > policy.max_scope_bytes
+            > policy.max_scope_bytes.get()
         {
             return Err(AdapterError);
         }
@@ -94,9 +94,9 @@ impl NativeClaimSource {
         limits: ClaimObservationLimits,
     ) -> Result<EntryInspectionLimits, AdapterError> {
         if limits.max_members == 0
-            || limits.max_members > self.policy.max_members
+            || limits.max_members > self.policy.max_members.get()
             || limits.max_member_bytes == 0
-            || limits.max_member_bytes > self.policy.max_member_bytes
+            || limits.max_member_bytes > self.policy.max_member_bytes.get()
             || limits.max_metadata_bytes == 0
         {
             return Err(AdapterError);
@@ -183,16 +183,17 @@ impl NativeClaimSource {
 
     async fn exact_local_readback(&self, expected: &[u8]) -> Result<bool, AdapterError> {
         let per_member = size_of::<groupnet_runtime::InspectedEntry>()
-            .checked_add(self.policy.max_member_bytes)
+            .checked_add(self.policy.max_member_bytes.get())
             .and_then(|bytes| bytes.checked_add(self.max_value_bytes))
             .ok_or(AdapterError)?;
         let limits = ClaimObservationLimits {
-            max_members: self.policy.max_members,
-            max_member_bytes: self.policy.max_member_bytes,
+            max_members: self.policy.max_members.get(),
+            max_member_bytes: self.policy.max_member_bytes.get(),
             max_metadata_bytes: size_of::<InspectedEntries>()
                 .checked_add(
                     self.policy
                         .max_members
+                        .get()
                         .checked_mul(per_member)
                         .ok_or(AdapterError)?,
                 )

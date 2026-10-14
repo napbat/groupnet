@@ -1,34 +1,60 @@
 //! Bounded metadata for opt-in source-backed state snapshots.
 
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+
 use super::{BoundComparison, Cursor, Scope, SourceProof};
 use crate::Time;
 
 /// Finite resource and time limits for one state-sync snapshot attempt.
+///
+/// Byte and chunk budgets are nonzero by type; [`SnapshotConfig::validate`]
+/// checks the logical-time budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotConfig {
     /// Maximum combined variable-length offer metadata and certificate bytes.
     /// One offer's fixed struct overhead is bounded separately.
-    pub max_metadata_bytes: usize,
+    pub max_metadata_bytes: NonZeroUsize,
     /// Maximum encoded image bytes.
-    pub max_snapshot_bytes: u64,
+    pub max_snapshot_bytes: NonZeroU64,
     /// Maximum number of sequential chunks.
-    pub max_chunks: u32,
+    pub max_chunks: NonZeroU32,
     /// Maximum encoded bytes in one chunk.
-    pub max_chunk_bytes: usize,
+    pub max_chunk_bytes: NonZeroUsize,
     /// Maximum charged decoded/private candidate bytes.
-    pub max_candidate_bytes: u64,
-    /// Total logical time from before hold acquisition through ready admission.
+    pub max_candidate_bytes: NonZeroU64,
+    /// Total logical time from before hold acquisition through ready
+    /// admission, in milliseconds; nonzero.
     pub max_total_ms: u64,
 }
 
+/// Invalid [`SnapshotConfig`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotConfigError {
+    /// [`SnapshotConfig::max_total_ms`] is zero.
+    ZeroMaxTotal,
+}
+
+impl fmt::Display for SnapshotConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroMaxTotal => f.write_str("snapshot max_total_ms must be nonzero"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotConfigError {}
+
 impl SnapshotConfig {
-    pub(super) fn valid(self) -> bool {
-        self.max_metadata_bytes > 0
-            && self.max_snapshot_bytes > 0
-            && self.max_chunks > 0
-            && self.max_chunk_bytes > 0
-            && self.max_candidate_bytes > 0
-            && self.max_total_ms > 0
+    /// Checks that the attempt has a nonzero logical-time budget.
+    ///
+    /// # Errors
+    /// Returns [`SnapshotConfigError::ZeroMaxTotal`] for a zero time budget.
+    pub fn validate(&self) -> Result<(), SnapshotConfigError> {
+        if self.max_total_ms == 0 {
+            return Err(SnapshotConfigError::ZeroMaxTotal);
+        }
+        Ok(())
     }
 }
 

@@ -1,11 +1,13 @@
+use std::num::{NonZeroU32, NonZeroUsize};
+
 use super::*;
 use crate::{NodeId, Time};
 
 fn config() -> RecoveryConfig {
     RecoveryConfig {
-        max_members: 4,
-        max_member_bytes: 32,
-        max_barrier_rounds: 3,
+        max_members: NonZeroUsize::new(4).unwrap(),
+        max_member_bytes: NonZeroUsize::new(32).unwrap(),
+        max_barrier_rounds: NonZeroU32::new(3).unwrap(),
         total_ms: 100,
         attempt_ms: 20,
         settle_ms: 5,
@@ -74,7 +76,7 @@ fn rearm_policy_validates_before_the_first_event() {
             max_ms: 5
         }
         .validate(),
-        Err(RecoveryError::InvalidConfig)
+        Err(RecoveryRearmError::ZeroInitial)
     );
     assert_eq!(
         engine()
@@ -83,7 +85,7 @@ fn rearm_policy_validates_before_the_first_event() {
                 max_ms: 8
             })
             .err(),
-        Some(RecoveryError::InvalidConfig)
+        Some(RecoveryError::Rearm(RecoveryRearmError::MaxBelowInitial))
     );
     let mut used = engine();
     used.step(RecoveryEvent::Start);
@@ -293,8 +295,8 @@ fn limits_and_local_identity_are_checked_before_work() {
     assert_eq!(
         RecoveryEngine::new(
             RecoveryConfig {
-                max_members: usize::MAX,
-                max_member_bytes: 2,
+                max_members: NonZeroUsize::MAX,
+                max_member_bytes: NonZeroUsize::new(2).unwrap(),
                 ..config()
             },
             RecoveryMode::Leased,
@@ -302,11 +304,13 @@ fn limits_and_local_identity_are_checked_before_work() {
             1,
         )
         .err(),
-        Some(RecoveryError::InvalidConfig)
+        Some(RecoveryError::Config(
+            RecoveryConfigError::RosterBytesOverflow
+        ))
     );
     assert_eq!(
         RecoveryEngine::new(config(), RecoveryMode::Leased, NodeId::from(""), 1).err(),
-        Some(RecoveryError::InvalidConfig)
+        Some(RecoveryError::InvalidIdentity)
     );
 }
 

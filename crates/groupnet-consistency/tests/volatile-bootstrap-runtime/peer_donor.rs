@@ -36,8 +36,8 @@ impl PeerDonor {
         };
         let mut journal = DonorJournal::new(
             JournalConfig {
-                max_members: 2,
-                max_membership_bytes: 16,
+                max_members: std::num::NonZeroUsize::new(2).unwrap(),
+                max_membership_bytes: std::num::NonZeroUsize::new(16).unwrap(),
                 ..journal_config()
             },
             CaptureId {

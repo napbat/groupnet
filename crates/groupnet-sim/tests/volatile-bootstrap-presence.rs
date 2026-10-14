@@ -9,9 +9,9 @@ use groupnet_sim::SplitMix64;
 
 fn config() -> BootstrapConfig {
     BootstrapConfig {
-        max_members: 2,
-        max_member_bytes: 8,
-        max_scope_bytes: 16,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_scope_bytes: std::num::NonZeroUsize::new(16).unwrap(),
         settle_ms: 2,
         renew_ms: 3,
         claim_ttl_ms: 10,

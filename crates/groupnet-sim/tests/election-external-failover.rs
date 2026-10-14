@@ -31,6 +31,7 @@
 //! A failing seed is a reproducible counterexample, not a flake.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
@@ -55,17 +56,12 @@ fn hosted(activation: Activation) -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_INTERVAL_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation,
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
@@ -96,14 +92,15 @@ fn cluster(group: &str, members: &BTreeSet<NodeId>, config: &Config) -> Simulati
     sim.enable_anchor(LEASE_MS, STEAL_MARGIN_MS);
     sim.set_anchor_latency(ANCHOR_LATENCY_MS);
     for id in members {
-        sim.add(engine(group, id, members, config));
+        sim.add(engine(group, id, members, config))
+            .expect("distinct node");
     }
     sim
 }
 
 fn engine(group: &str, id: &NodeId, peers: &BTreeSet<NodeId>, config: &Config) -> GroupEngine {
     let seeds = peers.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(GroupId::new(group), id.clone(), seeds, config.clone())
+    GroupEngine::new(GroupId::new(group), id.clone(), seeds, config.clone()).expect("valid config")
 }
 
 /// An `(epoch, host)` pair: the unit that names a serializer.
@@ -257,8 +254,9 @@ fn a_partitioned_host_that_can_still_reach_the_anchor_keeps_the_group() {
     // one it cannot reach before it ranks — the partition outlives the restart,
     // as a real one would.
     let restart_at = split_at + 3_000;
-    sim.crash(&successor_side_top);
-    sim.add(engine(group, &successor_side_top, &members, &cfg()));
+    sim.crash(&successor_side_top).expect("live node");
+    sim.add(engine(group, &successor_side_top, &members, &cfg()))
+        .expect("distinct node");
     assert_eq!(
         pair_of(&sim, &successor_side_top),
         (0, None),
@@ -401,7 +399,9 @@ fn an_unreachable_anchor_lapses_the_host_and_elects_nobody() {
         );
     });
     assert!(
-        sim.is_member(&incumbent, &incumbent) && sim.role_of(&incumbent) == Some(Role::Host),
+        sim.is_member(&incumbent, &incumbent)
+            .expect("incumbent is in the simulation")
+            && sim.role_of(&incumbent) == Some(Role::Host),
         "premise: the incumbent is healthy and connected right up to the lapse"
     );
     sim.run_until(Time(lease));
@@ -418,7 +418,7 @@ fn an_unreachable_anchor_lapses_the_host_and_elects_nobody() {
 
     // Now make the rest of the cluster genuinely eligible: they bury the dead
     // incumbent, become top-ranked, and prompt for rounds that never happen.
-    sim.crash(&incumbent);
+    sim.crash(&incumbent).expect("live node");
     let survivors: BTreeSet<NodeId> = members
         .iter()
         .filter(|n| **n != incumbent)
@@ -543,7 +543,8 @@ fn failover_budget(seed: u64) -> (bool, u64) {
         rng.below(u32::try_from(MAX_JITTER_MS).expect("small") + 1),
     ));
     for id in &members {
-        sim.add(engine(&group, id, &members, &cfg()));
+        sim.add(engine(&group, id, &members, &cfg()))
+            .expect("distinct node");
     }
 
     // Converge first: the budget bounds *failover*, not bootstrap. The crash
@@ -560,7 +561,7 @@ fn failover_budget(seed: u64) -> (bool, u64) {
         .filter(|x| **x != incumbent)
         .cloned()
         .collect();
-    sim.crash(&incumbent);
+    sim.crash(&incumbent).expect("live node");
 
     let entitled_at = record.expires_at_wall_ms + STEAL_MARGIN_MS;
     let ranked_by = crash_at + cfg().detection_window_ms(members.len());
@@ -621,12 +622,13 @@ fn the_shaped_scenarios_exercise_every_kind_of_round() {
 
     // A steal (the host dies), a supersede (it comes back and re-wins rather
     // than resuming), renewals and yields all in one schedule.
-    sim.crash(&incumbent);
+    sim.crash(&incumbent).expect("live node");
     sim.run_until(Time(5_000));
-    sim.add(engine(group, &incumbent, &members, &cfg()));
+    sim.add(engine(group, &incumbent, &members, &cfg()))
+        .expect("distinct node");
     sim.run_until(Time(9_000));
     let successor = sole_host(&sim, "X-floors");
-    sim.crash(&successor);
+    sim.crash(&successor).expect("live node");
     sim.run_until(Time(14_000));
 
     let mut counts: BTreeMap<AnchorEvent, usize> = BTreeMap::new();

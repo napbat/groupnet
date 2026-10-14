@@ -57,7 +57,7 @@ impl Limits {
         if self.max_scopes == 0
             || self.max_parallel_ops == 0
             || self.max_parallel_ops > tokio::sync::Semaphore::MAX_PERMITS
-            || self.max_inflight_bytes < self.core.max_batch_bytes
+            || self.max_inflight_bytes < self.core.max_batch_bytes.get()
             || self.max_inflight_bytes > tokio::sync::Semaphore::MAX_PERMITS
             || self.max_checkpoint_bytes == 0
             || u32::try_from(self.max_checkpoint_bytes).is_err()
@@ -65,20 +65,26 @@ impl Limits {
             || self.max_checkpoint_inflight_bytes > tokio::sync::Semaphore::MAX_PERMITS
             || self.queue_depth == 0
             || self.queue_depth > tokio::sync::Semaphore::MAX_PERMITS
-            || u32::try_from(self.core.max_batch_bytes).is_err()
+            || u32::try_from(self.core.max_batch_bytes.get()).is_err()
             || self.core.snapshot.is_some_and(|snapshot| {
                 self.max_parallel_ops < 2
                     || self
                         .core
                         .max_batch_bytes
-                        .checked_add(snapshot.max_chunk_bytes.max(self.core.max_batch_bytes))
+                        .get()
+                        .checked_add(
+                            snapshot
+                                .max_chunk_bytes
+                                .get()
+                                .max(self.core.max_batch_bytes.get()),
+                        )
                         .is_none_or(|sum| sum > self.max_inflight_bytes)
-                    || snapshot.max_candidate_bytes > self.max_checkpoint_bytes as u64
-                    || usize::try_from(snapshot.max_candidate_bytes)
+                    || snapshot.max_candidate_bytes.get() > self.max_checkpoint_bytes as u64
+                    || usize::try_from(snapshot.max_candidate_bytes.get())
                         .ok()
                         .and_then(|candidate| self.max_checkpoint_bytes.checked_add(candidate))
                         .is_none_or(|sum| sum > self.max_checkpoint_inflight_bytes)
-                    || u32::try_from(snapshot.max_chunk_bytes).is_err()
+                    || u32::try_from(snapshot.max_chunk_bytes.get()).is_err()
             })
         {
             return Err(LimitsError);
@@ -353,7 +359,7 @@ mod tests {
     #[test]
     fn semaphore_and_batch_limits_reject_invalid_reserves() {
         let mut limits = Limits::default();
-        limits.max_inflight_bytes = limits.core.max_batch_bytes - 1;
+        limits.max_inflight_bytes = limits.core.max_batch_bytes.get() - 1;
         assert!(limits.validate().is_err());
 
         let limits = Limits {

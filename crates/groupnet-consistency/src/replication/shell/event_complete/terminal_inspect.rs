@@ -48,10 +48,10 @@ where
         key: SubscriberKey,
         deadline: Instant,
     ) -> Result<Option<TerminalReceipt>, TerminalInspectError> {
-        let max_cursor_bytes = self.replication.inner.limits.core.max_cursor_bytes;
+        let max_cursor_bytes = self.replication.inner.limits.core.max_cursor_bytes.get();
         if key.scope.stream.group != self.replication.inner.group.id().as_str()
             || key.subscriber.name.is_empty()
-            || key.subscriber.name.len() > self.limits.max_subscriber_bytes
+            || key.subscriber.name.len() > self.limits.max_subscriber_bytes.get()
             || key.scope.validate(max_cursor_bytes).is_err()
         {
             return Err(TerminalInspectError::InvalidKey);

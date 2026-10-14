@@ -4,40 +4,107 @@
 //! any number of concurrent calls onto **one** [`DataStream`] per peer, and
 //! an [`RpcServer`] answers them with an async handler.
 //!
+//! ## Ownership of the data plane
+//!
+//! RPC composes with the other stream consumers of a node; it does not need
+//! a bulk listener of its own. There are two ways to serve:
+//!
+//! * **Connection-level** — the application owns [`DataPlane::accept`] and
+//!   hands each stream that is meant for RPC to
+//!   [`RpcServer::serve`]`(from, stream)`. Every connection handed over is
+//!   served under the same server limits; at `max_connections` `serve`
+//!   refuses it with [`RpcServeError::AtCapacity`] (the stream is dropped),
+//!   while [`RpcServer::reserve`] waits for a slot instead. This is how one
+//!   plane — a runtime `Node`'s tunnel streams, say, which every bulk and
+//!   ordered-session consumer on that node shares — carries RPC next to
+//!   anything else: the application decides which consumer each inbound
+//!   stream belongs to (for example by a tag byte its dialers write first).
+//! * **Plane-owning** — [`RpcServer::bind`]`(plane, handler)` (or
+//!   [`bind_with`](RpcServer::bind_with)) runs the accept loop itself, on top
+//!   of the connection-level API: every inbound stream on that plane is an
+//!   RPC connection, and a full server stops accepting until one ends. Use it
+//!   for a plane that carries nothing but RPC (for TCP, its own
+//!   `TcpBulkTransport` bound to its own port).
+//!
+//! A client only connects, so it shares a plane with any other consumer
+//! freely — but the *remote* end of every stream it opens must reach an
+//! [`RpcServer`], so on a shared plane its transport writes whatever the
+//! remote dispatcher expects (the tag below) before the first frame.
+//!
 //! ```no_run
+//! use std::io;
 //! use std::time::Duration;
 //!
-//! use bytes::Bytes;
+//! use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 //! use groupnet_core::NodeId;
-//! use groupnet_rpc::{RpcClient, RpcConfig, RpcServer, RpcStatus};
-//! use groupnet_transport::bulk::{BulkTransport, DataPlane};
+//! use groupnet_rpc::{Bytes, BulkTransport, DataPlane, DataStream, RpcClient, RpcServer, RpcStatus};
 //!
-//! # async fn demo<B: BulkTransport>(server_plane: DataPlane<B>, client_plane: DataPlane<B>) {
-//! // On the serving node: the server owns this plane's `accept`.
-//! let server = RpcServer::spawn(server_plane, |from: NodeId, request: Bytes| async move {
+//! /// The first byte of every stream on the shared plane names its consumer.
+//! const RPC: u8 = 1;
+//! const BLOBS: u8 = 2;
+//!
+//! /// Dials through `B`, then writes `tag`: what an RPC client on a shared
+//! /// plane connects with.
+//! struct Tagged<B> {
+//!     inner: B,
+//!     tag: u8,
+//! }
+//!
+//! impl<B: BulkTransport> BulkTransport for Tagged<B> {
+//!     type Error = io::Error;
+//!     type Stream = B::Stream;
+//!
+//!     async fn connect(&self, to: &NodeId) -> io::Result<B::Stream> {
+//!         let mut stream = self.inner.connect(to).await.map_err(io::Error::other)?;
+//!         stream.write_all(&[self.tag]).await?;
+//!         Ok(stream)
+//!     }
+//!
+//!     async fn accept(&self) -> io::Result<(NodeId, B::Stream)> {
+//!         self.inner.accept().await.map_err(io::Error::other)
+//!     }
+//! }
+//!
+//! # async fn blobs<S>(from: NodeId, stream: DataStream<S>) {}
+//! # async fn demo<B: BulkTransport + Clone>(node: B) -> io::Result<()> {
+//! // Calling side: one client, cloned freely, tagging every stream it opens.
+//! let client = RpcClient::new(DataPlane::new(Tagged { inner: node.clone(), tag: RPC }));
+//! let reply = client
+//!     .call(&NodeId::new("node-b"), Bytes::from_static(b"ping"), Duration::from_secs(1))
+//!     .await;
+//! # drop(reply);
+//!
+//! // Serving side: the application owns `accept` and dispatches by tag.
+//! let rpc = RpcServer::new(|from: NodeId, request: Bytes| async move {
 //!     if request.is_empty() {
 //!         return Err(RpcStatus::new(400, format!("{from} sent nothing")));
 //!     }
 //!     Ok(request)
 //! });
-//!
-//! // On a calling node: one client, cloned freely.
-//! let client = RpcClient::new(client_plane, RpcConfig::default()).expect("valid limits");
-//! let reply = client
-//!     .call(&NodeId::new("node-b"), Bytes::from_static(b"ping"), Duration::from_secs(1))
-//!     .await;
-//! # drop((server, reply));
+//! let plane = DataPlane::new(node);
+//! loop {
+//!     let Ok((from, stream)) = plane.accept().await else { continue };
+//!     let rpc = rpc.clone();
+//!     // Read the tag off the accept loop, so a slow dialer stalls no one.
+//!     tokio::spawn(async move {
+//!         let mut raw = stream.into_inner();
+//!         let mut tag = [0];
+//!         if raw.read_exact(&mut tag).await.is_err() {
+//!             return;
+//!         }
+//!         match tag[0] {
+//!             // At capacity the stream is refused and dropped; the caller's
+//!             // client reconnects on its next call.
+//!             RPC => {
+//!                 let _ = rpc.serve(from, DataStream::new(raw));
+//!             }
+//!             BLOBS => blobs(from, DataStream::new(raw)).await,
+//!             _ => {}
+//!         }
+//!     });
+//! }
 //! # }
 //! ```
-//!
-//! ## Ownership of the data plane
-//!
-//! The server **owns [`DataPlane::accept`]** of the plane it is given: every
-//! inbound stream on it is taken to be an RPC connection. Give RPC its own
-//! bulk transport (for TCP, its own `TcpBulkTransport` bound to its own port)
-//! unless nothing else on the node accepts bulk streams. A client only
-//! connects, so it may share a plane with other connecting users — but the
-//! *remote* end of every stream it opens must be an [`RpcServer`].
 //!
 //! Peer addresses are the transport's business: register every peer a client
 //! calls on the client's transport (`TcpBulkTransport::register_peer` /
@@ -71,10 +138,13 @@
 //!
 //! ## Limits
 //!
-//! Limits are typed: frame bounds are a [`FrameLimit`], queue and admission
-//! bounds a [`QueueCapacity`](groupnet_transport::QueueCapacity), and the
-//! timers are checked once, when the client or server is built
-//! ([`RpcConfig::validate`], [`RpcServerConfig::validate`]).
+//! Limits are typed: frame bounds are a [`FrameLimit`] (built by
+//! [`FrameLimit::new`], failing with a [`FrameLimitError`]), queue and
+//! admission bounds a [`QueueCapacity`], and the timers are checked once,
+//! when the client or server is built ([`RpcConfig::validate`] →
+//! [`RpcConfigError`], [`RpcServerConfig::validate`] →
+//! [`RpcServerConfigError`], each variant naming its field). Nothing is
+//! clamped; an invalid value is refused.
 //!
 //! * `max_frame_bytes` caps one whole RPC frame (head included) on both
 //!   sides, at most the data plane's
@@ -89,8 +159,10 @@
 //!   at the limit evicts a destination no call is using (closing its
 //!   connection), or fails [`RpcError::Saturated`] if every destination is
 //!   busy.
-//! * A server serves at most `max_connections` connections; at the limit it
-//!   stops accepting until one ends.
+//! * A server serves at most `max_connections` connections, however they
+//!   reach it: at the limit [`RpcServer::serve`] refuses
+//!   ([`RpcServeError::AtCapacity`]), [`RpcServer::reserve`] waits, and a
+//!   [`bind`](RpcServer::bind) accept loop stops accepting until one ends.
 //! * A server runs at most `max_concurrent_per_connection` handlers per
 //!   connection; past that it stops reading the connection, which pushes
 //!   back on the caller through the transport.
@@ -100,9 +172,6 @@
 //!   clients', so the side that knows nothing is in flight closes first.
 //!   Call timeouts and timers are bounded by [`MAX_TIMEOUT`], the
 //!   wire deadline's `u32` milliseconds.
-//!
-//! [`DataPlane::accept`]: groupnet_transport::bulk::DataPlane::accept
-//! [`DataPlane::transport`]: groupnet_transport::bulk::DataPlane::transport
 
 mod client;
 mod codec;
@@ -111,16 +180,28 @@ mod server;
 
 use std::error::Error;
 use std::fmt;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use futures_util::io::AsyncWrite;
-use groupnet_transport::bulk::DataStream;
 use tokio::sync::mpsc;
 
+pub use bytes::Bytes;
 pub use client::RpcClient;
-pub use config::{FrameLimit, MAX_TIMEOUT, RpcConfig, RpcServerConfig};
-pub use server::{RpcServer, RpcServerHandle};
+pub use config::{
+    FrameLimit, FrameLimitError, MAX_TIMEOUT, RpcConfig, RpcConfigError, RpcServerConfig,
+    RpcServerConfigError,
+};
+pub use groupnet_transport::QueueCapacity;
+pub use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
+pub use server::{RpcServeError, RpcServer, RpcServerHandle, RpcSlot};
 
 use codec::Encoded;
+
+/// Locks a mutex whose data stays consistent across a panic: every critical
+/// section here is a single map, flag or task-set update.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// A failure a handler (or the server on its behalf) reports to the caller.
 ///

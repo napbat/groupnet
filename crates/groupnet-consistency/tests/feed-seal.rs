@@ -20,9 +20,7 @@ const GROUP: &str = "stores";
 const SETTLE: Duration = Duration::from_secs(3);
 
 fn opts() -> NodeOpts {
-    NodeOpts::new(GROUP)
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+    NodeOpts::new(GROUP).gossip_interval_ms(25)
 }
 
 fn cap() -> NonZeroUsize {

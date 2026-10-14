@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
-use groupnet_rpc::{RpcClient, RpcConfig, RpcError, RpcServer, RpcServerHandle, RpcStatus};
+use groupnet_rpc::{RpcClient, RpcError, RpcServer, RpcServerHandle, RpcStatus};
 use groupnet_testkit::cluster::eventually;
 use groupnet_transport::bulk::{BulkTransport, DataPlane};
 use groupnet_transport_mem::bulk::{MemBulkNet, MemBulkTransport};
@@ -58,10 +58,7 @@ fn counting_client(net: &MemBulkNet, id: &str) -> (RpcClient<Counting>, Arc<Atom
         inner: net.endpoint(NodeId::new(id)),
         connects: connects.clone(),
     });
-    (
-        RpcClient::new(plane, RpcConfig::default()).expect("default limits are valid"),
-        connects,
-    )
+    (RpcClient::new(plane), connects)
 }
 
 /// A server on `net` as `id` (re-registering `id` evicts any earlier one):
@@ -71,7 +68,7 @@ fn blocking_echo(
     id: &str,
     started: mpsc::UnboundedSender<()>,
 ) -> RpcServerHandle {
-    RpcServer::spawn(
+    RpcServer::bind(
         DataPlane::new(net.endpoint(NodeId::new(id))),
         move |_from: NodeId, request: Bytes| {
             let started = started.clone();
@@ -112,7 +109,7 @@ async fn a_timed_out_call_is_dropped_server_side_and_its_late_answer_discarded()
             }
         }
     };
-    let server = RpcServer::spawn(DataPlane::new(net.endpoint(NodeId::new("s"))), handler);
+    let server = RpcServer::bind(DataPlane::new(net.endpoint(NodeId::new("s"))), handler);
     let (client, connects) = counting_client(&net, "c");
     let to = NodeId::new("s");
 

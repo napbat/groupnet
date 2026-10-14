@@ -9,9 +9,9 @@ use groupnet_sim::SplitMix64;
 
 fn config() -> RecoveryConfig {
     RecoveryConfig {
-        max_members: 4,
-        max_member_bytes: 32,
-        max_barrier_rounds: 2,
+        max_members: std::num::NonZeroUsize::new(4).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
         total_ms: 20,
         attempt_ms: 5,
         settle_ms: 2,

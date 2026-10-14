@@ -137,7 +137,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         if scope.domain.is_empty() || scope.partition.is_empty() {
             return Err(AdapterError);
         }
-        let policy = policy.validate().map_err(|_| AdapterError)?;
+        policy.validate().map_err(|_| AdapterError)?;
         if scope
             .domain
             .len()
@@ -145,12 +145,12 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
             .is_none_or(|bytes| {
                 bytes > limits.wire.max_scope_bytes || bytes > limits.phase.max_scope_bytes
             })
-            || policy.max_metadata_bytes > limits.phase.max_body_bytes
-            || policy.max_chunk_bytes > limits.phase.max_body_bytes
-            || policy.max_batch_bytes > limits.phase.max_body_bytes
-            || policy.max_batch_events > limits.phase.max_events
-            || policy.max_members > limits.phase.max_members
-            || policy.max_cuts > limits.phase.max_cuts
+            || policy.max_metadata_bytes.get() > limits.phase.max_body_bytes
+            || policy.max_chunk_bytes.get() > limits.phase.max_body_bytes
+            || policy.max_batch_bytes.get() > limits.phase.max_body_bytes
+            || policy.max_batch_events.get() > limits.phase.max_events
+            || policy.max_members.get() > limits.phase.max_members
+            || policy.max_cuts.get() > limits.phase.max_cuts
         {
             return Err(AdapterError);
         }

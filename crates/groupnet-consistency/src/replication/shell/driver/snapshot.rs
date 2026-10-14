@@ -581,7 +581,7 @@ where
                     .limits
                     .core
                     .snapshot
-                    .map_or(0, |limit| limit.max_candidate_bytes);
+                    .map_or(0, |limit| limit.max_candidate_bytes.get());
                 if candidate.bytes as u64 > max {
                     return self.stop(FailureClass::Terminal);
                 }

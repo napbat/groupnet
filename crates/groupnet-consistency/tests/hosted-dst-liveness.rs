@@ -49,6 +49,7 @@
 #![cfg(feature = "hosted")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_consistency::WriteToken;
 use groupnet_consistency::hosted::{
@@ -108,19 +109,14 @@ fn cfg(voters: &BTreeSet<NodeId>) -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::Quorum {
                 voters: VoterRoster::new(voters.iter().cloned()),
             },
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
@@ -338,12 +334,11 @@ impl Harness {
         let mut nodes = BTreeMap::new();
         for id in &all {
             let seeds: Vec<NodeId> = all.iter().filter(|x| *x != id).cloned().collect();
-            sim.add(GroupEngine::new(
-                group.clone(),
-                id.clone(),
-                seeds,
-                cfg(&voters),
-            ));
+            sim.add(
+                GroupEngine::new(group.clone(), id.clone(), seeds, cfg(&voters))
+                    .expect("valid config"),
+            )
+            .expect("distinct node");
             nodes.insert(id.clone(), Node::new(id, Watermarks::new()));
         }
         Self {
@@ -392,7 +387,10 @@ impl Harness {
     fn follow(&mut self) {
         let tag = self.tag;
         for id in self.live_ids() {
-            let view = self.sim.entries_snapshot(&id);
+            let view = self
+                .sim
+                .entries_snapshot(&id)
+                .expect("live node is in the simulation");
             let lead = self.sim.leadership_of(&id).unwrap_or((0, None));
             self.nodes.get_mut(&id).expect("live").watch = Some(lead.clone());
             self.check_readings(&id, &view);
@@ -443,13 +441,18 @@ impl Harness {
         let node = &self.nodes[id];
         let encoded = encode_ledger(node.stamp, &node.applied);
         self.store.insert(id.clone(), node.applied.clone());
-        self.sim.command(id, set(&self.ledger_key, encoded));
+        self.sim
+            .command(id, set(&self.ledger_key, encoded))
+            .expect("live node");
     }
 
     /// The view both rules are handed, from `observer`'s **own** engine: the
     /// whole roster, silent voters included as `reading: None`.
     fn roster_view(&self, observer: &NodeId) -> Vec<LedgerView> {
-        let entries = self.sim.entries_snapshot(observer);
+        let entries = self
+            .sim
+            .entries_snapshot(observer)
+            .expect("observer is in the simulation");
         let read = |m: &NodeId| decode_ledger(entries.get(m)?.get(&self.ledger_key)?);
         let alive = |m: &NodeId| self.sim.status_of(observer, m) == Some(Status::Alive);
         let view = |member: &NodeId| LedgerView {
@@ -633,7 +636,9 @@ impl Harness {
         if node.inflight.len() < MAX_INFLIGHT {
             node.inflight.push(token);
         }
-        self.sim.command(id, set(&self.feed_key, life.encode()));
+        self.sim
+            .command(id, set(&self.feed_key, life.encode()))
+            .expect("live node");
         self.publish_ledger(id);
     }
 
@@ -671,8 +676,9 @@ impl Harness {
         };
         let seeds: Vec<NodeId> = self.all.iter().filter(|x| *x != id).cloned().collect();
         let (group, cfg) = (self.group.clone(), cfg(&self.voters));
-        let engine = GroupEngine::with_recovered(group, id.clone(), seeds, cfg, recovered);
-        self.sim.add(engine);
+        let engine = GroupEngine::with_recovered(group, id.clone(), seeds, cfg, recovered)
+            .expect("valid config");
+        self.sim.add(engine).expect("distinct node");
         let applied = self.store.get(id).cloned().unwrap_or_default();
         self.reborn.insert(id.clone());
         self.seen.retain(|(observer, _), _| observer != id);
@@ -839,7 +845,7 @@ fn healthy_scenario(seed: u64) -> Stats {
     let victim = pick(&others, &mut rng);
     h.run_rounds(6, 60);
     h.nodes.remove(&victim);
-    h.sim.crash(&victim);
+    h.sim.crash(&victim).expect("live node");
     h.run_rounds(4, 60);
     h.restart(&victim);
     h.run_rounds(22, 60);

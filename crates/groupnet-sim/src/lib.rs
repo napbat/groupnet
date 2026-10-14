@@ -10,6 +10,23 @@
 //! behaviour is reproducible bit-for-bit. No async runtime, no real sockets, no
 //! wall clock.
 //!
+//! ## A one-engine-per-node protocol harness
+//!
+//! Each [`NodeId`] in a [`Simulation`] hosts **exactly one** [`GroupEngine`],
+//! and so belongs to exactly one group. The simulator proves the group
+//! protocol — membership, failure detection, gossip convergence, elections —
+//! between engines; it is **not** a simulator of a multi-group `Node`. How a
+//! real node hosts many groups over one transport is groupnet-runtime's
+//! behaviour, and it is tested over groupnet-runtime with groupnet-testkit's
+//! in-memory cluster.
+//!
+//! [`Simulation::add`] therefore refuses a second engine for an id already
+//! present ([`SimError::DuplicateNode`]), and every mutation that targets one
+//! node by id refuses a node that is not there ([`SimError::UnknownNode`])
+//! instead of silently doing nothing.
+//!
+//! ## The external anchor
+//!
 //! It also models the one thing a Hosted group can depend on that is *not* in
 //! the cluster: [`Activation::External`]'s **CAS anchor**. One linearizable
 //! register per simulation, driven by rounds that are scheduled like any other
@@ -25,24 +42,30 @@
 //! use groupnet_core::{Config, GroupEngine, GroupId, NodeId, Time};
 //! use groupnet_sim::Simulation;
 //!
-//! let group = GroupId::new("shard-42");
-//! let ids: Vec<NodeId> = ["a", "b", "c"].iter().map(|s| NodeId::new(*s)).collect();
-//! let mut sim = Simulation::new(10); // 10ms link latency
-//! for id in &ids {
-//!     let seeds = ids.iter().filter(|x| *x != id).cloned();
-//!     sim.add(GroupEngine::new(group.clone(), id.clone(), seeds, Config::default()));
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let group = GroupId::new("shard-42");
+//!     let ids: Vec<NodeId> = ["a", "b", "c"].iter().map(|s| NodeId::new(*s)).collect();
+//!     let mut sim = Simulation::new(10); // 10ms link latency
+//!     for id in &ids {
+//!         let seeds = ids.iter().filter(|x| *x != id).cloned();
+//!         sim.add(GroupEngine::new(group.clone(), id.clone(), seeds, Config::default())?)?;
+//!     }
+//!     sim.run_until(Time(5_000));
+//!     assert!(sim.all_agree_on_coordinator());
+//!     Ok(())
 //! }
-//! sim.run_until(Time(5_000));
-//! assert!(sim.all_agree_on_coordinator());
 //! ```
 //!
 //! [`groupnet-runtime`]: https://docs.rs/groupnet-runtime
 //! [`GroupEngine`]: groupnet_core::GroupEngine
+//! [`NodeId`]: groupnet_core::NodeId
 
 mod anchor;
+mod error;
 mod rng;
 mod simulation;
 
 pub use anchor::AnchorEvent;
+pub use error::SimError;
 pub use rng::SplitMix64;
 pub use simulation::Simulation;

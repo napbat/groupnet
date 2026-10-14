@@ -150,7 +150,7 @@ impl<K> WriteFeed<K> {
         capacity: NonZeroUsize,
         encode: impl Fn(&K) -> Vec<u8> + Send + Sync + 'static,
     ) -> Self {
-        let max_frame_bytes = group.config().max_delta_frame_bytes;
+        let max_frame_bytes = group.config().max_delta_frame_bytes.get();
         Self {
             group,
             key: entry_key(name),

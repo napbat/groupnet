@@ -1,5 +1,7 @@
 //! State dissemination tests: digests, deltas, entries, eager push.
 
+use std::num::{NonZeroU64, NonZeroUsize};
+
 use groupnet_core::{Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, wire};
 use groupnet_testkit::frames::*;
 
@@ -9,8 +11,8 @@ use groupnet_testkit::frames::*;
 #[test]
 fn delta_digests_list_only_changed_members_with_periodic_full() {
     let config = Config {
-        anti_entropy_fanout: 1,
-        full_digest_every: 3,
+        gossip_fanout: NonZeroUsize::new(1).expect("nonzero"),
+        full_digest_every: NonZeroU64::new(3).expect("nonzero"),
         // Keep probes out of the timeline: no suspicion stamps.
         probe_interval_ms: 1_000_000,
         ..Config::default()
@@ -20,7 +22,8 @@ fn delta_digests_list_only_changed_members_with_periodic_full() {
         NodeId::new("a"),
         [NodeId::new("b")],
         config,
-    );
+    )
+    .expect("valid config");
 
     // Visit 1 (full): only ourselves exist — one summary.
     let effects = a.start(Time(0));
@@ -592,7 +595,8 @@ fn eager_push_can_be_disabled() {
             eager_push: false,
             ..Config::default()
         },
-    );
+    )
+    .expect("valid config");
     let effects = a.apply(Command::SetLocalEntry {
         key: "k".into(),
         value: b"v".to_vec(),

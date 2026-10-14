@@ -19,8 +19,9 @@ impl ExpiryTiming {
     /// Validate finite positive bounds and checked expiry arithmetic.
     ///
     /// # Errors
-    /// Returns [`PolicyError`] for invalid or overflowing values.
-    pub fn validate(self) -> Result<(), PolicyError> {
+    /// Returns the [`PolicyError`] variant naming the violated timing rule,
+    /// or [`PolicyError::Overflow`].
+    pub fn validate(&self) -> Result<(), PolicyError> {
         self.expiry_wait_ms().map(|_| ())
     }
 
@@ -35,14 +36,20 @@ impl ExpiryTiming {
     /// policy and its rate bound. A persisted wall timestamp is not authority.
     ///
     /// # Errors
-    /// Returns [`PolicyError`] for invalid or overflowing values.
-    pub fn expiry_wait_ms(self) -> Result<u64, PolicyError> {
-        if self.max_duration_ms == 0
-            || self.rate_denominator == 0
-            || self.rate_numerator < self.rate_denominator
-            || self.clock_margin_ms == 0
-        {
-            return Err(PolicyError::Invalid);
+    /// Returns the [`PolicyError`] variant naming the violated timing rule,
+    /// or [`PolicyError::Overflow`].
+    pub fn expiry_wait_ms(&self) -> Result<u64, PolicyError> {
+        if self.max_duration_ms == 0 {
+            return Err(PolicyError::ZeroMaxDuration);
+        }
+        if self.rate_denominator == 0 {
+            return Err(PolicyError::ZeroRateDenominator);
+        }
+        if self.rate_numerator < self.rate_denominator {
+            return Err(PolicyError::RateBelowOne);
+        }
+        if self.clock_margin_ms == 0 {
+            return Err(PolicyError::ZeroClockMargin);
         }
         let product = u128::from(self.max_duration_ms)
             .checked_mul(u128::from(self.rate_numerator))
@@ -79,7 +86,35 @@ mod tests {
                 ..timing
             }
             .validate(),
-            Err(PolicyError::Invalid)
+            Err(PolicyError::ZeroClockMargin)
+        );
+        assert_eq!(
+            ExpiryTiming {
+                max_duration_ms: 0,
+                ..timing
+            }
+            .validate(),
+            Err(PolicyError::ZeroMaxDuration)
+        );
+        assert_eq!(
+            ExpiryTiming {
+                rate_denominator: 0,
+                ..timing
+            }
+            .validate(),
+            Err(PolicyError::ZeroRateDenominator)
+        );
+        assert_eq!(
+            ExpiryTiming {
+                rate_numerator: 9,
+                ..timing
+            }
+            .validate(),
+            Err(PolicyError::RateBelowOne)
+        );
+        assert_eq!(
+            PolicyError::RateBelowOne.to_string(),
+            "admission rate_numerator must be at least rate_denominator"
         );
         assert_eq!(
             ExpiryTiming {

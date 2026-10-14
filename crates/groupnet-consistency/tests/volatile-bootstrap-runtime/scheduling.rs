@@ -43,9 +43,9 @@ async fn settling_acquisition_yields_until_its_deadline() {
     let handle = RecoveryHandle::open_with_bootstrap_and_rearm(
         Arc::new(ReadAdapter::default()),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 5_000,
             attempt_ms: 4_000,
             settle_ms: 5,

@@ -318,7 +318,7 @@ impl SnapshotSourceAdapter for Source {
             retained_to_cut: self.compare(&proof.retained_from, &cut_cursor, &proof)?,
             proof,
             total_bytes: bytes.len() as u64,
-            chunks: u32::try_from(bytes.len().div_ceil(limit.max_chunk_bytes))
+            chunks: u32::try_from(bytes.len().div_ceil(limit.max_chunk_bytes.get()))
                 .expect("small image"),
             digest: digest(&bytes),
             certificate: vec![1],
@@ -592,15 +592,15 @@ impl SnapshotApplicationAdapter<u64, Vec<Mutation>> for App {
 fn limits() -> Limits {
     let mut limits = Limits::default();
     limits.core.snapshot = Some(SnapshotConfig {
-        max_metadata_bytes: 512,
-        max_snapshot_bytes: 64,
-        max_chunks: 16,
-        max_chunk_bytes: 4,
-        max_candidate_bytes: 64,
+        max_metadata_bytes: std::num::NonZeroUsize::new(512).unwrap(),
+        max_snapshot_bytes: std::num::NonZeroU64::new(64).unwrap(),
+        max_chunks: std::num::NonZeroU32::new(16).unwrap(),
+        max_chunk_bytes: std::num::NonZeroUsize::new(4).unwrap(),
+        max_candidate_bytes: std::num::NonZeroU64::new(64).unwrap(),
         max_total_ms: 3000,
     });
-    limits.core.max_batch_events = 1;
-    limits.core.max_batch_bytes = 8;
+    limits.core.max_batch_events = std::num::NonZeroUsize::new(1).unwrap();
+    limits.core.max_batch_bytes = std::num::NonZeroUsize::new(8).unwrap();
     limits.core.attempt_timeout_ms = 500;
     limits.core.tail_check_ms = 100;
     limits.max_inflight_bytes = 32;

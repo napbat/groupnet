@@ -21,11 +21,8 @@ impl ClaimEngine {
         if self.stage != BootstrapStage::Unready {
             return Err(BootstrapError::Stage);
         }
-        self.transfer_config = Some(
-            config
-                .validate()
-                .map_err(|_| BootstrapError::InvalidConfig)?,
-        );
+        config.validate().map_err(BootstrapError::TransferConfig)?;
+        self.transfer_config = Some(config);
         Ok(())
     }
 
@@ -137,7 +134,7 @@ impl ClaimEngine {
         self.observed.remove(&selected);
         self.excluded.insert(selected);
         self.follow_due = None;
-        let mut step = if self.excluded.len() > self.config.max_members {
+        let mut step = if self.excluded.len() > self.config.max_members.get() {
             self.terminate()
         } else {
             self.observe()
@@ -163,7 +160,7 @@ impl ClaimEngine {
             });
         }
         if self.total_due.is_some_and(|due| self.now >= due)
-            || self.excluded.len() > self.config.max_members
+            || self.excluded.len() > self.config.max_members.get()
         {
             let fallback = self.terminate();
             effects.extend(fallback.effects);
@@ -345,7 +342,7 @@ impl ClaimEngine {
                     self.excluded.insert(selected);
                 }
                 if self.total_due.is_some_and(|due| self.now >= due)
-                    || self.excluded.len() > self.config.max_members
+                    || self.excluded.len() > self.config.max_members.get()
                 {
                     let fallback = self.terminate();
                     effects.extend(fallback.effects);
@@ -472,9 +469,9 @@ mod tests {
     #[test]
     fn child_allocator_exhaustion_fences_parent_and_falls_back() {
         let config = BootstrapConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_scope_bytes: 8,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             settle_ms: 2,
             renew_ms: 3,
             claim_ttl_ms: 10,
@@ -495,18 +492,18 @@ mod tests {
         .unwrap();
         engine
             .enable_transfer(TransferConfig {
-                expected_schema: 1,
-                max_metadata_bytes: 64,
-                max_encoded_bytes: 8,
-                max_decoded_bytes: 8,
-                max_chunk_bytes: 8,
-                max_chunks: 2,
-                max_batch_bytes: 8,
-                max_batch_events: 2,
-                max_replay_events: 4,
-                max_native_buffer_bytes: 8,
-                max_members: 2,
-                max_cuts: 1,
+                expected_schema: std::num::NonZeroU32::new(1).unwrap(),
+                max_metadata_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+                max_encoded_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                max_decoded_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                max_chunk_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                max_chunks: std::num::NonZeroUsize::new(2).unwrap(),
+                max_batch_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                max_batch_events: std::num::NonZeroUsize::new(2).unwrap(),
+                max_replay_events: std::num::NonZeroUsize::new(4).unwrap(),
+                max_native_buffer_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                max_members: std::num::NonZeroUsize::new(2).unwrap(),
+                max_cuts: std::num::NonZeroUsize::new(1).unwrap(),
                 coverage_poll_ms: 2,
             })
             .unwrap();

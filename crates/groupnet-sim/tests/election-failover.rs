@@ -20,6 +20,7 @@
 //! A failing seed is a reproducible counterexample, not a flake.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Time, placement,
@@ -55,19 +56,14 @@ fn cfg() -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_INTERVAL_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::Settle {
                 claim_settle_ms: CLAIM_SETTLE_MS,
             },
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
@@ -77,7 +73,7 @@ fn cfg() -> Config {
 /// them.
 fn engine(group: &GroupId, id: &NodeId, peers: &BTreeSet<NodeId>) -> GroupEngine {
     let seeds = peers.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(group.clone(), id.clone(), seeds, cfg())
+    GroupEngine::new(group.clone(), id.clone(), seeds, cfg()).expect("valid config")
 }
 
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
@@ -161,7 +157,7 @@ fn new_host_budget(seed: u64) {
     let mut sim = Simulation::new(2 + u64::from(rng.below(5)));
     sim.set_jitter(u64::from(rng.below(6)));
     for id in &ids {
-        sim.add(engine(&group, id, &all));
+        sim.add(engine(&group, id, &all)).expect("distinct node");
     }
 
     // Converge first: the budget bounds *failover*, not bootstrap. The crash
@@ -185,7 +181,7 @@ fn new_host_budget(seed: u64) {
         );
     }
 
-    sim.crash(&incumbent);
+    sim.crash(&incumbent).expect("live node");
     let survivors: BTreeSet<NodeId> = all.iter().filter(|x| **x != incumbent).cloned().collect();
     let budget = cfg().detection_window_ms(ids.len()) + CLAIM_SETTLE_MS + NEW_HOST_SLACK_MS;
     sim.run_until(Time(crash_at + budget));
@@ -267,7 +263,7 @@ fn split_brain(seed: u64) {
     let mut sim = Simulation::new(2 + u64::from(rng.below(5)));
     sim.set_jitter(u64::from(rng.below(6)));
     for id in &ids {
-        sim.add(engine(&group, id, &all));
+        sim.add(engine(&group, id, &all)).expect("distinct node");
     }
 
     let split_at = 3_000 + u64::from(rng.below(500));
@@ -436,7 +432,7 @@ fn same_epoch_collision(seed: u64) {
     let mut sim = Simulation::new(2 + u64::from(rng.below(5)));
     sim.set_jitter(u64::from(rng.below(6)));
     for id in &ids {
-        sim.add(engine(&group, id, &all));
+        sim.add(engine(&group, id, &all)).expect("distinct node");
     }
 
     let crash_at = 3_000 + u64::from(rng.below(500));
@@ -450,7 +446,7 @@ fn same_epoch_collision(seed: u64) {
 
     // The host goes silent and the survivors lose sight of each other at the
     // same instant: neither side can learn what the other settles.
-    sim.crash(&incumbent);
+    sim.crash(&incumbent).expect("live node");
     for a in &left {
         for b in &right {
             sim.block(a, b);

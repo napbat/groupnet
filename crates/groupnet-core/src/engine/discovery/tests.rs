@@ -1,6 +1,7 @@
 use crate::membership::{Member, Status};
 use crate::{Command, Config, Effect, GroupEngine, GroupId, NodeId, Time};
 use std::collections::VecDeque;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 fn engine(local: &str) -> GroupEngine {
     GroupEngine::new(
@@ -8,11 +9,12 @@ fn engine(local: &str) -> GroupEngine {
         NodeId::new(local),
         [],
         Config {
-            anti_entropy_fanout: 1,
-            full_digest_every: 1,
+            gossip_fanout: NonZeroUsize::MIN,
+            full_digest_every: NonZeroU64::MIN,
             ..Config::default()
         },
     )
+    .expect("valid config")
 }
 
 fn recipients(effects: Vec<Effect>) -> Vec<NodeId> {
@@ -64,7 +66,8 @@ fn discovery_contacts_are_bounded_and_do_not_replace_static_seeds() {
         NodeId::new("local"),
         [static_seed.clone()],
         Config::default(),
-    );
+    )
+    .expect("valid config");
     let admitted = NodeId::new("admitted");
     local.apply(Command::SetBootstrapContacts(vec![admitted.clone()]));
     local.apply(Command::SetBootstrapContacts(

@@ -1,5 +1,7 @@
 //! Terminal generation exhaustion still disposes snapshot resources.
 
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+
 use super::SessionEngine;
 use crate::replication::{
     Config, Effect, Event, Mode, Operation, Reject, Scope, SnapshotCleanupDisposition,
@@ -19,11 +21,11 @@ fn engine() -> SessionEngine {
         Mode::StateSync,
         Config {
             snapshot: Some(SnapshotConfig {
-                max_metadata_bytes: 128,
-                max_snapshot_bytes: 16,
-                max_chunks: 2,
-                max_chunk_bytes: 8,
-                max_candidate_bytes: 32,
+                max_metadata_bytes: NonZeroUsize::new(128).unwrap(),
+                max_snapshot_bytes: NonZeroU64::new(16).unwrap(),
+                max_chunks: NonZeroU32::new(2).unwrap(),
+                max_chunk_bytes: NonZeroUsize::new(8).unwrap(),
+                max_candidate_bytes: NonZeroU64::new(32).unwrap(),
                 max_total_ms: 100,
             }),
             ..Config::default()

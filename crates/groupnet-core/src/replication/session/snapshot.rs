@@ -122,9 +122,9 @@ impl SessionEngine {
         };
         if receipt.request != op
             || receipt.history.source.is_empty()
-            || receipt.history.source.len() > self.config.max_cursor_bytes
+            || receipt.history.source.len() > self.config.max_cursor_bytes.get()
             || receipt.certificate.is_empty()
-            || receipt.certificate.len() > self.snapshot_limits().max_metadata_bytes
+            || receipt.certificate.len() > self.snapshot_limits().max_metadata_bytes.get()
             || receipt.retained_until < progress.total_due
         {
             return Step::reject(Reject::Discontinuity);
@@ -156,27 +156,27 @@ impl SessionEngine {
             || offer.certificate.is_empty()
             || offer
                 .charged_metadata_bytes()
-                .is_none_or(|n| n > limit.max_metadata_bytes)
-            || offer.total_bytes > limit.max_snapshot_bytes
-            || offer.chunks > limit.max_chunks
+                .is_none_or(|n| n > limit.max_metadata_bytes.get())
+            || offer.total_bytes > limit.max_snapshot_bytes.get()
+            || offer.chunks > limit.max_chunks.get()
             || offer.total_bytes == 0
             || offer.chunks == 0
             || offer.total_bytes < u64::from(offer.chunks)
             || u64::from(offer.chunks)
-                .checked_mul(limit.max_chunk_bytes as u64)
+                .checked_mul(limit.max_chunk_bytes.get() as u64)
                 .is_none_or(|capacity| offer.total_bytes > capacity)
         {
             return Step::reject(Reject::Backpressure);
         }
         if let Err(error) = offer
             .cut
-            .validate(&self.scope, self.config.max_cursor_bytes)
+            .validate(&self.scope, self.config.max_cursor_bytes.get())
         {
             return Step::reject(Reject::Identity(error));
         }
         if let Err(error) = offer
             .proof
-            .validate(&self.scope, self.config.max_cursor_bytes)
+            .validate(&self.scope, self.config.max_cursor_bytes.get())
         {
             return Step::reject(Reject::Identity(error));
         }
@@ -198,7 +198,7 @@ impl SessionEngine {
             Effect::OpenSnapshotStage {
                 op,
                 offer: Box::new(offer),
-                max_candidate_bytes: limit.max_candidate_bytes,
+                max_candidate_bytes: limit.max_candidate_bytes.get(),
             }
         })
     }
@@ -207,7 +207,7 @@ impl SessionEngine {
         if let Err(error) = self.snapshot_live(op, Stage::SnapshotOpening) {
             return Step::reject(error);
         }
-        if charged_bytes > self.snapshot_limits().max_candidate_bytes {
+        if charged_bytes > self.snapshot_limits().max_candidate_bytes.get() {
             return Step::reject(Reject::Backpressure);
         }
         self.snapshot_next_chunk()
@@ -234,7 +234,7 @@ impl SessionEngine {
         let remaining = offer.total_bytes - offset;
         let max_bytes = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
-            .min(self.snapshot_limits().max_chunk_bytes);
+            .min(self.snapshot_limits().max_chunk_bytes.get());
         self.snapshot_effect(Stage::SnapshotReading, move |op| {
             Effect::ReadSnapshotChunk {
                 op,
@@ -259,7 +259,7 @@ impl SessionEngine {
             || chunk.offset != progress.next_offset
             || chunk.payload_id != op.token
             || chunk.bytes == 0
-            || chunk.bytes > self.snapshot_limits().max_chunk_bytes
+            || chunk.bytes > self.snapshot_limits().max_chunk_bytes.get()
             || chunk
                 .offset
                 .checked_add(chunk.bytes as u64)
@@ -283,7 +283,7 @@ impl SessionEngine {
         if let Err(error) = self.snapshot_live(op, Stage::SnapshotWriting) {
             return Step::reject(error);
         }
-        let max_candidate_bytes = self.snapshot_limits().max_candidate_bytes;
+        let max_candidate_bytes = self.snapshot_limits().max_candidate_bytes.get();
         let Some(progress) = self.snapshot.as_mut() else {
             return Step::reject(Reject::Stage);
         };
@@ -313,7 +313,7 @@ impl SessionEngine {
         if let Err(error) = self.snapshot_live(op, Stage::SnapshotVerifying) {
             return Step::reject(error);
         }
-        let max_candidate_bytes = self.snapshot_limits().max_candidate_bytes;
+        let max_candidate_bytes = self.snapshot_limits().max_candidate_bytes.get();
         let Some(progress) = self.snapshot.as_ref() else {
             return Step::reject(Reject::Stage);
         };
@@ -335,7 +335,7 @@ impl SessionEngine {
         if let Err(error) = self.snapshot_live(op, Stage::SnapshotBarrier) {
             return Step::reject(error);
         }
-        if let Err(error) = proof.validate(&self.scope, self.config.max_cursor_bytes) {
+        if let Err(error) = proof.validate(&self.scope, self.config.max_cursor_bytes.get()) {
             return Step::reject(Reject::Identity(error));
         }
         let Some(progress) = self.snapshot.as_ref() else {
@@ -376,8 +376,8 @@ impl SessionEngine {
             .as_ref()
             .and_then(|progress| progress.cursor.clone())
             .expect("snapshot cursor");
-        let max_events = self.config.max_batch_events;
-        let max_bytes = self.config.max_batch_bytes;
+        let max_events = self.config.max_batch_events.get();
+        let max_bytes = self.config.max_batch_bytes.get();
         self.snapshot_effect(Stage::SnapshotScanning, move |op| Effect::SnapshotScan {
             op,
             from,
@@ -405,11 +405,11 @@ impl SessionEngine {
             || batch.coverage.through.history != proof.head.history
             || batch.coverage.proof != proof.id
             || batch.coverage.certificate.is_empty()
-            || batch.coverage.certificate.len() > self.config.max_cursor_bytes
+            || batch.coverage.certificate.len() > self.config.max_cursor_bytes.get()
             || batch.events == 0
-            || batch.events > self.config.max_batch_events
+            || batch.events > self.config.max_batch_events.get()
             || batch.bytes == 0
-            || batch.bytes > self.config.max_batch_bytes
+            || batch.bytes > self.config.max_batch_bytes.get()
             || batch
                 .advance
                 .for_operands(from, &batch.coverage.through, &proof.id)
@@ -426,7 +426,7 @@ impl SessionEngine {
         if let Err(error) = batch
             .coverage
             .through
-            .validate(&self.scope, self.config.max_cursor_bytes)
+            .validate(&self.scope, self.config.max_cursor_bytes.get())
         {
             return Step::reject(Reject::Identity(error));
         }
@@ -446,7 +446,7 @@ impl SessionEngine {
         if let Err(error) = self.snapshot_live(op, Stage::SnapshotApplying) {
             return Step::reject(error);
         }
-        let max_candidate_bytes = self.snapshot_limits().max_candidate_bytes;
+        let max_candidate_bytes = self.snapshot_limits().max_candidate_bytes.get();
         let Some(progress) = self.snapshot.as_mut() else {
             return Step::reject(Reject::Stage);
         };
@@ -486,7 +486,7 @@ impl SessionEngine {
         if let Err(error) = self.snapshot_live(op, Stage::SnapshotSealing) {
             return Step::reject(error);
         }
-        let max_candidate_bytes = self.snapshot_limits().max_candidate_bytes;
+        let max_candidate_bytes = self.snapshot_limits().max_candidate_bytes.get();
         let Some(progress) = self.snapshot.as_mut() else {
             return Step::reject(Reject::Stage);
         };
@@ -541,7 +541,7 @@ impl SessionEngine {
         if let Err(error) = self.snapshot_live(op, Stage::SnapshotAttaching) {
             return Step::reject(error);
         }
-        if let Err(error) = proof.validate(&self.scope, self.config.max_cursor_bytes) {
+        if let Err(error) = proof.validate(&self.scope, self.config.max_cursor_bytes.get()) {
             return Step::reject(Reject::Identity(error));
         }
         let Some(progress) = self.snapshot.as_ref() else {

@@ -48,12 +48,11 @@ fn main() {
     let mut sim = Simulation::new(LATENCY_MS);
     for id in &ids {
         let seeds = ids.iter().filter(|other| *other != id).cloned();
-        sim.add(GroupEngine::new(
-            group.clone(),
-            id.clone(),
-            seeds,
-            Config::default(),
-        ));
+        sim.add(
+            GroupEngine::new(group.clone(), id.clone(), seeds, Config::default())
+                .expect("valid config"),
+        )
+        .expect("distinct node");
     }
 
     // ---- 1. formation ------------------------------------------------------
@@ -73,7 +72,8 @@ fn main() {
             key: "routing".into(),
             value: "v1".into(),
         },
-    );
+    )
+    .expect("live node");
     sim.run_until(Time(4_000));
     println!("\n  {coordinator} (coordinator) wrote routing=v1");
     metadata(&sim, &ids);
@@ -117,7 +117,8 @@ fn main() {
             key: "routing".into(),
             value: "v2".into(),
         },
-    );
+    )
+    .expect("live node");
     sim.run_until(Time(10_000));
     println!("\n  {majority_coordinator} wrote routing=v2 on the majority side");
     metadata(&sim, &ids);
@@ -168,7 +169,8 @@ fn report(sim: &Simulation, ids: &[NodeId]) {
             .collect();
         println!(
             "  {observer}  live={}  coordinator={coordinator}  view: {}",
-            sim.member_count(observer),
+            sim.member_count(observer)
+                .expect("observer is in the simulation"),
             view.join(" ")
         );
     }

@@ -7,6 +7,7 @@
 //! `Simulation`; a failing `(mask, crash, dwell_ms)` tuple is a replayable trace.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
@@ -37,13 +38,7 @@ fn config() -> Config {
         probe_interval_ms: 50,
         probe_timeout_ms: 40,
         suspect_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: 60,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::Settle {
                 claim_settle_ms: CLAIM_SETTLE_MS,
@@ -60,7 +55,7 @@ fn nodes() -> [NodeId; 3] {
 
 fn engine(group: &GroupId, node: &NodeId, nodes: &[NodeId; 3]) -> GroupEngine {
     let seeds = nodes.iter().filter(|candidate| *candidate != node).cloned();
-    GroupEngine::new(group.clone(), node.clone(), seeds, config())
+    GroupEngine::new(group.clone(), node.clone(), seeds, config()).expect("valid config")
 }
 
 fn block_mask(sim: &mut Simulation, nodes: &[NodeId; 3], mask: u8) {
@@ -144,7 +139,8 @@ fn run_case(case: Case) {
     let mut alive = all.clone();
     let mut sim = Simulation::new(7);
     for node in &nodes {
-        sim.add(engine(&group, node, &nodes));
+        sim.add(engine(&group, node, &nodes))
+            .expect("distinct node");
     }
 
     sim.run_until(Time(INITIAL_SETTLE_MS));
@@ -166,7 +162,7 @@ fn run_case(case: Case) {
 
     block_mask(&mut sim, &nodes, case.blocked_mask);
     if let Some(crashed) = case.crashed {
-        sim.crash(&nodes[crashed]);
+        sim.crash(&nodes[crashed]).expect("live node");
         alive.remove(&nodes[crashed]);
     }
 
@@ -177,7 +173,8 @@ fn run_case(case: Case) {
     sim.heal_all();
     if let Some(crashed) = case.crashed {
         let node = &nodes[crashed];
-        sim.add(engine(&group, node, &nodes));
+        sim.add(engine(&group, node, &nodes))
+            .expect("distinct node");
         alive.insert(node.clone());
     }
     assert_eq!(alive, all, "{case:?}: recovery did not restore every node");
@@ -188,7 +185,7 @@ fn run_case(case: Case) {
 
     for node in &nodes {
         assert_eq!(
-            sim.members_of(node),
+            sim.members_of(node).expect("node is in the simulation"),
             all,
             "{case:?}: {node} did not converge on full membership"
         );

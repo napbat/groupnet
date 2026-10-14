@@ -40,12 +40,10 @@ fn lease_cfg() -> LeaseConfig {
     LeaseConfig::for_duration(LEASE)
 }
 
-/// The timings every node in these tests runs at: fast gossip, brisk
-/// anti-entropy, one shared group.
+/// The timings every node in these tests runs at: a brisk gossip round, one
+/// shared group.
 fn opts() -> NodeOpts {
-    NodeOpts::new("stores")
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+    NodeOpts::new("stores").gossip_interval_ms(25)
 }
 
 const fn cap(n: usize) -> NonZeroUsize {
@@ -116,8 +114,7 @@ async fn serving(what: &str, view: &LeaseView) {
 async fn a_healthy_group_serves_under_leases_and_invalidates_at_ack_speed() {
     let cluster = MemCluster::builder(&["fast-a", "fast-b", "fast-c"])
         .group("stores")
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+        .gossip_interval_ms(25)
         .spawn()
         .await;
     let groups: Vec<&Group> = cluster.groups.iter().collect();
@@ -198,8 +195,7 @@ async fn a_healthy_group_serves_under_leases_and_invalidates_at_ack_speed() {
 async fn a_silent_readers_lease_lapses_and_it_must_resync_before_serving_again() {
     let cluster = MemCluster::builder(&["lapse-a", "lapse-b", "lapse-c"])
         .group("stores")
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+        .gossip_interval_ms(25)
         .spawn()
         .await;
     let groups: Vec<&Group> = cluster.groups.iter().collect();
@@ -325,8 +321,7 @@ async fn a_silent_readers_lease_lapses_and_it_must_resync_before_serving_again()
 async fn a_reader_that_renews_but_never_applies_lapses_under_a_write() {
     let cluster = MemCluster::builder(&["stall-a", "stall-b"])
         .group("stores")
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+        .gossip_interval_ms(25)
         .spawn()
         .await;
     let groups: Vec<&Group> = cluster.groups.iter().collect();
@@ -386,8 +381,7 @@ async fn a_reader_that_renews_but_never_applies_lapses_under_a_write() {
 async fn a_node_without_the_lease_tier_neither_blocks_writes_nor_serves() {
     let cluster = MemCluster::builder(&["mix-a", "mix-b", "mix-c"])
         .group("stores")
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+        .gossip_interval_ms(25)
         .spawn()
         .await;
     let groups: Vec<&Group> = cluster.groups.iter().collect();

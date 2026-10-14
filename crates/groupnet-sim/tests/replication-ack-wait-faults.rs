@@ -69,10 +69,10 @@ fn request(kind: AckKind) -> AckWaitRequest {
 
 fn limits() -> AckWaitLimits {
     AckWaitLimits {
-        max_required: 2,
-        max_identity_bytes: 32,
-        max_certificate_bytes: 32,
-        max_metadata_bytes: 256,
+        max_required: std::num::NonZeroUsize::new(2).unwrap(),
+        max_identity_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+        max_certificate_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+        max_metadata_bytes: std::num::NonZeroUsize::new(256).unwrap(),
         max_wait_ms: 50,
         poll_ms: 2,
     }

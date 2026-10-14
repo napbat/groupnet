@@ -229,11 +229,11 @@ application code. Every effect has a generation and operation token.
 
 ```rust,ignore
 pub struct ReplicationConfig {
-    pub max_cursor_bytes: usize,
+    pub max_cursor_bytes: NonZeroUsize,
     pub max_history_bytes: usize,
     pub max_history_events: usize,
-    pub max_snapshot_bytes: u64,
-    pub max_chunk_bytes: usize,
+    pub max_snapshot_bytes: NonZeroU64,
+    pub max_chunk_bytes: NonZeroUsize,
     pub max_inflight_bytes: usize,
     pub max_inflight_batches_per_scope: usize,
     pub max_active_scopes: usize,
@@ -340,7 +340,12 @@ starting limits, not measured throughput or latency guarantees.
 Snapshots are opt-in: `Config.snapshot` defaults to `None`. Callers provide
 finite image, chunk, metadata, decoded-candidate, and total-attempt limits;
 there is no implemented 1 GiB image/256 KiB chunk default or fixed four-transfer
-policy. Separate snapshot admission reserves ordinary replay operation,
+policy. The core's cursor, batch, retry-count, and snapshot count/byte limits
+are `NonZero*` types, so a zero cap is unrepresentable. `Config::validate(&self)`
+checks the remaining rules and names the first violation as a typed
+`ConfigError` (for example `ZeroTailCheck`, `Snapshot(SnapshotConfigError)`, or
+`Idle(IdlePolicyError)`); its `source()` exposes the nested policy error.
+Separate snapshot admission reserves ordinary replay operation,
 batch-byte, and checkpoint capacity. The runtime validates those reserves
 before opening sessions. Optional `IdlePolicy` provides bounded backoff and
 deterministic jitter without extending read freshness; only explicitly opened
@@ -613,9 +618,12 @@ The policy has a finite maximum interval and bounded deterministic jitter.
 Only explicitly opened scopes have workers. Consumers register resident or
 requested shards and close evicted scopes; possible shard count is not a
 reason to create a worker for every shard. The public fields are
-`unchanged_checks`, `max_interval_ms`, and `jitter_ms`; validation requires a
-positive check count, a maximum at least `Config.tail_check_ms`, and jitter
-no larger than that maximum. `Config.idle` defaults to `None`.
+`unchanged_checks` (a `NonZeroU32`, so the check count is always positive),
+`max_interval_ms`, and `jitter_ms`. `IdlePolicy::validate(&self,
+tail_check_ms)` returns a typed `IdlePolicyError`: `ZeroMaxInterval`,
+`MaxIntervalBelowTailCheck` for a maximum below `Config.tail_check_ms`, or
+`JitterExceedsMaxInterval`. `Config::validate` reports it as
+`ConfigError::Idle`. `Config.idle` defaults to `None`.
 
 Backing off checks does not extend any source proof, lease, admission,
 checkpoint, or permission to serve. The original freshness deadline remains
@@ -783,6 +791,10 @@ If writer and reader clock rates differ by at most the configured ratio
 `ceil(max_duration * rate_numerator / rate_denominator) + clock_margin_ms`
 of its clock units. The nonzero, persisted margin covers millisecond sample
 quantization and driver scheduling uncertainty; overflow rejects the policy.
+`AdmissionPolicy::validate` and `ExpiryTiming::validate` return a typed
+`PolicyError` naming the violated rule (`ZeroClockMargin`, `RateBelowOne`,
+`Overflow`, and so on); reader and writer cores surface it as
+`ReaderError::Policy(_)` / `WriterError::Policy(_)`.
 No per-node wall-clock comparison or persisted wall timestamp is used. A
 restarted writer restarts the entire wait. Admission records after the intent
 must replay the pending intent before serving. An invalidation acknowledgement

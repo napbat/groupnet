@@ -85,7 +85,8 @@ fn decode(bytes: &[u8]) -> Option<String> {
 /// claim guard reads, so `ranked(..)[0]` is the node that will bid and
 /// `ranked(..)[1]` is the one that inherits when it dies.
 fn ranked(group: &str, ids: &[&str]) -> Vec<NodeId> {
-    let members: Vec<(NodeId, u32)> = ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
+    let members: std::collections::BTreeMap<NodeId, u32> =
+        ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
     placement::owners(group, &members, ids.len())
 }
 

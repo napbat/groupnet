@@ -1,5 +1,8 @@
 //! Typed, finite transfer inputs and effects. No type grants read authority.
 
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroUsize};
+
 use crate::Time;
 use crate::volatile_recovery::RecoveryOperation;
 
@@ -30,61 +33,83 @@ pub(crate) fn native_cuts_cover(actual: &[NativeCut], expected: &[NativeCut]) ->
 }
 
 /// Finite per-transfer metadata, image, native buffer, and batch limits.
+///
+/// Budgets and the schema are nonzero by type; [`TransferConfig::validate`]
+/// checks the coverage cadence and the chunk budgets against the image cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferConfig {
     /// Application schema this follower can decode and install.
-    pub expected_schema: u32,
+    pub expected_schema: NonZeroU32,
     /// Maximum combined variable metadata bytes in one offer.
-    pub max_metadata_bytes: usize,
+    pub max_metadata_bytes: NonZeroUsize,
     /// Maximum encoded private image bytes.
-    pub max_encoded_bytes: usize,
+    pub max_encoded_bytes: NonZeroUsize,
     /// Maximum decoded private stage bytes.
-    pub max_decoded_bytes: usize,
-    /// Maximum encoded bytes in one verified chunk.
-    pub max_chunk_bytes: usize,
-    /// Maximum number of image chunks.
-    pub max_chunks: usize,
+    pub max_decoded_bytes: NonZeroUsize,
+    /// Maximum encoded bytes in one verified chunk; at most `max_encoded_bytes`.
+    pub max_chunk_bytes: NonZeroUsize,
+    /// Maximum number of image chunks; at most `max_encoded_bytes`.
+    pub max_chunks: NonZeroUsize,
     /// Maximum bytes in one donor journal batch.
-    pub max_batch_bytes: usize,
+    pub max_batch_bytes: NonZeroUsize,
     /// Maximum events in one donor journal batch.
-    pub max_batch_events: usize,
+    pub max_batch_events: NonZeroUsize,
     /// Maximum total donor journal events replayed in one transfer.
-    pub max_replay_events: usize,
+    pub max_replay_events: NonZeroUsize,
     /// Maximum buffered native effects before source coverage.
-    pub max_native_buffer_bytes: usize,
+    pub max_native_buffer_bytes: NonZeroUsize,
     /// Maximum complete member identities in offer and barrier.
-    pub max_members: usize,
+    pub max_members: NonZeroUsize,
     /// Maximum complete native writer cuts in offer and barrier.
-    pub max_cuts: usize,
-    /// Minimum logical cadence between unchanged native-coverage checks.
+    pub max_cuts: NonZeroUsize,
+    /// Minimum logical cadence between unchanged native-coverage checks;
+    /// nonzero.
     pub coverage_poll_ms: u64,
 }
 
+/// Invalid [`TransferConfig`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferConfigError {
+    /// [`TransferConfig::coverage_poll_ms`] is zero.
+    ZeroCoveragePoll,
+    /// [`TransferConfig::max_chunk_bytes`] exceeds
+    /// [`TransferConfig::max_encoded_bytes`].
+    ChunkBytesExceedEncoded,
+    /// [`TransferConfig::max_chunks`] exceeds [`TransferConfig::max_encoded_bytes`],
+    /// so some chunk would be empty.
+    ChunksExceedEncoded,
+}
+
+impl fmt::Display for TransferConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroCoveragePoll => "transfer coverage_poll_ms must be nonzero",
+            Self::ChunkBytesExceedEncoded => {
+                "transfer max_chunk_bytes must not exceed max_encoded_bytes"
+            }
+            Self::ChunksExceedEncoded => "transfer max_chunks must not exceed max_encoded_bytes",
+        })
+    }
+}
+
+impl std::error::Error for TransferConfigError {}
+
 impl TransferConfig {
-    /// Rejects zero, inverted, or unrepresentable finite budgets.
+    /// Rejects inverted or unprogressing finite budgets.
     ///
     /// # Errors
-    /// Returns [`TransferError::InvalidConfig`] for invalid budgets.
-    pub fn validate(self) -> Result<Self, TransferError> {
-        if self.expected_schema == 0
-            || self.max_metadata_bytes == 0
-            || self.max_encoded_bytes == 0
-            || self.max_decoded_bytes == 0
-            || self.max_chunk_bytes == 0
-            || self.max_chunks == 0
-            || self.max_batch_bytes == 0
-            || self.max_batch_events == 0
-            || self.max_replay_events == 0
-            || self.max_native_buffer_bytes == 0
-            || self.max_members == 0
-            || self.max_cuts == 0
-            || self.coverage_poll_ms == 0
-            || self.max_chunk_bytes > self.max_encoded_bytes
-            || self.max_chunks > self.max_encoded_bytes
-        {
-            return Err(TransferError::InvalidConfig);
+    /// Returns the [`TransferConfigError`] variant naming the first violated rule.
+    pub fn validate(&self) -> Result<(), TransferConfigError> {
+        if self.coverage_poll_ms == 0 {
+            return Err(TransferConfigError::ZeroCoveragePoll);
         }
-        Ok(self)
+        if self.max_chunk_bytes > self.max_encoded_bytes {
+            return Err(TransferConfigError::ChunkBytesExceedEncoded);
+        }
+        if self.max_chunks > self.max_encoded_bytes {
+            return Err(TransferConfigError::ChunksExceedEncoded);
+        }
+        Ok(())
     }
 }
 
@@ -413,8 +438,11 @@ pub enum TransferEffect {
 /// Rejection reason; terminal failures emit cleanup effects as well.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferError {
-    /// Invalid finite limits or identity at construction.
-    InvalidConfig,
+    /// The [`TransferConfig`] is invalid.
+    Config(TransferConfigError),
+    /// The [`TransferBinding`] has an empty, zero, mismatched, or oversized
+    /// identity, or its deadline already elapsed.
+    InvalidBinding,
     /// Input does not belong to the current phase.
     Stage,
     /// Reply belongs to a stale or forged operation, capture, or reservation.
@@ -433,6 +461,33 @@ pub enum TransferError {
     Expired,
     /// One runtime or source operation failed or outlived its deadline.
     Unavailable,
+}
+
+impl fmt::Display for TransferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Config(_) => "invalid transfer config",
+            Self::InvalidBinding => "invalid transfer binding",
+            Self::Stage => "transfer input belongs to another phase",
+            Self::Stale => "transfer reply is stale or forged",
+            Self::Allocator => "transfer allocator returned an invalid token",
+            Self::Capacity => "transfer capacity exceeded",
+            Self::Schema => "donor schema is incompatible",
+            Self::Continuity => "transfer source continuity is unprovable",
+            Self::BackwardTime => "transfer time moved backward",
+            Self::Expired => "transfer made no progress within its stall bound",
+            Self::Unavailable => "transfer operation failed or timed out",
+        })
+    }
+}
+
+impl std::error::Error for TransferError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// One deterministic transition with effects and an optional rejection.
@@ -458,4 +513,64 @@ pub struct TransferBinding {
     /// Initial stall bound: min(donor wait, selection total) from the start.
     /// The claim parent moves it later on each advance of the transfer.
     pub due: Time,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> TransferConfig {
+        let nz = |n| NonZeroUsize::new(n).unwrap();
+        TransferConfig {
+            expected_schema: NonZeroU32::MIN,
+            max_metadata_bytes: nz(32),
+            max_encoded_bytes: nz(16),
+            max_decoded_bytes: nz(16),
+            max_chunk_bytes: nz(8),
+            max_chunks: nz(4),
+            max_batch_bytes: nz(16),
+            max_batch_events: nz(3),
+            max_replay_events: nz(5),
+            max_native_buffer_bytes: nz(8),
+            max_members: nz(2),
+            max_cuts: nz(1),
+            coverage_poll_ms: 2,
+        }
+    }
+
+    #[test]
+    fn config_validate_names_each_rule() {
+        assert_eq!(config().validate(), Ok(()));
+        assert_eq!(
+            TransferConfig {
+                coverage_poll_ms: 0,
+                ..config()
+            }
+            .validate(),
+            Err(TransferConfigError::ZeroCoveragePoll)
+        );
+        assert_eq!(
+            TransferConfig {
+                max_chunk_bytes: NonZeroUsize::new(17).unwrap(),
+                ..config()
+            }
+            .validate(),
+            Err(TransferConfigError::ChunkBytesExceedEncoded)
+        );
+        assert_eq!(
+            TransferConfig {
+                max_chunks: NonZeroUsize::new(17).unwrap(),
+                ..config()
+            }
+            .validate(),
+            Err(TransferConfigError::ChunksExceedEncoded)
+        );
+        let error = TransferError::Config(TransferConfigError::ChunksExceedEncoded);
+        assert_eq!(error.to_string(), "invalid transfer config");
+        assert_eq!(
+            std::error::Error::source(&error).map(ToString::to_string),
+            Some("transfer max_chunks must not exceed max_encoded_bytes".to_owned())
+        );
+        assert!(std::error::Error::source(&TransferError::Stage).is_none());
+    }
 }

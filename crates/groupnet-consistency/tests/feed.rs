@@ -29,12 +29,10 @@ const fn cap(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("nonzero")
 }
 
-/// The timings every node in these tests runs at: fast gossip, brisk
-/// anti-entropy, one shared group.
+/// The timings every node in these tests runs at: a brisk gossip round, one
+/// shared group.
 fn opts() -> NodeOpts {
-    NodeOpts::new(GROUP)
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+    NodeOpts::new(GROUP).gossip_interval_ms(25)
 }
 
 async fn next_event(peers: &mut PeerWrites<String>) -> PeerWrite<String> {
@@ -256,7 +254,7 @@ async fn retired_prefix_gaps_then_delivers_the_anchor_and_tail() {
 #[tokio::test]
 async fn encoded_feed_budget_degrades_to_an_explicit_gap() {
     let net = Network::new();
-    let opts = opts().max_delta_frame_bytes(1_024);
+    let opts = opts().max_delta_frame_bytes(cap(1_024));
     let (a_id, _a_node, a_group) = spawn_mem_node(&net, "bytes-a", &["bytes-b"], &opts).await;
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "bytes-b", &["bytes-a"], &opts).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;

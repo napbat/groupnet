@@ -50,9 +50,9 @@ struct Coverage {
 
 fn config() -> BootstrapConfig {
     BootstrapConfig {
-        max_members: 3,
-        max_member_bytes: 8,
-        max_scope_bytes: 16,
+        max_members: std::num::NonZeroUsize::new(3).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_scope_bytes: std::num::NonZeroUsize::new(16).unwrap(),
         settle_ms: 3,
         renew_ms: 6,
         claim_ttl_ms: 12,

@@ -536,7 +536,6 @@ async fn the_reserved_routing_group_never_elects() {
     let net = Network::new();
     let config = Config {
         gossip_interval_ms: GOSSIP_MS,
-        anti_entropy_interval_ms: GOSSIP_MS,
         // Node-*wide* Hosted: the strongest thing a caller can ask for, and
         // the one that would drag the routing group in without the pin.
         mode: GroupMode::Hosted(hosted_config()),

@@ -9,9 +9,9 @@ use crate::NodeId;
 
 fn engine() -> RecoveryEngine {
     let config = RecoveryConfig {
-        max_members: 4,
-        max_member_bytes: 32,
-        max_barrier_rounds: 3,
+        max_members: std::num::NonZeroUsize::new(4).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(3).unwrap(),
         total_ms: 100,
         attempt_ms: 20,
         settle_ms: 5,

@@ -40,7 +40,7 @@ impl ClaimEngine {
                 Err(error) => return Self::reject(error),
             }
         }
-        if candidates.len() > self.config.max_members || !candidates.contains_key(&self.me) {
+        if candidates.len() > self.config.max_members.get() || !candidates.contains_key(&self.me) {
             return Self::reject(BootstrapError::InvalidObservation);
         }
         if self.followed_builder_unseen(members, &candidates) {

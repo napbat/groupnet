@@ -67,6 +67,7 @@
 //! [`AnchorRecord::stealable`]: groupnet_core::anchor::AnchorRecord::stealable
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
@@ -110,25 +111,20 @@ fn cfg() -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_INTERVAL_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::External {
                 steal_margin_ms: STEAL_MARGIN_MS,
             },
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
 fn engine(group: &str, id: &NodeId, peers: &BTreeSet<NodeId>) -> GroupEngine {
     let seeds = peers.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(GroupId::new(group), id.clone(), seeds, cfg())
+    GroupEngine::new(GroupId::new(group), id.clone(), seeds, cfg()).expect("valid config")
 }
 
 /// A cluster of `n` nodes with the anchor armed at the group's configuration.
@@ -137,7 +133,7 @@ fn cluster(group: &str, members: &BTreeSet<NodeId>) -> Simulation {
     sim.enable_anchor(LEASE_MS, STEAL_MARGIN_MS);
     sim.set_anchor_latency(ANCHOR_LATENCY_MS);
     for id in members {
-        sim.add(engine(group, id, members));
+        sim.add(engine(group, id, members)).expect("distinct node");
     }
     sim
 }
@@ -301,7 +297,7 @@ fn within_margin(seed: u64) -> (u64, u64) {
             3 => sim.heal_all(),
             4 if sim.nodes().len() > 2 => {
                 if let Some(host) = sim.hosts().first().cloned() {
-                    sim.crash(&host);
+                    sim.crash(&host).expect("live node");
                 }
             }
             _ => {
@@ -311,7 +307,8 @@ fn within_margin(seed: u64) -> (u64, u64) {
                     .cloned()
                     .collect();
                 if let Some(node) = down.first() {
-                    sim.add(engine(&group, node, &members));
+                    sim.add(engine(&group, node, &members))
+                        .expect("distinct node");
                 }
             }
         }
@@ -662,7 +659,7 @@ fn unknown_writes(seed: u64) -> u64 {
             // do with ambiguity.
             0 if sim.nodes().len() > 2 => {
                 if let Some(host) = sim.hosts().first().cloned() {
-                    sim.crash(&host);
+                    sim.crash(&host).expect("live node");
                 }
             }
             1 => {
@@ -672,7 +669,8 @@ fn unknown_writes(seed: u64) -> u64 {
                     .cloned()
                     .collect();
                 if let Some(node) = down.first() {
-                    sim.add(engine(&group, node, &members));
+                    sim.add(engine(&group, node, &members))
+                        .expect("distinct node");
                 }
             }
             _ => {

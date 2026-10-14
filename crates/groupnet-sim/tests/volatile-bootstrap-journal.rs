@@ -34,22 +34,22 @@ fn member(claim: &ClaimIdentity) -> BootstrapMemberIdentity {
 
 fn config() -> JournalConfig {
     JournalConfig {
-        max_encoded_bytes: 64,
-        max_decoded_bytes: 64,
-        max_events: 6,
-        max_suffix_bytes: 32,
-        max_event_bytes: 8,
-        max_identity_bytes: 4,
-        max_followers: 2,
-        max_follower_id_bytes: 8,
-        max_cuts: 1,
-        max_cut_bytes: 4,
-        max_members: 2,
-        max_membership_bytes: 16,
-        max_scope_bytes: 8,
-        max_batch_events: 2,
-        max_batch_bytes: 16,
-        max_inflight_bytes: 16,
+        max_encoded_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        max_decoded_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        max_events: std::num::NonZeroUsize::new(6).unwrap(),
+        max_suffix_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+        max_event_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_identity_bytes: std::num::NonZeroUsize::new(4).unwrap(),
+        max_followers: std::num::NonZeroUsize::new(2).unwrap(),
+        max_follower_id_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_cuts: std::num::NonZeroUsize::new(1).unwrap(),
+        max_cut_bytes: std::num::NonZeroUsize::new(4).unwrap(),
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_membership_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+        max_scope_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_batch_events: std::num::NonZeroUsize::new(2).unwrap(),
+        max_batch_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+        max_inflight_bytes: std::num::NonZeroUsize::new(16).unwrap(),
         max_total_ms: 30,
         max_follower_ms: 8,
     }
@@ -315,8 +315,8 @@ fn queued_transfer_reconstructs_every_exact_barrier() {
                     duplicate_acks += 1;
                 }
             }
-            assert!(journal.retained_bytes() <= limits.max_suffix_bytes);
-            assert!(journal.inflight_bytes() <= limits.max_inflight_bytes);
+            assert!(journal.retained_bytes() <= limits.max_suffix_bytes.get());
+            assert!(journal.inflight_bytes() <= limits.max_inflight_bytes.get());
         }
         assert_eq!(journal.current_cursor().unwrap().position, 5);
         assert_eq!(
@@ -420,7 +420,7 @@ fn queued_disposal_fences_delayed_batch_callbacks() {
             Err(JournalError::Stale)
         );
         late_rejected += 1;
-        assert!(journal.take_aborted().len() <= config().max_followers);
+        assert!(journal.take_aborted().len() <= config().max_followers.get());
     }
     assert_eq!(late_rejected, 48);
     assert!(ack_before_disposal > 0);
@@ -475,7 +475,7 @@ fn consume_barrier(
         for delta in &batch.deltas {
             apply(state, &delta.effect);
         }
-        assert!(journal.inflight_bytes() <= config().max_inflight_bytes);
+        assert!(journal.inflight_bytes() <= config().max_inflight_bytes.get());
         let operation = batch.operation;
         let through = batch.through.clone();
         drop(batch);
@@ -546,7 +546,7 @@ fn image_cut_suffix_and_expiry_schedules_never_skip_or_resurrect() {
         let mut follower_state = Some(7u8);
         consume_barrier(&mut journal, &reservation, &first, 4, &mut follower_state);
         assert_eq!(follower_state, live, "seed {seed} at B");
-        assert!(journal.retained_bytes() <= config().max_suffix_bytes);
+        assert!(journal.retained_bytes() <= config().max_suffix_bytes.get());
 
         match seed % 4 {
             0 => {
@@ -621,9 +621,9 @@ fn image_cut_suffix_and_expiry_schedules_never_skip_or_resurrect() {
                 overflowed += 1;
             }
         }
-        assert!(journal.inflight_bytes() <= config().max_inflight_bytes);
-        assert!(journal.retained_bytes() <= config().max_suffix_bytes);
-        assert!(journal.take_aborted().len() <= config().max_followers);
+        assert!(journal.inflight_bytes() <= config().max_inflight_bytes.get());
+        assert!(journal.retained_bytes() <= config().max_suffix_bytes.get());
+        assert!(journal.take_aborted().len() <= config().max_followers.get());
     }
     assert_eq!(
         (completed, expired, invalidated, overflowed),

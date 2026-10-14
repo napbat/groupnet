@@ -121,9 +121,9 @@ async fn own_origin_rebuild_keeps_presence_renewing_past_claim_ttls() {
     let handle = RecoveryHandle::open_with_bootstrap(
         Arc::clone(&origin),
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 1_000,
             attempt_ms: 500,
             settle_ms: 5,

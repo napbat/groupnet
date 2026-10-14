@@ -83,11 +83,11 @@ fn engine(session: u64) -> SessionEngine {
         Mode::StateSync,
         Config {
             snapshot: Some(SnapshotConfig {
-                max_metadata_bytes: 512,
-                max_snapshot_bytes: 16,
-                max_chunks: 4,
-                max_chunk_bytes: 4,
-                max_candidate_bytes: 64,
+                max_metadata_bytes: std::num::NonZeroUsize::new(512).unwrap(),
+                max_snapshot_bytes: std::num::NonZeroU64::new(16).unwrap(),
+                max_chunks: std::num::NonZeroU32::new(4).unwrap(),
+                max_chunk_bytes: std::num::NonZeroUsize::new(4).unwrap(),
+                max_candidate_bytes: std::num::NonZeroU64::new(64).unwrap(),
                 max_total_ms: 80,
             }),
             attempt_timeout_ms: 12,

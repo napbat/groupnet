@@ -75,6 +75,19 @@ pub enum IdentityError {
     WrongHistory,
 }
 
+impl std::fmt::Display for IdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "a required name or position is empty",
+            Self::TooLarge => "a name or position exceeds the configured byte cap",
+            Self::WrongScope => "the cursor belongs to a different stream or partition",
+            Self::WrongHistory => "the cursor belongs to a different source history",
+        })
+    }
+}
+
+impl std::error::Error for IdentityError {}
+
 impl Cursor {
     /// Checks identity and encoded position bounds before retaining a cursor.
     ///

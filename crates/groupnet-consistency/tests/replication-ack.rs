@@ -392,10 +392,10 @@ fn limits() -> (Limits, AckWaitLimits) {
     replay.core.tail_check_ms = 50;
     replay.max_parallel_ops = 2;
     let ack = AckWaitLimits {
-        max_required: 2,
-        max_identity_bytes: 64,
-        max_certificate_bytes: 64,
-        max_metadata_bytes: 512,
+        max_required: std::num::NonZeroUsize::new(2).unwrap(),
+        max_identity_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        max_certificate_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        max_metadata_bytes: std::num::NonZeroUsize::new(512).unwrap(),
         max_wait_ms: 4000,
         poll_ms: 20,
     };

@@ -21,12 +21,10 @@ const fn cap(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("nonzero")
 }
 
-/// The timings every node in these tests runs at: fast gossip, brisk
-/// anti-entropy, one shared group.
+/// The timings every node in these tests runs at: a brisk gossip round, one
+/// shared group.
 fn opts() -> NodeOpts {
-    NodeOpts::new("stores")
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+    NodeOpts::new("stores").gossip_interval_ms(25)
 }
 
 fn decode(bytes: &[u8]) -> Option<String> {

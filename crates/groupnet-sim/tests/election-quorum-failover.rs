@@ -20,6 +20,7 @@
 //! A failing seed is a reproducible counterexample, not a flake.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
@@ -42,19 +43,14 @@ fn cfg(voters: &BTreeSet<NodeId>) -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_INTERVAL_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::Quorum {
                 voters: VoterRoster::new(voters.iter().cloned()),
             },
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
@@ -91,12 +87,11 @@ impl Topology {
     fn boot(&self, sim: &mut Simulation) {
         for id in &self.booted {
             let seeds = self.booted.iter().filter(|x| *x != id).cloned();
-            sim.add(GroupEngine::new(
-                self.group.clone(),
-                id.clone(),
-                seeds,
-                self.cfg(),
-            ));
+            sim.add(
+                GroupEngine::new(self.group.clone(), id.clone(), seeds, self.cfg())
+                    .expect("valid config"),
+            )
+            .expect("distinct node");
         }
     }
 
@@ -525,7 +520,7 @@ fn failover_budget(seed: u64) {
         .cloned()
         .collect();
     let (epoch, _) = pair_of(&sim, survivors.iter().next().expect("a survivor"));
-    sim.crash(&incumbent);
+    sim.crash(&incumbent).expect("live node");
     if !topo.has_majority(&survivors) {
         // The crash took the roster majority with it. The CP answer is no host
         // at all, for ever — asserted here rather than skipped.

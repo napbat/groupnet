@@ -32,6 +32,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                 .config
                 .transfer
                 .max_metadata_bytes
+                .get()
                 .checked_mul(4)
                 .and_then(|bytes| bytes.checked_add(256));
             let Some(bytes) = bytes else {

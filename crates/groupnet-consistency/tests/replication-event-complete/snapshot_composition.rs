@@ -132,11 +132,11 @@ async fn native_snapshot_state_sync_and_named_events_compose_without_snapshot_de
         .await;
     let mut bounds = limits();
     bounds.core.snapshot = Some(SnapshotConfig {
-        max_metadata_bytes: 512,
-        max_snapshot_bytes: 64,
-        max_chunks: 16,
-        max_chunk_bytes: 4,
-        max_candidate_bytes: 64,
+        max_metadata_bytes: std::num::NonZeroUsize::new(512).unwrap(),
+        max_snapshot_bytes: std::num::NonZeroU64::new(64).unwrap(),
+        max_chunks: std::num::NonZeroU32::new(16).unwrap(),
+        max_chunk_bytes: std::num::NonZeroUsize::new(4).unwrap(),
+        max_candidate_bytes: std::num::NonZeroU64::new(64).unwrap(),
         max_total_ms: 3000,
     });
     let manager = Replication::new_native(

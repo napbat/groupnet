@@ -139,14 +139,14 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 }
                 let request = DonorRequest::Barrier {
                     attachment,
-                    max_metadata_bytes: self.policy.max_metadata_bytes,
+                    max_metadata_bytes: self.policy.max_metadata_bytes.get(),
                 };
                 self.barrier(context, op, request, deadline).await
             }
             TransferEffect::AdvanceBarrier { op, expected } => {
                 let request = DonorRequest::AdvanceBarrier {
                     expected,
-                    max_metadata_bytes: self.policy.max_metadata_bytes,
+                    max_metadata_bytes: self.policy.max_metadata_bytes.get(),
                 };
                 self.barrier(context, op, request, deadline).await
             }
@@ -160,8 +160,8 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 }
                 let request = DonorRequest::Batch {
                     barrier: receipt,
-                    max_bytes: self.policy.max_batch_bytes,
-                    max_events: self.policy.max_batch_events,
+                    max_bytes: self.policy.max_batch_bytes.get(),
+                    max_events: self.policy.max_batch_events.get(),
                 };
                 let reply = self.request(context, op, &request, deadline).await?;
                 let batch = reply.try_map(|reply| match reply {

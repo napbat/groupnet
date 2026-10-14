@@ -18,9 +18,9 @@ fn transient_full_scan_failures_retry_without_reviving_old_operations() {
         let mut rng = SplitMix64::new(seed);
         let failures = rng.below(16);
         let config = RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 16,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 35,
             attempt_ms: 8,
             settle_ms: 2,

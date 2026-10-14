@@ -597,7 +597,8 @@ fn rank_donors(
     host: Option<&NodeId>,
     covers: impl Fn(&NodeId) -> bool,
 ) -> Vec<NodeId> {
-    let weighted: Vec<(NodeId, u32)> = members.iter().map(|id| (id.clone(), 1)).collect();
+    let weighted: std::collections::BTreeMap<NodeId, u32> =
+        members.iter().map(|id| (id.clone(), 1)).collect();
     let ranked = placement::owners(group, &weighted, weighted.len());
     let mut ordered = Vec::with_capacity(ranked.len());
     if let Some(host) = host

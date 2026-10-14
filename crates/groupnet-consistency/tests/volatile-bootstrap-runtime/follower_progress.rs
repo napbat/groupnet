@@ -47,9 +47,9 @@ fn claims(phase: ClaimPhase) -> Arc<Claims> {
 /// than the build and the transfer below.
 fn short_recovery() -> RecoveryConfig {
     RecoveryConfig {
-        max_members: 2,
-        max_member_bytes: 8,
-        max_barrier_rounds: 2,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
         total_ms: 300,
         attempt_ms: 150,
         settle_ms: 5,
@@ -109,9 +109,10 @@ async fn progressing_transfer_outlives_the_donor_wait_and_every_episode_bound() 
     let mut config = bootstrap_config();
     config.require_participation = true;
     config.max_claim_metadata_bytes = 512;
-    config.transfer.max_chunks = CHUNKS;
-    config.transfer.max_encoded_bytes = CHUNKS;
-    config.transfer.max_decoded_bytes = CHUNKS;
+    let chunks = std::num::NonZeroUsize::new(CHUNKS).unwrap();
+    config.transfer.max_chunks = chunks;
+    config.transfer.max_encoded_bytes = chunks;
+    config.transfer.max_decoded_bytes = chunks;
     let (donor, admission, handle, reads) = open_follower(
         &claims,
         PeerDonor::paced(&peer_identity(), &follower_identity(), CHUNKS, 50),

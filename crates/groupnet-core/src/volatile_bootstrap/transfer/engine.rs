@@ -42,13 +42,15 @@ impl TransferSession {
     /// selection and its initial stall deadline.
     ///
     /// # Errors
-    /// Rejects malformed identities, bounds, or a deadline already elapsed.
+    /// Returns [`TransferError::Config`] for invalid limits or
+    /// [`TransferError::InvalidBinding`] for malformed identities or a
+    /// deadline already elapsed.
     pub fn new(
         config: TransferConfig,
         binding: TransferBinding,
         now: Time,
     ) -> Result<Self, TransferError> {
-        let config = config.validate()?;
+        config.validate().map_err(TransferError::Config)?;
         let binding_bytes = binding
             .scope
             .domain
@@ -56,7 +58,7 @@ impl TransferSession {
             .checked_add(binding.scope.partition.len())
             .and_then(|bytes| bytes.checked_add(binding.donor.node.as_str().len()))
             .and_then(|bytes| bytes.checked_add(binding.follower.node.as_str().len()))
-            .ok_or(TransferError::InvalidConfig)?;
+            .ok_or(TransferError::InvalidBinding)?;
         if binding.parent.session == 0
             || binding.parent.incarnation.0 == 0
             || binding.parent.generation == 0
@@ -76,9 +78,9 @@ impl TransferSession {
             || binding.follower.incarnation != binding.parent.incarnation
             || binding.follower.session != binding.parent.session
             || binding.follower.attempt != binding.parent.generation
-            || binding_bytes > config.max_metadata_bytes
+            || binding_bytes > config.max_metadata_bytes.get()
         {
-            return Err(TransferError::InvalidConfig);
+            return Err(TransferError::InvalidBinding);
         }
         Ok(Self {
             config,
@@ -205,7 +207,7 @@ impl TransferSession {
     }
 
     fn offer_valid(&self, offer: &TransferOffer) -> Result<(), TransferError> {
-        if offer.schema != self.config.expected_schema {
+        if offer.schema != self.config.expected_schema.get() {
             return Err(TransferError::Schema);
         }
         if offer.capture.scope != self.binding.scope
@@ -217,18 +219,18 @@ impl TransferSession {
             || offer.encoded_bytes == 0
             || offer.decoded_bytes == 0
             || offer.chunks == 0
-            || offer.encoded_bytes > self.config.max_encoded_bytes
-            || offer.decoded_bytes > self.config.max_decoded_bytes
-            || offer.chunks > self.config.max_chunks
+            || offer.encoded_bytes > self.config.max_encoded_bytes.get()
+            || offer.decoded_bytes > self.config.max_decoded_bytes.get()
+            || offer.chunks > self.config.max_chunks.get()
             || offer.encoded_bytes < offer.chunks
             || offer.encoded_bytes
                 > offer
                     .chunks
-                    .checked_mul(self.config.max_chunk_bytes)
+                    .checked_mul(self.config.max_chunk_bytes.get())
                     .ok_or(TransferError::Capacity)?
             || offer.members.is_empty()
-            || offer.members.len() > self.config.max_members
-            || offer.cuts.len() > self.config.max_cuts
+            || offer.members.len() > self.config.max_members.get()
+            || offer.cuts.len() > self.config.max_cuts.get()
         {
             return Err(TransferError::Capacity);
         }
@@ -243,7 +245,7 @@ impl TransferSession {
             bytes = bytes
                 .checked_add(member.node.as_str().len())
                 .ok_or(TransferError::Capacity)?;
-            if !member.valid_bounded(self.config.max_metadata_bytes)
+            if !member.valid_bounded(self.config.max_metadata_bytes.get())
                 || (index > 0 && offer.members[index - 1].node >= member.node)
             {
                 return Err(TransferError::Continuity);
@@ -271,7 +273,7 @@ impl TransferSession {
                 return Err(TransferError::Continuity);
             }
         }
-        if bytes > self.config.max_metadata_bytes {
+        if bytes > self.config.max_metadata_bytes.get() {
             return Err(TransferError::Capacity);
         }
         Ok(())
@@ -292,7 +294,7 @@ impl TransferSession {
             && receipt.barrier_operation > 0
             && receipt.cursor.capture == offer.capture
             && usize::try_from(receipt.cursor.position)
-                .is_ok_and(|position| position <= self.config.max_replay_events)
+                .is_ok_and(|position| position <= self.config.max_replay_events.get())
             && receipt.members == offer.members
             && native_cuts_cover(&receipt.covered_cuts, &offer.cuts)
             && self.barrier.as_ref().is_none_or(|previous| {
@@ -321,7 +323,7 @@ impl TransferSession {
             self.ok(vec![TransferEffect::CheckNativeCoverage {
                 op,
                 receipt,
-                max_buffer_bytes: self.config.max_native_buffer_bytes,
+                max_buffer_bytes: self.config.max_native_buffer_bytes.get(),
             }])
         } else {
             self.stage = TransferStage::Replaying;
@@ -342,9 +344,9 @@ impl TransferSession {
             || batch.from.position != self.applied
             || batch.through.position > barrier.cursor.position
             || batch.deltas.is_empty()
-            || batch.deltas.len() > self.config.max_batch_events
+            || batch.deltas.len() > self.config.max_batch_events.get()
             || batch.bytes == 0
-            || batch.bytes > self.config.max_batch_bytes
+            || batch.bytes > self.config.max_batch_bytes.get()
             || batch.operation == 0
         {
             return false;
@@ -409,7 +411,7 @@ impl TransferSession {
             && self
                 .replayed_events
                 .checked_add(batch.deltas.len())
-                .is_some_and(|count| count <= self.config.max_replay_events)
+                .is_some_and(|count| count <= self.config.max_replay_events.get())
     }
 
     /// Consume a pure event; `allocator` is a private composite-engine hook
@@ -471,7 +473,7 @@ impl TransferSession {
                 self.stage = TransferStage::RequestingOffer;
                 self.ok(vec![TransferEffect::FetchOffer {
                     op,
-                    max_metadata_bytes: self.config.max_metadata_bytes,
+                    max_metadata_bytes: self.config.max_metadata_bytes.get(),
                 }])
             }
             TransferEvent::Offered { op, offer } => {
@@ -537,7 +539,7 @@ impl TransferSession {
                 self.ok(vec![TransferEffect::FetchChunk {
                     op: next,
                     sequence: 0,
-                    max_bytes: self.config.max_chunk_bytes,
+                    max_bytes: self.config.max_chunk_bytes.get(),
                 }])
             }
             TransferEvent::ChunkStored {
@@ -557,10 +559,10 @@ impl TransferSession {
                 };
                 if sequence != self.next_chunk
                     || bytes == 0
-                    || bytes > self.config.max_chunk_bytes
+                    || bytes > self.config.max_chunk_bytes.get()
                     || total > offer.encoded_bytes
                     || decoded_charge > offer.decoded_bytes
-                    || decoded_charge > self.config.max_decoded_bytes
+                    || decoded_charge > self.config.max_decoded_bytes.get()
                 {
                     return self.abort(TransferError::Capacity);
                 }
@@ -584,7 +586,7 @@ impl TransferSession {
                     self.ok(vec![TransferEffect::FetchChunk {
                         op: next,
                         sequence: self.next_chunk,
-                        max_bytes: self.config.max_chunk_bytes,
+                        max_bytes: self.config.max_chunk_bytes.get(),
                     }])
                 }
             }
@@ -690,7 +692,7 @@ impl TransferSession {
                     || coverage.staged_through != receipt.cursor
                     || coverage.members != receipt.members
                     || !native_cuts_cover(&coverage.proven_cuts, &receipt.covered_cuts)
-                    || coverage.buffered_bytes > self.config.max_native_buffer_bytes
+                    || coverage.buffered_bytes > self.config.max_native_buffer_bytes.get()
                 {
                     return self.abort(TransferError::Continuity);
                 }
@@ -736,14 +738,14 @@ impl TransferSession {
                     || handoff.install != op
                     || self.coverage.as_ref() != Some(&handoff.coverage)
                     || self.attachment.as_ref() != Some(&handoff.attachment)
-                    || handoff.schema != self.config.expected_schema
+                    || handoff.schema != self.config.expected_schema.get()
                     || self
                         .offer
                         .as_ref()
                         .is_none_or(|offer| handoff.schema != offer.schema)
                     || handoff.applier_generation == 0
                     || !native_cuts_cover(&handoff.continued_cuts, &handoff.coverage.proven_cuts)
-                    || handoff.buffered_bytes > self.config.max_native_buffer_bytes
+                    || handoff.buffered_bytes > self.config.max_native_buffer_bytes.get()
                 {
                     return self.abort(TransferError::Continuity);
                 }

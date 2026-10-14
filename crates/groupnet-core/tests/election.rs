@@ -11,7 +11,8 @@ use groupnet_testkit::frames::*;
 /// same rendezvous order the coordinator, the claim guard, and the equal-epoch
 /// fencing tiebreak all read.
 fn ranked(ids: &[&str]) -> Vec<NodeId> {
-    let members: Vec<(NodeId, u32)> = ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
+    let members: std::collections::BTreeMap<NodeId, u32> =
+        ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
     placement::owners(TEST_GROUP, &members, ids.len())
 }
 

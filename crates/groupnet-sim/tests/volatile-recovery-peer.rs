@@ -131,9 +131,9 @@ fn peer_handoff_shaped_barrier_faults_keep_reads_closed_until_independent_affirm
         let move_head = fault == 0 && rng.below(2) == 0;
         let mut engine = RecoveryEngine::new(
             RecoveryConfig {
-                max_members: 2,
-                max_member_bytes: 16,
-                max_barrier_rounds: 3,
+                max_members: std::num::NonZeroUsize::new(2).unwrap(),
+                max_member_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+                max_barrier_rounds: std::num::NonZeroU32::new(3).unwrap(),
                 total_ms: 30,
                 attempt_ms: 5,
                 settle_ms: 1,
@@ -260,9 +260,9 @@ fn delayed_duplicate_and_lost_peer_callbacks_cannot_reopen_a_superseded_image() 
         let mut rng = SplitMix64::new(seed);
         let mut engine = RecoveryEngine::new(
             RecoveryConfig {
-                max_members: 2,
-                max_member_bytes: 16,
-                max_barrier_rounds: 2,
+                max_members: std::num::NonZeroUsize::new(2).unwrap(),
+                max_member_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+                max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
                 total_ms: 30,
                 attempt_ms: 5,
                 settle_ms: 1,

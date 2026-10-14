@@ -369,7 +369,7 @@ async fn main() {
     let bulk = MemBulkNet::new();
     // Rendezvous ranking decides who bids; taking the joiner from the bottom of
     // it keeps a late arrival from disturbing a healthy hostship.
-    let weighted: Vec<(NodeId, u32)> = IDS.iter().map(|id| (NodeId::new(*id), 1)).collect();
+    let weighted: BTreeMap<NodeId, u32> = IDS.iter().map(|id| (NodeId::new(*id), 1)).collect();
     let rank = placement::owners(GROUP, &weighted, IDS.len());
     let order: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
     let (voters, joiner_id) = (&order[..3], order[3]);

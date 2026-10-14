@@ -48,7 +48,7 @@ impl SessionEngine {
             self.retry_target = RetryTarget::Tail;
             return self.check_tail();
         };
-        if let Err(error) = cursor.validate(&self.scope, self.config.max_cursor_bytes) {
+        if let Err(error) = cursor.validate(&self.scope, self.config.max_cursor_bytes.get()) {
             return Step::reject(Reject::Identity(error));
         }
         if payload_id != Some(op.token) {
@@ -97,7 +97,7 @@ impl SessionEngine {
     }
 
     pub(super) fn resume_state(&mut self, cursor: Cursor, next_generation: bool) -> Step {
-        if let Err(error) = cursor.validate(&self.scope, self.config.max_cursor_bytes) {
+        if let Err(error) = cursor.validate(&self.scope, self.config.max_cursor_bytes.get()) {
             return Step::reject(Reject::Identity(error));
         }
         let closed = self.close_gate();

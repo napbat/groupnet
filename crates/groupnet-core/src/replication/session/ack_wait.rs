@@ -38,19 +38,12 @@ impl AckWait {
         if op.session == 0 || op.generation == 0 || op.token == 0 {
             return Err(AckWaitError::Identity);
         }
-        if limits.max_required == 0
-            || limits.max_identity_bytes == 0
-            || limits.max_certificate_bytes == 0
-            || limits.max_metadata_bytes == 0
-            || limits.max_wait_ms == 0
-            || limits.poll_ms == 0
-        {
-            return Err(AckWaitError::Backpressure);
-        }
+        limits.validate().map_err(AckWaitError::Limits)?;
         if request.due <= now || request.due.0 - now.0 > limits.max_wait_ms {
             return Err(AckWaitError::Deadline);
         }
-        validate_target(&request.target, scope, limits.max_identity_bytes)?;
+        let max_identity_bytes = limits.max_identity_bytes.get();
+        validate_target(&request.target, scope, max_identity_bytes)?;
         if request.roster.target != request.target
             || request.roster.kind != request.kind
             || request.roster.policy_version == 0
@@ -64,13 +57,13 @@ impl AckWait {
         ) {
             return Err(AckWaitError::Roster);
         }
-        if request.roster.required.len() > limits.max_required {
+        if request.roster.required.len() > limits.max_required.get() {
             return Err(AckWaitError::Backpressure);
         }
         if request.request_id.is_empty()
-            || request.request_id.len() > limits.max_identity_bytes
+            || request.request_id.len() > max_identity_bytes
             || request.roster.certificate.is_empty()
-            || request.roster.certificate.len() > limits.max_certificate_bytes
+            || request.roster.certificate.len() > limits.max_certificate_bytes.get()
         {
             return Err(AckWaitError::Identity);
         }
@@ -85,9 +78,7 @@ impl AckWait {
             if member.name.is_empty() || member.epoch.is_empty() || member.incarnation == 0 {
                 return Err(AckWaitError::Identity);
             }
-            if member.name.len() > limits.max_identity_bytes
-                || member.epoch.len() > limits.max_identity_bytes
-            {
+            if member.name.len() > max_identity_bytes || member.epoch.len() > max_identity_bytes {
                 return Err(AckWaitError::Backpressure);
             }
             if request.roster.required[..index]
@@ -101,7 +92,7 @@ impl AckWait {
                 .and_then(|n| n.checked_add(member.epoch.len()))
                 .ok_or(AckWaitError::Backpressure)?;
         }
-        if bytes > limits.max_metadata_bytes {
+        if bytes > limits.max_metadata_bytes.get() {
             return Err(AckWaitError::Backpressure);
         }
         let observed = vec![false; request.roster.required.len()];

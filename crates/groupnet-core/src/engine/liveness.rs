@@ -32,7 +32,7 @@ impl GroupEngine {
         let probers: Vec<NodeId> = self
             .probe_candidates()
             .filter(|n| **n != *target)
-            .take(self.config.indirect_probes.max(1))
+            .take(self.config.indirect_probes.get())
             .cloned()
             .collect();
         if probers.is_empty() {
