@@ -6,13 +6,14 @@ use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::{
     Transport,
-    admission::{AcceptedPeer, Admission, JoinRequest},
+    admission::{AcceptedPeer, Admission, JoinRequest, OpenAdmission},
     link::{LinkFuture, LinkProvider},
 };
-use groupnet_transport_punch::{
-    MAX_TCP_MESSAGE, NetworkKey, PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous,
+use groupnet_transport_punch::{MAX_TCP_MESSAGE, TcpRendezvous, TcpRendezvousConfig};
+// Endpoint configuration and path types come only from the adapter's re-exports.
+use groupnet_transport_tcp::{
+    NetworkKey, PathPolicy, PeerPath, TcpLink, TcpMsgTransport, TcpPunchConfig, TcpPunchConfigError,
 };
-use groupnet_transport_tcp::{TcpLink, TcpMsgTransport};
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 
@@ -35,15 +36,26 @@ fn config(local: &str, rendezvous: SocketAddr, policy: PathPolicy) -> TcpPunchCo
     config
 }
 
-async fn pair(policy: PathPolicy) -> (TcpRendezvous, TcpMsgTransport, TcpMsgTransport) {
-    let relay = TcpRendezvous::bind_with_admission(
-        loopback(),
+async fn keyed_relay(bind: SocketAddr, admission: Arc<dyn Admission>) -> io::Result<TcpRendezvous> {
+    TcpRendezvous::bind(TcpRendezvousConfig::with_admission(
+        bind,
         Some(key()),
-        Arc::new(groupnet_transport::admission::OpenAdmission),
-    )
+        admission,
+    ))
     .await
-    .unwrap();
-    let address = relay.local_addr().unwrap();
+}
+
+async fn open_relay() -> TcpRendezvous {
+    TcpRendezvous::bind(TcpRendezvousConfig::open(loopback()))
+        .await
+        .unwrap()
+}
+
+async fn pair(policy: PathPolicy) -> (TcpRendezvous, TcpMsgTransport, TcpMsgTransport) {
+    let relay = keyed_relay(loopback(), Arc::new(OpenAdmission))
+        .await
+        .unwrap();
+    let address = relay.local_addr();
     let a = TcpMsgTransport::bind_connectivity(config("a", address, policy))
         .await
         .unwrap();
@@ -74,11 +86,29 @@ async fn exchange(a: &TcpMsgTransport, b: &TcpMsgTransport, data: &[u8]) {
     );
 }
 
+#[test]
+fn adapter_reexports_build_and_validate_a_configuration() {
+    let mut config = TcpPunchConfig::new(
+        NodeId::from("a"),
+        "127.0.0.1:7000".parse().unwrap(),
+        NetworkKey::from_bytes([1; 32]),
+        vec![NodeId::from("b")],
+    );
+    config.policy = PathPolicy::RelayOnly;
+    config.validate().unwrap();
+    config.peers.push(NodeId::from("a"));
+    assert_eq!(
+        config.validate(),
+        Err(TcpPunchConfigError::LocalListedAsPeer)
+    );
+    assert_ne!(PeerPath::Direct, PeerPath::Relay);
+}
+
 #[tokio::test]
 async fn tcp_only_relay_and_relay_only_candidate_privacy() {
     let (relay, a, b) = pair(PathPolicy::RelayOnly).await;
-    assert_eq!(a.local_candidates().unwrap(), []);
-    assert_eq!(b.local_candidates().unwrap(), []);
+    assert_eq!(a.local_candidates(), []);
+    assert_eq!(b.local_candidates(), []);
     assert_eq!(a.direct_addr_to(&"b".into()), None);
     exchange(&a, &b, b"TCP without UDP").await;
     a.close().await;
@@ -90,20 +120,10 @@ async fn tcp_only_relay_and_relay_only_candidate_privacy() {
 async fn direct_candidates_reuse_registration_port_and_preserve_message_boundaries() {
     let (relay, a, b) = pair(PathPolicy::DirectPreferred).await;
     assert_eq!(a.observed_addr().unwrap().port(), a.local_addr().port());
-    assert!(a.local_addrs().unwrap().len() >= 2);
-    assert!(a.local_candidates().unwrap().len() >= 2);
-    let a_ports: Vec<_> = a
-        .local_addrs()
-        .unwrap()
-        .into_iter()
-        .map(|address| address.port())
-        .collect();
-    let b_ports: Vec<_> = b
-        .local_addrs()
-        .unwrap()
-        .into_iter()
-        .map(|address| address.port())
-        .collect();
+    assert!(a.local_addrs().len() >= 2);
+    assert!(a.local_candidates().len() >= 2);
+    let a_ports: Vec<_> = a.local_addrs().iter().map(SocketAddr::port).collect();
+    let b_ports: Vec<_> = b.local_addrs().iter().map(SocketAddr::port).collect();
     assert!(a_ports.contains(&b.direct_addr_to(&"a".into()).unwrap().port()));
     assert!(b_ports.contains(&a.direct_addr_to(&"b".into()).unwrap().port()));
     for data in [
@@ -129,8 +149,8 @@ async fn direct_candidates_reuse_registration_port_and_preserve_message_boundari
 
 #[tokio::test]
 async fn one_relay_only_peer_forces_relay_without_exposing_candidates() {
-    let relay = TcpRendezvous::bind_open(loopback()).await.unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = open_relay().await;
+    let address = relay.local_addr();
     let mut ac = TcpPunchConfig::open("a".into(), address);
     ac.bind = loopback();
     ac.policy = PathPolicy::DirectPreferred;
@@ -144,7 +164,7 @@ async fn one_relay_only_peer_forces_relay_without_exposing_candidates() {
     })
     .await;
     exchange(&a, &b, b"keyless, session fenced").await;
-    assert_eq!(b.local_candidates().unwrap(), []);
+    assert_eq!(b.local_candidates(), []);
     a.close().await;
     b.close().await;
     relay.close().await;
@@ -153,26 +173,21 @@ async fn one_relay_only_peer_forces_relay_without_exposing_candidates() {
 #[tokio::test]
 async fn duplicate_identity_cannot_evict_incumbent_and_shutdown_withdraws_sessions() {
     let (relay, a, b) = pair(PathPolicy::RelayOnly).await;
-    let duplicate = TcpMsgTransport::bind_connectivity(config(
-        "a",
-        relay.local_addr().unwrap(),
-        PathPolicy::RelayOnly,
-    ))
-    .await;
+    let duplicate =
+        TcpMsgTransport::bind_connectivity(config("a", relay.local_addr(), PathPolicy::RelayOnly))
+            .await;
     assert_eq!(
         duplicate.unwrap_err().kind(),
         io::ErrorKind::PermissionDenied
     );
     exchange(&a, &b, b"incumbent retained").await;
+    let addresses = a.local_addrs().to_vec();
     a.close().await;
     eventually_within("closed TCP session withdrawn", SETTLE, || {
         b.path_to(&"a".into()).is_none()
     })
     .await;
-    assert_eq!(
-        a.local_addrs().unwrap_err().kind(),
-        io::ErrorKind::NotConnected
-    );
+    assert_eq!(a.local_addrs(), addresses.as_slice());
     assert_eq!(
         a.recv().await.unwrap_err().kind(),
         io::ErrorKind::NotConnected
@@ -203,13 +218,10 @@ async fn replacement_sessions_fence_queued_frames_and_generation_tagged_sends() 
         b.path_to(&"a".into()).is_none()
     })
     .await;
-    let a = TcpMsgTransport::bind_connectivity(config(
-        "a",
-        relay.local_addr().unwrap(),
-        PathPolicy::RelayOnly,
-    ))
-    .await
-    .unwrap();
+    let a =
+        TcpMsgTransport::bind_connectivity(config("a", relay.local_addr(), PathPolicy::RelayOnly))
+            .await
+            .unwrap();
     eventually_within("replacement TCP session", SETTLE, || {
         b.path_to(&"a".into()) == Some(PeerPath::Relay)
     })
@@ -231,9 +243,7 @@ async fn replacement_sessions_fence_queued_frames_and_generation_tagged_sends() 
 #[tokio::test]
 async fn unauthenticated_direct_data_and_idle_accepts_do_not_authorize_messages() {
     let (relay, a, b) = pair(PathPolicy::DirectPreferred).await;
-    let mut hostile = TcpStream::connect(b.local_addrs().unwrap()[1])
-        .await
-        .unwrap();
+    let mut hostile = TcpStream::connect(b.local_addrs()[1]).await.unwrap();
     // Current unkeyed wire header and valid Data body, but no direct handshake.
     let bytes = b"\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0b\x00\x07unknown";
     hostile
@@ -244,11 +254,7 @@ async fn unauthenticated_direct_data_and_idle_accepts_do_not_authorize_messages(
     assert!(timeout(Duration::from_millis(100), b.recv()).await.is_err());
     let mut idle = Vec::new();
     for _ in 0..20 {
-        idle.push(
-            TcpStream::connect(b.local_addrs().unwrap()[1])
-                .await
-                .unwrap(),
-        );
+        idle.push(TcpStream::connect(b.local_addrs()[1]).await.unwrap());
     }
     exchange(&a, &b, b"independent authenticated stream").await;
     timeout(SETTLE, b.close()).await.unwrap();
@@ -276,11 +282,10 @@ impl Admission for CredentialAdmission {
 
 #[tokio::test]
 async fn application_admission_and_keyed_mode_fail_closed() {
-    let relay =
-        TcpRendezvous::bind_with_admission(loopback(), Some(key()), Arc::new(CredentialAdmission))
-            .await
-            .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = keyed_relay(loopback(), Arc::new(CredentialAdmission))
+        .await
+        .unwrap();
+    let address = relay.local_addr();
     assert!(
         TcpMsgTransport::bind_connectivity(config("denied", address, PathPolicy::RelayOnly))
             .await
@@ -301,8 +306,8 @@ async fn application_admission_and_keyed_mode_fail_closed() {
 
 #[tokio::test]
 async fn tcp_connectivity_link_rejects_identity_mismatch_before_binding() {
-    let relay = TcpRendezvous::bind_open(loopback()).await.unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = open_relay().await;
+    let address = relay.local_addr();
     assert!(
         Box::new(TcpLink::connectivity(TcpPunchConfig::open(
             "a".into(),
@@ -318,16 +323,10 @@ async fn tcp_connectivity_link_rejects_identity_mismatch_before_binding() {
 #[tokio::test]
 async fn ipv6_tcp_candidates_and_relay_when_supported() {
     let loopback: SocketAddr = "[::1]:0".parse().unwrap();
-    let Ok(relay) = TcpRendezvous::bind_with_admission(
-        loopback,
-        Some(key()),
-        Arc::new(groupnet_transport::admission::OpenAdmission),
-    )
-    .await
-    else {
+    let Ok(relay) = keyed_relay(loopback, Arc::new(OpenAdmission)).await else {
         return;
     };
-    let address = relay.local_addr().unwrap();
+    let address = relay.local_addr();
     let a = TcpMsgTransport::bind_connectivity(config("a", address, PathPolicy::DirectPreferred))
         .await
         .unwrap();
@@ -339,12 +338,7 @@ async fn ipv6_tcp_candidates_and_relay_when_supported() {
             && b.path_to(&"a".into()) == Some(PeerPath::Direct)
     })
     .await;
-    assert!(
-        a.local_candidates()
-            .unwrap()
-            .iter()
-            .all(SocketAddr::is_ipv6)
-    );
+    assert!(a.local_candidates().iter().all(SocketAddr::is_ipv6));
     exchange(&a, &b, b"IPv6 TCP").await;
     a.close().await;
     b.close().await;
@@ -367,12 +361,15 @@ async fn invalid_tcp_candidates_fail_before_network_work() {
         config
             .advertised_candidates
             .push(candidate.parse().unwrap());
+        let error = TcpMsgTransport::bind_connectivity(config)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
-            TcpMsgTransport::bind_connectivity(config)
-                .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<TcpPunchConfigError>()),
+            Some(&TcpPunchConfigError::InvalidAdvertisedCandidate { index: 0 })
         );
     }
 }
@@ -404,14 +401,10 @@ async fn control_loss_is_terminal_without_a_remaining_direct_session() {
 
 #[tokio::test]
 async fn candidate_scheduling_is_fair_across_more_than_four_peers() {
-    let relay = TcpRendezvous::bind_with_admission(
-        loopback(),
-        Some(key()),
-        Arc::new(groupnet_transport::admission::OpenAdmission),
-    )
-    .await
-    .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = keyed_relay(loopback(), Arc::new(OpenAdmission))
+        .await
+        .unwrap();
+    let address = relay.local_addr();
     let hub =
         TcpMsgTransport::bind_connectivity(config("hub", address, PathPolicy::DirectPreferred))
             .await
@@ -462,7 +455,7 @@ async fn candidate_scheduling_is_fair_across_more_than_four_peers() {
 #[tokio::test]
 async fn unauthenticated_accept_flood_does_not_starve_established_relay_or_heartbeats() {
     let (relay, a, b) = pair(PathPolicy::RelayOnly).await;
-    let address = relay.local_addr().unwrap();
+    let address = relay.local_addr();
     let bound = a.clone().into_bound_link(1);
     let registry = bound.sessions.as_ref().unwrap();
     let generation = registry

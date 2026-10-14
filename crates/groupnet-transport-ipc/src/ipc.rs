@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Largest message accepted by the IPC framing protocol, in bytes.
 pub const MAX_FRAME: usize = 65_000;
-pub use config::IpcConfig;
+pub use config::{IpcConfig, IpcConfigError};
 
 /// A native, local-only IPC listener address.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,25 +111,27 @@ pub struct IpcTransport {
 }
 
 impl IpcTransport {
-    /// Binds a native listener and starts its bounded Tokio runtime.
+    /// Binds a native listener with the default [`IpcConfig`] and starts its
+    /// bounded Tokio workers.
+    ///
+    /// Synchronous by design: a local listener needs no name resolution or
+    /// network round trip, but the current Tokio runtime must exist to spawn
+    /// the workers.
     ///
     /// # Errors
     /// Returns an error for empty/over-64-byte node IDs, insecure or occupied
     /// addresses, missing Tokio runtime, and native listener failures. Unix
     /// callers must create their own private directory before binding.
     pub fn bind(local: NodeId, address: &IpcAddress) -> io::Result<Self> {
-        Self::bind_with_config(local, address, IpcConfig::default())
+        Self::bind_with(local, address, IpcConfig::default())
     }
 
-    /// Binds a native listener with validated finite operational budgets.
+    /// Binds a native listener with explicit finite operational budgets.
     ///
     /// # Errors
-    /// Rejects invalid limits before binding, in addition to [`Self::bind`] errors.
-    pub fn bind_with_config(
-        local: NodeId,
-        address: &IpcAddress,
-        config: IpcConfig,
-    ) -> io::Result<Self> {
+    /// Returns `InvalidInput` carrying the [`IpcConfigError`] before binding,
+    /// in addition to [`Self::bind`] errors.
+    pub fn bind_with(local: NodeId, address: &IpcAddress, config: IpcConfig) -> io::Result<Self> {
         config.validate()?;
         frame::validate_id(&local)?;
         tokio::runtime::Handle::try_current()

@@ -8,8 +8,8 @@ use std::time::Duration;
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
-use groupnet_transport_punch::{MAX_MESSAGE, PathPolicy, PeerPath, PunchConfig, Rendezvous};
-use groupnet_transport_udp::UdpTransport;
+use groupnet_transport_punch::{MAX_UDP_MESSAGE, UdpRendezvous, UdpRendezvousConfig};
+use groupnet_transport_udp::{PathPolicy, PeerPath, UdpPunchConfig, UdpTransport};
 use tokio::time::timeout;
 
 const SETTLE: Duration = Duration::from_secs(15);
@@ -19,7 +19,7 @@ fn loopback() -> SocketAddr {
 }
 
 async fn endpoint(local: &str, address: SocketAddr, policy: PathPolicy) -> UdpTransport {
-    let mut config = PunchConfig::open(local.into(), address);
+    let mut config = UdpPunchConfig::open(local.into(), address);
     assert_eq!(config.policy, PathPolicy::RelayOnly);
     config.bind = loopback();
     config.policy = policy;
@@ -42,8 +42,10 @@ async fn deliver(from: &UdpTransport, to: &UdpTransport, sender: &str, receiver:
 
 #[tokio::test]
 async fn keyless_direct_preferred_discovers_bidirectional_paths_and_preserves_message_bounds() {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(loopback()))
+        .await
+        .unwrap();
+    let address = relay.local_addr();
     let a = endpoint("a", address, PathPolicy::DirectPreferred).await;
     let b = endpoint("b", address, PathPolicy::DirectPreferred).await;
     paths(&a, &b, PeerPath::Direct).await;
@@ -53,13 +55,13 @@ async fn keyless_direct_preferred_discovers_bidirectional_paths_and_preserves_me
     relay.close().await;
     for msg in [
         Vec::new(),
-        vec![0x5a; MAX_MESSAGE],
+        vec![0x5a; MAX_UDP_MESSAGE],
         b"application payload".to_vec(),
     ] {
         deliver(&a, &b, "a", "b", &msg).await;
         deliver(&b, &a, "b", "a", &msg).await;
     }
-    let oversized = vec![0; MAX_MESSAGE + 1];
+    let oversized = vec![0; MAX_UDP_MESSAGE + 1];
     for (transport, peer) in [(&a, "b"), (&b, "a")] {
         assert_eq!(
             transport
@@ -83,14 +85,16 @@ async fn keyless_relay_only_and_mixed_policies_deliver_bidirectionally_without_d
         (PathPolicy::DirectPreferred, PathPolicy::RelayOnly),
         (PathPolicy::RelayOnly, PathPolicy::DirectPreferred),
     ] {
-        let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-        let address = relay.local_addr().unwrap();
+        let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(loopback()))
+            .await
+            .unwrap();
+        let address = relay.local_addr();
         let a = endpoint("a", address, a_policy).await;
         let b = endpoint("b", address, b_policy).await;
         paths(&a, &b, PeerPath::Relay).await;
         for msg in [
             Vec::new(),
-            vec![0xa5; MAX_MESSAGE],
+            vec![0xa5; MAX_UDP_MESSAGE],
             b"relayed application payload".to_vec(),
         ] {
             deliver(&a, &b, "a", "b", &msg).await;
@@ -106,12 +110,14 @@ async fn keyless_relay_only_and_mixed_policies_deliver_bidirectionally_without_d
 
 #[tokio::test]
 async fn keyless_direct_reconnects_with_fresh_session_at_the_same_socket_address() {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(loopback()))
+        .await
+        .unwrap();
+    let address = relay.local_addr();
     let a = endpoint("a", address, PathPolicy::DirectPreferred).await;
     let b = endpoint("b", address, PathPolicy::DirectPreferred).await;
     paths(&a, &b, PeerPath::Direct).await;
-    let bind = b.local_addr().unwrap();
+    let bind = b.local_addr();
     for msg in [
         b"old session one".as_slice(),
         b"old session two",
@@ -124,11 +130,11 @@ async fn keyless_direct_reconnects_with_fresh_session_at_the_same_socket_address
         a.path_to(&"b".into()).is_none() && a.known_peers().is_empty()
     })
     .await;
-    let mut config = PunchConfig::open("b".into(), address);
+    let mut config = UdpPunchConfig::open("b".into(), address);
     config.bind = bind;
     config.policy = PathPolicy::DirectPreferred;
     let replacement = UdpTransport::bind_connectivity(config).await.unwrap();
-    assert_eq!(replacement.local_addr().unwrap(), bind);
+    assert_eq!(replacement.local_addr(), bind);
     paths(&a, &replacement, PeerPath::Direct).await;
     // A fresh sender starts its sequence again; the incumbent must not retain
     // replay state or receive capabilities belonging to the previous session.

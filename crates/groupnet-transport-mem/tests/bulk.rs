@@ -13,7 +13,7 @@ use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::QueueCapacity;
 use groupnet_transport::bulk::{BulkTransport, DataPlane};
-use groupnet_transport_mem::{MemBulkConfig, MemBulkNet};
+use groupnet_transport_mem::{MemBulkConfig, MemBulkConfigError, MemBulkNet};
 
 /// A pair of connected data planes on one fabric, `(a, b)`.
 fn pair() -> (
@@ -185,8 +185,10 @@ fn bulk_configuration_rejects_unaddressable_pipe_capacity() {
         ..MemBulkConfig::default()
     };
     assert_eq!(
-        MemBulkNet::with_config(config).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
+        MemBulkNet::with_config(config).unwrap_err(),
+        MemBulkConfigError::PipeBufferTooLarge {
+            pipe_buffer: NonZeroUsize::MAX
+        }
     );
     let largest = MemBulkConfig {
         accept_queue: QueueCapacity::MAX,

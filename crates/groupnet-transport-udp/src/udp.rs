@@ -16,7 +16,7 @@ mod framing;
 use framing::{MAX_DATAGRAM, SendBuffer, unframe};
 
 #[cfg(feature = "connectivity")]
-use groupnet_transport_punch::{PeerPath, PunchConfig, UdpConnection};
+use groupnet_transport_punch::{PeerPath, UdpConnection, UdpPunchConfig};
 
 /// Whether a receive error is a transient ICMP response rather than a socket
 /// failure.
@@ -41,6 +41,8 @@ fn retryable_recv_error(error: &io::Error) -> bool {
 #[derive(Debug)]
 struct Inner {
     socket: UdpSocket,
+    /// The socket's bind address, cached at bind so it outlives shutdown.
+    local_addr: SocketAddr,
     local: NodeId,
     /// `NodeId` -> where to send. Interior mutability so peers can be registered
     /// after binding (e.g. once ephemeral ports are known).
@@ -76,9 +78,11 @@ impl UdpTransport {
     pub async fn bind(local: NodeId, bind_addr: impl ToSocketAddrs) -> io::Result<Self> {
         let send_buffer = SendBuffer::new(&local)?;
         let socket = UdpSocket::bind(bind_addr).await?;
+        let local_addr = socket.local_addr()?;
         Ok(Self {
             backend: Backend::Direct(Arc::new(Inner {
                 socket,
+                local_addr,
                 local,
                 peers: RwLock::new(HashMap::new()),
                 send_buffer: Mutex::new(send_buffer),
@@ -94,7 +98,7 @@ impl UdpTransport {
     /// # Errors
     /// Propagates invalid configuration, admission and socket errors.
     #[cfg(feature = "connectivity")]
-    pub async fn bind_connectivity(config: PunchConfig) -> io::Result<Self> {
+    pub async fn bind_connectivity(config: UdpPunchConfig) -> io::Result<Self> {
         Ok(Self {
             backend: Backend::Connectivity(UdpConnection::bind(config).await?),
         })
@@ -110,14 +114,12 @@ impl UdpTransport {
         }
     }
 
-    /// The address the socket is bound to (useful when binding to an ephemeral
-    /// port with `:0`).
-    ///
-    /// # Errors
-    /// Propagates socket errors, or `NotConnected` after connection shutdown.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    /// The address the primary socket is bound to (useful when binding to an
+    /// ephemeral port with `:0`). Cached at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
         match &self.backend {
-            Backend::Direct(inner) => inner.socket.local_addr(),
+            Backend::Direct(inner) => inner.local_addr,
             #[cfg(feature = "connectivity")]
             Backend::Connectivity(connection) => connection.local_addr(),
         }
@@ -142,33 +144,31 @@ impl UdpTransport {
         }
     }
 
-    /// Returns every leased socket's actual bind address (one in raw mode).
-    ///
-    /// # Errors
-    /// Propagates socket errors, or `NotConnected` after connection shutdown.
+    /// Returns every leased socket's bind address (one in raw mode), primary
+    /// first. Cached at bind and retained after shutdown.
     #[cfg(feature = "connectivity")]
-    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+    #[must_use]
+    pub fn local_addrs(&self) -> &[SocketAddr] {
         match &self.backend {
-            Backend::Direct(inner) => Ok(vec![inner.socket.local_addr()?]),
+            Backend::Direct(inner) => std::slice::from_ref(&inner.local_addr),
             Backend::Connectivity(connection) => connection.local_addrs(),
         }
     }
 
     /// Returns advertised native candidates, or the raw socket's bind address.
-    /// Relay-only connections return no candidates.
-    ///
-    /// # Errors
-    /// Propagates socket errors, or `NotConnected` after connection shutdown.
+    /// Relay-only connections return no candidates. Gathered at bind and
+    /// retained after shutdown.
     #[cfg(feature = "connectivity")]
-    pub fn local_candidates(&self) -> io::Result<Vec<SocketAddr>> {
+    #[must_use]
+    pub fn local_candidates(&self) -> Vec<SocketAddr> {
         match &self.backend {
-            Backend::Direct(inner) => Ok(vec![inner.socket.local_addr()?]),
+            Backend::Direct(inner) => vec![inner.local_addr],
             Backend::Connectivity(connection) => connection.local_candidates(),
         }
     }
 
-    /// Returns the rendezvous-observed primary mapping, if disclosed and live.
-    /// Raw endpoints have no rendezvous mapping.
+    /// Returns the rendezvous-observed primary mapping, if disclosed. A live
+    /// query: `None` after shutdown. Raw endpoints have no rendezvous mapping.
     #[cfg(feature = "connectivity")]
     #[must_use]
     pub fn observed_addr(&self) -> Option<SocketAddr> {
@@ -238,7 +238,7 @@ impl UdpTransport {
             Backend::Direct(_) => BoundLink::new(self, config),
             #[cfg(feature = "connectivity")]
             Backend::Connectivity(connection) => {
-                config.mtu = groupnet_transport_punch::MAX_MESSAGE;
+                config.mtu = groupnet_transport_punch::MAX_UDP_MESSAGE;
                 let sessions = connection.sessions();
                 let lifecycle = Arc::new(ConnectivityLifecycle(connection.clone()));
                 BoundLink::new(self, config)
@@ -504,10 +504,7 @@ mod tests {
         let sender = UdpTransport::bind(sender_id.clone(), delayed_addr)
             .await
             .expect("bind delayed sender");
-        sender.register_peer(
-            receiver_id.clone(),
-            receiver.local_addr().expect("receiver address"),
-        );
+        sender.register_peer(receiver_id.clone(), receiver.local_addr());
         sender
             .send(&receiver_id, b"peer is now live")
             .await
@@ -535,9 +532,9 @@ mod tests {
         // must observe it (shared book) to reach the receiver.
         sender
             .clone()
-            .register_peer(receiver_id.clone(), receiver.local_addr().expect("addr"));
+            .register_peer(receiver_id.clone(), receiver.local_addr());
         // So the receiver can attribute the inbound datagram back to us.
-        receiver.register_peer(sender_id.clone(), sender.local_addr().expect("addr"));
+        receiver.register_peer(sender_id.clone(), sender.local_addr());
 
         sender.send(&receiver_id, b"hello").await.expect("send");
 
@@ -560,7 +557,7 @@ mod tests {
         let receiver_id = NodeId::new("attr-receiver");
 
         // ONLY the sender knows where to dial; the receiver's book is empty.
-        sender.register_peer(receiver_id.clone(), receiver.local_addr().expect("addr"));
+        sender.register_peer(receiver_id.clone(), receiver.local_addr());
         sender.send(&receiver_id, b"hello").await.expect("send");
 
         let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
@@ -596,7 +593,7 @@ mod tests {
         receiver.register_peer(sender_id.clone(), "127.0.0.1:9".parse().expect("addr"));
 
         let sender = bind_as("move-sender").await;
-        sender.register_peer(receiver_id.clone(), receiver.local_addr().expect("addr"));
+        sender.register_peer(receiver_id.clone(), receiver.local_addr());
         sender.send(&receiver_id, b"i moved").await.expect("send");
 
         let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
@@ -610,7 +607,7 @@ mod tests {
                 .read()
                 .expect("peers")
                 .get(&sender_id),
-            Some(&sender.local_addr().expect("addr")),
+            Some(&sender.local_addr()),
             "the book rebound to the sender's live address"
         );
     }
@@ -624,9 +621,9 @@ mod tests {
         let sender_id = NodeId::new("adv-sender");
         let receiver_id = NodeId::new("adv-receiver");
 
-        let receiver_addr = receiver.local_addr().expect("addr").to_string();
+        let receiver_addr = receiver.local_addr().to_string();
         sender.learn_peer(&receiver_id, &receiver_addr);
-        let sender_addr = sender.local_addr().expect("addr").to_string();
+        let sender_addr = sender.local_addr().to_string();
         receiver.learn_peer(&sender_id, &sender_addr);
         sender.learn_peer(&NodeId::new("junk"), "not-an-address");
 
@@ -674,9 +671,9 @@ mod tests {
         // real one (as the seed re-resolver does on a pod-IP change).
         let stale: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         receiver.register_peer(sender_id.clone(), stale);
-        receiver.register_peer(sender_id.clone(), sender.local_addr().expect("addr"));
+        receiver.register_peer(sender_id.clone(), sender.local_addr());
 
-        sender.register_peer(receiver_id.clone(), receiver.local_addr().expect("addr"));
+        sender.register_peer(receiver_id.clone(), receiver.local_addr());
         sender.send(&receiver_id, b"ping").await.expect("send");
 
         let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())

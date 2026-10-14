@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
-use groupnet_transport_punch::{PathPolicy, PeerPath, PunchConfig, Rendezvous};
-use groupnet_transport_udp::UdpTransport;
+use groupnet_transport_punch::{UdpRendezvous, UdpRendezvousConfig};
+use groupnet_transport_udp::{
+    PathPolicy, PeerPath, UdpPunchConfig, UdpPunchConfigError, UdpTransport,
+};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -18,6 +20,10 @@ fn loopback() -> SocketAddr {
     ([127, 0, 0, 1], 0).into()
 }
 
+async fn open_relay(bind: SocketAddr) -> io::Result<UdpRendezvous> {
+    UdpRendezvous::bind(UdpRendezvousConfig::open(bind)).await
+}
+
 async fn pair(
     address: SocketAddr,
     bind: SocketAddr,
@@ -25,7 +31,7 @@ async fn pair(
 ) -> (UdpTransport, UdpTransport) {
     let unused = UdpSocket::bind(bind).await.unwrap();
     let unreachable = unused.local_addr().unwrap();
-    let mut config = PunchConfig::open("a".into(), address);
+    let mut config = UdpPunchConfig::open("a".into(), address);
     config.policy = policy;
     config.bind = bind;
     config.candidate_binds = vec![bind];
@@ -57,25 +63,28 @@ async fn exchange(a: &UdpTransport, b: &UdpTransport) {
     }
 }
 
+fn rejected(error: &io::Error) -> Option<UdpPunchConfigError> {
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<UdpPunchConfigError>())
+        .copied()
+}
+
 #[tokio::test]
 async fn multiple_leased_sockets_unreachable_hint_and_observed_path_deliver_bidirectionally() {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-    let (a, b) = pair(
-        relay.local_addr().unwrap(),
-        loopback(),
-        PathPolicy::DirectPreferred,
-    )
-    .await;
+    let relay = open_relay(loopback()).await.unwrap();
+    let (a, b) = pair(relay.local_addr(), loopback(), PathPolicy::DirectPreferred).await;
     paths(&a, &b, PeerPath::Direct).await;
     eventually_within("observed mappings available", SETTLE, || {
         a.observed_addr().is_some() && b.observed_addr().is_some()
     })
     .await;
     for endpoint in [&a, &b] {
-        let binds = endpoint.local_addrs().unwrap();
+        let binds = endpoint.local_addrs();
         assert_eq!(binds.len(), 2);
         assert_ne!(binds[0], binds[1]);
-        let candidates = endpoint.local_candidates().unwrap();
+        let candidates = endpoint.local_candidates();
         assert!(binds.iter().all(|address| candidates.contains(address)));
         assert_eq!(candidates.len(), 3);
     }
@@ -84,19 +93,19 @@ async fn multiple_leased_sockets_unreachable_hint_and_observed_path_deliver_bidi
     assert_eq!(a.direct_addr_to(&"b".into()), Some(selected));
     relay.close().await;
     exchange(&a, &b).await;
+    let candidates = a.local_candidates();
     a.connection().unwrap().close().await;
     b.connection().unwrap().close().await;
-    assert_eq!(
-        a.local_candidates().unwrap_err().kind(),
-        io::ErrorKind::NotConnected
-    );
+    assert!(a.connection().unwrap().is_closed());
+    assert_eq!(a.local_candidates(), candidates);
+    assert_eq!(a.observed_addr(), None);
 }
 
 #[tokio::test]
 async fn relay_only_keeps_candidates_private_and_sends_no_candidate_checks() {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
+    let relay = open_relay(loopback()).await.unwrap();
     let spy = UdpSocket::bind(loopback()).await.unwrap();
-    let mut config = PunchConfig::open("a".into(), relay.local_addr().unwrap());
+    let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
     config.bind = loopback();
     config.candidate_binds = vec![loopback()];
     config.advertised_candidates = vec![spy.local_addr().unwrap()];
@@ -106,8 +115,8 @@ async fn relay_only_keeps_candidates_private_and_sends_no_candidate_checks() {
     config.local = "b".into();
     let b = UdpTransport::bind_connectivity(config).await.unwrap();
     paths(&a, &b, PeerPath::Relay).await;
-    assert_eq!(a.local_candidates().unwrap(), []);
-    assert_eq!(b.local_candidates().unwrap(), []);
+    assert_eq!(a.local_candidates(), []);
+    assert_eq!(b.local_candidates(), []);
     assert!(a.observed_addr().is_none());
     assert!(a.direct_addr_to(&"b".into()).is_none());
     exchange(&a, &b).await;
@@ -125,7 +134,7 @@ async fn relay_only_keeps_candidates_private_and_sends_no_candidate_checks() {
 #[tokio::test]
 async fn ipv6_candidates_and_multisocket_direct_delivery_where_available() {
     let bind: SocketAddr = "[::1]:0".parse().unwrap();
-    let relay = match Rendezvous::bind_open(bind).await {
+    let relay = match open_relay(bind).await {
         Ok(relay) => relay,
         Err(error)
             if matches!(
@@ -137,12 +146,7 @@ async fn ipv6_candidates_and_multisocket_direct_delivery_where_available() {
         }
         Err(error) => panic!("IPv6 rendezvous bind failed: {error}"),
     };
-    let (a, b) = pair(
-        relay.local_addr().unwrap(),
-        bind,
-        PathPolicy::DirectPreferred,
-    )
-    .await;
+    let (a, b) = pair(relay.local_addr(), bind, PathPolicy::DirectPreferred).await;
     paths(&a, &b, PeerPath::Direct).await;
     assert!(a.direct_addr_to(&"b".into()).unwrap().is_ipv6());
     exchange(&a, &b).await;
@@ -153,7 +157,7 @@ async fn ipv6_candidates_and_multisocket_direct_delivery_where_available() {
 
 #[tokio::test]
 async fn invalid_candidate_targets_and_socket_counts_fail_closed() {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
+    let relay = open_relay(loopback()).await.unwrap();
     for address in [
         "0.0.0.0:9",
         "127.0.0.1:0",
@@ -163,33 +167,27 @@ async fn invalid_candidate_targets_and_socket_counts_fail_closed() {
         "[ff02::1]:9",
         "[fe80::1%4]:9",
     ] {
-        let mut config = PunchConfig::open("a".into(), relay.local_addr().unwrap());
+        let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
         config.advertised_candidates = vec![address.parse().unwrap()];
+        let error = UdpTransport::bind_connectivity(config).await.unwrap_err();
         assert_eq!(
-            UdpTransport::bind_connectivity(config)
-                .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+            rejected(&error),
+            Some(UdpPunchConfigError::InvalidAdvertisedCandidate { index: 0 })
         );
     }
-    let mut config = PunchConfig::open("a".into(), relay.local_addr().unwrap());
+    let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
     config.candidate_binds = vec![loopback(); 4];
+    let error = UdpTransport::bind_connectivity(config).await.unwrap_err();
     assert_eq!(
-        UdpTransport::bind_connectivity(config)
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        rejected(&error),
+        Some(UdpPunchConfigError::TooManyCandidateBinds { len: 4 })
     );
-    let mut config = PunchConfig::open("a".into(), relay.local_addr().unwrap());
+    let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
     config.advertised_candidates = vec![([127, 0, 0, 1], 9).into(); 9];
+    let error = UdpTransport::bind_connectivity(config).await.unwrap_err();
     assert_eq!(
-        UdpTransport::bind_connectivity(config)
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        rejected(&error),
+        Some(UdpPunchConfigError::TooManyAdvertisedCandidates { len: 9 })
     );
     relay.close().await;
 }
@@ -210,8 +208,8 @@ async fn ipv4_relay_registration_owns_ipv6_candidate_sockets_and_gathers_wildcar
         Err(error) => panic!("IPv6 candidate socket bind failed: {error}"),
     };
     drop(available);
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-    let mut config = PunchConfig::open("a".into(), relay.local_addr().unwrap());
+    let relay = open_relay(loopback()).await.unwrap();
+    let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
     config.policy = PathPolicy::DirectPreferred;
     config.candidate_binds = vec![ipv6];
     let a = UdpTransport::bind_connectivity(config.clone())
@@ -221,7 +219,7 @@ async fn ipv4_relay_registration_owns_ipv6_candidate_sockets_and_gathers_wildcar
     let b = UdpTransport::bind_connectivity(config).await.unwrap();
     paths(&a, &b, PeerPath::Direct).await;
     for endpoint in [&a, &b] {
-        let candidates = endpoint.local_candidates().unwrap();
+        let candidates = endpoint.local_candidates();
         assert!(candidates.iter().any(SocketAddr::is_ipv4));
         assert!(candidates.iter().any(SocketAddr::is_ipv6));
         assert!(
@@ -230,10 +228,10 @@ async fn ipv4_relay_registration_owns_ipv6_candidate_sockets_and_gathers_wildcar
                 .all(|address| !address.ip().is_unspecified())
         );
         assert!(candidates.len() <= 8);
-        assert_eq!(endpoint.local_addrs().unwrap().len(), 2);
+        assert_eq!(endpoint.local_addrs().len(), 2);
     }
     exchange(&a, &b).await;
-    let binds = a.local_addrs().unwrap();
+    let binds = a.local_addrs().to_vec();
     a.connection().unwrap().close().await;
     // The additional candidate socket has no detached reader keeping it alive.
     let rebound = UdpSocket::bind(binds[1]).await.unwrap();

@@ -271,7 +271,7 @@ application's USB ownership. Applications still need their own resource policy.
 
 ## 3. Native discovery, direct paths, and relay
 
-`UdpLink::connectivity` uses an explicitly started, self-hosted `Rendezvous`. In keyed mode,
+`UdpLink::connectivity` uses an explicitly started, self-hosted `UdpRendezvous`. In keyed mode,
 the shared `NetworkKey` authenticates the routing fabric. Registration includes
 a challenge response tied to the observed source address; leases, admission,
 replay checks, and bounds constrain discovery and relay traffic.
@@ -289,7 +289,7 @@ Fresh random protocol capabilities remain mandatory internal session mechanics,
 not application-managed identity keys.
 
 Path selection is independent of admission and configured-key authentication.
-`PunchConfig::open` defaults to `RelayOnly`; setting its public `policy` field to
+`UdpPunchConfig::open` defaults to `RelayOnly`; setting its public `policy` field to
 `DirectPreferred` enables punching with relay fallback. A pair stays relay-only
 if either endpoint requests it: neither endpoint is offered the other's socket
 address, and neither sends or accepts direct probes/data for that pair. The
@@ -377,24 +377,36 @@ UDP retains its existing rendezvous/discovery lease coupling. Neither TCP contro
 nor its relay is automatically TLS-encrypted or an HTTP proxy protocol.
 
 TCP rendezvous data uses bounded backpressure by default, not a fixed packet-rate
-cap. `TcpRendezvousConfig` separates control and relay-data queues, pending
+cap. `TcpRendezvousLimits` separates control and relay-data queues, pending
 admission and admitted-session capacity. `ControlRateLimit` bounds control traffic
 independently; `RelayPacing::Bytes` optionally limits relay data by bytes per second
 and burst bytes. Waiting for data capacity or pacing is cancellation-aware.
-Choose `bind_config`, `bind_open_config`, or `bind_with_admission_config` to supply
-the policy. UDP rendezvous exposes `RendezvousConfig` / `RendezvousLimits` through
-`Rendezvous::bind_config`. `TcpRendezvous::closed()` resolves, stickily, once the
-server task stops (after `close()`, last-handle drop, or an unexpected stop); then
-`local_addr()` reports `NotConnected`. Endpoints expose the same sticky signal
-through `TcpMsgTransport::closed()` and `SessionRegistry::closed()`.
+
+Both rendezvous services take one full endpoint configuration through one
+binder: `UdpRendezvous::bind(UdpRendezvousConfig)` and
+`TcpRendezvous::bind(TcpRendezvousConfig)`. Each configuration holds the bind
+address, optional `NetworkKey`, optional fixed allowlist, `Admission` policy,
+protocol-specific limits (`UdpRendezvousLimits`, `TcpRendezvousLimits`) and
+`relay_pacing`, and is built with `new(bind, key, peers)` (keyed allowlist,
+open admission), `open(bind)` or `with_admission(bind, key, admission)`.
+Endpoint (`UdpPunchConfig`, `TcpPunchConfig`) and rendezvous configurations
+expose `validate()`, returning a typed error enum with one field-named variant
+per rule; every binder runs it first and fails with `InvalidInput` wrapping
+that error. `UdpRendezvousLimits` counts are `NonZeroUsize`, valid by
+construction. `TcpRendezvous::closed()` resolves, stickily, once the server task
+stops (after `close()`, last-handle drop, or an unexpected stop). Rendezvous and
+connection `local_addr`/`local_addrs`/`local_candidates` are cached at bind and
+retained after shutdown; `UdpConnection::is_closed()` and
+`TcpConnection::is_closed()` report shutdown. Endpoints expose the same sticky
+signal through `TcpMsgTransport::closed()` and `SessionRegistry::closed()`.
 
 The UDP rendezvous applies the same rule: its fixed 256-packet/second per-source
 budget covers control and rejected relay requests only (relay toward a missing
 or stale recipient session). Admitted relay data never spends it;
-`RendezvousConfig::relay_pacing` (the shared `RelayPacing`, default
+`UdpRendezvousConfig::relay_pacing` (the shared `RelayPacing`, default
 `Backpressure`) optionally limits it by bytes, dropping datagrams over budget, so
-`burst_bytes` must hold at least one `MAX_MESSAGE`. Native TCP streams (dialed,
-accepted direct and rendezvous) set `TCP_NODELAY`. `TcpRendezvousConfig`
+`burst_bytes` must hold at least one `MAX_UDP_MESSAGE`. Native TCP streams (dialed,
+accepted direct and rendezvous) set `TCP_NODELAY`. `TcpRendezvousLimits`
 capacities and both endpoint `queue_capacity` fields are `QueueCapacity`;
 `TcpConnection::path_changes()` notifies neighbor/direct-path changes.
 

@@ -15,7 +15,7 @@ use std::{
 };
 
 use groupnet::{
-    connectivity::{PathPolicy, TcpPunchConfig, TcpRendezvous},
+    connectivity::{PathPolicy, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig},
     core::NodeId,
     messaging::{Bytes, Delivery, Frame, MessageContext, SendOptions},
     runtime::Node,
@@ -40,8 +40,11 @@ async fn main() -> io::Result<()> {
             ));
         }
     };
-    let relay = TcpRendezvous::bind_open("127.0.0.1:0".parse().map_err(io::Error::other)?).await?;
-    let address = relay.local_addr()?;
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(
+        "127.0.0.1:0".parse().map_err(io::Error::other)?,
+    ))
+    .await?;
+    let address = relay.local_addr();
     let b_tcp = TcpMsgTransport::bind_connectivity(config("b", address, policy)).await?;
     let c_tcp = TcpMsgTransport::bind_connectivity(config("c", address, policy)).await?;
     let memory = Network::new();

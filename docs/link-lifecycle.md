@@ -66,6 +66,40 @@ closed before publishing its final empty snapshot, so a subscriber woken by that
 snapshot already observes the closed state. Every adapter bounds admitted
 identities by the shared `groupnet_transport::MAX_NODE_ID_BYTES` (255).
 
+Admission failures are actionable. `JoinRequest::validate` names a malformed
+claim (`JoinRequestError`: the claimed identity or an oversized credential);
+policies call it first and deny with `PermissionDenied` naming the claim. The
+`Admission` trait keeps `io::Result` and a boxed `LinkFuture` because adapters
+hold policies as `Arc<dyn Admission>`; its rustdoc carries a compiled
+allowlist example of the `Box::pin(async move { .. })` pattern.
+`SessionRegistry::try_admit` reports `SessionError` (identity, closed,
+duplicate, capacity or generation exhaustion), and converts into `io::Error`
+with the kinds adapters already used.
+
+### Link modes and validation
+
+`TcpLink` and `UdpLink` each carry their mode as a type parameter. `new`
+builds the direct mode (`TcpLink<TcpDirect>` / `UdpLink<UdpDirect>`, the
+default parameter); `connectivity` builds the native mode
+(`TcpLink<TcpConnectivity>` / `UdpLink<UdpConnectivity>`). Direct-only TCP
+settings — `with_admission`, `with_credentials`, `with_admission_config`,
+`with_msg_config` — exist only on the direct mode, so a native link cannot be
+given admission or tuning it would silently ignore; its admission comes from
+its `TcpPunchConfig` / `UdpPunchConfig`. `with_cost` applies to both. It is
+one link type per protocol; no separate link is registered. Each adapter crate
+re-exports the connectivity types its signatures name (`TcpPunchConfig` or
+`UdpPunchConfig` with its error, `NetworkKey`, `PathPolicy`, `PeerPath`, and
+`UdpConnection` for UDP), so a standalone adapter user depends on
+`groupnet-transport-punch` only to host a rendezvous.
+
+Link setters only store values. Every link provider (TCP, UDP, IPC) validates
+once, when it binds, and fails with `InvalidInput` carrying the configuration's
+typed error (`TcpMsgConfigError`, `TcpAdmissionError`, `IpcConfigError`, the
+native configuration's error, or `NodeIdError`) before opening a socket.
+Callers preflight with the configuration's `validate()`. A raw
+`TcpMsgTransport::bind_admitted(local, addr, config, admission)` takes the
+policy, presented credential and bounds bundled as one `TcpAdmission`.
+
 ## 1. Successful managed-node startup
 
 `Node::builder(id).link(provider)` and `.links(providers)` populate one
@@ -180,13 +214,27 @@ bounded capacity and, when selected, byte-based pacing.
 
 Every bounded queue, channel, or semaphore capacity in a networking config is a
 `groupnet_transport::QueueCapacity`, valid by construction (`1..=` Tokio's
-`Semaphore::MAX_PERMITS`), so configs never re-validate it. Length-prefixed
+`Semaphore::MAX_PERMITS`), so configs never re-validate it; other counts that
+must be nonzero (`TcpAdmissionConfig::max_peers`, `SessionRegistry::new`) are
+`NonZeroUsize`. Each config with remaining rules exposes `validate()` returning
+a typed error enum that names the field. Length-prefixed
 stream protocols share `groupnet_transport::framing` (feature `framing`): the
 256 MiB `MAX_FRAME_BYTES` ceiling that no per-protocol limit may exceed, the
 big-endian zerocopy `LengthHeader` checked against the receiver's limit before
 payload allocation, and `write_vectored`, which writes header and payload parts
 without joining them and resumes partial writes at the exact byte. Protocol
-headers, validation, and authentication stay in each protocol.
+headers, validation, and authentication stay in each protocol. The public
+`write_vectored` is Tokio-only; runtime-agnostic code frames `futures-io`
+streams through `bulk::DataStream`, which shares the same ceiling, header and
+write loop.
+
+Address getters follow one rule: an address fixed at bind (`local_addr`,
+`local_addrs`) is cached and returned as a plain value, retained after
+shutdown (`TcpBulkTransport::local_addr` is `None` for a dial-only endpoint);
+live state (`observed_addr`, `path_to`, `direct_addr_to`, `is_closed`) is a
+query returning `Option`/`bool`. The `groupnet-transport` crate docs compare
+how each binding is constructed, including why memory and IPC construction is
+synchronous.
 
 
 ## 3. Startup failures and cancellation

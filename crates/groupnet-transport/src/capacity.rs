@@ -90,17 +90,48 @@ impl QueueCapacity {
     }
 }
 
+/// Why a raw value is not a [`QueueCapacity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueCapacityError {
+    /// A queue must hold at least one slot.
+    Zero,
+    /// The value exceeds [`QueueCapacity::MAX`].
+    AboveMax {
+        /// The rejected value.
+        value: usize,
+    },
+}
+
+impl fmt::Display for QueueCapacityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => f.write_str("queue capacity must be nonzero"),
+            Self::AboveMax { value } => write!(
+                f,
+                "queue capacity {value} exceeds Tokio's semaphore limit {MAX_PERMITS}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QueueCapacityError {}
+
+impl From<QueueCapacityError> for io::Error {
+    fn from(error: QueueCapacityError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
 impl TryFrom<usize> for QueueCapacity {
-    type Error = io::Error;
+    type Error = QueueCapacityError;
 
     /// # Errors
-    /// Returns `InvalidInput` for zero or a value above [`QueueCapacity::MAX`].
-    fn try_from(value: usize) -> io::Result<Self> {
-        Self::new(value).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "queue capacity must be nonzero and fit Tokio's semaphore limit",
-            )
+    /// Returns [`QueueCapacityError::Zero`] or [`QueueCapacityError::AboveMax`].
+    fn try_from(value: usize) -> Result<Self, QueueCapacityError> {
+        Self::new(value).ok_or(if value == 0 {
+            QueueCapacityError::Zero
+        } else {
+            QueueCapacityError::AboveMax { value }
         })
     }
 }
@@ -145,12 +176,17 @@ mod tests {
         assert_eq!(QueueCapacity::new(usize::MAX), None);
         assert_eq!(QueueCapacity::new(1), Some(QueueCapacity::MIN));
         assert_eq!(QueueCapacity::new(MAX_PERMITS), Some(QueueCapacity::MAX));
-        for value in [0, MAX_PERMITS + 1] {
-            assert_eq!(
-                QueueCapacity::try_from(value).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
-            );
-        }
+        assert_eq!(QueueCapacity::try_from(0), Err(QueueCapacityError::Zero));
+        assert_eq!(
+            QueueCapacity::try_from(MAX_PERMITS + 1),
+            Err(QueueCapacityError::AboveMax {
+                value: MAX_PERMITS + 1
+            })
+        );
+        assert_eq!(
+            io::Error::from(QueueCapacityError::Zero).kind(),
+            io::ErrorKind::InvalidInput
+        );
         let capacity = QueueCapacity::try_from(64).unwrap();
         assert_eq!(capacity.get(), 64);
         assert_eq!(usize::from(capacity), 64);

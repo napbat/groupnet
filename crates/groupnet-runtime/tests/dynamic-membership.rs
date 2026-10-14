@@ -123,8 +123,9 @@ impl Pair {
     async fn start() -> io::Result<Self> {
         let a = NodeId::new("keyless-a");
         let b = NodeId::new("keyless-b");
-        let sessions_a = SessionRegistry::new(4)?;
-        let sessions_b = SessionRegistry::new(4)?;
+        let capacity = std::num::NonZeroUsize::new(4).expect("nonzero");
+        let sessions_a = SessionRegistry::new(capacity);
+        let sessions_b = SessionRegistry::new(capacity);
         let (send_a, receive_a) = mpsc::channel(32);
         let (send_b, receive_b) = mpsc::channel(32);
         let node_a = start(Endpoint {

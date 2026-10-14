@@ -14,24 +14,25 @@
 //! Relay data uses bounded TCP backpressure, optionally paced by payload bytes.
 //! Control abuse has an independent configurable budget.
 
+mod config;
 mod endpoint;
 mod policy;
 mod server;
 mod sockets;
 mod wire;
 
-use crate::{NetworkKey, PathPolicy, PeerPath};
+use crate::common::{closed, invalid, lock, random};
+use crate::PeerPath;
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{
-    Inbound, QueueCapacity,
+    Inbound,
     admission::{SessionId, SessionLease, SessionRegistry},
     link::AdmittedInbound,
 };
-use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::HashMap,
-    fmt, io,
+    io,
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -42,7 +43,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub use policy::{ControlRateLimit, TcpRendezvousConfig};
+pub use config::{TcpPunchConfig, TcpPunchConfigError};
+pub use policy::{
+    ControlRateLimit, TcpRendezvousConfig, TcpRendezvousConfigError, TcpRendezvousLimits,
+};
 pub use server::TcpRendezvous;
 
 /// Maximum application payload in one native TCP frame.
@@ -51,117 +55,9 @@ pub const MAX_TCP_MESSAGE: usize = 65_000;
 // not the operational limit on dynamically admitted sessions.
 const MAX_PEERS: usize = u8::MAX as usize;
 const MAX_CANDIDATES: usize = 8;
+const MAX_CANDIDATE_BINDS: usize = 3;
 const DEADLINE: Duration = Duration::from_secs(3);
 const IDLE: Duration = Duration::from_secs(6);
-
-/// Configuration for one TCP-only traversal endpoint.
-#[derive(Clone)]
-pub struct TcpPunchConfig {
-    /// Application-chosen routing identity (1–64 UTF-8 bytes).
-    pub local: NodeId,
-    /// Registration and primary reusable listening/source socket bind.
-    pub bind: SocketAddr,
-    /// Explicit TCP rendezvous address.
-    pub rendezvous: SocketAddr,
-    /// Optional trusted-fabric key. Keyed endpoints never downgrade.
-    pub key: Option<NetworkKey>,
-    /// Static peer allowlist; empty when discovering dynamically.
-    pub peers: Vec<NodeId>,
-    /// Whether rendezvous-admitted identities may be discovered dynamically.
-    pub dynamic: bool,
-    /// Opaque application admission credential, limited to 1024 bytes.
-    pub credential: Vec<u8>,
-    /// Direct preference or privacy-preserving relay-only operation.
-    pub policy: PathPolicy,
-    /// Additional listener/source binds, at most three, including other families.
-    /// Each socket is retained for the lifetime of the endpoint.
-    pub candidate_binds: Vec<SocketAddr>,
-    /// Explicit externally mapped TCP candidates, at most eight total candidates.
-    /// These are hints, never authorization. Invalid addresses are rejected.
-    /// Each local/remote pair permits one outstanding check, with three-attempt
-    /// bursts separated by a ten-second cooldown. A rotating peer scheduler caps
-    /// the endpoint at sixteen outstanding dials and sixteen new checks/second.
-    pub advertised_candidates: Vec<SocketAddr>,
-    /// Expand wildcard listeners to local interface addresses when gathering.
-    /// IPv6 link-local addresses without a scope are not advertised.
-    pub gather_interfaces: bool,
-    /// Maximum concurrently admitted neighbors (an operational memory bound).
-    pub max_peers: usize,
-    /// Capacity of the endpoint's bounded packet, event and writer queues.
-    pub queue_capacity: QueueCapacity,
-}
-
-impl TcpPunchConfig {
-    /// Creates a keyed, static, direct-preferred endpoint.
-    #[must_use]
-    pub fn new(local: NodeId, rendezvous: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> Self {
-        let mut config = Self::dynamic(local, rendezvous, Some(key), Vec::new());
-        config.peers = peers;
-        config.dynamic = false;
-        config
-    }
-
-    /// Creates explicit keyless dynamic discovery, defaulting to relay-only.
-    #[must_use]
-    pub fn open(local: NodeId, rendezvous: SocketAddr) -> Self {
-        Self::dynamic(local, rendezvous, None, Vec::new())
-    }
-
-    /// Creates dynamic discovery with application credentials and an optional key.
-    #[must_use]
-    pub fn dynamic(
-        local: NodeId,
-        rendezvous: SocketAddr,
-        key: Option<NetworkKey>,
-        credential: Vec<u8>,
-    ) -> Self {
-        Self {
-            local,
-            bind: SocketAddr::new(
-                if rendezvous.is_ipv4() {
-                    std::net::Ipv4Addr::UNSPECIFIED.into()
-                } else {
-                    std::net::Ipv6Addr::UNSPECIFIED.into()
-                },
-                0,
-            ),
-            rendezvous,
-            policy: if key.is_some() {
-                PathPolicy::DirectPreferred
-            } else {
-                PathPolicy::RelayOnly
-            },
-            key,
-            peers: Vec::new(),
-            dynamic: true,
-            credential,
-            candidate_binds: Vec::new(),
-            advertised_candidates: Vec::new(),
-            gather_interfaces: true,
-            max_peers: 128,
-            queue_capacity: QueueCapacity::of(128),
-        }
-    }
-}
-
-impl fmt::Debug for TcpPunchConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TcpPunchConfig")
-            .field("local", &self.local)
-            .field("bind", &self.bind)
-            .field("rendezvous", &self.rendezvous)
-            .field("key", &self.key)
-            .field("peers", &self.peers)
-            .field("dynamic", &self.dynamic)
-            .field("policy", &self.policy)
-            .field("candidate_binds", &self.candidate_binds)
-            .field("advertised_candidates", &self.advertised_candidates)
-            .field("gather_interfaces", &self.gather_interfaces)
-            .field("max_peers", &self.max_peers)
-            .field("queue_capacity", &self.queue_capacity)
-            .finish_non_exhaustive()
-    }
-}
 
 #[derive(Debug)]
 struct View {
@@ -261,45 +157,49 @@ impl TcpConnection {
     /// Binds reusable listeners and completes bounded rendezvous admission.
     ///
     /// # Errors
-    /// Returns invalid configuration, socket, authentication, admission, or timeout errors.
+    /// Rejects invalid configuration as `InvalidInput` wrapping its
+    /// [`TcpPunchConfigError`], then returns socket, authentication, admission,
+    /// or timeout errors.
     pub async fn bind(config: TcpPunchConfig) -> io::Result<Self> {
         endpoint::bind(config).await
     }
 
     /// Returns the primary registration source bind, including its assigned port.
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.ensure_open()?;
-        Ok(self.inner.address)
+    /// Cached at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.address
     }
 
     /// Returns the registration source address observed by rendezvous.
+    /// A live query: `None` after shutdown.
     #[must_use]
     pub fn observed_addr(&self) -> Option<SocketAddr> {
-        (!self.inner.cancel.is_cancelled()).then_some(self.inner.observed)
+        (!self.is_closed()).then_some(self.inner.observed)
     }
 
     /// Returns locally gathered/explicit candidates (empty for relay-only).
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_candidates(&self) -> io::Result<Vec<SocketAddr>> {
-        self.ensure_open()?;
-        Ok(self.inner.candidates.clone())
+    /// Gathered at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_candidates(&self) -> Vec<SocketAddr> {
+        self.inner.candidates.clone()
     }
 
     /// Returns every retained reusable source/listener bind.
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
-        self.ensure_open()?;
-        Ok(self.inner.addresses.clone())
+    /// Cached at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.inner.addresses
+    }
+
+    /// Whether this connection has shut down through any clone. A live query.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.cancel.is_cancelled()
     }
 
     /// Returns the physical peer endpoint of the validated direct connection.
+    /// A live query: `None` while relaying and after shutdown.
     #[must_use]
     pub fn direct_addr_to(&self, node: &NodeId) -> Option<SocketAddr> {
         if self.inner.cancel.is_cancelled() {
@@ -313,6 +213,7 @@ impl TcpConnection {
     }
 
     /// Returns the currently available direct or relay path.
+    /// A live query: `None` after shutdown.
     #[must_use]
     pub fn path_to(&self, node: &NodeId) -> Option<PeerPath> {
         if self.inner.cancel.is_cancelled() {
@@ -374,15 +275,11 @@ impl TcpConnection {
     /// Cancels and drains all control, dial, listener, and established stream tasks.
     pub async fn close(&self) {
         self.shutdown();
-        let mut task = self.inner.task.lock().await;
-        if let Some(running) = task.as_mut() {
-            let _ = running.await;
-        }
-        task.take();
+        crate::common::join(&self.inner.task).await;
     }
 
     fn ensure_open(&self) -> io::Result<()> {
-        if self.inner.cancel.is_cancelled() {
+        if self.is_closed() {
             Err(closed())
         } else {
             Ok(())
@@ -515,29 +412,4 @@ impl TcpConnection {
             }
         }
     }
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-fn closed() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotConnected,
-        "TCP traversal transport closed",
-    )
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn random() -> io::Result<wire::Token> {
-    let mut token = [0; 32];
-    SystemRandom::new()
-        .fill(&mut token)
-        .map_err(|_| io::Error::other("secure random source failed"))?;
-    Ok(token)
 }

@@ -125,11 +125,14 @@ impl Admission for CountPolicy {
 #[tokio::test]
 async fn open_policy_is_not_invoked_before_address_proof_and_proof_is_single_use() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let relay =
-        Rendezvous::bind_with_admission(loopback(), None, Arc::new(CountPolicy(calls.clone())))
-            .await
-            .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::with_admission(
+        loopback(),
+        None,
+        Arc::new(CountPolicy(calls.clone())),
+    ))
+    .await
+    .unwrap();
+    let address = relay.local_addr();
     let mut raw = Raw::new("unknown-before-bind".into()).await;
     let thief = Raw::new(raw.node.clone()).await;
     raw.socket
@@ -232,10 +235,14 @@ async fn policy_concurrency_is_bounded_and_shutdown_drains_every_evaluation() {
         active: active.clone(),
         started: started.clone(),
     });
-    let relay = Rendezvous::bind_with_admission(loopback(), None, policy)
-        .await
-        .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::with_admission(
+        loopback(),
+        None,
+        policy,
+    ))
+    .await
+    .unwrap();
+    let address = relay.local_addr();
     let mut sockets = Vec::new();
     for index in 0..32 {
         let mut raw = Raw::new(format!("pending-{index}")).await;
@@ -261,12 +268,14 @@ async fn policy_concurrency_is_bounded_and_shutdown_drains_every_evaluation() {
 
 #[tokio::test]
 async fn stale_queue_generation_cannot_be_reauthorized_using_reused_identity() {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-    let address = relay.local_addr().unwrap();
-    let a = UdpConnection::bind(PunchConfig::open("a".into(), address))
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(loopback()))
         .await
         .unwrap();
-    let b = UdpConnection::bind(PunchConfig::open("b".into(), address))
+    let address = relay.local_addr();
+    let a = UdpConnection::bind(UdpPunchConfig::open("a".into(), address))
+        .await
+        .unwrap();
+    let b = UdpConnection::bind(UdpPunchConfig::open("b".into(), address))
         .await
         .unwrap();
     eventually_within("peer discovery", SETTLE, || {
@@ -338,12 +347,14 @@ fn maximum_credential_with_maximum_identity_fits_keyed_and_open_datagrams() {
 
 #[tokio::test]
 async fn selected_outbound_generation_cannot_send_to_a_replacement_lease() {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-    let address = relay.local_addr().unwrap();
-    let a = UdpConnection::bind(PunchConfig::open("a".into(), address))
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(loopback()))
         .await
         .unwrap();
-    let b = UdpConnection::bind(PunchConfig::open("b".into(), address))
+    let address = relay.local_addr();
+    let a = UdpConnection::bind(UdpPunchConfig::open("a".into(), address))
+        .await
+        .unwrap();
+    let b = UdpConnection::bind(UdpPunchConfig::open("b".into(), address))
         .await
         .unwrap();
     eventually_within("outbound generation discovery", SETTLE, || {
@@ -403,11 +414,14 @@ async fn selected_outbound_generation_cannot_send_to_a_replacement_lease() {
 #[tokio::test]
 async fn unadmitted_session_flood_cannot_starve_live_heartbeats_or_relay() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let relay =
-        Rendezvous::bind_with_admission(loopback(), None, Arc::new(CountPolicy(calls.clone())))
-            .await
-            .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::with_admission(
+        loopback(),
+        None,
+        Arc::new(CountPolicy(calls.clone())),
+    ))
+    .await
+    .unwrap();
+    let address = relay.local_addr();
     let mut incumbent = Raw::new("incumbent".into()).await;
     incumbent.register(address).await;
     assert!(matches!(
@@ -467,13 +481,16 @@ async fn unadmitted_session_flood_cannot_starve_live_heartbeats_or_relay() {
 #[tokio::test]
 async fn unproved_challenge_saturation_does_not_reserve_established_peer_capacity() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let relay =
-        Rendezvous::bind_with_admission(loopback(), None, Arc::new(CountPolicy(calls.clone())))
-            .await
-            .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::with_admission(
+        loopback(),
+        None,
+        Arc::new(CountPolicy(calls.clone())),
+    ))
+    .await
+    .unwrap();
+    let address = relay.local_addr();
     let mut attacker = Raw::new("unproved-0".into()).await;
-    for index in 0..DEFAULT_MAX_PEERS {
+    for index in 0..DEFAULT_MAX_PEERS.get() {
         attacker.node = format!("unproved-{index}");
         attacker.challenge(address).await;
     }
@@ -482,7 +499,7 @@ async fn unproved_challenge_saturation_does_not_reserve_established_peer_capacit
         attacker.challenge(address).await;
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let admitted = UdpConnection::bind(PunchConfig::dynamic(
+    let admitted = UdpConnection::bind(UdpPunchConfig::dynamic(
         "legitimate".into(),
         address,
         None,

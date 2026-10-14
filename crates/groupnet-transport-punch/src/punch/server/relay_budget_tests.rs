@@ -200,15 +200,18 @@ fn byte_pacing_drops_over_budget_relay_without_spending_control() {
 
 #[test]
 fn relay_pacing_burst_must_hold_one_maximum_relay_message() {
-    let mut config = RendezvousConfig::open(loopback());
+    let mut config = UdpRendezvousConfig::open(loopback());
     config.validate().unwrap();
     let paced = |burst| RelayPacing::Bytes {
         bytes_per_second: NonZeroU64::new(1).unwrap(),
         burst_bytes: NonZeroU64::new(burst).unwrap(),
     };
-    let max = u64::try_from(super::super::MAX_MESSAGE).unwrap();
+    let max = u64::try_from(super::super::MAX_UDP_MESSAGE).unwrap();
     config.relay_pacing = paced(max - 1);
-    assert!(config.validate().is_err());
+    assert_eq!(
+        config.validate(),
+        Err(UdpRendezvousConfigError::PacingBurstBelowMessage)
+    );
     config.relay_pacing = paced(max);
     config.validate().unwrap();
 }

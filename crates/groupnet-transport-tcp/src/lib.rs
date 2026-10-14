@@ -7,8 +7,8 @@
 //!   message-oriented [`Transport`] over a bounded pool of **persistent**
 //!   connections: dialed lazily on first send, reused, closed when idle,
 //!   oldest-evicted at the cap. The constant-connection alternative to the
-//!   UDP binding for deployments that want it — see the [`msg`
-//!   module](self::msg)-level docs for the exact pooling behaviour.
+//!   UDP binding for deployments that want it — see its docs for the exact
+//!   pooling behaviour.
 //! * **`bulk` — data plane.** `TcpBulkTransport` implements `BulkTransport`:
 //!   one reliable, ordered byte stream per `connect`, for replication and
 //!   bulk transfer. Both ends set `TCP_NODELAY`; inbound identity handshakes
@@ -17,7 +17,11 @@
 //! * **`link` — router registration** (opt-in): `TcpLink` admits peers through
 //!   an explicit application policy (a configured-peer allowlist by default).
 //!   Managed sessions are full-duplex, bounded, and retained while connected;
-//!   only live admitted sessions become routing neighbors.
+//!   only live admitted sessions become routing neighbors. Its admission
+//!   setters exist only on a direct link (`TcpLink<TcpDirect>`); a native link
+//!   (`TcpLink<TcpConnectivity>`) takes its admission from `TcpPunchConfig`, so
+//!   settings it would ignore cannot be written. `TcpMsgTransport::bind_admitted`
+//!   takes the same policy, credential and bounds bundled as a `TcpAdmission`.
 //! * **`connectivity` — native TCP paths** (opt-in): the existing message transport
 //!   and `TcpLink` can own a `TcpConnection` from `groupnet-transport-punch`,
 //!   with rendezvous admission, candidate traversal, and maintained relay fallback.
@@ -25,6 +29,11 @@
 //!   transport or link type is registered. Native paths retain their protocol MTU
 //!   and live admission generations across conversion into a managed link.
 //!   `TcpMsgTransport::path_changes` observes direct/relay path changes.
+//!   The configuration and path types these signatures name (`TcpPunchConfig`,
+//!   `TcpPunchConfigError`, `NetworkKey`, `PathPolicy`, `PeerPath`) are
+//!   re-exported here, so standalone users need no direct
+//!   `groupnet-transport-punch` dependency; only a self-hosted rendezvous
+//!   (`TcpRendezvous`) comes from that crate.
 //!
 //! `TcpMsgTransport::closed` resolves, stickily, once an endpoint shuts down.
 //!
@@ -43,20 +52,26 @@ mod handshake;
 #[cfg(feature = "bulk")]
 mod bulk;
 #[cfg(feature = "bulk")]
-pub use bulk::{TcpBulkConfig, TcpBulkTransport};
+pub use bulk::{TcpBulkConfig, TcpBulkConfigError, TcpBulkTransport};
 
 #[cfg(feature = "msg")]
-pub mod msg;
-#[cfg(feature = "link")]
-pub use msg::TcpAdmissionConfig;
+mod msg;
+#[cfg(feature = "connectivity")]
+pub use groupnet_transport_punch::{
+    NetworkKey, PathPolicy, PeerPath, TcpPunchConfig, TcpPunchConfigError,
+};
 #[cfg(feature = "connectivity")]
 pub use msg::TcpPathChanges;
+#[cfg(feature = "link")]
+pub use msg::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError};
 #[cfg(feature = "msg")]
-pub use msg::{TcpMsgConfig, TcpMsgTransport};
+pub use msg::{TcpMsgConfig, TcpMsgConfigError, TcpMsgTransport};
 
 #[cfg(feature = "link")]
 mod link;
 #[cfg(feature = "msg")]
 mod tasks;
+#[cfg(feature = "connectivity")]
+pub use link::TcpConnectivity;
 #[cfg(feature = "link")]
-pub use link::TcpLink;
+pub use link::{TcpDirect, TcpLink};

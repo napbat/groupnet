@@ -10,7 +10,7 @@ use std::time::Duration;
 use groupnet_core::NodeId;
 use groupnet_transport::QueueCapacity;
 use groupnet_transport::bulk::BulkTransport;
-use groupnet_transport_tcp::{TcpBulkConfig, TcpBulkTransport};
+use groupnet_transport_tcp::{TcpBulkConfig, TcpBulkConfigError, TcpBulkTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -108,13 +108,19 @@ async fn invalid_bounds_and_local_ids_are_rejected_before_binding() {
         ..TcpBulkConfig::default()
     };
     assert_eq!(
-        zero_deadline.validate().expect_err("zero deadline").kind(),
-        io::ErrorKind::InvalidInput
+        zero_deadline.validate(),
+        Err(TcpBulkConfigError::ZeroHandshakeTimeout)
     );
     let error = TcpBulkTransport::bind_with(NodeId::new("server"), "127.0.0.1:0", zero_deadline)
         .await
         .expect_err("zero deadline");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<TcpBulkConfigError>()),
+        Some(&TcpBulkConfigError::ZeroHandshakeTimeout)
+    );
     for id in [
         String::new(),
         "x".repeat(groupnet_transport::MAX_NODE_ID_BYTES + 1),

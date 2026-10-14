@@ -19,6 +19,13 @@ fn key() -> NetworkKey {
     NetworkKey::from_bytes([23; 32])
 }
 
+async fn rendezvous(peers: &[&str]) -> UdpRendezvous {
+    let peers = peers.iter().map(|peer| NodeId::from(*peer)).collect();
+    UdpRendezvous::bind(UdpRendezvousConfig::new(loopback(), key(), peers))
+        .await
+        .unwrap()
+}
+
 struct RawPeer {
     name: &'static str,
     session: Session,
@@ -152,10 +159,8 @@ impl RawPeer {
 
 #[tokio::test]
 async fn captured_registration_cannot_redirect_from_a_different_udp_address() {
-    let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
-        .await
-        .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = rendezvous(&["a", "b"]).await;
+    let address = relay.local_addr();
     let mut a = RawPeer::new("a", [1; 16]).await;
     let mut b = RawPeer::new("b", [2; 16]).await;
     let mut attacker = RawPeer::new("a", [1; 16]).await;
@@ -200,10 +205,8 @@ async fn captured_registration_cannot_redirect_from_a_different_udp_address() {
 
 #[tokio::test]
 async fn consumed_and_old_session_registration_replays_cannot_replace_a_new_session() {
-    let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
-        .await
-        .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = rendezvous(&["a", "b"]).await;
+    let address = relay.local_addr();
     let mut a = RawPeer::new("a", [1; 16]).await;
     let mut b = RawPeer::new("b", [2; 16]).await;
     b.register(address, PathPolicy::RelayOnly).await;
@@ -230,10 +233,8 @@ async fn consumed_and_old_session_registration_replays_cannot_replace_a_new_sess
 
 #[tokio::test]
 async fn expired_challenge_and_unregistered_relay_are_rejected() {
-    let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
-        .await
-        .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = rendezvous(&["a", "b"]).await;
+    let address = relay.local_addr();
     let mut a = RawPeer::new("a", [1; 16]).await;
     let mut b = RawPeer::new("b", [2; 16]).await;
     b.register(address, PathPolicy::RelayOnly).await;
@@ -281,10 +282,8 @@ async fn expired_challenge_and_unregistered_relay_are_rejected() {
 
 #[tokio::test]
 async fn replayed_relay_datagrams_and_wrong_recipient_sessions_are_not_forwarded() {
-    let relay = Rendezvous::bind(loopback(), key(), vec!["a".into(), "b".into()])
-        .await
-        .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = rendezvous(&["a", "b"]).await;
+    let address = relay.local_addr();
     let mut a = RawPeer::new("a", [1; 16]).await;
     let mut b = RawPeer::new("b", [2; 16]).await;
     a.register(address, PathPolicy::RelayOnly).await;
@@ -332,10 +331,8 @@ async fn replayed_relay_datagrams_and_wrong_recipient_sessions_are_not_forwarded
 
 #[tokio::test]
 async fn unknown_names_and_bad_authentication_cannot_obtain_reflections() {
-    let relay = Rendezvous::bind(loopback(), key(), vec!["a".into()])
-        .await
-        .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = rendezvous(&["a"]).await;
+    let address = relay.local_addr();
     let mut unknown = RawPeer::new("unknown", [1; 16]).await;
     unknown.send(address, Body::Hello { nonce: [1; 16] }).await;
     unknown.silent().await;
@@ -366,15 +363,9 @@ async fn unknown_names_and_bad_authentication_cannot_obtain_reflections() {
 
 #[tokio::test]
 async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive_queue() {
-    let relay = Rendezvous::bind(
-        loopback(),
-        key(),
-        vec!["a".into(), "b".into(), "unknown".into()],
-    )
-    .await
-    .unwrap();
-    let address = relay.local_addr().unwrap();
-    let mut config = PunchConfig::new("a".into(), address, key(), vec!["b".into()]);
+    let relay = rendezvous(&["a", "b", "unknown"]).await;
+    let address = relay.local_addr();
+    let mut config = UdpPunchConfig::new("a".into(), address, key(), vec!["b".into()]);
     config.bind = loopback();
     let a = UdpConnection::bind(config).await.unwrap();
     let mut b = RawPeer::new("b", [2; 16]).await;
@@ -384,7 +375,7 @@ async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive
     })
     .await;
     let (_, a_session, secret) = b.observed_peer(address, "a").await;
-    let destination = a.local_addr().unwrap();
+    let destination = a.local_addr();
     b.socket
         .send_to(&[0; MAX_PACKET + 100], destination)
         .await

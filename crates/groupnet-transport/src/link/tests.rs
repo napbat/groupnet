@@ -87,7 +87,7 @@ impl Transport for OwnedEndpoint {
 
 #[tokio::test]
 async fn link_worker_transfers_the_allocation_and_selected_generation() {
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
     let peer = NodeId::new("peer");
     let lease = registry
         .try_admit(crate::admission::AcceptedPeer::new(peer.clone()))
@@ -177,7 +177,7 @@ async fn worker_offers_the_direct_sink_bounded_by_the_link_mtu() {
         }
         tokio::task::yield_now().await;
     };
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
     let session = registry
         .try_admit(crate::admission::AcceptedPeer::new(NodeId::new("peer")))
         .unwrap()

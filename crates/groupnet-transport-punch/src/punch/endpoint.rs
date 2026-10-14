@@ -19,12 +19,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::wire::{self, Body, MAX_PACKET, Packet, Session};
 use super::{
-    Capability, HEARTBEAT, MAX_CHECKS, Outbound, PathPolicy, Peer, PunchConfig, lock, random,
+    Capability, HEARTBEAT, MAX_CHECKS, Outbound, PathPolicy, Peer, UdpPunchConfig, lock, random,
     transient,
 };
 
 struct Endpoint {
-    config: PunchConfig,
+    config: UdpPunchConfig,
     socket: UdpSocket,
     extra_sockets: Vec<UdpSocket>,
     local_candidates: super::candidates::Candidates,
@@ -58,7 +58,7 @@ pub(super) type SocketLeases = (
 );
 
 pub(super) async fn run(
-    config: PunchConfig,
+    config: UdpPunchConfig,
     sockets: SocketLeases,
     seed: (Session, Session),
     peers: Arc<Mutex<HashMap<String, Peer>>>,
@@ -77,7 +77,7 @@ pub(super) async fn run(
 }
 
 async fn drive(
-    config: PunchConfig,
+    config: UdpPunchConfig,
     sockets: SocketLeases,
     seed: (Session, Session),
     peers: Arc<Mutex<HashMap<String, Peer>>>,
@@ -397,7 +397,7 @@ impl Endpoint {
         }
         let mut peers = lock(&self.peers);
         peers.retain(|_, peer| peer.lease.is_active() && peer.path(Instant::now()).is_some());
-        if !peers.contains_key(peer) && peers.len() >= self.config.max_peers {
+        if !peers.contains_key(peer) && peers.len() >= self.config.max_peers.get() {
             return;
         }
         if let Some(previous) = peers.get_mut(peer) {

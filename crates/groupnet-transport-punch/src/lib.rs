@@ -1,12 +1,12 @@
 //! Native UDP and TCP multi-candidate traversal with session-bound relay fallback.
 //!
-//! [`PunchConfig::new`] preserves explicitly keyed, allowlisted fabrics.
-//! [`PunchConfig::open`] defaults to [`PathPolicy::RelayOnly`]. Explicitly setting
-//! [`PunchConfig::policy`] to [`PathPolicy::DirectPreferred`] enables keyless
+//! [`UdpPunchConfig::new`] preserves explicitly keyed, allowlisted fabrics.
+//! [`UdpPunchConfig::open`] defaults to [`PathPolicy::RelayOnly`]. Explicitly setting
+//! [`UdpPunchConfig::policy`] to [`PathPolicy::DirectPreferred`] enables keyless
 //! punching: no pre-shared transport key or identity keypair is required.
 //! Internal fresh random challenges and capabilities prove return-routability,
 //! not cryptographic identity. Application admission may independently require
-//! credentials through [`Rendezvous::bind_with_admission`]; keyed configurations
+//! credentials through [`UdpRendezvousConfig::with_admission`]; keyed configurations
 //! retain strict HMAC authentication and never downgrade.
 //! UDP registration proves address return-routability before discovery or relay.
 //! Direct data requires current session-bound path proofs and message authentication.
@@ -14,11 +14,20 @@
 //! The rendezvous sees identities, addresses, and raw transport messages; it is
 //! not a participant in the routing group.
 //!
+//! Each protocol has one endpoint configuration ([`UdpPunchConfig`],
+//! [`TcpPunchConfig`]) and one rendezvous configuration ([`UdpRendezvousConfig`],
+//! [`TcpRendezvousConfig`]) with nested protocol-specific limits. Every
+//! configuration exposes `validate`, returning a typed error that names the
+//! violated field; each binder calls it first and surfaces a failure as
+//! `InvalidInput` wrapping that typed error.
+//!
 //! [`UdpConnection`] and [`TcpConnection`] establish and maintain adjacent packet
 //! paths, with bounded best-effort I/O, admission generations, and explicit
 //! cancellation/drain. They do not implement router transport or link traits.
 //! TCP/UDP transport adapters own routing integration; the router alone performs
 //! logical multi-hop forwarding. UDP does not fragment oversized payloads.
+//! Local bind addresses and candidates are cached at bind and retained after
+//! shutdown; peer paths and observed addresses are live queries.
 //!
 //! [`TcpPunchConfig`], [`TcpConnection`], and [`TcpRendezvous`]
 //! provide independent TCP-only discovery, coordinated reusable-source-port active
@@ -31,16 +40,18 @@
 //! Actual traversal depends on OS/NAT behavior; unsupported direct paths retain
 //! relay operation where that relay remains reachable.
 
+mod common;
 mod pacing;
 mod punch;
 mod tcp;
 
 pub use pacing::RelayPacing;
 pub use punch::{
-    MAX_MESSAGE, NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous, RendezvousConfig,
-    RendezvousLimits, UdpConnection,
+    MAX_UDP_MESSAGE, NetworkKey, PathPolicy, PeerPath, UdpConnection, UdpPunchConfig,
+    UdpPunchConfigError, UdpRendezvous, UdpRendezvousConfig, UdpRendezvousConfigError,
+    UdpRendezvousLimits,
 };
 pub use tcp::{
-    ControlRateLimit, MAX_TCP_MESSAGE, TcpConnection, TcpPunchConfig, TcpRendezvous,
-    TcpRendezvousConfig,
+    ControlRateLimit, MAX_TCP_MESSAGE, TcpConnection, TcpPunchConfig, TcpPunchConfigError,
+    TcpRendezvous, TcpRendezvousConfig, TcpRendezvousConfigError, TcpRendezvousLimits,
 };

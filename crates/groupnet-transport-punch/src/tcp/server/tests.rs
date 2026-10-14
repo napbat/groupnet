@@ -139,23 +139,27 @@ fn relay_rejects_stale_sessions_and_nonmutual_admission() {
     assert!(relay(&entries, &NodeId::new("source"), [1; 32], packet()).is_some());
 }
 
+fn open(limits: TcpRendezvousLimits) -> TcpRendezvousConfig {
+    TcpRendezvousConfig {
+        limits,
+        ..TcpRendezvousConfig::open("127.0.0.1:0".parse().unwrap())
+    }
+}
+
 #[tokio::test]
 async fn configured_rendezvous_forwards_data_bursts_without_revoking_admission() {
-    let rendezvous = TcpRendezvous::bind_open_config(
-        "127.0.0.1:0".parse().unwrap(),
-        TcpRendezvousConfig {
-            session_queue: QueueCapacity::of(1024),
-            event_queue: QueueCapacity::of(1024),
-            control: super::super::ControlRateLimit {
-                frames_per_second: std::num::NonZeroU32::new(1).unwrap(),
-                burst_frames: std::num::NonZeroU32::new(1).unwrap(),
-            },
-            ..Default::default()
+    let rendezvous = TcpRendezvous::bind(open(TcpRendezvousLimits {
+        session_queue: QueueCapacity::of(1024),
+        event_queue: QueueCapacity::of(1024),
+        control: super::super::ControlRateLimit {
+            frames_per_second: std::num::NonZeroU32::new(1).unwrap(),
+            burst_frames: std::num::NonZeroU32::new(1).unwrap(),
         },
-    )
+        ..Default::default()
+    }))
     .await
     .unwrap();
-    let address = rendezvous.local_addr().unwrap();
+    let address = rendezvous.local_addr();
     let mut a_config = TcpPunchConfig::open(NodeId::new("source"), address);
     a_config.queue_capacity = QueueCapacity::of(1024);
     let mut b_config = TcpPunchConfig::open(NodeId::new("target"), address);
@@ -197,17 +201,14 @@ async fn configured_rendezvous_forwards_data_bursts_without_revoking_admission()
 
 #[tokio::test]
 async fn configured_session_cap_denies_excess_admission_without_revoking_incumbent() {
-    let rendezvous = TcpRendezvous::bind_open_config(
-        "127.0.0.1:0".parse().unwrap(),
-        TcpRendezvousConfig {
-            max_sessions: QueueCapacity::of(1),
-            session_queue: QueueCapacity::of(1),
-            ..Default::default()
-        },
-    )
+    let rendezvous = TcpRendezvous::bind(open(TcpRendezvousLimits {
+        max_sessions: QueueCapacity::of(1),
+        session_queue: QueueCapacity::of(1),
+        ..Default::default()
+    }))
     .await
     .unwrap();
-    let address = rendezvous.local_addr().unwrap();
+    let address = rendezvous.local_addr();
     let incumbent = TcpConnection::bind(TcpPunchConfig::open(NodeId::new("first"), address))
         .await
         .unwrap();
@@ -215,8 +216,16 @@ async fn configured_session_cap_denies_excess_admission_without_revoking_incumbe
         .await
         .unwrap_err();
     assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
-    assert!(incumbent.local_addr().is_ok());
+    assert!(!incumbent.is_closed());
+    let primary = incumbent.local_addr();
+    let addresses = incumbent.local_addrs().to_vec();
+    let candidates = incumbent.local_candidates();
     incumbent.close().await;
+    assert!(incumbent.is_closed());
+    assert_eq!(incumbent.local_addr(), primary);
+    assert_eq!(incumbent.local_addrs(), addresses.as_slice());
+    assert_eq!(incumbent.local_candidates(), candidates);
+    assert_eq!(incumbent.observed_addr(), None);
     rendezvous.close().await;
 }
 
@@ -230,9 +239,10 @@ async fn assert_pending(closed: &mut std::pin::Pin<&mut impl Future<Output = ()>
 
 #[tokio::test]
 async fn closed_resolves_stickily_after_close_drains_the_server() {
-    let rendezvous = TcpRendezvous::bind_open("127.0.0.1:0".parse().unwrap())
+    let rendezvous = TcpRendezvous::bind(open(TcpRendezvousLimits::default()))
         .await
         .unwrap();
+    let address = rendezvous.local_addr();
     let closed = rendezvous.closed();
     let mut closed = std::pin::pin!(closed);
     assert_pending(&mut closed).await;
@@ -246,15 +256,12 @@ async fn closed_resolves_stickily_after_close_drains_the_server() {
     tokio::time::timeout(DEADLINE, rendezvous.closed())
         .await
         .expect("closed() is sticky for later callers");
-    assert_eq!(
-        rendezvous.local_addr().unwrap_err().kind(),
-        io::ErrorKind::NotConnected
-    );
+    assert_eq!(rendezvous.local_addr(), address);
 }
 
 #[tokio::test]
 async fn closed_resolves_when_the_server_task_stops_without_close() {
-    let rendezvous = TcpRendezvous::bind_open("127.0.0.1:0".parse().unwrap())
+    let rendezvous = TcpRendezvous::bind(open(TcpRendezvousLimits::default()))
         .await
         .unwrap();
     let closed = rendezvous.closed();
@@ -265,16 +272,13 @@ async fn closed_resolves_when_the_server_task_stops_without_close() {
     tokio::time::timeout(DEADLINE, closed)
         .await
         .expect("terminal server stop resolves closed()");
-    assert_eq!(
-        rendezvous.local_addr().unwrap_err().kind(),
-        io::ErrorKind::NotConnected
-    );
+    assert_ne!(rendezvous.local_addr().port(), 0);
     rendezvous.close().await;
 }
 
 #[tokio::test]
 async fn closed_outlives_and_resolves_after_the_last_handle_drops() {
-    let rendezvous = TcpRendezvous::bind_open("127.0.0.1:0".parse().unwrap())
+    let rendezvous = TcpRendezvous::bind(open(TcpRendezvousLimits::default()))
         .await
         .unwrap();
     let closed = rendezvous.closed();
@@ -293,12 +297,12 @@ async fn authenticated_heartbeats_keep_slow_byte_pacing_live_and_cancellation_dr
         (source.registration.node.clone(), source),
         (target.registration.node.clone(), target),
     ])));
-    let config = TcpRendezvousConfig {
+    let policy = Policy {
+        limits: TcpRendezvousLimits::default(),
         relay_pacing: RelayPacing::Bytes {
             bytes_per_second: std::num::NonZeroU64::new(1).unwrap(),
             burst_bytes: std::num::NonZeroU64::new(1).unwrap(),
         },
-        ..Default::default()
     };
     let (server, client) = tokio::io::duplex(16);
     let (mut server_read, mut server_write) = tokio::io::split(server);
@@ -310,7 +314,7 @@ async fn authenticated_heartbeats_keep_slow_byte_pacing_live_and_cancellation_dr
         let source = NodeId::new("source");
         tokio::select! {
             () = stopped.cancelled() => Ok(()),
-            result = read_client(&mut server_read, &auth, &entries, &source, [1; 32], config) => result,
+            result = read_client(&mut server_read, &auth, &entries, &source, [1; 32], policy) => result,
         }
     });
     let stopped = cancel.clone();

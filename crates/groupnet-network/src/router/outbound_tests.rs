@@ -74,7 +74,7 @@ async fn blocked_and_router_queued_frames_cannot_cross_into_replacement_session(
 {
     let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
     let peer = NodeId::new("peer");
-    let registry = SessionRegistry::new(1)?;
+    let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
     let first = registry.try_admit(AcceptedPeer::new(peer.clone()))?;
     let (incoming, receive) = mpsc::channel(16);
     let (delivered, mut packets) = mpsc::channel(16);
@@ -130,7 +130,7 @@ async fn remaining_fragments_keep_original_generation_and_stop_after_revocation(
     let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
     let shared = router.inner.shared.clone();
     let peer = NodeId::new("peer");
-    let registry = SessionRegistry::new(1)?;
+    let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
     let first = registry.try_admit(AcceptedPeer::new(peer.clone()))?;
     let (queued, receive) = mpsc::channel(16);
     let mut io = adapters::io(

@@ -1,4 +1,16 @@
 use super::*;
+use std::num::NonZeroUsize;
+
+fn registry(max_peers: usize) -> SessionRegistry {
+    SessionRegistry::new(NonZeroUsize::new(max_peers).expect("nonzero test capacity"))
+}
+
+fn typed<E: error::Error + 'static>(error: &io::Error) -> &E {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<E>())
+        .expect("typed inner error")
+}
 
 #[test]
 fn open_is_explicit_and_checks_identity_and_credential_bounds() {
@@ -8,13 +20,22 @@ fn open_is_explicit_and_checks_identity_and_credential_bounds() {
         futures::executor::block_on(policy.admit(JoinRequest::new(&node, &[], None))).unwrap();
     assert_eq!(accepted.node, node);
     let credential = vec![7; MAX_CREDENTIAL_BYTES + 1];
-    assert!(
+    let error =
         futures::executor::block_on(policy.admit(JoinRequest::new(&node, &credential, None)))
-            .is_err()
+            .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        typed::<JoinRequestError>(&error),
+        &JoinRequestError::CredentialTooLong {
+            len: MAX_CREDENTIAL_BYTES + 1
+        }
     );
-    assert!(
+    let error =
         futures::executor::block_on(policy.admit(JoinRequest::new(&NodeId::new(""), &[], None)))
-            .is_err()
+            .unwrap_err();
+    assert_eq!(
+        typed::<JoinRequestError>(&error),
+        &JoinRequestError::Claimed(NodeIdError::Empty)
     );
     assert!(
         !format!("{:?}", JoinRequest::new(&node, b"private-credential", None))
@@ -24,20 +45,24 @@ fn open_is_explicit_and_checks_identity_and_credential_bounds() {
 
 #[test]
 fn duplicate_and_capacity_cannot_evict_a_live_lease() {
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = registry(1);
     let node = NodeId::new("one");
     let incumbent = registry.try_admit(AcceptedPeer::new(node.clone())).unwrap();
+    let duplicate = registry
+        .try_admit(AcceptedPeer::new(node.clone()))
+        .unwrap_err();
+    assert_eq!(duplicate, SessionError::AlreadyAdmitted(node.clone()));
     assert_eq!(
-        registry
-            .try_admit(AcceptedPeer::new(node.clone()))
-            .unwrap_err()
-            .kind(),
+        io::Error::from(duplicate).kind(),
         io::ErrorKind::AlreadyExists
     );
-    assert!(
+    assert_eq!(
         registry
             .try_admit(AcceptedPeer::new(NodeId::new("two")))
-            .is_err()
+            .unwrap_err(),
+        SessionError::CapacityReached {
+            max_peers: NonZeroUsize::MIN
+        }
     );
     assert!(incumbent.is_active());
     assert_eq!(registry.subscribe().borrow().len(), 1);
@@ -52,7 +77,7 @@ fn duplicate_and_capacity_cannot_evict_a_live_lease() {
 
 #[test]
 fn stale_cleanup_and_queued_tags_cannot_authorize_a_reconnect() {
-    let registry = SessionRegistry::new(2).unwrap();
+    let registry = registry(2);
     let node = NodeId::new("reconnect");
     let first = registry.try_admit(AcceptedPeer::new(node.clone())).unwrap();
     let retained = first.clone();
@@ -73,7 +98,7 @@ fn stale_cleanup_and_queued_tags_cannot_authorize_a_reconnect() {
 
 #[test]
 fn simultaneous_reservations_are_atomic() {
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = registry(1);
     let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
     let workers: Vec<_> = (0..8)
         .map(|_| {
@@ -94,7 +119,7 @@ fn simultaneous_reservations_are_atomic() {
 
 #[test]
 fn shutdown_withdraws_leases_and_permanently_fails_closed() {
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = registry(1);
     let lease = registry
         .try_admit(AcceptedPeer::new(NodeId::new("peer")))
         .unwrap();
@@ -102,20 +127,18 @@ fn shutdown_withdraws_leases_and_permanently_fails_closed() {
     registry.close();
     assert!(!lease.is_active());
     assert!(registry.subscribe().borrow().is_empty());
-    assert_eq!(
-        registry
-            .try_admit(AcceptedPeer::new(NodeId::new("later")))
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::BrokenPipe
-    );
+    let closed = registry
+        .try_admit(AcceptedPeer::new(NodeId::new("later")))
+        .unwrap_err();
+    assert_eq!(closed, SessionError::Closed);
+    assert_eq!(io::Error::from(closed).kind(), io::ErrorKind::BrokenPipe);
 }
 
 #[test]
 fn closed_is_sticky_and_distinguishable_from_an_idle_registry() {
     use futures::FutureExt;
 
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = registry(1);
     let mut neighbors = registry.subscribe();
     let mut pending = Box::pin(registry.closed());
     // Open and empty: the snapshot alone cannot tell, the lifecycle API can.
@@ -146,7 +169,7 @@ fn closed_is_sticky_and_distinguishable_from_an_idle_registry() {
 fn closed_future_ends_when_every_registry_handle_is_dropped() {
     use futures::FutureExt;
 
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = registry(1);
     let mut pending = Box::pin(registry.closed());
     assert!(pending.as_mut().now_or_never().is_none());
     drop(registry);
@@ -155,15 +178,17 @@ fn closed_future_ends_when_every_registry_handle_is_dropped() {
 
 #[test]
 fn node_identity_bound_is_shared() {
-    let registry = SessionRegistry::new(2).unwrap();
+    let registry = registry(2);
     let longest = NodeId::new("n".repeat(crate::MAX_NODE_ID_BYTES));
     assert!(registry.try_admit(AcceptedPeer::new(longest)).is_ok());
     let too_long = NodeId::new("n".repeat(crate::MAX_NODE_ID_BYTES + 1));
+    let error = registry.try_admit(AcceptedPeer::new(too_long)).unwrap_err();
     assert_eq!(
-        registry
-            .try_admit(AcceptedPeer::new(too_long))
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        error,
+        SessionError::Identity(NodeIdError::TooLong {
+            len: crate::MAX_NODE_ID_BYTES + 1,
+            max: crate::MAX_NODE_ID_BYTES
+        })
     );
+    assert_eq!(io::Error::from(error).kind(), io::ErrorKind::InvalidInput);
 }

@@ -8,8 +8,8 @@ mod recovery_tests;
 #[cfg(test)]
 mod pacing_tests;
 use super::{
-    DEADLINE, IDLE, Inner, MAX_CANDIDATES, MAX_PEERS, Outgoing, TcpConnection, TcpPunchConfig,
-    View, Views, closed, invalid, lock, random, server, sockets,
+    DEADLINE, IDLE, Inner, Outgoing, TcpConnection, TcpPunchConfig, View, Views, closed, invalid,
+    lock, random, sockets,
     wire::{self, Auth, Duplex, Message, Token},
 };
 use crate::PathPolicy;
@@ -92,8 +92,8 @@ enum Event {
 }
 
 pub(super) async fn bind(config: TcpPunchConfig) -> io::Result<TcpConnection> {
-    validate(&config)?;
-    let sessions = SessionRegistry::new(config.max_peers)?;
+    config.validate()?;
+    let sessions = SessionRegistry::new(config.max_peers);
     let auth = wire::auth(config.key.as_ref());
     let session = random()?;
     let (mut stream, reusable) = tokio::time::timeout(DEADLINE, registration_socket(&config))
@@ -175,33 +175,6 @@ pub(super) async fn bind(config: TcpPunchConfig) -> io::Result<TcpConnection> {
             task: tokio::sync::Mutex::new(Some(task)),
         }),
     })
-}
-
-fn validate(config: &TcpPunchConfig) -> io::Result<()> {
-    if config.peers.len() > config.max_peers || config.peers.len() > MAX_PEERS {
-        return Err(invalid("TCP static peers exceed configured peer capacity"));
-    }
-    server::validate_peers(&config.peers)?;
-    server::validate_peers(std::slice::from_ref(&config.local))?;
-    if config.peers.contains(&config.local)
-        || config.credential.len() > 1024
-        || config.candidate_binds.len() > 3
-        || config.advertised_candidates.len() > MAX_CANDIDATES
-        || config
-            .advertised_candidates
-            .iter()
-            .any(|address| !sockets::valid(*address))
-        || !sockets::valid(config.rendezvous)
-        || config.bind.is_ipv4() != config.rendezvous.is_ipv4()
-        || config.bind.ip().is_multicast()
-        || config
-            .candidate_binds
-            .iter()
-            .any(|address| address.ip().is_multicast())
-    {
-        return Err(invalid("invalid TCP traversal configuration"));
-    }
-    Ok(())
 }
 
 async fn registration_socket(config: &TcpPunchConfig) -> io::Result<(TcpStream, bool)> {
@@ -714,7 +687,7 @@ mod tests {
             pending_checks: HashSet::new(),
             views: Arc::new(Views::new()),
             proofs: Arc::new(Mutex::new(HashMap::new())),
-            sessions: SessionRegistry::new(8).unwrap(),
+            sessions: SessionRegistry::new(std::num::NonZeroUsize::new(8).unwrap()),
             incoming,
             cancel: CancellationToken::new(),
         };

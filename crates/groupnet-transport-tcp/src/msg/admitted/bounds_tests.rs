@@ -18,12 +18,13 @@ async fn bounded_endpoint(
         NodeId::new(id),
         "127.0.0.1:0",
         TcpMsgConfig::default(),
-        Arc::new(OpenAdmission),
-        Vec::new(),
-        TcpAdmissionConfig {
-            max_pending: QueueCapacity::MIN,
-            max_peers,
-            handshake_timeout,
+        TcpAdmission {
+            config: TcpAdmissionConfig {
+                max_pending: QueueCapacity::MIN,
+                max_peers: std::num::NonZeroUsize::new(max_peers).expect("nonzero capacity"),
+                handshake_timeout,
+            },
+            ..TcpAdmission::new(Arc::new(OpenAdmission))
         },
     )
     .await
@@ -140,9 +141,7 @@ async fn churn_bounds_handshake_and_hint_learning_but_preserves_configured_boots
             advertise: Some(advertised),
             ..TcpMsgConfig::default()
         },
-        Arc::new(OpenAdmission),
-        Vec::new(),
-        TcpAdmissionConfig::default(),
+        TcpAdmission::new(Arc::new(OpenAdmission)),
     )
     .await
     .expect("seed");

@@ -8,8 +8,8 @@ use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::link::LinkProvider;
 use groupnet_transport_mem::Network;
-use groupnet_transport_punch::{PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous};
-use groupnet_transport_tcp::{TcpLink, TcpMsgTransport};
+use groupnet_transport_punch::{TcpRendezvous, TcpRendezvousConfig};
+use groupnet_transport_tcp::{PathPolicy, PeerPath, TcpLink, TcpMsgTransport, TcpPunchConfig};
 
 const WAIT: Duration = Duration::from_secs(15);
 
@@ -46,10 +46,10 @@ async fn exchange(a: &Router, c: &Router, payload: &[u8]) {
 }
 
 async fn topology(policy: PathPolicy) -> (TcpRendezvous, Router, Router, Router) {
-    let relay = TcpRendezvous::bind_open("127.0.0.1:0".parse().unwrap())
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::open("127.0.0.1:0".parse().unwrap()))
         .await
         .unwrap();
-    let address = relay.local_addr().unwrap();
+    let address = relay.local_addr();
     let (a, b, c) = (router("a"), router("b"), router("c"));
     let memory = Network::new();
     a.add_transport(
@@ -127,7 +127,7 @@ async fn compatible_connectivity_promotes_direct_route_and_loss_restores_bridge(
     exchange(&a, &c, b"initial transit").await;
     let a_tcp = TcpMsgTransport::bind_connectivity(config(
         "a",
-        relay.local_addr().unwrap(),
+        relay.local_addr(),
         PathPolicy::DirectPreferred,
     ))
     .await

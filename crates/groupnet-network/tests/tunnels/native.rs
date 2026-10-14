@@ -7,7 +7,8 @@ use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::bulk::BulkTransport;
 use groupnet_transport_punch::{
-    NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous, TcpPunchConfig, TcpRendezvous,
+    NetworkKey, PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig,
+    UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
 };
 use groupnet_transport_tcp::TcpMsgTransport;
 use groupnet_transport_udp::UdpTransport;
@@ -21,16 +22,16 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
         let left = NodeId::new("left");
         let right = NodeId::new("right");
         let key = NetworkKey::from_bytes([19; 32]);
-        let relay = Rendezvous::bind(
+        let relay = UdpRendezvous::bind(UdpRendezvousConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             key.clone(),
             vec![left.clone(), right.clone()],
-        )
+        ))
         .await
         .unwrap();
         let configure = |local, peer| {
             let mut config =
-                PunchConfig::new(local, relay.local_addr().unwrap(), key.clone(), vec![peer]);
+                UdpPunchConfig::new(local, relay.local_addr(), key.clone(), vec![peer]);
             config.bind = "127.0.0.1:0".parse().unwrap();
             config.policy = policy;
             config
@@ -85,16 +86,15 @@ async fn native_tcp_relay_large_echo_half_closes_without_revoking_admission() {
     let left = NodeId::new("tcp-left");
     let right = NodeId::new("tcp-right");
     let key = NetworkKey::from_bytes([29; 32]);
-    let relay = TcpRendezvous::bind(
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         key.clone(),
         vec![left.clone(), right.clone()],
-    )
+    ))
     .await
     .unwrap();
     let configure = |local, peer| {
-        let mut config =
-            TcpPunchConfig::new(local, relay.local_addr().unwrap(), key.clone(), vec![peer]);
+        let mut config = TcpPunchConfig::new(local, relay.local_addr(), key.clone(), vec![peer]);
         config.bind = "127.0.0.1:0".parse().unwrap();
         config.policy = PathPolicy::RelayOnly;
         config

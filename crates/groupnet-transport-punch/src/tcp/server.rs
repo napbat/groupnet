@@ -1,12 +1,14 @@
 //! Bounded TCP admission, pair introductions, and independent relay writers.
 use super::{
-    DEADLINE, IDLE, MAX_CANDIDATES, NetworkKey, TcpRendezvousConfig, closed, invalid, lock, random,
-    sockets,
+    DEADLINE, IDLE, MAX_CANDIDATES, TcpRendezvousConfig, TcpRendezvousLimits, closed, invalid,
+    lock, random, sockets,
     wire::{self, Auth, Duplex, Message, Token},
 };
+use crate::RelayPacing;
+use crate::common::check_peers;
 use crate::pacing::Budget;
 use groupnet_core::NodeId;
-use groupnet_transport::admission::{Admission, JoinRequest, OpenAdmission};
+use groupnet_transport::admission::{Admission, JoinRequest};
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -44,101 +46,32 @@ pub struct TcpRendezvous {
 }
 
 impl TcpRendezvous {
-    /// Binds a keyed rendezvous restricted to an explicit identity allowlist.
+    /// Binds a rendezvous from its full configuration: allowlist or dynamic
+    /// admission, optional fabric key, operational limits and relay pacing.
     ///
     /// # Errors
-    /// Returns invalid identities, duplicate allowlist entries, or bind errors.
-    pub async fn bind(bind: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> io::Result<Self> {
-        Self::bind_config(bind, key, peers, TcpRendezvousConfig::default()).await
-    }
-
-    /// Binds a keyed allowlist with explicit operational limits and relay policy.
-    ///
-    /// # Errors
-    /// Rejects invalid limits or identities and returns socket errors.
-    pub async fn bind_config(
-        bind: SocketAddr,
-        key: NetworkKey,
-        peers: Vec<NodeId>,
-        config: TcpRendezvousConfig,
-    ) -> io::Result<Self> {
-        let allowed = validate_peers(&peers)?;
-        Self::start(
-            bind,
-            Some(key),
-            Arc::new(OpenAdmission),
-            Some(Arc::new(allowed)),
-            config,
-        )
-        .await
-    }
-
-    /// Binds explicit unauthenticated dynamic admission.
-    ///
-    /// # Errors
-    /// Returns invalid bind or socket errors.
-    pub async fn bind_open(bind: SocketAddr) -> io::Result<Self> {
-        Self::bind_open_config(bind, TcpRendezvousConfig::default()).await
-    }
-
-    /// Binds open admission with explicit operational limits and relay policy.
-    ///
-    /// # Errors
-    /// Rejects invalid limits and returns socket errors.
-    pub async fn bind_open_config(
-        bind: SocketAddr,
-        config: TcpRendezvousConfig,
-    ) -> io::Result<Self> {
-        Self::bind_with_admission_config(bind, None, Arc::new(OpenAdmission), config).await
-    }
-
-    /// Binds application-controlled admission with optional strict fabric authentication.
-    ///
-    /// # Errors
-    /// Returns invalid bind or socket errors.
-    pub async fn bind_with_admission(
-        bind: SocketAddr,
-        key: Option<NetworkKey>,
-        admission: Arc<dyn Admission>,
-    ) -> io::Result<Self> {
-        Self::bind_with_admission_config(bind, key, admission, TcpRendezvousConfig::default()).await
-    }
-
-    /// Binds application admission with explicit operational limits and relay policy.
-    ///
-    /// # Errors
-    /// Rejects invalid limits and returns socket errors.
-    pub async fn bind_with_admission_config(
-        bind: SocketAddr,
-        key: Option<NetworkKey>,
-        admission: Arc<dyn Admission>,
-        config: TcpRendezvousConfig,
-    ) -> io::Result<Self> {
-        Self::start(bind, key, admission, None, config).await
-    }
-
-    async fn start(
-        bind: SocketAddr,
-        key: Option<NetworkKey>,
-        admission: Arc<dyn Admission>,
-        allowed: Option<Arc<HashSet<NodeId>>>,
-        config: TcpRendezvousConfig,
-    ) -> io::Result<Self> {
+    /// Rejects invalid configuration as `InvalidInput` wrapping its
+    /// [`TcpRendezvousConfigError`](crate::TcpRendezvousConfigError), and
+    /// propagates socket errors.
+    pub async fn bind(config: TcpRendezvousConfig) -> io::Result<Self> {
         config.validate()?;
-        if bind.ip().is_multicast() {
-            return Err(invalid("multicast TCP rendezvous bind"));
-        }
-        let listener = TcpListener::bind(bind).await?;
+        let allowed = config
+            .peers
+            .map(|peers| Arc::new(peers.into_iter().collect::<HashSet<_>>()));
+        let listener = TcpListener::bind(config.bind).await?;
         let address = listener.local_addr()?;
         let cancel = CancellationToken::new();
         let stopped = CancellationToken::new();
         let server = run(
             listener,
-            wire::auth(key.as_ref()),
-            admission,
+            wire::auth(config.key.as_ref()),
+            config.admission,
             allowed,
             cancel.clone(),
-            config,
+            Policy {
+                limits: config.limits,
+                relay_pacing: config.relay_pacing,
+            },
         );
         // Armed before spawning, so even a task aborted before its first poll
         // publishes the stop. Tuple fields drop in order: the endpoint reports
@@ -158,26 +91,17 @@ impl TcpRendezvous {
         })
     }
 
-    /// Returns the actual TCP listening address.
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        if self.inner.cancel.is_cancelled() {
-            Err(closed())
-        } else {
-            Ok(self.inner.address)
-        }
+    /// Returns the actual TCP listening address, cached at bind and retained
+    /// after shutdown.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.address
     }
 
     /// Cancels and drains all pending admission, reader, and writer tasks.
     pub async fn close(&self) {
         self.inner.cancel.cancel();
-        let mut task = self.inner.task.lock().await;
-        if let Some(running) = task.as_mut() {
-            let _ = running.await;
-        }
-        task.take();
+        crate::common::join(&self.inner.task).await;
     }
 
     /// Resolves once the server task has stopped, whether through [`Self::close`],
@@ -188,14 +112,17 @@ impl TcpRendezvous {
     }
 }
 
-pub(super) fn validate_peers(peers: &[NodeId]) -> io::Result<HashSet<NodeId>> {
-    let mut seen = HashSet::with_capacity(peers.len());
-    for node in peers {
-        if node.as_str().is_empty() || node.as_str().len() > 64 || !seen.insert(node.clone()) {
-            return Err(invalid("invalid or duplicate TCP identity"));
-        }
-    }
-    Ok(seen)
+/// Runtime limits and relay pacing, copied into every session task.
+#[derive(Clone, Copy, Debug)]
+struct Policy {
+    limits: TcpRendezvousLimits,
+    relay_pacing: RelayPacing,
+}
+
+/// Validates a peer list received in a registration and indexes it.
+fn validate_peers(peers: &[NodeId]) -> io::Result<HashSet<NodeId>> {
+    check_peers(peers).map_err(|_| invalid("invalid or duplicate TCP identity"))?;
+    Ok(peers.iter().cloned().collect())
 }
 
 struct Registration {
@@ -294,10 +221,11 @@ async fn run(
     admission: Arc<dyn Admission>,
     allowed: Option<Arc<HashSet<NodeId>>>,
     cancel: CancellationToken,
-    config: TcpRendezvousConfig,
+    policy: Policy,
 ) {
-    let pending = Arc::new(Semaphore::new(config.max_pending.get()));
-    let (events, mut incoming) = mpsc::channel(config.event_queue.get());
+    let limits = policy.limits;
+    let pending = Arc::new(Semaphore::new(limits.max_pending.get()));
+    let (events, mut incoming) = mpsc::channel(limits.event_queue.get());
     let mut tasks = JoinSet::new();
     let entries: Entries = Arc::new(std::sync::Mutex::new(HashMap::new()));
     loop {
@@ -305,12 +233,12 @@ async fn run(
             biased;
             () = cancel.cancelled() => break,
             Some(event) = incoming.recv() => match event {
-                Event::Join(registration, stream, auth) => join(registration, (stream, auth), &entries, &mut tasks, &events, &cancel, &config),
+                Event::Join(registration, stream, auth) => join(registration, (stream, auth), &entries, &mut tasks, &events, &cancel, policy),
                 Event::Closed(node, session) => remove(&mut lock(&entries), &node, session),
             },
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             Ok((stream, address)) = sockets::accept(&listener) => {
-                if tasks.len() >= config.max_sessions.get() + config.max_pending.get() { continue; }
+                if tasks.len() >= limits.max_sessions.get() + limits.max_pending.get() { continue; }
                 let Ok(permit) = pending.clone().try_acquire_owned() else { continue; };
                 let events = events.clone(); let auth = wire::fresh(&auth); let admission = admission.clone(); let allowed = allowed.clone();
                 tasks.spawn(async move {
@@ -358,11 +286,12 @@ fn join(
     tasks: &mut JoinSet<()>,
     events: &mpsc::Sender<Event>,
     cancel: &CancellationToken,
-    config: &TcpRendezvousConfig,
+    policy: Policy,
 ) {
     let (stream, auth) = socket;
     let mut entries = lock(shared);
-    if entries.contains_key(&registration.node) || entries.len() >= config.max_sessions.get() {
+    if entries.contains_key(&registration.node) || entries.len() >= policy.limits.max_sessions.get()
+    {
         let auth = auth.clone();
         tasks.spawn(async move {
             let mut stream = stream;
@@ -374,8 +303,8 @@ fn join(
         });
         return;
     }
-    let (writer, control_outgoing) = mpsc::channel(config.control_queue.get());
-    let (data_writer, data_outgoing) = mpsc::channel(config.session_queue.get());
+    let (writer, control_outgoing) = mpsc::channel(policy.limits.control_queue.get());
+    let (data_writer, data_outgoing) = mpsc::channel(policy.limits.session_queue.get());
     let peer_cancel = cancel.child_token();
     let node = registration.node.clone();
     let session = registration.session;
@@ -433,7 +362,7 @@ fn join(
         events.clone(),
         (node.clone(), session),
         peer_cancel.clone(),
-        (*config, shared.clone()),
+        (policy, shared.clone()),
     ));
     entries.insert(
         node,
@@ -520,12 +449,12 @@ async fn connection(
     events: mpsc::Sender<Event>,
     identity: (NodeId, Token),
     cancel: CancellationToken,
-    context: (TcpRendezvousConfig, Entries),
+    context: (Policy, Entries),
 ) {
     let (node, session) = identity;
-    let (config, entries) = context;
+    let (policy, entries) = context;
     let (mut reader, mut writer) = stream.into_split();
-    let reading = read_client(&mut reader, &auth.rx, &entries, &node, session, config);
+    let reading = read_client(&mut reader, &auth.rx, &entries, &node, session, policy);
     let writing = write_client(&mut writer, &auth.tx, outgoing);
     tokio::select! { () = cancel.cancelled() => {}, _ = reading => {}, _ = writing => {} }
     cancel.cancel();
@@ -567,15 +496,15 @@ async fn read_client<R: tokio::io::AsyncRead + Unpin>(
     entries: &Entries,
     node: &NodeId,
     session: Token,
-    config: TcpRendezvousConfig,
+    policy: Policy,
 ) -> io::Result<()> {
     let now = tokio::time::Instant::now();
     let mut control = Budget::new(
-        u64::from(config.control.frames_per_second.get()),
-        u64::from(config.control.burst_frames.get()),
+        u64::from(policy.limits.control.frames_per_second.get()),
+        u64::from(policy.limits.control.burst_frames.get()),
         now,
     );
-    let mut data = config.relay_pacing.budget(now);
+    let mut data = policy.relay_pacing.budget(now);
     loop {
         let message = tokio::time::timeout(IDLE, wire::read(reader, auth))
             .await

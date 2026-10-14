@@ -77,27 +77,19 @@ impl TcpMsgTransport {
     /// # Errors
     /// Propagates native configuration, bind, authentication, admission, and timeout errors.
     pub async fn bind_connectivity(config: TcpPunchConfig) -> io::Result<Self> {
-        let connection = TcpConnection::bind(config).await?;
-        let address = connection.local_addr()?;
         Ok(Self {
             backend: Backend::Connectivity {
-                connection,
-                address,
+                connection: TcpConnection::bind(config).await?,
             },
         })
     }
 
-    /// Returns every retained listener/source bind for a running endpoint.
-    /// Direct mode has exactly one listener.
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+    /// Returns every retained listener/source bind. Direct mode has exactly
+    /// one listener. Cached at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_addrs(&self) -> &[SocketAddr] {
         match &self.backend {
-            Backend::Direct(inner) => {
-                ensure_direct_open(inner.tasks.stopped())?;
-                Ok(vec![inner.local_addr])
-            }
+            Backend::Direct(inner) => std::slice::from_ref(&inner.local_addr),
             Backend::Connectivity { connection, .. } => connection.local_addrs(),
         }
     }
@@ -105,18 +97,16 @@ impl TcpMsgTransport {
     /// Returns locally gathered and explicitly configured native candidates.
     /// Direct mode returns its concrete listener address, or no candidates for
     /// an unspecified listener. Native relay-only mode returns no candidates.
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_candidates(&self) -> io::Result<Vec<SocketAddr>> {
+    /// Gathered at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_candidates(&self) -> Vec<SocketAddr> {
         match &self.backend {
             Backend::Direct(inner) => {
-                ensure_direct_open(inner.tasks.stopped())?;
-                Ok(if inner.local_addr.ip().is_unspecified() {
+                if inner.local_addr.ip().is_unspecified() {
                     Vec::new()
                 } else {
                     vec![inner.local_addr]
-                })
+                }
             }
             Backend::Connectivity { connection, .. } => connection.local_candidates(),
         }
@@ -232,16 +222,12 @@ impl TcpMsgTransport {
     }
 }
 
-fn ensure_direct_open(stopped: bool) -> io::Result<()> {
-    if stopped { Err(shut_down()) } else { Ok(()) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use groupnet_testkit::cluster::eventually_within;
     use groupnet_transport::Transport;
-    use groupnet_transport_punch::TcpRendezvous;
+    use groupnet_transport_punch::{TcpRendezvous, TcpRendezvousConfig};
     use std::time::Duration;
 
     const SETTLE: Duration = Duration::from_secs(5);
@@ -249,10 +235,10 @@ mod tests {
     #[tokio::test]
     async fn native_hints_cannot_change_paths_and_bound_lifecycle_owns_shared_sessions() {
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let relay = TcpRendezvous::bind_open(loopback)
+        let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(loopback))
             .await
             .expect("rendezvous");
-        let rendezvous = relay.local_addr().expect("rendezvous address");
+        let rendezvous = relay.local_addr();
         let a_id = NodeId::new("adapter-a");
         let b_id = NodeId::new("adapter-b");
         let mut a_config = TcpPunchConfig::open(a_id.clone(), rendezvous);
@@ -265,6 +251,8 @@ mod tests {
         let b = TcpMsgTransport::bind_connectivity(b_config)
             .await
             .expect("b");
+        let addresses = a.local_addrs().to_vec();
+        assert_eq!(addresses.first(), Some(&a.local_addr()));
         let mut changes = a.path_changes().expect("native path watch");
         let sessions = a.sessions().expect("native registry");
         let live = sessions.subscribe();
@@ -327,7 +315,7 @@ mod tests {
         assert_eq!(changes.paths(), Vec::new());
         assert!(live.borrow().is_empty());
         assert!(!sessions.is_active(&b_id, generation));
-        assert!(a.local_addrs().is_err());
+        assert_eq!(a.local_addrs(), addresses.as_slice());
         assert!(a.send(&b_id, b"closed").await.is_err());
         assert_eq!(a.path_to(&b_id), None);
         let _replacement = tokio::net::TcpListener::bind(a.local_addr())
@@ -339,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_path_changes_follow_admitted_sessions_until_shutdown() {
-        use crate::{TcpAdmissionConfig, TcpMsgConfig};
+        use crate::{TcpAdmission, TcpMsgConfig};
         use groupnet_transport::admission::OpenAdmission;
 
         let raw = TcpMsgTransport::bind(NodeId::new("raw"), "127.0.0.1:0")
@@ -351,9 +339,7 @@ mod tests {
                 NodeId::new(id),
                 "127.0.0.1:0",
                 TcpMsgConfig::default(),
-                Arc::new(OpenAdmission),
-                Vec::new(),
-                TcpAdmissionConfig::default(),
+                TcpAdmission::new(Arc::new(OpenAdmission)),
             )
         };
         let a = admitted("paths-a").await.expect("a");

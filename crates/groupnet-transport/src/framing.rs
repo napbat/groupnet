@@ -6,6 +6,15 @@
 //! ([`LengthHeader`]), and the partial-write-safe vectored writer
 //! ([`write_vectored`]). Protocols layer their own headers, validation and
 //! authentication on top; none restates these.
+//!
+//! ## Tokio-only
+//!
+//! [`write_vectored`] takes Tokio's [`AsyncWrite`]: it serves the Tokio-based
+//! adapters in this workspace. There is deliberately no `futures-io`
+//! counterpart here. Runtime-agnostic code frames its streams through
+//! `bulk::DataStream` (feature `bulk`), which accepts any `futures-io`
+//! stream and shares this module's ceiling, header and partial-write loop;
+//! a Tokio stream adapts to it with `tokio_util::compat`.
 
 use std::future::poll_fn;
 use std::io::{self, IoSlice};

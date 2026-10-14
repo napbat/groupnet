@@ -4,7 +4,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::UdpSocket;
 
-use super::{PunchConfig, invalid};
+use super::UdpPunchConfig;
 
 pub(super) const MAX_CANDIDATES: usize = 8;
 pub(super) const MAX_SOCKETS: usize = 4;
@@ -99,26 +99,10 @@ pub(super) fn valid(address: SocketAddr) -> bool {
     }
 }
 
-pub(super) async fn bind(config: &PunchConfig) -> io::Result<(Vec<UdpSocket>, Candidates)> {
-    if config.candidate_binds.len() >= MAX_SOCKETS
-        || config.advertised_candidates.len() > MAX_CANDIDATES
-        || config
-            .advertised_candidates
-            .iter()
-            .any(|address| !valid(*address))
-    {
-        return Err(invalid("invalid UDP candidate count or address"));
-    }
+/// Binds the primary and candidate sockets of an already validated configuration.
+pub(super) async fn bind(config: &UdpPunchConfig) -> io::Result<(Vec<UdpSocket>, Candidates)> {
     let mut sockets = Vec::with_capacity(1 + config.candidate_binds.len());
     for address in std::iter::once(&config.bind).chain(&config.candidate_binds) {
-        if address.ip().is_multicast()
-            || matches!(address.ip(), IpAddr::V4(ip) if ip.is_link_local() || ip.is_broadcast())
-            || matches!(address, SocketAddr::V6(address) if address.ip().is_unicast_link_local())
-        {
-            return Err(invalid(
-                "multicast and link-local UDP binds are unsupported",
-            ));
-        }
         sockets.push(UdpSocket::bind(address).await?);
     }
     let mut candidates = Candidates::default();

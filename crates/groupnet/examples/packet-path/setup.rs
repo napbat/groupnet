@@ -3,7 +3,8 @@
 use std::{fmt, io, net::SocketAddr, time::Duration};
 
 use groupnet::connectivity::{
-    PathPolicy, PeerPath, PunchConfig, Rendezvous, TcpPunchConfig, TcpRendezvous,
+    PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig, UdpPunchConfig,
+    UdpRendezvous, UdpRendezvousConfig,
 };
 use groupnet::core::NodeId;
 use groupnet::network::{
@@ -48,7 +49,7 @@ impl fmt::Display for Path {
 
 enum RelayService {
     None,
-    Udp(Rendezvous),
+    Udp(UdpRendezvous),
     Tcp(TcpRendezvous),
 }
 
@@ -92,8 +93,8 @@ impl Pair {
                 )
             }
             Path::Udp => {
-                let relay = Rendezvous::bind_open(bind).await?;
-                let mut config = PunchConfig::open(NodeId::new(LEFT), relay.local_addr()?);
+                let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(bind)).await?;
+                let mut config = UdpPunchConfig::open(NodeId::new(LEFT), relay.local_addr());
                 config.candidate_binds = vec![bind];
                 config.policy = PathPolicy::DirectPreferred;
                 let left_udp = UdpTransport::bind_connectivity(config.clone()).await?;
@@ -112,12 +113,12 @@ impl Pair {
                 )
             }
             Path::Tcp | Path::Relay => {
-                let relay = TcpRendezvous::bind_open(bind).await?;
+                let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(bind)).await?;
                 let (policy, expected) = match path {
                     Path::Relay => (PathPolicy::RelayOnly, PeerPath::Relay),
                     _ => (PathPolicy::DirectPreferred, PeerPath::Direct),
                 };
-                let mut config = TcpPunchConfig::open(NodeId::new(LEFT), relay.local_addr()?);
+                let mut config = TcpPunchConfig::open(NodeId::new(LEFT), relay.local_addr());
                 config.candidate_binds = vec![bind];
                 config.policy = policy;
                 let left_tcp = TcpMsgTransport::bind_connectivity(config.clone()).await?;

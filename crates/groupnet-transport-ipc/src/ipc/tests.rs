@@ -145,7 +145,7 @@ async fn static_owned_send_drops_admitted_session_packets() {
                 sender,
             },
         );
-    let registry = SessionRegistry::new(1).unwrap();
+    let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
     let lease = registry
         .try_admit(AcceptedPeer::new(remote.clone()))
         .unwrap();

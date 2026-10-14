@@ -97,12 +97,12 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
         challenges: Challenges::default(),
         decisions: JoinSet::new(),
         pre_admission: unpaced(now),
-        limits: RendezvousLimits::default(),
+        limits: UdpRendezvousLimits::default(),
         relay_pacing: RelayPacing::Backpressure,
     };
     for sequence in [1, 2] {
         let issued = now + Duration::from_secs(sequence - 1);
-        for index in 0..DEFAULT_MAX_PEERS {
+        for index in 0..DEFAULT_MAX_PEERS.get() {
             let name = format!("unproved-{index}");
             let packet = Packet {
                 sender: &name,
@@ -118,7 +118,7 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
                     .is_some()
             );
         }
-        assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS);
+        assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS.get());
         assert!(state.entries.is_empty());
     }
     let issued = now + Duration::from_secs(2);
@@ -136,7 +136,7 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
     else {
         panic!("expected challenge");
     };
-    assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS);
+    assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS.get());
     let proven = state
         .challenges
         .prove(
@@ -156,7 +156,7 @@ fn renewable_unproved_pool_is_bounded_and_evictable_without_consuming_peer_slots
         .unwrap();
     assert_eq!(proven.session, [3; 16]);
     assert!(state.entries.is_empty());
-    assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS - 1);
+    assert_eq!(state.challenges.pending.len(), DEFAULT_MAX_PEERS.get() - 1);
 }
 
 #[tokio::test]
@@ -407,16 +407,16 @@ async fn configured_peer_and_pending_policy_limits_independently_reject_overflow
         let socket = UdpSocket::bind(loopback()).await.unwrap();
         let recipient = UdpSocket::bind(loopback()).await.unwrap();
         let now = Instant::now();
-        let limits = RendezvousLimits {
-            max_peers,
-            max_pending_admissions,
-            max_challenges: 3,
+        let limits = UdpRendezvousLimits {
+            max_peers: std::num::NonZeroUsize::new(max_peers).unwrap(),
+            max_pending_admissions: std::num::NonZeroUsize::new(max_pending_admissions).unwrap(),
+            max_challenges: std::num::NonZeroUsize::new(3).unwrap(),
         };
         let mut state = ServerState {
             entries: HashMap::new(),
             challenges: Challenges {
                 pending: HashMap::new(),
-                capacity: limits.max_challenges,
+                capacity: limits.max_challenges.get(),
             },
             decisions: JoinSet::new(),
             pre_admission: unpaced(now),

@@ -12,8 +12,11 @@ use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest, MAX_CREDENTIAL_BYTES};
 use groupnet_transport::link::{LinkFuture, LinkProvider};
-use groupnet_transport_punch::{NetworkKey, PathPolicy, PeerPath, PunchConfig, Rendezvous};
-use groupnet_transport_udp::{UdpLink, UdpTransport};
+use groupnet_transport_punch::{UdpRendezvous, UdpRendezvousConfig};
+// Endpoint configuration and path types come only from the adapter's re-exports.
+use groupnet_transport_udp::{
+    NetworkKey, PathPolicy, PeerPath, UdpLink, UdpPunchConfig, UdpPunchConfigError, UdpTransport,
+};
 use tokio::time::timeout;
 
 const SETTLE: Duration = Duration::from_secs(15);
@@ -23,7 +26,7 @@ fn loopback() -> SocketAddr {
 }
 
 async fn attach(router: &Router, address: SocketAddr) {
-    let mut config = PunchConfig::open(router.local_id().clone(), address);
+    let mut config = UdpPunchConfig::open(router.local_id().clone(), address);
     config.bind = loopback();
     let link = Box::new(UdpLink::connectivity(config))
         .bind(router.local_id().clone())
@@ -34,8 +37,10 @@ async fn attach(router: &Router, address: SocketAddr) {
 
 #[tokio::test]
 async fn keyless_unknown_identities_discover_route_relay_withdraw_and_reconnect() {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(loopback()))
+        .await
+        .unwrap();
+    let address = relay.local_addr();
     let a = Router::new(
         "6adfa0df-40af-4470-a125-7c4c1f122989".into(),
         RouterConfig::default(),
@@ -113,12 +118,16 @@ impl Admission for AccountPolicy {
 }
 
 async fn custom_accounts(policy: PathPolicy, expected: PeerPath) {
-    let relay = Rendezvous::bind_with_admission(loopback(), None, Arc::new(AccountPolicy))
-        .await
-        .unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::with_admission(
+        loopback(),
+        None,
+        Arc::new(AccountPolicy),
+    ))
+    .await
+    .unwrap();
+    let address = relay.local_addr();
     let config_for = |identity: &str, credential: Vec<u8>| {
-        let mut config = PunchConfig::dynamic(identity.into(), address, None, credential);
+        let mut config = UdpPunchConfig::dynamic(identity.into(), address, None, credential);
         config.bind = loopback();
         config.policy = policy;
         config
@@ -189,10 +198,12 @@ async fn custom_credentials_and_canonical_identity_enforce_keyless_direct_admiss
 }
 
 async fn duplicate_incumbent(policy: PathPolicy, expected: PeerPath) {
-    let relay = Rendezvous::bind_open(loopback()).await.unwrap();
-    let address = relay.local_addr().unwrap();
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(loopback()))
+        .await
+        .unwrap();
+    let address = relay.local_addr();
     let config = |local: &str| {
-        let mut config = PunchConfig::open(local.into(), address);
+        let mut config = UdpPunchConfig::open(local.into(), address);
         config.bind = loopback();
         config.policy = policy;
         config
@@ -242,16 +253,16 @@ async fn duplicate_keyless_direct_identity_never_evicts_the_incumbent() {
 #[tokio::test]
 async fn explicit_keyed_dynamic_mode_never_downgrades_and_credentials_remain_bounded() {
     let key = NetworkKey::from_bytes([41; 32]);
-    let relay = Rendezvous::bind_with_admission(
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::with_admission(
         loopback(),
         Some(key.clone()),
         Arc::new(groupnet_transport::admission::OpenAdmission),
-    )
+    ))
     .await
     .unwrap();
-    let address = relay.local_addr().unwrap();
+    let address = relay.local_addr();
     for policy in [PathPolicy::RelayOnly, PathPolicy::DirectPreferred] {
-        let mut config = PunchConfig::open("open".into(), address);
+        let mut config = UdpPunchConfig::open("open".into(), address);
         config.policy = policy;
         assert_eq!(
             UdpTransport::bind_connectivity(config)
@@ -261,17 +272,22 @@ async fn explicit_keyed_dynamic_mode_never_downgrades_and_credentials_remain_bou
             io::ErrorKind::TimedOut
         );
     }
-    let mut config = PunchConfig::dynamic("keyed".into(), address, Some(key), Vec::new());
+    let mut config = UdpPunchConfig::dynamic("keyed".into(), address, Some(key), Vec::new());
     config.policy = PathPolicy::RelayOnly;
     let accepted = UdpTransport::bind_connectivity(config).await.unwrap();
-    let mut oversized = PunchConfig::open(NodeId::from("oversized"), address);
+    let mut oversized = UdpPunchConfig::open(NodeId::from("oversized"), address);
     oversized.credential = vec![0; MAX_CREDENTIAL_BYTES + 1];
+    let error = UdpTransport::bind_connectivity(oversized)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        UdpTransport::bind_connectivity(oversized)
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<UdpPunchConfigError>()),
+        Some(&UdpPunchConfigError::CredentialTooLarge {
+            len: MAX_CREDENTIAL_BYTES + 1
+        })
     );
     accepted.connection().unwrap().close().await;
     relay.close().await;

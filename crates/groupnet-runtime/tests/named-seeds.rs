@@ -57,7 +57,7 @@ async fn a_seed_whose_name_moves_is_rejoined_without_its_help() {
     let b_udp = UdpTransport::bind(b_id.clone(), "127.0.0.1:0")
         .await
         .expect("bind b");
-    let b_addr = b_udp.local_addr().expect("b addr");
+    let b_addr = b_udp.local_addr();
 
     let answer = Arc::new(Mutex::new(dead_addr()));
     let moves = Arc::new(Mutex::new(Vec::new()));

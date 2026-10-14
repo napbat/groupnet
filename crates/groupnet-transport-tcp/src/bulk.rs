@@ -60,18 +60,38 @@ impl Default for TcpBulkConfig {
 }
 
 impl TcpBulkConfig {
-    /// Checks the bounds the types cannot express.
+    /// Checks the bound the types cannot express.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for a zero handshake timeout.
-    pub fn validate(&self) -> io::Result<()> {
+    /// Returns [`TcpBulkConfigError::ZeroHandshakeTimeout`].
+    pub const fn validate(&self) -> Result<(), TcpBulkConfigError> {
         if self.handshake_timeout.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TCP bulk handshake timeout must be nonzero",
-            ));
+            return Err(TcpBulkConfigError::ZeroHandshakeTimeout);
         }
         Ok(())
+    }
+}
+
+/// A violated [`TcpBulkConfig`] bound, from [`TcpBulkConfig::validate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpBulkConfigError {
+    /// `handshake_timeout` is zero.
+    ZeroHandshakeTimeout,
+}
+
+impl std::fmt::Display for TcpBulkConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroHandshakeTimeout => f.write_str("handshake_timeout must be nonzero"),
+        }
+    }
+}
+
+impl std::error::Error for TcpBulkConfigError {}
+
+impl From<TcpBulkConfigError> for io::Error {
+    fn from(error: TcpBulkConfigError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
     }
 }
 
@@ -130,8 +150,9 @@ impl TcpBulkTransport {
     /// runtime: the listener and its handshakes run as spawned tasks.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for an invalid configuration or local id, and
-    /// propagates any socket bind error.
+    /// Returns `InvalidInput` carrying the [`TcpBulkConfigError`] or
+    /// [`NodeIdError`](groupnet_transport::NodeIdError) for an invalid
+    /// configuration or local id, and propagates any socket bind error.
     pub async fn bind_with(
         local: NodeId,
         addr: impl ToSocketAddrs,
@@ -174,16 +195,12 @@ impl TcpBulkTransport {
         &self.local
     }
 
-    /// The address the listener is bound to (useful with an ephemeral `:0`).
-    ///
-    /// # Errors
-    /// A [`dial_only`](Self::dial_only) endpoint has no listener and returns
-    /// [`io::ErrorKind::NotConnected`].
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener
-            .as_ref()
-            .map(|listener| listener.addr)
-            .ok_or_else(no_listener)
+    /// The address the listener was bound to (useful with an ephemeral `:0`),
+    /// cached at bind; `None` for a [`dial_only`](Self::dial_only) endpoint,
+    /// which has no listener.
+    #[must_use]
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.as_ref().map(|listener| listener.addr)
     }
 
     /// Teaches this endpoint that `node` listens at `addr`.
@@ -346,11 +363,4 @@ async fn handshake(
         return;
     };
     let _ = queue.send(Ok((from, sock))).await;
-}
-
-fn no_listener() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotConnected,
-        "a dial-only endpoint has no listener",
-    )
 }

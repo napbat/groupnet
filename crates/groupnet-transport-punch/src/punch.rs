@@ -8,15 +8,17 @@
 //! is not a routing participant.
 
 mod candidates;
+mod config;
 mod endpoint;
 mod server;
 mod wire;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -24,21 +26,23 @@ use groupnet_core::NodeId;
 use groupnet_transport::admission::{SessionLease, SessionRegistry};
 use groupnet_transport::link::AdmittedInbound;
 use groupnet_transport::{Inbound, QueueCapacity};
-use ring::{
-    hmac,
-    rand::{SecureRandom, SystemRandom},
-};
+use ring::hmac;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-pub use server::{Rendezvous, RendezvousConfig, RendezvousLimits};
+use crate::common::{closed, invalid, lock, random};
+
+pub use config::{UdpPunchConfig, UdpPunchConfigError};
+pub use server::{
+    UdpRendezvous, UdpRendezvousConfig, UdpRendezvousConfigError, UdpRendezvousLimits,
+};
 
 /// Largest application message carried by one session-bound UDP datagram.
-pub const MAX_MESSAGE: usize = 960;
-const DEFAULT_MAX_PEERS: usize = 128;
+pub const MAX_UDP_MESSAGE: usize = 960;
+const DEFAULT_MAX_PEERS: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 const DEFAULT_QUEUE_CAPACITY: QueueCapacity = QueueCapacity::of(128);
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const LEASE: Duration = Duration::from_secs(6);
@@ -102,136 +106,6 @@ pub enum PeerPath {
     Direct,
     /// A live rendezvous registration is available for relay delivery.
     Relay,
-}
-
-/// Socket, trusted identities and rendezvous policy for one endpoint.
-#[derive(Clone)]
-pub struct PunchConfig {
-    /// Stable routing identity (1–64 UTF-8 bytes).
-    pub local: NodeId,
-    /// Primary UDP bind address; its family must match the rendezvous.
-    /// This socket owns the observed mapping and remains the relay/control path.
-    pub bind: SocketAddr,
-    /// Explicit rendezvous address; no third-party discovery service is used.
-    pub rendezvous: SocketAddr,
-    /// Optional explicit trusted-fabric key; keyed peers never downgrade.
-    /// `None` requires no provisioned transport key or identity keypair, but does
-    /// not disable internal random challenges or application admission credentials.
-    pub key: Option<NetworkKey>,
-    /// Initial static allowlist, or no fixed identities in dynamic mode.
-    pub peers: Vec<NodeId>,
-    /// Whether admitted rendezvous peers are discovered dynamically.
-    pub dynamic: bool,
-    /// Opaque application admission credential (at most 1024 bytes).
-    pub credential: Vec<u8>,
-    /// Direct-path preference or relay-only operation.
-    pub policy: PathPolicy,
-    /// Additional direct-path sockets (at most three), including another IP family.
-    /// Their lifetimes are owned by this endpoint; the primary `bind` owns relay registration.
-    pub candidate_binds: Vec<SocketAddr>,
-    /// Operator-supplied direct addresses (at most eight), checked independently.
-    /// Addresses are untrusted hints, never proof of a usable path.
-    pub advertised_candidates: Vec<SocketAddr>,
-    /// Gather usable local interface addresses for wildcard-bound sockets.
-    /// Link-local addresses are excluded because remote scope identifiers are not portable.
-    pub gather_interfaces: bool,
-    /// Maximum live admitted peers retained by this endpoint (must be nonzero).
-    /// This operational limit does not change candidate or wire-format bounds.
-    pub max_peers: usize,
-    /// Packet capacity of each incoming and outgoing queue.
-    /// Full queues drop best-effort packets without blocking.
-    pub queue_capacity: QueueCapacity,
-}
-
-impl PunchConfig {
-    /// Creates a direct-preferred configuration with an ephemeral wildcard bind.
-    #[must_use]
-    pub fn new(local: NodeId, rendezvous: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> Self {
-        let bind = if rendezvous.is_ipv4() {
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
-        };
-        Self {
-            local,
-            bind,
-            rendezvous,
-            key: Some(key),
-            peers,
-            dynamic: false,
-            credential: Vec::new(),
-            policy: PathPolicy::DirectPreferred,
-            candidate_binds: Vec::new(),
-            advertised_candidates: Vec::new(),
-            gather_interfaces: true,
-            max_peers: DEFAULT_MAX_PEERS,
-            queue_capacity: DEFAULT_QUEUE_CAPACITY,
-        }
-    }
-
-    /// Creates explicit keyless dynamic discovery, conservatively defaulting to relay-only.
-    #[must_use]
-    pub fn open(local: NodeId, rendezvous: SocketAddr) -> Self {
-        Self::dynamic(local, rendezvous, None, Vec::new())
-    }
-
-    /// Creates dynamic discovery with an optional fabric key and opaque credential.
-    /// Keyless configurations default to relay-only; policy may explicitly enable direct paths.
-    #[must_use]
-    pub fn dynamic(
-        local: NodeId,
-        rendezvous: SocketAddr,
-        key: Option<NetworkKey>,
-        credential: Vec<u8>,
-    ) -> Self {
-        Self {
-            local,
-            bind: SocketAddr::new(
-                if rendezvous.is_ipv4() {
-                    Ipv4Addr::UNSPECIFIED.into()
-                } else {
-                    std::net::Ipv6Addr::UNSPECIFIED.into()
-                },
-                0,
-            ),
-            rendezvous,
-            policy: if key.is_some() {
-                PathPolicy::DirectPreferred
-            } else {
-                PathPolicy::RelayOnly
-            },
-            key,
-            peers: Vec::new(),
-            dynamic: true,
-            credential,
-            candidate_binds: Vec::new(),
-            advertised_candidates: Vec::new(),
-            gather_interfaces: true,
-            max_peers: DEFAULT_MAX_PEERS,
-            queue_capacity: DEFAULT_QUEUE_CAPACITY,
-        }
-    }
-}
-
-impl fmt::Debug for PunchConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PunchConfig")
-            .field("local", &self.local)
-            .field("bind", &self.bind)
-            .field("rendezvous", &self.rendezvous)
-            .field("key", &self.key)
-            .field("peers", &self.peers)
-            .field("dynamic", &self.dynamic)
-            .field("credential", &"[REDACTED]")
-            .field("policy", &self.policy)
-            .field("candidate_binds", &self.candidate_binds)
-            .field("advertised_candidates", &self.advertised_candidates)
-            .field("gather_interfaces", &self.gather_interfaces)
-            .field("max_peers", &self.max_peers)
-            .field("queue_capacity", &self.queue_capacity)
-            .finish()
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -424,25 +298,12 @@ impl UdpConnection {
     /// five seconds; static configurations retain background registration.
     ///
     /// # Errors
-    /// Rejects invalid configuration, dynamic policy denial or registration
+    /// Rejects invalid configuration as `InvalidInput` wrapping its
+    /// [`UdpPunchConfigError`], then dynamic policy denial or registration
     /// timeout, and socket/random-source failures.
-    pub async fn bind(config: PunchConfig) -> io::Result<Self> {
-        validate_names_with_limit(&config.peers, config.max_peers)?;
-        let sessions = SessionRegistry::new(config.max_peers)?;
-        validate_name(&config.local)?;
-        if config.credential.len() > groupnet_transport::admission::MAX_CREDENTIAL_BYTES {
-            return Err(invalid("invalid credential size"));
-        }
-        if config.peers.contains(&config.local) {
-            return Err(invalid("local identity must not be a configured peer"));
-        }
-        if !candidates::valid(config.rendezvous)
-            || config.bind.is_ipv4() != config.rendezvous.is_ipv4()
-        {
-            return Err(invalid(
-                "invalid rendezvous address or socket address family",
-            ));
-        }
+    pub async fn bind(config: UdpPunchConfig) -> io::Result<Self> {
+        config.validate()?;
+        let sessions = SessionRegistry::new(config.max_peers);
         let (sockets, local_candidates) = candidates::bind(&config).await?;
         let addresses = sockets
             .iter()
@@ -505,35 +366,36 @@ impl UdpConnection {
         })
     }
 
-    /// Returns the socket's actual bind address, including its assigned port.
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.ensure_open()?;
-        Ok(self.inner.address)
+    /// Returns the primary socket's bind address, including its assigned port.
+    /// Cached at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.address
     }
 
-    /// Returns every leased socket's actual bind address.
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
-        self.ensure_open()?;
-        Ok(self.inner.addresses.clone())
+    /// Returns every leased socket's bind address, primary first.
+    /// Cached at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.inner.addresses
     }
 
     /// Returns the bounded advertised local candidates (empty under relay-only policy).
-    ///
-    /// # Errors
-    /// Returns `NotConnected` after shutdown.
-    pub fn local_candidates(&self) -> io::Result<Vec<SocketAddr>> {
-        self.ensure_open()?;
-        Ok(self.inner.candidates.iter().collect())
+    /// Gathered at bind and retained after shutdown.
+    #[must_use]
+    pub fn local_candidates(&self) -> Vec<SocketAddr> {
+        self.inner.candidates.iter().collect()
+    }
+
+    /// Whether this connection has shut down through any clone. A live query.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.cancel.is_cancelled()
     }
 
     /// Returns the primary address observed by the current rendezvous registration.
-    /// Relay-only endpoints do not retain or disclose this address.
+    /// Relay-only endpoints do not retain or disclose this address. A live
+    /// query: `None` before registration and after shutdown.
     #[must_use]
     pub fn observed_addr(&self) -> Option<SocketAddr> {
         if self.inner.cancel.is_cancelled() {
@@ -543,6 +405,7 @@ impl UdpConnection {
     }
 
     /// Returns the selected live direct peer address, or `None` while relaying.
+    /// A live query: `None` after shutdown.
     #[must_use]
     pub fn direct_addr_to(&self, node: &NodeId) -> Option<SocketAddr> {
         if self.inner.cancel.is_cancelled() {
@@ -571,6 +434,7 @@ impl UdpConnection {
     }
 
     /// Returns the current direct or relay path, or `None` before discovery/after expiry.
+    /// A live query: `None` after shutdown.
     #[must_use]
     pub fn path_to(&self, node: &NodeId) -> Option<PeerPath> {
         if self.inner.cancel.is_cancelled() {
@@ -605,15 +469,11 @@ impl UdpConnection {
     /// Cancels all I/O and waits for the socket-owning task to finish.
     pub async fn close(&self) {
         self.shutdown();
-        let mut task = self.inner.task.lock().await;
-        if let Some(running) = task.as_mut() {
-            let _ = running.await;
-        }
-        task.take();
+        crate::common::join(&self.inner.task).await;
     }
 
     fn ensure_open(&self) -> io::Result<()> {
-        if self.inner.cancel.is_cancelled() {
+        if self.is_closed() {
             Err(closed())
         } else {
             Ok(())
@@ -628,8 +488,8 @@ impl UdpConnection {
         message: impl FnOnce() -> Bytes,
     ) -> io::Result<()> {
         self.ensure_open()?;
-        if length > MAX_MESSAGE {
-            return Err(invalid("UDP message exceeds MAX_MESSAGE"));
+        if length > MAX_UDP_MESSAGE {
+            return Err(invalid("UDP message exceeds MAX_UDP_MESSAGE"));
         }
         if (!self.inner.dynamic && !self.inner.configured.contains(to))
             || (self.inner.dynamic && self.path_to(to).is_none())
@@ -761,49 +621,6 @@ impl UdpConnection {
             }
         }
     }
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-fn closed() -> io::Error {
-    io::Error::new(io::ErrorKind::NotConnected, "UDP connection closed")
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn random<const N: usize>() -> io::Result<[u8; N]> {
-    let mut bytes = [0; N];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| io::Error::other("secure random source failed"))?;
-    Ok(bytes)
-}
-
-fn validate_name(node: &NodeId) -> io::Result<()> {
-    if node.as_str().is_empty() || node.as_str().len() > 64 {
-        return Err(invalid("UDP identities must contain 1–64 UTF-8 bytes"));
-    }
-    Ok(())
-}
-
-fn validate_names_with_limit(nodes: &[NodeId], limit: usize) -> io::Result<()> {
-    if limit == 0 || nodes.len() > limit {
-        return Err(invalid("invalid UDP peer capacity"));
-    }
-    let mut seen = HashSet::with_capacity(nodes.len());
-    for node in nodes {
-        validate_name(node)?;
-        if !seen.insert(node) {
-            return Err(invalid("duplicate UDP identity"));
-        }
-    }
-    Ok(())
 }
 
 fn transient(error: &io::Error) -> bool {

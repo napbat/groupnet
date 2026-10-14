@@ -25,7 +25,7 @@ async fn registered_source_cannot_bypass_malformed_identity_rejection() {
         sender_id.clone(),
         sender.local_addr().expect("sender address"),
     );
-    let addr = receiver.local_addr().expect("receiver address");
+    let addr = receiver.local_addr();
     for malformed in [b"bad".as_slice(), &[1, 0, 0, 0, 0xff], &[1, 4, 0, 0]] {
         sender.send_to(malformed, addr).await.expect("noise send");
     }
@@ -48,10 +48,7 @@ async fn concurrent_clones_keep_datagrams_separate() {
     let sender = bind("sender").await;
     let receiver = bind("receiver").await;
     let receiver_id = NodeId::new("receiver");
-    sender.register_peer(
-        receiver_id.clone(),
-        receiver.local_addr().expect("receiver address"),
-    );
+    sender.register_peer(receiver_id.clone(), receiver.local_addr());
     let clone = sender.clone();
     let first = [1; 1024];
     let second = [2; 257];
@@ -80,10 +77,7 @@ async fn oversized_outbound_frame_is_rejected_without_poisoning_buffer() {
     let sender = bind("sender").await;
     let receiver = bind("receiver").await;
     let receiver_id = NodeId::new("receiver");
-    sender.register_peer(
-        receiver_id.clone(),
-        receiver.local_addr().expect("receiver address"),
-    );
+    sender.register_peer(receiver_id.clone(), receiver.local_addr());
     assert_eq!(
         sender
             .send(&receiver_id, &vec![0; MAX_DATAGRAM])
@@ -117,10 +111,7 @@ async fn raw_owned_admitted_send_roundtrips_bytes() {
     let sender = bind("sender").await;
     let receiver = bind("receiver").await;
     let receiver_id = NodeId::new("receiver");
-    sender.register_peer(
-        receiver_id.clone(),
-        receiver.local_addr().expect("receiver address"),
-    );
+    sender.register_peer(receiver_id.clone(), receiver.local_addr());
     sender
         .send_owned_admitted(&receiver_id, bytes::Bytes::from_static(b"owned"), None)
         .await
@@ -144,10 +135,7 @@ async fn receive_reuses_scratch_and_retains_independent_owned_payloads() {
         super::Backend::Connectivity(_) => panic!("raw endpoint"),
     };
     let pointer = inner.receive_buffer.lock().await.as_ptr();
-    sender.register_peer(
-        NodeId::new("receiver"),
-        receiver.local_addr().expect("address"),
-    );
+    sender.register_peer(NodeId::new("receiver"), receiver.local_addr());
     // Cancelling an idle receive releases the scratch owner for the next call.
     tokio::select! {
         biased;

@@ -35,7 +35,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-use crate::MemBulkConfig;
+use crate::{MemBulkConfig, MemBulkConfigError};
 
 /// What a connector puts on a target's accept queue: its own id, and the far
 /// half of the pipe it just built.
@@ -61,8 +61,8 @@ impl MemBulkNet {
     /// Creates a data-plane fabric with bounded accept queues and pipes.
     ///
     /// # Errors
-    /// Rejects zero or unsupported queue/pipe capacities.
-    pub fn with_config(config: MemBulkConfig) -> io::Result<Self> {
+    /// Returns the [`MemBulkConfigError`] for an unsupported pipe capacity.
+    pub fn with_config(config: MemBulkConfig) -> Result<Self, MemBulkConfigError> {
         config.validate()?;
         Ok(Self {
             queues: Queues::default(),

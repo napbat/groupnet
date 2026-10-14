@@ -15,9 +15,10 @@ pub(super) async fn endpoint(
         NodeId::new(id),
         "127.0.0.1:0",
         TcpMsgConfig::default(),
-        policy,
-        credential.to_vec(),
-        TcpAdmissionConfig::default(),
+        TcpAdmission {
+            credential: credential.to_vec(),
+            ..TcpAdmission::new(policy)
+        },
     )
     .await
     .expect("admitted bind")
@@ -91,9 +92,7 @@ async fn unknown_keyless_joiner_receives_server_traffic_without_reverse_dial() {
         NodeId::new("uuid-unknown-client"),
         "0.0.0.0:0",
         TcpMsgConfig::default(),
-        Arc::new(OpenAdmission),
-        Vec::new(),
-        TcpAdmissionConfig::default(),
+        TcpAdmission::new(Arc::new(OpenAdmission)),
     )
     .await
     .expect("client");
@@ -287,12 +286,13 @@ async fn pending_policy_capacity_and_deadline_are_bounded_and_shutdown_drains() 
         NodeId::new("server"),
         "127.0.0.1:0",
         TcpMsgConfig::default(),
-        policy.clone(),
-        Vec::new(),
-        TcpAdmissionConfig {
-            max_pending: QueueCapacity::MIN,
-            handshake_timeout: Duration::from_secs(1),
-            ..TcpAdmissionConfig::default()
+        TcpAdmission {
+            config: TcpAdmissionConfig {
+                max_pending: QueueCapacity::MIN,
+                handshake_timeout: Duration::from_secs(1),
+                ..TcpAdmissionConfig::default()
+            },
+            ..TcpAdmission::new(policy.clone())
         },
     )
     .await
@@ -340,11 +340,12 @@ async fn oversized_wire_credentials_are_rejected_before_policy_and_capacity_hold
         NodeId::new("server"),
         "127.0.0.1:0",
         TcpMsgConfig::default(),
-        policy.clone(),
-        Vec::new(),
-        TcpAdmissionConfig {
-            max_peers: 1,
-            ..TcpAdmissionConfig::default()
+        TcpAdmission {
+            config: TcpAdmissionConfig {
+                max_peers: std::num::NonZeroUsize::MIN,
+                ..TcpAdmissionConfig::default()
+            },
+            ..TcpAdmission::new(policy.clone())
         },
     )
     .await
@@ -412,9 +413,7 @@ async fn idle_pool_settings_do_not_expire_admitted_sessions() {
             max_outbound: std::num::NonZeroUsize::MIN,
             ..TcpMsgConfig::default()
         },
-        Arc::new(OpenAdmission),
-        Vec::new(),
-        TcpAdmissionConfig::default(),
+        TcpAdmission::new(Arc::new(OpenAdmission)),
     )
     .await
     .expect("server");
@@ -461,32 +460,46 @@ async fn clean_cutover_rejects_raw_handshakes_and_invalid_local_bounds() {
         Ok(0) | Err(_)
     ));
     assert_eq!(peers(&server), 0);
-    assert!(
-        TcpMsgTransport::bind_admitted(
-            NodeId::new("oversized"),
-            "127.0.0.1:0",
-            TcpMsgConfig::default(),
-            Arc::new(OpenAdmission),
-            vec![0; MAX_CREDENTIAL_BYTES + 1],
-            TcpAdmissionConfig::default(),
-        )
-        .await
-        .is_err()
+    let oversized = TcpMsgTransport::bind_admitted(
+        NodeId::new("oversized"),
+        "127.0.0.1:0",
+        TcpMsgConfig::default(),
+        TcpAdmission {
+            credential: vec![0; MAX_CREDENTIAL_BYTES + 1],
+            ..TcpAdmission::new(Arc::new(OpenAdmission))
+        },
+    )
+    .await
+    .expect_err("oversized credential");
+    assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        oversized
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<TcpAdmissionError>()),
+        Some(&TcpAdmissionError::CredentialTooLong {
+            len: MAX_CREDENTIAL_BYTES + 1
+        }),
+        "the credential, not the timeout, is named"
     );
-    assert!(
-        TcpMsgTransport::bind_admitted(
-            NodeId::new("bad-bounds"),
-            "127.0.0.1:0",
-            TcpMsgConfig::default(),
-            Arc::new(OpenAdmission),
-            Vec::new(),
-            TcpAdmissionConfig {
+    let bad_bounds = TcpMsgTransport::bind_admitted(
+        NodeId::new("bad-bounds"),
+        "127.0.0.1:0",
+        TcpMsgConfig::default(),
+        TcpAdmission {
+            config: TcpAdmissionConfig {
                 handshake_timeout: Duration::ZERO,
                 ..TcpAdmissionConfig::default()
             },
-        )
-        .await
-        .is_err()
+            ..TcpAdmission::new(Arc::new(OpenAdmission))
+        },
+    )
+    .await
+    .expect_err("zero handshake timeout");
+    assert_eq!(
+        bad_bounds
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<TcpAdmissionError>()),
+        Some(&TcpAdmissionError::ZeroHandshakeTimeout)
     );
     server.close().await;
 }
@@ -541,11 +554,12 @@ async fn shutdown_cancels_policy_work_without_waiting_for_handshake_deadline() {
         NodeId::new("server"),
         "127.0.0.1:0",
         TcpMsgConfig::default(),
-        policy.clone(),
-        Vec::new(),
-        TcpAdmissionConfig {
-            handshake_timeout: Duration::from_secs(60),
-            ..TcpAdmissionConfig::default()
+        TcpAdmission {
+            config: TcpAdmissionConfig {
+                handshake_timeout: Duration::from_secs(60),
+                ..TcpAdmissionConfig::default()
+            },
+            ..TcpAdmission::new(policy.clone())
         },
     )
     .await
@@ -678,9 +692,7 @@ async fn admitted_reader_applies_configured_frame_cap() {
             max_frame_bytes: 4,
             ..TcpMsgConfig::default()
         },
-        Arc::new(OpenAdmission),
-        Vec::new(),
-        TcpAdmissionConfig::default(),
+        TcpAdmission::new(Arc::new(OpenAdmission)),
     )
     .await
     .expect("server");

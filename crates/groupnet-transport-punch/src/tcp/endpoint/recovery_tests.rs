@@ -3,7 +3,7 @@ use super::{
     ProofPeer, Proofs, TcpConnection, TcpPunchConfig, direct, lock, register,
     wire::{self, Message, Token},
 };
-use crate::{PathPolicy, PeerPath, TcpRendezvous};
+use crate::{PathPolicy, PeerPath, TcpRendezvous, TcpRendezvousConfig};
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use std::{
@@ -90,10 +90,10 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    let rendezvous = TcpRendezvous::bind_open("127.0.0.1:0".parse().unwrap())
+    let rendezvous = TcpRendezvous::bind(TcpRendezvousConfig::open("127.0.0.1:0".parse().unwrap()))
         .await
         .unwrap();
-    let address = rendezvous.local_addr().unwrap();
+    let address = rendezvous.local_addr();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let candidate = listener.local_addr().unwrap();
     let peer_session = [19; 32];
@@ -309,12 +309,10 @@ async fn disconnected_peer(replace_before_close: bool) {
         )
         .await;
     }
-    let replacement = TcpConnection::bind(TcpPunchConfig::open(
-        peer.clone(),
-        rendezvous.local_addr().unwrap(),
-    ))
-    .await
-    .unwrap();
+    let replacement =
+        TcpConnection::bind(TcpPunchConfig::open(peer.clone(), rendezvous.local_addr()))
+            .await
+            .unwrap();
     eventually_within(
         "live rendezvous admits a replacement generation",
         RECOVER,

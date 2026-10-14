@@ -1,6 +1,7 @@
 //! Message body codec: identities, candidates, bounded blobs, and frame kinds.
 use bytes::Bytes;
 use groupnet_core::NodeId;
+use groupnet_transport::admission::MAX_CREDENTIAL_BYTES;
 use std::{io, net::SocketAddr};
 use zerocopy::FromBytes;
 use zerocopy::byteorder::big_endian::U16;
@@ -72,7 +73,7 @@ pub(super) fn encode(message: &Message, out: &mut Vec<u8>) -> io::Result<()> {
             text(out, node.as_str())?;
             out.extend_from_slice(session);
             out.extend_from_slice(challenge);
-            blob(out, credential, 1024)?;
+            blob(out, credential, MAX_CREDENTIAL_BYTES)?;
             if peers.len() > MAX_PEERS {
                 return Err(invalid("too many TCP peers"));
             }
@@ -263,7 +264,7 @@ pub(super) fn decode(cursor: &mut Cursor<'_>, backing: &Bytes, end: usize) -> io
             let node = cursor.node()?;
             let session = cursor.token()?;
             let challenge = cursor.token()?;
-            let credential = cursor.blob(1024)?;
+            let credential = cursor.blob(MAX_CREDENTIAL_BYTES)?;
             let count = usize::from(cursor.byte()?);
             if count > MAX_PEERS {
                 return Err(invalid("TCP peer count"));
