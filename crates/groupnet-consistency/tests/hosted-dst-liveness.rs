@@ -53,8 +53,8 @@ use std::num::NonZeroUsize;
 
 use groupnet_consistency::WriteToken;
 use groupnet_consistency::hosted::{
-    Commit, CommitCore, CompletenessCore, LedgerView, Watermarks, decode_ledger, encode_ledger,
-    hosted_feed_name, ledger_entry_key,
+    self, Commit, CommitCore, CompletenessCore, LedgerView, Watermarks, decode_ledger,
+    encode_ledger, ledger_entry_key,
 };
 use groupnet_core::{
     Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId,
@@ -120,10 +120,9 @@ fn cfg(voters: &BTreeSet<NodeId>) -> Config {
     }
 }
 
-/// The entry key the hosted feed occupies: `WriteFeed`'s key derivation is
-/// crate-private, so the prefix is spelled here, the *name* comes from the tier.
+/// The entry key the hosted feed occupies, as the tier names it.
 fn feed_entry_key() -> String {
-    format!("~writes:{}", hosted_feed_name(""))
+    hosted::feed_entry_key("")
 }
 
 /// The datum one hosted write carries: small, and self-identifying, so a

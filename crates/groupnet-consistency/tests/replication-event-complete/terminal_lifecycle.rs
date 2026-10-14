@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use super::*;
-use groupnet_core::replication::{Stage, TerminalReason, TerminalReceipt, TerminalRequest};
+use groupnet_consistency::replication::{TerminalReason, TerminalRequest};
 
 #[tokio::test]
 async fn unknown_terminal_write_is_read_back_before_retention_is_released() {
@@ -208,7 +208,7 @@ async fn reset_requires_exact_tombstone_and_advances_persistent_name_fence() {
     );
     // Remove the conclusive failed local attempt, then reset the name with
     // the exact durable predecessor and a strictly newer source ordinal.
-    let failed_key = groupnet_core::replication::SubscriberKey {
+    let failed_key = SubscriberKey {
         scope: scope(),
         subscriber: key.clone(),
     };

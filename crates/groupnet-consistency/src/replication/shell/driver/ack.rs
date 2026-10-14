@@ -133,7 +133,7 @@ where
         };
         let certified = tokio::time::timeout_at(
             tokio::time::Instant::from_std(attempt_deadline),
-            source.certify(&request, limits),
+            source.certify_erased(&request, limits),
         )
         .await;
         if !self.ack_slot_matches(generation, &id) {
@@ -314,7 +314,7 @@ where
         }
         let observed = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            source.observe(&request, op, &waiting, limits),
+            source.observe_erased(&request, op, &waiting, limits),
         )
         .await;
         self.tick();

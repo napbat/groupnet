@@ -62,7 +62,16 @@ pub fn checked_advertised_head_named(
     group: &Group,
     peer: &NodeId,
 ) -> Result<Option<WriteToken>, InvalidFeedHead> {
-    let Some(bytes) = group.node_entry(peer, &entry_key(name)) else {
+    checked_head_at(&entry_key(name), group, peer)
+}
+
+/// The head `peer` advertises under the feed entry `key`.
+pub(crate) fn checked_head_at(
+    key: &str,
+    group: &Group,
+    peer: &NodeId,
+) -> Result<Option<WriteToken>, InvalidFeedHead> {
+    let Some(bytes) = group.node_entry(peer, key) else {
         return Ok(None);
     };
     let frame = Frame::decode(&bytes).ok_or(InvalidFeedHead)?;
@@ -290,7 +299,17 @@ impl<K> PeerWrites<K> {
         me: NodeId,
         decode: impl Fn(&[u8]) -> Option<K> + Send + Sync + 'static,
     ) -> Self {
-        let key = entry_key(name);
+        Self::at_entry(entry_key(name), group, me, decode)
+    }
+
+    /// Subscribes to the feeds gossiped under the tier-owned entry `key` (the
+    /// counterpart of `WriteFeed::at_entry`).
+    pub(crate) fn at_entry(
+        key: String,
+        group: Group,
+        me: NodeId,
+        decode: impl Fn(&[u8]) -> Option<K> + Send + Sync + 'static,
+    ) -> Self {
         let events = group.events();
         let mut cursors = HashMap::new();
         for (node, entries) in group.all_entries().iter() {
@@ -360,9 +379,9 @@ impl<K> PeerWrites<K> {
     }
 
     fn scan_all(&mut self) {
-        for node in self.group.members() {
-            if node != self.me {
-                self.scan(&node);
+        for node in &*self.group.roster() {
+            if *node != self.me {
+                self.scan(node);
             }
         }
     }

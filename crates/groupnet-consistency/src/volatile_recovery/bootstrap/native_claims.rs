@@ -1,10 +1,12 @@
 //! Native Groupnet TTL entries as bounded, advisory bootstrap claims.
 
+use std::num::NonZeroUsize;
+
 use groupnet_core::Status;
 use groupnet_core::volatile_bootstrap::{
-    BootstrapClaim, BootstrapConfig, BootstrapMember, BootstrapOperation, BootstrapScope,
-    ClaimIdentity, PresenceIdentity, claim_entry_key, decode_claim_value, encode_claim_value,
-    encoded_claim_len, presence_entry_key,
+    BootstrapClaim, BootstrapConfig, BootstrapConfigError, BootstrapMember, BootstrapOperation,
+    BootstrapScope, ClaimCodecError, ClaimIdentity, PresenceIdentity, claim_entry_key,
+    decode_claim_value, encode_claim_value, encoded_claim_len, presence_entry_key,
 };
 use groupnet_runtime::{EntryBudget, EntryInspectionLimits, Group, InspectedEntries};
 use std::mem::size_of;
@@ -14,7 +16,58 @@ use super::admission::{AdmissionClass, Admitted, ByteAdmission, Reservation};
 use super::ports::{
     ClaimObservationLimits, ClaimSnapshot, ClaimSource, ParticipationSnapshot, TimedClaim,
 };
-use crate::volatile_recovery::{AdapterError, BoxRecoveryFuture};
+use crate::volatile_recovery::{AdapterError, AdapterErrorKind};
+
+/// A Group inspection or mutation failed; the source stays unreadable.
+const UNAVAILABLE: AdapterError = AdapterError::new(AdapterErrorKind::Unavailable);
+
+/// A native entry is malformed, outside policy, or contradicts membership.
+const MALFORMED: AdapterError = AdapterError::new(AdapterErrorKind::Malformed);
+
+/// A size computation overflowed or exceeded the caller's metadata bound.
+const CAPACITY: AdapterError = AdapterError::new(AdapterErrorKind::Capacity);
+
+/// A bounded snapshot vector could not be allocated.
+fn allocation(error: std::collections::TryReserveError) -> AdapterError {
+    AdapterError::with_source(AdapterErrorKind::Capacity, error)
+}
+
+/// A [`NativeClaimSource::new`] argument rule that was violated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeClaimSourceError {
+    /// `policy` failed [`BootstrapConfig::validate`]; the
+    /// [`BootstrapConfigError`] is the [`source`](std::error::Error::source).
+    Policy(BootstrapConfigError),
+    /// `scope` exceeds `policy.max_scope_bytes`.
+    ScopeTooLong,
+    /// The scoped claim entry key does not fit `max_key_bytes`; the
+    /// [`ClaimCodecError`] is the [`source`](std::error::Error::source).
+    ClaimKey(ClaimCodecError),
+    /// The scoped presence entry key does not fit `max_key_bytes`; the
+    /// [`ClaimCodecError`] is the [`source`](std::error::Error::source).
+    PresenceKey(ClaimCodecError),
+}
+
+impl std::fmt::Display for NativeClaimSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Policy(_) => "invalid bootstrap policy",
+            Self::ScopeTooLong => "scope exceeds policy.max_scope_bytes",
+            Self::ClaimKey(_) => "claim entry key unrepresentable",
+            Self::PresenceKey(_) => "presence entry key unrepresentable",
+        })
+    }
+}
+
+impl std::error::Error for NativeClaimSourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Policy(error) => Some(error),
+            Self::ClaimKey(error) | Self::PresenceKey(error) => Some(error),
+            Self::ScopeTooLong => None,
+        }
+    }
+}
 
 mod participation;
 mod presence;
@@ -52,37 +105,36 @@ impl NativeClaimSource {
     /// Binds one stable scope/policy to a Group and shared byte budget.
     ///
     /// # Errors
-    /// Rejects an invalid policy or an unrepresentable scoped entry key.
+    /// Names the invalid policy, oversized scope, or unrepresentable scoped
+    /// entry key.
     pub fn new(
         group: Group,
         scope: BootstrapScope,
         policy: BootstrapConfig,
         max_key_bytes: usize,
-        max_value_bytes: usize,
+        max_value_bytes: NonZeroUsize,
         admission: ByteAdmission,
-    ) -> Result<Self, AdapterError> {
-        policy.validate().map_err(|_| AdapterError)?;
-        if max_value_bytes == 0 {
-            return Err(AdapterError);
-        }
+    ) -> Result<Self, NativeClaimSourceError> {
+        policy.validate().map_err(NativeClaimSourceError::Policy)?;
         if scope
             .domain
             .len()
             .checked_add(scope.partition.len())
-            .ok_or(AdapterError)?
-            > policy.max_scope_bytes.get()
+            .is_none_or(|bytes| bytes > policy.max_scope_bytes.get())
         {
-            return Err(AdapterError);
+            return Err(NativeClaimSourceError::ScopeTooLong);
         }
-        let key = claim_entry_key(&scope, max_key_bytes).map_err(|_| AdapterError)?;
-        let presence_key = presence_entry_key(&scope, max_key_bytes).map_err(|_| AdapterError)?;
+        let key =
+            claim_entry_key(&scope, max_key_bytes).map_err(NativeClaimSourceError::ClaimKey)?;
+        let presence_key = presence_entry_key(&scope, max_key_bytes)
+            .map_err(NativeClaimSourceError::PresenceKey)?;
         Ok(Self {
             group,
             scope,
             policy,
             key,
             presence_key,
-            max_value_bytes,
+            max_value_bytes: max_value_bytes.get(),
             admission,
             published: Mutex::new(None),
             presence_published: Mutex::new(None),
@@ -99,7 +151,7 @@ impl NativeClaimSource {
             || limits.max_member_bytes > self.policy.max_member_bytes.get()
             || limits.max_metadata_bytes == 0
         {
-            return Err(AdapterError);
+            return Err(AdapterErrorKind::InvalidInput.into());
         }
         Ok(EntryInspectionLimits {
             max_key_bytes: self.key.len(),
@@ -116,26 +168,22 @@ impl NativeClaimSource {
         admission: &ByteAdmission,
     ) -> Result<Admitted<ClaimSnapshot>, AdapterError> {
         if !self.admission.same_pool(admission) {
-            return Err(AdapterError);
+            return Err(AdapterErrorKind::InvalidInput.into());
         }
         let inspection_limits = self.inspection_limits(limits)?;
         let raw_charge = limits
             .max_metadata_bytes
             .checked_add(self.key.len())
-            .ok_or(AdapterError)?;
-        let raw_budget = admission
-            .reserve(AdmissionClass::Inflight, raw_charge)
-            .map_err(|_| AdapterError)?;
+            .ok_or(CAPACITY)?;
+        let raw_budget = admission.reserve(AdmissionClass::Inflight, raw_charge)?;
         let (raw, raw_budget) = self
             .group
             .inspect_scoped_entry(self.key.clone(), inspection_limits, raw_budget)
             .await
-            .map_err(|_| AdapterError)?;
+            .map_err(|_| UNAVAILABLE)?;
         let raw = raw_budget.hold(raw);
         let converted_bytes = converted_charge(raw.get(), limits.max_metadata_bytes)?;
-        let converted_budget = admission
-            .reserve(AdmissionClass::Inflight, converted_bytes)
-            .map_err(|_| AdapterError)?;
+        let converted_budget = admission.reserve(AdmissionClass::Inflight, converted_bytes)?;
         let snapshot = raw.consume(|raw| self.convert(raw))?;
         Ok(converted_budget.hold(snapshot))
     }
@@ -145,16 +193,16 @@ impl NativeClaimSource {
         let mut claims = Vec::new();
         members
             .try_reserve_exact(raw.entries.len())
-            .map_err(|_| AdapterError)?;
+            .map_err(allocation)?;
         claims
             .try_reserve_exact(raw.entries.len())
-            .map_err(|_| AdapterError)?;
+            .map_err(allocation)?;
         for entry in raw.entries {
             let eligible = entry.status == Status::Alive;
             if let Some(value) = entry.value {
-                let remaining_ms = entry.remaining_ttl_ms.ok_or(AdapterError)?;
+                let remaining_ms = entry.remaining_ttl_ms.ok_or(MALFORMED)?;
                 if remaining_ms == 0 || remaining_ms > self.policy.claim_ttl_ms {
-                    return Err(AdapterError);
+                    return Err(MALFORMED);
                 }
                 let mut claim = decode_claim_value(
                     &self.scope,
@@ -163,7 +211,7 @@ impl NativeClaimSource {
                     &value,
                     self.max_value_bytes,
                 )
-                .map_err(|_| AdapterError)?;
+                .map_err(|_| MALFORMED)?;
                 claim.remaining_ms = remaining_ms;
                 if eligible {
                     claims.push(claim);
@@ -185,7 +233,7 @@ impl NativeClaimSource {
         let per_member = size_of::<groupnet_runtime::InspectedEntry>()
             .checked_add(self.policy.max_member_bytes.get())
             .and_then(|bytes| bytes.checked_add(self.max_value_bytes))
-            .ok_or(AdapterError)?;
+            .ok_or(CAPACITY)?;
         let limits = ClaimObservationLimits {
             max_members: self.policy.max_members.get(),
             max_member_bytes: self.policy.max_member_bytes.get(),
@@ -195,24 +243,23 @@ impl NativeClaimSource {
                         .max_members
                         .get()
                         .checked_mul(per_member)
-                        .ok_or(AdapterError)?,
+                        .ok_or(CAPACITY)?,
                 )
-                .ok_or(AdapterError)?,
+                .ok_or(CAPACITY)?,
         };
         let inspection_limits = self.inspection_limits(limits)?;
         let raw_charge = limits
             .max_metadata_bytes
             .checked_add(self.key.len())
-            .ok_or(AdapterError)?;
+            .ok_or(CAPACITY)?;
         let budget = self
             .admission
-            .reserve(AdmissionClass::Inflight, raw_charge)
-            .map_err(|_| AdapterError)?;
+            .reserve(AdmissionClass::Inflight, raw_charge)?;
         let (observed, budget) = self
             .group
             .inspect_scoped_entry(self.key.clone(), inspection_limits, budget)
             .await
-            .map_err(|_| AdapterError)?;
+            .map_err(|_| UNAVAILABLE)?;
         let matching = observed.entries.iter().any(|entry| {
             &entry.node == self.group.local_node()
                 && entry.value.as_deref() == Some(expected)
@@ -225,157 +272,136 @@ impl NativeClaimSource {
 }
 
 impl ClaimSource for NativeClaimSource {
-    fn observe_participation<'a>(
-        &'a self,
+    async fn observe_participation(
+        &self,
         _op: BootstrapOperation,
         limits: ClaimObservationLimits,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<Admitted<ParticipationSnapshot>, AdapterError>> {
-        Box::pin(async move { self.inspect_participation(limits, admission).await })
+        admission: &ByteAdmission,
+    ) -> Result<Admitted<ParticipationSnapshot>, AdapterError> {
+        self.inspect_participation(limits, admission).await
     }
 
-    fn publish_presence(
+    async fn publish_presence(
         &self,
         presence: groupnet_core::volatile_bootstrap::BootstrapPresence,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move { self.publish_presence_inner(presence).await })
+    ) -> Result<(), AdapterError> {
+        self.publish_presence_inner(presence).await
     }
 
-    fn withdraw_presence(
+    async fn withdraw_presence(&self, identity: PresenceIdentity) -> Result<(), AdapterError> {
+        self.withdraw_presence_inner(identity).await
+    }
+
+    async fn publish_claim(&self, claim: BootstrapClaim) -> Result<(), AdapterError> {
+        if claim.identity.node != *self.group.local_node() {
+            return Err(AdapterErrorKind::InvalidInput.into());
+        }
+        let mut published = self.published.lock().await;
+        let value_len = encoded_claim_len(&self.scope, self.policy, &claim, self.max_value_bytes)
+            .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
+        let queued_bytes = self.key.len().checked_add(value_len).ok_or(CAPACITY)?;
+        let queued = self
+            .admission
+            .reserve(AdmissionClass::Inflight, queued_bytes)?;
+        let retained = self
+            .admission
+            .reserve(AdmissionClass::Inflight, value_len)?;
+        let value = encode_claim_value(&self.scope, self.policy, &claim, self.max_value_bytes)
+            .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
+        let value = retained.hold(value);
+        let confirmed = self
+            .group
+            .set_entry_confirmed(
+                self.key.clone(),
+                value.get().clone(),
+                Some(self.policy.claim_ttl_ms),
+                self.key.len(),
+                self.max_value_bytes,
+                queued,
+            )
+            .await;
+        if confirmed.is_err() && !self.exact_local_readback(value.get()).await? {
+            return Err(UNAVAILABLE);
+        }
+        *published = Some((claim.identity, value));
+        Ok(())
+    }
+
+    async fn withdraw_claim(&self, selected: ClaimIdentity) -> Result<(), AdapterError> {
+        let mut published = self.published.lock().await;
+        let Some((identity, value)) = published.as_ref() else {
+            return Ok(());
+        };
+        if *identity != selected {
+            return Ok(());
+        }
+        let queued_bytes = self
+            .key
+            .len()
+            .checked_add(value.get().len())
+            .ok_or(CAPACITY)?;
+        let queued = self
+            .admission
+            .reserve(AdmissionClass::Inflight, queued_bytes)?;
+        let expected = value.get().clone();
+        let result = self
+            .group
+            .delete_entry_if_value(
+                self.key.clone(),
+                expected,
+                self.key.len(),
+                self.max_value_bytes,
+                queued,
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                *published = None;
+                Ok(())
+            }
+            Err(_) if !self.exact_local_readback(value.get()).await? => {
+                *published = None;
+                Ok(())
+            }
+            Err(_) => Err(UNAVAILABLE),
+        }
+    }
+
+    async fn observe_claims(
         &self,
-        identity: PresenceIdentity,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move { self.withdraw_presence_inner(identity).await })
-    }
-
-    fn publish_claim(
-        &self,
-        claim: BootstrapClaim,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            if claim.identity.node != *self.group.local_node() {
-                return Err(AdapterError);
-            }
-            let mut published = self.published.lock().await;
-            let value_len =
-                encoded_claim_len(&self.scope, self.policy, &claim, self.max_value_bytes)
-                    .map_err(|_| AdapterError)?;
-            let queued_bytes = self.key.len().checked_add(value_len).ok_or(AdapterError)?;
-            let queued = self
-                .admission
-                .reserve(AdmissionClass::Inflight, queued_bytes)
-                .map_err(|_| AdapterError)?;
-            let retained = self
-                .admission
-                .reserve(AdmissionClass::Inflight, value_len)
-                .map_err(|_| AdapterError)?;
-            let value = encode_claim_value(&self.scope, self.policy, &claim, self.max_value_bytes)
-                .map_err(|_| AdapterError)?;
-            let value = retained.hold(value);
-            let confirmed = self
-                .group
-                .set_entry_confirmed(
-                    self.key.clone(),
-                    value.get().clone(),
-                    Some(self.policy.claim_ttl_ms),
-                    self.key.len(),
-                    self.max_value_bytes,
-                    queued,
-                )
-                .await;
-            if confirmed.is_err() && !self.exact_local_readback(value.get()).await? {
-                return Err(AdapterError);
-            }
-            *published = Some((claim.identity, value));
-            Ok(())
-        })
-    }
-
-    fn withdraw_claim(
-        &self,
-        selected: ClaimIdentity,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            let mut published = self.published.lock().await;
-            let Some((identity, value)) = published.as_ref() else {
-                return Ok(());
-            };
-            if *identity != selected {
-                return Ok(());
-            }
-            let queued_bytes = self
-                .key
-                .len()
-                .checked_add(value.get().len())
-                .ok_or(AdapterError)?;
-            let queued = self
-                .admission
-                .reserve(AdmissionClass::Inflight, queued_bytes)
-                .map_err(|_| AdapterError)?;
-            let expected = value.get().clone();
-            let result = self
-                .group
-                .delete_entry_if_value(
-                    self.key.clone(),
-                    expected,
-                    self.key.len(),
-                    self.max_value_bytes,
-                    queued,
-                )
-                .await;
-            match result {
-                Ok(_) => {
-                    *published = None;
-                    Ok(())
-                }
-                Err(_) if !self.exact_local_readback(value.get()).await? => {
-                    *published = None;
-                    Ok(())
-                }
-                Err(_) => Err(AdapterError),
-            }
-        })
-    }
-
-    fn observe_claims<'a>(
-        &'a self,
         _op: BootstrapOperation,
         limits: ClaimObservationLimits,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<Admitted<ClaimSnapshot>, AdapterError>> {
-        Box::pin(async move { self.inspect(limits, admission).await })
+        admission: &ByteAdmission,
+    ) -> Result<Admitted<ClaimSnapshot>, AdapterError> {
+        self.inspect(limits, admission).await
     }
 
-    fn observe_selected_claim<'a>(
-        &'a self,
+    async fn observe_selected_claim(
+        &self,
         _op: BootstrapOperation,
         selected: ClaimIdentity,
         limits: ClaimObservationLimits,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TimedClaim>>, AdapterError>> {
-        Box::pin(async move {
-            let snapshot = self.inspect(limits, admission).await?;
-            let selected_claim = snapshot
-                .get()
-                .claims
-                .iter()
-                .find(|claim| claim.identity == selected);
-            let Some(selected_claim) = selected_claim else {
-                return Ok(None);
-            };
-            let charge_bytes = size_of::<TimedClaim>()
-                .checked_add(selected.node.as_str().len())
-                .ok_or(AdapterError)?;
-            let charge = admission
-                .reserve(AdmissionClass::Inflight, charge_bytes)
-                .map_err(|_| AdapterError)?;
-            let result = TimedClaim {
-                sampled_at: snapshot.get().sampled_at,
-                claim: selected_claim.clone(),
-            };
-            drop(snapshot);
-            Ok(Some(charge.hold(result)))
-        })
+        admission: &ByteAdmission,
+    ) -> Result<Option<Admitted<TimedClaim>>, AdapterError> {
+        let snapshot = self.inspect(limits, admission).await?;
+        let selected_claim = snapshot
+            .get()
+            .claims
+            .iter()
+            .find(|claim| claim.identity == selected);
+        let Some(selected_claim) = selected_claim else {
+            return Ok(None);
+        };
+        let charge_bytes = size_of::<TimedClaim>()
+            .checked_add(selected.node.as_str().len())
+            .ok_or(CAPACITY)?;
+        let charge = admission.reserve(AdmissionClass::Inflight, charge_bytes)?;
+        let result = TimedClaim {
+            sampled_at: snapshot.get().sampled_at,
+            claim: selected_claim.clone(),
+        };
+        drop(snapshot);
+        Ok(Some(charge.hold(result)))
     }
 }
 
@@ -384,12 +410,12 @@ fn converted_charge(raw: &InspectedEntries, max_bytes: usize) -> Result<usize, A
         .entries
         .len()
         .checked_mul(size_of::<BootstrapMember>())
-        .ok_or(AdapterError)?;
+        .ok_or(CAPACITY)?;
     let claims = raw
         .entries
         .len()
         .checked_mul(size_of::<BootstrapClaim>())
-        .ok_or(AdapterError)?;
+        .ok_or(CAPACITY)?;
     let identities = raw.entries.iter().try_fold(0usize, |total, entry| {
         total.checked_add(entry.node.as_str().len())
     });
@@ -397,9 +423,9 @@ fn converted_charge(raw: &InspectedEntries, max_bytes: usize) -> Result<usize, A
         .checked_add(members)
         .and_then(|bytes| bytes.checked_add(claims))
         .and_then(|bytes| bytes.checked_add(identities?))
-        .ok_or(AdapterError)?;
+        .ok_or(CAPACITY)?;
     if total == 0 || total > max_bytes {
-        return Err(AdapterError);
+        return Err(CAPACITY);
     }
     Ok(total)
 }

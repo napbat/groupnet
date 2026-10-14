@@ -1,12 +1,13 @@
 //! Multi-node tests over the in-memory transport: consumer-typed sequence
 //! floors reach peers and list their publishers, never regress within a
 //! publisher's life, fade to "no claim" when refreshes stop (and come back on
-//! a republish), read as absent for unknown and undecodable entries, and stay
-//! isolated between named sets.
+//! a republish), read as absent for unknown and undecodable entries, stay
+//! isolated between named sets (including keys that once collided with a named
+//! set's entries), and refuse a TTL the engine would read as "never expires".
 
 use std::time::Duration;
 
-use groupnet_consistency::SeqFloors;
+use groupnet_consistency::{SeqFloors, SeqFloorsError};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually, spawn_mem_node};
 use groupnet_transport_mem::Network;
 
@@ -34,8 +35,8 @@ async fn floors_disseminate_and_list_their_publishers() {
     let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "fl-b", &["fl-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
-    let writer = SeqFloors::new(a_group, LONG_TTL);
-    let reader = SeqFloors::new(b_group, LONG_TTL);
+    let writer = SeqFloors::new(a_group, LONG_TTL).expect("valid ttl");
+    let reader = SeqFloors::new(b_group, LONG_TTL).expect("valid ttl");
 
     // Nothing claimed yet: absence, not zero.
     assert_eq!(reader.floor_of(&a_id, "shard-7"), None);
@@ -75,8 +76,8 @@ async fn floors_never_regress_within_a_publisher_life() {
     let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "mo-b", &["mo-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
-    let writer = SeqFloors::new(a_group, LONG_TTL);
-    let reader = SeqFloors::new(b_group, LONG_TTL);
+    let writer = SeqFloors::new(a_group, LONG_TTL).expect("valid ttl");
+    let reader = SeqFloors::new(b_group, LONG_TTL).expect("valid ttl");
 
     writer.publish("shard-1", 10).expect("entry accepted");
     eventually("b sees the high floor", || {
@@ -118,8 +119,8 @@ async fn ttl_expiry_is_the_idle_signal() {
     let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "tt-b", &["tt-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
-    let writer = SeqFloors::new(a_group, Duration::from_millis(300));
-    let reader = SeqFloors::new(b_group, LONG_TTL);
+    let writer = SeqFloors::new(a_group, Duration::from_millis(300)).expect("valid ttl");
+    let reader = SeqFloors::new(b_group, LONG_TTL).expect("valid ttl");
 
     writer.publish("shard-3", 12).expect("entry accepted");
     eventually("b sees the floor", || {
@@ -159,26 +160,29 @@ async fn unknown_and_undecodable_floors_read_as_no_claim() {
     let (b_id, _b_node, b_group) = spawn_mem_node(&net, "un-b", &["un-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
-    let reader = SeqFloors::new(b_group.clone(), LONG_TTL);
+    let reader = SeqFloors::new(b_group.clone(), LONG_TTL).expect("valid ttl");
 
     // Never published, by anyone: absent, and absent for the peer that is
     // not publishing at all.
     assert_eq!(reader.floor_of(&a_id, "shard-0"), None);
     assert_eq!(reader.floor_of(&b_id, "shard-0"), None);
 
-    // A peer writing junk under the documented entry layout (`~floor:<key>`)
-    // must read as "no claim", never as a number nobody wrote.
-    a_group.set_entry("~floor:short", vec![1, 2, 3], None).ok();
-    a_group.set_entry("~floor:long", vec![0_u8; 9], None).ok();
-    a_group.set_entry("~floor:empty", Vec::new(), None).ok();
-    let writer = SeqFloors::new(a_group, LONG_TTL);
+    // A peer writing junk under the documented default-set entry layout
+    // (`~floor/d/<key>`) must read as "no claim", never as a number nobody
+    // wrote.
+    a_group
+        .set_entry("~floor/d/short", vec![1, 2, 3], None)
+        .ok();
+    a_group.set_entry("~floor/d/long", vec![0_u8; 9], None).ok();
+    a_group.set_entry("~floor/d/empty", Vec::new(), None).ok();
+    let writer = SeqFloors::new(a_group, LONG_TTL).expect("valid ttl");
     writer.publish("good", 5).expect("entry accepted");
 
     // The junk really arrived (so the assertions below are not vacuous)…
     eventually("b sees the raw entries", || {
-        b_group.node_entry(&a_id, "~floor:short").is_some()
-            && b_group.node_entry(&a_id, "~floor:long").is_some()
-            && b_group.node_entry(&a_id, "~floor:empty").is_some()
+        b_group.node_entry(&a_id, "~floor/d/short").is_some()
+            && b_group.node_entry(&a_id, "~floor/d/long").is_some()
+            && b_group.node_entry(&a_id, "~floor/d/empty").is_some()
             && reader.floor_of(&a_id, "good") == Some(5)
     })
     .await;
@@ -203,16 +207,16 @@ async fn named_sets_do_not_cross_read() {
     let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "nm-b", &["nm-a"], &opts()).await;
     converged_within(&[&a_group, &b_group], SETTLE).await;
 
-    let lsn = SeqFloors::named("lsn", a_group.clone(), LONG_TTL);
-    let idx = SeqFloors::named("idx", a_group.clone(), LONG_TTL);
-    let default = SeqFloors::new(a_group, LONG_TTL);
+    let lsn = SeqFloors::named("lsn", a_group.clone(), LONG_TTL).expect("valid ttl");
+    let idx = SeqFloors::named("idx", a_group.clone(), LONG_TTL).expect("valid ttl");
+    let default = SeqFloors::new(a_group, LONG_TTL).expect("valid ttl");
     lsn.publish("s1", 10).expect("entry accepted");
     idx.publish("s1", 99).expect("entry accepted");
     default.publish("s1", 5).expect("entry accepted");
 
-    let read_lsn = SeqFloors::named("lsn", b_group.clone(), LONG_TTL);
-    let read_idx = SeqFloors::named("idx", b_group.clone(), LONG_TTL);
-    let read_default = SeqFloors::new(b_group, LONG_TTL);
+    let read_lsn = SeqFloors::named("lsn", b_group.clone(), LONG_TTL).expect("valid ttl");
+    let read_idx = SeqFloors::named("idx", b_group.clone(), LONG_TTL).expect("valid ttl");
+    let read_default = SeqFloors::new(b_group, LONG_TTL).expect("valid ttl");
 
     // All three converge, and each reads exactly its own set's value — the
     // same key in three sets never crosses over.
@@ -225,4 +229,49 @@ async fn named_sets_do_not_cross_read() {
     assert_eq!(read_lsn.floors_for("s1"), vec![(a_id.clone(), 10)]);
     assert_eq!(read_idx.floors_for("s1"), vec![(a_id.clone(), 99)]);
     assert_eq!(read_default.floors_for("s1"), vec![(a_id, 5)]);
+}
+
+/// A default-set key that spells a named set's entry under the old layout
+/// (`"lsn:s7"` vs. `"s7"` in the set named `"lsn"`, once both
+/// `~floor:lsn:s7`) stays a separate claim: one publisher, two values, and a
+/// peer reads each back independently.
+#[tokio::test]
+async fn default_keys_never_alias_a_named_set() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "al-a", &["al-b"], &opts()).await;
+    let (_b_id, _b_node, b_group) = spawn_mem_node(&net, "al-b", &["al-a"], &opts()).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
+
+    let default = SeqFloors::new(a_group.clone(), LONG_TTL).expect("valid ttl");
+    let lsn = SeqFloors::named("lsn", a_group, LONG_TTL).expect("valid ttl");
+    default.publish("lsn:s7", 3).expect("entry accepted");
+    lsn.publish("s7", 41).expect("entry accepted");
+
+    let read_default = SeqFloors::new(b_group.clone(), LONG_TTL).expect("valid ttl");
+    let read_lsn = SeqFloors::named("lsn", b_group, LONG_TTL).expect("valid ttl");
+    eventually("b sees both claims", || {
+        read_default.floor_of(&a_id, "lsn:s7") == Some(3)
+            && read_lsn.floor_of(&a_id, "s7") == Some(41)
+    })
+    .await;
+    assert_eq!(read_default.floors_for("lsn:s7"), vec![(a_id.clone(), 3)]);
+    assert_eq!(read_lsn.floors_for("s7"), vec![(a_id, 41)]);
+}
+
+/// A sub-millisecond TTL would round to the engine's "never expires" zero —
+/// the stale claim floors exist to prevent — so construction refuses it
+/// rather than silently raising it.
+#[tokio::test]
+async fn a_sub_millisecond_ttl_is_refused() {
+    let net = Network::new();
+    let (_a_id, _a_node, a_group) = spawn_mem_node(&net, "tt-a", &[], &opts()).await;
+
+    assert!(matches!(
+        SeqFloors::new(a_group.clone(), Duration::from_micros(500)),
+        Err(SeqFloorsError::TtlTooShort { .. })
+    ));
+    assert!(matches!(
+        SeqFloors::named("lsn", a_group, Duration::from_micros(500)),
+        Err(SeqFloorsError::TtlTooShort { .. })
+    ));
 }

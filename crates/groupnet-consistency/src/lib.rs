@@ -20,13 +20,16 @@
 //! everything below: per-writer order, gap detection, frontiers, tokens.
 //! The **strong-coherence tier** (feature `acks`, off by default) adds
 //! write-side acknowledgement: `AckLedger` publishes each node's applied
-//! watermarks and `applied_cluster_wide` holds a writer until every alive
-//! member has applied its write (`applied_by_selected` narrows that to the
-//! members a selector admits — e.g. those advertising `CAP_ACKS` — so a
-//! mixed deployment does not pay a timeout per non-participant). Its price
-//! is real — one
-//! ledger republish per applied event, and write latency bounded by the
-//! slowest alive member — right for small clusters that must be
+//! watermarks, and a writer waits for them over a selection it names —
+//! `applied_cluster_wide` (every member it believes alive),
+//! `applied_by_selected` (the alive members a selector admits, e.g. those
+//! advertising `CAP_ACKS`, so a mixed deployment does not pay a timeout per
+//! non-participant) or `applied_by_roster` (a fixed roster, the only known
+//! denominator). Each resolves to an `AckOutcome` naming who was selected, who
+//! acknowledged and who is missing, so an empty or lagging selection is never
+//! mistaken for a full acknowledgement. Its price is real — one ledger
+//! republish per applied event, and write latency bounded by the slowest
+//! selected member — right for small clusters that must be
 //! indistinguishable from a single node, wrong past the scaling envelope
 //! (large fabrics keep the session tier and shard into cells instead). Its
 //! successor, the **coherence-lease tier** (feature `leases`, off by default,
@@ -64,6 +67,34 @@
 //! with your number — the hot-set shape shardstore hand-rolls over
 //! `set_entry`/`node_entry`, with per-key TTL expiry as the idle signal and
 //! absence meaning route conservatively.
+//!
+//! # Application API
+//!
+//! The crate root carries the handles an application holds and the values
+//! their signatures name: [`WriteFeed`], [`PeerWrites`], [`Frontier`],
+//! [`SeqFloors`], the ack tier's `AckLedger` and waits, the lease tier's
+//! `Leases` / `LeaseView`, the Hosted tier's `HostedWrites` / `HostedReads` /
+//! `CommitLedger`, and the handoff tier's `Handoff` with its snapshot adapter
+//! traits — plus [`Group`], the runtime handle every one of them is built on.
+//! Source-backed replication and volatile recovery are opt-in tiers with
+//! adapter-shaped APIs, so they live entirely under their modules
+//! (`replication`, `volatile_recovery`), each re-exporting the domain types
+//! its adapter traits name.
+//!
+//! Every publication reports what it did **locally**: a feed write, a seal or
+//! a ledger advance is recorded first, then *enqueued* into the group actor's
+//! bounded inbox. A refused enqueue is an error naming what was kept
+//! ([`Unadvertised`], [`CommandRejected`]), retried by the next publication or
+//! an explicit republish — never a claim that gossip delivered anything.
+//!
+//! # Protocol-driver API
+//!
+//! The sans-IO cores the shells are built on — `hosted::CommitCore` and
+//! `hosted::CompletenessCore`, `hosted::handoff::HandoffCore`,
+//! `lease::LeaseCore`, `lease::CoherenceCore` and `lease::GrantLedger`, and
+//! the entry codecs next to them — stay public for custom drivers and the
+//! deterministic simulator, but only at their tier module path. An
+//! application never needs them.
 //!
 //! # What you get — and what you deliberately don't
 //!
@@ -161,7 +192,8 @@
 //! - **One feed per name per group.** The default feed occupies one
 //!   reserved entry; independent subsystems sharing a group must use
 //!   [`WriteFeed::named`] / [`PeerWrites::named`] to keep their feeds
-//!   apart.
+//!   apart. Tier-owned feeds (a hosted write path's) live in their own entry
+//!   namespace, so no feed name, whatever it spells, shares one with them.
 //! - **The frontier remembers every writer it has seen.** One token per
 //!   peer, bounded by group membership — departed peers' watermarks linger
 //!   harmlessly.
@@ -178,13 +210,13 @@
 //! use groupnet_runtime::Node;
 //! use groupnet_transport_mem::{MemLink, Network};
 //!
-//! # async fn demo() {
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! let net = Network::new();
 //! let me = NodeId::new("node-a");
 //! let node = Node::builder(me.clone())
 //!     .link(MemLink::new(net.endpoint(me.clone()), vec![NodeId::new("node-b")]))
 //!     .seed(NodeId::new("node-b"))
-//!     .start().await.expect("the memory link binds");
+//!     .start().await?;
 //! let group = node.join_group("stores");
 //!
 //! let feed = WriteFeed::new(
@@ -200,8 +232,9 @@
 //! // The node-local state kept coherent — a cache, an index, a replica.
 //! let fresh: Arc<Mutex<HashSet<String>>> = Arc::default();
 //!
-//! // After every local durable write (the token is the client's RYW token):
-//! let token = feed.publish(&"user:1".to_owned()).await;
+//! // After every local durable write (the token is the client's RYW token).
+//! // An `Err` here means the write is recorded but not yet advertised.
+//! let token = feed.publish(&"user:1".to_owned()).await?;
 //!
 //! // Apply peer writes, advancing the frontier only once applied:
 //! let local = Arc::clone(&fresh);
@@ -233,11 +266,13 @@
 //! if view.reached(&writer, token).await {
 //!     // local state now reflects that write — serve the read
 //! }
+//! # Ok(())
 //! # }
 //! ```
 
 #[cfg(feature = "acks")]
 mod acks;
+mod entry;
 mod feed;
 mod floor;
 mod frontier;
@@ -246,6 +281,7 @@ pub mod hosted;
 #[cfg(feature = "leases")]
 pub mod lease;
 mod peers;
+mod publish;
 #[cfg(feature = "replication")]
 pub mod replication;
 mod token;
@@ -253,30 +289,39 @@ mod token;
 pub mod volatile_recovery;
 mod wire;
 
+// Application handles and the values their signatures name. Protocol-driver
+// cores (sans-IO state machines, codecs, ledger views) stay at their tier
+// module path: `hosted::`, `hosted::handoff::`, `lease::`.
 #[cfg(feature = "acks")]
-pub use acks::{AckLedger, CAP_ACKS, applied_by, applied_by_selected, applied_cluster_wide};
-pub use feed::WriteFeed;
-pub use floor::SeqFloors;
+pub use acks::{
+    AckBasis, AckLedger, AckOutcome, CAP_ACKS, applied_by, applied_by_roster, applied_by_selected,
+    applied_cluster_wide,
+};
+pub use feed::{PublishError, Unadvertised, WriteFeed};
+pub use floor::{SeqFloors, SeqFloorsError};
 pub use frontier::{Frontier, FrontierView};
+// The runtime handle every tier is built on, and the bounded-inbox refusal its
+// publication APIs report.
+pub use groupnet_runtime::{CommandRejected, Group};
 #[cfg(feature = "handoff")]
 pub use hosted::handoff::{
-    Coverage, DoneCheck, DoneCounts, Handoff, HandoffCore, HandoffError, HandoffPhase,
-    HandoffReceipt, HandoffStep, Offered, RefusalCode, Snapshot, SnapshotChunks, SnapshotSink,
-    SnapshotSource, Staleness,
+    ChunkLimit, ChunkLimitError, Handoff, HandoffError, HandoffReceipt, Snapshot, SnapshotChunks,
+    SnapshotSink, SnapshotSource,
 };
 #[cfg(feature = "hosted")]
 pub use hosted::{
-    CAP_HOSTED, Commit, CommitCore, CommitLedger, CommitOutcome, CommitReceipt, CommitVerdict,
-    Completeness, CompletenessCore, Fence, HostedError, HostedRead, HostedReads, HostedSetupError,
-    HostedWrites, LedgerView, Reading, Watermarks,
+    CAP_HOSTED, Commit, CommitLedger, CommitOutcome, CommitReceipt, Completeness, Fence,
+    HostedError, HostedRead, HostedReads, HostedSetupError, HostedWrites,
 };
 #[cfg(feature = "leases")]
 pub use lease::{
-    CAP_LEASE, ClockMs, CoherenceCore, CoherenceOutcome, CoherenceStep, GrantLedger, GranterLife,
-    LeaseConfig, LeaseConfigError, LeaseCore, LeaseState, LeaseView, Leases, RenewalId, WaitMember,
+    CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseConfigError, LeaseStartError, LeaseState,
+    LeaseView, Leases, LeasesBuilder,
 };
 pub use peers::{
     InvalidFeedHead, PeerWrite, PeerWrites, advertised_head, advertised_head_named,
     checked_advertised_head, checked_advertised_head_named,
 };
+#[cfg(any(feature = "acks", feature = "hosted"))]
+pub use publish::Recorded;
 pub use token::WriteToken;

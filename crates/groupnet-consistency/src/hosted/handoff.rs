@@ -16,7 +16,7 @@
 //! with nothing to rebuild from and no honest option but to keep refusing
 //! service. This module is the way out: pull a **covering snapshot** from a peer
 //! that already holds one, over the data plane
-//! ([`BulkTransport`](groupnet_transport::bulk::BulkTransport)), and verify what
+//! ([`BulkTransport`]), and verify what
 //! arrives before adopting a byte of it.
 //!
 //! # The shape
@@ -130,9 +130,18 @@ mod wire;
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::num::NonZeroUsize;
 
-use bytes::Bytes;
 use groupnet_core::NodeId;
+use groupnet_transport::framing::MAX_FRAME_BYTES;
+
+/// The chunk payload type [`SnapshotChunks`] and [`SnapshotSink`] exchange,
+/// re-exported so an adapter needs no direct `bytes` dependency.
+pub use bytes::Bytes;
+/// The data-plane types [`Handoff::fetch`], [`Handoff::fetch_on`] and
+/// [`Handoff::offer`] take, re-exported so a caller can name them through this
+/// module.
+pub use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
 
 pub use self::core::{
     Coverage, DoneCheck, DoneCounts, HandoffCore, HandoffPhase, HandoffStep, Staleness,
@@ -152,10 +161,17 @@ pub trait SnapshotSource: Send + Sync + 'static {
 
     /// Opens a snapshot: the watermarks it covers, and the chunks that carry it.
     ///
+    /// `limit` is the longest chunk this donor will put on the wire; size the
+    /// image's chunks to it. A chunk past it is refused locally, before it is
+    /// sent, and ends the transfer — see [`SnapshotChunks`].
+    ///
     /// Called once per served request. An `Err` is answered to the requester as
     /// [`RefusalCode::Unavailable`] — a donor that cannot open is not a donor,
     /// and the requester tries the next one.
-    fn open(&self) -> impl Future<Output = io::Result<Snapshot<Self::Chunks>>> + Send;
+    fn open(
+        &self,
+        limit: ChunkLimit,
+    ) -> impl Future<Output = io::Result<Snapshot<Self::Chunks>>> + Send;
 }
 
 /// The chunk half of a [`Snapshot`]: opaque bytes, in order, until `None`.
@@ -163,20 +179,16 @@ pub trait SnapshotSource: Send + Sync + 'static {
 /// Chunk boundaries are the source's business and carry no meaning on the wire —
 /// the sink sees exactly the chunks the source produced, in exactly that order.
 /// Size them for the data plane's framing rather than for the consumer's
-/// records, and note that the framing puts a hard ceiling on that: one chunk
-/// becomes one frame, and
-/// [`DataStream`](groupnet_transport::bulk::DataStream) refuses to *read* a
-/// frame past [`MAX_FRAME_BYTES`](groupnet_transport::framing::MAX_FRAME_BYTES)
-/// (256 MiB), so a chunk must stay under that less
-/// the six-byte `GNHO` prefix it is written behind.
+/// records: one chunk becomes one frame, and no chunk may be longer than the
+/// [`ChunkLimit`] the donor passed to [`SnapshotSource::open`].
 ///
-/// Nothing checks that on the way out. An oversized chunk is sent perfectly
-/// happily and then kills the transfer at the **receiver**, as
-/// [`HandoffError::Io`] wrapping an
-/// [`InvalidData`](io::ErrorKind::InvalidData) — with the sink dropped
-/// unfinished, so nothing is installed and the whole image has to cross again.
-/// The cap is a guard against a source that streams its state as one enormous
-/// chunk, not a size to aim at.
+/// The donor checks every chunk against that limit **before** sending it. An
+/// oversized chunk never reaches the wire: [`Handoff::offer`] stops at it and
+/// returns [`HandoffError::ChunkTooLarge`] carrying both sizes, and the
+/// requester sees the stream end without a `Done` frame — a
+/// [`HandoffError::Truncated`] with its sink dropped unfinished, so nothing is
+/// installed. The limit is a guard against a source that streams its state as
+/// one enormous chunk, not a size to aim at.
 pub trait SnapshotChunks: Send + 'static {
     /// The next chunk, or `None` at the end of the snapshot.
     ///
@@ -184,6 +196,94 @@ pub trait SnapshotChunks: Send + 'static {
     /// end without a `Done` frame and drops its sink unfinished.
     fn next(&mut self) -> impl Future<Output = io::Result<Option<Bytes>>> + Send;
 }
+
+/// The longest snapshot chunk a donor puts on the wire, in payload bytes.
+///
+/// One chunk becomes one data-plane frame behind the handoff's six-byte `GNHO`
+/// prefix, and the framing refuses any frame past
+/// [`MAX_FRAME_BYTES`], so
+/// [`MAX`](Self::MAX) is that ceiling less the prefix. It is the default, and
+/// the bound every requester accepts. A donor may run under a smaller limit
+/// ([`Handoff::with_chunk_limit`]) to bound the memory one frame costs at either
+/// end; the requester needs no matching setting, because it accepts anything up
+/// to `MAX`.
+///
+/// The donor hands its limit to [`SnapshotSource::open`] and checks every chunk
+/// against it before sending — see [`SnapshotChunks`] for what an oversized
+/// chunk costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkLimit(NonZeroUsize);
+
+impl ChunkLimit {
+    /// The protocol's ceiling: the data plane's frame ceiling less the handoff
+    /// frame prefix.
+    pub const MAX: Self = Self(NonZeroUsize::new(MAX_FRAME_BYTES - wire::PREFIX).unwrap());
+
+    /// A limit of `bytes` per chunk.
+    ///
+    /// # Errors
+    /// [`ChunkLimitError::AboveMax`] when `bytes` exceeds [`MAX`](Self::MAX) —
+    /// a chunk that long could never cross as one frame.
+    pub const fn new(bytes: NonZeroUsize) -> Result<Self, ChunkLimitError> {
+        if bytes.get() > Self::MAX.get() {
+            return Err(ChunkLimitError::AboveMax {
+                bytes: bytes.get(),
+                max: Self::MAX.get(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// The limit in payload bytes.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    /// Whether a chunk of `len` payload bytes may be sent under this limit. An
+    /// empty chunk always may.
+    #[must_use]
+    pub const fn admits(self, len: usize) -> bool {
+        len <= self.get()
+    }
+}
+
+impl Default for ChunkLimit {
+    fn default() -> Self {
+        Self::MAX
+    }
+}
+
+impl fmt::Display for ChunkLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.get())
+    }
+}
+
+/// Why a [`ChunkLimit`] could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkLimitError {
+    /// The requested limit exceeds [`ChunkLimit::MAX`].
+    AboveMax {
+        /// The limit asked for, in bytes.
+        bytes: usize,
+        /// The largest limit there is, in bytes.
+        max: usize,
+    },
+}
+
+impl fmt::Display for ChunkLimitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChunkLimitError::AboveMax { bytes, max } => write!(
+                f,
+                "chunk limit of {bytes} bytes exceeds the handoff ceiling of {max} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChunkLimitError {}
 
 /// One opened snapshot: what it covers, and the bytes that carry it.
 ///
@@ -339,6 +439,16 @@ pub enum HandoffError {
     /// The stream ended, or the counts did not tally, before a whole snapshot
     /// had arrived. Nothing staged is adopted.
     Truncated,
+    /// The donor's [`SnapshotChunks`] produced a chunk longer than the donor's
+    /// [`ChunkLimit`]. Raised by [`Handoff::offer`] **before** the chunk is
+    /// sent: the transfer stops there, and the requester sees a stream that
+    /// ended without `Done` ([`Truncated`](Self::Truncated)).
+    ChunkTooLarge {
+        /// The offending chunk's payload length, in bytes.
+        len: usize,
+        /// The limit it broke — the one [`SnapshotSource::open`] was given.
+        limit: ChunkLimit,
+    },
     /// The peer is not speaking this protocol: a foreign magic, a version or
     /// frame kind this build does not define, or a frame arriving out of the
     /// order [`HandoffPhase`] fixes. Loud on purpose — the alternative is
@@ -365,6 +475,10 @@ impl fmt::Display for HandoffError {
             }
             HandoffError::Refused { code } => write!(f, "handoff refused: {code}"),
             HandoffError::Truncated => f.write_str("snapshot ended before it was whole"),
+            HandoffError::ChunkTooLarge { len, limit } => write!(
+                f,
+                "snapshot chunk of {len} bytes exceeds the chunk limit of {limit}"
+            ),
             HandoffError::Protocol(what) => write!(f, "handoff protocol error: {what}"),
             HandoffError::Io(err) => write!(f, "handoff i/o error: {err}"),
         }
@@ -389,11 +503,20 @@ impl From<io::Error> for HandoffError {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::num::NonZeroUsize;
 
     use groupnet_core::NodeId;
+    use groupnet_transport::framing::MAX_FRAME_BYTES;
 
-    use super::{HandoffError, HandoffReceipt, RefusalCode, Snapshot, Watermarks};
+    use super::{
+        ChunkLimit, ChunkLimitError, HandoffError, HandoffReceipt, RefusalCode, Snapshot,
+        Watermarks,
+    };
     use crate::token::WriteToken;
+
+    fn nonzero(bytes: usize) -> NonZeroUsize {
+        NonZeroUsize::new(bytes).expect("a nonzero test size")
+    }
 
     fn marks(pairs: &[(&str, u64, u64)]) -> Watermarks {
         pairs
@@ -444,6 +567,59 @@ mod tests {
         // Every other variant is self-contained: no hidden cause to chase.
         assert!(std::error::Error::source(&HandoffError::Truncated).is_none());
         assert!(std::error::Error::source(&HandoffError::Protocol("x")).is_none());
+    }
+
+    #[test]
+    fn the_chunk_ceiling_is_the_frame_ceiling_less_the_handoff_prefix() {
+        // `GNHO`, version, kind: six bytes ride in front of every chunk, and the
+        // data plane refuses a frame past its ceiling, so this is the longest
+        // chunk that can ever cross as one frame.
+        assert_eq!(ChunkLimit::MAX.get(), MAX_FRAME_BYTES - 6);
+        assert_eq!(ChunkLimit::default(), ChunkLimit::MAX);
+        assert_eq!(
+            ChunkLimit::new(nonzero(MAX_FRAME_BYTES - 6)),
+            Ok(ChunkLimit::MAX)
+        );
+    }
+
+    #[test]
+    fn a_limit_past_the_ceiling_is_refused_with_both_sizes() {
+        let over = MAX_FRAME_BYTES - 5;
+        let err = ChunkLimit::new(nonzero(over)).expect_err("one byte over the ceiling");
+        assert_eq!(
+            err,
+            ChunkLimitError::AboveMax {
+                bytes: over,
+                max: ChunkLimit::MAX.get(),
+            }
+        );
+        let shown = err.to_string();
+        assert!(shown.contains(&over.to_string()), "{shown}");
+        assert!(
+            shown.contains(&ChunkLimit::MAX.get().to_string()),
+            "{shown}"
+        );
+        assert!(ChunkLimit::new(nonzero(usize::MAX)).is_err());
+    }
+
+    #[test]
+    fn a_limit_admits_up_to_and_including_its_size() {
+        let limit = ChunkLimit::new(nonzero(64)).expect("a small limit");
+        assert_eq!(limit.get(), 64);
+        assert!(limit.admits(0), "an empty chunk always fits");
+        assert!(limit.admits(64), "an at-limit chunk fits");
+        assert!(!limit.admits(65), "one byte over does not");
+        assert_eq!(limit.to_string(), "64 bytes");
+    }
+
+    #[test]
+    fn an_oversize_chunk_error_names_both_sizes_and_has_no_hidden_cause() {
+        let limit = ChunkLimit::new(nonzero(64)).expect("a small limit");
+        let err = HandoffError::ChunkTooLarge { len: 65, limit };
+        let shown = err.to_string();
+        assert!(shown.contains("65 bytes"), "{shown}");
+        assert!(shown.contains("64 bytes"), "{shown}");
+        assert!(std::error::Error::source(&err).is_none());
     }
 
     #[test]

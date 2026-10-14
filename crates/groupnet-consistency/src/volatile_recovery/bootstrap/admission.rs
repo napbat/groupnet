@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::volatile_recovery::{AdapterError, AdapterErrorKind};
+
 /// Distinct pools charged under one aggregate limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionClass {
@@ -48,18 +50,88 @@ pub struct AdmissionLimits {
     pub max_reservations: usize,
 }
 
+/// An [`AdmissionLimits`] rule that [`AdmissionLimits::validate`] rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionLimitsError {
+    /// `max_total_bytes` is zero.
+    ZeroTotal,
+    /// `max_reservations` is zero.
+    ZeroReservations,
+    /// The cap of this class exceeds `max_total_bytes`.
+    ClassExceedsTotal(AdmissionClass),
+}
+
+impl std::fmt::Display for AdmissionLimitsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroTotal => formatter.write_str("max_total_bytes is zero"),
+            Self::ZeroReservations => formatter.write_str("max_reservations is zero"),
+            Self::ClassExceedsTotal(class) => {
+                write!(formatter, "the {class:?} cap exceeds max_total_bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AdmissionLimitsError {}
+
 /// Failed admission never licenses an allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionError {
-    /// Limits are zero or incoherent.
-    InvalidLimits,
     /// Requested charge is zero or exceeds its class cap.
     InvalidCharge,
     /// Aggregate, class, or reservation capacity is exhausted.
     Full,
 }
 
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidCharge => "admission charge is zero or exceeds its class cap",
+            Self::Full => "admission capacity is exhausted",
+        })
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+/// A refused charge is a [`AdapterErrorKind::Capacity`] failure that keeps
+/// the admission error as its source.
+impl From<AdmissionError> for AdapterError {
+    fn from(error: AdmissionError) -> Self {
+        Self::with_source(AdapterErrorKind::Capacity, error)
+    }
+}
+
 impl AdmissionLimits {
+    /// Checks the aggregate and per-class caps. A zero class cap is valid: it
+    /// disables that class.
+    ///
+    /// # Errors
+    /// Names the zero aggregate bound or the class cap above the total.
+    pub fn validate(&self) -> Result<(), AdmissionLimitsError> {
+        if self.max_total_bytes == 0 {
+            return Err(AdmissionLimitsError::ZeroTotal);
+        }
+        if self.max_reservations == 0 {
+            return Err(AdmissionLimitsError::ZeroReservations);
+        }
+        let classes = [
+            AdmissionClass::Encoded,
+            AdmissionClass::Decoded,
+            AdmissionClass::Suffix,
+            AdmissionClass::NativeOverlap,
+            AdmissionClass::Inflight,
+        ];
+        match classes
+            .into_iter()
+            .find(|class| self.class_cap(*class) > self.max_total_bytes)
+        {
+            Some(class) => Err(AdmissionLimitsError::ClassExceedsTotal(class)),
+            None => Ok(()),
+        }
+    }
+
     const fn class_cap(self, class: AdmissionClass) -> usize {
         match class {
             AdmissionClass::Encoded => self.max_encoded_bytes,
@@ -68,16 +140,6 @@ impl AdmissionLimits {
             AdmissionClass::NativeOverlap => self.max_native_overlap_bytes,
             AdmissionClass::Inflight => self.max_inflight_bytes,
         }
-    }
-
-    const fn classes(self) -> [usize; 5] {
-        [
-            self.max_encoded_bytes,
-            self.max_decoded_bytes,
-            self.max_suffix_bytes,
-            self.max_native_overlap_bytes,
-            self.max_inflight_bytes,
-        ]
     }
 }
 
@@ -108,17 +170,9 @@ impl ByteAdmission {
     /// Constructs a bounded shared budget.
     ///
     /// # Errors
-    /// Rejects zero or incoherent limits.
-    pub fn new(limits: AdmissionLimits) -> Result<Self, AdmissionError> {
-        if limits.max_total_bytes == 0
-            || limits.max_reservations == 0
-            || limits
-                .classes()
-                .iter()
-                .any(|cap| *cap > limits.max_total_bytes)
-        {
-            return Err(AdmissionError::InvalidLimits);
-        }
+    /// Names the zero or incoherent limit [`AdmissionLimits::validate`] rejects.
+    pub fn new(limits: AdmissionLimits) -> Result<Self, AdmissionLimitsError> {
+        limits.validate()?;
         Ok(Self(Arc::new(Inner {
             limits,
             used: Mutex::new(Used::default()),
@@ -465,5 +519,40 @@ mod tests {
             AdmissionError::InvalidCharge
         );
         assert!(budget.reserve(AdmissionClass::Encoded, 1).is_ok());
+    }
+
+    #[test]
+    fn invalid_limits_name_their_rule() {
+        assert_eq!(
+            ByteAdmission::new(AdmissionLimits {
+                max_total_bytes: 0,
+                ..limits()
+            })
+            .unwrap_err(),
+            AdmissionLimitsError::ZeroTotal
+        );
+        assert_eq!(
+            AdmissionLimits {
+                max_suffix_bytes: 11,
+                ..limits()
+            }
+            .validate(),
+            Err(AdmissionLimitsError::ClassExceedsTotal(
+                AdmissionClass::Suffix
+            ))
+        );
+    }
+
+    #[test]
+    fn refused_charge_is_a_capacity_failure_with_its_cause() {
+        use std::error::Error as _;
+
+        let budget = ByteAdmission::new(limits()).unwrap();
+        let error = AdapterError::from(budget.reserve(AdmissionClass::Encoded, 11).unwrap_err());
+        assert_eq!(error.kind(), AdapterErrorKind::Capacity);
+        assert_eq!(
+            error.source().map(ToString::to_string),
+            Some(AdmissionError::InvalidCharge.to_string())
+        );
     }
 }

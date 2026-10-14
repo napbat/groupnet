@@ -11,7 +11,13 @@ use crate::volatile_recovery::bootstrap::bulk_wire::WireReply;
 use crate::volatile_recovery::bootstrap::ports::{
     DonorRequest, TransferContext, TransferResources,
 };
-use crate::volatile_recovery::{AdapterError, PublicationPermit};
+use crate::volatile_recovery::{AdapterError, AdapterErrorKind, PublicationPermit};
+
+/// A donor reply of the wrong kind or bound to another reservation.
+const MALFORMED: AdapterError = AdapterError::new(AdapterErrorKind::Malformed);
+
+/// A local resource no longer matches the effect's reservation or attachment.
+const FENCED: AdapterError = AdapterError::new(AdapterErrorKind::Fenced);
 
 impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
     #[expect(
@@ -32,7 +38,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         deadline: Instant,
     ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
         if Instant::now() >= deadline {
-            return Err(AdapterError);
+            return Err(AdapterErrorKind::Expired.into());
         }
         // Source request and correlation copies are allocated only after this
         // separate charge, which lives across the entire network await.
@@ -61,13 +67,13 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 let reply = self.request(context, op, &request, deadline).await?;
                 let event = reply.try_map(|reply| match reply {
                     WireReply::Offer(offer) => Ok(TransferEvent::Offered { op, offer }),
-                    _ => Err(AdapterError),
+                    _ => Err(MALFORMED),
                 })?;
                 Ok(Some(event))
             }
             TransferEffect::ReserveDonor { op, capture, cut } => {
                 if capture != cut.capture {
-                    return Err(AdapterError);
+                    return Err(AdapterErrorKind::InvalidInput.into());
                 }
                 let request = DonorRequest::Reserve {
                     follower: context.follower.clone(),
@@ -84,7 +90,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                         resources.reservation = Some(reservation.clone());
                         Ok(TransferEvent::DonorReserved { op, reservation })
                     }
-                    _ => Err(AdapterError),
+                    _ => Err(MALFORMED),
                 })?;
                 Ok(Some(event))
             }
@@ -93,7 +99,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 sequence,
                 max_bytes,
             } => {
-                let reservation = resources.reservation.clone().ok_or(AdapterError)?;
+                let reservation = resources.reservation.clone().ok_or(FENCED)?;
                 let request = DonorRequest::Chunk {
                     reservation,
                     sequence,
@@ -104,7 +110,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                     WireReply::Chunk(chunk) if !chunk.is_empty() && chunk.len() <= max_bytes => {
                         Ok(chunk)
                     }
-                    _ => Err(AdapterError),
+                    _ => Err(MALFORMED),
                 })?;
                 let bytes = chunk.get().len();
                 let decoded_charge = self.state.store_chunk(sequence, &chunk, resources).await?;
@@ -117,7 +123,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
             }
             TransferEffect::AttachStream { op, reservation } => {
                 if resources.reservation.as_ref() != Some(&reservation) {
-                    return Err(AdapterError);
+                    return Err(FENCED);
                 }
                 let request = DonorRequest::Attach {
                     reservation: reservation.clone(),
@@ -128,14 +134,14 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                         resources.attachment = Some(token.clone());
                         Ok(TransferEvent::StreamAttached { op, token })
                     }
-                    _ => Err(AdapterError),
+                    _ => Err(MALFORMED),
                 })?;
                 Ok(Some(event))
             }
             TransferEffect::FetchBarrier { op, reservation } => {
-                let attachment = resources.attachment.clone().ok_or(AdapterError)?;
+                let attachment = resources.attachment.clone().ok_or(FENCED)?;
                 if attachment.reservation != reservation {
-                    return Err(AdapterError);
+                    return Err(FENCED);
                 }
                 let request = DonorRequest::Barrier {
                     attachment,
@@ -156,7 +162,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                     .as_ref()
                     .is_none_or(|attachment| attachment.reservation != receipt.reservation)
                 {
-                    return Err(AdapterError);
+                    return Err(FENCED);
                 }
                 let request = DonorRequest::Batch {
                     barrier: receipt,
@@ -166,7 +172,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 let reply = self.request(context, op, &request, deadline).await?;
                 let batch = reply.try_map(|reply| match reply {
                     WireReply::Batch(batch) => Ok(batch),
-                    _ => Err(AdapterError),
+                    _ => Err(MALFORMED),
                 })?;
                 self.state.stage_batch(&batch, resources).await?;
                 Ok(Some(
@@ -187,7 +193,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 let reply = self.request(context, op, &request, deadline).await?;
                 Ok(Some(reply.try_map(|reply| match reply {
                     WireReply::Acked => Ok(TransferEvent::BatchAcknowledged { op, through }),
-                    _ => Err(AdapterError),
+                    _ => Err(MALFORMED),
                 })?))
             }
             TransferEffect::ReleaseReservation(reservation) => {
@@ -198,7 +204,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                     .request(context, context.parent, &request, deadline)
                     .await?;
                 if !matches!(reply.get(), WireReply::Released) {
-                    return Err(AdapterError);
+                    return Err(MALFORMED);
                 }
                 if resources.reservation.as_ref() == Some(&reservation) {
                     resources.attachment = None;
@@ -230,7 +236,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         self.client
             .request(self.correlation(context, op), request, deadline)
             .await
-            .map_err(|_| AdapterError)
+            .map_err(AdapterError::from)
     }
 
     async fn barrier(
@@ -243,7 +249,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         let reply = self.request(context, op, &request, deadline).await?;
         Ok(Some(reply.try_map(|reply| match reply {
             WireReply::Barrier(receipt) => Ok(TransferEvent::BarrierReceived { op, receipt }),
-            _ => Err(AdapterError),
+            _ => Err(MALFORMED),
         })?))
     }
 }

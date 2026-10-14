@@ -1,10 +1,10 @@
-//! The shell's pure corpus: the admission table, the feed names, the setup
+//! The shell's pure corpus: the admission table, the feed entries, the setup
 //! errors.
 
 use groupnet_core::NodeId;
 use groupnet_runtime::{Leadership, Role};
 
-use super::{HostedSetupError, admit, hosted_feed_name};
+use super::{HostedSetupError, admit, feed_entry_key};
 use crate::hosted::HostedError;
 
 fn node(name: &str) -> NodeId {
@@ -146,12 +146,16 @@ fn the_recovery_gate_never_changes_a_non_hosts_verdict() {
 
 #[test]
 fn write_paths_map_to_distinct_feeds() {
-    assert_eq!(hosted_feed_name(""), "hosted");
-    assert_eq!(hosted_feed_name("docs"), "hosted:docs");
-    assert_ne!(hosted_feed_name("a"), hosted_feed_name("b"));
-    // Distinct from the session tier's default feed: a hosted path and a
-    // plain one coexist on one node.
-    assert_ne!(hosted_feed_name(""), "");
+    assert_eq!(feed_entry_key(""), "~hosted/writes/d");
+    assert_eq!(feed_entry_key("docs"), "~hosted/writes/n4:docs");
+    assert_ne!(feed_entry_key("a"), feed_entry_key("b"));
+    // Outside the session tier's namespace: no plain feed name, not even the
+    // `hosted:<name>` spelling that once aliased a path, reaches one.
+    assert_ne!(
+        feed_entry_key("docs"),
+        crate::wire::entry_key("hosted:docs")
+    );
+    assert_ne!(feed_entry_key(""), crate::wire::entry_key("hosted"));
 }
 
 #[test]

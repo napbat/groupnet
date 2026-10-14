@@ -23,7 +23,7 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
 use super::lineage::{HostedRead, Lineage};
-use super::writes::hosted_feed_name;
+use super::writes::feed_entry_key;
 use crate::peers::{PeerWrite, PeerWrites};
 
 /// Subscriber half of a hosted write path: the group's authority as one ordered
@@ -54,23 +54,29 @@ use crate::peers::{PeerWrite, PeerWrites};
 ///
 /// // A gap belongs to the adopted lineage, not to a fixed peer.
 /// let mut host: Option<NodeId> = None;
+/// // Whether a ledger publication was refused by the group actor's inbox and
+/// // still has to reach the wire.
+/// let mut unpublished = false;
 /// while let Some(event) = reads.next().await {
 ///     match event {
 ///         HostedRead::Wrote { host: writer, token, key } => {
 ///             let _ = key; // apply it
-///             ledger.record(&writer, token).await;
+///             unpublished |= ledger.record(&writer, token).await.is_err();
 ///         }
 ///         HostedRead::Gap { missed_through } => {
 ///             // Flush, rebuild, or refetch before recording coverage.
 ///             if let Some(host) = &host {
-///                 ledger.record(host, missed_through).await;
+///                 unpublished |= ledger.record(host, missed_through).await.is_err();
 ///             }
 ///         }
 ///         HostedRead::Migrated { host: adopted, .. } => {
 ///             host = adopted;
 ///             // Publish this voter's fresh view even if no writes arrive.
-///             ledger.refresh().await;
+///             unpublished = true;
 ///         }
+///     }
+///     if unpublished {
+///         unpublished = ledger.refresh().await.is_err();
 ///     }
 /// }
 /// # }
@@ -117,7 +123,8 @@ impl<K> HostedReads<K> {
     }
 
     /// [`new`](Self::new) for a named write path — the counterpart of
-    /// [`HostedWrites::named`](super::HostedWrites::named) under the same name.
+    /// [`HostedWritesBuilder::name`](super::HostedWritesBuilder::name) under the
+    /// same name.
     pub fn named(
         name: &str,
         group: Group,
@@ -125,7 +132,7 @@ impl<K> HostedReads<K> {
         decode: impl Fn(&[u8]) -> Option<K> + Send + Sync + 'static,
     ) -> Self {
         let events = group.events();
-        let inner = PeerWrites::named(&hosted_feed_name(name), group.clone(), me, decode);
+        let inner = PeerWrites::at_entry(feed_entry_key(name), group.clone(), me, decode);
         Self {
             group,
             inner,

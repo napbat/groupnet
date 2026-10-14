@@ -3,19 +3,16 @@
 #![cfg(feature = "replication")]
 
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, CatchUp, Checkpoint, CheckpointLimit, InstallPermit,
-    Limits, Materialized, ReadVerdict, Replication, RevocationPermit, ScanLimit, SourceAdapter,
-    SourceBatch, TailLimit,
-};
-use groupnet_core::replication::{
-    BoundComparison, Comparison, Cursor, IdlePolicy, ProofId, Scope, SourceHistory, SourceProof,
-    Stage, Stream,
+    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
+    Comparison, Cursor, IdlePolicy, InstallPermit, Limits, Materialized, ProofId, ReadVerdict,
+    Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory,
+    SourceProof, Stage, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -225,9 +222,9 @@ fn limits() -> Limits {
     limits.core.tail_check_ms = 40;
     limits.core.attempt_timeout_ms = 500;
     limits.core.retry_ms = 20;
-    limits.core.max_batch_events = std::num::NonZeroUsize::new(2).unwrap();
-    limits.core.max_batch_bytes = std::num::NonZeroUsize::new(8).unwrap();
-    limits.max_inflight_bytes = 8;
+    limits.core.max_batch_events = NonZeroUsize::new(2).expect("nonzero");
+    limits.core.max_batch_bytes = NonZeroUsize::new(8).expect("nonzero");
+    limits.max_inflight_bytes = NonZeroUsize::new(8).expect("nonzero");
     limits.core.idle = Some(IdlePolicy {
         unchanged_checks: std::num::NonZeroU32::new(1).unwrap(),
         max_interval_ms: 160,
@@ -428,7 +425,7 @@ async fn restored_authority_rechecks_even_when_false_command_was_backpressured()
         .await;
     let source = Source::default();
     let mut config = limits();
-    config.queue_depth = 1;
+    config.queue_depth = NonZeroUsize::MIN;
     let manager = Replication::new(
         cluster.groups[0].clone(),
         source.clone(),

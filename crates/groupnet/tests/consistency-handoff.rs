@@ -8,7 +8,8 @@
 //!
 //! * `consistency-handoff` turns on the underlying crate's `handoff` (and the
 //!   `hosted` tier it is built on), so `consistency::hosted::handoff` exists and
-//!   its vocabulary is reachable at the facade's crate root like every other
+//!   its application vocabulary (`Handoff`, the source/sink traits,
+//!   `ChunkLimit`) is reachable at the facade's crate root like every other
 //!   tier's;
 //! * it turns on the facade's own `bulk`, so `transport::bulk` — the
 //!   `DataPlane` a fetch is driven over — is there to drive it with;
@@ -25,10 +26,11 @@
 
 use std::io;
 
-use bytes::Bytes;
+use groupnet::consistency::hosted::Watermarks;
+use groupnet::consistency::hosted::handoff::{Bytes, Offered};
 use groupnet::consistency::{
-    CommitLedger, Frontier, Handoff, Offered, Snapshot, SnapshotChunks, SnapshotSink,
-    SnapshotSource, Watermarks, WriteToken,
+    ChunkLimit, CommitLedger, Frontier, Handoff, Snapshot, SnapshotChunks, SnapshotSink,
+    SnapshotSource, WriteToken,
 };
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
@@ -57,7 +59,10 @@ struct FixedSource(Watermarks, Vec<Bytes>);
 impl SnapshotSource for FixedSource {
     type Chunks = FixedChunks;
 
-    fn open(&self) -> impl Future<Output = io::Result<Snapshot<FixedChunks>>> {
+    fn open(&self, limit: ChunkLimit) -> impl Future<Output = io::Result<Snapshot<FixedChunks>>> {
+        // A source sizes its chunks to the limit it is handed; these are fixed
+        // and tiny, so they only have to fit it.
+        assert!(self.1.iter().all(|chunk| limit.admits(chunk.len())));
         std::future::ready(Ok(Snapshot {
             covers: self.0.clone(),
             chunks: FixedChunks(self.1.clone().into_iter()),
@@ -155,7 +160,9 @@ async fn a_handoff_runs_over_the_facades_two_planes() {
     // The fold that turns a transfer into evidence, reached from the facade too.
     let ledger = CommitLedger::new(groups[0].1.clone());
     let (frontier, view) = Frontier::new();
-    Handoff::seed(&receipt, &ledger, &frontier).await;
+    Handoff::seed(&receipt, &ledger, &frontier)
+        .await
+        .expect("the seeded ledger is enqueued");
     assert_eq!(ledger.watermarks(), covers);
     for (writer, token) in &covers {
         assert!(view.reached(writer, *token).await, "barrier on {writer}");

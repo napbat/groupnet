@@ -1,6 +1,9 @@
 use super::*;
+use crate::volatile_recovery::AdapterErrorKind;
 use groupnet_core::Time;
 use groupnet_testkit::cluster::eventually_within;
+use std::error::Error as _;
+use std::future::ready;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const SETTLE: Duration = Duration::from_secs(2);
@@ -10,7 +13,20 @@ struct Adapter {
     revokes: AtomicUsize,
     origin_attempts: AtomicUsize,
     fail_origin: AtomicBool,
+    /// Stage, class, and source text of each failure the core consumed.
+    failures: Mutex<Vec<(RecoveryStage, AdapterErrorKind, Option<String>)>>,
 }
+
+#[derive(Debug)]
+struct OriginOutage;
+
+impl std::fmt::Display for OriginOutage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("origin outage")
+    }
+}
+
+impl std::error::Error for OriginOutage {}
 
 impl RecoveryAdapter for Adapter {
     fn revoke_serving(&self) {
@@ -22,22 +38,23 @@ impl RecoveryAdapter for Adapter {
         _op: RecoveryOperation,
         _distrust_bodies: bool,
         _permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async { Ok(()) })
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Ok(()))
     }
 
     fn rebuild_origin(
         &self,
         _op: RecoveryOperation,
         _permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            self.origin_attempts.fetch_add(1, Ordering::SeqCst);
-            if self.fail_origin.load(Ordering::SeqCst) {
-                Err(AdapterError)
-            } else {
-                Ok(())
-            }
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        self.origin_attempts.fetch_add(1, Ordering::SeqCst);
+        ready(if self.fail_origin.load(Ordering::SeqCst) {
+            Err(AdapterError::with_source(
+                AdapterErrorKind::Unavailable,
+                OriginOutage,
+            ))
+        } else {
+            Ok(())
         })
     }
 
@@ -45,20 +62,24 @@ impl RecoveryAdapter for Adapter {
         &self,
         _op: RecoveryOperation,
         _limits: RecoveryConfig,
-    ) -> BoxRecoveryFuture<'_, PeerObservation> {
-        Box::pin(async { Err(AdapterError) })
+    ) -> impl Future<Output = PeerObservation> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
     fn wait_frontiers(
         &self,
         _op: RecoveryOperation,
         _heads: Vec<(NodeId, Mark)>,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
     fn affirm(&self, _op: RecoveryOperation) -> bool {
         true
+    }
+
+    fn operation_failed(&self, stage: RecoveryStage, error: AdapterError) {
+        lock(&self.failures).push((stage, error.kind(), error.source().map(ToString::to_string)));
     }
 
     fn fell_back(&self, _from: RecoveryStage, _reason: RecoveryFallback) {}
@@ -283,6 +304,38 @@ fn open_without_executor_returns_typed_error() {
 }
 
 #[test]
+fn rejected_core_config_is_the_open_error_source() {
+    let adapter = Arc::new(Adapter::default());
+    let config = RecoveryConfig {
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
+        total_ms: 0,
+        attempt_ms: 20,
+        settle_ms: 1,
+        poll_ms: 1,
+    };
+    let error = RecoveryHandle::open(
+        adapter,
+        config,
+        RecoveryMode::Unleased,
+        NodeId::from("me"),
+        1,
+    )
+    .expect_err("zero total budget is rejected");
+    let RecoveryOpenError::Core(core) = error else {
+        panic!("expected the core's rejection, got {error:?}");
+    };
+    assert_eq!(error.to_string(), "recovery core rejected the open");
+    assert_eq!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<RecoveryError>()),
+        Some(&core)
+    );
+}
+
+#[test]
 fn affirmation_expiring_during_callback_never_opens_gate() {
     let shared = shared();
     let config = RecoveryConfig {
@@ -493,6 +546,11 @@ async fn optional_rearm_recovers_after_a_long_origin_outage_without_a_restart_si
     .await;
     assert!(!handle.status().may_serve);
     assert!(adapter.origin_attempts.load(Ordering::SeqCst) >= 2);
+    assert!(lock(&adapter.failures).contains(&(
+        RecoveryStage::Rebuilding,
+        AdapterErrorKind::Unavailable,
+        Some("origin outage".to_owned()),
+    )));
 
     adapter.fail_origin.store(false, Ordering::SeqCst);
     eventually_within("automatic rearm reaches Ready", SETTLE, || {

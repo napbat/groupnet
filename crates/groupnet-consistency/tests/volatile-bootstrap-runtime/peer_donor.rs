@@ -1,6 +1,7 @@
 //! A remote Ready donor serving one follower's peer transfer.
 
 use super::*;
+use groupnet_consistency::volatile_recovery::bootstrap::ports::StageResources;
 
 #[derive(Debug)]
 pub(super) struct PeerDonor {
@@ -80,32 +81,28 @@ impl PeerDonor {
     fn admitted(
         admission: &ByteAdmission,
         event: TransferEvent,
-    ) -> Result<
-        Option<
-            groupnet_consistency::volatile_recovery::bootstrap::admission::Admitted<TransferEvent>,
-        >,
-        AdapterError,
-    > {
-        let charge = admission
-            .reserve(AdmissionClass::Inflight, 256)
-            .map_err(|_| AdapterError)?;
+    ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
+        let charge = admission.reserve(AdmissionClass::Inflight, 256)?;
         Ok(Some(charge.hold(event)))
     }
 }
 
+/// A transfer effect inconsistent with this donor's single offer.
+const INVALID: AdapterError = AdapterError::new(AdapterErrorKind::InvalidInput);
+
 impl DonorPort for PeerDonor {
     type Image = Vec<u8>;
     type Stage = Vec<u8>;
-    type Attachment = groupnet_core::volatile_bootstrap::journal::AttachToken;
+    type Attachment = AttachToken;
     type NativeBuffer = Vec<u8>;
 
-    fn build_local_capture<'a>(
-        &'a self,
+    fn build_local_capture(
+        &self,
         _request: LocalCaptureRequest,
-        _admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
+        _admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<LocalCaptureOutcome<Self::Image>, AdapterError>> + Send {
         self.local_builds.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Err(AdapterError) })
+        std::future::ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
     fn retire_local_capture(&self, _capture: &DonorCapture<Self::Image>) {}
@@ -117,183 +114,164 @@ impl DonorPort for PeerDonor {
         _now: Time,
         _admission: &ByteAdmission,
     ) -> Result<DonorReply, AdapterError> {
-        Err(AdapterError)
+        Err(AdapterErrorKind::Unsupported.into())
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "the in-memory port maps each transfer phase to one exact test event"
     )]
-    fn execute<'a>(
-        &'a self,
-        context: &'a TransferContext,
+    async fn execute(
+        &self,
+        context: &TransferContext,
         effect: TransferEffect,
-        resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-        admission: &'a ByteAdmission,
+        resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
+        admission: &ByteAdmission,
         permit: Option<PublicationPermit>,
         _deadline: Instant,
-    ) -> BoxRecoveryFuture<
-        'a,
-        Result<
-            Option<
-                groupnet_consistency::volatile_recovery::bootstrap::admission::Admitted<
-                    TransferEvent,
-                >,
-            >,
-            AdapterError,
-        >,
-    > {
-        Box::pin(async move {
-            match effect {
-                TransferEffect::FetchOffer { op, .. } => {
-                    let charge = admission
-                        .reserve(AdmissionClass::Inflight, 256)
-                        .map_err(|_| AdapterError)?;
-                    Ok(Some(charge.hold(TransferEvent::Offered {
-                        op,
-                        offer: self.offer.clone(),
-                    })))
-                }
-                TransferEffect::ReserveStage {
+    ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
+        match effect {
+            TransferEffect::FetchOffer { op, .. } => {
+                let charge = admission.reserve(AdmissionClass::Inflight, 256)?;
+                Ok(Some(charge.hold(TransferEvent::Offered {
                     op,
-                    encoded_bytes,
-                    decoded_bytes,
-                    ..
-                } => {
-                    let encoded = admission
-                        .reserve(AdmissionClass::Encoded, encoded_bytes)
-                        .map_err(|_| AdapterError)?;
-                    let decoded = admission
-                        .reserve(AdmissionClass::Decoded, decoded_bytes)
-                        .map_err(|_| AdapterError)?;
-                    resources.stage = Some(groupnet_consistency::volatile_recovery::bootstrap::ports::StageResources::new(Vec::new(), encoded, decoded)?);
-                    Self::admitted(admission, TransferEvent::StageReserved { op })
-                }
-                TransferEffect::ReserveDonor { op, capture, cut } => {
-                    if capture != self.offer.capture || cut != self.offer.image_cut {
-                        return Err(AdapterError);
-                    }
-                    let reservation = self
-                        .journal
-                        .lock()
-                        .unwrap()
-                        .reserve(Time(1), context.follower.clone(), &cut)
-                        .map_err(|_| AdapterError)?;
-                    Self::admitted(admission, TransferEvent::DonorReserved { op, reservation })
-                }
-                TransferEffect::FetchChunk { op, sequence, .. } => {
-                    if sequence >= self.offer.chunks {
-                        return Err(AdapterError);
-                    }
-                    tokio::time::sleep(Duration::from_millis(self.chunk_ms)).await;
-                    let stage = resources.stage.as_mut().ok_or(AdapterError)?;
-                    stage.stage_mut().push(42);
-                    Self::admitted(
-                        admission,
-                        TransferEvent::ChunkStored {
-                            op,
-                            sequence,
-                            bytes: 1,
-                            decoded_charge: 1,
-                        },
-                    )
-                }
-                TransferEffect::VerifyImage { op, commitment } => {
-                    if commitment != [9; 32]
-                        || resources.stage.as_mut().is_none_or(|stage| {
-                            stage.stage_mut().as_slice() != vec![42; self.offer.chunks].as_slice()
-                        })
-                    {
-                        return Err(AdapterError);
-                    }
-                    Self::admitted(admission, TransferEvent::ImageVerified { op, commitment })
-                }
-                TransferEffect::AttachStream { op, reservation } => {
-                    let mut journal = self.journal.lock().unwrap();
-                    let token = journal
-                        .begin_attach(Time(1), &reservation)
-                        .map_err(|_| AdapterError)?;
-                    journal
-                        .confirm_attach(Time(1), &token)
-                        .map_err(|_| AdapterError)?;
-                    resources.attachment = Some(token.clone());
-                    Self::admitted(admission, TransferEvent::StreamAttached { op, token })
-                }
-                TransferEffect::FetchBarrier { op, reservation } => {
-                    let receipt = self
-                        .journal
-                        .lock()
-                        .unwrap()
-                        .barrier(Time(1), &reservation)
-                        .map_err(|_| AdapterError)?;
-                    Self::admitted(admission, TransferEvent::BarrierReceived { op, receipt })
-                }
-                TransferEffect::CheckNativeCoverage { op, receipt, .. } => {
-                    let coverage = NativeCoverageReceipt {
-                        parent: context.parent,
-                        staged_through: receipt.cursor.clone(),
-                        proven_cuts: receipt.covered_cuts.clone(),
-                        members: receipt.members.clone(),
-                        barrier: receipt,
-                        buffered_bytes: 0,
-                    };
-                    Self::admitted(admission, TransferEvent::NativeCovered { op, coverage })
-                }
-                TransferEffect::InstallCandidate { op, coverage } => {
-                    if self.pause_install.load(Ordering::SeqCst) {
-                        self.install_started.notify_one();
-                        self.resume_install.notified().await;
-                    }
-                    let permit = permit.ok_or(AdapterError)?;
-                    let stage = resources.stage.take().ok_or(AdapterError)?;
-                    let attachment = resources.attachment.clone().ok_or(AdapterError)?;
-                    permit
-                        .publish(|| {
-                            stage.install(|image| *self.live.lock().unwrap() = Some(image));
-                            self.installed.fetch_add(1, Ordering::SeqCst);
-                        })
-                        .ok_or(AdapterError)?;
-                    let handoff = NativeHandoffReceipt {
-                        recovery: permit.operation(),
-                        install: op,
-                        attachment,
-                        schema: 1,
-                        applier_generation: 1,
-                        continued_cuts: coverage.proven_cuts.clone(),
-                        buffered_bytes: 0,
-                        coverage: *coverage,
-                    };
-                    Self::admitted(
-                        admission,
-                        TransferEvent::Installed {
-                            op,
-                            handoff: Box::new(handoff),
-                        },
-                    )
-                }
-                TransferEffect::ReleaseReservation(reservation) => {
-                    let _ = self.journal.lock().unwrap().release(Time(1), &reservation);
-                    resources.attachment = None;
-                    Ok(None)
-                }
-                TransferEffect::DiscardStage { .. } => {
-                    resources.stage = None;
-                    resources.native_overlap = None;
-                    Ok(None)
-                }
-                _ => Err(AdapterError),
+                    offer: self.offer.clone(),
+                })))
             }
-        })
+            TransferEffect::ReserveStage {
+                op,
+                encoded_bytes,
+                decoded_bytes,
+                ..
+            } => {
+                let encoded = admission.reserve(AdmissionClass::Encoded, encoded_bytes)?;
+                let decoded = admission.reserve(AdmissionClass::Decoded, decoded_bytes)?;
+                resources.stage = Some(StageResources::new(Vec::new(), encoded, decoded)?);
+                Self::admitted(admission, TransferEvent::StageReserved { op })
+            }
+            TransferEffect::ReserveDonor { op, capture, cut } => {
+                if capture != self.offer.capture || cut != self.offer.image_cut {
+                    return Err(INVALID);
+                }
+                let reservation = self
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .reserve(Time(1), context.follower.clone(), &cut)
+                    .map_err(fenced)?;
+                Self::admitted(admission, TransferEvent::DonorReserved { op, reservation })
+            }
+            TransferEffect::FetchChunk { op, sequence, .. } => {
+                if sequence >= self.offer.chunks {
+                    return Err(INVALID);
+                }
+                tokio::time::sleep(Duration::from_millis(self.chunk_ms)).await;
+                let stage = resources.stage.as_mut().ok_or(AdapterErrorKind::Fenced)?;
+                stage.stage_mut().push(42);
+                Self::admitted(
+                    admission,
+                    TransferEvent::ChunkStored {
+                        op,
+                        sequence,
+                        bytes: 1,
+                        decoded_charge: 1,
+                    },
+                )
+            }
+            TransferEffect::VerifyImage { op, commitment } => {
+                if commitment != [9; 32]
+                    || resources.stage.as_mut().is_none_or(|stage| {
+                        stage.stage_mut().as_slice() != vec![42; self.offer.chunks].as_slice()
+                    })
+                {
+                    return Err(AdapterErrorKind::Malformed.into());
+                }
+                Self::admitted(admission, TransferEvent::ImageVerified { op, commitment })
+            }
+            TransferEffect::AttachStream { op, reservation } => {
+                let mut journal = self.journal.lock().unwrap();
+                let token = journal
+                    .begin_attach(Time(1), &reservation)
+                    .map_err(fenced)?;
+                journal.confirm_attach(Time(1), &token).map_err(fenced)?;
+                resources.attachment = Some(token.clone());
+                Self::admitted(admission, TransferEvent::StreamAttached { op, token })
+            }
+            TransferEffect::FetchBarrier { op, reservation } => {
+                let receipt = self
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .barrier(Time(1), &reservation)
+                    .map_err(fenced)?;
+                Self::admitted(admission, TransferEvent::BarrierReceived { op, receipt })
+            }
+            TransferEffect::CheckNativeCoverage { op, receipt, .. } => {
+                let coverage = NativeCoverageReceipt {
+                    parent: context.parent,
+                    staged_through: receipt.cursor.clone(),
+                    proven_cuts: receipt.covered_cuts.clone(),
+                    members: receipt.members.clone(),
+                    barrier: receipt,
+                    buffered_bytes: 0,
+                };
+                Self::admitted(admission, TransferEvent::NativeCovered { op, coverage })
+            }
+            TransferEffect::InstallCandidate { op, coverage } => {
+                if self.pause_install.load(Ordering::SeqCst) {
+                    self.install_started.notify_one();
+                    self.resume_install.notified().await;
+                }
+                let permit = permit.ok_or(AdapterErrorKind::Fenced)?;
+                let stage = resources.stage.take().ok_or(AdapterErrorKind::Fenced)?;
+                let attachment = resources
+                    .attachment
+                    .clone()
+                    .ok_or(AdapterErrorKind::Fenced)?;
+                permit
+                    .publish(|| {
+                        stage.install(|image| *self.live.lock().unwrap() = Some(image));
+                        self.installed.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .ok_or(AdapterErrorKind::Fenced)?;
+                let handoff = NativeHandoffReceipt {
+                    recovery: permit.operation(),
+                    install: op,
+                    attachment,
+                    schema: 1,
+                    applier_generation: 1,
+                    continued_cuts: coverage.proven_cuts.clone(),
+                    buffered_bytes: 0,
+                    coverage: *coverage,
+                };
+                Self::admitted(
+                    admission,
+                    TransferEvent::Installed {
+                        op,
+                        handoff: Box::new(handoff),
+                    },
+                )
+            }
+            TransferEffect::ReleaseReservation(reservation) => {
+                let _ = self.journal.lock().unwrap().release(Time(1), &reservation);
+                resources.attachment = None;
+                Ok(None)
+            }
+            TransferEffect::DiscardStage { .. } => {
+                resources.stage = None;
+                resources.native_overlap = None;
+                Ok(None)
+            }
+            _ => Err(AdapterErrorKind::Unsupported.into()),
+        }
     }
 
-    fn detach<'a>(
-        &'a self,
-        _token: groupnet_core::volatile_bootstrap::journal::AttachToken,
-        resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>> {
-        Box::pin(async move {
-            resources.attachment = None;
-            Ok(())
-        })
+    fn detach(
+        &self,
+        _token: AttachToken,
+        resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        resources.attachment = None;
+        std::future::ready(Ok(()))
     }
 }

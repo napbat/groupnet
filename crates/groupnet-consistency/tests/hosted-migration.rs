@@ -34,10 +34,10 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use groupnet_consistency::hosted::{commit_applied_by, commit_reading, hosted_feed_name};
+use groupnet_consistency::hosted::{advertised_path_head, commit_applied_by, commit_reading};
 use groupnet_consistency::{
     CAP_HOSTED, Commit, CommitLedger, CommitOutcome, Completeness, HostedError, HostedRead,
-    HostedReads, HostedWrites, WriteToken, advertised_head_named,
+    HostedReads, HostedWrites, WriteToken,
 };
 use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster, placement};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node, Role};
@@ -167,14 +167,13 @@ impl Voter {
             .advertise_capabilities([CAP_HOSTED])
             .expect("the advertisement is enqueued");
         let ledger = Arc::new(CommitLedger::new(handle.clone()));
-        let writes = HostedWrites::committed(
-            handle.clone(),
-            id.clone(),
-            cap(RING),
-            |key: &String| key.clone().into_bytes(),
-            Arc::clone(&ledger),
-        )
-        .expect("a Quorum group supports the committed regime");
+        let writes =
+            HostedWrites::builder(handle.clone(), id.clone(), cap(RING), |key: &String| {
+                key.clone().into_bytes()
+            })
+            .committed(Arc::clone(&ledger))
+            .build()
+            .expect("a Quorum group supports the committed regime");
         Self {
             id,
             node: Some(node),
@@ -245,7 +244,7 @@ impl Voter {
                             .push(Seen::Wrote(writer.clone(), token));
                         // The apply happens here, before the record — that
                         // ordering is the whole meaning of a watermark.
-                        ledger.record(&writer, token).await;
+                        ledger.record(&writer, token).await.expect("enqueued");
                     }
                     HostedRead::Gap { missed_through } => {
                         log.lock().expect("log").push(Seen::Gap(missed_through));
@@ -253,7 +252,7 @@ impl Voter {
                         // raises belongs to the lineage's host, which the
                         // preceding `Migrated` named.
                         if let Some(host) = &host {
-                            ledger.record(host, missed_through).await;
+                            ledger.record(host, missed_through).await.expect("enqueued");
                         }
                     }
                     HostedRead::Migrated {
@@ -264,7 +263,7 @@ impl Voter {
                             .expect("log")
                             .push(Seen::Migrated(epoch, adopted.clone()));
                         host = adopted;
-                        ledger.refresh().await;
+                        ledger.refresh().await.expect("enqueued");
                     }
                 }
             }
@@ -548,7 +547,7 @@ async fn commit_then_strand_a_tail(
         eventually_within(
             "the tail to reach the survivors' entry views",
             SETTLE,
-            || advertised_head_named(&hosted_feed_name(""), &group, &old_host) == Some(tail),
+            || advertised_path_head("", &group, &old_host) == Some(tail),
         )
         .await;
     }
@@ -590,7 +589,7 @@ async fn a_serving_host_cuts_its_predecessors_late_tail() {
         async move {
             loop {
                 for ledger in &ledgers {
-                    ledger.refresh().await;
+                    ledger.refresh().await.expect("enqueued");
                 }
                 tokio::time::sleep(RESTAMP).await;
             }

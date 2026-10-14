@@ -10,7 +10,7 @@
 //!
 //! # The three tasks
 //!
-//! [`Leases::new`] spawns one task per half of the protocol:
+//! [`LeasesBuilder::start`] spawns one task per half of the protocol:
 //!
 //! * **The renewal ticker.** Every [`LeaseConfig::renew_every`] it records the
 //!   publish instant `s_i` and advertises the resulting [`RenewalId`] under a
@@ -18,7 +18,7 @@
 //!   enqueued, which is the inequality the reader's whole window rests on.
 //! * **The granter.** On any change to a peer's renewal entry (and on
 //!   membership churn, on a lagged event stream, and on a slow backstop tick)
-//!   it re-folds every renewal it can see into one wholesale `~lease:g` entry
+//!   it re-folds every renewal it can see into one wholesale grant-map entry
 //!   and republishes it — but only when the bytes changed, so a group whose
 //!   readers renew in lockstep does not re-author an identical map per event.
 //! * **The view.** On any group change (and on the same backstop tick) it
@@ -66,7 +66,7 @@
 //!
 //! The tasks hold an [`Arc`] of the shared state, never a [`Leases`] — so
 //! dropping the handle really does run its [`Drop`], which aborts them. A drop
-//! **does not** retract the `~lease` entry: it is exactly the shape of this
+//! **does not** retract the renewal entry: it is exactly the shape of this
 //! process dying, and the entry must lapse on the *granters'* clocks, which is
 //! the guarantee the writer's slow path is built on. [`Leases::leave`] is the
 //! graceful counterpart for a planned departure.
@@ -83,6 +83,7 @@ use std::time::{Duration, Instant};
 
 use groupnet_core::{Config, NodeId};
 use groupnet_runtime::{CommandRejected, Group};
+use tokio::runtime::{Handle, TryCurrentError};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
@@ -93,9 +94,9 @@ use super::grants::GrantLedger;
 use super::tasks;
 use super::wire::{
     GrantMap, RenewalId, decode_grants, decode_renewal, encode_grants, encode_renewal,
-    grant_entry_key, renewal_entry_key, validate_name,
+    grant_entry_key, renewal_entry_key,
 };
-use super::{CAP_LEASE, LeaseConfig, LeaseState, wall_clock_epoch};
+use super::{CAP_LEASE, LeaseConfig, LeaseConfigError, LeaseState, wall_clock_epoch};
 
 mod writes;
 
@@ -349,8 +350,8 @@ impl Shared {
     /// The reader's guard is the latch this also sets, and it deliberately does
     /// *not* re-arm — see the module docs for why the two halves differ.
     fn warmed_up(&self) -> bool {
-        let warm = self.started.elapsed()
-            >= warmup_window(self.group.config(), self.group.members().len());
+        let warm =
+            self.started.elapsed() >= warmup_window(self.group.config(), self.group.roster().len());
         if warm {
             // Relaxed: this flag guards no data of its own (the core it gates is
             // behind a mutex), so there is nothing for an acquire/release pair
@@ -408,7 +409,7 @@ impl fmt::Debug for Leases {
 }
 
 impl Drop for Leases {
-    /// Stops renewing, granting and ingesting — and **leaves the `~lease` entry
+    /// Stops renewing, granting and ingesting — and **leaves the renewal entry
     /// alone**.
     ///
     /// That is deliberate. A drop is the shape of this process dying, and the
@@ -424,42 +425,103 @@ impl Drop for Leases {
     }
 }
 
-impl Leases {
-    /// Joins the default lease set of `group` as `me`, under `cfg`, and starts
-    /// renewing, granting and ingesting.
-    ///
-    /// The lease life's epoch is the wall clock at construction (see
-    /// [`with_epoch`](Self::with_epoch)); the state starts at
-    /// [`LeaseState::NeedsResync`], because a node that has just booted has
-    /// missed every invalidation issued while it was down.
-    ///
-    /// # Panics
-    /// If called outside a Tokio runtime — this spawns the tier's tasks.
+/// Why a lease set did not start. Nothing was spawned or published.
+#[derive(Debug)]
+pub enum LeaseStartError {
+    /// The [`LeaseConfig`] is outside the envelope the tier can honour.
+    InvalidConfig(LeaseConfigError),
+    /// There is no current Tokio runtime to own the set's background tasks.
+    NoRuntime(TryCurrentError),
+}
+
+impl fmt::Display for LeaseStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LeaseStartError::InvalidConfig(_) => f.write_str("invalid lease configuration"),
+            LeaseStartError::NoRuntime(_) => {
+                f.write_str("a lease set must start inside a Tokio runtime")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LeaseStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LeaseStartError::InvalidConfig(error) => Some(error),
+            LeaseStartError::NoRuntime(error) => Some(error),
+        }
+    }
+}
+
+impl From<LeaseConfigError> for LeaseStartError {
+    fn from(error: LeaseConfigError) -> Self {
+        LeaseStartError::InvalidConfig(error)
+    }
+}
+
+/// Configures one lease set before anything runs: which set, which life, and
+/// what tuning. [`start`](Self::start) validates, then spawns the set's tasks —
+/// so the first renewal on the wire already carries the chosen epoch.
+#[derive(Debug)]
+pub struct LeasesBuilder {
+    group: Group,
+    me: NodeId,
+    set: Option<String>,
+    epoch: Option<u64>,
+    config: LeaseConfig,
+}
+
+impl LeasesBuilder {
+    /// Joins a named lease set instead of the default one. Independent
+    /// subsystems sharing one group name their sets so their entries stay
+    /// apart. Any name is valid — none is reserved — and every name (the
+    /// empty one included) is a set distinct from the default set.
     #[must_use]
-    pub fn new(group: Group, me: NodeId, cfg: LeaseConfig) -> Self {
-        Self::named("", group, me, cfg)
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.set = Some(name.into());
+        self
     }
 
-    /// A named lease set — independent subsystems sharing one group name their
-    /// sets so their entries stay apart. An empty name is the default set.
-    ///
-    /// A `cfg` outside [`LeaseConfig::validate`]'s envelope still *runs*, in the
-    /// fail-closed direction each variant documents; a debug build asserts on it
-    /// rather than letting a typo'd margin turn into a reader that never serves.
-    ///
-    /// # Panics
-    /// If `name` contains `:`, or if it is `"g"`: a set named `g` would author
-    /// its renewals into `~lease:g`, which is the default set's grant entry.
-    /// Also if called outside a Tokio runtime.
+    /// The lease life's epoch. Use a durable, strictly-increasing per-node
+    /// counter (a boot counter, a WAL generation) when the wall-clock default
+    /// is not trustworthy across restarts, exactly as with
+    /// [`WriteFeed::with_epoch`](crate::WriteFeed::with_epoch). Without it the
+    /// epoch is the wall clock at [`start`](Self::start).
     #[must_use]
-    pub fn named(name: &str, group: Group, me: NodeId, cfg: LeaseConfig) -> Self {
-        validate_name(name);
-        debug_assert!(
-            cfg.validate().is_ok(),
-            "lease config outside its own envelope: {:?}",
-            cfg.validate()
-        );
-        let epoch = wall_clock_epoch();
+    pub fn epoch(mut self, epoch: u64) -> Self {
+        self.epoch = Some(epoch);
+        self
+    }
+
+    /// The set's tuning; [`LeaseConfig::default`] without it.
+    #[must_use]
+    pub fn config(mut self, config: LeaseConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Validates the configuration and starts renewing, granting and
+    /// ingesting on the current Tokio runtime.
+    ///
+    /// The state starts at [`LeaseState::NeedsResync`], because a node that
+    /// has just booted has missed every invalidation issued while it was down.
+    ///
+    /// # Errors
+    /// [`LeaseStartError::InvalidConfig`] for a config outside
+    /// [`LeaseConfig::validate`]'s envelope, [`LeaseStartError::NoRuntime`]
+    /// outside a Tokio runtime. Either way nothing was spawned or published.
+    pub fn start(self) -> Result<Leases, LeaseStartError> {
+        self.config.validate()?;
+        let runtime = Handle::try_current().map_err(LeaseStartError::NoRuntime)?;
+        let Self {
+            group,
+            me,
+            set,
+            epoch,
+            config: cfg,
+        } = self;
+        let epoch = epoch.unwrap_or_else(wall_clock_epoch);
         let core = LeaseCore::new(me.clone(), &cfg, epoch);
         let ledger = GrantLedger::new(me.clone(), &cfg, epoch, ClockMs::ZERO);
         let (serve, _) = watch::channel(None);
@@ -467,8 +529,8 @@ impl Leases {
             group,
             me,
             cfg,
-            renewal_key: renewal_entry_key(name),
-            grant_key: grant_entry_key(name),
+            renewal_key: renewal_entry_key(set.as_deref()),
+            grant_key: grant_entry_key(set.as_deref()),
             started: Instant::now(),
             warmed: Arc::new(AtomicBool::new(false)),
             core: Arc::new(Mutex::new(core)),
@@ -477,40 +539,33 @@ impl Leases {
             serve: Arc::new(serve),
             left: AtomicBool::new(false),
         });
-        let tasks = tasks::spawn(&shared);
-        Self { shared, tasks }
+        let tasks = tasks::spawn(&runtime, &shared);
+        Ok(Leases { shared, tasks })
+    }
+}
+
+impl Leases {
+    /// Joins the default lease set of `group` as `me`, under `cfg`, with a
+    /// wall-clock epoch — [`builder`](Self::builder) with only a config.
+    ///
+    /// # Errors
+    /// As [`LeasesBuilder::start`].
+    pub fn new(group: Group, me: NodeId, cfg: LeaseConfig) -> Result<Self, LeaseStartError> {
+        Self::builder(group, me).config(cfg).start()
     }
 
-    /// Replaces the lease life's epoch. Use a durable, strictly-increasing
-    /// per-node counter (a boot counter, a WAL generation) when the wall-clock
-    /// default is not trustworthy across restarts, exactly as with
-    /// [`WriteFeed::with_epoch`](crate::WriteFeed::with_epoch).
-    ///
-    /// Chain it directly onto the constructor. The renewal ticker's first turn
-    /// fires at construction, so one renewal of the boot epoch may already be
-    /// on the wire; this re-seeds the core and the grant ledger and immediately
-    /// publishes a renewal of the new epoch over it. Both directions are safe —
-    /// grants against the abandoned epoch never confirm
-    /// ([`LeaseCore::observe_grant_map`]), and the re-seeded ledger presumes
-    /// everything was granted at its birth — so the worst case is a few
-    /// milliseconds of frozen confirmation, never a window nobody granted.
+    /// Configures this node's participation in a lease set of `group` as
+    /// `me`: a named set, a durable epoch, a tuning. Nothing runs until
+    /// [`LeasesBuilder::start`].
     #[must_use]
-    pub fn with_epoch(self, epoch: u64) -> Self {
-        *lock(&self.shared.core) = LeaseCore::new(self.shared.me.clone(), &self.shared.cfg, epoch);
-        *lock(&self.shared.ledger) = GrantLedger::new(
-            self.shared.me.clone(),
-            &self.shared.cfg,
-            epoch,
-            self.shared.now(),
-        );
-        let _ = self.shared.renew();
-        publish_serve(
-            &self.shared.core,
-            &self.shared.serve,
-            self.shared.now(),
-            &self.shared.warmed,
-        );
-        self
+    pub fn builder(group: Group, me: NodeId) -> LeasesBuilder {
+        LeasesBuilder {
+            group,
+            me,
+            set: None,
+            epoch: None,
+            config: LeaseConfig::default(),
+        }
     }
 
     /// This lease set's tuning.

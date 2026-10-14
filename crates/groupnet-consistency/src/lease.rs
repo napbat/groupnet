@@ -21,11 +21,13 @@
 //!
 //! # The protocol, in one page
 //!
-//! * **Renew.** A reader publishes `~lease` — one [`RenewalId`] under a TTL of
+//! * **Renew.** A reader publishes its renewal entry (`~lease/r/…`, see
+//!   [`renewal_entry_key`]) — one [`RenewalId`] under a TTL of
 //!   one lease duration — every [`LeaseConfig::renew_every`], recording the
 //!   instant `s_i` *before* each write is enqueued.
 //! * **Grant.** Every member folds the renewals it has adopted into one
-//!   wholesale `~lease:g` entry: `(reader, epoch, seq)` per reader, replace
+//!   wholesale grant-map entry (`~lease/g/…`, see [`grant_entry_key`]):
+//!   `(reader, epoch, seq)` per reader, replace
 //!   semantics, no TTL, plus a row under its own id naming the life that
 //!   authored it ([`GranterLife`]). That is a granter saying "I have seen this
 //!   reader's lease and I will wait for it". A granter grants a reader that
@@ -170,7 +172,7 @@
 //!   16-byte entry per reader per [`LeaseConfig::renew_every`], riding the
 //!   gossip cadence that already exists.
 //! * **Grants are not.** A granter re-folds and republishes its *whole*
-//!   `~lease:g` map on every peer renewal it adopts (and when one of its
+//!   grant map on every peer renewal it adopts (and when one of its
 //!   writes ends), so each member authors up to `N − 1` rewrites of an
 //!   `O(N)`-entry value per renewal interval — `O(N²)` bytes per member per
 //!   interval, before dissemination charges its own fanout. The granter's
@@ -214,7 +216,7 @@ use groupnet_core::NodeId;
 pub use self::coherence::{CoherenceCore, CoherenceStep, WaitMember};
 pub use self::core::{ClockMs, LeaseCore};
 pub use self::grants::GrantLedger;
-pub use self::shell::{LeaseView, Leases};
+pub use self::shell::{LeaseStartError, LeaseView, Leases, LeasesBuilder};
 pub use self::wire::{
     GrantMap, GranterLife, RenewalId, decode_grants, decode_renewal, encode_grants, encode_renewal,
     grant_entry_key, renewal_entry_key,
@@ -249,43 +251,68 @@ pub struct LeaseConfig {
     /// How long a granted serve-lease lasts (`D`). The writer's worst-case
     /// stall on a silent peer, and the reader's window between confirmations.
     pub duration: Duration,
-    /// How often the reader republishes its renewal. Must be well inside
-    /// `duration` — the default is `duration / 3`, so two consecutive lost
-    /// renewals still leave the lease standing.
+    /// How often the reader republishes its renewal. Must be nonzero and at
+    /// most `duration / 2` — the default is `duration / 3`, so two consecutive
+    /// lost renewals still leave the lease standing.
     pub renew_every: Duration,
     /// Reader-side safety margin subtracted from every serve window, for
-    /// clock-*rate* skew between the reader and its granters. Defaults to
-    /// `max(duration / 100, 5ms)`; see the honesty box on what it does and
-    /// does not buy.
+    /// clock-*rate* skew between the reader and its granters. Must be below
+    /// `duration`. Defaults to `max(duration / 100, 5ms)`; see the honesty box
+    /// on what it does and does not buy.
     pub rate_margin: Duration,
 }
 
-/// Why a [`LeaseConfig`] cannot be honoured as written.
+/// Why a [`LeaseConfig`] cannot be honoured as written — one variant per
+/// violated rule, naming the field. [`Leases`] refuses to start on any of
+/// them; nothing is clamped or corrected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseConfigError {
-    /// `duration` rounds to zero milliseconds. Zero is the engine's
-    /// "never expires" TTL — a lease that never expires is precisely the stale
-    /// claim this tier exists to prevent — so it is clamped to 1 ms, which is
-    /// certainly not what the caller meant.
-    DurationTooShort,
-    /// `renew_every` is zero (a spinning ticker) or past `duration / 2`, which
-    /// leaves no room for a single lost renewal.
-    RenewalCadence,
+    /// `duration` is under one millisecond. Zero is the engine's "never
+    /// expires" TTL — a lease that never expires is precisely the stale claim
+    /// this tier exists to prevent.
+    DurationTooShort {
+        /// The rejected `duration`.
+        duration: Duration,
+    },
+    /// `renew_every` is zero: a spinning ticker.
+    RenewEveryZero,
+    /// `renew_every` is past `duration / 2`, which leaves no room for a single
+    /// lost renewal.
+    RenewEveryTooLong {
+        /// The rejected `renew_every`.
+        renew_every: Duration,
+        /// The largest `renew_every` this `duration` allows.
+        max: Duration,
+    },
     /// `rate_margin` is at or past `duration`: no serve window can ever open,
-    /// so the reader would never serve. Fail-closed rather than clamped — the
-    /// margin is a safety number and this layer must not quietly shrink it.
-    MarginTooLarge,
+    /// so the reader would never serve.
+    RateMarginTooLarge {
+        /// The rejected `rate_margin`.
+        rate_margin: Duration,
+        /// The lease `duration` it must stay below.
+        duration: Duration,
+    },
 }
 
 impl fmt::Display for LeaseConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            LeaseConfigError::DurationTooShort => "lease duration rounds to zero milliseconds",
-            LeaseConfigError::RenewalCadence => {
-                "renew_every must be non-zero and at most half the lease duration"
+        match self {
+            LeaseConfigError::DurationTooShort { duration } => {
+                write!(f, "lease duration {duration:?} is under one millisecond")
             }
-            LeaseConfigError::MarginTooLarge => "rate_margin leaves no serve window",
-        })
+            LeaseConfigError::RenewEveryZero => f.write_str("lease renew_every must be nonzero"),
+            LeaseConfigError::RenewEveryTooLong { renew_every, max } => write!(
+                f,
+                "lease renew_every {renew_every:?} exceeds half the duration ({max:?})"
+            ),
+            LeaseConfigError::RateMarginTooLarge {
+                rate_margin,
+                duration,
+            } => write!(
+                f,
+                "lease rate_margin {rate_margin:?} leaves no serve window in {duration:?}"
+            ),
+        }
     }
 }
 
@@ -315,29 +342,43 @@ impl LeaseConfig {
     /// Whether this configuration is inside the envelope the tier can honour.
     ///
     /// # Errors
-    /// [`LeaseConfigError`], one variant per way it is not — each of which
-    /// still *runs*, in the fail-closed direction (see the variants).
+    /// [`LeaseConfigError`], naming the first violated rule.
     pub fn validate(&self) -> Result<(), LeaseConfigError> {
         if self.duration.as_millis() == 0 {
-            return Err(LeaseConfigError::DurationTooShort);
+            return Err(LeaseConfigError::DurationTooShort {
+                duration: self.duration,
+            });
         }
-        if self.renew_every.is_zero() || self.renew_every * 2 > self.duration {
-            return Err(LeaseConfigError::RenewalCadence);
+        if self.renew_every.is_zero() {
+            return Err(LeaseConfigError::RenewEveryZero);
+        }
+        let max = self.duration / 2;
+        if self.renew_every > max {
+            return Err(LeaseConfigError::RenewEveryTooLong {
+                renew_every: self.renew_every,
+                max,
+            });
         }
         if self.rate_margin >= self.duration {
-            return Err(LeaseConfigError::MarginTooLarge);
+            return Err(LeaseConfigError::RateMarginTooLarge {
+                rate_margin: self.rate_margin,
+                duration: self.duration,
+            });
         }
         Ok(())
     }
 
-    /// The lease duration in milliseconds, never zero — a zero TTL is the
-    /// engine's "never expires".
+    /// The lease duration in whole milliseconds — the TTL the renewal carries.
+    /// Never zero for a validated config; the sans-IO cores also floor it at
+    /// 1 ms so that a core driven with an unvalidated config never asks the
+    /// engine for its "never expires" TTL.
     #[must_use]
     pub fn duration_ms(&self) -> u64 {
         clamp_ms(self.duration).max(1)
     }
 
-    /// The renewal interval in milliseconds, never zero.
+    /// The renewal interval in whole milliseconds, floored at 1 ms like
+    /// [`duration_ms`](Self::duration_ms).
     #[must_use]
     pub fn renew_every_ms(&self) -> u64 {
         clamp_ms(self.renew_every).max(1)
@@ -449,28 +490,48 @@ mod tests {
     #[test]
     fn validation_names_each_way_a_config_is_unhonourable() {
         let sub_ms = LeaseConfig::for_duration(Duration::from_micros(500));
-        assert_eq!(sub_ms.validate(), Err(LeaseConfigError::DurationTooShort));
-        // …and the duration the core actually uses is clamped off zero, which
-        // is the engine's "never expires".
-        assert_eq!(sub_ms.duration_ms(), 1);
+        assert_eq!(
+            sub_ms.validate(),
+            Err(LeaseConfigError::DurationTooShort {
+                duration: Duration::from_micros(500)
+            })
+        );
 
         let lazy = LeaseConfig {
             renew_every: Duration::from_millis(1_500),
             ..LeaseConfig::default()
         };
-        assert_eq!(lazy.validate(), Err(LeaseConfigError::RenewalCadence));
+        assert_eq!(
+            lazy.validate(),
+            Err(LeaseConfigError::RenewEveryTooLong {
+                renew_every: Duration::from_millis(1_500),
+                max: Duration::from_secs(1),
+            })
+        );
         let spinning = LeaseConfig {
             renew_every: Duration::ZERO,
             ..LeaseConfig::default()
         };
-        assert_eq!(spinning.validate(), Err(LeaseConfigError::RenewalCadence));
-        assert_eq!(spinning.renew_every_ms(), 1, "clamped off a spin");
+        assert_eq!(spinning.validate(), Err(LeaseConfigError::RenewEveryZero));
 
         let paranoid = LeaseConfig {
             rate_margin: Duration::from_secs(2),
             ..LeaseConfig::default()
         };
-        assert_eq!(paranoid.validate(), Err(LeaseConfigError::MarginTooLarge));
+        assert_eq!(
+            paranoid.validate(),
+            Err(LeaseConfigError::RateMarginTooLarge {
+                rate_margin: Duration::from_secs(2),
+                duration: Duration::from_secs(2),
+            })
+        );
+        assert!(
+            paranoid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("rate_margin")
+        );
     }
 
     #[test]

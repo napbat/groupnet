@@ -3,6 +3,7 @@
 //! The child owns advisory claim and private transfer resources. It never
 //! opens the read gate or spawns another recovery task.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,7 +14,15 @@ use groupnet_core::volatile_bootstrap::{BootstrapMemberIdentity, BootstrapOperat
 use groupnet_core::volatile_recovery::{RecoveryEvent, RecoveryOperation};
 
 use super::admission::Admitted;
-use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit};
+use crate::volatile_recovery::{PublicationPermit, ReadyCapturePermit};
+
+/// One erased child operation. [`BootstrapDriver`] is held as
+/// `Box<dyn BootstrapDriver>` so a [`RecoveryHandle`] keeps one type with or
+/// without a bootstrap child; its asynchronous methods therefore return boxed
+/// futures, unlike the statically dispatched adapter traits.
+///
+/// [`RecoveryHandle`]: crate::volatile_recovery::RecoveryHandle
+pub type BootstrapFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// One bounded acquisition outcome under the original outer operation.
 #[derive(Debug)]
@@ -80,6 +89,16 @@ pub enum BootstrapBindingError {
     Stale,
 }
 
+impl std::fmt::Display for BootstrapBindingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stale => formatter.write_str("bootstrap result belongs to a replaced operation"),
+        }
+    }
+}
+
+impl std::error::Error for BootstrapBindingError {}
+
 /// Type-erased, opt-in child held by the one existing recovery worker.
 ///
 /// A concrete implementation owns one `ClaimEngine`, one `TransferSession`
@@ -97,17 +116,17 @@ pub trait BootstrapDriver: Send + 'static {
         &mut self,
         recovery: RecoveryOperation,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, BootstrapOutcome>;
+    ) -> BootstrapFuture<'_, BootstrapOutcome>;
 
     /// Retire exact candidate work while keeping this process's scoped presence.
-    fn cancel(&mut self, recovery: RecoveryOperation) -> BoxRecoveryFuture<'_, ()>;
+    fn cancel(&mut self, recovery: RecoveryOperation) -> BootstrapFuture<'_, ()>;
 
     /// Terminal worker shutdown withdraws process presence as well as candidates.
-    fn shutdown(&mut self) -> BoxRecoveryFuture<'_, ()>;
+    fn shutdown(&mut self) -> BootstrapFuture<'_, ()>;
 
     /// Withdraw the exact old donor capture on a locally built baseline's
     /// lease lapse, retaining only presence until the outer proof completes.
-    fn suspend_local(&mut self, recovery: RecoveryOperation) -> BoxRecoveryFuture<'_, ()>;
+    fn suspend_local(&mut self, recovery: RecoveryOperation) -> BootstrapFuture<'_, ()>;
 
     /// Bind a suspended local image to a newly affirmed outer generation.
     /// No old publication permission or donor capture becomes valid again.
@@ -126,7 +145,7 @@ pub trait BootstrapDriver: Send + 'static {
     fn peer_roster(
         &mut self,
         due: Instant,
-    ) -> BoxRecoveryFuture<'_, Option<Vec<BootstrapMemberIdentity>>>;
+    ) -> BootstrapFuture<'_, Option<Vec<BootstrapMemberIdentity>>>;
 
     /// Earliest claim renewal, journal expiry, or source operation deadline.
     fn next_deadline(&self) -> Option<Instant>;
@@ -141,5 +160,5 @@ pub trait BootstrapDriver: Send + 'static {
         &mut self,
         now: Instant,
         ready: Option<ReadyCapturePermit>,
-    ) -> BoxRecoveryFuture<'_, ()>;
+    ) -> BootstrapFuture<'_, ()>;
 }

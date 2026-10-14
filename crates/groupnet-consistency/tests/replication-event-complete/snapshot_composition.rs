@@ -5,10 +5,9 @@ use std::time::Instant;
 
 use super::*;
 use groupnet_consistency::replication::{
-    SnapshotApplicationAdapter, SnapshotAttachment, SnapshotHold, SnapshotImage,
-    SnapshotSourceAdapter, SnapshotStage,
+    Operation, SnapshotApplicationAdapter, SnapshotAttachment, SnapshotConfig, SnapshotHold,
+    SnapshotImage, SnapshotOffer, SnapshotSourceAdapter, SnapshotStage, Time,
 };
-use groupnet_core::replication::{Operation, SnapshotConfig, SnapshotOffer};
 
 fn unused<T>() -> Result<T, AdapterFailure<io::Error>> {
     Err(AdapterFailure::Terminal(io::Error::other(
@@ -25,7 +24,7 @@ impl SnapshotSourceAdapter for MemSource {
         &self,
         _scope: Scope,
         _request: Operation,
-        _total_due: groupnet_core::Time,
+        _total_due: Time,
         _wall_deadline: Instant,
         _limit: SnapshotConfig,
     ) -> impl Future<Output = Result<SnapshotHold<()>, AdapterFailure<io::Error>>> + Send {
@@ -163,7 +162,7 @@ async fn native_snapshot_state_sync_and_named_events_compose_without_snapshot_de
         )
         .expect("named open");
     eventually_within("named registration protected", SETTLE, || {
-        handle.status().stage == groupnet_core::replication::Stage::Protected
+        handle.status().stage == Stage::Protected
     })
     .await;
 }

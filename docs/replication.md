@@ -335,7 +335,13 @@ replica memory. Domain memory admission remains necessary. Queues hold at most
 32 commands per scope. An operation has a 30-second deadline including capacity
 waits; three retries use a one-second delay. Replay-only tail checks currently
 run every five seconds for each registered scope. These are configurable
-starting limits, not measured throughput or latency guarantees.
+starting limits, not measured throughput or latency guarantees. Shell counts
+and byte reserves in `Limits` are `NonZeroUsize`; `Limits::validate` reports
+the first violated cross-field rule as a `LimitsError` variant naming the
+field(s) and values (for example `InflightBelowBatch` or
+`SnapshotParallelOpsBelowTwo`), and carries a failed core `Config::validate`
+as `LimitsError::Core(CoreConfigError)`, whose `source()` is that core error.
+Nothing is clamped.
 
 Snapshots are opt-in: `Config.snapshot` defaults to `None`. Callers provide
 finite image, chunk, metadata, decoded-candidate, and total-attempt limits;
@@ -347,7 +353,10 @@ checks the remaining rules and names the first violation as a typed
 `Idle(IdlePolicyError)`); its `source()` exposes the nested policy error.
 Separate snapshot admission reserves ordinary replay operation,
 batch-byte, and checkpoint capacity. The runtime validates those reserves
-before opening sessions. Optional `IdlePolicy` provides bounded backoff and
+before opening sessions: `Replication::new`/`new_native` return
+`OpenError::InvalidLimits` with the `LimitsError` as its `source()`, and
+`OpenError::SnapshotLimitsUnsupported`/`SnapshotLimitsRequired` when
+`Config.snapshot` does not match the chosen constructor. Optional `IdlePolicy` provides bounded backoff and
 deterministic jitter without extending read freshness; only explicitly opened
 scopes have workers. See [idle source checks](#idle-source-checks).
 Source-owned retained-history byte and age limits remain separate. Snapshot
@@ -543,6 +552,10 @@ unchanged.
 
 The `groupnet-consistency` `replication` feature supplies the async manager;
 the facade exposes it with `consistency-replication`. Replay-only is the default.
+`groupnet_consistency::replication` re-exports every core domain type its
+adapter signatures, limits, statuses, and errors name (`Scope`, `Cursor`,
+`SourceProof`, `CoreConfig`, the subscription and acknowledgement types, …),
+so adapters need no `groupnet_core` path; the sans-IO engine stays in core.
 Typed source and application adapters keep native positions and batches outside the
 core. Core-issued load and install operations restore an atomic checkpoint
 before replay. The manager bounds registration, commands, operation admission,

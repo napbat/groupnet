@@ -169,16 +169,19 @@ where
     /// Adds source-backed named event delivery before opening sessions.
     ///
     /// # Errors
-    /// Returns invalid configuration for limits that fail
-    /// [`SubscriptionLimits::validate`], or when `StateSync` sessions are
-    /// already open.
+    /// Returns [`OpenError::InvalidSubscriptionLimits`] naming the violated
+    /// rule, or
+    /// [`OpenError::SessionsStarted`] when `StateSync` sessions are already open.
     pub fn with_event_complete<D: DurableEventSink<S::Position, S::Batch>>(
         self,
         sink: D,
         limits: SubscriptionLimits,
     ) -> Result<EventSubscriptions<S, A, D, M>, OpenError> {
-        if limits.validate().is_err() || !lock(&self.inner.sessions).is_empty() {
-            return Err(OpenError::InvalidConfig);
+        limits
+            .validate()
+            .map_err(OpenError::InvalidSubscriptionLimits)?;
+        if !lock(&self.inner.sessions).is_empty() {
+            return Err(OpenError::SessionsStarted);
         }
         Ok(EventSubscriptions {
             replication: self,
@@ -210,8 +213,9 @@ where
     /// Opens one stable subscriber identity under an exact fresh incarnation.
     ///
     /// # Errors
-    /// Returns duplicate, wrong-group, invalid identity, or shared-capacity
-    /// backpressure before source or sink work begins.
+    /// Returns duplicate, wrong-group, [`OpenError::InvalidScope`],
+    /// [`OpenError::InvalidStartPosition`], [`OpenError::StartRejected`], or
+    /// shared-capacity backpressure before source or sink work begins.
     #[expect(
         clippy::too_many_lines,
         reason = "registration validation, admission, and atomic worker publication stay in one lifecycle operation"
@@ -248,7 +252,7 @@ where
             core_config,
             session_id.get(),
         )
-        .map_err(|_| OpenError::InvalidConfig)?;
+        .map_err(OpenError::InvalidScope)?;
         let initial = match start {
             SubscriptionStart::StartAt {
                 position,
@@ -260,7 +264,7 @@ where
                     .inner
                     .source
                     .cursor(scope, &position)
-                    .map_err(|_| OpenError::InvalidConfig)?;
+                    .map_err(|failure| OpenError::InvalidStartPosition(failure.class()))?;
                 engine.step(Event::StartSubscription {
                     request: Box::new(RegisterSubscriber {
                         key: key.clone(),
@@ -296,7 +300,7 @@ where
                     .inner
                     .source
                     .cursor(scope, &position)
-                    .map_err(|_| OpenError::InvalidConfig)?;
+                    .map_err(|failure| OpenError::InvalidStartPosition(failure.class()))?;
                 engine.step(Event::StartSubscription {
                     request: Box::new(RegisterSubscriber {
                         key: key.clone(),
@@ -311,11 +315,11 @@ where
                 })
             }
         };
-        if initial.rejection.is_some() {
-            return Err(OpenError::InvalidConfig);
+        if let Some(reason) = initial.rejection {
+            return Err(OpenError::StartRejected(reason));
         }
         let reservation = self.replication.inner.reserve_registration(session_id)?;
-        let (commands, receiver) = mpsc::channel(self.replication.inner.limits.queue_depth);
+        let (commands, receiver) = mpsc::channel(self.replication.inner.limits.queue_depth.get());
         let (updates, published) = watch::channel(NamedPublished {
             state: engine.state().clone(),
             source_ack: None,

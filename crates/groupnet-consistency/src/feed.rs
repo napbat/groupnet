@@ -7,14 +7,84 @@ use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use groupnet_runtime::Group;
+use groupnet_runtime::{CommandRejected, Group};
 
+use crate::publish::enqueue;
 use crate::token::WriteToken;
 use crate::wire::{Frame, entry_key};
 
-/// Attempts before giving up on advertising a frame under inbox
-/// backpressure (the ring keeps the write; the next publish re-carries it).
-const PUBLISH_RETRIES: usize = 8;
+/// A feed change that was recorded in the ring locally but whose
+/// advertisement the group actor's bounded inbox refused (or the actor has
+/// shut down).
+///
+/// The change is **not lost**: the ring is state, not a log, so the next
+/// successful [`WriteFeed::publish`] or [`WriteFeed::republish`] carries it.
+/// `token` is the change's position — the write's (or the seal's) token —
+/// and stays valid as a read-your-writes token, but no peer can observe it
+/// until a later advertisement succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unadvertised {
+    /// The token of the change that was recorded but not advertised.
+    pub token: WriteToken,
+    /// Why the advertisement was not enqueued.
+    pub cause: CommandRejected,
+}
+
+impl fmt::Display for Unadvertised {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "feed change ({}, {}) recorded but not advertised: {}",
+            self.token.epoch, self.token.seq, self.cause
+        )
+    }
+}
+
+impl std::error::Error for Unadvertised {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// Why [`WriteFeed::publish`] did not end with an advertised write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishError {
+    /// The feed life is sealed ([`WriteFeed::seal`]); nothing was recorded.
+    Sealed,
+    /// The write was recorded but its advertisement was refused.
+    Unadvertised(Unadvertised),
+}
+
+impl PublishError {
+    /// The token of the recorded write, when there is one: `Some` for
+    /// [`Unadvertised`](Self::Unadvertised) (the write is in the ring and a
+    /// later advertisement carries it), `None` for [`Sealed`](Self::Sealed).
+    #[must_use]
+    pub fn recorded(&self) -> Option<WriteToken> {
+        match self {
+            PublishError::Sealed => None,
+            PublishError::Unadvertised(unadvertised) => Some(unadvertised.token),
+        }
+    }
+}
+
+impl fmt::Display for PublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PublishError::Sealed => f.write_str("the feed life is sealed: no write may follow"),
+            PublishError::Unadvertised(unadvertised) => unadvertised.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for PublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PublishError::Sealed => None,
+            PublishError::Unadvertised(unadvertised) => Some(unadvertised),
+        }
+    }
+}
 
 type EncodeFn<K> = dyn Fn(&K) -> Vec<u8> + Send + Sync;
 
@@ -97,11 +167,13 @@ fn wall_clock_epoch() -> u64 {
 
 /// Publisher half: advertises this node's writes to the group.
 ///
-/// Call [`WriteFeed::publish`] after every local durable write. The feed is
-/// best-effort under actor-inbox backpressure — a dropped advertisement is
-/// re-carried by the next publish (the ring is state, not a log); call
-/// [`WriteFeed::republish`] at quiescence points if the last write must be
-/// advertised promptly.
+/// Call [`WriteFeed::publish`] after every local durable write. Recording is
+/// local and synchronous; advertising enqueues the ring's frame into the
+/// group actor's bounded inbox. A refused enqueue is reported
+/// ([`Unadvertised`]) and the change stays in the ring — the next successful
+/// publish carries it (the ring is state, not a log) — so call
+/// [`WriteFeed::republish`] when the last change must be advertised promptly.
+/// Success means *enqueued*, never *delivered*.
 pub struct WriteFeed<K> {
     group: Group,
     key: String,
@@ -150,10 +222,22 @@ impl<K> WriteFeed<K> {
         capacity: NonZeroUsize,
         encode: impl Fn(&K) -> Vec<u8> + Send + Sync + 'static,
     ) -> Self {
+        Self::at_entry(entry_key(name), group, capacity, encode)
+    }
+
+    /// A feed gossiped under the tier-owned entry `key`, for a tier (such as
+    /// a hosted write path) whose feeds must not share a session feed's
+    /// entry namespace.
+    pub(crate) fn at_entry(
+        key: String,
+        group: Group,
+        capacity: NonZeroUsize,
+        encode: impl Fn(&K) -> Vec<u8> + Send + Sync + 'static,
+    ) -> Self {
         let max_frame_bytes = group.config().max_delta_frame_bytes.get();
         Self {
             group,
-            key: entry_key(name),
+            key,
             ring: Mutex::new(Ring {
                 epoch: wall_clock_epoch(),
                 first_seq: 1,
@@ -215,30 +299,39 @@ impl<K> WriteFeed<K> {
     /// future is polled), so even a dropped future is re-carried by the
     /// next publish. The future borrows only the feed, not `key`.
     ///
-    /// # Panics
-    /// Panics after [`seal`](Self::seal): a sealed life promised its peers
-    /// that no write follows the seal, and one that did could be missed by a
-    /// subscriber that already crossed into the writer's next life.
+    /// # Errors
+    /// - [`PublishError::Sealed`] after [`seal`](Self::seal): a sealed life
+    ///   promised its peers that no write follows the seal, and one that did
+    ///   could be missed by a subscriber that already crossed into the
+    ///   writer's next life. Nothing is recorded.
+    /// - [`PublishError::Unadvertised`] when the write was recorded but the
+    ///   group actor refused its advertisement; see [`Unadvertised`].
     pub fn publish<'feed>(
         &'feed self,
         key: &K,
-    ) -> impl Future<Output = WriteToken> + Send + use<'feed, K> {
-        let token = {
+    ) -> impl Future<Output = Result<WriteToken, PublishError>> + Send + use<'feed, K> {
+        let recorded = {
             let mut ring = self
                 .ring
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(!ring.sealed, "WriteFeed::publish after the feed was sealed");
-            let token = WriteToken {
-                epoch: ring.epoch,
-                seq: ring.first_seq + ring.keys.len() as u64,
-            };
-            ring.push((self.encode)(key));
-            token
+            if ring.sealed {
+                Err(PublishError::Sealed)
+            } else {
+                let token = WriteToken {
+                    epoch: ring.epoch,
+                    seq: ring.first_seq + ring.keys.len() as u64,
+                };
+                ring.push((self.encode)(key));
+                Ok(token)
+            }
         };
         async move {
-            self.advertise_current().await;
-            token
+            let token = recorded?;
+            self.advertise_current()
+                .await
+                .map_err(|cause| PublishError::Unadvertised(Unadvertised { token, cause }))?;
+            Ok(token)
         }
     }
 
@@ -261,7 +354,12 @@ impl<K> WriteFeed<K> {
     /// the application made durable but never published through this feed is
     /// exactly the loss a restart gap covers, and a seal would hide it.
     /// Sealing again resolves to the same token.
-    pub fn seal(&self) -> impl Future<Output = WriteToken> + Send + '_ {
+    ///
+    /// # Errors
+    /// [`Unadvertised`] when the seal was recorded but the group actor refused
+    /// its advertisement: the life is sealed locally either way, and a later
+    /// [`republish`](Self::republish) carries the sealed frame.
+    pub fn seal(&self) -> impl Future<Output = Result<WriteToken, Unadvertised>> + Send + '_ {
         let token = {
             let mut ring = self
                 .ring
@@ -274,8 +372,10 @@ impl<K> WriteFeed<K> {
             }
         };
         async move {
-            self.advertise_current().await;
-            token
+            self.advertise_current()
+                .await
+                .map_err(|cause| Unadvertised { token, cause })?;
+            Ok(token)
         }
     }
 
@@ -295,9 +395,17 @@ impl<K> WriteFeed<K> {
     /// token cannot restore retired entries or move sequence identity backward.
     ///
     /// The ring is shortened synchronously before the returned future is
-    /// polled. If its advertisement meets sustained inbox backpressure, the
-    /// next [`publish`](Self::publish) re-carries the compacted window.
-    pub fn retire_through(&self, token: WriteToken) -> impl Future<Output = ()> + Send + '_ {
+    /// polled, and only a change is advertised.
+    ///
+    /// # Errors
+    /// [`CommandRejected`] when the window was shortened locally but the group
+    /// actor refused its advertisement; the next successful
+    /// [`publish`](Self::publish) or [`republish`](Self::republish) carries
+    /// the compacted window.
+    pub fn retire_through(
+        &self,
+        token: WriteToken,
+    ) -> impl Future<Output = Result<(), CommandRejected>> + Send + '_ {
         let changed = {
             let mut ring = self
                 .ring
@@ -307,39 +415,37 @@ impl<K> WriteFeed<K> {
         };
         async move {
             if changed {
-                self.advertise_current().await;
+                self.advertise_current().await?;
             }
+            Ok(())
         }
     }
 
-    /// Re-advertises the current feed without recording a new write —
-    /// useful at quiescence points after a `publish` hit backpressure.
-    pub fn republish(&self) -> impl Future<Output = ()> + Send + '_ {
+    /// Re-advertises the current feed without recording a new write — the
+    /// retry path after an [`Unadvertised`] or a rejected retirement, and
+    /// useful at quiescence points.
+    ///
+    /// # Errors
+    /// [`CommandRejected`] when the group actor's bounded inbox refused every
+    /// enqueue attempt, or the actor has shut down.
+    pub fn republish(&self) -> impl Future<Output = Result<(), CommandRejected>> + Send + '_ {
         self.advertise_current()
     }
 
-    async fn advertise_current(&self) {
-        for _ in 0..PUBLISH_RETRIES {
-            // Enqueue while holding the ring lock: a concurrent publish or
-            // retirement can only mutate after this frame is ordered into the
-            // actor inbox, so delayed/out-of-order futures cannot advertise an
-            // older window over a newer one.
-            let advertised = {
-                let ring = self
-                    .ring
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                self.group
-                    .set_entry(self.key.clone(), ring.frame().encode(), None)
-                    .is_ok()
-            };
-            if advertised {
-                return;
-            }
-            // Inbox backpressure: yield and retry; on sustained pressure the
-            // ring re-carries this write on the next publish.
-            tokio::task::yield_now().await;
-        }
+    async fn advertise_current(&self) -> Result<(), CommandRejected> {
+        // Enqueue while holding the ring lock: a concurrent publish or
+        // retirement can only mutate after this frame is ordered into the
+        // actor inbox, so delayed/out-of-order futures cannot advertise an
+        // older window over a newer one.
+        enqueue(|| {
+            let ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.group
+                .set_entry(self.key.clone(), ring.frame().encode(), None)
+        })
+        .await
     }
 }
 

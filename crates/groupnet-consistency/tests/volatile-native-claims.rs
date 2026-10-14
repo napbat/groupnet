@@ -1,19 +1,30 @@
 //! Native Groupnet claims are bounded TTL hints, never read authority.
 #![cfg(feature = "volatile-recovery")]
 
+use std::num::NonZeroUsize;
+
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, ByteAdmission,
 };
-use groupnet_consistency::volatile_recovery::bootstrap::native_claims::NativeClaimSource;
+use groupnet_consistency::volatile_recovery::bootstrap::native_claims::{
+    NativeClaimSource, NativeClaimSourceError,
+};
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
     ClaimObservationLimits, ClaimSource,
 };
-use groupnet_core::Status;
-use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapClaim, BootstrapConfig, BootstrapOperation, BootstrapPresence, BootstrapScope,
-    ClaimIdentity, ClaimPhase, PresenceIdentity, claim_entry_key, presence_entry_key,
+use groupnet_consistency::volatile_recovery::bootstrap::{
+    BootId, BootstrapClaim, BootstrapConfig, BootstrapConfigError, BootstrapOperation,
+    BootstrapPresence, BootstrapScope, ClaimIdentity, ClaimPhase, PresenceIdentity,
 };
+use groupnet_core::Status;
+use groupnet_core::volatile_bootstrap::{claim_entry_key, presence_entry_key};
 use groupnet_testkit::cluster::{MemCluster, eventually};
+
+const VALUE_BYTES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+
+fn nz(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).expect("nonzero")
+}
 
 fn policy() -> BootstrapConfig {
     BootstrapConfig {
@@ -84,6 +95,49 @@ fn presence(node: groupnet_core::NodeId, boot: u128, session: u64) -> BootstrapP
     }
 }
 
+/// Each violated construction rule is named, never collapsed into one error.
+#[tokio::test]
+async fn construction_names_each_rejected_argument() {
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
+    let group = &cluster.groups[0];
+    let open = |scope, policy, max_key_bytes, max_value_bytes| {
+        NativeClaimSource::new(
+            group.clone(),
+            scope,
+            policy,
+            max_key_bytes,
+            max_value_bytes,
+            admission(),
+        )
+        .unwrap_err()
+    };
+    let long = BootstrapScope {
+        domain: "d".repeat(64),
+        partition: "p".into(),
+    };
+    assert_eq!(
+        open(long, policy(), 128, VALUE_BYTES),
+        NativeClaimSourceError::ScopeTooLong
+    );
+    let invalid = BootstrapConfig {
+        max_members: nz(usize::MAX),
+        ..policy()
+    };
+    let error = open(scope(), invalid, 128, VALUE_BYTES);
+    assert_eq!(
+        error,
+        NativeClaimSourceError::Policy(BootstrapConfigError::UnboundedMaxMembers)
+    );
+    assert_eq!(
+        std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<BootstrapConfigError>()),
+        Some(&BootstrapConfigError::UnboundedMaxMembers)
+    );
+    let error = open(scope(), policy(), 4, VALUE_BYTES);
+    assert!(matches!(error, NativeClaimSourceError::ClaimKey(_)));
+    assert!(std::error::Error::source(&error).is_some());
+}
+
 /// A process restarted under the same member name publishes its new life's
 /// presence while the survivor still holds the previous life's unexpired one.
 #[tokio::test]
@@ -96,8 +150,9 @@ async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_prese
         groupnet_testkit::cluster::spawn_mem_node(&net, "re-b", &["re-a"], &opts).await;
     groupnet_testkit::cluster::converged(&[&a_group, &b_group]).await;
     let budget = admission();
-    let source =
-        |group| NativeClaimSource::new(group, scope(), policy(), 128, 256, budget.clone()).unwrap();
+    let source = |group| {
+        NativeClaimSource::new(group, scope(), policy(), 128, VALUE_BYTES, budget.clone()).unwrap()
+    };
     let old = source(b_group.clone());
     old.publish_presence(presence(b_id.clone(), 7, 8))
         .await
@@ -128,7 +183,7 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -137,7 +192,7 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -192,7 +247,7 @@ async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_a
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -251,7 +306,7 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -260,7 +315,7 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -361,7 +416,7 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -370,7 +425,7 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -446,7 +501,7 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -455,7 +510,7 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();
@@ -508,7 +563,7 @@ async fn failed_converted_admission_retires_raw_actor_response_first() {
         scope(),
         policy(),
         128,
-        256,
+        VALUE_BYTES,
         budget.clone(),
     )
     .unwrap();

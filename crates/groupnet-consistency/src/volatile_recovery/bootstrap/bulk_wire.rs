@@ -13,7 +13,9 @@ mod transport;
 pub use phase::{
     PhaseLimits, WireReply, decode_reply, decode_request, encode_reply, encode_request,
 };
-pub use transport::{BootstrapBulkClient, BootstrapBulkListener, BulkError, BulkLimits};
+pub use transport::{
+    BootstrapBulkClient, BootstrapBulkListener, BulkError, BulkLimits, BulkLimitsError,
+};
 
 const MAGIC: [u8; 4] = *b"GBST";
 // Peers upgrade together: this byte only rejects a mis-deployed peer, and it

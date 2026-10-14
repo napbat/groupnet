@@ -21,7 +21,7 @@ use groupnet_core::volatile_recovery::RecoveryOperation;
 
 use super::admission::{AdmissionClass, Admitted, ByteAdmission, Reservation};
 use crate::volatile_recovery::{
-    AdapterError, BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit,
+    AdapterError, AdapterErrorKind, PublicationPermit, ReadyCapturePermit,
 };
 
 /// Complete, source-observed roster and native TTL claims for one scope.
@@ -90,61 +90,64 @@ pub struct ClaimObservationLimits {
 /// The source must enforce member count, identity bytes, and combined
 /// metadata bytes before it allocates a snapshot. An unreadable or malformed
 /// record is an error, not absence. A TTL claim is never serving authority or
-/// an origin write log.
+/// an origin write log. The asynchronous methods return `Send` futures;
+/// implement them as `async fn` or with an `async move` body.
 pub trait ClaimSource: Send + Sync + 'static {
     /// Publish or renew exact scoped participation through native TTL and
     /// revision fencing. It conveys no donor or serving authority.
     fn publish_presence(
         &self,
         presence: groupnet_core::volatile_bootstrap::BootstrapPresence,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 
     /// Best-effort conditional withdrawal of this exact worker presence.
     fn withdraw_presence(
         &self,
         identity: groupnet_core::volatile_bootstrap::PresenceIdentity,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 
     /// Read complete native membership, long-lived participation, and
-    /// transient builder claims from one bounded actor cut.
-    fn observe_participation<'a>(
-        &'a self,
+    /// transient builder claims from one bounded actor cut. The default
+    /// source has no participation records and fails with
+    /// [`AdapterErrorKind::Unsupported`].
+    fn observe_participation(
+        &self,
         op: BootstrapOperation,
         limits: ClaimObservationLimits,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<Admitted<ParticipationSnapshot>, AdapterError>> {
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<Admitted<ParticipationSnapshot>, AdapterError>> + Send {
         let _ = (op, limits, admission);
-        Box::pin(async { Err(AdapterError) })
+        async { Err(AdapterErrorKind::Unsupported.into()) }
     }
 
     /// Publish or renew one exact local claim under native TTL semantics.
     fn publish_claim(
         &self,
         claim: BootstrapClaim,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 
     /// Best-effort withdrawal of one exact local claim incarnation.
     fn withdraw_claim(
         &self,
         selected: ClaimIdentity,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 
     /// Read a complete bounded member and claim snapshot.
-    fn observe_claims<'a>(
-        &'a self,
+    fn observe_claims(
+        &self,
         op: BootstrapOperation,
         limits: ClaimObservationLimits,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<Admitted<ClaimSnapshot>, AdapterError>>;
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<Admitted<ClaimSnapshot>, AdapterError>> + Send;
 
     /// Read one exact selected claim, including its native TTL and renewal.
-    fn observe_selected_claim<'a>(
-        &'a self,
+    fn observe_selected_claim(
+        &self,
         op: BootstrapOperation,
         selected: ClaimIdentity,
         limits: ClaimObservationLimits,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TimedClaim>>, AdapterError>>;
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<Option<Admitted<TimedClaim>>, AdapterError>> + Send;
 }
 
 /// Private stage owned by the recovery worker, with real memory charges.
@@ -163,11 +166,12 @@ impl<S> StageResources<S> {
     /// Binds a newly created private stage to pre-acquired memory permits.
     ///
     /// # Errors
-    /// Rejects reservations charged to the wrong byte classes.
+    /// Rejects reservations charged to the wrong byte classes as
+    /// [`AdapterErrorKind::InvalidInput`].
     pub fn new(stage: S, encoded: Reservation, decoded: Reservation) -> Result<Self, AdapterError> {
         if encoded.class() != AdmissionClass::Encoded || decoded.class() != AdmissionClass::Decoded
         {
-            return Err(AdapterError);
+            return Err(AdapterErrorKind::InvalidInput.into());
         }
         Ok(Self {
             stage,
@@ -230,23 +234,33 @@ impl JournalIngress {
     /// storage budget includes bounded vector/header and barrier copies.
     ///
     /// # Errors
-    /// An uncaptured or invalidated journal cannot enter live publication.
+    /// An uncaptured or invalidated journal cannot enter live publication
+    /// ([`AdapterErrorKind::Fenced`]); a suffix reservation of the wrong
+    /// class or below the journal's storage bound is
+    /// [`AdapterErrorKind::InvalidInput`].
     pub fn new(
         journal: DonorJournal,
         suffix: Reservation,
         changed: Arc<Notify>,
     ) -> Result<Self, AdapterError> {
-        if !matches!(
+        let error = if !matches!(
             journal.state(),
             JournalState::Capturing | JournalState::Active
-        ) || suffix.class() != AdmissionClass::Suffix
+        ) {
+            Some(AdapterErrorKind::Fenced)
+        } else if suffix.class() != AdmissionClass::Suffix
             || DonorJournal::storage_bound(journal.config())
                 .ok()
                 .is_none_or(|needed| suffix.bytes() < needed)
         {
+            Some(AdapterErrorKind::InvalidInput)
+        } else {
+            None
+        };
+        if let Some(kind) = error {
             drop(journal);
             drop(suffix);
-            return Err(AdapterError);
+            return Err(kind.into());
         }
         Ok(Self(Arc::new(JournalIngressInner {
             journal: Mutex::new(journal),
@@ -323,19 +337,27 @@ impl<I> DonorCapture<I> {
     /// ingress is already attached to the live index publication coordinator.
     ///
     /// # Errors
-    /// Returns an adapter error until image C and the suffix are ready.
+    /// Returns [`AdapterErrorKind::Fenced`] until image C and the suffix are
+    /// ready, or [`AdapterErrorKind::InvalidInput`] for reservations of the
+    /// wrong byte classes. Either way the journal is invalidated.
     pub fn new(
         image: I,
         ingress: JournalIngress,
         encoded: Reservation,
         decoded: Reservation,
     ) -> Result<Self, AdapterError> {
-        if ingress.with_journal(|journal| journal.state()) != JournalState::Active
+        let active = ingress.with_journal(|journal| journal.state()) == JournalState::Active;
+        if !active
             || encoded.class() != AdmissionClass::Encoded
             || decoded.class() != AdmissionClass::Decoded
         {
             ingress.with_journal(|journal| journal.invalidate(Invalidation::DonorLost));
-            return Err(AdapterError);
+            return Err(if active {
+                AdapterErrorKind::InvalidInput
+            } else {
+                AdapterErrorKind::Fenced
+            }
+            .into());
         }
         Ok(Self {
             image,
@@ -625,7 +647,9 @@ pub enum DonorReply {
 /// requested exact operation. Cleanup effects return None after resources
 /// are retired. `InstallCandidate` must use the supplied publication permit
 /// for one fenced swap and normal-feed handoff; a sampled head or boolean
-/// cannot stand in for the typed Installed receipt.
+/// cannot stand in for the typed Installed receipt. The asynchronous methods
+/// return `Send` futures; implement them as `async fn` or with an
+/// `async move` body.
 pub trait DonorPort: Send + Sync + 'static {
     /// Encoded donor image and its bounded private metadata.
     type Image: Send + 'static;
@@ -646,21 +670,23 @@ pub trait DonorPort: Send + Sync + 'static {
     /// # Errors
     /// Returns `LocalOnly` after a successful origin scan that cannot be
     /// admitted for peer donation. An error means the local scan failed.
-    fn build_local_capture<'a>(
-        &'a self,
+    fn build_local_capture(
+        &self,
         request: LocalCaptureRequest,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>>;
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<LocalCaptureOutcome<Self::Image>, AdapterError>> + Send;
 
     /// Capture a fresh image from an already-Ready complete local index.
     /// This is available only to the opt-in participation worker. Returning
     /// an error leaves local reads intact and disables peer donor service.
-    fn recapture_current_index<'a>(
-        &'a self,
-        _request: ReadyCaptureRequest,
-        _admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+    /// The default port fails with [`AdapterErrorKind::Unsupported`].
+    fn recapture_current_index(
+        &self,
+        request: ReadyCaptureRequest,
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<DonorCapture<Self::Image>, AdapterError>> + Send {
+        let _ = (request, admission);
+        async { Err(AdapterErrorKind::Unsupported.into()) }
     }
 
     /// Synchronously remove this exact capture's journal ingress from the
@@ -686,22 +712,22 @@ pub trait DonorPort: Send + Sync + 'static {
     ) -> Result<DonorReply, AdapterError>;
 
     /// Execute one bounded transfer effect without a second scheduler.
-    fn execute<'a>(
-        &'a self,
-        context: &'a TransferContext,
+    fn execute(
+        &self,
+        context: &TransferContext,
         effect: TransferEffect,
-        resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-        admission: &'a ByteAdmission,
+        resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
+        admission: &ByteAdmission,
         permit: Option<PublicationPermit>,
         deadline: Instant,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TransferEvent>>, AdapterError>>;
+    ) -> impl Future<Output = Result<Option<Admitted<TransferEvent>>, AdapterError>> + Send;
 
     /// Immediately retire an exact attachment after source-side cancellation.
-    fn detach<'a>(
-        &'a self,
+    fn detach(
+        &self,
         token: AttachToken,
-        resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>>;
+        resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 }
 
 /// Shared, opt-in capabilities. Cloning this handle shares the same memory

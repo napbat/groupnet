@@ -3,18 +3,16 @@
 #![cfg(feature = "replication")]
 
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, CatchUp, Checkpoint, CheckpointLimit, InstallPermit,
-    Limits, Materialized, OpenError, ReadVerdict, Replication, RevocationPermit, ScanLimit,
-    SourceAdapter, SourceBatch, TailLimit,
-};
-use groupnet_core::replication::{
-    BoundComparison, Comparison, Cursor, ProofId, Scope, SourceHistory, SourceProof, Stage, Stream,
+    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
+    Comparison, Cursor, InstallPermit, Limits, Materialized, OpenError, ProofId, ReadVerdict,
+    Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory,
+    SourceProof, Stage, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -385,9 +383,9 @@ fn limits() -> Limits {
     limits.core.tail_check_ms = 30;
     limits.core.attempt_timeout_ms = 500;
     limits.core.retry_ms = 20;
-    limits.core.max_batch_events = std::num::NonZeroUsize::new(2).unwrap();
-    limits.core.max_batch_bytes = std::num::NonZeroUsize::new(8).unwrap();
-    limits.max_inflight_bytes = 8;
+    limits.core.max_batch_events = NonZeroUsize::new(2).expect("nonzero");
+    limits.core.max_batch_bytes = NonZeroUsize::new(8).expect("nonzero");
+    limits.max_inflight_bytes = NonZeroUsize::new(8).expect("nonzero");
     limits
 }
 
@@ -773,8 +771,8 @@ async fn slow_scope_cannot_hold_global_admission_forever() {
     *source.held_partition.lock().expect("partition lock") = Some("slow".into());
     let mut bounded = limits();
     bounded.core.attempt_timeout_ms = 80;
-    bounded.core.max_retries = std::num::NonZeroU32::new(10).unwrap();
-    bounded.max_parallel_ops = 2;
+    bounded.core.max_retries = std::num::NonZeroU32::new(10).expect("nonzero");
+    bounded.max_parallel_ops = NonZeroUsize::new(2).expect("nonzero");
     let manager = Replication::new(
         cluster.groups[0].clone(),
         source.clone(),
@@ -848,7 +846,7 @@ async fn bounded_scope_registry_reports_backpressure_and_reclaims_capacity() {
         .spawn()
         .await;
     let mut bounded = limits();
-    bounded.max_scopes = 1;
+    bounded.max_scopes = NonZeroUsize::MIN;
     let manager = Replication::new(
         cluster.groups[0].clone(),
         MemSource::new(),

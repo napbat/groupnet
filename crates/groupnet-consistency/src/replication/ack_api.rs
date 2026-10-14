@@ -1,5 +1,7 @@
 //! Optional source-certified evidence for bounded named acknowledgement waits.
 
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -146,9 +148,25 @@ pub enum AckWaitStartError {
     Closed,
 }
 
-/// Boxed standard future used only by the opt-in metadata evidence bridge.
-pub type AckSourceFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, AckSourceFailure>> + Send + 'a>>;
+impl fmt::Display for AckWaitStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unsupported => "named ack wait: no evidence source attached",
+            Self::Backpressured => "named ack wait: wait slot or queue is full",
+            Self::Invalid(_) => "named ack wait: invalid request",
+            Self::Closed => "named ack wait: worker closed",
+        })
+    }
+}
+
+impl Error for AckWaitStartError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Invalid(error) => Some(error),
+            Self::Unsupported | Self::Backpressured | Self::Closed => None,
+        }
+    }
+}
 
 /// Trusted local adapter that checks named rosters and individual evidence
 /// against the authoritative source, never against gossip or peer assertions.
@@ -160,27 +178,68 @@ pub type AckSourceFuture<'a, T> =
 /// allocations after their deadline or handle is dropped.
 pub trait AckEvidenceSource: Send + Sync + 'static {
     /// Validates even an empty fixed roster before the core starts the wait.
-    fn certify<'a>(
-        &'a self,
-        request: &'a NamedAckRequest,
+    fn certify(
+        &self,
+        request: &NamedAckRequest,
         limits: AckWaitLimits,
-    ) -> AckSourceFuture<'a, ()>;
+    ) -> impl Future<Output = Result<(), AckSourceFailure>> + Send;
 
     /// Reads at most one verified acknowledgement for this exact poll token.
     /// Empty checks return [`AckObservation::Pending`] so the core schedules
     /// the next source-tail check without requiring a feed hint.
-    fn observe<'a>(
+    fn observe(
+        &self,
+        request: &AckWaitRequest,
+        poll: Operation,
+        waiting: &[RequiredSubscriber],
+        limits: AckWaitLimits,
+    ) -> impl Future<Output = Result<AckObservation, AckSourceFailure>> + Send;
+}
+
+type ErasedAckFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, AckSourceFailure>> + Send + 'a>>;
+
+/// Object-safe bridge for the manager, whose type is fixed before the
+/// optional evidence source is attached; only polls through it are boxed.
+pub(crate) trait ErasedAckSource: Send + Sync + 'static {
+    fn certify_erased<'a>(
+        &'a self,
+        request: &'a NamedAckRequest,
+        limits: AckWaitLimits,
+    ) -> ErasedAckFuture<'a, ()>;
+
+    fn observe_erased<'a>(
         &'a self,
         request: &'a AckWaitRequest,
         poll: Operation,
         waiting: &'a [RequiredSubscriber],
         limits: AckWaitLimits,
-    ) -> AckSourceFuture<'a, AckObservation>;
+    ) -> ErasedAckFuture<'a, AckObservation>;
+}
+
+impl<T: AckEvidenceSource> ErasedAckSource for T {
+    fn certify_erased<'a>(
+        &'a self,
+        request: &'a NamedAckRequest,
+        limits: AckWaitLimits,
+    ) -> ErasedAckFuture<'a, ()> {
+        Box::pin(self.certify(request, limits))
+    }
+
+    fn observe_erased<'a>(
+        &'a self,
+        request: &'a AckWaitRequest,
+        poll: Operation,
+        waiting: &'a [RequiredSubscriber],
+        limits: AckWaitLimits,
+    ) -> ErasedAckFuture<'a, AckObservation> {
+        Box::pin(self.observe(request, poll, waiting, limits))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NamedAckRequest, validate_named};
+    use super::{AckWaitStartError, NamedAckRequest, validate_named};
     use groupnet_core::replication::{
         AckKind, AckTarget, AckWaitError, AckWaitLimits, CertifiedRoster, RequiredSubscriber,
         Scope, SourceHistory, Stream,
@@ -257,6 +316,21 @@ mod tests {
         assert_eq!(
             validate_named(&request, &scope, limits),
             Err(AckWaitError::Backpressure)
+        );
+    }
+
+    #[test]
+    fn invalid_start_chains_the_core_wait_error() {
+        let error = AckWaitStartError::Invalid(AckWaitError::Roster);
+        assert_eq!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<AckWaitError>()),
+            Some(&AckWaitError::Roster)
+        );
+        assert!(std::error::Error::source(&AckWaitStartError::Closed).is_none());
+        assert_eq!(
+            AckWaitStartError::Backpressured.to_string(),
+            "named ack wait: wait slot or queue is full"
         );
     }
 }

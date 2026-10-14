@@ -79,18 +79,15 @@ use std::fmt;
 use std::sync::Mutex;
 
 use groupnet_core::NodeId;
-use groupnet_runtime::Group;
+use groupnet_runtime::{CommandRejected, Group};
 
+use crate::publish::{Recorded, enqueue};
 use crate::token::WriteToken;
 
 /// The group entry key prefix the tier occupies (`~`-prefixed like the
 /// runtime's other reserved entries: `~caps`, `~applied`, `~writes`,
 /// `~lease`).
 const LEDGER_KEY: &str = "~hosted:applied";
-
-/// Attempts before giving up on republishing under inbox backpressure (the next
-/// `record` re-carries the full map; the ledger is state, not a log).
-const PUBLISH_RETRIES: usize = 8;
 
 /// One publisher's applied watermark per writer: the highest [`WriteToken`] of
 /// that writer's feed it has applied.
@@ -146,8 +143,8 @@ pub struct LedgerView {
 /// The entry key a commit ledger occupies: `~hosted:applied` for the default
 /// write path, `~hosted:applied:<name>` for a named one.
 ///
-/// Names must not contain `:` — the layout's own separator, so such a name
-/// would merge with a neighbouring path's key space.
+/// The fixed prefix makes this injective over names, so any name — `:`
+/// included — addresses its own entry.
 #[must_use]
 pub fn ledger_entry_key(name: &str) -> String {
     if name.is_empty() {
@@ -464,17 +461,29 @@ impl CommitLedger {
     /// Both folds are monotone: a lower token is ignored, and the stamp never
     /// regresses. Call this from the apply loop **after** the application
     /// actually happened — typically right next to `Frontier::advance`. A call
-    /// that moves neither the stamp nor the watermark publishes nothing.
-    pub async fn record(&self, writer: &NodeId, token: WriteToken) {
+    /// that moves neither the stamp nor the watermark publishes nothing and
+    /// returns [`Recorded::Covered`].
+    ///
+    /// # Errors
+    /// [`CommandRejected`] when the ledger **advanced locally** but the group
+    /// actor's bounded inbox refused every enqueue attempt (or the actor has
+    /// shut down). The advance is kept; the next advancing `record`, or a
+    /// [`refresh`](Self::refresh), re-carries it.
+    pub async fn record(
+        &self,
+        writer: &NodeId,
+        token: WriteToken,
+    ) -> Result<Recorded, CommandRejected> {
         let lead_epoch = self.group.leadership().epoch;
         let encoded = {
             let mut state = self.lock();
             if !fold(&mut state, writer, token, lead_epoch) {
-                return;
+                return Ok(Recorded::Covered);
             }
             encode_ledger(state.stamp, &state.applied)
         };
-        self.publish(encoded).await;
+        self.publish(&encoded).await?;
+        Ok(Recorded::Advanced)
     }
 
     /// Re-stamps the ledger with the group's current leadership epoch and
@@ -484,15 +493,20 @@ impl CommitLedger {
     /// loop is quiet still has to tell a recovering host that its view is
     /// *fresh*. Call it whenever leadership changes — the epoch `Gap` a
     /// migration surfaces is exactly the signal — and it is harmless to call at
-    /// any other time.
-    pub async fn refresh(&self) {
+    /// any other time, including as the retry after a rejected
+    /// [`record`](Self::record).
+    ///
+    /// # Errors
+    /// [`CommandRejected`] when the group actor's bounded inbox refused every
+    /// enqueue attempt, or the actor has shut down; the stamp is kept locally.
+    pub async fn refresh(&self) -> Result<(), CommandRejected> {
         let lead_epoch = self.group.leadership().epoch;
         let encoded = {
             let mut state = self.lock();
             state.stamp = state.stamp.max(lead_epoch);
             encode_ledger(state.stamp, &state.applied)
         };
-        self.publish(encoded).await;
+        self.publish(&encoded).await
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -501,19 +515,12 @@ impl CommitLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    async fn publish(&self, encoded: Vec<u8>) {
-        for _ in 0..PUBLISH_RETRIES {
-            if self
-                .group
-                .set_entry(self.key.clone(), encoded.clone(), None)
-                .is_ok()
-            {
-                return;
-            }
-            // Inbox backpressure: yield and retry. The ledger is state, so the
-            // next record re-carries the whole map.
-            tokio::task::yield_now().await;
-        }
+    async fn publish(&self, encoded: &[u8]) -> Result<(), CommandRejected> {
+        enqueue(|| {
+            self.group
+                .set_entry(self.key.clone(), encoded.to_vec(), None)
+        })
+        .await
     }
 }
 

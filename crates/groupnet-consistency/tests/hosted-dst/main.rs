@@ -22,8 +22,8 @@
 //!
 //! * **The feed is harness-authored, in the feed's own layout** — `WriteFeed`'s
 //!   frame codec is crate-private, so the host writes
-//!   `(epoch)(first_seq)(count)(len, key)*` into `~writes:hosted` itself, under
-//!   the name the tier's own [`hosted_feed_name`] gives it — and the follower
+//!   `(epoch)(first_seq)(count)(len, key)*` into the entry the tier's own
+//!   [`hosted::feed_entry_key`] names — and the follower
 //!   half is `PeerWrites`' cursor rule over those bytes ([`scan`]): a ring
 //!   overrun or an epoch change is the
 //!   [`Gap`](groupnet_consistency::PeerWrite::Gap) whose `missed_through` the
@@ -75,7 +75,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use groupnet_consistency::WriteToken;
-use groupnet_consistency::hosted::{Watermarks, hosted_feed_name};
+use groupnet_consistency::hosted::{self, Watermarks};
 use groupnet_core::{Activation, Command, Config, GroupMode, HostedConfig, NodeId, VoterRoster};
 use groupnet_sim::SplitMix64;
 
@@ -139,10 +139,9 @@ fn cfg(voters: &BTreeSet<NodeId>) -> Config {
     }
 }
 
-/// The entry key the hosted feed occupies: `WriteFeed`'s key derivation is
-/// crate-private, so the prefix is spelled here, the *name* comes from the tier.
+/// The entry key the hosted feed occupies, as the tier names it.
 fn feed_entry_key() -> String {
-    format!("~writes:{}", hosted_feed_name(""))
+    hosted::feed_entry_key("")
 }
 
 /// The datum one write carries: self-identifying, so a follower can prove the

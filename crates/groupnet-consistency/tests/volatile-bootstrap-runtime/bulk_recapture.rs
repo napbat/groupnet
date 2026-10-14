@@ -1,19 +1,17 @@
 //! Real Ready-generation recapture through the production bulk port.
 
 use super::*;
-use groupnet_consistency::volatile_recovery::bootstrap::admission::Admitted;
+use groupnet_consistency::volatile_recovery::bootstrap::JournalBatch;
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_adapter::{
     BootstrapStatePort, BulkDonorPort,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
     BulkLimits, PhaseLimits, WireLimits,
 };
-use groupnet_consistency::volatile_recovery::bootstrap::ports::{
-    LogicalClock, ReadyCaptureRequest,
-};
-use groupnet_core::volatile_bootstrap::journal::{AttachToken, JournalBatch};
+use groupnet_consistency::volatile_recovery::bootstrap::ports::LogicalClock;
 use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_mem::MemBulkNet;
+use std::future::ready;
 
 #[derive(Debug, Default)]
 struct RecaptureState {
@@ -25,62 +23,20 @@ impl BootstrapStatePort for RecaptureState {
     type Stage = Vec<u8>;
     type NativeBuffer = Vec<u8>;
 
-    fn build_local_capture<'a>(
-        &'a self,
+    fn build_local_capture(
+        &self,
         _request: LocalCaptureRequest,
-        _admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+        _admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<LocalCaptureOutcome<Self::Image>, AdapterError>> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
-    fn recapture_current_index<'a>(
-        &'a self,
-        request: groupnet_consistency::volatile_recovery::bootstrap::ports::ReadyCaptureRequest,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
-        Box::pin(async move {
-            let encoded = admission
-                .reserve(AdmissionClass::Encoded, 1)
-                .map_err(|_| AdapterError)?;
-            let decoded = admission
-                .reserve(AdmissionClass::Decoded, 1)
-                .map_err(|_| AdapterError)?;
-            let suffix = admission
-                .reserve(
-                    AdmissionClass::Suffix,
-                    DonorJournal::storage_bound(journal_config()).map_err(|_| AdapterError)?,
-                )
-                .map_err(|_| AdapterError)?;
-            let mut journal = request
-                .guard
-                .capture(|generation| {
-                    assert_eq!(generation, request.recovery_generation);
-                    let mut journal = DonorJournal::new(
-                        journal_config(),
-                        CaptureId {
-                            scope: BootstrapScope {
-                                domain: "o".into(),
-                                partition: "b".into(),
-                            },
-                            donor: request.selected.clone(),
-                            recovery_generation: generation,
-                            serial: 2,
-                        },
-                    )
-                    .map_err(|_| AdapterError)?;
-                    journal
-                        .begin_capture(request.clock.now(), 1, 1, request.members, Vec::new())
-                        .map_err(|_| AdapterError)?;
-                    self.captures.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, AdapterError>(journal)
-                })
-                .ok_or(AdapterError)??;
-            journal
-                .finish_capture(request.clock.now(), 1, 1)
-                .map_err(|_| AdapterError)?;
-            let ingress = JournalIngress::new(journal, suffix, request.wake)?;
-            DonorCapture::new(vec![42], ingress, encoded, decoded)
-        })
+    fn recapture_current_index(
+        &self,
+        request: ReadyCaptureRequest,
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<DonorCapture<Self::Image>, AdapterError>> + Send {
+        ready(self.recapture(request, admission))
     }
 
     fn retire_local_capture(&self, _capture: &DonorCapture<Self::Image>) {}
@@ -91,7 +47,7 @@ impl BootstrapStatePort for RecaptureState {
         _max_metadata_bytes: usize,
         _admission: &ByteAdmission,
     ) -> Result<Admitted<TransferOffer>, AdapterError> {
-        Err(AdapterError)
+        Err(AdapterErrorKind::Unsupported.into())
     }
 
     fn image_chunk(
@@ -101,44 +57,89 @@ impl BootstrapStatePort for RecaptureState {
         _max_bytes: usize,
         _admission: &ByteAdmission,
     ) -> Result<Admitted<Vec<u8>>, AdapterError> {
-        Err(AdapterError)
+        Err(AdapterErrorKind::Unsupported.into())
     }
 
-    fn execute_local<'a>(
-        &'a self,
-        _context: &'a TransferContext,
+    fn execute_local(
+        &self,
+        _context: &TransferContext,
         _effect: TransferEffect,
-        _resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-        _admission: &'a ByteAdmission,
+        _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+        _admission: &ByteAdmission,
         _permit: Option<PublicationPermit>,
         _deadline: Instant,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TransferEvent>>, AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+    ) -> impl Future<Output = Result<Option<Admitted<TransferEvent>>, AdapterError>> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
-    fn store_chunk<'a>(
-        &'a self,
+    fn store_chunk(
+        &self,
         _sequence: usize,
-        _chunk: &'a Admitted<Vec<u8>>,
-        _resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<usize, AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+        _chunk: &Admitted<Vec<u8>>,
+        _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<usize, AdapterError>> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
-    fn stage_batch<'a>(
-        &'a self,
-        _batch: &'a Admitted<JournalBatch>,
-        _resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+    fn stage_batch(
+        &self,
+        _batch: &Admitted<JournalBatch>,
+        _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
-    fn detach<'a>(
-        &'a self,
+    fn detach(
+        &self,
         _token: AttachToken,
-        _resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>> {
-        Box::pin(async { Ok(()) })
+        _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Ok(()))
+    }
+}
+
+impl RecaptureState {
+    /// One synchronous Ready recapture under the fresh generation guard.
+    fn recapture(
+        &self,
+        request: ReadyCaptureRequest,
+        admission: &ByteAdmission,
+    ) -> Result<DonorCapture<Vec<u8>>, AdapterError> {
+        let encoded = admission.reserve(AdmissionClass::Encoded, 1)?;
+        let decoded = admission.reserve(AdmissionClass::Decoded, 1)?;
+        let suffix = admission.reserve(
+            AdmissionClass::Suffix,
+            DonorJournal::storage_bound(journal_config()).map_err(fenced)?,
+        )?;
+        let mut journal = request
+            .guard
+            .capture(|generation| {
+                assert_eq!(generation, request.recovery_generation);
+                let mut journal = DonorJournal::new(
+                    journal_config(),
+                    CaptureId {
+                        scope: BootstrapScope {
+                            domain: "o".into(),
+                            partition: "b".into(),
+                        },
+                        donor: request.selected.clone(),
+                        recovery_generation: generation,
+                        serial: 2,
+                    },
+                )
+                .map_err(fenced)?;
+                journal
+                    .begin_capture(request.clock.now(), 1, 1, request.members, Vec::new())
+                    .map_err(fenced)?;
+                self.captures.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, AdapterError>(journal)
+            })
+            .ok_or(AdapterErrorKind::Fenced)??;
+        journal
+            .finish_capture(request.clock.now(), 1, 1)
+            .map_err(fenced)?;
+        let ingress = JournalIngress::new(journal, suffix, request.wake)?;
+        DonorCapture::new(vec![42], ingress, encoded, decoded)
     }
 }
 
@@ -195,7 +196,7 @@ async fn bulk_port_recaptures_only_a_real_ready_generation() {
                 max_identity_bytes: 8,
                 max_effect_bytes: 128,
             },
-            server_request_ms: 1000,
+            server_request: Duration::from_secs(1),
         },
     )
     .unwrap();

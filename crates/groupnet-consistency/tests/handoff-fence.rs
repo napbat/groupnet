@@ -59,17 +59,16 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures_util::io::{AsyncRead, AsyncWrite};
-use groupnet_consistency::hosted::commit_reading;
+use groupnet_consistency::hosted::handoff::{Bytes, DataPlane, DataStream};
+use groupnet_consistency::hosted::{Watermarks, commit_reading};
 use groupnet_consistency::{
-    CommitLedger, Handoff, HandoffError, Snapshot, SnapshotChunks, SnapshotSink, SnapshotSource,
-    Watermarks, WriteToken,
+    ChunkLimit, CommitLedger, Handoff, HandoffError, Snapshot, SnapshotChunks, SnapshotSink,
+    SnapshotSource, WriteToken,
 };
 use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
-use groupnet_transport::bulk::{DataPlane, DataStream};
 use groupnet_transport_mem::{MemBulkNet, Network};
 use tokio::sync::watch;
 
@@ -145,7 +144,10 @@ impl TestSource {
 impl SnapshotSource for TestSource {
     type Chunks = TestChunks;
 
-    fn open(&self) -> impl std::future::Future<Output = io::Result<Snapshot<TestChunks>>> + Send {
+    fn open(
+        &self,
+        _limit: ChunkLimit,
+    ) -> impl Future<Output = io::Result<Snapshot<TestChunks>>> + Send {
         std::future::ready(Ok(Snapshot {
             covers: self.covers.clone(),
             chunks: TestChunks {
@@ -225,13 +227,13 @@ struct TestSink {
 }
 
 impl SnapshotSink for TestSink {
-    fn apply(&mut self, chunk: Bytes) -> impl std::future::Future<Output = io::Result<()>> + Send {
+    fn apply(&mut self, chunk: Bytes) -> impl Future<Output = io::Result<()>> + Send {
         self.pending.extend_from_slice(&chunk);
         self.state.lock().expect("sink state").staged += 1;
         std::future::ready(Ok(()))
     }
 
-    fn finish(self) -> impl std::future::Future<Output = io::Result<()>> + Send {
+    fn finish(self) -> impl Future<Output = io::Result<()>> + Send {
         self.state.lock().expect("sink state").installed = true;
         std::future::ready(Ok(()))
     }
@@ -712,7 +714,7 @@ async fn donors_asks_the_host_first_and_leaves_out_whoever_is_short() {
         } else {
             WriteToken { epoch: 4, seq: 10 }
         };
-        ledger.record(&writer, token).await;
+        ledger.record(&writer, token).await.expect("enqueued");
     }
     let watcher = cells[observer].group.clone();
     eventually_within("every reading to reach the observer's view", SETTLE, || {

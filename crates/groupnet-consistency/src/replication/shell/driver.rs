@@ -357,7 +357,7 @@ where
         manager: &Manager<S, A, M>,
         deadline: Instant,
     ) -> Option<OwnedSemaphorePermit> {
-        let count = u32::try_from(manager.limits.max_checkpoint_bytes).ok()?;
+        let count = u32::try_from(manager.limits.max_checkpoint_bytes.get()).ok()?;
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             Arc::clone(&manager.checkpoint_bytes).acquire_many_owned(count),
@@ -408,7 +408,7 @@ where
             self.manager.app.load_checkpoint(
                 scope,
                 CheckpointLimit {
-                    bytes: self.manager.limits.max_checkpoint_bytes,
+                    bytes: self.manager.limits.max_checkpoint_bytes.get(),
                 },
             ),
         )
@@ -416,7 +416,7 @@ where
         self.tick();
         match loaded {
             Ok(Ok(Some(checkpoint))) => {
-                if checkpoint.bytes > self.manager.limits.max_checkpoint_bytes {
+                if checkpoint.bytes > self.manager.limits.max_checkpoint_bytes.get() {
                     return self.stop(FailureClass::Terminal);
                 }
                 let cursor = match self
@@ -874,7 +874,7 @@ where
     fn demand(&mut self, cursor: Cursor) -> bool {
         let comparison = if let Some(existing) = self.engine.state().target.as_ref() {
             let Some(proof) = self.proof.as_ref() else {
-                if self.deferred_floors.len() < self.manager.limits.queue_depth {
+                if self.deferred_floors.len() < self.manager.limits.queue_depth.get() {
                     self.deferred_floors.push_back(cursor);
                     return true;
                 }

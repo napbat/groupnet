@@ -23,7 +23,7 @@ acks = ["tokio/time"]
 # Off by default, and priced honestly (the tier's honesty box has the full
 # accounting). The cheap half is one 16-byte renewal entry per reader per
 # renewal interval. The expensive half is the grant map: every member rewrites
-# its *whole* O(roster) `~lease:g` entry on every peer renewal it adopts — up to
+# its *whole* O(roster) grant-map entry on every peer renewal it adopts — up to
 # N-1 rewrites of an O(N) value per member per interval — and the view task
 # re-folds every granter's map on every `NodeStateChanged` it sees, including
 # the ack tier's watermark churn, so that fold scales with write rate rather

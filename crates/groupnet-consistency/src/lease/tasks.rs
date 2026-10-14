@@ -15,6 +15,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use groupnet_runtime::GroupEvent;
+use tokio::runtime::Handle;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
@@ -24,15 +25,12 @@ use super::LeaseConfig;
 use super::shell::Shared;
 use super::wire::encode_grants;
 
-/// Spawns the set's three tasks onto the current runtime.
-///
-/// # Panics
-/// If there is no current Tokio runtime.
-pub(super) fn spawn(shared: &Arc<Shared>) -> Vec<JoinHandle<()>> {
+/// Spawns the set's three tasks onto `runtime`.
+pub(super) fn spawn(runtime: &Handle, shared: &Arc<Shared>) -> Vec<JoinHandle<()>> {
     vec![
-        tokio::spawn(renewal_task(Arc::clone(shared))),
-        tokio::spawn(granter_task(Arc::clone(shared))),
-        tokio::spawn(view_task(Arc::clone(shared))),
+        runtime.spawn(renewal_task(Arc::clone(shared))),
+        runtime.spawn(granter_task(Arc::clone(shared))),
+        runtime.spawn(view_task(Arc::clone(shared))),
     ]
 }
 
@@ -49,8 +47,8 @@ fn backstop_ticker(cfg: &LeaseConfig) -> Interval {
     ticker
 }
 
-/// The renewal ticker (a). The first turn fires at construction, so a reader is
-/// renewing before [`Leases::new`](super::Leases::new) returns.
+/// The renewal ticker (a). The first turn fires as soon as the set starts, so
+/// a reader is renewing promptly after [`LeasesBuilder::start`](super::LeasesBuilder::start).
 async fn renewal_task(shared: Arc<Shared>) {
     let mut ticker = tokio::time::interval(Duration::from_millis(shared.cfg.renew_every_ms()));
     // A stalled process re-spaces its renewals from *now* rather than firing

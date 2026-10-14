@@ -39,7 +39,8 @@ async fn the_lease_shell_runs_through_the_facade() {
         group,
         me,
         LeaseConfig::for_duration(Duration::from_millis(300)),
-    );
+    )
+    .expect("a valid lease set");
     let view = leases.view();
     assert!(
         !view.valid(),

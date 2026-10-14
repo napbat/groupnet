@@ -8,7 +8,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken};
+use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, PublishError, WriteFeed, WriteToken};
 use groupnet_core::NodeId;
 use groupnet_runtime::Group;
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
@@ -42,9 +42,9 @@ async fn next_event(peers: &mut PeerWrites<String>) -> PeerWrite<String> {
         .expect("event stream ended")
 }
 
-/// The epoch of the feed frame `group` currently holds for `peer`.
+/// The epoch of the default feed frame `group` currently holds for `peer`.
 fn advertised_epoch(group: &Group, peer: &NodeId) -> Option<u64> {
-    let frame = group.node_entry(peer, "~writes")?;
+    let frame = group.node_entry(peer, "~writes/d")?;
     Some(u64::from_le_bytes(frame.get(0..8)?.try_into().ok()?))
 }
 
@@ -64,11 +64,15 @@ async fn a_sealed_restart_renews_without_a_gap() {
     let old = feed(a_group.clone(), 7);
     let mut last = WriteToken { epoch: 0, seq: 0 };
     for key in ["w1", "w2"] {
-        last = old.publish(&key.to_owned()).await;
+        last = old.publish(&key.to_owned()).await.expect("advertised");
     }
-    let seal = old.seal().await;
+    let seal = old.seal().await.expect("advertised");
     assert_eq!(seal, WriteToken { epoch: 7, seq: 3 });
-    assert_eq!(old.seal().await, seal, "sealing again is the same seal");
+    assert_eq!(
+        old.seal().await.expect("advertised"),
+        seal,
+        "sealing again is the same seal"
+    );
     for seq in 1..=2 {
         match next_event(&mut peers).await {
             PeerWrite::Wrote { peer, token, .. } => {
@@ -93,7 +97,7 @@ async fn a_sealed_restart_renews_without_a_gap() {
     let (_reborn, _reborn_node, reborn_group) =
         spawn_mem_node(&net, "seal-a", &["seal-b"], &opts()).await;
     let new = feed(reborn_group, 9);
-    new.republish().await;
+    new.republish().await.expect("advertised");
     assert_eq!(
         next_event(&mut peers).await,
         PeerWrite::Renewed {
@@ -109,7 +113,7 @@ async fn a_sealed_restart_renews_without_a_gap() {
         "the old life stays covered"
     );
 
-    let first = new.publish(&"n1".to_owned()).await;
+    let first = new.publish(&"n1".to_owned()).await.expect("advertised");
     match next_event(&mut peers).await {
         PeerWrite::Wrote { peer, token, key } => {
             assert_eq!((token, key.as_str()), (first, "n1"));
@@ -133,7 +137,7 @@ async fn an_unsealed_restart_gaps_as_soon_as_the_new_life_is_announced() {
     let mut peers = PeerWrites::new(b_group, NodeId::new("crash-b"), decode);
 
     let old = feed(a_group.clone(), 7);
-    old.publish(&"w1".to_owned()).await;
+    old.publish(&"w1".to_owned()).await.expect("advertised");
     assert!(matches!(
         next_event(&mut peers).await,
         PeerWrite::Wrote { .. }
@@ -144,7 +148,7 @@ async fn an_unsealed_restart_gaps_as_soon_as_the_new_life_is_announced() {
     a_node.close().await;
     let (_reborn, _reborn_node, reborn_group) =
         spawn_mem_node(&net, "crash-a", &["crash-b"], &opts()).await;
-    feed(reborn_group, 9).republish().await;
+    feed(reborn_group, 9).republish().await.expect("advertised");
     assert_eq!(
         next_event(&mut peers).await,
         PeerWrite::Gap {
@@ -168,20 +172,20 @@ async fn a_seal_the_subscriber_never_saw_still_gaps() {
     let mut peers = PeerWrites::new(b_group.clone(), NodeId::new("lost-b"), decode);
 
     let old = feed(a_group.clone(), 7);
-    old.publish(&"w1".to_owned()).await;
+    old.publish(&"w1".to_owned()).await.expect("advertised");
     assert!(matches!(
         next_event(&mut peers).await,
         PeerWrite::Wrote { .. }
     ));
     // Sealed and replaced before the subscriber looks again.
-    old.seal().await;
+    old.seal().await.expect("advertised");
     drop(old);
     drop(a_group);
     a_node.close().await;
     let (_reborn, _reborn_node, reborn_group) =
         spawn_mem_node(&net, "lost-a", &["lost-b"], &opts()).await;
     let new = feed(reborn_group, 9);
-    new.republish().await;
+    new.republish().await.expect("advertised");
     eventually_within(
         "the new life's frame replaces the sealed one",
         SETTLE,
@@ -198,13 +202,21 @@ async fn a_seal_the_subscriber_never_saw_still_gaps() {
 }
 
 /// Publishing after the seal would break the promise subscribers crossed
-/// on, so the feed refuses it loudly.
+/// on, so the feed refuses it — and records nothing.
 #[tokio::test]
-#[should_panic(expected = "WriteFeed::publish after the feed was sealed")]
-async fn publishing_after_the_seal_panics() {
+async fn publishing_after_the_seal_is_refused() {
     let net = Network::new();
     let (_a_id, _a_node, a_group) = spawn_mem_node(&net, "late-a", &[], &opts()).await;
     let old = feed(a_group, 7);
-    old.seal().await;
-    drop(old.publish(&"late".to_owned()));
+    old.seal().await.expect("advertised");
+    let sealed_at = old.last_token();
+    assert_eq!(
+        old.publish(&"late".to_owned()).await,
+        Err(PublishError::Sealed)
+    );
+    assert_eq!(
+        old.last_token(),
+        sealed_at,
+        "a refused publish records nothing"
+    );
 }

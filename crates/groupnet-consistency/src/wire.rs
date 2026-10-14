@@ -1,18 +1,34 @@
 //! The gossiped representation: which group entry a feed occupies, and the
 //! ring frame encoded into it.
 
-/// The group entry key under which a node's default write feed is gossiped
-/// (`~`-prefixed like the runtime's reserved entries). Named feeds append
-/// `:<name>`.
-const ENTRY_KEY: &str = "~writes";
+use crate::entry::set_key;
 
-/// The entry key for a feed name: the reserved default, or `~writes:<name>`.
+/// The reserved group entry base of every session-tier write feed
+/// (`~`-prefixed like the runtime's reserved entries).
+const ENTRY_BASE: &str = "~writes";
+
+/// The reserved group entry base of every hosted write path's feed. Distinct
+/// from [`ENTRY_BASE`], so no session feed name can author into a hosted
+/// path's entry.
+#[cfg(feature = "hosted")]
+const HOSTED_ENTRY_BASE: &str = "~hosted/writes";
+
+/// A feed name as a set: `""` is the default feed.
+fn feed_set(name: &str) -> Option<&str> {
+    (!name.is_empty()).then_some(name)
+}
+
+/// The entry key of the session-tier feed `name`: `~writes/d` for the
+/// default feed, `~writes/n<len>:<name>` for a named one.
 pub(crate) fn entry_key(name: &str) -> String {
-    if name.is_empty() {
-        ENTRY_KEY.to_owned()
-    } else {
-        format!("{ENTRY_KEY}:{name}")
-    }
+    set_key(ENTRY_BASE, feed_set(name))
+}
+
+/// The entry key of hosted write path `name`'s feed: `~hosted/writes/d` for
+/// the default path, `~hosted/writes/n<len>:<name>` for a named one.
+#[cfg(feature = "hosted")]
+pub(crate) fn hosted_entry_key(name: &str) -> String {
+    set_key(HOSTED_ENTRY_BASE, feed_set(name))
 }
 
 /// The wire frame: the feed epoch, `first_seq`, the encoded keys of the last
@@ -187,8 +203,45 @@ mod tests {
 
     #[test]
     fn feed_names_map_to_distinct_entries() {
-        assert_eq!(entry_key(""), "~writes");
-        assert_eq!(entry_key("docs"), "~writes:docs");
+        assert_eq!(entry_key(""), "~writes/d");
+        assert_eq!(entry_key("docs"), "~writes/n4:docs");
         assert_ne!(entry_key("docs"), entry_key("index"));
+        assert_ne!(entry_key(""), entry_key("d"));
+    }
+
+    /// A session feed name can never alias a hosted path's feed, whatever it
+    /// spells: `hosted:x` once shared `~writes:hosted:x` with hosted path `x`.
+    #[cfg(feature = "hosted")]
+    #[test]
+    fn session_feeds_and_hosted_paths_never_share_an_entry() {
+        use super::hosted_entry_key;
+
+        assert_eq!(hosted_entry_key(""), "~hosted/writes/d");
+        assert_eq!(hosted_entry_key("x"), "~hosted/writes/n1:x");
+        assert_ne!(entry_key("hosted:x"), hosted_entry_key("x"));
+        assert_ne!(entry_key("hosted"), hosted_entry_key(""));
+
+        let names = [
+            "",
+            "x",
+            "hosted",
+            "hosted:x",
+            "hosted/writes/d",
+            "/hosted/writes/n1:x",
+            "d",
+            "n1:x",
+        ];
+        let mut keys: Vec<String> = names
+            .iter()
+            .flat_map(|name| [entry_key(name), hosted_entry_key(name)])
+            .collect();
+        let total = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            total,
+            "every (tier, name) pair is its own entry"
+        );
     }
 }

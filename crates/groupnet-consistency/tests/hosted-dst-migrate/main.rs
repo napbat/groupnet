@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
 use groupnet_consistency::WriteToken;
-use groupnet_consistency::hosted::{Watermarks, hosted_feed_name};
+use groupnet_consistency::hosted::{self, Watermarks};
 use groupnet_core::{Activation, Command, Config, GroupMode, HostedConfig, NodeId, VoterRoster};
 use groupnet_sim::SplitMix64;
 
@@ -109,10 +109,9 @@ fn cfg(voters: &BTreeSet<NodeId>) -> Config {
     }
 }
 
-/// The entry key the hosted feed occupies: `WriteFeed`'s key derivation is
-/// crate-private, so the prefix is spelled here, the *name* comes from the tier.
+/// The entry key the hosted feed occupies, as the tier names it.
 fn feed_entry_key() -> String {
-    format!("~writes:{}", hosted_feed_name(""))
+    hosted::feed_entry_key("")
 }
 
 /// The datum one write carries: self-identifying, so a follower can prove the

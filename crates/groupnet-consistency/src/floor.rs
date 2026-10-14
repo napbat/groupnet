@@ -47,14 +47,15 @@
 //!
 //! # Entry layout
 //!
-//! One entry per key: `~floor:<key>` for the default set, `~floor:<name>:<key>`
-//! for a named one — `~`-prefixed like every other reserved entry, so delta
+//! One entry per key: `~floor/d/<key>` for the default set and
+//! `~floor/n<len>:<name>/<key>` for a named one, `<len>` being the name's
+//! length in bytes — `~`-prefixed like every other reserved entry, so delta
 //! digests disseminate each key incrementally instead of re-shipping a map on
-//! every advance. Set names must not contain `:`; the *keys* may, with one
-//! sharp edge that follows from the layout: a default-set key of `"lsn:s7"`
-//! occupies the same entry as key `"s7"` of the set named `"lsn"`. Keep set
-//! names out of the default set's key space (or name every set) and the
-//! ambiguity cannot arise.
+//! every advance. The `d` discriminator and the length prefix make the layout
+//! injective: names and keys may contain any character, and no default-set key
+//! can ever address a named set's entry (`"lsn:s7"` in the default set and
+//! `"s7"` in the set named `"lsn"` are different entries). Every name — the
+//! empty one included — is a set distinct from the default set.
 //!
 //! # Not provided, by design
 //!
@@ -79,19 +80,11 @@ use std::time::Duration;
 use groupnet_core::NodeId;
 use groupnet_runtime::{CommandRejected, Group};
 
-/// The reserved group entry prefix every floor occupies (`~`-prefixed like
-/// the runtime's other reserved entries).
-const FLOOR_KEY: &str = "~floor";
+use crate::entry::set_prefix;
 
-/// The entry-key prefix of a set: `~floor:` for the default set,
-/// `~floor:<name>:` for a named one.
-fn prefix_for(name: &str) -> String {
-    if name.is_empty() {
-        format!("{FLOOR_KEY}:")
-    } else {
-        format!("{FLOOR_KEY}:{name}:")
-    }
-}
+/// The reserved group entry base every floor occupies (`~`-prefixed like the
+/// runtime's other reserved entries).
+const FLOOR_KEY: &str = "~floor";
 
 /// The group entry key one floor key occupies within a set.
 fn entry_key(prefix: &str, key: &str) -> String {
@@ -126,6 +119,30 @@ fn fold_max(published: &mut HashMap<String, u64>, key: &str, floor: u64) -> u64 
     }
 }
 
+/// Why a [`SeqFloors`] cannot be constructed as asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqFloorsError {
+    /// `ttl` is under one millisecond. The engine's TTLs are whole
+    /// milliseconds and reads zero as "never expires" — and a floor that never
+    /// expires is precisely the stale claim this type exists to prevent.
+    TtlTooShort {
+        /// The rejected TTL.
+        ttl: Duration,
+    },
+}
+
+impl fmt::Display for SeqFloorsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SeqFloorsError::TtlTooShort { ttl } => {
+                write!(f, "floor ttl {ttl:?} is under one millisecond")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SeqFloorsError {}
+
 /// Per-node sequence floors in a consumer-defined space: "node *N* has
 /// applied *key* through *floor*".
 ///
@@ -148,7 +165,7 @@ fn fold_max(published: &mut HashMap<String, u64>, key: &str, floor: u64) -> u64 
 /// # use groupnet_runtime::Group;
 /// # fn demo(group: Group, replica: &NodeId) -> Result<(), Box<dyn std::error::Error>> {
 /// // Refresh well inside the TTL: publish on every apply, or on a ticker.
-/// let floors = SeqFloors::new(group, Duration::from_secs(5));
+/// let floors = SeqFloors::new(group, Duration::from_secs(5))?;
 /// floors.publish("shard-7", 4_210)?; // applied through LSN 4210
 ///
 /// // Read side: use the replica only if it claims to be caught up. `None`
@@ -185,38 +202,38 @@ impl SeqFloors {
     ///
     /// Size `ttl` at several refresh intervals: it is how long a *stale*
     /// claim survives after a publisher goes quiet, and how quickly a live
-    /// one is dropped if a refresh is lost. Sub-millisecond TTLs are raised
-    /// to 1 ms — the engine reads a zero TTL as "never expires", and a floor
-    /// that never expires is precisely the stale claim this type exists to
-    /// prevent.
-    #[must_use]
-    pub fn new(group: Group, ttl: Duration) -> Self {
-        Self::build(prefix_for(""), group, ttl)
+    /// one is dropped if a refresh is lost.
+    ///
+    /// # Errors
+    /// [`SeqFloorsError::TtlTooShort`] for a TTL under one millisecond: the
+    /// engine reads a zero TTL as "never expires", and this constructor never
+    /// silently raises it.
+    pub fn new(group: Group, ttl: Duration) -> Result<Self, SeqFloorsError> {
+        Self::build(None, group, ttl)
     }
 
     /// A named floor set — independent subsystems sharing one group name
-    /// their sets so their keys occupy distinct entries. An empty name is
-    /// the default set ([`new`](Self::new)).
+    /// their sets so their keys occupy distinct entries. Any name is valid,
+    /// and every name (the empty one included) is a set distinct from the
+    /// default set ([`new`](Self::new)); see the module docs' entry layout.
     ///
-    /// # Panics
-    /// If `name` contains `:`, which is the layout's own separator: the name
-    /// would silently merge with a neighbouring set's key space.
-    #[must_use]
-    pub fn named(name: &str, group: Group, ttl: Duration) -> Self {
-        assert!(
-            !name.contains(':'),
-            "floor set names must not contain ':' (got {name:?})"
-        );
-        Self::build(prefix_for(name), group, ttl)
+    /// # Errors
+    /// As [`new`](Self::new).
+    pub fn named(name: &str, group: Group, ttl: Duration) -> Result<Self, SeqFloorsError> {
+        Self::build(Some(name), group, ttl)
     }
 
-    fn build(prefix: String, group: Group, ttl: Duration) -> Self {
-        Self {
-            group,
-            prefix,
-            ttl_ms: u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX).max(1),
-            published: Mutex::new(HashMap::new()),
+    fn build(set: Option<&str>, group: Group, ttl: Duration) -> Result<Self, SeqFloorsError> {
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        if ttl_ms == 0 {
+            return Err(SeqFloorsError::TtlTooShort { ttl });
         }
+        Ok(Self {
+            group,
+            prefix: set_prefix(FLOOR_KEY, set),
+            ttl_ms,
+            published: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Advertises that this node has reached `floor` for `key`, and refreshes
@@ -282,11 +299,11 @@ impl SeqFloors {
     pub fn floors_for(&self, key: &str) -> Vec<(NodeId, u64)> {
         let entry = entry_key(&self.prefix, key);
         self.group
-            .members()
-            .into_iter()
+            .roster()
+            .iter()
             .filter_map(|node| {
-                let floor = decode(&self.group.node_entry(&node, &entry)?)?;
-                Some((node, floor))
+                let floor = decode(&self.group.node_entry(node, &entry)?)?;
+                Some((node.clone(), floor))
             })
             .collect()
     }
@@ -296,28 +313,33 @@ impl SeqFloors {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{decode, encode, entry_key, fold_max, prefix_for};
+    use super::{FLOOR_KEY, decode, encode, entry_key, fold_max};
+    use crate::entry::set_prefix;
+
+    fn key(set: Option<&str>, key: &str) -> String {
+        entry_key(&set_prefix(FLOOR_KEY, set), key)
+    }
 
     #[test]
     fn set_names_and_keys_map_to_distinct_entries() {
-        assert_eq!(entry_key(&prefix_for(""), "shard-7"), "~floor:shard-7");
-        assert_eq!(
-            entry_key(&prefix_for("lsn"), "shard-7"),
-            "~floor:lsn:shard-7"
-        );
+        assert_eq!(key(None, "shard-7"), "~floor/d/shard-7");
+        assert_eq!(key(Some("lsn"), "shard-7"), "~floor/n3:lsn/shard-7");
         // Distinct names never share an entry, and neither do distinct keys:
         // per-key entries are what makes dissemination and expiry per-key.
-        assert_ne!(
-            entry_key(&prefix_for("lsn"), "s"),
-            entry_key(&prefix_for("idx"), "s")
-        );
-        assert_ne!(
-            entry_key(&prefix_for("lsn"), "a"),
-            entry_key(&prefix_for("lsn"), "b")
-        );
-        // An empty name is the default set.
-        assert_eq!(prefix_for(""), prefix_for(""));
-        assert_ne!(prefix_for(""), prefix_for("lsn"));
+        assert_ne!(key(Some("lsn"), "s"), key(Some("idx"), "s"));
+        assert_ne!(key(Some("lsn"), "a"), key(Some("lsn"), "b"));
+        // The default set is its own address, distinct even from the empty name.
+        assert_ne!(key(None, "s"), key(Some(""), "s"));
+    }
+
+    #[test]
+    fn the_formerly_colliding_default_and_named_keys_are_distinct_entries() {
+        // Under the old `~floor:<key>` / `~floor:<name>:<key>` layout these two
+        // were the same entry, `~floor:lsn:s7`.
+        assert_ne!(key(None, "lsn:s7"), key(Some("lsn"), "s7"));
+        // Separators inside names are harmless too.
+        assert_ne!(key(Some("a:b"), "c"), key(Some("a"), "b:c"));
+        assert_ne!(key(Some("a/b"), "c"), key(Some("a"), "b/c"));
     }
 
     #[test]

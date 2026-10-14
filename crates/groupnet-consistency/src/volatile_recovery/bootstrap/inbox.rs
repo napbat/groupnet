@@ -21,6 +21,18 @@ pub enum DonorInboxError {
     Closed,
 }
 
+impl std::fmt::Display for DonorInboxError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidCapacity => "donor inbox capacity is zero or unrepresentable",
+            Self::Full => "donor inbox is full",
+            Self::Closed => "donor inbox is closed",
+        })
+    }
+}
+
+impl std::error::Error for DonorInboxError {}
+
 /// A completed or failed exact donor request.
 pub type DonorResponse = oneshot::Receiver<Result<DonorReply, AdapterError>>;
 
@@ -151,6 +163,7 @@ impl DonorInbox {
 mod tests {
     use super::super::admission::{AdmissionClass, AdmissionLimits, ByteAdmission};
     use super::*;
+    use crate::volatile_recovery::AdapterErrorKind;
 
     fn admitted_request(admission: &ByteAdmission) -> Admitted<DonorRequest> {
         admission
@@ -190,8 +203,11 @@ mod tests {
         assert_eq!(admission.usage(), (1, [0, 0, 0, 0, 1], 1));
         let incoming = inbox.recv().await.unwrap();
         assert!(matches!(incoming.request(), DonorRequest::Offer { .. }));
-        incoming.respond(Err(AdapterError));
-        assert!(first.await.unwrap().is_err());
+        incoming.respond(Err(AdapterErrorKind::Fenced.into()));
+        assert_eq!(
+            first.await.unwrap().unwrap_err().kind(),
+            AdapterErrorKind::Fenced
+        );
         assert_eq!(admission.usage(), (0, [0; 5], 0));
     }
 }
