@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, Admitted, ByteAdmission,
 };
@@ -610,21 +611,21 @@ fn bootstrap_config() -> BootstrapRuntimeConfig {
             max_cuts: std::num::NonZeroUsize::new(1).unwrap(),
             coverage_poll_ms: 5,
         },
-        max_claim_metadata_bytes: 128,
-        donor_inbox_capacity: 2,
+        max_claim_metadata_bytes: std::num::NonZeroUsize::new(128).unwrap(),
+        donor_inbox_capacity: QueueCapacity::of(2),
         require_participation: false,
     }
 }
 
 fn admission() -> ByteAdmission {
     ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: 100_000,
+        max_total_bytes: std::num::NonZeroUsize::new(100_000).unwrap(),
         max_encoded_bytes: 1_024,
         max_decoded_bytes: 1_024,
         max_suffix_bytes: 50_000,
         max_native_overlap_bytes: 1_024,
         max_inflight_bytes: 8_192,
-        max_reservations: 32,
+        max_reservations: std::num::NonZeroUsize::new(32).unwrap(),
     })
     .unwrap()
 }

@@ -688,8 +688,8 @@ async fn a_chunk_past_the_donors_limit_is_refused_before_it_is_sent() {
 // ---------------------------------------------------------------------------
 
 /// A write path name is any string: it travels length-prefixed and selects the
-/// ledger key `~hosted:applied:<name>`, which is distinct for every distinct
-/// name — so a `:` inside one is ordinary input, not a programming error. Two
+/// ledger key `~hosted/applied/n<len>:<name>`, which is distinct for every
+/// distinct name — so a `:` inside one is ordinary input, not a programming error. Two
 /// ends under the same such name transfer; an end under a different name is
 /// refused as `BadRequest`.
 #[tokio::test]

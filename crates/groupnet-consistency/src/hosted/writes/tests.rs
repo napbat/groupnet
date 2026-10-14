@@ -171,13 +171,13 @@ fn setup_errors_say_which_configuration_is_wrong() {
             .contains("static voter roster")
     );
     let mismatch = HostedSetupError::LedgerMismatch {
-        expected: "~hosted:applied:docs".to_owned(),
-        found: "~hosted:applied".to_owned(),
+        expected: "~hosted/applied/n4:docs".to_owned(),
+        found: "~hosted/applied/d".to_owned(),
     };
     assert_eq!(
         mismatch.to_string(),
-        "the commit ledger publishes under ~hosted:applied, but this write path reads \
-         ~hosted:applied:docs"
+        "the commit ledger publishes under ~hosted/applied/d, but this write path reads \
+         ~hosted/applied/n4:docs"
     );
     assert_ne!(mismatch, HostedSetupError::NotQuorum);
 }

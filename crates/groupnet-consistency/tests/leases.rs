@@ -518,6 +518,17 @@ async fn a_fresh_writer_refuses_the_no_holders_fast_path_until_it_has_warmed_up(
         started.elapsed() < LEASE / 2,
         "a warmed-up writer with a visible lease landscape is back on the fast path"
     );
+
+    // A timeout beyond the clock's range is a wait without a deadline, never
+    // an overflow: the next write resolves on its acknowledgement.
+    let second_write = feed.publish(&"k2".to_owned()).await.expect("advertised");
+    let outcome = tokio::time::timeout(
+        LEASE * 3,
+        w_leases.invalidated_coherently(&w_id, second_write, Duration::MAX),
+    )
+    .await
+    .expect("the acknowledgement resolves the unbounded wait");
+    assert_eq!(outcome, CoherenceOutcome::AllApplied);
 }
 
 /// The **reader's** boot guard: the read-side twin of the warm-up guard above,

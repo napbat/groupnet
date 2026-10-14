@@ -1237,7 +1237,7 @@ them.
 
 ```rust
 use groupnet::consistency::{
-    AckLedger, AckOutcome, PeerWrite, PeerWrites, PublishError, WriteFeed, WriteToken,
+    AckLedger, AckOutcome, AckWait, PeerWrite, PeerWrites, PublishError, WriteFeed, WriteToken,
     applied_by_roster,
 };
 use groupnet::core::NodeId;
@@ -1253,7 +1253,8 @@ async fn write(
     replicas: Vec<NodeId>,
 ) -> Result<AckOutcome, PublishError> {
     let token = feed.publish(&key).await?;
-    let outcome = applied_by_roster(group, group.local_node(), token, replicas, Duration::from_secs(2)).await;
+    let wait = AckWait { writer: group.local_node(), token, timeout: Duration::from_secs(2) };
+    let outcome = applied_by_roster(group, wait, replicas).await;
     if outcome.is_vacuous() {
         println!("nobody but the writer was named: nothing was acknowledged");
     } else if !outcome.is_complete() {
@@ -1282,7 +1283,8 @@ async fn apply_and_ack(group: Group, mut cache: HashMap<String, String>) {
             PeerWrite::Sealed { peer, token } => (peer, token),
             PeerWrite::Renewed { peer, epoch, .. } => (peer, WriteToken { epoch, seq: 0 }),
         };
-        // A refused enqueue keeps the advance locally; the next record re-carries it.
+        // A refused enqueue keeps the advance locally; the next *advancing*
+        // record re-carries it, or `ledger.republish()` retries without one.
         let _ = ledger.record(&writer, applied).await;
     }
 }

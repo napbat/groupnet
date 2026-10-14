@@ -4,6 +4,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use groupnet_core::replication::{
     Config as CoreConfig, ConfigError as CoreConfigError, SnapshotConfig,
 };
+use groupnet_transport::QueueCapacity;
 use tokio::sync::Semaphore;
 
 use super::{Limits, LimitsError};
@@ -136,16 +137,14 @@ fn shell_reserves_report_their_own_field() {
         })
     );
 
+    // The command queue's bound lives in its type: the largest capacity a
+    // channel accepts is valid, and nothing above it is constructible.
     let limits = Limits {
-        queue_depth: above,
+        queue_depth: QueueCapacity::MAX,
         ..Limits::default()
     };
-    assert_eq!(
-        limits.validate(),
-        Err(LimitsError::QueueDepthAbovePermits {
-            queue_depth: above.get()
-        })
-    );
+    assert_eq!(limits.validate(), Ok(()));
+    assert!(QueueCapacity::try_from(above.get()).is_err());
 }
 
 #[test]
@@ -240,7 +239,9 @@ fn snapshot_reserves_report_their_own_field() {
 
 #[test]
 fn shell_rule_errors_name_their_field_and_have_no_source() {
-    let error = LimitsError::QueueDepthAbovePermits { queue_depth: 7 };
+    let error = LimitsError::ParallelOpsAbovePermits {
+        max_parallel_ops: 7,
+    };
     assert!(error.source().is_none());
-    assert!(error.to_string().contains("queue_depth (7)"));
+    assert!(error.to_string().contains("max_parallel_ops (7)"));
 }

@@ -51,7 +51,7 @@ fn open_local_only(
     donor.allow_recapture.store(true, Ordering::SeqCst);
     let mut config = bootstrap_config();
     config.require_participation = true;
-    config.max_claim_metadata_bytes = 512;
+    config.max_claim_metadata_bytes = std::num::NonZeroUsize::new(512).unwrap();
     config.claim.renew_ms = renew_ms;
     config.claim.claim_ttl_ms = config.claim.claim_ttl_ms.max(renew_ms * 2);
     let (driver, _sender) = BootstrapSession::new(
@@ -65,15 +65,16 @@ fn open_local_only(
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap();
     let reads = Arc::new(ReadAdapter::default());
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::clone(&reads),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::clone(&reads), NodeId::from("me"), 9)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -81,13 +82,11 @@ fn open_local_only(
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        mode,
-        NodeId::from("me"),
-        9,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(mode)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     (claims, donor, reads, handle)
 }
 

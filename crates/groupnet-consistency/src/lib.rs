@@ -233,7 +233,9 @@
 //! let fresh: Arc<Mutex<HashSet<String>>> = Arc::default();
 //!
 //! // After every local durable write (the token is the client's RYW token).
-//! // An `Err` here means the write is recorded but not yet advertised.
+//! // `PublishError::Unadvertised` means the write is recorded but not yet
+//! // advertised (a later advertisement carries it); `PublishError::Sealed`
+//! // means the feed life is sealed and nothing was recorded.
 //! let token = feed.publish(&"user:1".to_owned()).await?;
 //!
 //! // Apply peer writes, advancing the frontier only once applied:
@@ -288,6 +290,8 @@ pub mod replication;
 mod token;
 #[cfg(feature = "volatile-recovery")]
 pub mod volatile_recovery;
+#[cfg(any(feature = "acks", feature = "hosted"))]
+mod wait;
 mod wire;
 
 // Application handles and the values their signatures name. Protocol-driver
@@ -295,8 +299,8 @@ mod wire;
 // module path: `hosted::`, `hosted::handoff::`, `lease::`.
 #[cfg(feature = "acks")]
 pub use acks::{
-    AckBasis, AckLedger, AckOutcome, CAP_ACKS, applied_by, applied_by_roster, applied_by_selected,
-    applied_cluster_wide,
+    AckBasis, AckLedger, AckOutcome, AckWait, CAP_ACKS, applied_by, applied_by_roster,
+    applied_by_selected, applied_cluster_wide,
 };
 pub use feed::{PublishError, Unadvertised, WriteFeed};
 pub use floor::{SeqFloors, SeqFloorsError};
@@ -304,6 +308,10 @@ pub use frontier::{Frontier, FrontierView};
 // The runtime handle every tier is built on, and the bounded-inbox refusal its
 // publication APIs report.
 pub use groupnet_runtime::{CommandRejected, Group};
+// The bounded-queue capacity the replication and volatile-recovery
+// configurations name.
+#[cfg(any(feature = "replication", feature = "volatile-recovery"))]
+pub use groupnet_transport::QueueCapacity;
 #[cfg(feature = "handoff")]
 pub use hosted::handoff::{
     ChunkLimit, ChunkLimitError, Handoff, HandoffError, HandoffReceipt, Snapshot, SnapshotChunks,

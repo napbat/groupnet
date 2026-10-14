@@ -14,8 +14,8 @@ mod shell;
 
 pub use error::{AdapterError, AdapterErrorKind};
 pub use shell::{
-    PeerObservation, PublicationPermit, ReadyCapturePermit, RecoveryAdapter, RecoveryHandle,
-    RecoveryOpenError, RecoveryStatus,
+    PeerObservation, PublicationPermit, ReadyCapturePermit, RecoveryAdapter, RecoveryBuilder,
+    RecoveryHandle, RecoveryOpenError, RecoveryStatus,
 };
 
 pub use groupnet_core::volatile_recovery::{

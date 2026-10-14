@@ -3,7 +3,7 @@
 use super::*;
 use groupnet_consistency::volatile_recovery::bootstrap::JournalBatch;
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_adapter::{
-    BootstrapStatePort, BulkDonorPort,
+    BootstrapStatePort, BulkDonorOptions, BulkDonorPort,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
     BulkLimits, PhaseLimits, WireLimits,
@@ -146,9 +146,8 @@ impl RecaptureState {
 #[tokio::test]
 async fn bulk_port_recaptures_only_a_real_ready_generation() {
     let reads = Arc::new(ReadAdapter::default());
-    let handle = RecoveryHandle::open(
-        Arc::clone(&reads),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::clone(&reads), NodeId::from("me"), 12)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -156,12 +155,10 @@ async fn bulk_port_recaptures_only_a_real_ready_generation() {
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        12,
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     eventually_within("origin reaches Ready", SETTLE, || handle.status().may_serve).await;
     let original = reads.latest_origin_permit.lock().unwrap().clone().unwrap();
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -173,30 +170,32 @@ async fn bulk_port_recaptures_only_a_real_ready_generation() {
         Arc::clone(&state),
         DataPlane::new(net.endpoint(NodeId::from("me"))),
         admission.clone(),
-        BootstrapScope {
-            domain: "o".into(),
-            partition: "b".into(),
-        },
-        bootstrap_config().transfer,
-        BulkLimits {
-            wire: WireLimits {
-                max_frame_bytes: 4096,
-                max_scope_bytes: 8,
-                max_node_bytes: 8,
-                max_payload_bytes: 2048,
+        BulkDonorOptions {
+            scope: BootstrapScope {
+                domain: "o".into(),
+                partition: "b".into(),
             },
-            phase: PhaseLimits {
-                max_body_bytes: 2048,
-                max_scope_bytes: 8,
-                max_node_bytes: 8,
-                max_writer_bytes: 8,
-                max_cuts: 1,
-                max_members: 2,
-                max_events: 8,
-                max_identity_bytes: 8,
-                max_effect_bytes: 128,
+            policy: bootstrap_config().transfer,
+            limits: BulkLimits {
+                wire: WireLimits {
+                    max_frame_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
+                    max_scope_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                    max_node_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                    max_payload_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
+                },
+                phase: PhaseLimits {
+                    max_body_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
+                    max_scope_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                    max_node_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                    max_writer_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                    max_cuts: std::num::NonZeroUsize::new(1).unwrap(),
+                    max_members: std::num::NonZeroUsize::new(2).unwrap(),
+                    max_events: std::num::NonZeroUsize::new(8).unwrap(),
+                    max_identity_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                    max_effect_bytes: std::num::NonZeroUsize::new(128).unwrap(),
+                },
+                server_request: Duration::from_secs(1),
             },
-            server_request: Duration::from_secs(1),
         },
     )
     .unwrap();

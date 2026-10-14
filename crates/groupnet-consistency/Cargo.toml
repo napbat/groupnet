@@ -39,7 +39,7 @@ leases = ["acks", "tokio/rt"]
 # `QuorumApplied` / `AllApplied`).
 #
 # Deliberately does *not* imply `acks`. The tier's commit ledger is a new,
-# epoch-stamped entry (`~hosted:applied`) rather than a scoped reuse of the ack
+# epoch-stamped entry (`~hosted/applied/…`) rather than a scoped reuse of the ack
 # tier's `~applied`: an unstamped watermark cannot tell a fresh reading from a
 # pre-migration one, which is what a leader-completeness recovery needs, and it
 # lets an ack round opened before a migration resolve after the new host has
@@ -67,7 +67,6 @@ hosted = ["tokio/time"]
 # them is already there behind `bulk`.
 handoff = [
     "hosted",
-    "dep:groupnet-transport",
     "groupnet-transport/bulk",
     "dep:bytes",
     "dep:futures-util",
@@ -85,7 +84,6 @@ volatile-recovery = ["tokio/rt", "tokio/time", "tokio/macros"]
 # the control plane only; this feature adds the existing bulk stream graph.
 volatile-bootstrap-bulk = [
     "volatile-recovery",
-    "dep:groupnet-transport",
     "groupnet-transport/bulk",
     "dep:bytes",
     "dep:futures-util",
@@ -98,9 +96,11 @@ volatile-bootstrap-bulk = [
 groupnet-core = { workspace = true }
 groupnet-runtime = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
-# The handoff tier's data plane — inert unless the `handoff` feature is enabled,
-# and the same versions `groupnet-transport/bulk` already pins.
-groupnet-transport = { workspace = true, optional = true }
+# Already in the graph through `groupnet-runtime`; named directly for the
+# `QueueCapacity` the replication and volatile-recovery configs take, and for
+# the handoff tier's data plane (`bulk`, inert unless `handoff` or
+# `volatile-bootstrap-bulk` is enabled).
+groupnet-transport = { workspace = true }
 bytes = { workspace = true, optional = true }
 futures-util = { workspace = true, features = ["io"], optional = true }
 

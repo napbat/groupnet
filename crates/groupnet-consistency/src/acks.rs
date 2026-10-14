@@ -13,7 +13,8 @@
 //! * [`applied_by_roster`] — a fixed roster the caller names, alive or not
 //!   ([`AckBasis::FixedRoster`]): the only form with a known denominator.
 //!
-//! Every wait resolves to an [`AckOutcome`] naming the members it selected,
+//! Every wait takes one [`AckWait`] — whose write, and how long to wait for
+//! it — and resolves to an [`AckOutcome`] naming the members it selected,
 //! which of them acknowledged and which are still missing, so an empty
 //! selection or a selector that skipped a lagging advertiser is visible
 //! rather than indistinguishable from a full acknowledgement. With eager
@@ -43,6 +44,7 @@ use groupnet_runtime::{CommandRejected, Group};
 
 use crate::publish::{Recorded, enqueue};
 use crate::token::WriteToken;
+use crate::wait::WaitDeadline;
 
 /// The group entry key under which a node's applied watermarks are gossiped.
 const ACK_KEY: &str = "~applied";
@@ -56,17 +58,20 @@ const ACK_KEY: &str = "~applied";
 ///
 /// ```no_run
 /// # use std::time::Duration;
-/// # use groupnet_consistency::{AckOutcome, CAP_ACKS, Group, WriteToken, applied_by_selected};
+/// # use groupnet_consistency::{
+/// #     AckOutcome, AckWait, CAP_ACKS, Group, WriteToken, applied_by_selected,
+/// # };
 /// # use groupnet_core::NodeId;
 /// # async fn demo(group: &Group, me: &NodeId, token: WriteToken) -> AckOutcome {
 /// group.advertise_capabilities([CAP_ACKS]).ok();
-/// applied_by_selected(
-///     group,
-///     me,
+/// let wait = AckWait {
+///     writer: me,
 ///     token,
-///     |peer| group.node_has_capability(peer, CAP_ACKS),
-///     Duration::from_secs(1),
-/// )
+///     timeout: Duration::from_secs(1),
+/// };
+/// applied_by_selected(group, wait, |peer| {
+///     group.node_has_capability(peer, CAP_ACKS)
+/// })
 /// .await
 /// # }
 /// ```
@@ -164,6 +169,22 @@ pub fn applied_by(group: &Group, member: &NodeId, writer: &NodeId) -> Option<Wri
     decode_one(&bytes, writer.as_str())
 }
 
+/// One acknowledgement wait: `writer`'s feed applied through `token`, waited
+/// for at most `timeout`.
+///
+/// A `timeout` longer than the clock can represent waits until the outcome
+/// is complete; `Duration::ZERO` samples the gossiped ledgers once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckWait<'a> {
+    /// The writer whose feed the acknowledgements cover; never waited on
+    /// itself.
+    pub writer: &'a NodeId,
+    /// The token every selected member must have applied.
+    pub token: WriteToken,
+    /// How long to wait before reporting the members still missing.
+    pub timeout: Duration,
+}
+
 /// How an ack wait chose the members it waited on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckBasis {
@@ -238,9 +259,10 @@ impl AckOutcome {
     }
 }
 
-/// Waits (bounded by `timeout`) until every member this node currently
-/// believes `Alive`, other than `writer` itself, advertises having applied
-/// `writer`'s feed through `token` ([`AckBasis::AliveMembers`]).
+/// Waits (bounded by `wait.timeout`) until every member this node currently
+/// believes `Alive`, other than `wait.writer` itself, advertises having
+/// applied the writer's feed through `wait.token`
+/// ([`AckBasis::AliveMembers`]).
 ///
 /// This is live-membership unanimity, not a fixed denominator: members that
 /// die mid-wait drop out as SWIM marks them non-alive, and a single-member
@@ -248,21 +270,16 @@ impl AckOutcome {
 /// members that must acknowledge is known in advance; in a deployment where
 /// some peers do not run an [`AckLedger`] at all, prefer
 /// [`applied_by_selected`] over eating a timeout per non-participant.
-pub async fn applied_cluster_wide(
-    group: &Group,
-    writer: &NodeId,
-    token: WriteToken,
-    timeout: Duration,
-) -> AckOutcome {
-    wait(timeout, || {
-        alive_outcome(group, writer, token, AckBasis::AliveMembers, |_| true)
+pub async fn applied_cluster_wide(group: &Group, wait: AckWait<'_>) -> AckOutcome {
+    poll(wait.timeout, || {
+        alive_outcome(group, wait, AckBasis::AliveMembers, |_| true)
     })
     .await
 }
 
 /// [`applied_cluster_wide`], scoped ([`AckBasis::AliveSelected`]): waits
-/// (bounded by `timeout`) only on members that are currently `Alive`, are not
-/// `writer` itself, **and** pass `include`.
+/// (bounded by `wait.timeout`) only on members that are currently `Alive`,
+/// are not `wait.writer` itself, **and** pass `include`.
 ///
 /// The selection is re-evaluated on every poll, not snapshotted, so it tracks
 /// both liveness churn and late-arriving advertisements: a peer that dies
@@ -287,39 +304,35 @@ pub async fn applied_cluster_wide(
 /// which cannot lag.
 pub async fn applied_by_selected(
     group: &Group,
-    writer: &NodeId,
-    token: WriteToken,
+    wait: AckWait<'_>,
     include: impl Fn(&NodeId) -> bool,
-    timeout: Duration,
 ) -> AckOutcome {
-    wait(timeout, || {
-        alive_outcome(group, writer, token, AckBasis::AliveSelected, &include)
+    poll(wait.timeout, || {
+        alive_outcome(group, wait, AckBasis::AliveSelected, &include)
     })
     .await
 }
 
-/// Waits (bounded by `timeout`) until every member of `roster` other than
-/// `writer` itself advertises having applied `writer`'s feed through `token`
-/// ([`AckBasis::FixedRoster`]).
+/// Waits (bounded by `wait.timeout`) until every member of `roster` other
+/// than `wait.writer` itself advertises having applied the writer's feed
+/// through `wait.token` ([`AckBasis::FixedRoster`]).
 ///
 /// The denominator is fixed: membership churn neither adds to nor removes from
 /// it, so a roster member that is dead, partitioned or not running an
-/// [`AckLedger`] holds the wait until `timeout` and is reported in
+/// [`AckLedger`] holds the wait until the timeout and is reported in
 /// [`AckOutcome::missing`]. Duplicates in `roster` count once.
 pub async fn applied_by_roster(
     group: &Group,
-    writer: &NodeId,
-    token: WriteToken,
+    wait: AckWait<'_>,
     roster: impl IntoIterator<Item = NodeId>,
-    timeout: Duration,
 ) -> AckOutcome {
-    let mut members: Vec<NodeId> = roster.into_iter().filter(|m| m != writer).collect();
+    let mut members: Vec<NodeId> = roster.into_iter().filter(|m| m != wait.writer).collect();
     members.sort_unstable();
     members.dedup();
-    wait(timeout, || {
+    poll(wait.timeout, || {
         let mut outcome = AckOutcome::empty(AckBasis::FixedRoster);
         for member in &members {
-            outcome.count(group, member.clone(), writer, token);
+            outcome.count(group, member.clone(), wait.writer, wait.token);
         }
         outcome
     })
@@ -329,8 +342,7 @@ pub async fn applied_by_roster(
 /// One evaluation of a live-membership selection.
 fn alive_outcome(
     group: &Group,
-    writer: &NodeId,
-    token: WriteToken,
+    wait: AckWait<'_>,
     basis: AckBasis,
     include: impl Fn(&NodeId) -> bool,
 ) -> AckOutcome {
@@ -338,11 +350,11 @@ fn alive_outcome(
     statuses.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut outcome = AckOutcome::empty(basis);
     for (member, status) in statuses {
-        if member == *writer || status != Status::Alive {
+        if member == *wait.writer || status != Status::Alive {
             continue;
         }
         if include(&member) {
-            outcome.count(group, member, writer, token);
+            outcome.count(group, member, wait.writer, wait.token);
         } else {
             outcome.skipped.push(member);
         }
@@ -351,11 +363,11 @@ fn alive_outcome(
 }
 
 /// Re-evaluates until the outcome is complete or the deadline passes.
-async fn wait(timeout: Duration, mut evaluate: impl FnMut() -> AckOutcome) -> AckOutcome {
-    let deadline = tokio::time::Instant::now() + timeout;
+async fn poll(timeout: Duration, mut evaluate: impl FnMut() -> AckOutcome) -> AckOutcome {
+    let deadline = WaitDeadline::after(timeout);
     loop {
         let outcome = evaluate();
-        if outcome.is_complete() || tokio::time::Instant::now() >= deadline {
+        if outcome.is_complete() || deadline.passed() {
             return outcome;
         }
         tokio::time::sleep(POLL_INTERVAL).await;

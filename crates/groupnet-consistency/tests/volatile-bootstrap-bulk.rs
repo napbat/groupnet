@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, ByteAdmission,
 };
@@ -24,13 +25,13 @@ use tokio::sync::{oneshot, watch};
 
 fn admission() -> ByteAdmission {
     ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: 100_000,
+        max_total_bytes: std::num::NonZeroUsize::new(100_000).unwrap(),
         max_encoded_bytes: 100_000,
         max_decoded_bytes: 100_000,
         max_suffix_bytes: 100_000,
         max_native_overlap_bytes: 100_000,
         max_inflight_bytes: 100_000,
-        max_reservations: 100,
+        max_reservations: std::num::NonZeroUsize::new(100).unwrap(),
     })
     .unwrap()
 }
@@ -38,21 +39,21 @@ fn admission() -> ByteAdmission {
 fn limits() -> BulkLimits {
     BulkLimits {
         wire: WireLimits {
-            max_frame_bytes: 4096,
-            max_scope_bytes: 64,
-            max_node_bytes: 32,
-            max_payload_bytes: 2048,
+            max_frame_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_payload_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
         },
         phase: PhaseLimits {
-            max_body_bytes: 2048,
-            max_scope_bytes: 64,
-            max_node_bytes: 32,
-            max_writer_bytes: 32,
-            max_cuts: 4,
-            max_members: 4,
-            max_events: 4,
-            max_identity_bytes: 32,
-            max_effect_bytes: 128,
+            max_body_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_writer_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_cuts: std::num::NonZeroUsize::new(4).unwrap(),
+            max_members: std::num::NonZeroUsize::new(4).unwrap(),
+            max_events: std::num::NonZeroUsize::new(4).unwrap(),
+            max_identity_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_effect_bytes: std::num::NonZeroUsize::new(128).unwrap(),
         },
         server_request: Duration::from_secs(1),
     }
@@ -118,7 +119,7 @@ async fn real_bulk_binding_delivers_exact_typed_reply_and_releases_all_charges()
     let server_budget = admission();
     let client_budget = admission();
     let (correlation, request) = exchange();
-    let (sender, mut inbox) = DonorInbox::new(4).unwrap();
+    let (sender, mut inbox) = DonorInbox::new(QueueCapacity::of(4));
     inbox.set_identity(Some(correlation.donor.clone()));
     let listener =
         BootstrapBulkListener::new(donor, sender, server_budget.clone(), limits()).unwrap();
@@ -156,7 +157,7 @@ async fn timed_out_caller_and_cancelled_listener_retire_queued_work() {
     let server_budget = admission();
     let client_budget = admission();
     let (correlation, request) = exchange();
-    let (sender, inbox) = DonorInbox::new(1).unwrap();
+    let (sender, inbox) = DonorInbox::new(QueueCapacity::of(1));
     inbox.set_identity(Some(correlation.donor.clone()));
     let listener =
         BootstrapBulkListener::new(donor, sender, server_budget.clone(), limits()).unwrap();
@@ -186,7 +187,7 @@ async fn full_donor_inbox_returns_exact_capacity_refusal_and_retires_charge() {
     let server_budget = admission();
     let client_budget = admission();
     let (correlation, request) = exchange();
-    let (sender, inbox) = DonorInbox::new(1).unwrap();
+    let (sender, inbox) = DonorInbox::new(QueueCapacity::of(1));
     inbox.set_identity(Some(correlation.donor.clone()));
     let occupied = server_budget
         .reserve(AdmissionClass::Inflight, 512)
@@ -224,7 +225,7 @@ async fn closed_donor_inbox_rejects_without_retaining_bytes() {
     let server_budget = admission();
     let client_budget = admission();
     let (correlation, request) = exchange();
-    let (sender, inbox) = DonorInbox::new(1).unwrap();
+    let (sender, inbox) = DonorInbox::new(QueueCapacity::of(1));
     inbox.set_identity(Some(correlation.donor.clone()));
     drop(inbox);
     let listener =
@@ -264,7 +265,7 @@ async fn listener_follows_worker_capture_identity_across_session_rotation() {
         unreachable!();
     };
     reservation.capture.donor = renewed.donor.clone();
-    let (sender, mut inbox) = DonorInbox::new(4).unwrap();
+    let (sender, mut inbox) = DonorInbox::new(QueueCapacity::of(4));
     inbox.set_identity(Some(old.donor.clone()));
     let listener =
         BootstrapBulkListener::new(donor, sender, server_budget.clone(), limits()).unwrap();

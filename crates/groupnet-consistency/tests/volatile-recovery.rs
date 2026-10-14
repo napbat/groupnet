@@ -134,14 +134,11 @@ async fn failed_full_scan_retries_and_old_page_cannot_publish() {
         fail_first: AtomicBool::new(true),
         ..MemoryAdapter::default()
     });
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        1,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 1)
+        .config(config())
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     assert!(adapter.revoked.load(Ordering::SeqCst) >= 1);
     eventually_within("full rescan retry affirmed", SETTLE, || {
         handle.status().may_serve
@@ -180,14 +177,11 @@ async fn progressing_scan_outlives_attempt_and_episode_bounds_in_one_pass() {
         ..MemoryAdapter::default()
     });
     let started = Instant::now();
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        1,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 1)
+        .config(config())
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     eventually_within("slow progressing scan affirmed", SETTLE * 3, || {
         handle.status().may_serve
     })
@@ -207,14 +201,11 @@ async fn scan_without_progress_reports_is_failed_at_its_attempt_bound() {
         page_ms: AtomicU64::new(50),
         ..MemoryAdapter::default()
     });
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        1,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 1)
+        .config(config())
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     eventually_within("stalled scan retried", SETTLE, || {
         adapter.rebuilds.load(Ordering::SeqCst) >= 2
     })
@@ -230,14 +221,11 @@ async fn scan_without_progress_reports_is_failed_at_its_attempt_bound() {
 #[tokio::test]
 async fn public_gap_closes_read_gate_before_worker_handles_coalesced_signals() {
     let adapter = Arc::new(MemoryAdapter::default());
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        2,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 2)
+        .config(config())
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     eventually_within("cold origin rescan affirmed", SETTLE, || {
         handle.status().may_serve
     })
@@ -259,14 +247,11 @@ async fn public_gap_closes_read_gate_before_worker_handles_coalesced_signals() {
 #[tokio::test]
 async fn last_handle_drop_revokes_serving_without_waiting_for_worker_poll() {
     let adapter = Arc::new(MemoryAdapter::default());
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        3,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 3)
+        .config(config())
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     eventually_within("cold recovery ready before drop", SETTLE, || {
         handle.status().may_serve
     })
@@ -283,14 +268,11 @@ async fn last_handle_drop_revokes_serving_without_waiting_for_worker_poll() {
 #[tokio::test]
 async fn duplicate_zero_and_old_lapses_do_not_close_an_affirmed_gate() {
     let adapter = Arc::new(MemoryAdapter::default());
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Leased,
-        NodeId::from("me"),
-        4,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 4)
+        .config(config())
+        .mode(RecoveryMode::Leased)
+        .open()
+        .unwrap();
     eventually_within("cold leased recovery ready", SETTLE, || {
         handle.status().may_serve
     })
@@ -316,14 +298,11 @@ async fn duplicate_zero_and_old_lapses_do_not_close_an_affirmed_gate() {
 #[tokio::test]
 async fn gap_after_long_ready_idle_receives_a_fresh_total_budget() {
     let adapter = Arc::new(MemoryAdapter::default());
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        5,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 5)
+        .config(config())
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     eventually_within("initial recovery ready", SETTLE, || {
         handle.status().may_serve
     })
@@ -345,14 +324,11 @@ async fn gap_after_long_ready_idle_receives_a_fresh_total_budget() {
 #[tokio::test]
 async fn unsupported_lapse_does_not_revoke_unleased_recovery() {
     let adapter = Arc::new(MemoryAdapter::default());
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        6,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 6)
+        .config(config())
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     eventually_within("unleased recovery ready", SETTLE, || {
         handle.status().may_serve
     })
@@ -369,14 +345,11 @@ async fn unsupported_lapse_does_not_revoke_unleased_recovery() {
 #[tokio::test(flavor = "current_thread")]
 async fn prequeued_signal_notify_does_not_cancel_its_own_invalidation() {
     let adapter = Arc::new(MemoryAdapter::default());
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        config(),
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        7,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 7)
+        .config(config())
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     // This synchronous call runs before the worker's first poll on a
     // current-thread executor, leaving a stored Notify permit.
     handle.feed_gap(1).unwrap();
@@ -399,14 +372,11 @@ async fn origin_only_can_explicitly_restart_after_origin_recovers() {
         attempt_ms: 10,
         ..config()
     };
-    let handle = RecoveryHandle::open(
-        Arc::clone(&adapter),
-        limits,
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        8,
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 8)
+        .config(limits)
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .unwrap();
     eventually_within("origin-only after finite failed scans", SETTLE, || {
         handle.status().state.stage
             == groupnet_consistency::volatile_recovery::RecoveryStage::OriginOnly

@@ -3,8 +3,9 @@
 use std::sync::{Arc, Mutex};
 
 use groupnet_core::volatile_bootstrap::ClaimIdentity;
+use groupnet_transport::QueueCapacity;
 
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use super::admission::Admitted;
 use super::ports::{DonorReply, DonorRequest};
@@ -13,8 +14,6 @@ use crate::volatile_recovery::AdapterError;
 /// Failed admission to the one worker's bounded donor inbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DonorInboxError {
-    /// A zero or unrepresentable queue length was configured.
-    InvalidCapacity,
     /// The bounded queue is full; the request was dropped with its charge.
     Full,
     /// The recovery worker ended and cannot serve this capture.
@@ -24,7 +23,6 @@ pub enum DonorInboxError {
 impl std::fmt::Display for DonorInboxError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::InvalidCapacity => "donor inbox capacity is zero or unrepresentable",
             Self::Full => "donor inbox is full",
             Self::Closed => "donor inbox is closed",
         })
@@ -110,17 +108,12 @@ impl Drop for DonorInbox {
 
 impl DonorInbox {
     /// Opens one bounded queue and its cloneable ingress handle.
-    ///
-    /// # Errors
-    /// Rejects zero or unrepresentable queue capacity.
-    pub fn new(capacity: usize) -> Result<(DonorSender, Self), DonorInboxError> {
-        if capacity == 0 || capacity > Semaphore::MAX_PERMITS {
-            return Err(DonorInboxError::InvalidCapacity);
-        }
-        let (sender, receiver) = mpsc::channel(capacity);
+    #[must_use]
+    pub fn new(capacity: QueueCapacity) -> (DonorSender, Self) {
+        let (sender, receiver) = mpsc::channel(capacity.get());
         let wake = Arc::new(Notify::new());
         let identity = Arc::new(Mutex::new(None));
-        Ok((
+        (
             DonorSender {
                 sender,
                 wake: Arc::clone(&wake),
@@ -131,7 +124,7 @@ impl DonorInbox {
                 wake,
                 identity,
             },
-        ))
+        )
     }
 
     /// Publishes or withdraws the exact donor identity along with the worker's
@@ -175,26 +168,23 @@ mod tests {
     }
 
     #[test]
-    fn semaphore_overflow_is_rejected_before_channel_construction() {
-        assert_eq!(
-            DonorInbox::new(Semaphore::MAX_PERMITS + 1).unwrap_err(),
-            DonorInboxError::InvalidCapacity
-        );
+    fn the_largest_capacity_tokio_accepts_opens() {
+        let (_sender, _inbox) = DonorInbox::new(QueueCapacity::MAX);
     }
 
     #[tokio::test]
     async fn full_queue_and_dropped_receiver_release_exact_request_charge() {
         let admission = ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 2,
+            max_total_bytes: std::num::NonZeroUsize::new(2).unwrap(),
             max_encoded_bytes: 0,
             max_decoded_bytes: 0,
             max_suffix_bytes: 0,
             max_native_overlap_bytes: 0,
             max_inflight_bytes: 2,
-            max_reservations: 2,
+            max_reservations: std::num::NonZeroUsize::new(2).unwrap(),
         })
         .unwrap();
-        let (sender, mut inbox) = DonorInbox::new(1).unwrap();
+        let (sender, mut inbox) = DonorInbox::new(QueueCapacity::MIN);
         let first = sender.try_submit(admitted_request(&admission)).unwrap();
         assert_eq!(
             sender.try_submit(admitted_request(&admission)).unwrap_err(),

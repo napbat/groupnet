@@ -5,6 +5,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 
 use groupnet_core::replication::{Config as CoreConfig, ConfigError as CoreConfigError};
+use groupnet_transport::QueueCapacity;
 use tokio::sync::Semaphore;
 
 const DEFAULT_MAX_SCOPES: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
@@ -13,7 +14,7 @@ const DEFAULT_MAX_INFLIGHT_BYTES: NonZeroUsize = NonZeroUsize::new(32 * 1024 * 1
 const DEFAULT_MAX_CHECKPOINT_BYTES: NonZeroUsize = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
 const DEFAULT_MAX_CHECKPOINT_INFLIGHT_BYTES: NonZeroUsize =
     NonZeroUsize::new(256 * 1024 * 1024).unwrap();
-const DEFAULT_QUEUE_DEPTH: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+const DEFAULT_QUEUE_DEPTH: QueueCapacity = QueueCapacity::of(32);
 
 /// Bounded shell capacity in addition to the sans-IO core's batch limits.
 ///
@@ -37,7 +38,7 @@ pub struct Limits {
     /// least one `max_checkpoint_bytes` candidate.
     pub max_checkpoint_inflight_bytes: NonZeroUsize,
     /// Bounded command queue per scope; floor requests return backpressure.
-    pub queue_depth: NonZeroUsize,
+    pub queue_depth: QueueCapacity,
 }
 
 impl Default for Limits {
@@ -102,11 +103,6 @@ pub enum LimitsError {
     CheckpointInflightAbovePermits {
         /// Configured `max_checkpoint_inflight_bytes`.
         max_checkpoint_inflight_bytes: usize,
-    },
-    /// `queue_depth` exceeds the bounded channel's permit ceiling.
-    QueueDepthAbovePermits {
-        /// Configured `queue_depth`.
-        queue_depth: usize,
     },
     /// Snapshot recovery (`core.snapshot`) holds one operation for the
     /// snapshot stream while replay continues, so `max_parallel_ops` must be
@@ -200,10 +196,6 @@ impl fmt::Display for LimitsError {
                 "replication limits: max_checkpoint_inflight_bytes \
                  ({max_checkpoint_inflight_bytes}) exceeds {permits}"
             ),
-            Self::QueueDepthAbovePermits { queue_depth } => write!(
-                f,
-                "replication limits: queue_depth ({queue_depth}) exceeds {permits}"
-            ),
             Self::SnapshotParallelOpsBelowTwo { max_parallel_ops } => write!(
                 f,
                 "replication limits: snapshot recovery needs max_parallel_ops >= 2, got \
@@ -271,7 +263,6 @@ impl Limits {
         let max_batch_bytes = self.core.max_batch_bytes.get();
         let max_checkpoint_bytes = self.max_checkpoint_bytes.get();
         let max_checkpoint_inflight_bytes = self.max_checkpoint_inflight_bytes.get();
-        let queue_depth = self.queue_depth.get();
         if max_parallel_ops > permits {
             return Err(LimitsError::ParallelOpsAbovePermits { max_parallel_ops });
         }
@@ -302,9 +293,6 @@ impl Limits {
             return Err(LimitsError::CheckpointInflightAbovePermits {
                 max_checkpoint_inflight_bytes,
             });
-        }
-        if queue_depth > permits {
-            return Err(LimitsError::QueueDepthAbovePermits { queue_depth });
         }
         if let Some(snapshot) = self.core.snapshot {
             let max_chunk_bytes = snapshot.max_chunk_bytes.get();

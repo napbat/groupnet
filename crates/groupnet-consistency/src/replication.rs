@@ -9,7 +9,8 @@
 //! This module is the tier's complete surface: it re-exports every
 //! `groupnet_core::replication` domain type that an adapter signature, limit,
 //! status, or error names ([`Scope`], [`Cursor`], [`SourceProof`],
-//! [`CoreConfig`], …), so an adapter needs only this module and `std`. The
+//! [`CoreConfig`], …), so an adapter needs only this module, `std`, and the
+//! shared core vocabulary (`groupnet_core::Time`, never re-exported here). The
 //! core's sans-IO engine (`SessionEngine`, `Event`, `Effect`, `Step`) stays in
 //! `groupnet_core::replication` for custom drivers.
 
@@ -33,7 +34,6 @@ pub use api::{
     SourceScanResult, TailLimit,
 };
 pub use fence::{InstallPermit, OperationFence, RevocationPermit};
-pub use groupnet_core::Time;
 pub use groupnet_core::replication::{
     AckEvidence, AckKind, AckTarget, AckWaitError, AckWaitLimits, AckWaitLimitsError,
     AckWaitOutcome, AckWaitRequest, BoundComparison, CertifiedRoster, CommitSubscriberAck,

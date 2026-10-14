@@ -116,7 +116,81 @@ pub trait BootstrapStatePort: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 }
 
-/// A [`BulkDonorPort`] configuration rule that [`BulkDonorPort::new`] rejected.
+/// What one [`BulkDonorPort`] transfers: the complete scope it is pinned to,
+/// the follower's transfer policy, and the bulk limits that must carry it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BulkDonorOptions {
+    /// Complete application partition every exchange is correlated to.
+    pub scope: BootstrapScope,
+    /// The follower's transfer policy; its budgets must fit `limits.phase`.
+    pub policy: TransferConfig,
+    /// Network and decode limits for each exchange.
+    pub limits: BulkLimits,
+}
+
+impl BulkDonorOptions {
+    /// Checks the scope, the policy, the limits, and that every policy budget
+    /// fits the phase bound that carries it.
+    ///
+    /// # Errors
+    /// The [`BulkDonorPortError`] naming the first violated rule.
+    pub fn validate(&self) -> Result<(), BulkDonorPortError> {
+        let Self {
+            scope,
+            policy,
+            limits,
+        } = self;
+        if scope.domain.is_empty() || scope.partition.is_empty() {
+            return Err(BulkDonorPortError::EmptyScope);
+        }
+        policy.validate().map_err(BulkDonorPortError::Policy)?;
+        limits.validate().map_err(BulkDonorPortError::Limits)?;
+        if scope
+            .domain
+            .len()
+            .checked_add(scope.partition.len())
+            .is_none_or(|bytes| {
+                bytes > limits.wire.max_scope_bytes.get()
+                    || bytes > limits.phase.max_scope_bytes.get()
+            })
+        {
+            return Err(BulkDonorPortError::ScopeTooLong);
+        }
+        let body = limits.phase.max_body_bytes;
+        let rules = [
+            (
+                policy.max_metadata_bytes > body,
+                BulkDonorPortError::MetadataExceedsBody,
+            ),
+            (
+                policy.max_chunk_bytes > body,
+                BulkDonorPortError::ChunkExceedsBody,
+            ),
+            (
+                policy.max_batch_bytes > body,
+                BulkDonorPortError::BatchBytesExceedBody,
+            ),
+            (
+                policy.max_batch_events > limits.phase.max_events,
+                BulkDonorPortError::BatchEventsExceedPhase,
+            ),
+            (
+                policy.max_members > limits.phase.max_members,
+                BulkDonorPortError::MembersExceedPhase,
+            ),
+            (
+                policy.max_cuts > limits.phase.max_cuts,
+                BulkDonorPortError::CutsExceedPhase,
+            ),
+        ];
+        match rules.into_iter().find(|(violated, _)| *violated) {
+            Some((_, error)) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A [`BulkDonorOptions`] rule that [`BulkDonorOptions::validate`] rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BulkDonorPortError {
     /// `scope.domain` or `scope.partition` is empty.
@@ -124,6 +198,9 @@ pub enum BulkDonorPortError {
     /// `policy` failed [`TransferConfig::validate`]; the
     /// [`TransferConfigError`] is the [`source`](std::error::Error::source).
     Policy(TransferConfigError),
+    /// `limits` failed [`BulkLimits::validate`]; the [`BulkLimitsError`] is
+    /// the [`source`](std::error::Error::source).
+    Limits(BulkLimitsError),
     /// `scope` exceeds `limits.wire.max_scope_bytes` or
     /// `limits.phase.max_scope_bytes`.
     ScopeTooLong,
@@ -139,38 +216,28 @@ pub enum BulkDonorPortError {
     MembersExceedPhase,
     /// `policy.max_cuts` exceeds `limits.phase.max_cuts`.
     CutsExceedPhase,
-    /// `limits` failed [`BulkLimits::validate`].
-    Limits(BulkLimitsError),
 }
 
 impl std::fmt::Display for BulkDonorPortError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptyScope => formatter.write_str("bootstrap scope domain or partition is empty"),
-            Self::Policy(_) => formatter.write_str("invalid transfer policy"),
-            Self::ScopeTooLong => {
-                formatter.write_str("bootstrap scope exceeds the bulk scope limit")
-            }
+        formatter.write_str(match self {
+            Self::EmptyScope => "bootstrap scope domain or partition is empty",
+            Self::Policy(_) => "invalid transfer policy",
+            Self::Limits(_) => "invalid bulk limits",
+            Self::ScopeTooLong => "bootstrap scope exceeds the bulk scope limit",
             Self::MetadataExceedsBody => {
-                formatter.write_str("policy.max_metadata_bytes exceeds limits.phase.max_body_bytes")
+                "policy.max_metadata_bytes exceeds limits.phase.max_body_bytes"
             }
-            Self::ChunkExceedsBody => {
-                formatter.write_str("policy.max_chunk_bytes exceeds limits.phase.max_body_bytes")
-            }
+            Self::ChunkExceedsBody => "policy.max_chunk_bytes exceeds limits.phase.max_body_bytes",
             Self::BatchBytesExceedBody => {
-                formatter.write_str("policy.max_batch_bytes exceeds limits.phase.max_body_bytes")
+                "policy.max_batch_bytes exceeds limits.phase.max_body_bytes"
             }
             Self::BatchEventsExceedPhase => {
-                formatter.write_str("policy.max_batch_events exceeds limits.phase.max_events")
+                "policy.max_batch_events exceeds limits.phase.max_events"
             }
-            Self::MembersExceedPhase => {
-                formatter.write_str("policy.max_members exceeds limits.phase.max_members")
-            }
-            Self::CutsExceedPhase => {
-                formatter.write_str("policy.max_cuts exceeds limits.phase.max_cuts")
-            }
-            Self::Limits(_) => formatter.write_str("invalid bulk limits"),
-        }
+            Self::MembersExceedPhase => "policy.max_members exceeds limits.phase.max_members",
+            Self::CutsExceedPhase => "policy.max_cuts exceeds limits.phase.max_cuts",
+        })
     }
 }
 
@@ -203,7 +270,8 @@ pub struct BulkDonorPort<A: BootstrapStatePort, B: BulkTransport> {
 }
 
 impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
-    /// Binds the client to the worker's one shared admission pool.
+    /// Binds the client to the worker's one shared admission pool, after
+    /// [`BulkDonorOptions::validate`].
     ///
     /// # Errors
     /// Names the first scope, policy, or transport-limit rule violated.
@@ -211,56 +279,15 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         state: Arc<A>,
         plane: DataPlane<B>,
         admission: ByteAdmission,
-        scope: BootstrapScope,
-        policy: TransferConfig,
-        limits: BulkLimits,
+        options: BulkDonorOptions,
     ) -> Result<Self, BulkDonorPortError> {
-        if scope.domain.is_empty() || scope.partition.is_empty() {
-            return Err(BulkDonorPortError::EmptyScope);
-        }
-        policy.validate().map_err(BulkDonorPortError::Policy)?;
-        if scope
-            .domain
-            .len()
-            .checked_add(scope.partition.len())
-            .is_none_or(|bytes| {
-                bytes > limits.wire.max_scope_bytes || bytes > limits.phase.max_scope_bytes
-            })
-        {
-            return Err(BulkDonorPortError::ScopeTooLong);
-        }
-        let body = limits.phase.max_body_bytes;
-        let rules = [
-            (
-                policy.max_metadata_bytes.get() > body,
-                BulkDonorPortError::MetadataExceedsBody,
-            ),
-            (
-                policy.max_chunk_bytes.get() > body,
-                BulkDonorPortError::ChunkExceedsBody,
-            ),
-            (
-                policy.max_batch_bytes.get() > body,
-                BulkDonorPortError::BatchBytesExceedBody,
-            ),
-            (
-                policy.max_batch_events.get() > limits.phase.max_events,
-                BulkDonorPortError::BatchEventsExceedPhase,
-            ),
-            (
-                policy.max_members.get() > limits.phase.max_members,
-                BulkDonorPortError::MembersExceedPhase,
-            ),
-            (
-                policy.max_cuts.get() > limits.phase.max_cuts,
-                BulkDonorPortError::CutsExceedPhase,
-            ),
-        ];
-        if let Some((_, error)) = rules.into_iter().find(|(violated, _)| *violated) {
-            return Err(error);
-        }
-        let client = BootstrapBulkClient::new(plane, admission.clone(), limits)
-            .map_err(BulkDonorPortError::Limits)?;
+        options.validate()?;
+        let BulkDonorOptions {
+            scope,
+            policy,
+            limits,
+        } = options;
+        let client = BootstrapBulkClient::validated(plane, admission.clone(), limits);
         Ok(Self {
             state,
             client,
@@ -369,3 +396,55 @@ impl<A: BootstrapStatePort, B: BulkTransport> DonorPort for BulkDonorPort<A, B> 
 
 mod donor;
 mod mapping;
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    fn options() -> BulkDonorOptions {
+        BulkDonorOptions {
+            scope: BootstrapScope {
+                domain: "origin".into(),
+                partition: "bucket".into(),
+            },
+            policy: groupnet_core::volatile_bootstrap::transfer::TransferConfig::new(
+                NonZeroU32::MIN,
+            ),
+            limits: BulkLimits::default(),
+        }
+    }
+
+    /// The default bulk limits carry the default transfer policy: a
+    /// deployment that changes neither needs no tuning to pair them.
+    #[test]
+    fn the_default_limits_carry_the_default_policy() {
+        assert_eq!(options().validate(), Ok(()));
+    }
+
+    #[test]
+    fn options_name_the_violated_rule_and_keep_the_cause() {
+        let mut empty = options();
+        empty.scope.partition.clear();
+        assert_eq!(empty.validate(), Err(BulkDonorPortError::EmptyScope));
+
+        let mut wide = options();
+        wide.policy.max_members = wide
+            .limits
+            .phase
+            .max_members
+            .checked_add(1)
+            .expect("headroom");
+        assert_eq!(wide.validate(), Err(BulkDonorPortError::MembersExceedPhase));
+
+        let mut zero = options();
+        zero.limits.server_request = std::time::Duration::ZERO;
+        let error = zero.validate().unwrap_err();
+        assert_eq!(
+            error,
+            BulkDonorPortError::Limits(BulkLimitsError::ZeroServerRequest)
+        );
+        assert!(std::error::Error::source(&error).is_some());
+    }
+}

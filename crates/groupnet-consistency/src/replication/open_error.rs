@@ -133,7 +133,9 @@ mod tests {
 
     #[test]
     fn limit_failures_chain_as_source() {
-        let limits = LimitsError::QueueDepthAbovePermits { queue_depth: 9 };
+        let limits = LimitsError::ParallelOpsAbovePermits {
+            max_parallel_ops: 9,
+        };
         let error = OpenError::from(limits);
         assert_eq!(error, OpenError::InvalidLimits(limits));
         let source = error.source().expect("limits error is the source");

@@ -139,15 +139,24 @@ port argument, not a fresh duration derived inside a network adapter.
 `BulkDonorPort<A, B>` wraps a consumer `A: BootstrapStatePort` and a
 `BootstrapBulkClient<B: BulkTransport>`; it implements `DonorPort` for the
 existing worker without a new task, timer, map of stages, or operation
-allocator. Construction also pins a complete `BootstrapScope` and bulk limits;
-`BulkDonorPort::new` names the violated rule as a `BulkDonorPortError`: a
-failed `TransferConfig::validate` is `Policy(TransferConfigError)`, a policy
-budget above its `limits.phase` bound has its own variant (for example
-`MetadataExceedsBody` or `MembersExceedPhase`), and `BulkLimits::validate`
-names each zero or inverted bound as a `BulkLimitsError` carried by `Limits`.
-Wrapped errors are the variant's `source()`. The responder's per-request bound
-is the `Duration`
-`BulkLimits::server_request`.
+allocator. Construction pins a `BulkDonorOptions` value — a complete
+`BootstrapScope`, the follower's `TransferConfig` policy, and `BulkLimits`.
+`BulkDonorOptions::validate` (run by `BulkDonorPort::new`) names the violated
+rule as a `BulkDonorPortError`: a failed `TransferConfig::validate` is
+`Policy(TransferConfigError)`, a failed `BulkLimits::validate` is
+`Limits(BulkLimitsError)`, and a policy budget above its `limits.phase` bound
+has its own variant (for example `MetadataExceedsBody` or
+`MembersExceedPhase`). Every wire and phase bound is a `NonZeroUsize`;
+`WireLimits::validate` and `PhaseLimits::validate` name a bound above the
+transport frame cap or the length/count field that carries it, and
+`BulkLimits::validate` composes them (`Wire`, `Phase`) with the rules relating
+the two, a zero `server_request`, and a `server_request` the clock cannot
+represent — so the listener and client reject it before they exist rather
+than after the first accepted connection. Wrapped errors are the variant's
+`source()`. `AdmissionLimits` keeps a nonzero aggregate and reservation count
+by type; a zero class cap stays valid and disables that class. Every limits
+value has a `Default` sized for the core's default transfer policy. The
+responder's per-request bound is the `Duration` `BulkLimits::server_request`.
 It constructs the client from the **same** admission handle passed to the
 worker, or rejects a separately supplied handle whose pool identity differs;
 a mismatched pool cannot evade the global cap. Local capture and guarded

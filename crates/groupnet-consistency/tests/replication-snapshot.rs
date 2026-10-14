@@ -15,8 +15,9 @@ use groupnet_consistency::replication::{
     Operation, ProofId, ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope,
     SnapshotApplicationAdapter, SnapshotAttachment, SnapshotConfig, SnapshotHold, SnapshotImage,
     SnapshotOffer, SnapshotSourceAdapter, SnapshotStage, SourceAdapter, SourceBatch, SourceHistory,
-    SourceProof, Stream, TailLimit, Time,
+    SourceProof, Stream, TailLimit,
 };
+use groupnet_core::Time;
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
 

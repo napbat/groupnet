@@ -6,6 +6,7 @@ use super::{
     Instant, NodeId, Ordering, OriginDonor, ReadAdapter, RecoveryConfig, RecoveryHandle,
     RecoveryMode, RecoveryRearm, SETTLE, admission, bootstrap_config, eventually_within,
 };
+use groupnet_consistency::volatile_recovery::bootstrap::PresenceIdentity;
 use groupnet_core::volatile_bootstrap::ClaimPhase;
 
 /// Thirty 50 ms pages take 1.5 s: three donor waits (500 ms), about twice the
@@ -33,16 +34,17 @@ async fn progressing_local_build_outlives_fixed_bounds_and_keeps_its_claim_live(
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap();
     let adapter = Arc::new(ReadAdapter::default());
     let started = Instant::now();
-    let handle = RecoveryHandle::open_with_bootstrap_and_rearm(
-        Arc::clone(&adapter),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 9)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -50,17 +52,15 @@ async fn progressing_local_build_outlives_fixed_bounds_and_keeps_its_claim_live(
             attempt_ms: 300,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        9,
-        RecoveryRearm {
+        })
+        .mode(RecoveryMode::Unleased)
+        .rearm(RecoveryRearm {
             initial_ms: 50,
             max_ms: 200,
-        },
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     let building = |min_progress: u64| {
         claims
             .local

@@ -291,16 +291,32 @@ fn open_without_executor_returns_typed_error() {
         poll_ms: 1,
     };
     assert_eq!(
-        RecoveryHandle::open(
-            adapter,
-            config,
-            RecoveryMode::Unleased,
-            NodeId::from("me"),
-            1
-        )
-        .err(),
+        RecoveryHandle::builder(adapter, NodeId::from("me"), 1)
+            .config(config)
+            .mode(RecoveryMode::Unleased)
+            .open()
+            .err(),
         Some(RecoveryOpenError::NoRuntime)
     );
+}
+
+#[test]
+fn the_builder_starts_unleased_with_the_default_limits() {
+    let builder = RecoveryHandle::builder(Arc::new(Adapter::default()), NodeId::from("me"), 1);
+    assert_eq!(builder.mode, RecoveryMode::Unleased);
+    assert_eq!(
+        builder.config,
+        groupnet_core::volatile_recovery::RecoveryConfig::default()
+    );
+    assert!(builder.rearm.is_none() && builder.bootstrap.is_none());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = runtime
+        .block_on(async { builder.open() })
+        .expect("the defaults open");
+    assert!(!handle.status().may_serve, "a driver opens closed");
 }
 
 #[test]
@@ -315,14 +331,11 @@ fn rejected_core_config_is_the_open_error_source() {
         settle_ms: 1,
         poll_ms: 1,
     };
-    let error = RecoveryHandle::open(
-        adapter,
-        config,
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        1,
-    )
-    .expect_err("zero total budget is rejected");
+    let error = RecoveryHandle::builder(adapter, NodeId::from("me"), 1)
+        .config(config)
+        .mode(RecoveryMode::Unleased)
+        .open()
+        .expect_err("zero total budget is rejected");
     let RecoveryOpenError::Core(core) = error else {
         panic!("expected the core's rejection, got {error:?}");
     };
@@ -479,17 +492,18 @@ async fn cancel_or_last_drop_during_cooldown_prevents_another_origin_attempt() {
     for cancel in [true, false] {
         let adapter = Arc::new(Adapter::default());
         adapter.fail_origin.store(true, Ordering::SeqCst);
-        let handle = RecoveryHandle::open_with_rearm(
+        let handle = RecoveryHandle::builder(
             Arc::clone(&adapter),
-            config,
-            RecoveryMode::Unleased,
             NodeId::from("me"),
             100 + u64::from(cancel),
-            RecoveryRearm {
-                initial_ms: 80,
-                max_ms: 80,
-            },
         )
+        .config(config)
+        .mode(RecoveryMode::Unleased)
+        .rearm(RecoveryRearm {
+            initial_ms: 80,
+            max_ms: 80,
+        })
+        .open()
         .unwrap();
         eventually_within("failed episode enters cooldown", SETTLE, || {
             handle.status().state.stage
@@ -528,18 +542,15 @@ async fn optional_rearm_recovers_after_a_long_origin_outage_without_a_restart_si
         settle_ms: 1,
         poll_ms: 5,
     };
-    let handle = RecoveryHandle::open_with_rearm(
-        Arc::clone(&adapter),
-        config,
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        11,
-        RecoveryRearm {
+    let handle = RecoveryHandle::builder(Arc::clone(&adapter), NodeId::from("me"), 11)
+        .config(config)
+        .mode(RecoveryMode::Unleased)
+        .rearm(RecoveryRearm {
             initial_ms: 40,
             max_ms: 80,
-        },
-    )
-    .unwrap();
+        })
+        .open()
+        .unwrap();
     eventually_within("the first finite episode exhausts", SETTLE, || {
         handle.status().state.stage == groupnet_core::volatile_recovery::RecoveryStage::OriginOnly
     })

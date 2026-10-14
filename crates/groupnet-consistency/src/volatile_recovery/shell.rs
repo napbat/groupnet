@@ -567,103 +567,85 @@ impl<A: RecoveryAdapter> Drop for RecoveryHandle<A> {
     }
 }
 
-impl<A: RecoveryAdapter> RecoveryHandle<A> {
+/// Configures one per-domain recovery driver before it opens; nothing is
+/// checked, revoked or spawned until [`open`](Self::open).
+///
+/// Starts from [`RecoveryMode::Unleased`] — a gap always needs origin
+/// reconciliation, the mode that assumes no lease — the core's default
+/// [`RecoveryConfig`], no rearm policy, and no peer bootstrap child.
+pub struct RecoveryBuilder<A: RecoveryAdapter> {
+    adapter: Arc<A>,
+    me: NodeId,
+    session: u64,
+    config: RecoveryConfig,
+    mode: RecoveryMode,
+    rearm: Option<RecoveryRearm>,
+    bootstrap: Option<Box<dyn BootstrapDriver>>,
+}
+
+impl<A: RecoveryAdapter> std::fmt::Debug for RecoveryBuilder<A> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryBuilder")
+            .field("me", &self.me)
+            .field("session", &self.session)
+            .field("config", &self.config)
+            .field("mode", &self.mode)
+            .field("rearm", &self.rearm)
+            .field("bootstrap", &self.bootstrap.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<A: RecoveryAdapter> RecoveryBuilder<A> {
+    /// Finite recovery, roster, and operation limits.
+    #[must_use]
+    pub fn config(mut self, config: RecoveryConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The reader-side coherence policy the consumer runs.
+    #[must_use]
+    pub fn mode(mut self, mode: RecoveryMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Capped automatic full recovery after an exhausted episode. The policy
+    /// does not change any individual attempt's `RecoveryConfig::total_ms` or
+    /// source authority.
+    #[must_use]
+    pub fn rearm(mut self, rearm: RecoveryRearm) -> Self {
+        self.rearm = Some(rearm);
+        self
+    }
+
+    /// An optional source-backed peer bootstrap child. It only supplies a
+    /// private baseline; independent lease and application authority still
+    /// decide whether reads may be served.
+    #[must_use]
+    pub fn bootstrap(mut self, driver: Box<dyn BootstrapDriver>) -> Self {
+        self.bootstrap = Some(driver);
+        self
+    }
+
     /// Opens a closed driver and schedules the mandatory cold origin rebuild.
-    /// A unique nonzero session incarnation is required for every process life.
     ///
     /// # Errors
-    /// Returns a core configuration or platform clock-range error before a
-    /// worker is spawned.
-    ///
-    pub fn open(
-        adapter: Arc<A>,
-        config: RecoveryConfig,
-        mode: RecoveryMode,
-        me: NodeId,
-        session: u64,
-    ) -> Result<Self, RecoveryOpenError> {
-        Self::open_configured(adapter, config, mode, me, session, None)
-    }
-
-    /// Opens a closed driver with capped automatic full recovery after an
-    /// exhausted episode. The policy does not change any individual attempt's
-    /// `RecoveryConfig::total_ms` or source authority.
-    ///
-    /// # Errors
-    /// Rejects invalid policy bounds, platform clock range, or no executor.
-    pub fn open_with_rearm(
-        adapter: Arc<A>,
-        config: RecoveryConfig,
-        mode: RecoveryMode,
-        me: NodeId,
-        session: u64,
-        rearm: RecoveryRearm,
-    ) -> Result<Self, RecoveryOpenError> {
-        Self::open_configured(adapter, config, mode, me, session, Some(rearm))
-    }
-
-    /// Opens one recovery worker with an optional source-backed peer bootstrap
-    /// child. The child only supplies a private baseline; independent lease
-    /// and application authority still decide whether reads may be served.
-    ///
-    /// # Errors
-    /// Rejects invalid recovery configuration, clock range, or no executor.
-    pub fn open_with_bootstrap(
-        adapter: Arc<A>,
-        config: RecoveryConfig,
-        mode: RecoveryMode,
-        me: NodeId,
-        session: u64,
-        bootstrap: Box<dyn BootstrapDriver>,
-    ) -> Result<Self, RecoveryOpenError> {
-        Self::open_inner(adapter, config, mode, me, session, None, Some(bootstrap))
-    }
-
-    /// Opens the same worker with both a peer bootstrap child and a bounded
-    /// rearm policy for later exhausted recovery episodes.
-    ///
-    /// # Errors
-    /// Rejects invalid recovery or rearm bounds, clock range, or no executor.
-    pub fn open_with_bootstrap_and_rearm(
-        adapter: Arc<A>,
-        config: RecoveryConfig,
-        mode: RecoveryMode,
-        me: NodeId,
-        session: u64,
-        rearm: RecoveryRearm,
-        bootstrap: Box<dyn BootstrapDriver>,
-    ) -> Result<Self, RecoveryOpenError> {
-        Self::open_inner(
+    /// Returns a core configuration, identity or rearm-policy error, a
+    /// platform clock-range error, or no executor — each before a worker is
+    /// spawned.
+    pub fn open(self) -> Result<RecoveryHandle<A>, RecoveryOpenError> {
+        let Self {
             adapter,
-            config,
-            mode,
             me,
             session,
-            Some(rearm),
-            Some(bootstrap),
-        )
-    }
-
-    fn open_configured(
-        adapter: Arc<A>,
-        config: RecoveryConfig,
-        mode: RecoveryMode,
-        me: NodeId,
-        session: u64,
-        rearm: Option<RecoveryRearm>,
-    ) -> Result<Self, RecoveryOpenError> {
-        Self::open_inner(adapter, config, mode, me, session, rearm, None)
-    }
-
-    fn open_inner(
-        adapter: Arc<A>,
-        config: RecoveryConfig,
-        mode: RecoveryMode,
-        me: NodeId,
-        session: u64,
-        rearm: Option<RecoveryRearm>,
-        bootstrap: Option<Box<dyn BootstrapDriver>>,
-    ) -> Result<Self, RecoveryOpenError> {
+            config,
+            mode,
+            rearm,
+            bootstrap,
+        } = self;
         let mut engine =
             RecoveryEngine::new(config, mode, me, session).map_err(RecoveryOpenError::Core)?;
         if let Some(policy) = rearm {
@@ -706,7 +688,25 @@ impl<A: RecoveryAdapter> RecoveryHandle<A> {
         });
         shared.force_close(false);
         runtime.spawn(run(Arc::clone(&shared), engine, config, bootstrap));
-        Ok(Self { shared })
+        Ok(RecoveryHandle { shared })
+    }
+}
+
+impl<A: RecoveryAdapter> RecoveryHandle<A> {
+    /// Configures a driver over `adapter` for process life `session` of node
+    /// `me`. A unique nonzero session incarnation is required for every
+    /// process life.
+    #[must_use]
+    pub fn builder(adapter: Arc<A>, me: NodeId, session: u64) -> RecoveryBuilder<A> {
+        RecoveryBuilder {
+            adapter,
+            me,
+            session,
+            config: groupnet_core::volatile_recovery::RecoveryConfig::default(),
+            mode: RecoveryMode::Unleased,
+            rearm: None,
+            bootstrap: None,
+        }
     }
 
     /// Immediately revokes serving and retains a full origin-rescan obligation.

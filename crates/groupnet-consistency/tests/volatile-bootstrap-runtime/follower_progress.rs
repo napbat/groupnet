@@ -66,7 +66,7 @@ async fn follower_outwaits_a_progressing_build_longer_than_its_recovery_budget()
     let claims = claims(ClaimPhase::Building);
     let mut config = bootstrap_config();
     config.require_participation = true;
-    config.max_claim_metadata_bytes = 512;
+    config.max_claim_metadata_bytes = std::num::NonZeroUsize::new(512).unwrap();
     let (donor, admission, handle, reads) = open_follower(
         &claims,
         PeerDonor::new(&peer_identity(), &follower_identity()),
@@ -108,7 +108,7 @@ async fn progressing_transfer_outlives_the_donor_wait_and_every_episode_bound() 
     let claims = claims(ClaimPhase::Ready);
     let mut config = bootstrap_config();
     config.require_participation = true;
-    config.max_claim_metadata_bytes = 512;
+    config.max_claim_metadata_bytes = std::num::NonZeroUsize::new(512).unwrap();
     let chunks = std::num::NonZeroUsize::new(CHUNKS).unwrap();
     config.transfer.max_chunks = chunks;
     config.transfer.max_encoded_bytes = chunks;

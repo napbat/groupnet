@@ -47,7 +47,53 @@ fn remaining_ms(ttl: Option<Duration>) -> Option<u64> {
     ttl.and_then(|ttl| u64::try_from(ttl.as_millis()).ok())
 }
 
-/// A [`NativeClaimSource::new`] argument rule that was violated.
+/// What one [`NativeClaimSource`] publishes and observes: the stable scope,
+/// its claim policy, and the native entry bounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeClaimOptions {
+    /// Complete application partition the claims are scoped to.
+    pub scope: BootstrapScope,
+    /// Claim limits; must pass [`BootstrapConfig::validate`].
+    pub policy: BootstrapConfig,
+    /// Maximum bytes in a scoped claim or presence entry key.
+    pub max_key_bytes: usize,
+    /// Maximum bytes in one native claim entry value.
+    pub max_value_bytes: NonZeroUsize,
+}
+
+impl NativeClaimOptions {
+    /// Checks the policy, the scope against it, and that both scoped entry
+    /// keys fit `max_key_bytes`.
+    ///
+    /// # Errors
+    /// The [`NativeClaimSourceError`] naming the first violated rule.
+    pub fn validate(&self) -> Result<(), NativeClaimSourceError> {
+        self.entry_keys().map(drop)
+    }
+
+    /// The scoped claim and presence entry keys, after every rule passed.
+    fn entry_keys(&self) -> Result<(String, String), NativeClaimSourceError> {
+        self.policy
+            .validate()
+            .map_err(NativeClaimSourceError::Policy)?;
+        if self
+            .scope
+            .domain
+            .len()
+            .checked_add(self.scope.partition.len())
+            .is_none_or(|bytes| bytes > self.policy.max_scope_bytes.get())
+        {
+            return Err(NativeClaimSourceError::ScopeTooLong);
+        }
+        let key = claim_entry_key(&self.scope, self.max_key_bytes)
+            .map_err(NativeClaimSourceError::ClaimKey)?;
+        let presence_key = presence_entry_key(&self.scope, self.max_key_bytes)
+            .map_err(NativeClaimSourceError::PresenceKey)?;
+        Ok((key, presence_key))
+    }
+}
+
+/// A [`NativeClaimOptions`] rule that was violated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeClaimSourceError {
     /// `policy` failed [`BootstrapConfig::validate`]; the
@@ -117,32 +163,24 @@ pub struct NativeClaimSource {
 }
 
 impl NativeClaimSource {
-    /// Binds one stable scope/policy to a Group and shared byte budget.
+    /// Binds one stable scope/policy to a Group and shared byte budget, after
+    /// [`NativeClaimOptions::validate`].
     ///
     /// # Errors
     /// Names the invalid policy, oversized scope, or unrepresentable scoped
     /// entry key.
     pub fn new(
         group: Group,
-        scope: BootstrapScope,
-        policy: BootstrapConfig,
-        max_key_bytes: usize,
-        max_value_bytes: NonZeroUsize,
         admission: ByteAdmission,
+        options: NativeClaimOptions,
     ) -> Result<Self, NativeClaimSourceError> {
-        policy.validate().map_err(NativeClaimSourceError::Policy)?;
-        if scope
-            .domain
-            .len()
-            .checked_add(scope.partition.len())
-            .is_none_or(|bytes| bytes > policy.max_scope_bytes.get())
-        {
-            return Err(NativeClaimSourceError::ScopeTooLong);
-        }
-        let key =
-            claim_entry_key(&scope, max_key_bytes).map_err(NativeClaimSourceError::ClaimKey)?;
-        let presence_key = presence_entry_key(&scope, max_key_bytes)
-            .map_err(NativeClaimSourceError::PresenceKey)?;
+        let (key, presence_key) = options.entry_keys()?;
+        let NativeClaimOptions {
+            scope,
+            policy,
+            max_value_bytes,
+            ..
+        } = options;
         Ok(Self {
             group,
             scope,

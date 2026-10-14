@@ -3,10 +3,11 @@
 //!
 //! # One entry, one stamp, many watermarks
 //!
-//! Every participant publishes a single gossiped entry, `~hosted:applied`
-//! (`~hosted:applied:<name>` for a named write path), carrying **the leadership
-//! epoch it has adopted** and a count, followed by the highest [`WriteToken`] it
-//! has *applied* from each writer it follows:
+//! Every participant publishes a single gossiped entry, `~hosted/applied/d`
+//! (`~hosted/applied/n<len>:<name>` for a named write path — the crate's
+//! shared entry layout), carrying **the leadership epoch it has adopted** and a
+//! count, followed by the highest [`WriteToken`] it has *applied* from each
+//! writer it follows:
 //!
 //! ```text
 //! (lead_epoch: u64 LE) (records: u32 LE) (writer_len: u32, writer: utf-8, token_epoch: u64, token_seq: u64)*
@@ -81,13 +82,15 @@ use std::sync::Mutex;
 use groupnet_core::NodeId;
 use groupnet_runtime::{CommandRejected, Group};
 
+use crate::entry::set_key;
 use crate::publish::{Recorded, enqueue};
 use crate::token::WriteToken;
+use crate::wire::feed_set;
 
-/// The group entry key prefix the tier occupies (`~`-prefixed like the
+/// The group entry base the tier's ledgers occupy (`~`-prefixed like the
 /// runtime's other reserved entries: `~caps`, `~applied`, `~writes`,
-/// `~lease`).
-const LEDGER_KEY: &str = "~hosted:applied";
+/// `~lease`), beside the hosted feeds' `~hosted/writes`.
+const LEDGER_BASE: &str = "~hosted/applied";
 
 /// One publisher's applied watermark per writer: the highest [`WriteToken`] of
 /// that writer's feed it has applied.
@@ -140,18 +143,15 @@ pub struct LedgerView {
     pub reading: Option<Reading>,
 }
 
-/// The entry key a commit ledger occupies: `~hosted:applied` for the default
-/// write path, `~hosted:applied:<name>` for a named one.
+/// The entry key a commit ledger occupies: `~hosted/applied/d` for the default
+/// write path, `~hosted/applied/n<len>:<name>` for a named one.
 ///
-/// The fixed prefix makes this injective over names, so any name — `:`
-/// included — addresses its own entry.
+/// The crate's shared entry layout makes this injective over names, so any
+/// name — `:` and `/` included — addresses its own entry, and the default path
+/// is distinct from every name.
 #[must_use]
 pub fn ledger_entry_key(name: &str) -> String {
-    if name.is_empty() {
-        LEDGER_KEY.to_owned()
-    } else {
-        format!("{LEDGER_KEY}:{name}")
-    }
+    set_key(LEDGER_BASE, feed_set(name))
 }
 
 /// `(lead_epoch)(records)(writer_len, writer, token_epoch, token_seq)*`,
@@ -425,8 +425,8 @@ impl CommitLedger {
         self.lock().stamp
     }
 
-    /// The entry key this ledger publishes under — `~hosted:applied`, or
-    /// `~hosted:applied:<name>` for a named write path.
+    /// The entry key this ledger publishes under — `~hosted/applied/d`, or
+    /// `~hosted/applied/n<len>:<name>` for a named write path.
     ///
     /// A [`HostedWrites`](super::HostedWrites) reads its peers' ledgers under
     /// the key derived from *its own* name, so the two must agree; the committed
@@ -559,12 +559,22 @@ mod tests {
 
     #[test]
     fn write_paths_map_to_distinct_entries() {
-        assert_eq!(ledger_entry_key(""), "~hosted:applied");
-        assert_eq!(ledger_entry_key("docs"), "~hosted:applied:docs");
+        assert_eq!(ledger_entry_key(""), "~hosted/applied/d");
+        assert_eq!(ledger_entry_key("docs"), "~hosted/applied/n4:docs");
+        assert_eq!(ledger_entry_key("d"), "~hosted/applied/n1:d");
         assert_ne!(ledger_entry_key("a"), ledger_entry_key("b"));
-        // Distinct from the ack tier's ledger: the two coexist on one node and
-        // mean different things.
+        // Separators inside a name cannot forge another path's entry: the
+        // length prefix ends the name, so no name reaches a sibling base or
+        // collides with a name that merely shares its prefix.
+        assert_ne!(ledger_entry_key("a:b"), ledger_entry_key("a"));
+        assert_ne!(ledger_entry_key("n1:d"), ledger_entry_key("d"));
+        assert_ne!(ledger_entry_key("x/d"), ledger_entry_key("x"));
+        // Distinct from the ack tier's ledger and from every hosted feed: the
+        // entries coexist on one node and mean different things.
         assert_ne!(ledger_entry_key(""), "~applied");
+        for name in ["", "docs"] {
+            assert_ne!(ledger_entry_key(name), crate::wire::hosted_entry_key(name));
+        }
     }
 
     #[test]

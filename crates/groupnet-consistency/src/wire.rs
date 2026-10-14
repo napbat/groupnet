@@ -13,8 +13,8 @@ const ENTRY_BASE: &str = "~writes";
 #[cfg(feature = "hosted")]
 const HOSTED_ENTRY_BASE: &str = "~hosted/writes";
 
-/// A feed name as a set: `""` is the default feed.
-fn feed_set(name: &str) -> Option<&str> {
+/// A feed or write-path name as a set: `""` is the default one.
+pub(crate) fn feed_set(name: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
