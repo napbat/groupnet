@@ -2,7 +2,13 @@
 //! tunnel over admitted TCP links, all authenticated by the same generated
 //! credentials and opened on ephemeral loopback ports.
 
-use std::{fmt, io, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{
+    fmt, io,
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroUsize},
+    sync::Arc,
+    time::Duration,
+};
 
 use groupnet::core::NodeId;
 use groupnet::network::{
@@ -183,7 +189,7 @@ impl Tunnel {
             );
         }
         let links: [TcpMsgTransport; 2] = links.try_into().expect("two links");
-        links[0].register_peer(ids[1].clone(), links[1].local_addr());
+        links[0].register_peer(ids[1].clone(), links[1].local_addr())?;
         links[0].connect_peer(&ids[1])?;
         let mut networks = Vec::with_capacity(2);
         for (index, id) in ids.iter().enumerate() {
@@ -194,7 +200,7 @@ impl Tunnel {
                         link_queue: frames,
                         ..RouterConfig::default()
                     })
-                    .link(links[index].clone().into_bound_link(1))
+                    .link(links[index].clone().into_bound_link(NonZeroU32::MIN))
                     .tunnels(credentials.tunnel(index, &limits)?)
                     .bind(id.clone())
                     .await?,

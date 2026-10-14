@@ -317,8 +317,8 @@ impl UdpConnection {
         let cancel = CancellationToken::new();
         let (outbound, outgoing) = mpsc::channel(config.queue_capacity.get());
         let (incoming, inbound) = mpsc::channel(config.queue_capacity.get());
-        let configured = config.peers.clone();
-        let dynamic = config.dynamic;
+        let configured = config.peers.static_peers().to_vec();
+        let dynamic = config.peers.is_dynamic();
         let local = config.local.clone();
         let (ready, admitted) = tokio::sync::oneshot::channel();
         let mut task = tokio::spawn(endpoint::run(

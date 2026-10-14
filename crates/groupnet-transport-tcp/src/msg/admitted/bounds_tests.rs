@@ -35,8 +35,10 @@ async fn bounded_endpoint(
 async fn minimum_capacity_simultaneous_dials_keep_the_lexical_winner_and_exchange_payloads() {
     let a = bounded_endpoint("a", 2, Duration::from_secs(5)).await;
     let b = bounded_endpoint("b", 2, Duration::from_secs(5)).await;
-    a.register_peer(b.local_id().clone(), b.local_addr());
-    b.register_peer(a.local_id().clone(), a.local_addr());
+    a.register_peer(b.local_id().clone(), b.local_addr())
+        .unwrap();
+    b.register_peer(a.local_id().clone(), a.local_addr())
+        .unwrap();
     // No await between dials: both outbound permits are occupied before either
     // accept task runs, reproducing mutual rejection with one shared permit.
     a.connect_peer(b.local_id()).expect("a dial");
@@ -76,10 +78,12 @@ async fn occupy_both_directions(
     endpoint: &TcpMsgTransport,
     listener: &tokio::net::TcpListener,
 ) -> (TcpStream, TcpStream) {
-    endpoint.register_peer(
-        NodeId::new("silent"),
-        listener.local_addr().expect("address"),
-    );
+    endpoint
+        .register_peer(
+            NodeId::new("silent"),
+            listener.local_addr().expect("address"),
+        )
+        .unwrap();
     endpoint.connect_peer(&NodeId::new("silent")).expect("dial");
     let (mut outbound, _) = timeout(Duration::from_secs(5), listener.accept())
         .await
@@ -145,7 +149,9 @@ async fn churn_bounds_handshake_and_hint_learning_but_preserves_configured_boots
     )
     .await
     .expect("seed");
-    server.register_peer(seed.local_id().clone(), seed.local_addr());
+    server
+        .register_peer(seed.local_id().clone(), seed.local_addr())
+        .unwrap();
     connect(&seed, &server);
     eventually(|| peers(&server) == 1 && peers(&seed) == 1).await;
     server.learn_peer(seed.local_id(), &advertised.to_string());

@@ -1,10 +1,10 @@
 //! Loopback fixtures using the same pinned TLS setup as connectivity-bridge.
 
-use std::{fmt, io, net::SocketAddr, time::Duration};
+use std::{fmt, io, net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use groupnet::connectivity::{
-    PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig, UdpPunchConfig,
-    UdpRendezvous, UdpRendezvousConfig,
+    PathPolicy, PeerPath, PeerPolicy, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig,
+    UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
 };
 use groupnet::core::NodeId;
 use groupnet::network::{
@@ -12,6 +12,7 @@ use groupnet::network::{
     tunnel::{PeerIdentity, TlsIdentity},
 };
 use groupnet::runtime::Node;
+use groupnet::transport::admission::OpenAdmission;
 use groupnet::transport::mem::{MemLink, Network};
 use groupnet::transport::tcp::TcpMsgTransport;
 use groupnet::transport::udp::UdpTransport;
@@ -93,8 +94,13 @@ impl Pair {
                 )
             }
             Path::Udp => {
-                let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(bind)).await?;
-                let mut config = UdpPunchConfig::open(NodeId::new(LEFT), relay.local_addr());
+                let relay = UdpRendezvous::bind(open_udp_rendezvous(bind)).await?;
+                let mut config = UdpPunchConfig::new(
+                    NodeId::new(LEFT),
+                    relay.local_addr(),
+                    None,
+                    PeerPolicy::Dynamic,
+                );
                 config.candidate_binds = vec![bind];
                 config.policy = PathPolicy::DirectPreferred;
                 let left_udp = UdpTransport::bind_connectivity(config.clone()).await?;
@@ -106,19 +112,24 @@ impl Pair {
                 })
                 .await?;
                 (
-                    left.link(left_udp.clone().into_bound_link(1)),
-                    right.link(right_udp.clone().into_bound_link(1)),
+                    left.link(left_udp.clone().into_bound_link(NonZeroU32::MIN)),
+                    right.link(right_udp.clone().into_bound_link(NonZeroU32::MIN)),
                     RelayService::Udp(relay),
                     Monitor::Udp(left_udp, right_udp),
                 )
             }
             Path::Tcp | Path::Relay => {
-                let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(bind)).await?;
+                let relay = TcpRendezvous::bind(open_tcp_rendezvous(bind)).await?;
                 let (policy, expected) = match path {
                     Path::Relay => (PathPolicy::RelayOnly, PeerPath::Relay),
                     _ => (PathPolicy::DirectPreferred, PeerPath::Direct),
                 };
-                let mut config = TcpPunchConfig::open(NodeId::new(LEFT), relay.local_addr());
+                let mut config = TcpPunchConfig::new(
+                    NodeId::new(LEFT),
+                    relay.local_addr(),
+                    None,
+                    PeerPolicy::Dynamic,
+                );
                 config.candidate_binds = vec![bind];
                 config.policy = policy;
                 let left_tcp = TcpMsgTransport::bind_connectivity(config.clone()).await?;
@@ -130,8 +141,8 @@ impl Pair {
                 })
                 .await?;
                 (
-                    left.link(left_tcp.clone().into_bound_link(1)),
-                    right.link(right_tcp.clone().into_bound_link(1)),
+                    left.link(left_tcp.clone().into_bound_link(NonZeroU32::MIN)),
+                    right.link(right_tcp.clone().into_bound_link(NonZeroU32::MIN)),
                     RelayService::Tcp(relay),
                     Monitor::Tcp(left_tcp, right_tcp, expected),
                 )
@@ -183,6 +194,16 @@ impl Pair {
             RelayService::Tcp(relay) => relay.close().await,
         }
     }
+}
+
+/// A keyless, open-admission UDP rendezvous configuration.
+fn open_udp_rendezvous(bind: SocketAddr) -> UdpRendezvousConfig {
+    UdpRendezvousConfig::new(bind, None, PeerPolicy::Dynamic, Arc::new(OpenAdmission))
+}
+
+/// A keyless, open-admission TCP rendezvous configuration.
+fn open_tcp_rendezvous(bind: SocketAddr) -> TcpRendezvousConfig {
+    TcpRendezvousConfig::new(bind, None, PeerPolicy::Dynamic, Arc::new(OpenAdmission))
 }
 
 async fn settle(mut ready: impl FnMut() -> bool) -> io::Result<()> {

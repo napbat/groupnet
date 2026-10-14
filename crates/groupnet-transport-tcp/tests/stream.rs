@@ -7,8 +7,9 @@
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
+use groupnet_transport::MAX_NODE_ID_BYTES;
 use groupnet_transport::bulk::DataPlane;
-use groupnet_transport_tcp::TcpBulkTransport;
+use groupnet_transport_tcp::{NodeIdError, TcpBulkTransport};
 use std::time::Duration;
 
 #[tokio::test]
@@ -80,7 +81,7 @@ async fn hostname_book_resolves_each_connect_under_caller_deadline() {
 
 #[tokio::test]
 async fn a_dial_only_endpoint_calls_out_and_never_accepts() {
-    let client = TcpBulkTransport::dial_only(NodeId::new("client-a"));
+    let client = TcpBulkTransport::dial_only(NodeId::new("client-a")).expect("valid id");
     assert_eq!(
         client.local_addr(),
         None,
@@ -115,4 +116,20 @@ async fn a_dial_only_endpoint_calls_out_and_never_accepts() {
     // Nothing can reach the client, so accept stays pending.
     let accepted = tokio::time::timeout(Duration::from_millis(50), client.accept()).await;
     assert!(accepted.is_err(), "a dial-only endpoint accepted a stream");
+}
+
+#[test]
+fn a_dial_only_endpoint_rejects_identities_its_handshake_would_refuse() {
+    assert_eq!(
+        TcpBulkTransport::dial_only(NodeId::new("")).err(),
+        Some(NodeIdError::Empty)
+    );
+    assert_eq!(
+        TcpBulkTransport::dial_only(NodeId::new("x".repeat(MAX_NODE_ID_BYTES + 1))).err(),
+        Some(NodeIdError::TooLong {
+            len: MAX_NODE_ID_BYTES + 1,
+            max: MAX_NODE_ID_BYTES,
+        })
+    );
+    assert!(TcpBulkTransport::dial_only(NodeId::new("x".repeat(MAX_NODE_ID_BYTES))).is_ok());
 }

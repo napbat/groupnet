@@ -211,7 +211,10 @@ async fn late_completion_with_reused_wire_session_cannot_clear_a_new_attempt() {
 struct Block;
 
 impl Admission for Block {
-    fn admit<'a>(&'a self, _: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+    fn admit<'a>(
+        &'a self,
+        _: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
         Box::pin(std::future::pending())
     }
 }
@@ -239,10 +242,9 @@ async fn delayed_policy_task_uses_the_received_attempt_deadline() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(
-        decision.accepted.unwrap_err().kind(),
-        io::ErrorKind::TimedOut
-    );
+    let error = decision.accepted.unwrap_err();
+    assert!(matches!(error, AdmissionError::Unavailable(_)));
+    assert_eq!(io::Error::from(error).kind(), io::ErrorKind::TimedOut);
 }
 
 #[tokio::test]

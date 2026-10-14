@@ -48,9 +48,8 @@ async fn configured_pair(
         local.add_transport(
             net.endpoint(local.local_id().clone()),
             LinkConfig {
-                peers: vec![peer.local_id().clone()],
-                cost: 1,
-                mtu: 1200,
+                mtu: std::num::NonZeroUsize::new(1200).expect("nonzero MTU"),
+                ..LinkConfig::new(vec![peer.local_id().clone()])
             },
         )?;
     }

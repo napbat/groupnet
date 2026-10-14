@@ -199,3 +199,57 @@ async fn worker_offers_the_direct_sink_bounded_by_the_link_mtu() {
     cancel.cancel();
     worker.await.unwrap();
 }
+
+#[test]
+fn link_config_defaults_and_typed_peer_validation() {
+    use crate::{MAX_NODE_ID_BYTES, NodeIdError};
+    use std::error::Error as _;
+
+    let default = LinkConfig::default();
+    assert_eq!(default.peers, Vec::<NodeId>::new());
+    assert_eq!(default.cost.get(), 1);
+    assert_eq!(default.mtu.get(), 65_000);
+    let local = NodeId::new("local");
+    assert_eq!(default.validate_for(&local), Ok(()));
+
+    let config = LinkConfig::new(vec![NodeId::new("a"), NodeId::new("b")]);
+    assert_eq!(config.cost, default.cost);
+    assert_eq!(config.validate_for(&local), Ok(()));
+
+    let empty = LinkConfig::new(vec![NodeId::new("a"), NodeId::new("")]);
+    let error = empty.validate().unwrap_err();
+    assert_eq!(
+        error,
+        LinkConfigError::Peer {
+            index: 1,
+            error: NodeIdError::Empty
+        }
+    );
+    assert!(
+        error.source().is_some(),
+        "the identity error stays the source"
+    );
+    let long = LinkConfig::new(vec![NodeId::new("n".repeat(MAX_NODE_ID_BYTES + 1))]);
+    assert!(matches!(
+        long.validate(),
+        Err(LinkConfigError::Peer { index: 0, .. })
+    ));
+    let duplicate = LinkConfig::new(vec![NodeId::new("a"), NodeId::new("b"), NodeId::new("a")]);
+    assert_eq!(
+        duplicate.validate(),
+        Err(LinkConfigError::DuplicatePeer { index: 2 })
+    );
+    let own = LinkConfig::new(vec![NodeId::new("a"), local.clone()]);
+    assert_eq!(own.validate(), Ok(()), "intrinsically valid");
+    assert_eq!(
+        own.validate_for(&local),
+        Err(LinkConfigError::LocalPeer { index: 1 })
+    );
+    let io = io::Error::from(LinkConfigError::LocalPeer { index: 1 });
+    assert_eq!(io.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        io.get_ref()
+            .and_then(|inner| inner.downcast_ref::<LinkConfigError>())
+            .is_some()
+    );
+}

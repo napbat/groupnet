@@ -33,6 +33,7 @@ pub use admitted::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError};
 pub use config::{TcpMsgConfig, TcpMsgConfigError};
 #[cfg(feature = "connectivity")]
 pub use connectivity::TcpPathChanges;
+pub use endpoint::TcpRegisterPeerError;
 use framing::{FrameReader, extend_ready, next_batch, write_frames};
 
 #[derive(Debug)]
@@ -443,7 +444,7 @@ async fn read_loop(
     let Some(endpoint) = inner.upgrade() else {
         return;
     };
-    let mut reader = FrameReader::new(endpoint.config.max_frame_bytes);
+    let mut reader = FrameReader::new(endpoint.config.max_frame_bytes.get());
     drop(endpoint);
     loop {
         let Ok(read) = timeout(read_idle, reader.next(&mut sock)).await else {
@@ -522,7 +523,8 @@ mod tests {
     async fn frames_flow_over_a_single_reused_connection() {
         let a = bind_as("msg-a").await;
         let b = bind_as("msg-b").await;
-        a.register_peer(NodeId::new("msg-b"), b.local_addr());
+        a.register_peer(NodeId::new("msg-b"), b.local_addr())
+            .unwrap();
 
         let big = vec![0xCDu8; 100 * 1024];
         a.send(&NodeId::new("msg-b"), b"hello").await.expect("send");
@@ -564,7 +566,8 @@ mod tests {
         .await
         .expect("bind");
         let b = bind_as("idle-b").await;
-        a.register_peer(NodeId::new("idle-b"), b.local_addr());
+        a.register_peer(NodeId::new("idle-b"), b.local_addr())
+            .unwrap();
 
         a.send(&NodeId::new("idle-b"), b"ping").await.expect("send");
         assert_eq!(recv_one(&b).await.msg, b"ping".to_vec());
@@ -577,13 +580,13 @@ mod tests {
     async fn failed_dial_recovers_and_redials() {
         let a = bind_as("redial-a").await;
         let peer = NodeId::new("redial-b");
-        a.register_peer(peer.clone(), dead_addr().await);
+        a.register_peer(peer.clone(), dead_addr().await).unwrap();
 
         a.send(&peer, b"void").await.expect("send is best-effort");
         eventually(|| a.outbound_connections() == 0, "failed dial cleanup").await;
 
         let b = bind_as("redial-b").await;
-        a.register_peer(peer.clone(), b.local_addr());
+        a.register_peer(peer.clone(), b.local_addr()).unwrap();
         a.send(&peer, b"back").await.expect("send");
         assert_eq!(recv_one(&b).await.msg, b"back".to_vec());
     }
@@ -594,7 +597,9 @@ mod tests {
     async fn inbound_intro_teaches_the_reverse_path() {
         let joiner = bind_as("intro-joiner").await;
         let seed = bind_as("intro-seed").await;
-        joiner.register_peer(NodeId::new("intro-seed"), seed.local_addr());
+        joiner
+            .register_peer(NodeId::new("intro-seed"), seed.local_addr())
+            .unwrap();
 
         joiner
             .send(&NodeId::new("intro-seed"), b"hi")
@@ -645,8 +650,10 @@ mod tests {
         .expect("bind");
         let b = bind_as("cap-b").await;
         let c = bind_as("cap-c").await;
-        a.register_peer(NodeId::new("cap-b"), b.local_addr());
-        a.register_peer(NodeId::new("cap-c"), c.local_addr());
+        a.register_peer(NodeId::new("cap-b"), b.local_addr())
+            .unwrap();
+        a.register_peer(NodeId::new("cap-c"), c.local_addr())
+            .unwrap();
 
         a.send(&NodeId::new("cap-b"), b"one").await.expect("send");
         assert_eq!(recv_one(&b).await.msg, b"one".to_vec());
@@ -662,7 +669,8 @@ mod tests {
         let a = bind_as("close-a").await;
         let b = bind_as("close-b").await;
         let address = a.local_addr();
-        a.register_peer(NodeId::new("close-b"), b.local_addr());
+        a.register_peer(NodeId::new("close-b"), b.local_addr())
+            .unwrap();
         a.send(&NodeId::new("close-b"), b"outbound")
             .await
             .expect("send");
@@ -723,14 +731,16 @@ mod tests {
             "127.0.0.1:0",
             TcpMsgConfig {
                 inbound_queue: QueueCapacity::MIN,
-                max_frame_bytes: 4,
+                max_frame_bytes: NonZeroUsize::new(4).unwrap(),
                 ..TcpMsgConfig::default()
             },
         )
         .await
         .expect("bind");
         let sender = bind_as("bounded-sender").await;
-        sender.register_peer(receiver.local_id().clone(), receiver.local_addr());
+        sender
+            .register_peer(receiver.local_id().clone(), receiver.local_addr())
+            .unwrap();
         for body in [b"one".as_slice(), b"two".as_slice(), b"last".as_slice()] {
             sender.send(receiver.local_id(), body).await.expect("send");
         }
@@ -754,26 +764,21 @@ mod tests {
                 ..TcpMsgConfig::default()
             },
             TcpMsgConfig {
-                max_frame_bytes: 0,
+                max_frame_bytes: NonZeroUsize::new(MAX_FRAME_BYTES + 1).unwrap(),
                 ..TcpMsgConfig::default()
             },
             TcpMsgConfig {
-                max_frame_bytes: MAX_FRAME_BYTES + 1,
-                ..TcpMsgConfig::default()
-            },
-            TcpMsgConfig {
-                max_frame_bytes: usize::MAX,
+                max_frame_bytes: NonZeroUsize::MAX,
                 ..TcpMsgConfig::default()
             },
         ];
         let expected = [
             TcpMsgConfigError::ZeroIdleTimeout,
-            TcpMsgConfigError::ZeroMaxFrameBytes,
             TcpMsgConfigError::MaxFrameBytesAboveCeiling {
-                max_frame_bytes: MAX_FRAME_BYTES + 1,
+                max_frame_bytes: NonZeroUsize::new(MAX_FRAME_BYTES + 1).unwrap(),
             },
             TcpMsgConfigError::MaxFrameBytesAboveCeiling {
-                max_frame_bytes: usize::MAX,
+                max_frame_bytes: NonZeroUsize::MAX,
             },
         ];
         for (config, expected) in invalid.into_iter().zip(expected) {
@@ -799,18 +804,28 @@ mod tests {
                 .expect_err("local id outside the handshake bound");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
-        let endpoint = TcpMsgTransport::bind_with(
-            NodeId::new("larger"),
-            "127.0.0.1:0",
-            TcpMsgConfig {
-                inbound_queue: QueueCapacity::of(2048),
-                max_frame_bytes: MAX_FRAME_BYTES,
-                ..TcpMsgConfig::default()
-            },
-        )
-        .await
-        .expect("operational limits may exceed defaults");
+        let ceiling = TcpMsgConfig {
+            inbound_queue: QueueCapacity::of(2048),
+            max_frame_bytes: NonZeroUsize::new(MAX_FRAME_BYTES).unwrap(),
+            ..TcpMsgConfig::default()
+        };
+        assert_eq!(ceiling.validate(), Ok(()), "the ceiling itself is valid");
+        let endpoint = TcpMsgTransport::bind_with(NodeId::new("larger"), "127.0.0.1:0", ceiling)
+            .await
+            .expect("operational limits may exceed defaults");
         endpoint.close().await;
+    }
+
+    /// A direct endpoint records the registered address.
+    #[tokio::test]
+    async fn direct_register_peer_is_observable() {
+        let a = bind_as("register-a").await;
+        let peer = NodeId::new("register-b");
+        let address = dead_addr().await;
+        assert_eq!(a.peer_addr(&peer), None);
+        assert_eq!(a.register_peer(peer.clone(), address), Ok(()));
+        assert_eq!(a.peer_addr(&peer), Some(address));
+        a.close().await;
     }
 
     #[cfg(feature = "link")]
@@ -820,7 +835,7 @@ mod tests {
             NodeId::new("owned-raw"),
             "127.0.0.1:0",
             TcpMsgConfig {
-                max_frame_bytes: 4,
+                max_frame_bytes: NonZeroUsize::new(4).unwrap(),
                 outbound_queue: QueueCapacity::MIN,
                 ..TcpMsgConfig::default()
             },

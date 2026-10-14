@@ -66,24 +66,25 @@ impl QueueCapacity {
         self.0
     }
 
-    /// Scales the capacity, clamping into the valid range: a product above
-    /// [`Self::MAX`] yields `MAX`, and a zero `factor` yields [`Self::MIN`].
+    /// Scales the capacity, saturating at [`Self::MAX`]. The factor is
+    /// nonzero, so the product never leaves the valid range from below and
+    /// saturation is the only adjustment.
     #[must_use]
-    pub const fn saturating_mul(self, factor: usize) -> Self {
-        Self::clamped(self.get().saturating_mul(factor))
+    pub const fn saturating_mul(self, factor: NonZeroUsize) -> Self {
+        Self::saturated(self.get().saturating_mul(factor.get()))
     }
 
-    /// Adds slack slots, clamping to [`Self::MAX`].
+    /// Adds slack slots, saturating at [`Self::MAX`].
     #[must_use]
     pub const fn saturating_add(self, extra: usize) -> Self {
-        Self::clamped(self.get().saturating_add(extra))
+        Self::saturated(self.get().saturating_add(extra))
     }
 
-    const fn clamped(value: usize) -> Self {
+    /// A nonzero slot count, saturated at [`Self::MAX`]. Callers only pass
+    /// sums and products of nonzero values, so `value` is never zero.
+    const fn saturated(value: usize) -> Self {
         if value > MAX_PERMITS {
             Self::MAX
-        } else if value == 0 {
-            Self::MIN
         } else {
             Self::of(value)
         }
@@ -203,13 +204,15 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_saturates_inside_the_valid_range() {
+    fn arithmetic_saturates_only_at_the_maximum() {
         let window = QueueCapacity::of(64);
-        assert_eq!(window.saturating_mul(2).get(), 128);
-        assert_eq!(window.saturating_mul(2).saturating_add(8).get(), 136);
-        assert_eq!(window.saturating_mul(0), QueueCapacity::MIN);
-        assert_eq!(window.saturating_mul(usize::MAX), QueueCapacity::MAX);
+        let two = NonZeroUsize::new(2).unwrap();
+        assert_eq!(window.saturating_mul(two).get(), 128);
+        assert_eq!(window.saturating_mul(two).saturating_add(8).get(), 136);
+        assert_eq!(window.saturating_mul(NonZeroUsize::MIN), window);
+        assert_eq!(window.saturating_add(0), window);
+        assert_eq!(window.saturating_mul(NonZeroUsize::MAX), QueueCapacity::MAX);
         assert_eq!(QueueCapacity::MAX.saturating_add(1), QueueCapacity::MAX);
-        assert_eq!(QueueCapacity::MAX.saturating_mul(2), QueueCapacity::MAX);
+        assert_eq!(QueueCapacity::MAX.saturating_mul(two), QueueCapacity::MAX);
     }
 }

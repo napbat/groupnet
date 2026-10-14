@@ -4,7 +4,7 @@ use super::{Backend, Inner, Outbound, TcpMsgTransport, write_loop};
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{error, fmt, io, net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc;
 
 impl TcpMsgTransport {
@@ -101,18 +101,28 @@ impl TcpMsgTransport {
     /// Managed endpoints retain it independently of the bounded learned book;
     /// handshake and gossip learning cannot overwrite it. Registering again
     /// replaces the configured address, without changing an existing connection.
-    /// This has no effect in connectivity mode: rendezvous admission owns paths.
+    ///
+    /// # Errors
+    /// Returns [`TcpRegisterPeerError::Connectivity`] for a native
+    /// connectivity endpoint (feature `connectivity`), whose rendezvous
+    /// admission owns every path; nothing is recorded.
     ///
     /// # Panics
     /// If the direct address book lock was poisoned.
-    pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
-        if let Some(inner) = self.direct() {
-            inner
-                .peers
-                .write()
-                .expect("peers lock poisoned")
-                .register(node, addr);
-        }
+    pub fn register_peer(
+        &self,
+        node: NodeId,
+        addr: SocketAddr,
+    ) -> Result<(), TcpRegisterPeerError> {
+        let Some(inner) = self.direct() else {
+            return Err(TcpRegisterPeerError::Connectivity);
+        };
+        inner
+            .peers
+            .write()
+            .expect("peers lock poisoned")
+            .register(node, addr);
+        Ok(())
     }
 
     /// Returns a direct endpoint's configured or learned dial address, or a
@@ -189,7 +199,7 @@ impl Transport for TcpMsgTransport {
                 if inner.tasks.stopped() {
                     return Err(shut_down());
                 }
-                if msg.len() > inner.config.max_frame_bytes {
+                if msg.len() > inner.config.max_frame_bytes.get() {
                     return Ok(());
                 }
                 #[cfg(feature = "link")]
@@ -214,7 +224,7 @@ impl Transport for TcpMsgTransport {
             if inner.tasks.stopped() {
                 return Err(shut_down());
             }
-            if msg.len() > inner.config.max_frame_bytes {
+            if msg.len() > inner.config.max_frame_bytes.get() {
                 return Ok(());
             }
         }
@@ -313,7 +323,7 @@ impl Inner {
         if self.tasks.stopped() {
             return Err(shut_down());
         }
-        if msg.len() > self.config.max_frame_bytes {
+        if msg.len() > self.config.max_frame_bytes.get() {
             return Ok(());
         }
         {
@@ -382,4 +392,32 @@ impl Inner {
 
 fn shut_down() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "tcp msg transport shut down")
+}
+
+/// Why [`TcpMsgTransport::register_peer`] recorded nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpRegisterPeerError {
+    /// The endpoint runs native connectivity (feature `connectivity`):
+    /// rendezvous admission and validated candidate checks own every peer
+    /// path, so an explicit dial address cannot apply.
+    Connectivity,
+}
+
+impl fmt::Display for TcpRegisterPeerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connectivity => f.write_str(
+                "a connectivity endpoint takes its peer paths from rendezvous admission, \
+                 not register_peer",
+            ),
+        }
+    }
+}
+
+impl error::Error for TcpRegisterPeerError {}
+
+impl From<TcpRegisterPeerError> for io::Error {
+    fn from(error: TcpRegisterPeerError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
 }

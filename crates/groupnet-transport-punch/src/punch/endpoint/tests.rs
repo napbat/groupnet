@@ -24,7 +24,12 @@ pub(super) async fn endpoint(
 ) {
     let relay = UdpSocket::bind(loopback()).await.unwrap();
     let remote = UdpSocket::bind(loopback()).await.unwrap();
-    let mut config = UdpPunchConfig::open("local".into(), relay.local_addr().unwrap());
+    let mut config = UdpPunchConfig::new(
+        "local".into(),
+        relay.local_addr().unwrap(),
+        None,
+        crate::PeerPolicy::Dynamic,
+    );
     config.policy = policy;
     let (incoming, receiver) = mpsc::channel(4);
     let mut endpoint = Endpoint {

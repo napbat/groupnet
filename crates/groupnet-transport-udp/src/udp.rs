@@ -2,9 +2,9 @@
 //! session-fenced native connectivity over the connection's owned sockets.
 
 use std::collections::HashMap;
-use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::{error, fmt, io};
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
@@ -229,16 +229,26 @@ impl UdpTransport {
     /// If the raw address book was poisoned by a panic in another thread.
     #[cfg(feature = "link")]
     #[must_use]
-    pub fn into_bound_link(self, cost: u32) -> groupnet_transport::link::BoundLink {
+    pub fn into_bound_link(
+        self,
+        cost: std::num::NonZeroU32,
+    ) -> groupnet_transport::link::BoundLink {
         use groupnet_transport::link::{BoundLink, LinkConfig};
 
-        let mut config = LinkConfig::new(self.known_peers());
-        config.cost = cost;
+        let config = LinkConfig {
+            cost,
+            ..LinkConfig::new(self.known_peers())
+        };
         match &self.backend {
             Backend::Direct(_) => BoundLink::new(self, config),
             #[cfg(feature = "connectivity")]
             Backend::Connectivity(connection) => {
-                config.mtu = groupnet_transport_punch::MAX_UDP_MESSAGE;
+                const NATIVE_MTU: std::num::NonZeroUsize =
+                    std::num::NonZeroUsize::new(groupnet_transport_punch::MAX_UDP_MESSAGE).unwrap();
+                let config = LinkConfig {
+                    mtu: NATIVE_MTU,
+                    ..config
+                };
                 let sessions = connection.sessions();
                 let lifecycle = Arc::new(ConnectivityLifecycle(connection.clone()));
                 BoundLink::new(self, config)
@@ -252,24 +262,27 @@ impl UdpTransport {
     /// previous binding for `node`. Callable through any clone — all clones
     /// share one book.
     ///
-    /// Has no effect in connectivity mode: only native admission and validated
-    /// candidate checks may establish or change a connected peer's path.
+    /// # Errors
+    /// Returns [`UdpRegisterPeerError::Connectivity`] for a connectivity
+    /// endpoint (feature `connectivity`): only native admission and validated
+    /// candidate checks may establish or change a connected peer's path, so
+    /// nothing is recorded.
     ///
     /// # Panics
     /// If the address book was poisoned by a panic in another thread.
-    pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
-        #[cfg(not(feature = "connectivity"))]
-        let Backend::Direct(inner) = &self.backend;
-        #[cfg(feature = "connectivity")]
-        let inner = match &self.backend {
-            Backend::Direct(inner) => inner,
-            Backend::Connectivity(_) => return,
-        };
-        inner
-            .peers
-            .write()
-            .expect("peers lock poisoned")
-            .insert(node, addr);
+    pub fn register_peer(
+        &self,
+        node: NodeId,
+        addr: SocketAddr,
+    ) -> Result<(), UdpRegisterPeerError> {
+        match &self.backend {
+            Backend::Direct(inner) => {
+                inner.register(node, addr);
+                Ok(())
+            }
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(_) => Err(UdpRegisterPeerError::Connectivity),
+        }
     }
 
     /// Returns the owned native connection when connectivity is enabled.
@@ -292,10 +305,10 @@ impl Transport for UdpTransport {
 
     fn learn_peer(&self, node: &NodeId, addr: &str) {
         match &self.backend {
-            Backend::Direct(_) => {
+            Backend::Direct(inner) => {
                 // Raw advertisements are hints: register only parseable addresses.
                 if let Ok(addr) = addr.parse::<SocketAddr>() {
-                    self.register_peer(node.clone(), addr);
+                    inner.register(node.clone(), addr);
                 }
             }
             #[cfg(feature = "connectivity")]
@@ -396,7 +409,7 @@ impl Transport for UdpTransport {
                     .get(&from)
                     .copied();
                 if known != Some(addr) {
-                    self.register_peer(from.clone(), addr);
+                    inner.register(from.clone(), addr);
                 }
                 let msg = Bytes::copy_from_slice(msg);
                 return Ok(Inbound { from, msg });
@@ -415,6 +428,44 @@ impl Transport for UdpTransport {
             #[cfg(feature = "connectivity")]
             Backend::Connectivity(connection) => connection.recv_admitted().await,
         }
+    }
+}
+
+impl Inner {
+    /// Records `node`'s raw datagram address, replacing any earlier one.
+    fn register(&self, node: NodeId, addr: SocketAddr) {
+        self.peers
+            .write()
+            .expect("peers lock poisoned")
+            .insert(node, addr);
+    }
+}
+
+/// Why [`UdpTransport::register_peer`] recorded nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UdpRegisterPeerError {
+    /// The endpoint runs native connectivity (feature `connectivity`):
+    /// session-fenced admission and validated candidate checks own every peer
+    /// path, so a raw address registration cannot apply.
+    Connectivity,
+}
+
+impl fmt::Display for UdpRegisterPeerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connectivity => f.write_str(
+                "a connectivity endpoint takes its peer paths from native admission, \
+                 not register_peer",
+            ),
+        }
+    }
+}
+
+impl error::Error for UdpRegisterPeerError {}
+
+impl From<UdpRegisterPeerError> for io::Error {
+    fn from(error: UdpRegisterPeerError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
     }
 }
 
@@ -489,7 +540,9 @@ mod tests {
         let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve port");
         let delayed_addr = reservation.local_addr().expect("reserved address");
         drop(reservation);
-        receiver.register_peer(sender_id.clone(), delayed_addr);
+        receiver
+            .register_peer(sender_id.clone(), delayed_addr)
+            .unwrap();
 
         let recv = tokio::spawn({
             let receiver = receiver.clone();
@@ -504,7 +557,9 @@ mod tests {
         let sender = UdpTransport::bind(sender_id.clone(), delayed_addr)
             .await
             .expect("bind delayed sender");
-        sender.register_peer(receiver_id.clone(), receiver.local_addr());
+        sender
+            .register_peer(receiver_id.clone(), receiver.local_addr())
+            .unwrap();
         sender
             .send(&receiver_id, b"peer is now live")
             .await
@@ -532,9 +587,12 @@ mod tests {
         // must observe it (shared book) to reach the receiver.
         sender
             .clone()
-            .register_peer(receiver_id.clone(), receiver.local_addr());
+            .register_peer(receiver_id.clone(), receiver.local_addr())
+            .unwrap();
         // So the receiver can attribute the inbound datagram back to us.
-        receiver.register_peer(sender_id.clone(), sender.local_addr());
+        receiver
+            .register_peer(sender_id.clone(), sender.local_addr())
+            .unwrap();
 
         sender.send(&receiver_id, b"hello").await.expect("send");
 
@@ -557,7 +615,9 @@ mod tests {
         let receiver_id = NodeId::new("attr-receiver");
 
         // ONLY the sender knows where to dial; the receiver's book is empty.
-        sender.register_peer(receiver_id.clone(), receiver.local_addr());
+        sender
+            .register_peer(receiver_id.clone(), receiver.local_addr())
+            .unwrap();
         sender.send(&receiver_id, b"hello").await.expect("send");
 
         let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
@@ -590,10 +650,14 @@ mod tests {
         let receiver_id = NodeId::new("move-receiver");
 
         // The receiver holds a STALE address for the sender.
-        receiver.register_peer(sender_id.clone(), "127.0.0.1:9".parse().expect("addr"));
+        receiver
+            .register_peer(sender_id.clone(), "127.0.0.1:9".parse().expect("addr"))
+            .unwrap();
 
         let sender = bind_as("move-sender").await;
-        sender.register_peer(receiver_id.clone(), receiver.local_addr());
+        sender
+            .register_peer(receiver_id.clone(), receiver.local_addr())
+            .unwrap();
         sender.send(&receiver_id, b"i moved").await.expect("send");
 
         let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
@@ -648,14 +712,30 @@ mod tests {
         let old: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
         let new: SocketAddr = "127.0.0.1:9002".parse().expect("addr");
 
-        t.register_peer(peer.clone(), old);
-        t.register_peer(peer.clone(), new);
+        t.register_peer(peer.clone(), old).unwrap();
+        t.register_peer(peer.clone(), new).unwrap();
 
         assert_eq!(
             raw_inner(&t).peers.read().expect("peers").get(&peer),
             Some(&new)
         );
         assert_eq!(raw_inner(&t).peers.read().expect("peers").len(), 1);
+    }
+
+    /// A direct endpoint records a registered address and exposes it through
+    /// the public peer queries.
+    #[tokio::test]
+    async fn direct_register_peer_is_observable() {
+        let t = bind_as("local").await;
+        let peer = NodeId::new("peer");
+        let addr: SocketAddr = "127.0.0.1:9003".parse().expect("addr");
+        assert_eq!(t.known_peers(), Vec::<NodeId>::new());
+
+        assert_eq!(t.register_peer(peer.clone(), addr), Ok(()));
+
+        #[cfg(feature = "connectivity")]
+        assert_eq!(t.direct_addr_to(&peer), Some(addr));
+        assert_eq!(t.known_peers(), vec![peer]);
     }
 
     /// An inbound datagram from a re-registered address still attributes to the
@@ -670,10 +750,14 @@ mod tests {
         // Register the sender at a stale address first, then re-resolve to its
         // real one (as the seed re-resolver does on a pod-IP change).
         let stale: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        receiver.register_peer(sender_id.clone(), stale);
-        receiver.register_peer(sender_id.clone(), sender.local_addr());
+        receiver.register_peer(sender_id.clone(), stale).unwrap();
+        receiver
+            .register_peer(sender_id.clone(), sender.local_addr())
+            .unwrap();
 
-        sender.register_peer(receiver_id.clone(), receiver.local_addr());
+        sender
+            .register_peer(receiver_id.clone(), receiver.local_addr())
+            .unwrap();
         sender.send(&receiver_id, b"ping").await.expect("send");
 
         let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())

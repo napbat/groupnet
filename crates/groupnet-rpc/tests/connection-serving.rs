@@ -28,7 +28,7 @@ use groupnet_rpc::{
     RpcServer, RpcServerConfig, RpcStatus,
 };
 use groupnet_testkit::cluster::eventually;
-use groupnet_transport_mem::bulk::{MemBulkNet, MemBulkTransport};
+use groupnet_transport_mem::{MemBulkNet, MemBulkTransport};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::advance;

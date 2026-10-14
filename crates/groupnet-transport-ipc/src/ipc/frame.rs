@@ -28,8 +28,8 @@ struct FrameHeader {
 }
 
 /// Checks `id` against the 64-byte introduction field.
-pub(super) fn validate_id(id: &NodeId) -> io::Result<()> {
-    Ok(groupnet_transport::validate_node_id(id, MAX_ID)?)
+pub(super) fn validate_id(id: &NodeId) -> Result<(), groupnet_transport::NodeIdError> {
+    groupnet_transport::validate_node_id(id, MAX_ID)
 }
 
 pub(super) async fn introduce<S: AsyncRead + AsyncWrite + Unpin>(

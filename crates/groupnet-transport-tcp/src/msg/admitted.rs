@@ -3,6 +3,9 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::num::NonZeroU32;
+#[cfg(feature = "connectivity")]
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -155,15 +158,19 @@ impl TcpMsgTransport {
     /// An admitted endpoint routes only through live admitted peers; address-book
     /// entries are bootstrap hints and never bypass admission.
     #[must_use]
-    pub fn into_bound_link(self, cost: u32) -> BoundLink {
-        let mut config = LinkConfig::new(Vec::new());
-        config.cost = cost;
+    pub fn into_bound_link(self, cost: NonZeroU32) -> BoundLink {
+        let mut config = LinkConfig {
+            cost,
+            ..LinkConfig::default()
+        };
         if let Some(inner) = self.direct() {
             config.mtu = config.mtu.min(inner.config.max_frame_bytes);
         }
         #[cfg(feature = "connectivity")]
         if matches!(&self.backend, super::Backend::Connectivity { .. }) {
-            config.mtu = groupnet_transport_punch::MAX_TCP_MESSAGE;
+            const NATIVE_MTU: NonZeroUsize =
+                NonZeroUsize::new(groupnet_transport_punch::MAX_TCP_MESSAGE).unwrap();
+            config.mtu = NATIVE_MTU;
         }
         let lifecycle = self.lifecycle();
         let sessions = self.sessions();
@@ -261,7 +268,7 @@ impl Managed {
         let Some(expected) = expected else {
             return Ok(());
         };
-        if msg.len() > inner.config.max_frame_bytes {
+        if msg.len() > inner.config.max_frame_bytes.get() {
             return Ok(());
         }
         let connections = self.connections.lock().expect("connections lock poisoned");
@@ -292,7 +299,7 @@ impl Managed {
         if peer == &inner.local
             || msg
                 .as_ref()
-                .is_some_and(|msg| msg.len() > inner.config.max_frame_bytes)
+                .is_some_and(|msg| msg.len() > inner.config.max_frame_bytes.get())
         {
             return Ok(());
         }
@@ -346,7 +353,7 @@ impl Managed {
         let intro = inner.intro.clone();
         let managed = self.clone();
         let peer = peer.clone();
-        let max_frame_bytes = inner.config.max_frame_bytes;
+        let max_frame_bytes = inner.config.max_frame_bytes.get();
         inner.tasks.spawn(async move {
             let work = async move {
                 let mut socket = TcpStream::connect(addr).await?;
@@ -379,7 +386,7 @@ impl Managed {
         let local = inner.local.clone();
         let intro = inner.intro.clone();
         let queue = inner.config.outbound_queue;
-        let max_frame_bytes = inner.config.max_frame_bytes;
+        let max_frame_bytes = inner.config.max_frame_bytes.get();
         inner.tasks.spawn(async move {
             let result = timeout(managed.config.handshake_timeout, async {
                 let mut socket = socket;

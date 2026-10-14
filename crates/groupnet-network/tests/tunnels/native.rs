@@ -1,14 +1,18 @@
 //! Composition of native path selection, router MTUs, and pinned TLS streams.
 
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
 use groupnet_network::tunnel::{PeerIdentity, TunnelTransport};
 use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
+use groupnet_transport::admission::OpenAdmission;
 use groupnet_transport::bulk::BulkTransport;
 use groupnet_transport_punch::{
-    NetworkKey, PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig,
-    UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
+    NetworkKey, PathPolicy, PeerPath, PeerPolicy, TcpPunchConfig, TcpRendezvous,
+    TcpRendezvousConfig, UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
 };
 use groupnet_transport_tcp::TcpMsgTransport;
 use groupnet_transport_udp::UdpTransport;
@@ -24,14 +28,19 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
         let key = NetworkKey::from_bytes([19; 32]);
         let relay = UdpRendezvous::bind(UdpRendezvousConfig::new(
             "127.0.0.1:0".parse().unwrap(),
-            key.clone(),
-            vec![left.clone(), right.clone()],
+            Some(key.clone()),
+            PeerPolicy::Static(vec![left.clone(), right.clone()]),
+            Arc::new(OpenAdmission),
         ))
         .await
         .unwrap();
         let configure = |local, peer| {
-            let mut config =
-                UdpPunchConfig::new(local, relay.local_addr(), key.clone(), vec![peer]);
+            let mut config = UdpPunchConfig::new(
+                local,
+                relay.local_addr(),
+                Some(key.clone()),
+                PeerPolicy::Static(vec![peer]),
+            );
             config.bind = "127.0.0.1:0".parse().unwrap();
             config.policy = policy;
             config
@@ -53,11 +62,11 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
         let left_router = Router::new(left.clone(), RouterConfig::default()).unwrap();
         let right_router = Router::new(right.clone(), RouterConfig::default()).unwrap();
         left_router
-            .add_link(left_udp.clone().into_bound_link(1))
+            .add_link(left_udp.clone().into_bound_link(NonZeroU32::MIN))
             .await
             .unwrap();
         right_router
-            .add_link(right_udp.clone().into_bound_link(1))
+            .add_link(right_udp.clone().into_bound_link(NonZeroU32::MIN))
             .await
             .unwrap();
         eventually_within("native routes established", DEADLINE, || {
@@ -88,13 +97,19 @@ async fn native_tcp_relay_large_echo_half_closes_without_revoking_admission() {
     let key = NetworkKey::from_bytes([29; 32]);
     let relay = TcpRendezvous::bind(TcpRendezvousConfig::new(
         "127.0.0.1:0".parse().unwrap(),
-        key.clone(),
-        vec![left.clone(), right.clone()],
+        Some(key.clone()),
+        PeerPolicy::Static(vec![left.clone(), right.clone()]),
+        Arc::new(OpenAdmission),
     ))
     .await
     .unwrap();
     let configure = |local, peer| {
-        let mut config = TcpPunchConfig::new(local, relay.local_addr(), key.clone(), vec![peer]);
+        let mut config = TcpPunchConfig::new(
+            local,
+            relay.local_addr(),
+            Some(key.clone()),
+            PeerPolicy::Static(vec![peer]),
+        );
         config.bind = "127.0.0.1:0".parse().unwrap();
         config.policy = PathPolicy::RelayOnly;
         config
@@ -113,11 +128,11 @@ async fn native_tcp_relay_large_echo_half_closes_without_revoking_admission() {
     let left_router = Router::new(left.clone(), RouterConfig::default()).unwrap();
     let right_router = Router::new(right.clone(), RouterConfig::default()).unwrap();
     left_router
-        .add_link(left_tcp.clone().into_bound_link(1))
+        .add_link(left_tcp.clone().into_bound_link(NonZeroU32::MIN))
         .await
         .unwrap();
     right_router
-        .add_link(right_tcp.clone().into_bound_link(1))
+        .add_link(right_tcp.clone().into_bound_link(NonZeroU32::MIN))
         .await
         .unwrap();
     eventually_within("native TCP relay routes established", DEADLINE, || {

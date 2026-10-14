@@ -34,7 +34,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "bulk")]
-pub mod bulk;
+mod bulk;
 mod config;
 mod mem;
 
@@ -43,6 +43,8 @@ pub use bulk::{MemBulkNet, MemBulkTransport};
 pub use config::NetworkConfig;
 #[cfg(feature = "bulk")]
 pub use config::{MemBulkConfig, MemBulkConfigError};
+/// The bound every queue in [`NetworkConfig`] and `MemBulkConfig` takes.
+pub use groupnet_transport::QueueCapacity;
 pub use mem::{Closed, MemTransport, Network};
 
 #[cfg(feature = "link")]

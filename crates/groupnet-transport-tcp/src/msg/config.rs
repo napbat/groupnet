@@ -10,7 +10,7 @@ use groupnet_transport::framing::MAX_FRAME_BYTES;
 
 /// Default allocation guard for an inbound payload; deployments may tune it
 /// up to the shared stream frame ceiling.
-const DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_FRAME: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
 
 /// Tuning for [`TcpMsgTransport`](crate::TcpMsgTransport) and the managed
 /// `TcpLink` (feature `link`). The default values suit a gossip control plane.
@@ -37,9 +37,9 @@ pub struct TcpMsgConfig {
     /// when full, propagating TCP backpressure. Default: 1024.
     pub inbound_queue: QueueCapacity,
     /// Maximum payload bytes per frame, checked before inbound allocation and
-    /// outbound queueing. Must be nonzero and at most the shared stream ceiling
+    /// outbound queueing. Nonzero by type and at most the shared stream ceiling
     /// [`MAX_FRAME_BYTES`]. Default: 16 MiB.
-    pub max_frame_bytes: usize,
+    pub max_frame_bytes: NonZeroUsize,
     /// The listener address to introduce ourselves with when dialing, so the
     /// accepting side can dial back without prior registration. `None`
     /// introduces the bound address unless it is unspecified (`0.0.0.0`);
@@ -70,10 +70,7 @@ impl TcpMsgConfig {
         if self.idle_timeout.is_zero() {
             return Err(TcpMsgConfigError::ZeroIdleTimeout);
         }
-        if self.max_frame_bytes == 0 {
-            return Err(TcpMsgConfigError::ZeroMaxFrameBytes);
-        }
-        if self.max_frame_bytes > MAX_FRAME_BYTES {
+        if self.max_frame_bytes.get() > MAX_FRAME_BYTES {
             return Err(TcpMsgConfigError::MaxFrameBytesAboveCeiling {
                 max_frame_bytes: self.max_frame_bytes,
             });
@@ -87,12 +84,10 @@ impl TcpMsgConfig {
 pub enum TcpMsgConfigError {
     /// `idle_timeout` is zero.
     ZeroIdleTimeout,
-    /// `max_frame_bytes` is zero.
-    ZeroMaxFrameBytes,
     /// `max_frame_bytes` exceeds the shared stream frame ceiling.
     MaxFrameBytesAboveCeiling {
         /// The configured limit.
-        max_frame_bytes: usize,
+        max_frame_bytes: NonZeroUsize,
     },
 }
 
@@ -100,7 +95,6 @@ impl fmt::Display for TcpMsgConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroIdleTimeout => f.write_str("idle_timeout must be nonzero"),
-            Self::ZeroMaxFrameBytes => f.write_str("max_frame_bytes must be nonzero"),
             Self::MaxFrameBytesAboveCeiling { max_frame_bytes } => write!(
                 f,
                 "max_frame_bytes {max_frame_bytes} exceeds the {MAX_FRAME_BYTES}-byte stream ceiling"

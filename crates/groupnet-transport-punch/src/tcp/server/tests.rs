@@ -3,6 +3,7 @@ use crate::{PeerPath, RelayPacing, TcpConnection, TcpPunchConfig};
 use bytes::Bytes;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::QueueCapacity;
+use groupnet_transport::admission::OpenAdmission;
 
 fn entry(
     node: &str,
@@ -142,8 +143,17 @@ fn relay_rejects_stale_sessions_and_nonmutual_admission() {
 fn open(limits: TcpRendezvousLimits) -> TcpRendezvousConfig {
     TcpRendezvousConfig {
         limits,
-        ..TcpRendezvousConfig::open("127.0.0.1:0".parse().unwrap())
+        ..TcpRendezvousConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            PeerPolicy::Dynamic,
+            Arc::new(OpenAdmission),
+        )
     }
+}
+
+fn endpoint(local: &str, rendezvous: SocketAddr) -> TcpPunchConfig {
+    TcpPunchConfig::new(NodeId::new(local), rendezvous, None, PeerPolicy::Dynamic)
 }
 
 #[tokio::test]
@@ -160,9 +170,9 @@ async fn configured_rendezvous_forwards_data_bursts_without_revoking_admission()
     .await
     .unwrap();
     let address = rendezvous.local_addr();
-    let mut a_config = TcpPunchConfig::open(NodeId::new("source"), address);
+    let mut a_config = endpoint("source", address);
     a_config.queue_capacity = QueueCapacity::of(1024);
-    let mut b_config = TcpPunchConfig::open(NodeId::new("target"), address);
+    let mut b_config = endpoint("target", address);
     b_config.queue_capacity = QueueCapacity::of(1024);
     let a = TcpConnection::bind(a_config).await.unwrap();
     let b = TcpConnection::bind(b_config).await.unwrap();
@@ -209,10 +219,10 @@ async fn configured_session_cap_denies_excess_admission_without_revoking_incumbe
     .await
     .unwrap();
     let address = rendezvous.local_addr();
-    let incumbent = TcpConnection::bind(TcpPunchConfig::open(NodeId::new("first"), address))
+    let incumbent = TcpConnection::bind(endpoint("first", address))
         .await
         .unwrap();
-    let denied = TcpConnection::bind(TcpPunchConfig::open(NodeId::new("second"), address))
+    let denied = TcpConnection::bind(endpoint("second", address))
         .await
         .unwrap_err();
     assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);

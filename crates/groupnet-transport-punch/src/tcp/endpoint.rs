@@ -12,7 +12,7 @@ use super::{
     lock, random, sockets,
     wire::{self, Auth, Duplex, Message, Token},
 };
-use crate::PathPolicy;
+use crate::{PathPolicy, PeerPolicy};
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{
@@ -207,8 +207,8 @@ async fn register(
             session,
             challenge,
             credential: config.credential.clone(),
-            peers: config.peers.clone(),
-            dynamic: config.dynamic,
+            peers: config.peers.static_peers().to_vec(),
+            dynamic: config.peers.is_dynamic(),
             relay_only: config.policy == PathPolicy::RelayOnly,
             candidates: candidates.to_vec(),
         },
@@ -461,7 +461,10 @@ impl Runtime {
     fn intro(&mut self, node: NodeId, session: Token, secret: Token, candidates: Vec<SocketAddr>) {
         if !self.control_live
             || node == self.config.local
-            || (!self.config.dynamic && !self.config.peers.contains(&node))
+            || match &self.config.peers {
+                PeerPolicy::Static(peers) => !peers.contains(&node),
+                PeerPolicy::Dynamic => false,
+            }
             || candidates.iter().any(|address| !sockets::valid(*address))
         {
             return;
@@ -670,11 +673,11 @@ mod tests {
     }
 
     fn runtime() -> (Runtime, mpsc::Receiver<AdmittedInbound>) {
-        let config = TcpPunchConfig::dynamic(
+        let config = TcpPunchConfig::new(
             NodeId::from("local"),
             "127.0.0.1:1".parse().unwrap(),
             Some(crate::NetworkKey::from_bytes([1; 32])),
-            Vec::new(),
+            PeerPolicy::Dynamic,
         );
         let (incoming, delivered) = mpsc::channel(8);
         let runtime = Runtime {

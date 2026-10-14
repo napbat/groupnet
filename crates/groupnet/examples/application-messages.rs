@@ -7,6 +7,7 @@
 use std::{
     io,
     net::SocketAddr,
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -15,12 +16,13 @@ use std::{
 };
 
 use groupnet::{
-    connectivity::{PathPolicy, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig},
+    connectivity::{PathPolicy, PeerPolicy, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig},
     core::NodeId,
     messaging::{Delivery, Frame, MessageContext, SendOptions},
     runtime::Node,
     transport::{
         Bytes,
+        admission::OpenAdmission,
         mem::{MemLink, Network},
         tcp::TcpMsgTransport,
     },
@@ -41,8 +43,11 @@ async fn main() -> io::Result<()> {
             ));
         }
     };
-    let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::new(
         "127.0.0.1:0".parse().map_err(io::Error::other)?,
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
     ))
     .await?;
     let address = relay.local_addr();
@@ -62,12 +67,12 @@ async fn main() -> io::Result<()> {
             memory.endpoint(NodeId::new("b")),
             vec![NodeId::new("a")],
         ))
-        .link(b_tcp.into_bound_link(1))
+        .link(b_tcp.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(30)
         .start()
         .await?;
     let c = Node::builder(NodeId::new("c"))
-        .link(c_tcp.into_bound_link(1))
+        .link(c_tcp.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(30)
         .start()
         .await?;
@@ -82,7 +87,7 @@ async fn main() -> io::Result<()> {
 }
 
 fn config(local: &str, address: SocketAddr, policy: PathPolicy) -> TcpPunchConfig {
-    let mut config = TcpPunchConfig::open(NodeId::new(local), address);
+    let mut config = TcpPunchConfig::new(NodeId::new(local), address, None, PeerPolicy::Dynamic);
     config.bind = "127.0.0.1:0".parse().expect("literal address");
     config.candidate_binds.push(config.bind);
     config.gather_interfaces = false;

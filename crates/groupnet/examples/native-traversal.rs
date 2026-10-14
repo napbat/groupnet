@@ -6,15 +6,18 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet::connectivity::{
-    PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig, UdpPunchConfig,
-    UdpRendezvous, UdpRendezvousConfig,
+    PathPolicy, PeerPath, PeerPolicy, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig,
+    UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
 };
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
 use groupnet::transport::Transport;
+use groupnet::transport::admission::OpenAdmission;
 use groupnet::transport::tcp::TcpMsgTransport;
 use groupnet::transport::udp::UdpTransport;
 
@@ -122,9 +125,15 @@ async fn membership(left: Node, right: Node) -> io::Result<()> {
 }
 
 async fn udp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
-    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(bind)).await?;
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::new(
+        bind,
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    ))
+    .await?;
     let address = relay.local_addr();
-    let mut left = UdpPunchConfig::open(NodeId::new("native-a"), address);
+    let mut left = UdpPunchConfig::new(NodeId::new("native-a"), address, None, PeerPolicy::Dynamic);
     left.candidate_binds = vec![bind];
     left.policy = policy;
     let mut right = left.clone();
@@ -144,12 +153,12 @@ async fn udp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
     );
     exchange(&left, &right).await?;
     let first = Node::builder(NodeId::new("native-a"))
-        .link(left.into_bound_link(1))
+        .link(left.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(50)
         .start()
         .await?;
     let second = Node::builder(NodeId::new("native-b"))
-        .link(right.into_bound_link(1))
+        .link(right.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(50)
         .start()
         .await?;
@@ -159,9 +168,15 @@ async fn udp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
 }
 
 async fn tcp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
-    let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(bind)).await?;
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::new(
+        bind,
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    ))
+    .await?;
     let address = relay.local_addr();
-    let mut left = TcpPunchConfig::open(NodeId::new("native-a"), address);
+    let mut left = TcpPunchConfig::new(NodeId::new("native-a"), address, None, PeerPolicy::Dynamic);
     left.candidate_binds = vec![bind];
     left.policy = policy;
     let mut right = left.clone();
@@ -181,12 +196,12 @@ async fn tcp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
     );
     exchange(&left, &right).await?;
     let first = Node::builder(NodeId::new("native-a"))
-        .link(left.into_bound_link(1))
+        .link(left.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(50)
         .start()
         .await?;
     let second = Node::builder(NodeId::new("native-b"))
-        .link(right.into_bound_link(1))
+        .link(right.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(50)
         .start()
         .await?;

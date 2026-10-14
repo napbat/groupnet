@@ -3,18 +3,22 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
 use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
+use groupnet_transport::admission::OpenAdmission;
 use groupnet_transport::link::LinkProvider;
 use groupnet_transport_punch::{
     MAX_UDP_MESSAGE, UdpRendezvous, UdpRendezvousConfig, UdpRendezvousConfigError,
 };
 use groupnet_transport_udp::{
-    NetworkKey, PathPolicy, PeerPath, UdpLink, UdpPunchConfig, UdpPunchConfigError, UdpTransport,
+    NetworkKey, PathPolicy, PeerPath, PeerPolicy, UdpLink, UdpPunchConfig, UdpPunchConfigError,
+    UdpTransport,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -38,8 +42,8 @@ async fn endpoint(
     let mut config = UdpPunchConfig::new(
         NodeId::from(local),
         rendezvous,
-        key(),
-        peers.iter().map(|name| NodeId::from(*name)).collect(),
+        Some(key()),
+        PeerPolicy::Static(peers.iter().map(|name| NodeId::from(*name)).collect()),
     );
     config.bind = loopback();
     config.policy = policy;
@@ -49,8 +53,9 @@ async fn endpoint(
 async fn keyed_relay() -> UdpRendezvous {
     UdpRendezvous::bind(UdpRendezvousConfig::new(
         loopback(),
-        key(),
-        vec!["a".into(), "b".into()],
+        Some(key()),
+        PeerPolicy::Static(vec!["a".into(), "b".into()]),
+        Arc::new(OpenAdmission),
     ))
     .await
     .unwrap()
@@ -182,8 +187,8 @@ async fn wrong_keys_unknown_identities_and_advertisements_cannot_join() {
     let mut config = UdpPunchConfig::new(
         "b".into(),
         address,
-        NetworkKey::from_bytes([9; 32]),
-        vec!["a".into()],
+        Some(NetworkKey::from_bytes([9; 32])),
+        PeerPolicy::Static(vec!["a".into()]),
     );
     config.bind = loopback();
     let wrong = UdpTransport::bind_connectivity(config).await.unwrap();
@@ -252,7 +257,8 @@ async fn configuration_limits_and_secret_debug_are_explicit() {
     assert_eq!(format!("{secret:?}"), "NetworkKey([REDACTED])");
     let address = SocketAddr::from(([127, 0, 0, 1], 12345));
     let peer_list = |peers: Vec<NodeId>| {
-        let mut config = UdpPunchConfig::new("a".into(), address, key(), peers);
+        let mut config =
+            UdpPunchConfig::new("a".into(), address, Some(key()), PeerPolicy::Static(peers));
         config.bind = loopback();
         config
     };
@@ -292,8 +298,9 @@ async fn configuration_limits_and_secret_debug_are_explicit() {
     }
     let error = UdpRendezvous::bind(UdpRendezvousConfig::new(
         loopback(),
-        key(),
-        vec![NodeId::from("")],
+        Some(key()),
+        PeerPolicy::Static(vec![NodeId::from("")]),
+        Arc::new(OpenAdmission),
     ))
     .await
     .unwrap_err();
@@ -321,14 +328,14 @@ async fn provider_binds_identity_cost_and_native_mtu_and_router_closes_socket() 
     let a_address = unused_address().await;
     let b_address = unused_address().await;
     for (router, peer, bind, cost) in [
-        (&a, b.local_id(), a_address, 7),
-        (&b, a.local_id(), b_address, 1),
+        (&a, b.local_id(), a_address, NonZeroU32::new(7).unwrap()),
+        (&b, a.local_id(), b_address, NonZeroU32::MIN),
     ] {
         let mut config = UdpPunchConfig::new(
             router.local_id().clone(),
             relay.local_addr(),
-            key(),
-            vec![peer.clone()],
+            Some(key()),
+            PeerPolicy::Static(vec![peer.clone()]),
         );
         config.bind = bind;
         config.policy = PathPolicy::RelayOnly;
@@ -368,8 +375,8 @@ async fn provider_rejects_a_different_local_identity_before_binding() {
     let mut config = UdpPunchConfig::new(
         "configured".into(),
         SocketAddr::from(([127, 0, 0, 1], 12345)),
-        key(),
-        vec!["peer".into()],
+        Some(key()),
+        PeerPolicy::Static(vec!["peer".into()]),
     );
     config.bind = bind;
     assert_eq!(
@@ -391,14 +398,16 @@ async fn failed_router_registration_drains_provider_endpoint() {
     let mut config = UdpPunchConfig::new(
         router.local_id().clone(),
         SocketAddr::from(([127, 0, 0, 1], 12345)),
-        key(),
-        vec!["peer".into()],
+        Some(key()),
+        PeerPolicy::Static(vec!["peer".into()]),
     );
     config.bind = bind;
-    let bound = Box::new(UdpLink::connectivity(config).with_cost(0))
+    let mut bound = Box::new(UdpLink::connectivity(config))
         .bind(router.local_id().clone())
         .await
         .unwrap();
+    // A link that lists the router's own identity as a peer is rejected at registration.
+    bound.config.peers.push(router.local_id().clone());
     assert!(router.add_link(bound).await.is_err());
     let rebound = UdpSocket::bind(bind).await.unwrap();
     drop(rebound);
@@ -411,8 +420,8 @@ async fn bound_provider_drop_cancels_socket_owner() {
     let mut config = UdpPunchConfig::new(
         "local".into(),
         SocketAddr::from(([127, 0, 0, 1], 12345)),
-        key(),
-        Vec::new(),
+        Some(key()),
+        PeerPolicy::Static(Vec::new()),
     );
     config.bind = bind;
     let bound = Box::new(UdpLink::connectivity(config))
@@ -457,8 +466,8 @@ async fn cancelled_close_preserves_the_task_for_a_later_drain() {
     let mut config = UdpPunchConfig::new(
         "local".into(),
         SocketAddr::from(([127, 0, 0, 1], 12345)),
-        key(),
-        Vec::new(),
+        Some(key()),
+        PeerPolicy::Static(Vec::new()),
     );
     config.bind = loopback();
     let transport = UdpTransport::bind_connectivity(config).await.unwrap();

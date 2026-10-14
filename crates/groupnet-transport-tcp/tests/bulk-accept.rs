@@ -25,7 +25,7 @@ async fn server(config: TcpBulkConfig) -> TcpBulkTransport {
 }
 
 fn client(server: &TcpBulkTransport, id: &str) -> TcpBulkTransport {
-    let client = TcpBulkTransport::dial_only(NodeId::new(id));
+    let client = TcpBulkTransport::dial_only(NodeId::new(id)).expect("valid id");
     client.register_peer(
         server.local_id().clone(),
         server.local_addr().expect("server address"),

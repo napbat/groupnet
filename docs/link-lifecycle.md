@@ -68,13 +68,20 @@ identities by the shared `groupnet_transport::MAX_NODE_ID_BYTES` (255).
 
 Admission failures are actionable. `JoinRequest::validate` names a malformed
 claim (`JoinRequestError`: the claimed identity or an oversized credential);
-policies call it first and deny with `PermissionDenied` naming the claim. The
-`Admission` trait keeps `io::Result` and a boxed `LinkFuture` because adapters
-hold policies as `Arc<dyn Admission>`; its rustdoc carries a compiled
-allowlist example of the `Box::pin(async move { .. })` pattern.
-`SessionRegistry::try_admit` reports `SessionError` (identity, closed,
-duplicate, capacity or generation exhaustion), and converts into `io::Error`
-with the kinds adapters already used.
+policies call it first (`?` converts it into `AdmissionError::Request`) and
+deny with a typed `AdmissionError`: `UnknownPeer` or `CredentialRejected`
+naming the claim, or `Unavailable` keeping the policy's own failure (an
+unreachable account store) as its `source()`. The `Admission` trait returns
+that error in a boxed `LinkFuture` because adapters hold policies as
+`Arc<dyn Admission>`; boxing is the object-safety requirement, the error stays
+typed. Adapters convert it into `io::Error` only at the socket boundary
+(`InvalidInput` for a malformed request, `PermissionDenied` for a denial, the
+cause's kind for an unavailable policy), keeping the typed error inside. The
+trait's rustdoc carries a compiled allowlist example of the
+`Box::pin(async move { .. })` pattern. `SessionRegistry::try_admit` reports
+`SessionError` (identity, closed, duplicate, capacity or generation
+exhaustion), and converts into `io::Error` with the kinds adapters already
+used.
 
 ### Link modes and validation
 
@@ -85,18 +92,34 @@ default parameter); `connectivity` builds the native mode
 settings — `with_admission`, `with_credentials`, `with_admission_config`,
 `with_msg_config` — exist only on the direct mode, so a native link cannot be
 given admission or tuning it would silently ignore; its admission comes from
-its `TcpPunchConfig` / `UdpPunchConfig`. `with_cost` applies to both. It is
-one link type per protocol; no separate link is registered. Each adapter crate
+its `TcpPunchConfig` / `UdpPunchConfig`. `with_cost` (a `NonZeroU32`) applies
+to both. It is one link type per protocol; no separate link is registered.
+The same rule holds below the links: `register_peer` on a connectivity-mode
+`TcpMsgTransport` or `UdpTransport` returns `TcpRegisterPeerError` /
+`UdpRegisterPeerError` instead of silently recording nothing, and a native
+configuration's `peers` is a `PeerPolicy` — `Static(allowlist)` or `Dynamic` —
+so a dynamic endpoint has no allowlist to ignore. Each adapter crate
 re-exports the connectivity types its signatures name (`TcpPunchConfig` or
-`UdpPunchConfig` with its error, `NetworkKey`, `PathPolicy`, `PeerPath`, and
-`UdpConnection` for UDP), so a standalone adapter user depends on
-`groupnet-transport-punch` only to host a rendezvous.
+`UdpPunchConfig` with its error, `PeerPolicy`, `NetworkKey`, `PathPolicy`,
+`PeerPath`, and `UdpConnection` for UDP) and the shared transport types they
+take (`QueueCapacity`, `PeerEndpoint`, `BoundLink`, `SessionRegistry`,
+`Admission`, `NodeIdError` as applicable), so a standalone adapter user depends
+on `groupnet-transport-punch` only to host a rendezvous.
 
-Link setters only store values. Every link provider (TCP, UDP, IPC) validates
-once, when it binds, and fails with `InvalidInput` carrying the configuration's
-typed error (`TcpMsgConfigError`, `TcpAdmissionError`, `IpcConfigError`, the
-native configuration's error, or `NodeIdError`) before opening a socket.
-Callers preflight with the configuration's `validate()`. A raw
+Link setters only store values. Every link provider (memory, TCP, UDP, IPC)
+validates once, when it binds, and completely before it opens any socket or
+listener: its own configuration, the `LinkConfig` it will register (cost and
+MTU are nonzero by type; `LinkConfig::validate_for(&local)` rejects an
+invalid, duplicated or local peer identity), and each configured peer endpoint
+(IPC also checks every peer against its 64-byte identity bound, `max_peers`
+and the platform address rules `register_peer` enforces). A failure is
+`InvalidInput` carrying the typed error (`LinkConfigError`,
+`TcpMsgConfigError`, `TcpAdmissionError`, `IpcConfigError`, `IpcPeerError`,
+the native configuration's error, or `NodeIdError`), and no endpoint exists.
+Callers preflight with the configurations' `validate()` and
+`LinkConfig::validate_for`. The router still applies its own bounds when the
+bound link registers (route capacity, and an MTU its fragment header and frame
+ceiling can use). A raw
 `TcpMsgTransport::bind_admitted(local, addr, config, admission)` takes the
 policy, presented credential and bounds bundled as one `TcpAdmission`.
 

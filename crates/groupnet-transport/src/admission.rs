@@ -122,21 +122,98 @@ impl AcceptedPeer {
     }
 }
 
+/// Why an [`Admission`] policy refused a claim.
+///
+/// Adapters convert it into an `io::Error` only at the socket boundary
+/// (`From<AdmissionError> for io::Error`): a malformed request becomes
+/// `InvalidInput`, a denial `PermissionDenied`, and an undecidable claim keeps
+/// its cause's kind. The typed error stays the inner error, so a caller can
+/// downcast it back.
+#[derive(Debug)]
+pub enum AdmissionError {
+    /// The claim is malformed, as reported by [`JoinRequest::validate`].
+    Request(JoinRequestError),
+    /// The claimed identity is not one this policy admits.
+    UnknownPeer {
+        /// The refused identity.
+        claimed: NodeId,
+    },
+    /// The presented credential does not authorize the claimed identity.
+    CredentialRejected {
+        /// The identity the credential failed to authorize.
+        claimed: NodeId,
+    },
+    /// The policy could not reach a decision — an unreachable account
+    /// store, a failed lookup. Adapters fail closed; the cause stays the
+    /// [`source`](error::Error::source).
+    Unavailable(Box<dyn error::Error + Send + Sync + 'static>),
+}
+
+impl fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request(error) => write!(f, "malformed admission request: {error}"),
+            Self::UnknownPeer { claimed } => write!(f, "{claimed} is not an admitted peer"),
+            Self::CredentialRejected { claimed } => {
+                write!(f, "the credential presented for {claimed} was rejected")
+            }
+            Self::Unavailable(error) => write!(f, "admission policy unavailable: {error}"),
+        }
+    }
+}
+
+impl error::Error for AdmissionError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::UnknownPeer { .. } | Self::CredentialRejected { .. } => None,
+            Self::Unavailable(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<JoinRequestError> for AdmissionError {
+    fn from(error: JoinRequestError) -> Self {
+        Self::Request(error)
+    }
+}
+
+/// A policy's own I/O failure: the claim stays undecided.
+impl From<io::Error> for AdmissionError {
+    fn from(error: io::Error) -> Self {
+        Self::Unavailable(Box::new(error))
+    }
+}
+
+impl From<AdmissionError> for io::Error {
+    fn from(error: AdmissionError) -> Self {
+        let kind = match &error {
+            AdmissionError::Request(_) => io::ErrorKind::InvalidInput,
+            AdmissionError::UnknownPeer { .. } | AdmissionError::CredentialRejected { .. } => {
+                io::ErrorKind::PermissionDenied
+            }
+            AdmissionError::Unavailable(cause) => cause
+                .downcast_ref::<io::Error>()
+                .map_or(io::ErrorKind::Other, io::Error::kind),
+        };
+        Self::new(kind, error)
+    }
+}
+
 /// Object-safe application policy, erased once per handshake, never per packet.
 ///
 /// Implementations return a boxed [`LinkFuture`] so adapters can hold any
 /// policy as `Arc<dyn Admission>`. Wrap the body in `Box::pin(async move {..})`;
-/// the future may borrow both the policy and the request for `'a`. Deny with
-/// an `io::Error` whose kind is `PermissionDenied` and whose message names the
-/// claim and the reason, and reject malformed claims with
-/// [`JoinRequest::validate`] (convertible with `?`), so operators can tell a
-/// refused identity from a broken request:
+/// the future may borrow both the policy and the request for `'a`. Reject
+/// malformed claims with [`JoinRequest::validate`] (convertible with `?`) and
+/// deny with the [`AdmissionError`] naming the reason, so operators can tell a
+/// refused identity from a broken request or an unreachable policy store:
 ///
 /// ```
-/// use std::{collections::HashSet, io};
+/// use std::collections::HashSet;
 ///
 /// use groupnet_core::NodeId;
-/// use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest};
+/// use groupnet_transport::admission::{AcceptedPeer, Admission, AdmissionError, JoinRequest};
 /// use groupnet_transport::link::LinkFuture;
 ///
 /// /// Admits only identities on a fixed list.
@@ -144,16 +221,18 @@ impl AcceptedPeer {
 /// struct Allowlist(HashSet<NodeId>);
 ///
 /// impl Admission for Allowlist {
-///     fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+///     fn admit<'a>(
+///         &'a self,
+///         request: JoinRequest<'a>,
+///     ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
 ///         Box::pin(async move {
 ///             request.validate()?;
 ///             if self.0.contains(request.claimed) {
 ///                 Ok(AcceptedPeer::new(request.claimed.clone()))
 ///             } else {
-///                 Err(io::Error::new(
-///                     io::ErrorKind::PermissionDenied,
-///                     format!("{} is not on the allowlist", request.claimed),
-///                 ))
+///                 Err(AdmissionError::UnknownPeer {
+///                     claimed: request.claimed.clone(),
+///                 })
 ///             }
 ///         })
 ///     }
@@ -164,13 +243,21 @@ impl AcceptedPeer {
 ///     policy.admit(JoinRequest::new(&NodeId::new("a"), &[], None)),
 /// );
 /// assert!(admitted.is_ok());
+/// let refused = futures::executor::block_on(
+///     policy.admit(JoinRequest::new(&NodeId::new("b"), &[], None)),
+/// );
+/// assert!(matches!(refused, Err(AdmissionError::UnknownPeer { .. })));
 /// ```
 pub trait Admission: Send + Sync + fmt::Debug + 'static {
     /// Authorizes one bounded identity claim.
     ///
     /// # Errors
-    /// Returns an error to deny admission; adapters must fail closed.
-    fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>>;
+    /// Returns the [`AdmissionError`] denying admission; adapters must fail
+    /// closed.
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>>;
 }
 
 /// Explicitly unauthenticated admission, requiring no key or shared secret.
@@ -179,7 +266,10 @@ pub trait Admission: Send + Sync + fmt::Debug + 'static {
 pub struct OpenAdmission;
 
 impl Admission for OpenAdmission {
-    fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
         Box::pin(async move {
             request.validate()?;
             Ok(AcceptedPeer {

@@ -1,6 +1,7 @@
 //! In-process link configuration and identity validation.
 
 use std::io;
+use std::num::NonZeroU32;
 
 use groupnet_core::NodeId;
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider};
@@ -10,53 +11,48 @@ use crate::MemTransport;
 /// An in-process link that consumes an existing fabric endpoint.
 ///
 /// Available with the `link` feature. The endpoint identity must match the
-/// binding node; dropping the transport releases its channel registration.
+/// binding node, and the declared peers must pass
+/// [`LinkConfig::validate_for`]; both are checked before the link is handed
+/// over. Dropping the transport releases its channel registration.
 #[derive(Debug)]
 pub struct MemLink {
     transport: MemTransport,
-    peers: Vec<NodeId>,
-    cost: u32,
+    config: LinkConfig,
 }
 
 impl MemLink {
     /// Declares the peers directly reachable through this fabric endpoint.
     #[must_use]
-    pub const fn new(transport: MemTransport, peers: Vec<NodeId>) -> Self {
+    pub fn new(transport: MemTransport, peers: Vec<NodeId>) -> Self {
         Self {
             transport,
-            peers,
-            cost: 1,
+            config: LinkConfig::new(peers),
         }
     }
 
     /// Sets the routing cost of this link (default: one).
     #[must_use]
-    pub const fn with_cost(mut self, cost: u32) -> Self {
-        self.cost = cost;
+    pub const fn with_cost(mut self, cost: NonZeroU32) -> Self {
+        self.config.cost = cost;
         self
     }
 }
 
 impl LinkProvider for MemLink {
     fn peers(&self) -> &[NodeId] {
-        &self.peers
+        &self.config.peers
     }
 
     fn bind(self: Box<Self>, local: NodeId) -> LinkFuture<'static, io::Result<BoundLink>> {
         Box::pin(async move {
-            let Self {
-                transport,
-                peers,
-                cost,
-            } = *self;
+            let Self { transport, config } = *self;
             if transport.local_id() != &local {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "memory endpoint identity does not match the binding node",
                 ));
             }
-            let mut config = LinkConfig::new(peers);
-            config.cost = cost;
+            config.validate_for(&local)?;
             Ok(BoundLink::new(transport, config))
         })
     }
@@ -76,5 +72,42 @@ mod tests {
             .await
             .expect_err("identity mismatch must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn provider_validates_cost_and_peers_before_handing_over() {
+        use groupnet_transport::link::LinkConfigError;
+
+        let net = Network::new();
+        let local = NodeId::new("local");
+        for (peers, expected) in [
+            (
+                vec![NodeId::new("a"), local.clone()],
+                LinkConfigError::LocalPeer { index: 1 },
+            ),
+            (
+                vec![NodeId::new("a"), NodeId::new("a")],
+                LinkConfigError::DuplicatePeer { index: 1 },
+            ),
+        ] {
+            let link = MemLink::new(net.endpoint(local.clone()), peers);
+            let error = Box::new(link)
+                .bind(local.clone())
+                .await
+                .expect_err("invalid peers must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<LinkConfigError>()),
+                Some(&expected)
+            );
+        }
+        let cost = NonZeroU32::new(7).unwrap();
+        let bound = Box::new(MemLink::new(net.endpoint(local.clone()), Vec::new()).with_cost(cost))
+            .bind(local)
+            .await
+            .unwrap();
+        assert_eq!(bound.config.cost, cost);
     }
 }

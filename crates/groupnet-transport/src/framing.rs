@@ -20,6 +20,7 @@ use std::future::poll_fn;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::{error, fmt};
 
 use tokio::io::AsyncWrite;
 use zerocopy::byteorder::big_endian::U32;
@@ -51,19 +52,15 @@ impl LengthHeader {
     /// Encodes a frame length.
     ///
     /// # Errors
-    /// Returns `InvalidInput` above [`MAX_FRAME_BYTES`], before anything is
-    /// written.
-    pub fn new(length: usize) -> io::Result<Self> {
-        if length > MAX_FRAME_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "frame exceeds the stream frame ceiling",
-            ));
-        }
-        let length = u32::try_from(length)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame length exceeds u32"))?;
+    /// Returns [`FrameLengthError::AboveCeiling`] above [`MAX_FRAME_BYTES`],
+    /// before anything is written.
+    pub fn new(length: usize) -> Result<Self, FrameLengthError> {
+        let encoded = u32::try_from(length)
+            .ok()
+            .filter(|_| length <= MAX_FRAME_BYTES)
+            .ok_or(FrameLengthError::AboveCeiling { length })?;
         Ok(Self {
-            length: U32::new(length),
+            length: U32::new(encoded),
         })
     }
 
@@ -71,13 +68,13 @@ impl LengthHeader {
     /// [`write_vectored`].
     ///
     /// # Errors
-    /// Returns `InvalidInput` when the sum overflows or exceeds
-    /// [`MAX_FRAME_BYTES`].
-    pub fn for_parts(parts: &[&[u8]]) -> io::Result<Self> {
+    /// Returns [`FrameLengthError::Overflow`] when the sum overflows `usize`
+    /// and [`FrameLengthError::AboveCeiling`] above [`MAX_FRAME_BYTES`].
+    pub fn for_parts(parts: &[&[u8]]) -> Result<Self, FrameLengthError> {
         let length = parts
             .iter()
             .try_fold(0usize, |total, part| total.checked_add(part.len()))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
+            .ok_or(FrameLengthError::Overflow)?;
         Self::new(length)
     }
 
@@ -87,21 +84,98 @@ impl LengthHeader {
         self.length.get()
     }
 
-    /// The decoded length, checked against the receiver's limit (itself
-    /// capped at [`MAX_FRAME_BYTES`]) before any payload storage is allocated.
+    /// The decoded length, checked against the receiver's limit before any
+    /// payload storage is allocated. The limit itself must be at most
+    /// [`MAX_FRAME_BYTES`]; a larger one is refused, not capped.
     ///
     /// # Errors
-    /// Returns `InvalidData` when the declared length exceeds the limit.
-    pub fn length_within(self, max_bytes: usize) -> io::Result<usize> {
-        usize::try_from(self.get())
+    /// Returns [`FrameLengthError::LimitAboveCeiling`] for an over-ceiling
+    /// `max_bytes`, and [`FrameLengthError::ReceivedAboveLimit`] when the
+    /// declared length exceeds it.
+    pub fn length_within(self, max_bytes: usize) -> Result<usize, FrameLengthError> {
+        if max_bytes > MAX_FRAME_BYTES {
+            return Err(FrameLengthError::LimitAboveCeiling { max_bytes });
+        }
+        let length = self.get();
+        usize::try_from(length)
             .ok()
-            .filter(|length| *length <= max_bytes.min(MAX_FRAME_BYTES))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "frame length exceeds the receive limit",
-                )
-            })
+            .filter(|length| *length <= max_bytes)
+            .ok_or(FrameLengthError::ReceivedAboveLimit { length, max_bytes })
+    }
+}
+
+/// Why a frame length or a frame limit was refused.
+///
+/// Converts into an `io::Error` at the stream boundary: a declared length
+/// over the receive limit is `InvalidData` (the peer sent it), every other
+/// variant `InvalidInput` (the caller supplied it). The typed error stays the
+/// inner error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameLengthError {
+    /// A frame to encode exceeds [`MAX_FRAME_BYTES`].
+    AboveCeiling {
+        /// The frame's length in bytes.
+        length: usize,
+    },
+    /// The summed lengths of a frame's parts overflow `usize`.
+    Overflow,
+    /// A frame limit is zero where a frame must carry at least one byte.
+    ZeroLimit,
+    /// A frame limit exceeds [`MAX_FRAME_BYTES`].
+    LimitAboveCeiling {
+        /// The refused limit.
+        max_bytes: usize,
+    },
+    /// A frame to send exceeds the caller's limit.
+    SendAboveLimit {
+        /// The frame's length in bytes.
+        length: usize,
+        /// The limit in force.
+        max_bytes: usize,
+    },
+    /// A received length prefix exceeds the receiver's limit.
+    ReceivedAboveLimit {
+        /// The declared length.
+        length: u32,
+        /// The limit in force.
+        max_bytes: usize,
+    },
+}
+
+impl fmt::Display for FrameLengthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AboveCeiling { length } => write!(
+                f,
+                "frame of {length} bytes exceeds the {MAX_FRAME_BYTES}-byte stream ceiling"
+            ),
+            Self::Overflow => f.write_str("frame length overflows usize"),
+            Self::ZeroLimit => f.write_str("frame limit must be nonzero"),
+            Self::LimitAboveCeiling { max_bytes } => write!(
+                f,
+                "frame limit {max_bytes} exceeds the {MAX_FRAME_BYTES}-byte stream ceiling"
+            ),
+            Self::SendAboveLimit { length, max_bytes } => write!(
+                f,
+                "frame of {length} bytes exceeds the {max_bytes}-byte send limit"
+            ),
+            Self::ReceivedAboveLimit { length, max_bytes } => write!(
+                f,
+                "received frame length {length} exceeds the {max_bytes}-byte receive limit"
+            ),
+        }
+    }
+}
+
+impl error::Error for FrameLengthError {}
+
+impl From<FrameLengthError> for io::Error {
+    fn from(error: FrameLengthError) -> Self {
+        let kind = match error {
+            FrameLengthError::ReceivedAboveLimit { .. } => io::ErrorKind::InvalidData,
+            _ => io::ErrorKind::InvalidInput,
+        };
+        Self::new(kind, error)
     }
 }
 

@@ -3,13 +3,16 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
+use groupnet_transport::admission::OpenAdmission;
 use groupnet_transport_punch::{UdpRendezvous, UdpRendezvousConfig};
 use groupnet_transport_udp::{
-    PathPolicy, PeerPath, UdpPunchConfig, UdpPunchConfigError, UdpTransport,
+    PathPolicy, PeerPath, PeerPolicy, UdpPunchConfig, UdpPunchConfigError, UdpTransport,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -21,7 +24,17 @@ fn loopback() -> SocketAddr {
 }
 
 async fn open_relay(bind: SocketAddr) -> io::Result<UdpRendezvous> {
-    UdpRendezvous::bind(UdpRendezvousConfig::open(bind)).await
+    UdpRendezvous::bind(UdpRendezvousConfig::new(
+        bind,
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    ))
+    .await
+}
+
+fn open_config(local: NodeId, rendezvous: SocketAddr) -> UdpPunchConfig {
+    UdpPunchConfig::new(local, rendezvous, None, PeerPolicy::Dynamic)
 }
 
 async fn pair(
@@ -31,7 +44,7 @@ async fn pair(
 ) -> (UdpTransport, UdpTransport) {
     let unused = UdpSocket::bind(bind).await.unwrap();
     let unreachable = unused.local_addr().unwrap();
-    let mut config = UdpPunchConfig::open("a".into(), address);
+    let mut config = open_config("a".into(), address);
     config.policy = policy;
     config.bind = bind;
     config.candidate_binds = vec![bind];
@@ -105,7 +118,7 @@ async fn multiple_leased_sockets_unreachable_hint_and_observed_path_deliver_bidi
 async fn relay_only_keeps_candidates_private_and_sends_no_candidate_checks() {
     let relay = open_relay(loopback()).await.unwrap();
     let spy = UdpSocket::bind(loopback()).await.unwrap();
-    let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
+    let mut config = open_config("a".into(), relay.local_addr());
     config.bind = loopback();
     config.candidate_binds = vec![loopback()];
     config.advertised_candidates = vec![spy.local_addr().unwrap()];
@@ -167,7 +180,7 @@ async fn invalid_candidate_targets_and_socket_counts_fail_closed() {
         "[ff02::1]:9",
         "[fe80::1%4]:9",
     ] {
-        let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
+        let mut config = open_config("a".into(), relay.local_addr());
         config.advertised_candidates = vec![address.parse().unwrap()];
         let error = UdpTransport::bind_connectivity(config).await.unwrap_err();
         assert_eq!(
@@ -175,14 +188,14 @@ async fn invalid_candidate_targets_and_socket_counts_fail_closed() {
             Some(UdpPunchConfigError::InvalidAdvertisedCandidate { index: 0 })
         );
     }
-    let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
+    let mut config = open_config("a".into(), relay.local_addr());
     config.candidate_binds = vec![loopback(); 4];
     let error = UdpTransport::bind_connectivity(config).await.unwrap_err();
     assert_eq!(
         rejected(&error),
         Some(UdpPunchConfigError::TooManyCandidateBinds { len: 4 })
     );
-    let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
+    let mut config = open_config("a".into(), relay.local_addr());
     config.advertised_candidates = vec![([127, 0, 0, 1], 9).into(); 9];
     let error = UdpTransport::bind_connectivity(config).await.unwrap_err();
     assert_eq!(
@@ -209,7 +222,7 @@ async fn ipv4_relay_registration_owns_ipv6_candidate_sockets_and_gathers_wildcar
     };
     drop(available);
     let relay = open_relay(loopback()).await.unwrap();
-    let mut config = UdpPunchConfig::open("a".into(), relay.local_addr());
+    let mut config = open_config("a".into(), relay.local_addr());
     config.policy = PathPolicy::DirectPreferred;
     config.candidate_binds = vec![ipv6];
     let a = UdpTransport::bind_connectivity(config.clone())

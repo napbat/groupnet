@@ -3,11 +3,12 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use groupnet_core::NodeId;
-use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest};
-use groupnet_transport::link::{BoundLink, LinkFuture, LinkProvider, PeerEndpoint};
+use groupnet_transport::admission::{AcceptedPeer, Admission, AdmissionError, JoinRequest};
+use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider, PeerEndpoint};
 
 use crate::{TcpAdmission, TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
 
@@ -33,10 +34,13 @@ use crate::{TcpAdmission, TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
 ///
 /// Setters only store their values. Binding is the one validation point: it
 /// fails with `InvalidInput` carrying the typed cause
-/// ([`TcpMsgConfigError`](crate::TcpMsgConfigError),
-/// [`TcpAdmissionError`](crate::TcpAdmissionError) or the native
-/// configuration's error) before opening any socket. Preflight with
-/// [`TcpMsgConfig::validate`] and [`TcpAdmission::validate`].
+/// ([`LinkConfigError`](groupnet_transport::link::LinkConfigError) for the
+/// configured peers, [`TcpMsgConfigError`](crate::TcpMsgConfigError),
+/// [`TcpAdmissionError`](crate::TcpAdmissionError), the local
+/// [`NodeIdError`](crate::NodeIdError) or the native configuration's error)
+/// before opening any socket or listener. Preflight with
+/// [`LinkConfig::validate_for`], [`TcpMsgConfig::validate`] and
+/// [`TcpAdmission::validate`].
 #[cfg_attr(
     feature = "connectivity",
     doc = r#"
@@ -46,13 +50,13 @@ Direct-only settings are rejected at compile time on a native link:
 
 ```compile_fail
 use groupnet_core::NodeId;
-use groupnet_transport_tcp::{NetworkKey, TcpLink, TcpPunchConfig};
+use groupnet_transport_tcp::{NetworkKey, PeerPolicy, TcpLink, TcpPunchConfig};
 
 let config = TcpPunchConfig::new(
     NodeId::new("a"),
     "127.0.0.1:7000".parse().unwrap(),
-    NetworkKey::from_bytes([7; 32]),
-    vec![NodeId::new("b")],
+    Some(NetworkKey::from_bytes([7; 32])),
+    PeerPolicy::Static(vec![NodeId::new("b")]),
 );
 let _ = TcpLink::connectivity(config).with_credentials(b"ignored".to_vec());
 ```
@@ -60,26 +64,29 @@ let _ = TcpLink::connectivity(config).with_credentials(b"ignored".to_vec());
 while both modes share the mode-independent settings:
 
 ```
-use groupnet_core::NodeId;
-use groupnet_transport_tcp::{NetworkKey, TcpLink, TcpPunchConfig};
+use std::num::NonZeroU32;
 
+use groupnet_core::NodeId;
+use groupnet_transport_tcp::{NetworkKey, PeerPolicy, TcpLink, TcpPunchConfig};
+
+let cost = NonZeroU32::new(2).unwrap();
 let config = TcpPunchConfig::new(
     NodeId::new("a"),
     "127.0.0.1:7000".parse().unwrap(),
-    NetworkKey::from_bytes([7; 32]),
-    vec![NodeId::new("b")],
+    Some(NetworkKey::from_bytes([7; 32])),
+    PeerPolicy::Static(vec![NodeId::new("b")]),
 );
-let _native = TcpLink::connectivity(config).with_cost(2);
+let _native = TcpLink::connectivity(config).with_cost(cost);
 let _direct = TcpLink::new("127.0.0.1:0".parse().unwrap(), Vec::new())
     .with_credentials(b"token".to_vec())
-    .with_cost(2);
+    .with_cost(cost);
 ```
 "#
 )]
 #[derive(Debug)]
 pub struct TcpLink<M = TcpDirect> {
     mode: M,
-    cost: u32,
+    cost: NonZeroU32,
 }
 
 /// The direct mode of a [`TcpLink`]: a listener, bootstrap endpoints,
@@ -120,7 +127,7 @@ pub struct TcpConnectivity {
 impl<M> TcpLink<M> {
     /// Sets the routing cost of this link (default: one).
     #[must_use]
-    pub fn with_cost(mut self, cost: u32) -> Self {
+    pub fn with_cost(mut self, cost: NonZeroU32) -> Self {
         self.cost = cost;
         self
     }
@@ -146,7 +153,7 @@ impl TcpLink<TcpDirect> {
                 credential: Vec::new(),
                 admission_config: TcpAdmissionConfig::default(),
             },
-            cost: 1,
+            cost: NonZeroU32::MIN,
         }
     }
 
@@ -191,7 +198,7 @@ impl TcpLink<TcpConnectivity> {
     pub const fn connectivity(config: crate::TcpPunchConfig) -> Self {
         Self {
             mode: TcpConnectivity { config },
-            cost: 1,
+            cost: NonZeroU32::MIN,
         }
     }
 }
@@ -216,6 +223,15 @@ impl LinkProvider for TcpLink<TcpDirect> {
                     },
                 cost,
             } = *self;
+            // Every configured peer is checked before the listener opens;
+            // `bind_admitted` then checks the tuning, admission and local id.
+            let configured = LinkConfig {
+                peers,
+                cost,
+                ..LinkConfig::default()
+            };
+            configured.validate_for(&local)?;
+            let LinkConfig { peers, .. } = configured;
             let admission = TcpAdmission {
                 policy: admission.unwrap_or_else(|| Arc::new(ConfiguredAdmission(peers.clone()))),
                 credential,
@@ -224,7 +240,7 @@ impl LinkProvider for TcpLink<TcpDirect> {
             let transport =
                 TcpMsgTransport::bind_admitted(local, bind, msg_config, admission).await?;
             for (node, address) in peers.iter().zip(addresses) {
-                transport.register_peer(node.clone(), address);
+                transport.register_peer(node.clone(), address)?;
             }
             transport.bootstrap(peers);
             Ok(transport.into_bound_link(cost))
@@ -235,7 +251,7 @@ impl LinkProvider for TcpLink<TcpDirect> {
 #[cfg(feature = "connectivity")]
 impl LinkProvider for TcpLink<TcpConnectivity> {
     fn peers(&self) -> &[NodeId] {
-        &self.mode.config.peers
+        self.mode.config.peers.static_peers()
     }
 
     fn bind(self: Box<Self>, local: NodeId) -> LinkFuture<'static, io::Result<BoundLink>> {
@@ -264,19 +280,18 @@ impl LinkProvider for TcpLink<TcpConnectivity> {
 struct ConfiguredAdmission(Vec<NodeId>);
 
 impl Admission for ConfiguredAdmission {
-    fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
         Box::pin(async move {
             request.validate()?;
             if self.0.contains(request.claimed) {
                 Ok(AcceptedPeer::new(request.claimed.clone()))
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{} is not a configured peer of this TCP link",
-                        request.claimed
-                    ),
-                ))
+                Err(AdmissionError::UnknownPeer {
+                    claimed: request.claimed.clone(),
+                })
             }
         })
     }

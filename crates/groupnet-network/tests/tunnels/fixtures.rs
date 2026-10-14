@@ -169,8 +169,8 @@ impl Fabric {
             let ct = TcpMsgTransport::bind(c.clone(), "127.0.0.1:0")
                 .await
                 .unwrap();
-            bt.register_peer(c.clone(), ct.local_addr());
-            ct.register_peer(b.clone(), bt.local_addr());
+            bt.register_peer(c.clone(), ct.local_addr()).unwrap();
+            ct.register_peer(b.clone(), bt.local_addr()).unwrap();
             br.add_transport(bt, LinkConfig::new(vec![c.clone()]))
                 .unwrap();
             cr.add_transport(ct, LinkConfig::new(vec![b])).unwrap();

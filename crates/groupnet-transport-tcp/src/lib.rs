@@ -30,12 +30,14 @@
 //!   and live admission generations across conversion into a managed link.
 //!   `TcpMsgTransport::path_changes` observes direct/relay path changes.
 //!   The configuration and path types these signatures name (`TcpPunchConfig`,
-//!   `TcpPunchConfigError`, `NetworkKey`, `PathPolicy`, `PeerPath`) are
-//!   re-exported here, so standalone users need no direct
+//!   `TcpPunchConfigError`, `PeerPolicy`, `NetworkKey`, `PathPolicy`,
+//!   `PeerPath`) are re-exported here, so standalone users need no direct
 //!   `groupnet-transport-punch` dependency; only a self-hosted rendezvous
 //!   (`TcpRendezvous`) comes from that crate.
 //!
 //! `TcpMsgTransport::closed` resolves, stickily, once an endpoint shuts down.
+//! `TcpMsgTransport::register_peer` records a direct endpoint's dial address
+//! and rejects a connectivity endpoint with `TcpRegisterPeerError`.
 //!
 //! The low-level message and bulk APIs retain trusted-topology identity
 //! attribution. Managed message admission uses its own bounded wire exchange,
@@ -43,6 +45,11 @@
 //! Every handshake introduces a node id of 1 to
 //! `groupnet_transport::MAX_NODE_ID_BYTES` bytes, the bound session admission
 //! enforces.
+//!
+//! The shared transport types these signatures name are re-exported at this
+//! crate's root, each with the feature that exposes it: `QueueCapacity`
+//! (`msg` or `bulk`), `NodeIdError` (`bulk`), and `Admission`, `BoundLink`,
+//! `PeerEndpoint` and `SessionRegistry` (`link`).
 //!
 //! [`Transport`]: groupnet_transport::Transport
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -54,19 +61,28 @@ mod handshake;
 mod bulk;
 #[cfg(feature = "bulk")]
 pub use bulk::{TcpBulkConfig, TcpBulkConfigError, TcpBulkTransport};
+#[cfg(feature = "bulk")]
+pub use groupnet_transport::NodeIdError;
+#[cfg(any(feature = "bulk", feature = "msg"))]
+pub use groupnet_transport::QueueCapacity;
+#[cfg(feature = "link")]
+pub use groupnet_transport::{
+    admission::{Admission, SessionRegistry},
+    link::{BoundLink, PeerEndpoint},
+};
 
 #[cfg(feature = "msg")]
 mod msg;
 #[cfg(feature = "connectivity")]
 pub use groupnet_transport_punch::{
-    NetworkKey, PathPolicy, PeerPath, TcpPunchConfig, TcpPunchConfigError,
+    NetworkKey, PathPolicy, PeerPath, PeerPolicy, TcpPunchConfig, TcpPunchConfigError,
 };
 #[cfg(feature = "connectivity")]
 pub use msg::TcpPathChanges;
 #[cfg(feature = "link")]
 pub use msg::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError};
 #[cfg(feature = "msg")]
-pub use msg::{TcpMsgConfig, TcpMsgConfigError, TcpMsgTransport};
+pub use msg::{TcpMsgConfig, TcpMsgConfigError, TcpMsgTransport, TcpRegisterPeerError};
 
 #[cfg(feature = "link")]
 mod link;
