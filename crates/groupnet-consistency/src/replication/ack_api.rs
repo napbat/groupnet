@@ -40,7 +40,7 @@ pub(crate) fn validate_named(
     scope: &Scope,
     limits: AckWaitLimits,
 ) -> Result<(), AckWaitError> {
-    if request.roster.required.len() > limits.max_required {
+    if request.roster.required.len() > limits.max_required.get() {
         return Err(AckWaitError::Backpressure);
     }
     if request.target != request.roster.target
@@ -54,7 +54,7 @@ pub(crate) fn validate_named(
     {
         return Err(AckWaitError::Roster);
     }
-    if request.target.scope() != scope || scope.validate(limits.max_identity_bytes).is_err() {
+    if request.target.scope() != scope || scope.validate(limits.max_identity_bytes.get()).is_err() {
         return Err(AckWaitError::Identity);
     }
     let mut total = 0usize;
@@ -68,15 +68,15 @@ pub(crate) fn validate_named(
         total = total
             .checked_add(field.len())
             .ok_or(AckWaitError::Backpressure)?;
-        if total > limits.max_metadata_bytes {
+        if total > limits.max_metadata_bytes.get() {
             return Err(AckWaitError::Backpressure);
         }
         Ok(())
     };
-    charge(&request.request_id, limits.max_identity_bytes)?;
+    charge(&request.request_id, limits.max_identity_bytes.get())?;
     charge(
         request.roster.certificate.as_slice(),
-        limits.max_certificate_bytes,
+        limits.max_certificate_bytes.get(),
     )?;
     for target in [&request.target, &request.roster.target] {
         for name in [
@@ -86,22 +86,22 @@ pub(crate) fn validate_named(
             &scope.partition,
             &target.history().source,
         ] {
-            charge(name.as_bytes(), limits.max_identity_bytes)?;
+            charge(name.as_bytes(), limits.max_identity_bytes.get())?;
         }
         match target {
-            AckTarget::Intent { id, .. } => charge(id, limits.max_identity_bytes)?,
+            AckTarget::Intent { id, .. } => charge(id, limits.max_identity_bytes.get())?,
             AckTarget::Cursor(cursor) => {
                 cursor
-                    .validate(scope, limits.max_identity_bytes)
+                    .validate(scope, limits.max_identity_bytes.get())
                     .map_err(|_| AckWaitError::Identity)?;
-                charge(&cursor.position, limits.max_identity_bytes)?;
+                charge(&cursor.position, limits.max_identity_bytes.get())?;
             }
         }
     }
     let mut prior = std::collections::BTreeSet::new();
     for required in &request.roster.required {
-        charge(required.name.as_bytes(), limits.max_identity_bytes)?;
-        charge(&required.epoch, limits.max_identity_bytes)?;
+        charge(required.name.as_bytes(), limits.max_identity_bytes.get())?;
+        charge(&required.epoch, limits.max_identity_bytes.get())?;
         if required.incarnation == 0 || !prior.insert(required.name.as_str()) {
             return Err(AckWaitError::Roster);
         }
@@ -221,10 +221,10 @@ mod tests {
             roster,
         };
         let limits = AckWaitLimits {
-            max_required: 2,
-            max_identity_bytes: 16,
-            max_certificate_bytes: 16,
-            max_metadata_bytes: 64,
+            max_required: std::num::NonZeroUsize::new(2).unwrap(),
+            max_identity_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+            max_certificate_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+            max_metadata_bytes: std::num::NonZeroUsize::new(64).unwrap(),
             max_wait_ms: 1000,
             poll_ms: 10,
         };

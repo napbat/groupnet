@@ -10,14 +10,16 @@
 //! backoff paces only the participants the failures were taken under: a
 //! joiner or a restarted peer starts its capture at once.
 
+use std::num::NonZeroUsize;
+
 use super::*;
 use crate::Status;
 use crate::volatile_bootstrap::BootstrapParticipant;
 
 const CONFIG: BootstrapConfig = BootstrapConfig {
-    max_members: 4,
-    max_member_bytes: 16,
-    max_scope_bytes: 32,
+    max_members: NonZeroUsize::new(4).unwrap(),
+    max_member_bytes: NonZeroUsize::new(16).unwrap(),
+    max_scope_bytes: NonZeroUsize::new(32).unwrap(),
     settle_ms: 2,
     renew_ms: 2,
     claim_ttl_ms: 6,

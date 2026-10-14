@@ -51,7 +51,9 @@ impl DurableDeliveryReceipt {
         {
             return Err(SubscriptionError::Binding);
         }
-        if self.ack_request_id.is_empty() || self.ack_request_id.len() > limits.max_request_bytes {
+        if self.ack_request_id.is_empty()
+            || self.ack_request_id.len() > limits.max_request_bytes.get()
+        {
             return Err(SubscriptionError::Bounds);
         }
         self.sink_cursor

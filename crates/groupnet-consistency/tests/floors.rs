@@ -19,12 +19,10 @@ const SETTLE: Duration = Duration::from_secs(3);
 /// Long enough that nothing expires mid-test where expiry is not the subject.
 const LONG_TTL: Duration = Duration::from_secs(30);
 
-/// The timings every node in these tests runs at: fast gossip, brisk
-/// anti-entropy, one shared group.
+/// The timings every node in these tests runs at: a brisk gossip round, one
+/// shared group.
 fn opts() -> NodeOpts {
-    NodeOpts::new(GROUP)
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+    NodeOpts::new(GROUP).gossip_interval_ms(25)
 }
 
 /// A published floor reaches a peer, and the peer can enumerate exactly the

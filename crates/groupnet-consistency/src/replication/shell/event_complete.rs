@@ -169,14 +169,15 @@ where
     /// Adds source-backed named event delivery before opening sessions.
     ///
     /// # Errors
-    /// Returns invalid configuration for zero or inconsistent identity bounds,
-    /// or when `StateSync` sessions are already open.
+    /// Returns invalid configuration for limits that fail
+    /// [`SubscriptionLimits::validate`], or when `StateSync` sessions are
+    /// already open.
     pub fn with_event_complete<D: DurableEventSink<S::Position, S::Batch>>(
         self,
         sink: D,
         limits: SubscriptionLimits,
     ) -> Result<EventSubscriptions<S, A, D, M>, OpenError> {
-        if !limits.valid() || !lock(&self.inner.sessions).is_empty() {
+        if limits.validate().is_err() || !lock(&self.inner.sessions).is_empty() {
             return Err(OpenError::InvalidConfig);
         }
         Ok(EventSubscriptions {
@@ -324,7 +325,7 @@ where
         let shared = Arc::new(NamedShared {
             key: key.clone(),
             session_id,
-            max_request_bytes: self.limits.max_request_bytes,
+            max_request_bytes: self.limits.max_request_bytes.get(),
             commands,
             hints: Notify::new(),
             published,

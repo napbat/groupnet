@@ -68,17 +68,21 @@ impl RecoveryEngine {
     /// Creates a closed recovery view with a unique local session incarnation.
     ///
     /// # Errors
-    /// Rejects invalid finite bounds, empty/oversized local identity, or zero
-    /// session incarnation before any effect is emitted.
+    /// Returns [`RecoveryError::Config`] for invalid finite bounds or
+    /// [`RecoveryError::InvalidIdentity`] for an empty/oversized local
+    /// identity or zero session incarnation, before any effect is emitted.
     pub fn new(
         config: RecoveryConfig,
         mode: RecoveryMode,
         me: NodeId,
         session: u64,
     ) -> Result<Self, RecoveryError> {
-        let config = config.validate()?;
-        if session == 0 || me.as_str().is_empty() || me.as_str().len() > config.max_member_bytes {
-            return Err(RecoveryError::InvalidConfig);
+        config.validate().map_err(RecoveryError::Config)?;
+        if session == 0
+            || me.as_str().is_empty()
+            || me.as_str().len() > config.max_member_bytes.get()
+        {
+            return Err(RecoveryError::InvalidIdentity);
         }
         Ok(Self {
             config,
@@ -123,9 +127,10 @@ impl RecoveryEngine {
     /// This may be selected only before the first event.
     ///
     /// # Errors
-    /// Rejects an invalid policy or an engine already used for recovery.
+    /// Returns [`RecoveryError::Rearm`] for an invalid policy or
+    /// [`RecoveryError::Stage`] for an engine already used for recovery.
     pub fn with_rearm(mut self, policy: RecoveryRearm) -> Result<Self, RecoveryError> {
-        let policy = policy.validate()?;
+        policy.validate().map_err(RecoveryError::Rearm)?;
         if self.stepped {
             return Err(RecoveryError::Stage);
         }
@@ -403,14 +408,14 @@ impl RecoveryEngine {
     }
 
     fn validate_peers(&self, peers: &[Peer]) -> Result<(), RecoveryError> {
-        if peers.len() > self.config.max_members {
+        if peers.len() > self.config.max_members.get() {
             return Err(RecoveryError::Capacity);
         }
         let mut unique = BTreeSet::new();
         for peer in peers {
             if peer.node == self.me
                 || peer.node.as_str().is_empty()
-                || peer.node.as_str().len() > self.config.max_member_bytes
+                || peer.node.as_str().len() > self.config.max_member_bytes.get()
                 || peer.grant.is_some_and(|mark| mark.sequence == 0)
                 || peer.head.is_some_and(|mark| mark.sequence == 0)
                 || peer.renewal.is_some_and(|renewal| {
@@ -460,8 +465,8 @@ impl RecoveryEngine {
                 self.grants.insert(peer.node.clone(), peer.grant);
             }
         }
-        if self.seen.len().saturating_add(self.exempt.len()) > self.config.max_members
-            || self.grants.len() > self.config.max_members
+        if self.seen.len().saturating_add(self.exempt.len()) > self.config.max_members.get()
+            || self.grants.len() > self.config.max_members.get()
         {
             return self.fallback_or_origin(RecoveryFallback::MembershipChanged);
         }
@@ -490,7 +495,7 @@ impl RecoveryEngine {
                 self.seen.insert(peer.node.clone());
             }
         }
-        if self.seen.len().saturating_add(self.exempt.len()) > self.config.max_members {
+        if self.seen.len().saturating_add(self.exempt.len()) > self.config.max_members.get() {
             return self.fallback_or_origin(RecoveryFallback::MembershipChanged);
         }
         let present: BTreeSet<&NodeId> = peers.iter().map(|peer| &peer.node).collect();
@@ -529,7 +534,7 @@ impl RecoveryEngine {
         }
         if recheck {
             self.barrier_rounds += 1;
-            if self.barrier_rounds >= self.config.max_barrier_rounds {
+            if self.barrier_rounds >= self.config.max_barrier_rounds.get() {
                 return self.fallback_or_origin(RecoveryFallback::BarrierExhausted);
             }
         }

@@ -58,7 +58,7 @@ fn enqueue(queue: &mut VecDeque<Effect>, step: Step) {
 fn source_calls(scopes: usize, active: usize, idle: bool) -> usize {
     let config = Config {
         idle: idle.then_some(IdlePolicy {
-            unchanged_checks: 1,
+            unchanged_checks: std::num::NonZeroU32::new(1).unwrap(),
             max_interval_ms: 80,
             jitter_ms: 0,
         }),

@@ -18,9 +18,7 @@ const CAP: &str = "acks";
 
 /// The timings every node here runs at: fast gossip, brisk anti-entropy.
 fn opts() -> NodeOpts {
-    NodeOpts::new("g")
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+    NodeOpts::new("g").gossip_interval_ms(25)
 }
 
 /// The base case: an advertisement reaches peers, scopes a member selection,
@@ -28,8 +26,7 @@ fn opts() -> NodeOpts {
 #[tokio::test]
 async fn an_advertisement_reaches_peers_and_scopes_the_member_set() {
     let cluster = MemCluster::builder(&["cap-a", "cap-b", "cap-c"])
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+        .gossip_interval_ms(25)
         .spawn()
         .await;
     let (a_id, c_id) = (cluster.ids[0].clone(), cluster.ids[2].clone());
@@ -73,8 +70,7 @@ async fn an_advertisement_reaches_peers_and_scopes_the_member_set() {
 #[tokio::test]
 async fn re_advertising_replaces_the_whole_set() {
     let cluster = MemCluster::builder(&["cap-r-a", "cap-r-b"])
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25)
+        .gossip_interval_ms(25)
         .spawn()
         .await;
     let a_id = cluster.ids[0].clone();

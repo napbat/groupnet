@@ -1,3 +1,5 @@
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+
 use super::*;
 use crate::Time;
 
@@ -105,13 +107,34 @@ fn batch(p: &SourceProof, from: u8, through: u8) -> Batch {
 
 #[test]
 fn configuration_and_identity_are_bounded() {
+    assert_eq!(Config::default().validate(), Ok(()));
     assert_eq!(
         Config {
-            max_cursor_bytes: 0,
+            tail_check_ms: 0,
             ..Config::default()
         }
         .validate(),
-        Err(ConfigError::Zero)
+        Err(ConfigError::ZeroTailCheck)
+    );
+    assert_eq!(
+        Config {
+            retry_ms: 0,
+            ..Config::default()
+        }
+        .validate(),
+        Err(ConfigError::ZeroRetry)
+    );
+    assert_eq!(
+        Config {
+            attempt_timeout_ms: 0,
+            ..Config::default()
+        }
+        .validate(),
+        Err(ConfigError::ZeroAttemptTimeout)
+    );
+    assert_eq!(
+        SessionEngine::new(scope(), Mode::StateSync, Config::default(), 0).unwrap_err(),
+        ConfigError::ZeroSession
     );
     let mut bad = cursor(1);
     bad.scope.partition = "elsewhere".into();
@@ -231,7 +254,7 @@ fn pending_work_coalesces_and_late_operations_are_rejected() {
 #[test]
 fn same_or_backward_batch_cannot_advance_and_retry_is_bounded() {
     let cfg = Config {
-        max_retries: 2,
+        max_retries: NonZeroU32::new(2).unwrap(),
         ..Config::default()
     };
     let mut e = SessionEngine::new(scope(), Mode::StateSync, cfg, 1).unwrap();
@@ -264,6 +287,81 @@ fn same_or_backward_batch_cannot_advance_and_retry_is_bounded() {
         e.step(Event::Tick(Time(2000))).effects,
         [] as [crate::replication::Effect; 0]
     );
+}
+
+#[test]
+fn nested_config_errors_name_their_rule_and_expose_source() {
+    let snapshot = SnapshotConfig {
+        max_metadata_bytes: NonZeroUsize::new(128).unwrap(),
+        max_snapshot_bytes: NonZeroU64::new(16).unwrap(),
+        max_chunks: NonZeroU32::new(4).unwrap(),
+        max_chunk_bytes: NonZeroUsize::new(4).unwrap(),
+        max_candidate_bytes: NonZeroU64::new(32).unwrap(),
+        max_total_ms: 0,
+    };
+    assert_eq!(snapshot.validate(), Err(SnapshotConfigError::ZeroMaxTotal));
+    let error = Config {
+        snapshot: Some(snapshot),
+        ..Config::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert_eq!(
+        error,
+        ConfigError::Snapshot(SnapshotConfigError::ZeroMaxTotal)
+    );
+    assert_eq!(error.to_string(), "invalid replication snapshot config");
+    assert_eq!(
+        std::error::Error::source(&error).map(ToString::to_string),
+        Some("snapshot max_total_ms must be nonzero".to_owned())
+    );
+
+    let error = Config {
+        idle: Some(IdlePolicy {
+            unchanged_checks: NonZeroU32::MIN,
+            max_interval_ms: 10,
+            jitter_ms: 0,
+        }),
+        ..Config::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert_eq!(
+        error,
+        ConfigError::Idle(IdlePolicyError::MaxIntervalBelowTailCheck)
+    );
+    assert!(std::error::Error::source(&error).is_some());
+
+    let mut empty = scope();
+    empty.partition.clear();
+    let error = SessionEngine::new(empty, Mode::StateSync, Config::default(), 1).unwrap_err();
+    assert_eq!(error, ConfigError::Identity(IdentityError::Empty));
+    assert_eq!(
+        std::error::Error::source(&error).map(ToString::to_string),
+        Some("a required name or position is empty".to_owned())
+    );
+    assert_eq!(
+        ConfigError::ZeroTailCheck.to_string(),
+        "replication tail_check_ms must be nonzero"
+    );
+    assert!(std::error::Error::source(&ConfigError::ZeroSession).is_none());
+}
+
+#[test]
+fn refusal_and_reject_display_and_chain_causes() {
+    assert_eq!(
+        Refusal::TailCheckDue.to_string(),
+        "the source tail check is overdue"
+    );
+    let reject = Reject::Identity(IdentityError::WrongScope);
+    assert_eq!(reject.to_string(), "invalid cursor or proof identity");
+    assert_eq!(
+        std::error::Error::source(&reject).map(ToString::to_string),
+        Some("the cursor belongs to a different stream or partition".to_owned())
+    );
+    let reject = Reject::Subscription(SubscriptionError::Bounds);
+    assert!(std::error::Error::source(&reject).is_some());
+    assert!(std::error::Error::source(&Reject::Stage).is_none());
 }
 
 #[test]

@@ -17,9 +17,9 @@ use groupnet_testkit::cluster::{MemCluster, eventually};
 
 fn policy() -> BootstrapConfig {
     BootstrapConfig {
-        max_members: 2,
-        max_member_bytes: 16,
-        max_scope_bytes: 64,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+        max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
         settle_ms: 20,
         renew_ms: 100,
         claim_ttl_ms: 3_000,
@@ -88,9 +88,7 @@ fn presence(node: groupnet_core::NodeId, boot: u128, session: u64) -> BootstrapP
 /// presence while the survivor still holds the previous life's unexpired one.
 #[tokio::test]
 async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_presence() {
-    let opts = groupnet_testkit::cluster::NodeOpts::new("g")
-        .gossip_interval_ms(10)
-        .anti_entropy_interval_ms(25);
+    let opts = groupnet_testkit::cluster::NodeOpts::new("g").gossip_interval_ms(25);
     let net = groupnet_transport_mem::Network::new();
     let (_a_id, _a_node, a_group) =
         groupnet_testkit::cluster::spawn_mem_node(&net, "re-a", &["re-b"], &opts).await;

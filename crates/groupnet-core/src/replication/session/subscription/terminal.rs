@@ -38,11 +38,13 @@ impl SessionEngine {
                 IdentityError::WrongScope,
             )));
         }
-        if !limits.valid()
-            || key.subscriber.name.is_empty()
-            || key.subscriber.name.len() > limits.max_subscriber_bytes
+        if let Err(error) = limits.validate() {
+            return Step::reject(Reject::Subscription(SubscriptionError::Limits(error)));
+        }
+        if key.subscriber.name.is_empty()
+            || key.subscriber.name.len() > limits.max_subscriber_bytes.get()
             || request_id.is_empty()
-            || request_id.len() > limits.max_request_bytes
+            || request_id.len() > limits.max_request_bytes.get()
         {
             return Step::reject(Reject::Subscription(SubscriptionError::Bounds));
         }
@@ -96,7 +98,7 @@ impl SessionEngine {
             return Step::reject(Reject::Subscription(SubscriptionError::HistoryUnavailable));
         };
         if let Err(error) =
-            state.validate_terminal_target(key, self.config.max_cursor_bytes, progress.limits)
+            state.validate_terminal_target(key, self.config.max_cursor_bytes.get(), progress.limits)
         {
             if error == SubscriptionError::HistoryUnavailable {
                 self.state.stage = Stage::IrrecoverableGap;
@@ -112,7 +114,7 @@ impl SessionEngine {
             request_id: terminal.request_id.clone(),
             reason: TerminalReason::Unsubscribed,
         };
-        if let Err(error) = request.validate(self.config.max_cursor_bytes, progress.limits) {
+        if let Err(error) = request.validate(self.config.max_cursor_bytes.get(), progress.limits) {
             return Step::reject(Reject::Subscription(error));
         }
         if let Some(progress) = self.subscription.as_mut() {
@@ -169,7 +171,7 @@ impl SessionEngine {
         }
         if progress.terminal.is_some()
             || request_id.is_empty()
-            || request_id.len() > progress.limits.max_request_bytes
+            || request_id.len() > progress.limits.max_request_bytes.get()
         {
             return Step::reject(Reject::Subscription(SubscriptionError::Bounds));
         }
@@ -242,7 +244,7 @@ impl SessionEngine {
                 reason: TerminalReason::Unsubscribed,
             }
         };
-        if let Err(error) = request.validate(self.config.max_cursor_bytes, progress.limits) {
+        if let Err(error) = request.validate(self.config.max_cursor_bytes.get(), progress.limits) {
             return Step::reject(Reject::Subscription(error));
         }
         let total_due = terminal.due;
@@ -349,7 +351,7 @@ impl SessionEngine {
         let Some(retries) = self.retries.checked_add(1) else {
             return Some(self.expire_subscriber_terminal());
         };
-        if retries > self.config.max_retries
+        if retries > self.config.max_retries.get()
             || self.terminal_due().is_some_and(|due| due <= self.now)
         {
             return Some(self.expire_subscriber_terminal());

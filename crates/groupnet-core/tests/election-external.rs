@@ -66,7 +66,8 @@ impl Run {
     /// captured, so nothing this engine has ever emitted escapes the purity
     /// assertion.
     fn new(id: &NodeId, peers: &[NodeId], config: Config) -> Self {
-        let mut engine = GroupEngine::new(GroupId::new(TEST_GROUP), id.clone(), [], config);
+        let mut engine = GroupEngine::new(GroupId::new(TEST_GROUP), id.clone(), [], config)
+            .expect("valid config");
         let mut all = Vec::new();
         if let Some(from) = peers.first() {
             let digest = peers

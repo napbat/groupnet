@@ -67,8 +67,9 @@ impl Harness {
         let (mut nodes, mut lags) = (BTreeMap::new(), BTreeMap::new());
         for id in &all {
             let seeds: Vec<NodeId> = all.iter().filter(|x| *x != id).cloned().collect();
-            let engine = GroupEngine::new(group.clone(), id.clone(), seeds, cfg(&voters));
-            sim.add(engine);
+            let engine = GroupEngine::new(group.clone(), id.clone(), seeds, cfg(&voters))
+                .expect("valid config");
+            sim.add(engine).expect("distinct node");
             let lag = usize::try_from(rng.below(lag.max(1))).expect("a 0..4 draw");
             lags.insert(id.clone(), lag);
             nodes.insert(id.clone(), Node::new(id, lag, Watermarks::new()));
@@ -120,7 +121,10 @@ impl Harness {
     fn follow(&mut self) {
         let tag = self.tag;
         for id in self.live_ids() {
-            let view = self.sim.entries_snapshot(&id);
+            let view = self
+                .sim
+                .entries_snapshot(&id)
+                .expect("live node is in the simulation");
             let lead = self.advance_watch(&id);
             self.check_readings(&id, &view);
             let mut advances: Vec<Advance> = Vec::new();
@@ -187,13 +191,18 @@ impl Harness {
         let node = &self.nodes[id];
         let encoded = encode_ledger(node.stamp, &node.applied);
         self.store.insert(id.clone(), node.applied.clone());
-        self.sim.command(id, set(&self.ledger_key, encoded));
+        self.sim
+            .command(id, set(&self.ledger_key, encoded))
+            .expect("live node");
     }
 
     /// The view both rules are handed, from `observer`'s **own** engine: the
     /// whole roster, silent voters included as `reading: None`.
     fn roster_view(&self, observer: &NodeId) -> Vec<LedgerView> {
-        let entries = self.sim.entries_snapshot(observer);
+        let entries = self
+            .sim
+            .entries_snapshot(observer)
+            .expect("observer is in the simulation");
         let read = |m: &NodeId| decode_ledger(entries.get(m)?.get(&self.ledger_key)?);
         let alive = |m: &NodeId| self.sim.status_of(observer, m) == Some(Status::Alive);
         let view = |member: &NodeId| LedgerView {
@@ -413,7 +422,9 @@ impl Harness {
             let fenced = false;
             node.inflight.push(InFlight { token, fenced });
         }
-        self.sim.command(id, set(&self.feed_key, life.encode()));
+        self.sim
+            .command(id, set(&self.feed_key, life.encode()))
+            .expect("live node");
         self.publish_ledger(id);
     }
 
@@ -429,7 +440,7 @@ impl Harness {
     }
 
     fn kill(&mut self, victim: &NodeId) {
-        self.sim.crash(victim);
+        self.sim.crash(victim).expect("live node");
         self.nodes.remove(victim);
     }
 
@@ -443,8 +454,9 @@ impl Harness {
         };
         let seeds: Vec<NodeId> = self.all.iter().filter(|x| *x != id).cloned().collect();
         let (group, cfg) = (self.group.clone(), cfg(&self.voters));
-        let engine = GroupEngine::with_recovered(group, id.clone(), seeds, cfg, recovered);
-        self.sim.add(engine);
+        let engine = GroupEngine::with_recovered(group, id.clone(), seeds, cfg, recovered)
+            .expect("valid config");
+        self.sim.add(engine).expect("distinct node");
         let applied = self.store.get(id).cloned().unwrap_or_default();
         self.reborn.insert(id.clone());
         self.seen.retain(|(observer, _), _| observer != id);
@@ -494,7 +506,9 @@ impl Harness {
             _ => {
                 let node = pick(&live, rng);
                 let churn = format!("v{}", self.now).into_bytes();
-                self.sim.command(&node, set("kv", churn));
+                self.sim
+                    .command(&node, set("kv", churn))
+                    .expect("live node");
             }
         }
     }

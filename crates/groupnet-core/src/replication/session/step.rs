@@ -190,7 +190,7 @@ impl SessionEngine {
                 ) {
                     return Step::reject(Reject::Stage);
                 }
-                if let Err(e) = cursor.validate(&self.scope, self.config.max_cursor_bytes) {
+                if let Err(e) = cursor.validate(&self.scope, self.config.max_cursor_bytes.get()) {
                     return Step::reject(Reject::Identity(e));
                 }
                 if self
@@ -247,7 +247,7 @@ impl SessionEngine {
                 if !self.matches(op, Stage::CheckingTail) {
                     return Step::reject(Reject::StaleOperation);
                 }
-                if let Err(e) = proof.validate(&self.scope, self.config.max_cursor_bytes) {
+                if let Err(e) = proof.validate(&self.scope, self.config.max_cursor_bytes.get()) {
                     return Step::reject(Reject::Identity(e));
                 }
                 let Some(materialized) = self.state.materialized.as_ref() else {
@@ -373,21 +373,21 @@ impl SessionEngine {
                     || batch.coverage.proof != proof.id
                     || batch.coverage.through.history != proof.head.history
                     || batch.coverage.certificate.is_empty()
-                    || batch.coverage.certificate.len() > self.config.max_cursor_bytes
+                    || batch.coverage.certificate.len() > self.config.max_cursor_bytes.get()
                 {
                     return Step::reject(Reject::Discontinuity);
                 }
                 if let Err(e) = batch
                     .coverage
                     .through
-                    .validate(&self.scope, self.config.max_cursor_bytes)
+                    .validate(&self.scope, self.config.max_cursor_bytes.get())
                 {
                     return Step::reject(Reject::Identity(e));
                 }
                 if batch.events == 0
-                    || batch.events > self.config.max_batch_events
+                    || batch.events > self.config.max_batch_events.get()
                     || batch.bytes == 0
-                    || batch.bytes > self.config.max_batch_bytes
+                    || batch.bytes > self.config.max_batch_bytes.get()
                 {
                     return Step::reject(Reject::Backpressure);
                 }
@@ -532,7 +532,7 @@ impl SessionEngine {
                     RetryTarget::Tail
                 };
                 self.retries = self.retries.saturating_add(1);
-                if self.retries >= self.config.max_retries {
+                if self.retries >= self.config.max_retries.get() {
                     self.state.stage = Stage::RetryExhausted;
                     self.retry_due = None;
                     return Step::ok(effects);

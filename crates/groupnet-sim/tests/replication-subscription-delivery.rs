@@ -86,10 +86,10 @@ fn registered(session: u64, ordinal: u64, sink_at: u8) -> (SessionEngine, Regist
         start: cursor(1),
         policy: RetentionPolicy {
             fingerprint: vec![7],
-            max_bytes: 1024,
-            max_events: 100,
+            max_bytes: std::num::NonZeroU64::new(1024).unwrap(),
+            max_events: std::num::NonZeroU64::new(100).unwrap(),
             max_age_ms: 1000,
-            max_lag_events: 100,
+            max_lag_events: std::num::NonZeroU64::new(100).unwrap(),
         },
         request_id: session.to_le_bytes().to_vec(),
         expected_prior_ordinal: None,

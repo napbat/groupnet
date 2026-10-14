@@ -62,7 +62,7 @@ fn seeded_delayed_load_install_and_cancel_never_publish_stale_checkpoint() {
             Config {
                 retry_ms: 5,
                 attempt_timeout_ms: 10,
-                max_retries: 3,
+                max_retries: std::num::NonZeroU32::new(3).unwrap(),
                 ..Config::default()
             },
             seed + 1,

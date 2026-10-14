@@ -1,5 +1,8 @@
 //! Optional source-check backoff. A poll schedule never extends proof freshness.
 
+use std::fmt;
+use std::num::NonZeroU32;
+
 use super::Scope;
 
 /// Finite idle source-check policy; the independent read freshness cadence
@@ -7,18 +10,56 @@ use super::Scope;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdlePolicy {
     /// Consecutive source-certified unchanged checks before backoff starts.
-    pub unchanged_checks: u32,
-    /// Maximum interval between idle source checks in logical milliseconds.
+    pub unchanged_checks: NonZeroU32,
+    /// Maximum interval between idle source checks in logical milliseconds;
+    /// nonzero and at least the session's `tail_check_ms`.
     pub max_interval_ms: u64,
-    /// Maximum deterministic positive jitter, capped by `max_interval_ms`.
+    /// Maximum deterministic positive jitter, at most `max_interval_ms`.
     pub jitter_ms: u64,
 }
 
+/// Invalid [`IdlePolicy`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdlePolicyError {
+    /// [`IdlePolicy::max_interval_ms`] is zero.
+    ZeroMaxInterval,
+    /// [`IdlePolicy::max_interval_ms`] is below the session's `tail_check_ms`.
+    MaxIntervalBelowTailCheck,
+    /// [`IdlePolicy::jitter_ms`] exceeds [`IdlePolicy::max_interval_ms`].
+    JitterExceedsMaxInterval,
+}
+
+impl fmt::Display for IdlePolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroMaxInterval => "idle max_interval_ms must be nonzero",
+            Self::MaxIntervalBelowTailCheck => {
+                "idle max_interval_ms must be at least the session tail_check_ms"
+            }
+            Self::JitterExceedsMaxInterval => "idle jitter_ms must not exceed max_interval_ms",
+        })
+    }
+}
+
+impl std::error::Error for IdlePolicyError {}
+
 impl IdlePolicy {
-    pub(super) fn valid(self, base_ms: u64) -> bool {
-        self.unchanged_checks > 0
-            && self.max_interval_ms >= base_ms
-            && self.jitter_ms <= self.max_interval_ms
+    /// Checks the policy against the owning session's base `tail_check_ms`
+    /// cadence, which backoff never undercuts.
+    ///
+    /// # Errors
+    /// Returns the [`IdlePolicyError`] variant naming the first violated rule.
+    pub fn validate(&self, tail_check_ms: u64) -> Result<(), IdlePolicyError> {
+        if self.max_interval_ms == 0 {
+            return Err(IdlePolicyError::ZeroMaxInterval);
+        }
+        if self.max_interval_ms < tail_check_ms {
+            return Err(IdlePolicyError::MaxIntervalBelowTailCheck);
+        }
+        if self.jitter_ms > self.max_interval_ms {
+            return Err(IdlePolicyError::JitterExceedsMaxInterval);
+        }
+        Ok(())
     }
 }
 
@@ -58,10 +99,10 @@ impl IdleState {
         } else {
             self.reset();
         }
-        if self.unchanged < policy.unchanged_checks {
+        if self.unchanged < policy.unchanged_checks.get() {
             return Some(base_ms);
         }
-        let shifts = self.unchanged - policy.unchanged_checks + 1;
+        let shifts = self.unchanged - policy.unchanged_checks.get() + 1;
         let interval = if shifts >= 63 {
             u64::MAX
         } else {
@@ -118,7 +159,7 @@ mod tests {
     #[test]
     fn deterministic_bounded_interval_and_reset() {
         let policy = IdlePolicy {
-            unchanged_checks: 2,
+            unchanged_checks: NonZeroU32::new(2).unwrap(),
             max_interval_ms: 80,
             jitter_ms: 4,
         };
@@ -140,7 +181,7 @@ mod tests {
     #[test]
     fn counter_exhaustion_fails_closed() {
         let policy = IdlePolicy {
-            unchanged_checks: 1,
+            unchanged_checks: NonZeroU32::MIN,
             max_interval_ms: 80,
             jitter_ms: 0,
         };
@@ -164,7 +205,7 @@ mod tests {
     #[test]
     fn replay_forces_one_hot_source_check_before_idle_count_resumes() {
         let policy = IdlePolicy {
-            unchanged_checks: 1,
+            unchanged_checks: NonZeroU32::MIN,
             max_interval_ms: 80,
             jitter_ms: 0,
         };
@@ -181,6 +222,42 @@ mod tests {
         assert_eq!(
             state.checked_interval(true, Some(policy), 10, &scope(), 1),
             Some(20)
+        );
+    }
+
+    #[test]
+    fn validate_names_each_violated_rule() {
+        let policy = IdlePolicy {
+            unchanged_checks: NonZeroU32::MIN,
+            max_interval_ms: 80,
+            jitter_ms: 4,
+        };
+        assert_eq!(policy.validate(10), Ok(()));
+        assert_eq!(policy.validate(80), Ok(()));
+        assert_eq!(
+            IdlePolicy {
+                max_interval_ms: 0,
+                jitter_ms: 0,
+                ..policy
+            }
+            .validate(0),
+            Err(IdlePolicyError::ZeroMaxInterval)
+        );
+        assert_eq!(
+            policy.validate(81),
+            Err(IdlePolicyError::MaxIntervalBelowTailCheck)
+        );
+        assert_eq!(
+            IdlePolicy {
+                jitter_ms: 81,
+                ..policy
+            }
+            .validate(10),
+            Err(IdlePolicyError::JitterExceedsMaxInterval)
+        );
+        assert_eq!(
+            IdlePolicyError::JitterExceedsMaxInterval.to_string(),
+            "idle jitter_ms must not exceed max_interval_ms"
         );
     }
 }

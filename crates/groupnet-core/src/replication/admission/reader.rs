@@ -22,8 +22,11 @@ pub struct AdmissionAppend {
 /// A rejected reader transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReaderError {
-    /// Invalid policy, identity, or finite bound.
-    Policy,
+    /// The fleet [`AdmissionPolicy`] is invalid.
+    Policy(PolicyError),
+    /// Reader name, scope, session, or admission incarnation is empty,
+    /// zero, oversized, or reused.
+    Identity,
     /// Another admission append or catch-up is in flight.
     Busy,
     /// Delayed or previous-process response.
@@ -32,6 +35,28 @@ pub enum ReaderError {
     Proof,
     /// Clock, token, or deadline exhausted.
     Exhausted,
+}
+
+impl std::fmt::Display for ReaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Policy(_) => "invalid admission policy",
+            Self::Identity => "invalid reader identity, scope, session, or incarnation",
+            Self::Busy => "another admission append or catch-up is in flight",
+            Self::Stale => "delayed or previous-process response",
+            Self::Proof => "invalid source proof, history, or projection",
+            Self::Exhausted => "clock, token, or deadline exhausted",
+        })
+    }
+}
+
+impl std::error::Error for ReaderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Policy(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -60,20 +85,21 @@ impl ReaderCore {
     /// responses from a previous process could still arrive.
     ///
     /// # Errors
-    /// Returns an invalid-policy error for empty identities or zero session.
+    /// Returns [`ReaderError::Policy`] for an invalid policy or
+    /// [`ReaderError::Identity`] for empty identities or a zero session.
     pub fn new(
         scope: Scope,
         policy: AdmissionPolicy,
         reader: String,
         session: u64,
     ) -> Result<Self, ReaderError> {
-        policy.validate().map_err(|_| ReaderError::Policy)?;
+        policy.validate().map_err(ReaderError::Policy)?;
         if reader.is_empty()
-            || reader.len() > policy.max_cursor_bytes
+            || reader.len() > policy.max_cursor_bytes.get()
             || session == 0
-            || !valid_scope(&scope, policy.max_cursor_bytes)
+            || !valid_scope(&scope, policy.max_cursor_bytes.get())
         {
-            return Err(ReaderError::Policy);
+            return Err(ReaderError::Identity);
         }
         Ok(Self {
             scope,
@@ -104,7 +130,7 @@ impl ReaderCore {
                 .as_ref()
                 .is_some_and(|active| active.id.incarnation == incarnation)
         {
-            return Err(ReaderError::Policy);
+            return Err(ReaderError::Identity);
         }
         let deadline = Time(
             now.0
@@ -185,10 +211,10 @@ impl ReaderCore {
         let admission = pending.cursor.as_ref().ok_or(ReaderError::Proof)?;
         if applied.history != self.policy.history
             || applied
-                .validate(&self.scope, self.policy.max_cursor_bytes)
+                .validate(&self.scope, self.policy.max_cursor_bytes.get())
                 .is_err()
             || proof
-                .validate(&self.scope, self.policy.max_cursor_bytes)
+                .validate(&self.scope, self.policy.max_cursor_bytes.get())
                 .is_err()
             || proof.head.history != self.policy.history
             || !matches!(
@@ -251,7 +277,7 @@ impl ReaderCore {
 }
 
 impl From<PolicyError> for ReaderError {
-    fn from(_: PolicyError) -> Self {
-        Self::Policy
+    fn from(error: PolicyError) -> Self {
+        Self::Policy(error)
     }
 }

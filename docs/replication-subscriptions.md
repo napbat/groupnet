@@ -419,7 +419,11 @@ slow source call cannot hold the whole manager's capacity; its future must
 be cancellation-safe. Certification and each observation also carry their
 own bounded byte/identity limits and consume a finite worker queue slot.
 The manager checks `AckWaitLimits` and request metadata before accepting
-work; no source call may allocate an unbounded roster or proof. A certified
+work; no source call may allocate an unbounded roster or proof. The count and
+byte caps are `NonZeroUsize`; `AckWaitLimits::validate(&self)` names a zero
+wait or poll, a poll longer than the wait, or an identity/certificate cap above
+the metadata cap as a typed `AckWaitLimitsError`, which the core's `AckWait`
+also reports as `AckWaitError::Limits`. A certified
 roster larger than the limit is rejected, not truncated. Pending certification
 occupies the session's **one active wait slot**. Even an empty roster needs
 source certification; the shell cannot infer satisfaction.

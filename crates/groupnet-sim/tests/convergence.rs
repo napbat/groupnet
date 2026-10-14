@@ -22,12 +22,11 @@ fn build_with(
     let mut sim = Simulation::new(latency).with_loss(loss_percent);
     for id in ids {
         let seeds = ids.iter().filter(|x| *x != id).cloned();
-        sim.add(GroupEngine::new(
-            group.clone(),
-            id.clone(),
-            seeds,
-            config.clone(),
-        ));
+        sim.add(
+            GroupEngine::new(group.clone(), id.clone(), seeds, config.clone())
+                .expect("valid config"),
+        )
+        .expect("distinct node");
     }
     sim
 }
@@ -42,7 +41,7 @@ fn three_nodes_agree_on_coordinator() {
 
     assert!(sim.all_agree_on_coordinator(), "nodes did not converge");
     for id in &ids {
-        assert_eq!(sim.member_count(id), 3, "{id} missing members");
+        assert_eq!(sim.member_count(id), Some(3), "{id} missing members");
     }
 }
 
@@ -65,7 +64,7 @@ fn converges_despite_deterministic_loss() {
 
     assert!(sim.all_agree_on_coordinator());
     for id in &ids {
-        assert_eq!(sim.member_count(id), 4);
+        assert_eq!(sim.member_count(id), Some(4));
     }
 }
 
@@ -103,7 +102,8 @@ fn metadata_propagates_and_converges() {
             key: "routing".into(),
             value: "v3".into(),
         },
-    );
+    )
+    .expect("live node");
     sim.run_until(Time(5_000));
 
     for id in &ids {
@@ -131,7 +131,8 @@ fn latest_write_wins_across_nodes() {
             key: "routing".into(),
             value: "v1".into(),
         },
-    );
+    )
+    .expect("live node");
     sim.run_until(Time(2_000));
     sim.command(
         &ids[1],
@@ -139,7 +140,8 @@ fn latest_write_wins_across_nodes() {
             key: "routing".into(),
             value: "v2".into(),
         },
-    );
+    )
+    .expect("live node");
     sim.run_until(Time(6_000));
 
     for id in &ids {
@@ -155,12 +157,16 @@ fn detects_and_removes_a_crashed_node() {
     let mut sim = build(&group, &ids, 10, 0);
     sim.run_until(Time(2_000));
     for id in &ids {
-        assert_eq!(sim.member_count(id), 4, "did not converge before crash");
+        assert_eq!(
+            sim.member_count(id),
+            Some(4),
+            "did not converge before crash"
+        );
     }
 
     // node-d crashes: it stops acking probes and gossiping.
     let dead = ids[3].clone();
-    sim.crash(&dead);
+    sim.crash(&dead).expect("live node");
     sim.run_until(Time(14_000));
 
     // Survivors detect it, mark it Dead, and drop it from the live set.
@@ -170,8 +176,8 @@ fn detects_and_removes_a_crashed_node() {
             Some(Status::Dead),
             "{id} still trusts crashed node"
         );
-        assert!(!sim.is_member(id, &dead));
-        assert_eq!(sim.member_count(id), 3);
+        assert_eq!(sim.is_member(id, &dead), Some(false));
+        assert_eq!(sim.member_count(id), Some(3));
     }
     // The coordinator must be a survivor, and all survivors agree.
     assert!(sim.all_agree_on_coordinator());
@@ -201,7 +207,7 @@ fn indirect_probe_prevents_false_positive_under_partition() {
                 "{observer} wrongly killed {node} despite indirect reachability"
             );
         }
-        assert_eq!(sim.member_count(observer), 3);
+        assert_eq!(sim.member_count(observer), Some(3));
     }
 }
 
@@ -219,7 +225,7 @@ fn dead_tombstones_are_reaped() {
     sim.run_until(Time(2_000));
 
     let dead = ids[3].clone();
-    sim.crash(&dead);
+    sim.crash(&dead).expect("live node");
     // Detected + declared Dead, then gossiped for dead_timeout, then reaped at
     // 2×dead_timeout — with no peer re-teaching it.
     sim.run_until(Time(12_000));
@@ -244,12 +250,12 @@ fn voluntary_leave_removes_node_and_sticks() {
     // node-c leaves gracefully; the leave must disseminate and not be refuted
     // (a grow-set could never express this).
     let gone = ids[2].clone();
-    sim.command(&gone, Command::Leave);
+    sim.command(&gone, Command::Leave).expect("live node");
     sim.run_until(Time(6_000));
 
     for id in &ids[..2] {
         assert_eq!(sim.status_of(id, &gone), Some(Status::Dead));
-        assert_eq!(sim.member_count(id), 2);
+        assert_eq!(sim.member_count(id), Some(2));
     }
 }
 
@@ -266,7 +272,8 @@ fn per_node_state_converges_cluster_wide() {
         sim.command(
             id,
             Command::SetLocalState(format!("weight={i}").into_bytes()),
-        );
+        )
+        .expect("live node");
     }
     sim.run_until(Time(5_000));
 
@@ -290,9 +297,11 @@ fn per_node_state_update_supersedes_cluster_wide() {
     let mut sim = build(&group, &ids, 10, 0);
     sim.run_until(Time(1_000));
 
-    sim.command(&ids[0], Command::SetLocalState(b"ready=false".to_vec()));
+    sim.command(&ids[0], Command::SetLocalState(b"ready=false".to_vec()))
+        .expect("live node");
     sim.run_until(Time(2_000));
-    sim.command(&ids[0], Command::SetLocalState(b"ready=true".to_vec()));
+    sim.command(&ids[0], Command::SetLocalState(b"ready=true".to_vec()))
+        .expect("live node");
     sim.run_until(Time(5_000));
 
     for observer in &ids {

@@ -12,9 +12,9 @@ use groupnet_core::volatile_recovery::{
 use groupnet_sim::SplitMix64;
 
 const CONFIG: RecoveryConfig = RecoveryConfig {
-    max_members: 2,
-    max_member_bytes: 16,
-    max_barrier_rounds: 2,
+    max_members: std::num::NonZeroUsize::new(2).unwrap(),
+    max_member_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+    max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
     total_ms: 40,
     attempt_ms: 8,
     settle_ms: 2,

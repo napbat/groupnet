@@ -67,7 +67,9 @@ sequentially and in exact offset order. It checks nonzero progress, each
 offset, count, size, total, checksum receipt, and final digest; an empty or
 truncated transfer cannot install. The application stage may spool to bounded
 private disk. `max_snapshot_bytes`, `max_chunks`, `max_chunk_bytes`,
-`max_metadata_bytes`, and `max_total_ms` are finite config limits;
+`max_metadata_bytes`, and `max_total_ms` are finite config limits; the four
+count/byte limits are `NonZero*` types, and `SnapshotConfig::validate(&self)`
+rejects a zero `max_total_ms` with `SnapshotConfigError::ZeroMaxTotal`;
 the metadata bound covers combined variable-length fields, with fixed struct
 overhead bounded by one offered image per session;
 `max_chunk_bytes` fits the shared in-flight byte reserve. The adapter reports

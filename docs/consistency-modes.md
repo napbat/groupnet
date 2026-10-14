@@ -347,7 +347,7 @@ protocol refines the sketch above in ways that are now contract:
   reported as a lapse so the reader re-synchronizes after it. Boot guards
   cover a node still learning its group, and both are **enforced in the
   shell** rather than asked of the deployment: for its first
-  `detection_window_ms + 2 × anti_entropy_interval` of participation a reader
+  `detection_window_ms + 2 × gossip_interval_ms` of participation a reader
   cannot reach `Serving` at all (`mark_caught_up` declines and no serve
   deadline is published — without that gate the empty roster a booting node
   holds confirms vacuously, and it can serve under a window no granter gave),
@@ -547,10 +547,10 @@ refine the sketch above and are now contract:
   promise that made it host. Anchoring on the last grant's *arrival* would
   hand the host an overhang past the promises it was built from — exactly
   where a second host fits. **The assumption:** a *renewal* round re-anchors
-  every anti-entropy tick, so a grant answering the previous round can be
+  every gossip round, so a grant answering the previous round can be
   counted into the current one and over-attribute the lease by at most one
-  anti-entropy interval. That is safe precisely while the **claim→grant round
-  trip — ≈2·(latency + jitter) — stays under `anti_entropy_interval_ms`**: the
+  gossip interval. That is safe precisely while the **claim→grant round
+  trip — ≈2·(latency + jitter) — stays under `gossip_interval_ms`**: the
   grant being mis-attributed answered a claim sent one round earlier, so it is a
   round trip, not a one-way hop, that has to fit inside the cadence. A deployment
   that cannot

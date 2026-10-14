@@ -75,6 +75,7 @@
 #![cfg(feature = "leases")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use groupnet_consistency::WriteToken;
@@ -142,21 +143,16 @@ fn cfg() -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: 40,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Eventual,
+        ..Config::default()
     }
 }
 
 /// An engine for `id` bootstrapped against every other node in `peers`.
 fn engine(group: &GroupId, id: &NodeId, peers: &[NodeId]) -> GroupEngine {
     let seeds = peers.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(group.clone(), id.clone(), seeds, cfg())
+    GroupEngine::new(group.clone(), id.clone(), seeds, cfg()).expect("valid config")
 }
 
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
@@ -363,7 +359,7 @@ impl Harness {
         let mut nodes = BTreeMap::new();
         let mut boots = BTreeMap::new();
         for id in &all {
-            sim.add(engine(&group, id, &all));
+            sim.add(engine(&group, id, &all)).expect("distinct node");
             boots.insert(id.clone(), 1);
             let phase = u64::from(rng.below(u32::try_from(RENEW_MS).unwrap_or(u32::MAX)));
             nodes.insert(id.clone(), Node::new(id, 1, 0, phase, resync_lag));
@@ -430,7 +426,10 @@ impl Harness {
     fn publish(&mut self) {
         let now = self.now;
         for id in self.live_ids() {
-            let view = self.sim.entries_snapshot(&id);
+            let view = self
+                .sim
+                .entries_snapshot(&id)
+                .expect("live node is in the simulation");
             let mut visible: Vec<(NodeId, RenewalId)> = Vec::new();
             let mut acks: Vec<(NodeId, WriteToken)> = Vec::new();
             for (peer, entries) in &view {
@@ -495,7 +494,8 @@ impl Harness {
     /// Authors one entry on `node`'s engine.
     fn set(&mut self, node: &NodeId, key: String, value: Vec<u8>, ttl_ms: Option<u64>) {
         self.sim
-            .command(node, Command::SetLocalEntry { key, value, ttl_ms });
+            .command(node, Command::SetLocalEntry { key, value, ttl_ms })
+            .expect("live node");
     }
 
     /// The reader's ingest — roster, then every counted granter's advertised
@@ -504,7 +504,10 @@ impl Harness {
     fn ingest_and_serve(&mut self) {
         let (now, lag, tag) = (self.now, self.resync_lag, self.tag);
         for id in self.live_ids() {
-            let view = self.sim.entries_snapshot(&id);
+            let view = self
+                .sim
+                .entries_snapshot(&id)
+                .expect("live node is in the simulation");
             // Every member this node still knows about — `Suspect` and
             // `Dead`-but-not-reaped included; the core keeps the rest it counted.
             let advertised: BTreeSet<NodeId> = self
@@ -565,7 +568,10 @@ impl Harness {
             let Some(inflight) = self.nodes[&id].inflight else {
                 continue;
             };
-            let view = self.sim.entries_snapshot(&id);
+            let view = self
+                .sim
+                .entries_snapshot(&id)
+                .expect("live node is in the simulation");
             let mut members: BTreeSet<NodeId> = view
                 .iter()
                 .filter(|(holder, entries)| {
@@ -750,7 +756,7 @@ impl Harness {
         match rng.below(slots) {
             0 | 2 if live.len() > 2 => {
                 let victim = pick(&live, rng);
-                self.sim.crash(&victim);
+                self.sim.crash(&victim).expect("live node");
                 self.nodes.remove(&victim);
             }
             1 | 3 if live.len() < self.all.len() => {
@@ -765,7 +771,9 @@ impl Harness {
                 *boot += 1;
                 let boot = *boot;
                 let all = self.all.clone();
-                self.sim.add(engine(&self.group, &node, &all));
+                self.sim
+                    .add(engine(&self.group, &node, &all))
+                    .expect("distinct node");
                 let fresh = Node::new(&node, boot, self.now, self.now, self.resync_lag);
                 self.nodes.insert(node, fresh);
             }

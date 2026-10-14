@@ -65,9 +65,9 @@ fn new_ready_attempt_can_win_but_never_extends_the_first_wait_budget() {
         let mut rng = SplitMix64::new(seed);
         let mut engine = ClaimEngine::new(
             BootstrapConfig {
-                max_members: 2,
-                max_member_bytes: 8,
-                max_scope_bytes: 16,
+                max_members: std::num::NonZeroUsize::new(2).unwrap(),
+                max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                max_scope_bytes: std::num::NonZeroUsize::new(16).unwrap(),
                 settle_ms: 2,
                 renew_ms: 3,
                 claim_ttl_ms: 10,

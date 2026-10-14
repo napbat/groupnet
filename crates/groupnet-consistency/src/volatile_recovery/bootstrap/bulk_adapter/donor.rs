@@ -28,9 +28,10 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
             let config = journal.config();
             config
                 .max_scope_bytes
-                .checked_add(config.max_membership_bytes)
-                .and_then(|bytes| bytes.checked_add(config.max_cut_bytes))
-                .is_some_and(|bytes| bytes <= self.policy.max_metadata_bytes)
+                .get()
+                .checked_add(config.max_membership_bytes.get())
+                .and_then(|bytes| bytes.checked_add(config.max_cut_bytes.get()))
+                .is_some_and(|bytes| bytes <= self.policy.max_metadata_bytes.get())
                 && config.max_batch_bytes <= self.policy.max_batch_bytes
                 && config.max_batch_events <= self.policy.max_batch_events
         });
@@ -39,7 +40,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         }
         match request {
             DonorRequest::Offer { max_metadata_bytes } => {
-                if *max_metadata_bytes != self.policy.max_metadata_bytes {
+                if *max_metadata_bytes != self.policy.max_metadata_bytes.get() {
                     return Err(AdapterError);
                 }
                 let offer = self
@@ -89,7 +90,9 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                         && journal.acknowledged(now, reservation).is_ok()
                 });
                 drop(cursor_charge);
-                if *max_bytes == 0 || *max_bytes > self.policy.max_chunk_bytes || !valid_reservation
+                if *max_bytes == 0
+                    || *max_bytes > self.policy.max_chunk_bytes.get()
+                    || !valid_reservation
                 {
                     return Err(AdapterError);
                 }
@@ -132,7 +135,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 attachment,
                 max_metadata_bytes,
             } => {
-                if *max_metadata_bytes != self.policy.max_metadata_bytes {
+                if *max_metadata_bytes != self.policy.max_metadata_bytes.get() {
                     return Err(AdapterError);
                 }
                 let charge = self.reply_charge(admission)?;
@@ -152,7 +155,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 expected,
                 max_metadata_bytes,
             } => {
-                if *max_metadata_bytes != self.policy.max_metadata_bytes {
+                if *max_metadata_bytes != self.policy.max_metadata_bytes.get() {
                     return Err(AdapterError);
                 }
                 let charge = self.reply_charge(admission)?;
@@ -169,8 +172,8 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 max_bytes,
                 max_events,
             } => {
-                if *max_bytes != self.policy.max_batch_bytes
-                    || *max_events != self.policy.max_batch_events
+                if *max_bytes != self.policy.max_batch_bytes.get()
+                    || *max_events != self.policy.max_batch_events.get()
                 {
                     return Err(AdapterError);
                 }

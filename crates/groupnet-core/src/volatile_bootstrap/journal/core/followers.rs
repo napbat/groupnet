@@ -41,11 +41,16 @@ impl DonorJournal {
             return Err(JournalError::Stale);
         }
         if follower.node.as_str().is_empty()
-            || follower.node.as_str().len() > self.config.max_follower_id_bytes
+            || follower.node.as_str().len() > self.config.max_follower_id_bytes.get()
             || follower.incarnation.0 == 0
             || follower.session == 0
             || follower.attempt == 0
-            || self.followers.len() >= self.config.max_followers.saturating_sub(self.aborted.len())
+            || self.followers.len()
+                >= self
+                    .config
+                    .max_followers
+                    .get()
+                    .saturating_sub(self.aborted.len())
         {
             return Err(JournalError::Capacity);
         }
@@ -312,7 +317,9 @@ impl DonorJournal {
             let next_bytes = bytes
                 .checked_add(event_bytes)
                 .ok_or(JournalError::Capacity)?;
-            if count >= self.config.max_batch_events || next_bytes > self.config.max_batch_bytes {
+            if count >= self.config.max_batch_events.get()
+                || next_bytes > self.config.max_batch_bytes.get()
+            {
                 break;
             }
             bytes = next_bytes;
@@ -323,7 +330,7 @@ impl DonorJournal {
             .inflight_bytes
             .checked_add(bytes)
             .ok_or(JournalError::Capacity)?;
-        if count == 0 || new_inflight > self.config.max_inflight_bytes {
+        if count == 0 || new_inflight > self.config.max_inflight_bytes.get() {
             return Err(JournalError::Capacity);
         }
         let operation = self.operation_token()?;

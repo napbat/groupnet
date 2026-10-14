@@ -33,8 +33,8 @@ fn policy() -> AdmissionPolicy {
         rate_numerator: 11,
         rate_denominator: 10,
         clock_margin_ms: 1,
-        max_waiters: 8,
-        max_cursor_bytes: 64,
+        max_waiters: std::num::NonZeroUsize::new(8).unwrap(),
+        max_cursor_bytes: std::num::NonZeroUsize::new(64).unwrap(),
     }
 }
 

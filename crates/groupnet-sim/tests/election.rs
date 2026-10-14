@@ -12,6 +12,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::{
     Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
@@ -48,19 +49,14 @@ fn cfg() -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_INTERVAL_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::Settle {
                 claim_settle_ms: CLAIM_SETTLE_MS,
             },
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
@@ -69,7 +65,7 @@ fn cfg() -> Config {
 /// engine keeps offering digests to its seeds even once it has buried them.
 fn engine(group: &GroupId, id: &NodeId, peers: &BTreeSet<NodeId>) -> GroupEngine {
     let seeds = peers.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(group.clone(), id.clone(), seeds, cfg())
+    GroupEngine::new(group.clone(), id.clone(), seeds, cfg()).expect("valid config")
 }
 
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
@@ -213,7 +209,7 @@ fn settle_chaos(seed: u64) {
 
     let mut alive: BTreeSet<NodeId> = all.iter().cloned().collect();
     for id in &all {
-        sim.add(engine(&group, id, &alive));
+        sim.add(engine(&group, id, &alive)).expect("distinct node");
     }
 
     let mut beliefs = Beliefs::default();
@@ -352,7 +348,8 @@ fn assert_one_fenced_host(
     // survivor agreeing who is in the group.
     for node in alive {
         assert_eq!(
-            sim.members_of(node),
+            sim.members_of(node)
+                .expect("alive node is in the simulation"),
             *alive,
             "E1 seed {seed}: {node} did not converge on the live set"
         );
@@ -408,7 +405,7 @@ fn inject_fault(
     match rng.below(8) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
-            sim.crash(&victim);
+            sim.crash(&victim).expect("live node");
             alive.remove(&victim);
         }
         1 if alive.len() < all.len() => {
@@ -421,7 +418,7 @@ fn inject_fault(
                 .collect();
             let node = pick(&down, rng);
             alive.insert(node.clone());
-            sim.add(engine(group, &node, alive));
+            sim.add(engine(group, &node, alive)).expect("distinct node");
             return Some(node);
         }
         2 if alive.len() > 1 => {
@@ -442,7 +439,8 @@ fn inject_fault(
                     value: format!("v{now}").into_bytes(),
                     ttl_ms: None,
                 },
-            );
+            )
+            .expect("live node");
         }
         _ => {
             let node = pick(alive, rng);
@@ -452,7 +450,8 @@ fn inject_fault(
                     key: "k".into(),
                     value: format!("v{now}"),
                 },
-            );
+            )
+            .expect("live node");
         }
     }
     None

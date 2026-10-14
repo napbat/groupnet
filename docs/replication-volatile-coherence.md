@@ -198,7 +198,9 @@ external recovery signal.
 ### Policy and safety
 
 An opt-in `RecoveryRearm` has nonzero `initial_ms` and `max_ms`, with
-`initial_ms <= max_ms`. One full attempt continues to use its original
+`initial_ms <= max_ms`; `RecoveryRearm::validate(&self)` reports a violation
+as `RecoveryRearmError::{ZeroInitial, MaxBelowInitial}`. One full attempt
+continues to use its original
 `RecoveryConfig.total_ms` and per-operation deadlines. At `OriginOnly`, the
 sans-IO engine clears the old operation and schedules a rearm at a checked
 logical deadline. The first exhausted turn waits `initial_ms`; each later
@@ -239,7 +241,8 @@ bucket free of control objects, and ordinary read fallbacks intact.
 ### API and execution boundary
 
 `RecoveryEngine::with_rearm(policy)` validates the policy before the first
-event. A coalesced `StartWithLapses` event preserves an explicit restart and
+event and returns `RecoveryError::Rearm(_)` for an invalid one.
+A coalesced `StartWithLapses` event preserves an explicit restart and
 its highest observed lapse counter in one full recovery generation.
 `RecoveryHandle::open_with_rearm` performs the matching platform
 deadline check before spawning its worker. Existing constructors remain

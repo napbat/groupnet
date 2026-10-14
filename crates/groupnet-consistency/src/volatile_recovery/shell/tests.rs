@@ -66,9 +66,9 @@ impl RecoveryAdapter for Adapter {
 
 fn shared() -> Arc<Shared<Adapter>> {
     let config = RecoveryConfig {
-        max_members: 2,
-        max_member_bytes: 8,
-        max_barrier_rounds: 2,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
         total_ms: 100,
         attempt_ms: 20,
         settle_ms: 1,
@@ -261,9 +261,9 @@ fn close_gate_counter_exhaustion_terminally_rejects_old_work() {
 fn open_without_executor_returns_typed_error() {
     let adapter = Arc::new(Adapter::default());
     let config = RecoveryConfig {
-        max_members: 2,
-        max_member_bytes: 8,
-        max_barrier_rounds: 2,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
         total_ms: 100,
         attempt_ms: 20,
         settle_ms: 1,
@@ -286,9 +286,9 @@ fn open_without_executor_returns_typed_error() {
 fn affirmation_expiring_during_callback_never_opens_gate() {
     let shared = shared();
     let config = RecoveryConfig {
-        max_members: 2,
-        max_member_bytes: 8,
-        max_barrier_rounds: 2,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
         total_ms: 100,
         attempt_ms: 20,
         settle_ms: 1,
@@ -372,9 +372,9 @@ fn coalesced_restart_precedes_gap_and_retains_its_lapse_counter() {
 fn no_op_signal_retains_a_newly_due_rearm_invalidation() {
     let mut engine = RecoveryEngine::new(
         RecoveryConfig {
-            max_members: 2,
-            max_member_bytes: 8,
-            max_barrier_rounds: 2,
+            max_members: std::num::NonZeroUsize::new(2).unwrap(),
+            max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+            max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
             total_ms: 20,
             attempt_ms: 5,
             settle_ms: 1,
@@ -415,9 +415,9 @@ fn unrepresentable_later_deadline_terminally_closes_worker() {
 #[tokio::test]
 async fn cancel_or_last_drop_during_cooldown_prevents_another_origin_attempt() {
     let config = RecoveryConfig {
-        max_members: 2,
-        max_member_bytes: 8,
-        max_barrier_rounds: 2,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
         total_ms: 30,
         attempt_ms: 10,
         settle_ms: 1,
@@ -467,9 +467,9 @@ async fn optional_rearm_recovers_after_a_long_origin_outage_without_a_restart_si
     let adapter = Arc::new(Adapter::default());
     adapter.fail_origin.store(true, Ordering::SeqCst);
     let config = RecoveryConfig {
-        max_members: 2,
-        max_member_bytes: 8,
-        max_barrier_rounds: 2,
+        max_members: std::num::NonZeroUsize::new(2).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
         total_ms: 80,
         attempt_ms: 15,
         settle_ms: 1,

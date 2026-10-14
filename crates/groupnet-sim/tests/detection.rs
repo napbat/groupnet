@@ -19,6 +19,7 @@
 //! A failing seed is a reproducible counterexample, not a flake.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Status, Time};
 use groupnet_sim::{Simulation, SplitMix64};
@@ -43,14 +44,9 @@ fn cfg() -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 5_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: 60,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Eventual,
+        ..Config::default()
     }
 }
 
@@ -65,7 +61,7 @@ fn chaos_cfg() -> Config {
 
 fn engine(group: &GroupId, id: &NodeId, peers: &BTreeSet<NodeId>, config: Config) -> GroupEngine {
     let seeds = peers.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(group.clone(), id.clone(), seeds, config)
+    GroupEngine::new(group.clone(), id.clone(), seeds, config).expect("valid config")
 }
 
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
@@ -194,7 +190,8 @@ fn detection_within_window(config: &Config, link: &Link, salt: u64, victims: u32
         let mut sim = Simulation::new(link.base + u64::from(rng.below(link.spread)));
         sim.set_jitter(u64::from(rng.below(link.jitter + 1)));
         for id in &ids {
-            sim.add(engine(&group, id, &all, config.clone()));
+            sim.add(engine(&group, id, &all, config.clone()))
+                .expect("distinct node");
         }
 
         // Converge first: the window bounds *detection*, not bootstrap. The
@@ -207,7 +204,9 @@ fn detection_within_window(config: &Config, link: &Link, salt: u64, victims: u32
         sim.run_until(Time(crash_at));
         for id in &ids {
             assert_eq!(
-                sim.members_of(id).len(),
+                sim.members_of(id)
+                    .expect("observer is in the simulation")
+                    .len(),
                 ids.len(),
                 "seed {seed}: {id} had not converged before the crash"
             );
@@ -223,7 +222,7 @@ fn detection_within_window(config: &Config, link: &Link, salt: u64, victims: u32
             doomed.insert(victim);
         }
         for victim in &doomed {
-            sim.crash(victim);
+            sim.crash(victim).expect("live node");
         }
 
         let window = config.detection_window_ms(ids.len());
@@ -290,7 +289,8 @@ fn run_since_scenario(seed: u64) {
 
     let mut alive: BTreeSet<NodeId> = all.clone();
     for id in &ids {
-        sim.add(engine(&group, id, &alive, chaos_cfg()));
+        sim.add(engine(&group, id, &alive, chaos_cfg()))
+            .expect("distinct node");
     }
 
     let mut history: Observed = BTreeMap::new();
@@ -382,7 +382,7 @@ fn inject_fault(
     match rng.below(8) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
-            sim.crash(&victim);
+            sim.crash(&victim).expect("live node");
             alive.remove(&victim);
         }
         1 if alive.len() < ids.len() => {
@@ -393,7 +393,8 @@ fn inject_fault(
                 .collect();
             let node = pick(&down, rng);
             alive.insert(node.clone());
-            sim.add(engine(group, &node, alive, chaos_cfg()));
+            sim.add(engine(group, &node, alive, chaos_cfg()))
+                .expect("distinct node");
             return Some(node);
         }
         2 if alive.len() > 1 => {
@@ -410,7 +411,8 @@ fn inject_fault(
             sim.command(
                 &node,
                 Command::SetLocalState(format!("s{now}").into_bytes()),
-            );
+            )
+            .expect("live node");
         }
         5 => {
             let node = pick(alive, rng);
@@ -421,7 +423,8 @@ fn inject_fault(
                     value: format!("v{now}").into_bytes(),
                     ttl_ms: None,
                 },
-            );
+            )
+            .expect("live node");
         }
         _ => {
             let node = pick(alive, rng);
@@ -431,7 +434,8 @@ fn inject_fault(
                     key: "k".into(),
                     value: format!("v{now}"),
                 },
-            );
+            )
+            .expect("live node");
         }
     }
     None

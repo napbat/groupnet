@@ -45,7 +45,7 @@ impl SessionEngine {
         if !self.matches(op, Stage::CheckingSubscriberTail) {
             return Step::reject(Reject::StaleOperation);
         }
-        if let Err(error) = proof.validate(&self.scope, self.config.max_cursor_bytes) {
+        if let Err(error) = proof.validate(&self.scope, self.config.max_cursor_bytes.get()) {
             return Step::reject(Reject::Identity(error));
         }
         let Some(progress) = self.subscription.as_ref() else {
@@ -117,8 +117,8 @@ impl SessionEngine {
                 op,
                 registration: Box::new(registration),
                 from,
-                max_events: self.config.max_batch_events,
-                max_bytes: self.config.max_batch_bytes,
+                max_events: self.config.max_batch_events.get(),
+                max_bytes: self.config.max_batch_bytes.get(),
             },
             Effect::ArmTimer(self.operation_due.expect("issued deadline")),
         ])
@@ -146,7 +146,7 @@ impl SessionEngine {
         if batch.coverage.from != *from
             || batch.coverage.proof != proof.id
             || batch.coverage.certificate.is_empty()
-            || batch.coverage.certificate.len() > self.config.max_cursor_bytes
+            || batch.coverage.certificate.len() > self.config.max_cursor_bytes.get()
             || batch.coverage.through.history != registration.epoch.history
         {
             return Step::reject(Reject::Discontinuity);
@@ -154,14 +154,14 @@ impl SessionEngine {
         if let Err(error) = batch
             .coverage
             .through
-            .validate(&self.scope, self.config.max_cursor_bytes)
+            .validate(&self.scope, self.config.max_cursor_bytes.get())
         {
             return Step::reject(Reject::Identity(error));
         }
         if batch.events == 0
-            || batch.events > self.config.max_batch_events
+            || batch.events > self.config.max_batch_events.get()
             || batch.bytes == 0
-            || batch.bytes > self.config.max_batch_bytes
+            || batch.bytes > self.config.max_batch_bytes.get()
         {
             return Step::reject(Reject::Backpressure);
         }
@@ -225,7 +225,7 @@ impl SessionEngine {
             registration,
             &sink.cursor,
             batch,
-            self.config.max_cursor_bytes,
+            self.config.max_cursor_bytes.get(),
             progress.limits,
         ) {
             return Step::reject(Reject::Subscription(error));
@@ -361,7 +361,7 @@ impl SessionEngine {
             self.operation_due = None;
             return Some(Step::reject(Reject::Exhausted));
         };
-        if retries > self.config.max_retries {
+        if retries > self.config.max_retries.get() {
             self.state.stage = Stage::RetryExhausted;
             self.outstanding = None;
             self.operation_due = None;

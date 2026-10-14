@@ -1,5 +1,7 @@
 //! Deterministic private checkpoint bootstrap transition tests.
 
+use std::num::{NonZeroU32, NonZeroUsize};
+
 use super::{
     ApplyReceipt, BoundComparison, Comparison, Config, ConfigError, Cursor, Effect, Event,
     IdentityError, Mode, Operation, ProofId, ReadDecision, Refusal, Reject, Scope, SessionEngine,
@@ -36,7 +38,7 @@ fn engine() -> SessionEngine {
         Config {
             retry_ms: 5,
             attempt_timeout_ms: 10,
-            max_retries: 3,
+            max_retries: NonZeroU32::new(3).unwrap(),
             ..Config::default()
         },
         72,
@@ -59,7 +61,7 @@ fn constructor_rejects_empty_and_oversized_scope_before_emitting_work() {
             oversized,
             Mode::StateSync,
             Config {
-                max_cursor_bytes: 16,
+                max_cursor_bytes: NonZeroUsize::new(16).unwrap(),
                 ..Config::default()
             },
             1

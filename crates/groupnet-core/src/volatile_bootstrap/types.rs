@@ -1,6 +1,9 @@
 //! Bounded, non-authoritative claim decisions for peer index bootstrap.
 
-use super::transfer::{TransferEffect, TransferError, TransferEvent};
+use std::fmt;
+use std::num::NonZeroUsize;
+
+use super::transfer::{TransferConfigError, TransferEffect, TransferError, TransferEvent};
 use crate::{NodeId, Status, Time};
 
 /// Stable application scope for one index image and origin builder.
@@ -21,53 +24,117 @@ impl BootstrapScope {
 }
 
 /// Fixed resource and logical-time limits for one scope.
+///
+/// Roster and byte caps are nonzero by type; [`BootstrapConfig::validate`]
+/// checks the millisecond timers and their relations to `total_ms`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootstrapConfig {
-    /// Maximum complete member/claim roster entries.
-    pub max_members: usize,
+    /// Maximum complete member/claim roster entries; below `usize::MAX`.
+    pub max_members: NonZeroUsize,
     /// Maximum UTF-8 bytes in one member ID.
-    pub max_member_bytes: usize,
+    pub max_member_bytes: NonZeroUsize,
     /// Maximum combined UTF-8 bytes in the scope names.
-    pub max_scope_bytes: usize,
-    /// Time allowed for claims to converge before selecting a builder.
+    pub max_scope_bytes: NonZeroUsize,
+    /// Time allowed for claims to converge before selecting a builder;
+    /// nonzero and below `total_ms`.
     pub settle_ms: u64,
-    /// Local cadence for publishing a fresh, monotone renewal sequence.
+    /// Local cadence for publishing a fresh, monotone renewal sequence; nonzero.
     pub renew_ms: u64,
-    /// Native TTL for an advertised claim.
+    /// Native TTL for an advertised claim; above `renew_ms`.
     pub claim_ttl_ms: u64,
-    /// Finite observation attempt timeout.
+    /// Finite observation attempt timeout; nonzero and at most `total_ms`.
     pub observe_ms: u64,
     /// Stall bound for a builder: how long its local origin build may run,
     /// and a follower keeps waiting for it, without the build advancing.
+    /// Nonzero and at most `total_ms`.
     pub donor_wait_ms: u64,
     /// Liveness budget for this bootstrap selection episode, restarted each
-    /// time the selected build advances.
+    /// time the selected build advances; nonzero.
     pub total_ms: u64,
 }
+
+/// Invalid [`BootstrapConfig`], naming the violated rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootstrapConfigError {
+    /// [`BootstrapConfig::max_members`] is `usize::MAX`, leaving no room for
+    /// checked roster arithmetic.
+    UnboundedMaxMembers,
+    /// [`BootstrapConfig::settle_ms`] is zero.
+    ZeroSettle,
+    /// [`BootstrapConfig::renew_ms`] is zero.
+    ZeroRenew,
+    /// [`BootstrapConfig::claim_ttl_ms`] is not above [`BootstrapConfig::renew_ms`].
+    ClaimTtlNotAboveRenew,
+    /// [`BootstrapConfig::observe_ms`] is zero.
+    ZeroObserve,
+    /// [`BootstrapConfig::donor_wait_ms`] is zero.
+    ZeroDonorWait,
+    /// [`BootstrapConfig::total_ms`] is zero.
+    ZeroTotal,
+    /// [`BootstrapConfig::settle_ms`] is not below [`BootstrapConfig::total_ms`].
+    SettleNotBelowTotal,
+    /// [`BootstrapConfig::observe_ms`] exceeds [`BootstrapConfig::total_ms`].
+    ObserveExceedsTotal,
+    /// [`BootstrapConfig::donor_wait_ms`] exceeds [`BootstrapConfig::total_ms`].
+    DonorWaitExceedsTotal,
+}
+
+impl fmt::Display for BootstrapConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnboundedMaxMembers => "bootstrap max_members must be below usize::MAX",
+            Self::ZeroSettle => "bootstrap settle_ms must be nonzero",
+            Self::ZeroRenew => "bootstrap renew_ms must be nonzero",
+            Self::ClaimTtlNotAboveRenew => "bootstrap claim_ttl_ms must exceed renew_ms",
+            Self::ZeroObserve => "bootstrap observe_ms must be nonzero",
+            Self::ZeroDonorWait => "bootstrap donor_wait_ms must be nonzero",
+            Self::ZeroTotal => "bootstrap total_ms must be nonzero",
+            Self::SettleNotBelowTotal => "bootstrap settle_ms must be below total_ms",
+            Self::ObserveExceedsTotal => "bootstrap observe_ms must not exceed total_ms",
+            Self::DonorWaitExceedsTotal => "bootstrap donor_wait_ms must not exceed total_ms",
+        })
+    }
+}
+
+impl std::error::Error for BootstrapConfigError {}
 
 impl BootstrapConfig {
     /// Rejects absent, inverted, or unbounded limits.
     ///
     /// # Errors
-    /// Returns [`BootstrapError::InvalidConfig`] for an invalid bound.
-    pub fn validate(self) -> Result<Self, BootstrapError> {
-        if self.max_members == 0
-            || self.max_members == usize::MAX
-            || self.max_member_bytes == 0
-            || self.max_scope_bytes == 0
-            || self.settle_ms == 0
-            || self.renew_ms == 0
-            || self.claim_ttl_ms <= self.renew_ms
-            || self.observe_ms == 0
-            || self.donor_wait_ms == 0
-            || self.total_ms == 0
-            || self.settle_ms >= self.total_ms
-            || self.observe_ms > self.total_ms
-            || self.donor_wait_ms > self.total_ms
-        {
-            return Err(BootstrapError::InvalidConfig);
+    /// Returns the [`BootstrapConfigError`] variant naming the first violated rule.
+    pub fn validate(&self) -> Result<(), BootstrapConfigError> {
+        if self.max_members.get() == usize::MAX {
+            return Err(BootstrapConfigError::UnboundedMaxMembers);
         }
-        Ok(self)
+        if self.settle_ms == 0 {
+            return Err(BootstrapConfigError::ZeroSettle);
+        }
+        if self.renew_ms == 0 {
+            return Err(BootstrapConfigError::ZeroRenew);
+        }
+        if self.claim_ttl_ms <= self.renew_ms {
+            return Err(BootstrapConfigError::ClaimTtlNotAboveRenew);
+        }
+        if self.observe_ms == 0 {
+            return Err(BootstrapConfigError::ZeroObserve);
+        }
+        if self.donor_wait_ms == 0 {
+            return Err(BootstrapConfigError::ZeroDonorWait);
+        }
+        if self.total_ms == 0 {
+            return Err(BootstrapConfigError::ZeroTotal);
+        }
+        if self.settle_ms >= self.total_ms {
+            return Err(BootstrapConfigError::SettleNotBelowTotal);
+        }
+        if self.observe_ms > self.total_ms {
+            return Err(BootstrapConfigError::ObserveExceedsTotal);
+        }
+        if self.donor_wait_ms > self.total_ms {
+            return Err(BootstrapConfigError::DonorWaitExceedsTotal);
+        }
+        Ok(())
     }
 }
 
@@ -277,8 +344,13 @@ pub enum BootstrapStage {
 /// Fail-closed input or state rejection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootstrapError {
-    /// Constructor or scope limits are invalid.
-    InvalidConfig,
+    /// The [`BootstrapConfig`] is invalid.
+    Config(BootstrapConfigError),
+    /// The transfer config passed to `ClaimEngine::enable_transfer` is invalid.
+    TransferConfig(TransferConfigError),
+    /// Scope, node identity, boot incarnation, or session is empty, zero, or
+    /// exceeds its configured byte cap.
+    InvalidIdentity,
     /// Input belongs to the wrong phase.
     Stage,
     /// Callback does not match the current operation or selected claim.
@@ -289,6 +361,31 @@ pub enum BootstrapError {
     BackwardTime,
     /// Checked generation, token, renewal, or logical-time arithmetic ended.
     Exhausted,
+}
+
+impl fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Config(_) => "invalid bootstrap config",
+            Self::TransferConfig(_) => "invalid bootstrap transfer config",
+            Self::InvalidIdentity => "invalid bootstrap scope or identity",
+            Self::Stage => "bootstrap input belongs to the wrong phase",
+            Self::StaleOperation => "bootstrap callback does not match the current operation",
+            Self::InvalidObservation => "bootstrap source facts are incomplete or contradictory",
+            Self::BackwardTime => "bootstrap time moved backward",
+            Self::Exhausted => "bootstrap checked arithmetic exhausted",
+        })
+    }
+}
+
+impl std::error::Error for BootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::TransferConfig(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// Explicit observation, completion, failure, and clock inputs.

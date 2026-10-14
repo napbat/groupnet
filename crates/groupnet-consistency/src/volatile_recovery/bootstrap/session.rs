@@ -147,10 +147,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         let core_bytes = config
             .transfer
             .max_metadata_bytes
+            .get()
             .checked_mul(12)
             .and_then(|value| value.checked_add(config.max_claim_metadata_bytes))
-            .and_then(|value| value.checked_add(config.claim.max_members.checked_mul(128)?))
-            .and_then(|value| value.checked_add(config.transfer.max_cuts.checked_mul(64)?))
+            .and_then(|value| value.checked_add(config.claim.max_members.get().checked_mul(128)?))
+            .and_then(|value| value.checked_add(config.transfer.max_cuts.get().checked_mul(64)?))
             .and_then(|value| value.checked_add(512))
             .ok_or(BootstrapSessionError::Core)?;
         let core_metadata = capabilities

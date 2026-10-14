@@ -341,7 +341,7 @@ where
                 snapshot_bytes: Arc::new(Semaphore::new(
                     limits.max_inflight_bytes
                         - if M::ENABLED {
-                            limits.core.max_batch_bytes
+                            limits.core.max_batch_bytes.get()
                         } else {
                             0
                         },
@@ -366,24 +366,14 @@ where
     ///
     /// # Errors
     /// Returns an invalid-configuration error if the manager is already
-    /// shared/open, configured twice, or given zero/inconsistent bounds.
+    /// shared/open, configured twice, or given limits that fail
+    /// [`AckWaitLimits::validate`].
     pub fn with_ack_evidence<E: AckEvidenceSource>(
         mut self,
         source: E,
         limits: AckWaitLimits,
     ) -> Result<Self, OpenError> {
-        if limits.max_required == 0
-            || limits.max_identity_bytes == 0
-            || limits.max_certificate_bytes == 0
-            || limits.max_metadata_bytes == 0
-            || limits.max_wait_ms == 0
-            || limits.poll_ms == 0
-            || limits.poll_ms > limits.max_wait_ms
-            || limits.max_identity_bytes > limits.max_metadata_bytes
-            || limits.max_certificate_bytes > limits.max_metadata_bytes
-        {
-            return Err(OpenError::InvalidConfig);
-        }
+        limits.validate().map_err(|_| OpenError::InvalidConfig)?;
         let manager = Arc::get_mut(&mut self.inner).ok_or(OpenError::InvalidConfig)?;
         if manager.ack.is_some() {
             return Err(OpenError::InvalidConfig);

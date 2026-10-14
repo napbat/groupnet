@@ -19,21 +19,22 @@ const MAX_PRESENCE_ATTEMPTS: usize = 4;
 impl NativeClaimSource {
     fn pair_limits(&self) -> Result<EntryInspectionLimits, AdapterError> {
         let per_member = size_of::<InspectedPairEntry>()
-            .checked_add(self.policy.max_member_bytes)
+            .checked_add(self.policy.max_member_bytes.get())
             .and_then(|bytes| bytes.checked_add(self.max_value_bytes.checked_mul(2)?))
             .ok_or(AdapterError)?;
         let max_response_bytes = size_of::<InspectedPair>()
             .checked_add(
                 self.policy
                     .max_members
+                    .get()
                     .checked_mul(per_member)
                     .ok_or(AdapterError)?,
             )
             .ok_or(AdapterError)?;
         Ok(EntryInspectionLimits {
             max_key_bytes: self.key.len().max(self.presence_key.len()),
-            max_members: self.policy.max_members,
-            max_member_bytes: self.policy.max_member_bytes,
+            max_members: self.policy.max_members.get(),
+            max_member_bytes: self.policy.max_member_bytes.get(),
             max_value_bytes: self.max_value_bytes,
             max_response_bytes,
         })

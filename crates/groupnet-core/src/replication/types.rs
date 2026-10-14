@@ -1,10 +1,13 @@
 //! Source-backed replica replay, snapshot, and idle-session decisions.
 
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroUsize};
+
 use crate::Time;
 
 use super::{
-    AckWaitError, BoundComparison, Coverage, Cursor, IdentityError, IdlePolicy, SnapshotConfig,
-    SubscriptionError,
+    AckWaitError, BoundComparison, Coverage, Cursor, IdentityError, IdlePolicy, IdlePolicyError,
+    SnapshotConfig, SnapshotConfigError, SubscriptionError,
 };
 
 /// Replay contract selected for this session.
@@ -17,6 +20,9 @@ pub enum Mode {
 }
 
 /// Limits enforced before effects and before accepting adapter responses.
+///
+/// Counts and byte budgets are nonzero by type; [`Config::validate`] checks
+/// the millisecond cadences and the nested snapshot and idle policies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Optional source-check backoff for inactive scopes; never extends proof freshness.
@@ -24,18 +30,19 @@ pub struct Config {
     /// Optional finite state-sync snapshot recovery; absent for replay-only sessions.
     pub snapshot: Option<SnapshotConfig>,
     /// Maximum encoded native cursor or proof byte length.
-    pub max_cursor_bytes: usize,
+    pub max_cursor_bytes: NonZeroUsize,
     /// Maximum records in one replay batch.
-    pub max_batch_events: usize,
+    pub max_batch_events: NonZeroUsize,
     /// Maximum encoded bytes in one replay batch.
-    pub max_batch_bytes: usize,
-    /// Independent source-tail check cadence in logical milliseconds.
+    pub max_batch_bytes: NonZeroUsize,
+    /// Independent source-tail check cadence in logical milliseconds; nonzero.
     pub tail_check_ms: u64,
-    /// Delay before retrying a transient failure.
+    /// Delay before retrying a transient failure, in logical milliseconds; nonzero.
     pub retry_ms: u64,
     /// Maximum transient failures before stopping automatic work.
-    pub max_retries: u32,
-    /// Maximum wait for one issued source or application operation.
+    pub max_retries: NonZeroU32,
+    /// Maximum wait for one issued source or application operation, in
+    /// logical milliseconds; nonzero.
     pub attempt_timeout_ms: u64,
 }
 
@@ -44,52 +51,90 @@ impl Default for Config {
         Self {
             idle: None,
             snapshot: None,
-            max_cursor_bytes: 4096,
-            max_batch_events: 4096,
-            max_batch_bytes: 8 * 1024 * 1024,
+            max_cursor_bytes: const { NonZeroUsize::new(4096).unwrap() },
+            max_batch_events: const { NonZeroUsize::new(4096).unwrap() },
+            max_batch_bytes: const { NonZeroUsize::new(8 * 1024 * 1024).unwrap() },
             tail_check_ms: 5000,
             retry_ms: 1000,
-            max_retries: 3,
+            max_retries: const { NonZeroU32::new(3).unwrap() },
             attempt_timeout_ms: 30_000,
         }
     }
 }
 
-/// Invalid session configuration.
+/// Invalid session configuration or session identity, naming the violated rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigError {
-    /// A budget or cadence is zero.
-    Zero,
-    /// Scope identity is empty or exceeds the configured encoding bound.
+    /// [`Config::tail_check_ms`] is zero.
+    ZeroTailCheck,
+    /// [`Config::retry_ms`] is zero.
+    ZeroRetry,
+    /// [`Config::attempt_timeout_ms`] is zero.
+    ZeroAttemptTimeout,
+    /// [`Config::snapshot`] is invalid.
+    Snapshot(SnapshotConfigError),
+    /// [`Config::idle`] is invalid against [`Config::tail_check_ms`].
+    Idle(IdlePolicyError),
+    /// The `session_id` passed to [`super::SessionEngine::new`] is zero.
+    ZeroSession,
+    /// Scope identity is empty or exceeds [`Config::max_cursor_bytes`].
     Identity(IdentityError),
 }
 
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroTailCheck => f.write_str("replication tail_check_ms must be nonzero"),
+            Self::ZeroRetry => f.write_str("replication retry_ms must be nonzero"),
+            Self::ZeroAttemptTimeout => {
+                f.write_str("replication attempt_timeout_ms must be nonzero")
+            }
+            Self::Snapshot(_) => f.write_str("invalid replication snapshot config"),
+            Self::Idle(_) => f.write_str("invalid replication idle policy"),
+            Self::ZeroSession => f.write_str("replication session_id must be nonzero"),
+            Self::Identity(_) => f.write_str("invalid replication scope identity"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::Idle(error) => Some(error),
+            Self::Identity(error) => Some(error),
+            Self::ZeroTailCheck
+            | Self::ZeroRetry
+            | Self::ZeroAttemptTimeout
+            | Self::ZeroSession => None,
+        }
+    }
+}
+
 impl Config {
-    /// Validates that all budgets and cadences make progress.
+    /// Validates that every cadence makes progress and that the nested
+    /// snapshot and idle policies are consistent.
     ///
     /// # Errors
-    /// Returns [`ConfigError::Zero`] when any required bound is zero.
-    pub fn validate(self) -> Result<Self, ConfigError> {
-        if self.max_cursor_bytes == 0
-            || self.max_batch_events == 0
-            || self.max_batch_bytes == 0
-            || self.tail_check_ms == 0
-            || self.retry_ms == 0
-            || self.max_retries == 0
-            || self.attempt_timeout_ms == 0
-        {
-            return Err(ConfigError::Zero);
+    /// Returns the [`ConfigError`] variant naming the first violated rule.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.tail_check_ms == 0 {
+            return Err(ConfigError::ZeroTailCheck);
         }
-        if self.snapshot.is_some_and(|snapshot| !snapshot.valid()) {
-            return Err(ConfigError::Zero);
+        if self.retry_ms == 0 {
+            return Err(ConfigError::ZeroRetry);
         }
-        if self
-            .idle
-            .is_some_and(|policy| !policy.valid(self.tail_check_ms))
-        {
-            return Err(ConfigError::Zero);
+        if self.attempt_timeout_ms == 0 {
+            return Err(ConfigError::ZeroAttemptTimeout);
         }
-        Ok(self)
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.validate().map_err(ConfigError::Snapshot)?;
+        }
+        if let Some(idle) = &self.idle {
+            idle.validate(self.tail_check_ms)
+                .map_err(ConfigError::Idle)?;
+        }
+        Ok(())
     }
 }
 
@@ -226,6 +271,20 @@ pub enum Refusal {
     Gap,
 }
 
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unready => "no complete replay state is installed",
+            Self::Floor => "the requested read floor is not materialized",
+            Self::Authority => "the source has not granted read authority",
+            Self::TailCheckDue => "the source tail check is overdue",
+            Self::Gap => "a retention gap requires recovery",
+        })
+    }
+}
+
+impl std::error::Error for Refusal {}
+
 /// Local read-gate result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadDecision {
@@ -258,6 +317,34 @@ pub enum Reject {
     Exhausted,
     /// This event is invalid for the current stage.
     Stage,
+}
+
+impl fmt::Display for Reject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::AckWait(_) => "acknowledgement wait rejected",
+            Self::Subscription(_) => "subscription input rejected",
+            Self::Identity(_) => "invalid cursor or proof identity",
+            Self::StaleOperation => "response belongs to a stale operation",
+            Self::Comparison => "source comparison is missing or misbound",
+            Self::History => "source history changed without a continuity proof",
+            Self::Backpressure => "source response exceeds a configured budget",
+            Self::Discontinuity => "source response is discontinuous",
+            Self::Exhausted => "a counter or logical deadline would overflow",
+            Self::Stage => "event is invalid for the current stage",
+        })
+    }
+}
+
+impl std::error::Error for Reject {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AckWait(error) => Some(error),
+            Self::Subscription(error) => Some(error),
+            Self::Identity(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// Bounded contiguous source batch; the driver retains native records by handle.

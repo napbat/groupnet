@@ -48,6 +48,7 @@
 //! A failing seed is a reproducible counterexample, not a flake.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_core::anchor::AnchorRecord;
 use groupnet_core::{
@@ -78,19 +79,14 @@ fn cfg() -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_INTERVAL_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::External {
                 steal_margin_ms: STEAL_MARGIN_MS,
             },
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
@@ -107,7 +103,8 @@ fn cluster(group: &str, members: &BTreeSet<NodeId>) -> Simulation {
     sim.set_anchor_latency(ANCHOR_LATENCY_MS);
     for id in members {
         let seeds = members.iter().filter(|x| *x != id).cloned();
-        sim.add(GroupEngine::new(group.clone(), id.clone(), seeds, cfg()));
+        sim.add(GroupEngine::new(group.clone(), id.clone(), seeds, cfg()).expect("valid config"))
+            .expect("distinct node");
     }
     sim
 }
@@ -389,7 +386,7 @@ fn a_long_external_run_never_bids_never_grants_and_never_persists() {
     sim.run_until(Time(3_000));
     let first = sole_host(&sim, "X-pure");
 
-    sim.crash(&first);
+    sim.crash(&first).expect("live node");
     sim.run_until(Time(6_000));
     let second = sole_host(&sim, "X-pure (after the crash)");
     assert_ne!(second, first);
@@ -397,12 +394,10 @@ fn a_long_external_run_never_bids_never_grants_and_never_persists() {
     // The dead node comes back with no memory of anything — including the
     // record that still carries its name in the log.
     let seeds = members.iter().filter(|x| **x != first).cloned();
-    sim.add(GroupEngine::new(
-        GroupId::new(group),
-        first.clone(),
-        seeds,
-        cfg(),
-    ));
+    sim.add(
+        GroupEngine::new(GroupId::new(group), first.clone(), seeds, cfg()).expect("valid config"),
+    )
+    .expect("distinct node");
     sim.run_until(Time(9_000));
 
     for node in members.iter().filter(|n| **n != second) {
@@ -453,12 +448,13 @@ struct Topology {
 impl Topology {
     fn engine(&self, id: &NodeId, peers: &BTreeSet<NodeId>) -> GroupEngine {
         let seeds = peers.iter().filter(|x| *x != id).cloned();
-        GroupEngine::new(self.group.clone(), id.clone(), seeds, cfg())
+        GroupEngine::new(self.group.clone(), id.clone(), seeds, cfg()).expect("valid config")
     }
 
     fn boot(&self, sim: &mut Simulation) {
         for id in &self.booted {
-            sim.add(self.engine(id, &self.booted));
+            sim.add(self.engine(id, &self.booted))
+                .expect("distinct node");
         }
     }
 }
@@ -505,7 +501,7 @@ fn inject_fault(
     match rng.below(11) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
-            sim.crash(&victim);
+            sim.crash(&victim).expect("live node");
             alive.remove(&victim);
         }
         1 if alive.len() < topo.booted.len() => {
@@ -520,7 +516,7 @@ fn inject_fault(
                 .collect();
             let node = pick(&down, rng);
             alive.insert(node.clone());
-            sim.add(topo.engine(&node, alive));
+            sim.add(topo.engine(&node, alive)).expect("distinct node");
             return Some(node);
         }
         2 if alive.len() > 1 => {
@@ -548,7 +544,8 @@ fn inject_fault(
                     value: format!("v{now}").into_bytes(),
                     ttl_ms: None,
                 },
-            );
+            )
+            .expect("live node");
         }
         _ => {
             let node = pick(alive, rng);
@@ -558,7 +555,8 @@ fn inject_fault(
                     key: "k".into(),
                     value: format!("v{now}"),
                 },
-            );
+            )
+            .expect("live node");
         }
     }
     None
@@ -760,7 +758,8 @@ fn assert_settled_on_the_register(
 ) {
     for node in alive {
         assert_eq!(
-            sim.members_of(node),
+            sim.members_of(node)
+                .expect("alive node is in the simulation"),
             *alive,
             "{label}: {node} did not converge on the live set"
         );

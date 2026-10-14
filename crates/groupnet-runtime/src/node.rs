@@ -36,7 +36,7 @@ pub(crate) const ROUTING_GROUP: &str = "__groupnet_routing__";
 /// The posture is **per group, not per node**: a node freely mixes hosted
 /// shard groups with eventual fabric groups, and opting one group in cannot
 /// make another run an election. Everything else about the group (gossip
-/// cadence, detector timings, fanout) still comes from the node's builder
+/// cadence and fanout, detector timings) still comes from the node's builder
 /// config — a profile only decides the mode.
 ///
 /// ```no_run
@@ -449,6 +449,44 @@ impl Node {
         Routing::new(group)
     }
 
+    /// Builds a group's engine from its effective `config`.
+    ///
+    /// A profile carrying voter storage builds the engine through
+    /// `with_recovered`, so the ledger is a floor from the first tick rather
+    /// than something applied after the boot blackout has already been armed.
+    /// Outside `Activation::Quorum` the two constructors are the same engine —
+    /// a group with no voter ledger has nothing to restore.
+    fn build_engine(
+        &self,
+        group: &GroupId,
+        config: &Config,
+        storage: Option<VoterStorage>,
+    ) -> (GroupEngine, Option<Arc<dyn GrantStore>>) {
+        // `Config::validate` ignores `mode`, the only thing a group overrides,
+        // so the node config `NodeBuilder::start` validated stays valid here.
+        const VALIDATED: &str = "NodeBuilder::start validated the node config, and \
+                                 Config::validate does not inspect the per-group mode";
+        let seeds = self.inner.seeds.iter().cloned();
+        match storage {
+            Some(storage) => (
+                GroupEngine::with_recovered(
+                    group.clone(),
+                    self.inner.id.clone(),
+                    seeds,
+                    config.clone(),
+                    storage.recovered,
+                )
+                .expect(VALIDATED),
+                Some(storage.store),
+            ),
+            None => (
+                GroupEngine::new(group.clone(), self.inner.id.clone(), seeds, config.clone())
+                    .expect(VALIDATED),
+                None,
+            ),
+        }
+    }
+
     /// Spawns a group actor and returns its handle, without touching the routes
     /// table — [`get_or_spawn`](Self::get_or_spawn) owns that, and calls this
     /// with the lock held, which is why nothing here may await.
@@ -490,33 +528,8 @@ impl Node {
             profile.mode
         };
 
-        // A profile carrying voter storage builds the engine through
-        // `with_recovered`, so the ledger is a floor from the first tick rather
-        // than something applied after the boot blackout has already been
-        // armed. Outside `Activation::Quorum` the two constructors are the same
-        // engine — a group with no voter ledger has nothing to restore.
         let reachable = self.inner.transport.reachable().borrow().clone();
-        let (mut engine, store) = match profile.storage {
-            Some(storage) => (
-                GroupEngine::with_recovered(
-                    group.clone(),
-                    self.inner.id.clone(),
-                    self.inner.seeds.iter().cloned(),
-                    config.clone(),
-                    storage.recovered,
-                ),
-                Some(storage.store),
-            ),
-            None => (
-                GroupEngine::new(
-                    group.clone(),
-                    self.inner.id.clone(),
-                    self.inner.seeds.iter().cloned(),
-                    config.clone(),
-                ),
-                None,
-            ),
-        };
+        let (mut engine, store) = self.build_engine(&group, &config, profile.storage);
         // Discovery contacts receive bounded periodic digest attempts but are
         // not members until an actual participant exchanges group protocol.
         engine.apply(groupnet_core::Command::SetBootstrapContacts(

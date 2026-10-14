@@ -115,7 +115,7 @@
 //!      roster would otherwise open ([`LeaseCore::set_roster`]).
 //!
 //!   Both run for the node's first `detection_window_ms + 2 ×
-//!   anti_entropy_interval` of participation. The residual is a reader that
+//!   gossip_interval_ms` of participation. The residual is a reader that
 //!   boots into a *full* partition from a writer and stays there past that
 //!   window: it never learns the writer, the writer never sees its lease, and
 //!   nothing ties the two together. A deployment with a fixed membership closes

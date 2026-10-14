@@ -69,7 +69,8 @@ const LEASE_MS: u64 = 600;
 ///
 /// [`TEST_GROUP`]: groupnet_testkit::frames::TEST_GROUP
 fn ranked(group: &str, ids: &[&str]) -> Vec<NodeId> {
-    let members: Vec<(NodeId, u32)> = ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
+    let members: std::collections::BTreeMap<NodeId, u32> =
+        ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
     placement::owners(group, &members, ids.len())
 }
 

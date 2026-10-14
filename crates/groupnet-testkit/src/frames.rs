@@ -19,7 +19,8 @@ pub const TEST_GROUP: &str = "g";
 /// equal-epoch fencing tiebreak all read.
 #[must_use]
 pub fn rank_by_placement(ids: &[&str]) -> Vec<NodeId> {
-    let members: Vec<(NodeId, u32)> = ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
+    let members: std::collections::BTreeMap<NodeId, u32> =
+        ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
     placement::owners(TEST_GROUP, &members, ids.len())
 }
 
@@ -122,6 +123,10 @@ pub fn leadership_changes(effects: &[Effect]) -> Vec<(u64, Option<NodeId>)> {
 
 /// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`] at the
 /// default [`Config`].
+///
+/// # Panics
+///
+/// Never: the default [`Config`] is valid.
 #[must_use]
 pub fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
     GroupEngine::new(
@@ -130,6 +135,7 @@ pub fn engine(id: &str, seeds: &[&str]) -> GroupEngine {
         seeds.iter().map(|s| NodeId::new(*s)),
         Config::default(),
     )
+    .expect("the default config is valid")
 }
 
 /// The default [`Config`] opted into [`GroupMode::Hosted`] with
@@ -168,6 +174,10 @@ pub fn quorum_config(voters: &[&str], lease_ms: u64) -> Config {
 /// Everything else is the default [`Config`], so a hosted engine and an
 /// [`engine`] differ by exactly the mode, which is what makes the "an
 /// `Eventual` group runs no election" assertions meaningful.
+///
+/// # Panics
+///
+/// Never: validation does not inspect the mode, and the rest is the default.
 #[must_use]
 pub fn hosted_engine(id: &str, seeds: &[&str], claim_settle_ms: u64, lease_ms: u64) -> GroupEngine {
     GroupEngine::new(
@@ -176,6 +186,7 @@ pub fn hosted_engine(id: &str, seeds: &[&str], claim_settle_ms: u64, lease_ms: u
         seeds.iter().map(|s| NodeId::new(*s)),
         settle_config(claim_settle_ms, lease_ms),
     )
+    .expect("a settle config over the defaults is valid")
 }
 
 /// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`], built with
@@ -185,6 +196,10 @@ pub fn hosted_engine(id: &str, seeds: &[&str], claim_settle_ms: u64, lease_ms: u
 /// Pair it with [`quorum_config`] for the posture `recovered` actually means
 /// something in, and with [`settle_config`] or a plain [`Config::default`] to
 /// pin that it means nothing anywhere else.
+///
+/// # Panics
+///
+/// If `config` fails [`Config::validate`].
 #[must_use]
 pub fn recovered_engine(
     id: &str,
@@ -199,6 +214,7 @@ pub fn recovered_engine(
         config,
         recovered,
     )
+    .expect("valid config")
 }
 
 /// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`], opted into
@@ -212,6 +228,10 @@ pub fn recovered_engine(
 /// separate settle knob here. A test that wants a voter able to grant from the
 /// first instant builds it through [`recovered_engine`] with
 /// [`RecoveredGrant::none`] instead.
+///
+/// # Panics
+///
+/// Never: validation does not inspect the mode, and the rest is the default.
 #[must_use]
 pub fn hosted_quorum_engine(
     id: &str,
@@ -225,6 +245,7 @@ pub fn hosted_quorum_engine(
         seeds.iter().map(|s| NodeId::new(*s)),
         quorum_config(voters, lease_ms),
     )
+    .expect("a quorum config over the defaults is valid")
 }
 
 /// A **started** [`hosted_quorum_engine`] for `id` over the roster `voters`,

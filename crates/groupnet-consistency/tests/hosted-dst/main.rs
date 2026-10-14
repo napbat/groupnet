@@ -72,6 +72,7 @@
 #![cfg(feature = "hosted")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use groupnet_consistency::WriteToken;
 use groupnet_consistency::hosted::{Watermarks, hosted_feed_name};
@@ -127,19 +128,14 @@ fn cfg(voters: &BTreeSet<NodeId>) -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation: Activation::Quorum {
                 voters: VoterRoster::new(voters.iter().cloned()),
             },
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 

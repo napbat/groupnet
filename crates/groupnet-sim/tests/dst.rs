@@ -24,6 +24,7 @@
 //! A failing seed is a reproducible counterexample, not a flake.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
 use groupnet_core::Time;
 use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Status, placement};
@@ -40,29 +41,23 @@ fn rng(seed: u64) -> SplitMix64 {
 }
 
 fn cfg() -> Config {
-    // Tight timers so the final settle converges quickly in logical time. The
-    // anti-entropy round paces with the gossip interval; fanout 2 is the targeted
-    // digest fanout.
+    // Tight timers so the final settle converges quickly in logical time; the
+    // gossip round keeps the default `gossip_fanout` of 2.
     Config {
         gossip_interval_ms: 60,
         probe_interval_ms: 50,
         probe_timeout_ms: 25,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 300,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: 60,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: FRAME_CAP,
+        max_delta_frame_bytes: NonZeroUsize::new(FRAME_CAP).expect("nonzero"),
         mode: GroupMode::Eventual,
+        ..Config::default()
     }
 }
 
 fn engine(group: &GroupId, id: &NodeId, alive: &BTreeSet<NodeId>) -> GroupEngine {
     let seeds = alive.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(group.clone(), id.clone(), seeds, cfg())
+    GroupEngine::new(group.clone(), id.clone(), seeds, cfg()).expect("valid config")
 }
 
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
@@ -92,7 +87,7 @@ fn run_scenario(seed: u64) {
 
     let mut alive: BTreeSet<NodeId> = all.iter().cloned().collect();
     for id in &all {
-        sim.add(engine(&group, id, &alive));
+        sim.add(engine(&group, id, &alive)).expect("distinct node");
     }
 
     let mut now = 0u64;
@@ -103,12 +98,16 @@ fn run_scenario(seed: u64) {
         // Safety: must hold at every step, even mid-chaos.
         for node in &alive {
             assert!(
-                sim.members_of(node).contains(node),
+                sim.members_of(node)
+                    .expect("alive node is in the simulation")
+                    .contains(node),
                 "seed {seed}: {node} dropped itself from membership"
             );
             if let Some(c) = sim.coordinator_of(node) {
                 assert!(
-                    sim.members_of(node).contains(&c),
+                    sim.members_of(node)
+                        .expect("alive node is in the simulation")
+                        .contains(&c),
                     "seed {seed}: {node} chose coordinator {c} it doesn't consider live"
                 );
             }
@@ -171,7 +170,7 @@ fn inject_fault(
     match rng.below(8) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
-            sim.crash(&victim);
+            sim.crash(&victim).expect("live node");
             alive.remove(&victim);
         }
         1 if alive.len() < all.len() => {
@@ -183,7 +182,7 @@ fn inject_fault(
                 .collect();
             let node = pick(&down, rng);
             alive.insert(node.clone());
-            sim.add(engine(group, &node, alive));
+            sim.add(engine(group, &node, alive)).expect("distinct node");
         }
         2 if alive.len() > 1 => {
             let a = pick(alive, rng);
@@ -199,7 +198,8 @@ fn inject_fault(
             sim.command(
                 &node,
                 Command::SetLocalState(format!("s{now}").into_bytes()),
-            );
+            )
+            .expect("live node");
         }
         5 => {
             // A permanent keyed entry authored by the node (no TTL, never
@@ -212,7 +212,8 @@ fn inject_fault(
                     value: format!("v{now}").into_bytes(),
                     ttl_ms: None,
                 },
-            );
+            )
+            .expect("live node");
         }
         6 => {
             let node = pick(alive, rng);
@@ -223,7 +224,8 @@ fn inject_fault(
                     value: vec![1],
                     ttl_ms: None,
                 },
-            );
+            )
+            .expect("live node");
         }
         _ => {
             let node = pick(alive, rng);
@@ -233,7 +235,8 @@ fn inject_fault(
                     key: "k".into(),
                     value: format!("v{now}"),
                 },
-            );
+            )
+            .expect("live node");
         }
     }
 }
@@ -244,13 +247,20 @@ fn inject_fault(
 fn assert_converged(sim: &Simulation, alive: &BTreeSet<NodeId>, seed: u64) {
     let expected_coord = placement::owner("shard", alive);
     let first = alive.iter().next().cloned().unwrap();
-    let meta = sim.metadata_snapshot(&first);
-    let state = sim.state_snapshot(&first);
-    let entries = sim.entries_snapshot(&first);
+    let meta = sim
+        .metadata_snapshot(&first)
+        .expect("alive node is in the simulation");
+    let state = sim
+        .state_snapshot(&first)
+        .expect("alive node is in the simulation");
+    let entries = sim
+        .entries_snapshot(&first)
+        .expect("alive node is in the simulation");
 
     for node in alive {
         assert_eq!(
-            sim.members_of(node),
+            sim.members_of(node)
+                .expect("alive node is in the simulation"),
             *alive,
             "seed {seed}: {node} did not converge on the live set"
         );
@@ -267,17 +277,20 @@ fn assert_converged(sim: &Simulation, alive: &BTreeSet<NodeId>, seed: u64) {
             );
         }
         assert_eq!(
-            sim.metadata_snapshot(node),
+            sim.metadata_snapshot(node)
+                .expect("alive node is in the simulation"),
             meta,
             "seed {seed}: metadata diverged at {node}"
         );
         assert_eq!(
-            sim.state_snapshot(node),
+            sim.state_snapshot(node)
+                .expect("alive node is in the simulation"),
             state,
             "seed {seed}: per-node blob state diverged at {node}"
         );
         assert_eq!(
-            sim.entries_snapshot(node),
+            sim.entries_snapshot(node)
+                .expect("alive node is in the simulation"),
             entries,
             "seed {seed}: per-node keyed entries diverged at {node}"
         );
@@ -300,7 +313,7 @@ fn dst_no_resurrection_after_reap() {
         let mut sim = Simulation::new(u64::from(2 + rng.below(6)));
         sim.set_jitter(u64::from(rng.below(6)));
         for id in &ids {
-            sim.add(engine(&group, id, &all));
+            sim.add(engine(&group, id, &all)).expect("distinct node");
         }
 
         // Author a key on a random node and let it fully propagate.
@@ -312,11 +325,13 @@ fn dst_no_resurrection_after_reap() {
                 value: b"present".to_vec(),
                 ttl_ms: None,
             },
-        );
+        )
+        .expect("live node");
         sim.run_until(Time(3_000));
         for obs in &ids {
             assert_eq!(
                 sim.entries_snapshot(obs)
+                    .expect("observer is in the simulation")
                     .get(&author)
                     .and_then(|m| m.get("doomed")),
                 Some(&b"present".to_vec()),
@@ -331,13 +346,15 @@ fn dst_no_resurrection_after_reap() {
             Command::DeleteLocalEntry {
                 key: "doomed".into(),
             },
-        );
+        )
+        .expect("live node");
         // Well past 2×dead_timeout (600ms) plus generous gossip time.
         sim.run_until(Time(30_000));
 
         for obs in &ids {
             assert!(
                 sim.entries_snapshot(obs)
+                    .expect("observer is in the simulation")
                     .get(&author)
                     .is_none_or(|m| !m.contains_key("doomed")),
                 "seed {seed}: {obs} resurrected the reaped key"
@@ -350,6 +367,7 @@ fn dst_no_resurrection_after_reap() {
         for obs in &ids {
             assert!(
                 sim.entries_snapshot(obs)
+                    .expect("observer is in the simulation")
                     .get(&author)
                     .is_none_or(|m| !m.contains_key("doomed")),
                 "seed {seed}: {obs} resurrected the reaped key after further gossip"
@@ -380,7 +398,10 @@ fn dst_scale_smoke_converges() {
     let mut sim = Simulation::new(5);
     for id in &ids {
         let seed_set: BTreeSet<NodeId> = seeds.iter().filter(|s| *s != id).cloned().collect();
-        sim.add(GroupEngine::new(group.clone(), id.clone(), seed_set, cfg()));
+        sim.add(
+            GroupEngine::new(group.clone(), id.clone(), seed_set, cfg()).expect("valid config"),
+        )
+        .expect("distinct node");
     }
 
     // Every node authors a handful of permanent keyed entries.
@@ -393,7 +414,8 @@ fn dst_scale_smoke_converges() {
                     value: format!("n{i}-e{k}").into_bytes(),
                     ttl_ms: None,
                 },
-            );
+            )
+            .expect("live node");
         }
     }
 
@@ -404,7 +426,9 @@ fn dst_scale_smoke_converges() {
 
     let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
     let expected_coord = placement::owner("scale", &all);
-    let entries = sim.entries_snapshot(&ids[0]);
+    let entries = sim
+        .entries_snapshot(&ids[0])
+        .expect("n000 is in the simulation");
     assert_eq!(
         entries.len(),
         ids.len(),
@@ -413,7 +437,9 @@ fn dst_scale_smoke_converges() {
 
     for id in &ids {
         assert_eq!(
-            sim.members_of(id).len(),
+            sim.members_of(id)
+                .expect("observer is in the simulation")
+                .len(),
             ids.len(),
             "{id} did not learn all {} members",
             ids.len()
@@ -424,7 +450,8 @@ fn dst_scale_smoke_converges() {
             "{id} disagrees on the coordinator"
         );
         assert_eq!(
-            sim.entries_snapshot(id),
+            sim.entries_snapshot(id)
+                .expect("observer is in the simulation"),
             entries,
             "{id} did not converge on every node's keyed entries"
         );
@@ -447,19 +474,18 @@ fn dst_bounded_frames_force_continuation() {
     let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
     let config = Config {
-        max_delta_frame_bytes: SMALL_CAP,
+        max_delta_frame_bytes: NonZeroUsize::new(SMALL_CAP).expect("nonzero"),
         ..cfg()
     };
     let mut sim = Simulation::new(4);
     sim.set_jitter(3);
     for id in &ids {
         let seeds = all.iter().filter(|x| *x != id).cloned();
-        sim.add(GroupEngine::new(
-            group.clone(),
-            id.clone(),
-            seeds,
-            config.clone(),
-        ));
+        sim.add(
+            GroupEngine::new(group.clone(), id.clone(), seeds, config.clone())
+                .expect("valid config"),
+        )
+        .expect("distinct node");
     }
 
     // Each node authors far more entries than a single 512-byte frame can carry,
@@ -473,13 +499,16 @@ fn dst_bounded_frames_force_continuation() {
                     value: format!("node{i}-key{k:02}-payload").into_bytes(),
                     ttl_ms: None,
                 },
-            );
+            )
+            .expect("live node");
         }
     }
 
     sim.run_until(Time(12_000));
 
-    let entries = sim.entries_snapshot(&ids[0]);
+    let entries = sim
+        .entries_snapshot(&ids[0])
+        .expect("n0 is in the simulation");
     // 4 nodes × 24 keys each present on every node.
     assert_eq!(entries.len(), ids.len());
     for keys in entries.values() {
@@ -487,7 +516,8 @@ fn dst_bounded_frames_force_continuation() {
     }
     for id in &ids {
         assert_eq!(
-            sim.entries_snapshot(id),
+            sim.entries_snapshot(id)
+                .expect("observer is in the simulation"),
             entries,
             "{id} did not converge under the tiny frame cap"
         );

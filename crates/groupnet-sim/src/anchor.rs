@@ -188,7 +188,7 @@ pub(crate) struct AnchorModel {
     blocked: BTreeSet<NodeId>,
     /// Nodes with a round in flight — the debounce the prompt's contract
     /// requires of every driver, without which a store round trip longer than
-    /// the anti-entropy interval would stack rounds and burn epochs.
+    /// the gossip interval would stack rounds and burn epochs.
     in_flight: BTreeSet<NodeId>,
     /// How many rounds have been performed, which is also the deterministic
     /// `Unknown` schedule's key.

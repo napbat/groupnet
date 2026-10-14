@@ -3,6 +3,11 @@
 //! Claims coordinate origin work but never authorize serving. Image capture,
 //! transfer and replay are bounded child decisions. The final read gate is
 //! always supplied by the application recovery and lease authority.
+//!
+//! [`BootstrapConfig`], [`journal::JournalConfig`] and
+//! [`transfer::TransferConfig`] carry nonzero counts and byte caps as
+//! `NonZero*` fields; each `validate` checks the remaining millisecond and
+//! cross-field rules and returns a typed error whose variant names the field.
 
 pub mod journal;
 pub mod transfer;
@@ -18,10 +23,10 @@ pub use claim_codec::{
 };
 pub use engine::ClaimEngine;
 pub use types::{
-    BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
-    BootstrapMember, BootstrapMemberIdentity, BootstrapOperation, BootstrapParticipant,
-    BootstrapPresence, BootstrapScope, BootstrapStage, BootstrapStep, ClaimIdentity, ClaimPhase,
-    PresenceIdentity, ReleaseReason, same_membership,
+    BootId, BootstrapClaim, BootstrapConfig, BootstrapConfigError, BootstrapEffect, BootstrapError,
+    BootstrapEvent, BootstrapMember, BootstrapMemberIdentity, BootstrapOperation,
+    BootstrapParticipant, BootstrapPresence, BootstrapScope, BootstrapStage, BootstrapStep,
+    ClaimIdentity, ClaimPhase, PresenceIdentity, ReleaseReason, same_membership,
 };
 
 #[cfg(test)]

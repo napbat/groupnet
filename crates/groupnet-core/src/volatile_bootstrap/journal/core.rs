@@ -4,8 +4,8 @@ mod followers;
 
 use super::types::{
     BarrierReceipt, CaptureCharge, CaptureId, DeltaIdentity, Invalidation, JournalConfig,
-    JournalCursor, JournalDelta, JournalError, JournalState, NativeCut, ReservationId,
-    ReservationStage,
+    JournalConfigError, JournalCursor, JournalDelta, JournalError, JournalState, NativeCut,
+    ReservationId, ReservationStage,
 };
 use crate::Time;
 use crate::volatile_bootstrap::{BootstrapMemberIdentity, same_membership};
@@ -65,11 +65,8 @@ pub struct DonorJournal {
 }
 
 impl DonorJournal {
-    fn storage_slots(count: usize) -> Result<usize, JournalError> {
-        count
-            .checked_mul(2)
-            .map(|slots| slots.max(4))
-            .ok_or(JournalError::InvalidConfig)
+    fn storage_slots(count: usize) -> Option<usize> {
+        count.checked_mul(2).map(|slots| slots.max(4))
     }
 
     fn copy_image_cuts(
@@ -80,7 +77,8 @@ impl DonorJournal {
         image_cuts
             .try_reserve_exact(cuts.len())
             .map_err(|_| JournalError::Capacity)?;
-        if image_cuts.capacity() > Self::storage_slots(config.max_cuts)? {
+        let max_slots = Self::storage_slots(config.max_cuts.get()).ok_or(JournalError::Capacity)?;
+        if image_cuts.capacity() > max_slots {
             return Err(JournalError::Capacity);
         }
         for cut in cuts {
@@ -88,7 +86,7 @@ impl DonorJournal {
             writer
                 .try_reserve_exact(cut.writer.len())
                 .map_err(|_| JournalError::Capacity)?;
-            if writer.capacity() > config.max_cut_bytes {
+            if writer.capacity() > config.max_cut_bytes.get() {
                 return Err(JournalError::Capacity);
             }
             writer.extend_from_slice(&cut.writer);
@@ -101,6 +99,52 @@ impl DonorJournal {
         Ok(image_cuts)
     }
 
+    /// The retained-heap reservation of [`Self::storage_bound`], or `None`
+    /// when the configured caps overflow `usize`.
+    pub(super) fn checked_storage_bound(config: &JournalConfig) -> Option<usize> {
+        use std::mem::size_of;
+
+        let slots = |count: usize, size: usize| Self::storage_slots(count)?.checked_mul(size);
+        let events = config.max_events.get();
+        let members = config.max_members.get();
+        let membership_bytes = config.max_membership_bytes.get();
+        let cuts = config.max_cuts.get();
+        let cut_bytes = config.max_cut_bytes.get();
+        let scope_bytes = config.max_scope_bytes.get();
+        let follower_id_bytes = config.max_follower_id_bytes.get();
+        let mut total = size_of::<Self>();
+        total = total.checked_add(slots(events, size_of::<JournalDelta>())?)?;
+        total = total.checked_add(config.max_suffix_bytes.get())?;
+        total = total.checked_add(events.checked_mul(config.max_event_bytes.get())?)?;
+        total = total.checked_add(events.checked_mul(config.max_identity_bytes.get())?)?;
+        total = total.checked_add(slots(members, size_of::<BootstrapMemberIdentity>())?)?;
+        total = total.checked_add(membership_bytes)?;
+        total = total.checked_add(slots(cuts, size_of::<NativeCut>())?)?;
+        total = total.checked_add(cut_bytes)?;
+        total = total.checked_add(cuts.checked_mul(cut_bytes)?)?;
+        // C's immutable writer cuts coexist with the advancing B cuts while
+        // encoding and throughout donor service.
+        total = total.checked_add(slots(cuts, size_of::<NativeCut>())?)?;
+        total = total.checked_add(cuts.checked_mul(cut_bytes)?)?;
+        total = total.checked_add(scope_bytes)?;
+        total = total.checked_add(follower_id_bytes)?;
+        // Both live and aborted vectors can retain allocated slots. Each live
+        // follower can additionally retain an exact B with copied roster,
+        // cuts, scope, and donor/follower identities. Returned B/readback
+        // values are physical clones admitted separately by the runtime.
+        let per_follower = slots(1, size_of::<Follower>())?
+            .checked_add(slots(1, size_of::<AbortedFollower>())?)?
+            .checked_add(size_of::<BarrierReceipt>())?
+            .checked_add(slots(members, size_of::<BootstrapMemberIdentity>())?)?
+            .checked_add(membership_bytes)?
+            .checked_add(slots(cuts, size_of::<NativeCut>())?)?
+            .checked_add(cut_bytes)?
+            .checked_add(cuts.checked_mul(cut_bytes)?)?
+            .checked_add(scope_bytes.checked_mul(8)?)?
+            .checked_add(follower_id_bytes.checked_mul(8)?)?;
+        total.checked_add(config.max_followers.get().checked_mul(per_follower)?)
+    }
+
     /// Conservative retained-heap reservation for one journal, excluding the
     /// separately admitted image and physical returned batch copies.
     ///
@@ -110,86 +154,13 @@ impl DonorJournal {
     /// reservation before starting its guarded index capture.
     ///
     /// # Errors
-    /// Rejects invalid limits or arithmetic overflow.
+    /// Returns [`JournalError::Config`] for an invalid config, including
+    /// [`JournalConfigError::StorageBoundOverflow`] when the bound overflows.
     pub fn storage_bound(config: JournalConfig) -> Result<usize, JournalError> {
-        use std::mem::size_of;
-
-        let config = config.validate()?;
-        let slots = |count: usize, size: usize| {
-            Self::storage_slots(count)?
-                .checked_mul(size)
-                .ok_or(JournalError::InvalidConfig)
-        };
-        let add = |total: usize, bytes: usize| {
-            total.checked_add(bytes).ok_or(JournalError::InvalidConfig)
-        };
-        let mut total = size_of::<Self>();
-        total = add(total, slots(config.max_events, size_of::<JournalDelta>())?)?;
-        total = add(total, config.max_suffix_bytes)?;
-        total = add(
-            total,
-            config
-                .max_events
-                .checked_mul(config.max_event_bytes)
-                .ok_or(JournalError::InvalidConfig)?,
-        )?;
-        total = add(
-            total,
-            config
-                .max_events
-                .checked_mul(config.max_identity_bytes)
-                .ok_or(JournalError::InvalidConfig)?,
-        )?;
-        total = add(
-            total,
-            slots(config.max_members, size_of::<BootstrapMemberIdentity>())?,
-        )?;
-        total = add(total, config.max_membership_bytes)?;
-        total = add(total, slots(config.max_cuts, size_of::<NativeCut>())?)?;
-        total = add(total, config.max_cut_bytes)?;
-        total = add(
-            total,
-            config
-                .max_cuts
-                .checked_mul(config.max_cut_bytes)
-                .ok_or(JournalError::InvalidConfig)?,
-        )?;
-        // C's immutable writer cuts coexist with the advancing B cuts while
-        // encoding and throughout donor service.
-        total = add(total, slots(config.max_cuts, size_of::<NativeCut>())?)?;
-        total = add(
-            total,
-            config
-                .max_cuts
-                .checked_mul(config.max_cut_bytes)
-                .ok_or(JournalError::InvalidConfig)?,
-        )?;
-        total = add(total, config.max_scope_bytes)?;
-        total = add(total, config.max_follower_id_bytes)?;
-        // Both live and aborted vectors can retain allocated slots. Each live
-        // follower can additionally retain an exact B with copied roster,
-        // cuts, scope, and donor/follower identities. Returned B/readback
-        // values are physical clones admitted separately by the runtime.
-        let per_follower = slots(1, size_of::<Follower>())?
-            .checked_add(slots(1, size_of::<AbortedFollower>())?)
-            .and_then(|n| n.checked_add(size_of::<BarrierReceipt>()))
-            .and_then(|n| {
-                n.checked_add(slots(config.max_members, size_of::<BootstrapMemberIdentity>()).ok()?)
-            })
-            .and_then(|n| n.checked_add(config.max_membership_bytes))
-            .and_then(|n| n.checked_add(slots(config.max_cuts, size_of::<NativeCut>()).ok()?))
-            .and_then(|n| n.checked_add(config.max_cut_bytes))
-            .and_then(|n| n.checked_add(config.max_cuts.checked_mul(config.max_cut_bytes)?))
-            .and_then(|n| n.checked_add(config.max_scope_bytes.checked_mul(8)?))
-            .and_then(|n| n.checked_add(config.max_follower_id_bytes.checked_mul(8)?))
-            .ok_or(JournalError::InvalidConfig)?;
-        add(
-            total,
-            config
-                .max_followers
-                .checked_mul(per_follower)
-                .ok_or(JournalError::InvalidConfig)?,
-        )
+        config.validate().map_err(JournalError::Config)?;
+        Self::checked_storage_bound(&config).ok_or(JournalError::Config(
+            JournalConfigError::StorageBoundOverflow,
+        ))
     }
 
     /// Immutable finite source limits used to reject incompatible follower
@@ -200,65 +171,71 @@ impl DonorJournal {
     }
 
     fn saved_barrier_fits(&self, receipt: &BarrierReceipt) -> bool {
-        receipt.members.capacity() <= Self::storage_slots(self.config.max_members).unwrap_or(0)
+        receipt.members.capacity()
+            <= Self::storage_slots(self.config.max_members.get()).unwrap_or(0)
             && receipt.covered_cuts.capacity()
-                <= Self::storage_slots(self.config.max_cuts).unwrap_or(0)
+                <= Self::storage_slots(self.config.max_cuts.get()).unwrap_or(0)
             && receipt
                 .covered_cuts
                 .iter()
-                .all(|cut| cut.writer.capacity() <= self.config.max_cut_bytes)
+                .all(|cut| cut.writer.capacity() <= self.config.max_cut_bytes.get())
     }
 
     /// Construct one uncaptured journal with a fresh donor capture identity.
     ///
     /// # Errors
-    /// Rejects invalid identity or resource limits.
+    /// Returns [`JournalError::Config`] for invalid limits or
+    /// [`JournalError::InvalidIdentity`] for an invalid capture identity.
     pub fn new(config: JournalConfig, id: CaptureId) -> Result<Self, JournalError> {
-        let config = config.validate()?;
-        Self::storage_bound(config)?;
+        config.validate().map_err(JournalError::Config)?;
+        let max_scope_bytes = config.max_scope_bytes.get();
         let scope_bytes = id
             .scope
             .domain
             .len()
             .checked_add(id.scope.partition.len())
-            .ok_or(JournalError::InvalidConfig)?;
+            .ok_or(JournalError::InvalidIdentity)?;
         if id.scope.domain.is_empty()
             || id.scope.partition.is_empty()
-            || scope_bytes > config.max_scope_bytes
+            || scope_bytes > max_scope_bytes
             || id
                 .scope
                 .domain
                 .capacity()
                 .checked_add(id.scope.partition.capacity())
-                .is_none_or(|capacity| capacity > config.max_scope_bytes)
+                .is_none_or(|capacity| capacity > max_scope_bytes)
             || id.donor.node.as_str().is_empty()
-            || id.donor.node.as_str().len() > config.max_follower_id_bytes
+            || id.donor.node.as_str().len() > config.max_follower_id_bytes.get()
             || id.donor.incarnation.0 == 0
             || id.donor.session == 0
             || id.donor.attempt == 0
             || id.recovery_generation == 0
             || id.serial == 0
         {
-            return Err(JournalError::InvalidConfig);
+            return Err(JournalError::InvalidIdentity);
         }
         // Fix all growable core vectors at their configured ceilings. A
         // platform allocator may return more slots than requested, so verify
         // the actual capacities against the charged headroom before use.
+        let max_events = config.max_events.get();
+        let max_followers = config.max_followers.get();
         let mut deltas = Vec::new();
         let mut followers = Vec::new();
         let mut aborted = Vec::new();
         deltas
-            .try_reserve_exact(config.max_events)
+            .try_reserve_exact(max_events)
             .map_err(|_| JournalError::Capacity)?;
         followers
-            .try_reserve_exact(config.max_followers)
+            .try_reserve_exact(max_followers)
             .map_err(|_| JournalError::Capacity)?;
         aborted
-            .try_reserve_exact(config.max_followers)
+            .try_reserve_exact(max_followers)
             .map_err(|_| JournalError::Capacity)?;
-        if deltas.capacity() > Self::storage_slots(config.max_events)?
-            || followers.capacity() > Self::storage_slots(config.max_followers)?
-            || aborted.capacity() > Self::storage_slots(config.max_followers)?
+        let event_slots = Self::storage_slots(max_events).ok_or(JournalError::Capacity)?;
+        let follower_slots = Self::storage_slots(max_followers).ok_or(JournalError::Capacity)?;
+        if deltas.capacity() > event_slots
+            || followers.capacity() > follower_slots
+            || aborted.capacity() > follower_slots
         {
             return Err(JournalError::Capacity);
         }
@@ -461,7 +438,7 @@ impl DonorJournal {
     }
 
     fn valid_members(&self, members: &[BootstrapMemberIdentity]) -> Result<(), JournalError> {
-        if members.is_empty() || members.len() > self.config.max_members {
+        if members.is_empty() || members.len() > self.config.max_members.get() {
             return Err(JournalError::Capacity);
         }
         let mut bytes = 0usize;
@@ -469,8 +446,8 @@ impl DonorJournal {
             bytes = bytes
                 .checked_add(member.node.as_str().len())
                 .ok_or(JournalError::Capacity)?;
-            if !member.valid_bounded(self.config.max_follower_id_bytes)
-                || bytes > self.config.max_membership_bytes
+            if !member.valid_bounded(self.config.max_follower_id_bytes.get())
+                || bytes > self.config.max_membership_bytes.get()
                 || (index > 0 && members[index - 1].node >= member.node)
             {
                 return Err(JournalError::Capacity);
@@ -486,7 +463,7 @@ impl DonorJournal {
     }
 
     fn valid_cuts(&self, cuts: &[NativeCut]) -> Result<(), JournalError> {
-        if cuts.len() > self.config.max_cuts {
+        if cuts.len() > self.config.max_cuts.get() {
             return Err(JournalError::Capacity);
         }
         let mut bytes = 0usize;
@@ -496,7 +473,7 @@ impl DonorJournal {
                 .ok_or(JournalError::Capacity)?;
             if cut.writer.is_empty()
                 || cut.epoch == 0
-                || bytes > self.config.max_cut_bytes
+                || bytes > self.config.max_cut_bytes.get()
                 || (index > 0 && cuts[index - 1].writer >= cut.writer)
             {
                 return Err(JournalError::Capacity);
@@ -527,8 +504,8 @@ impl DonorJournal {
         }
         if planned_encoded == 0
             || planned_decoded == 0
-            || planned_encoded > self.config.max_encoded_bytes
-            || planned_decoded > self.config.max_decoded_bytes
+            || planned_encoded > self.config.max_encoded_bytes.get()
+            || planned_decoded > self.config.max_decoded_bytes.get()
         {
             self.invalidate_inner(Invalidation::Capacity);
             return Err(JournalError::Capacity);
@@ -546,11 +523,11 @@ impl DonorJournal {
         }
         // A caller may pass a short Vec with an enormous retained capacity.
         // Reject that allocation before the journal takes ownership of it.
-        if members.capacity() > Self::storage_slots(self.config.max_members)?
-            || cuts.capacity() > Self::storage_slots(self.config.max_cuts)?
+        if members.capacity() > Self::storage_slots(self.config.max_members.get()).unwrap_or(0)
+            || cuts.capacity() > Self::storage_slots(self.config.max_cuts.get()).unwrap_or(0)
             || cuts
                 .iter()
-                .any(|cut| cut.writer.capacity() > self.config.max_cut_bytes)
+                .any(|cut| cut.writer.capacity() > self.config.max_cut_bytes.get())
         {
             self.invalidate_inner(Invalidation::Capacity);
             return Err(JournalError::Capacity);
@@ -577,7 +554,7 @@ impl DonorJournal {
         Ok(CaptureCharge {
             encoded_bytes: planned_encoded,
             decoded_bytes: planned_decoded,
-            suffix_bytes: self.config.max_suffix_bytes,
+            suffix_bytes: self.config.max_suffix_bytes.get(),
             started: now,
         })
     }
@@ -607,7 +584,7 @@ impl DonorJournal {
         self.charge = Some(CaptureCharge {
             encoded_bytes: actual_encoded,
             decoded_bytes: actual_decoded,
-            suffix_bytes: self.config.max_suffix_bytes,
+            suffix_bytes: self.config.max_suffix_bytes.get(),
             started: self.capture_started.ok_or(JournalError::Stage)?,
         });
         self.state = JournalState::Active;
@@ -752,15 +729,15 @@ impl DonorJournal {
         };
         if identity_bytes == 0
             || effect.is_empty()
-            || effect.capacity() > self.config.max_event_bytes
+            || effect.capacity() > self.config.max_event_bytes.get()
             || match &identity {
                 DeltaIdentity::Native(cut) => cut.writer.capacity(),
                 DeltaIdentity::Local(id) => id.capacity(),
-            } > self.config.max_identity_bytes
-            || identity_bytes > self.config.max_identity_bytes
-            || event_bytes > self.config.max_event_bytes
-            || total_bytes > self.config.max_suffix_bytes
-            || self.deltas.len() >= self.config.max_events
+            } > self.config.max_identity_bytes.get()
+            || identity_bytes > self.config.max_identity_bytes.get()
+            || event_bytes > self.config.max_event_bytes.get()
+            || total_bytes > self.config.max_suffix_bytes.get()
+            || self.deltas.len() >= self.config.max_events.get()
         {
             self.invalidate_inner(Invalidation::Capacity);
             return Err(JournalError::Capacity);

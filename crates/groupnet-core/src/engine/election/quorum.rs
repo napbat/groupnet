@@ -96,7 +96,7 @@
 //! is already sized well above the gossip cadence, and it is stated here rather
 //! than papered over. The mis-attribution is impossible at all while the
 //! **claim→grant round trip — ≈2·(latency + jitter) — stays under
-//! `anti_entropy_interval_ms`**: a grant can only be counted into the wrong
+//! `gossip_interval_ms`**: a grant can only be counted into the wrong
 //! round if it is still in flight when the next one opens, and it has a claim's
 //! flight time *and* its own to cover before then. It is a round trip that has
 //! to fit inside the cadence, not a one-way hop.
@@ -126,7 +126,7 @@
 use std::collections::BTreeSet;
 
 use crate::config::{Activation, VoterRoster};
-use crate::{Config, Effect, GroupEngine, GroupId, NodeId, Time, wire};
+use crate::{Config, ConfigError, Effect, GroupEngine, GroupId, NodeId, Time, wire};
 
 use super::{Election, Role};
 
@@ -324,15 +324,19 @@ impl GroupEngine {
     /// See [`RecoveredGrant`] for the contract, and in particular for why
     /// recovery restores the granted **pair** and not the instant it was
     /// granted at.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// The [`ConfigError`] from [`Config::validate`] when `config` breaks one of
+    /// its rules, exactly as [`new`](GroupEngine::new) reports it.
     pub fn with_recovered(
         group: GroupId,
         local: NodeId,
         seeds: impl IntoIterator<Item = NodeId>,
         config: Config,
         recovered: RecoveredGrant,
-    ) -> Self {
-        let mut engine = Self::new(group, local, seeds, config);
+    ) -> Result<Self, ConfigError> {
+        let mut engine = Self::new(group, local, seeds, config)?;
         if let Some(q) = engine.quorum_mut() {
             match recovered.0 {
                 // Attested never-granted: nothing to restore, and the boot
@@ -342,7 +346,7 @@ impl GroupEngine {
                 Some(pair) => q.granted = Some(pair),
             }
         }
-        engine
+        Ok(engine)
     }
 
     /// The `(epoch, claimant)` pair this node has granted as a voter, if any.

@@ -17,8 +17,16 @@
 //! platform computes byte-identical placement — no floating-point `ln`, no
 //! cross-machine drift. (`std`'s `DefaultHasher` is deliberately not stable and
 //! must never be used here.)
+//!
+//! # Input shape
+//!
+//! Both functions take their members as a keyed collection: [`owner`] an
+//! unweighted [`BTreeSet`] of nodes, [`owners`] a [`BTreeMap`] from node to
+//! weight. A node therefore appears at most once by construction, so a
+//! returned replica set is always distinct and the ranking cannot depend on
+//! the order a caller listed members in.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::NodeId;
 
@@ -72,14 +80,15 @@ fn node_score(key: &str, node: &NodeId, weight: u32) -> u64 {
 
 /// Ranks `members` for `key` and returns the top `replicas` owners, best first.
 ///
-/// Each member is `(node, weight)`; a weight of `0` makes a node ineligible.
-/// Deterministic and order-independent: the same inputs always yield the same
-/// ranking on any machine. The primary owner is `owners(..)[0]`.
+/// `members` maps each node to its weight; a weight of `0` makes a node
+/// ineligible. Deterministic: the same inputs always yield the same ranking on
+/// any machine, and the owners are distinct because the map holds each node
+/// once. The primary owner is `owners(..)[0]`.
 #[must_use]
-pub fn owners(key: &str, members: &[(NodeId, u32)], replicas: usize) -> Vec<NodeId> {
+pub fn owners(key: &str, members: &BTreeMap<NodeId, u32>, replicas: usize) -> Vec<NodeId> {
     let mut ranked: Vec<(u64, &NodeId)> = members
         .iter()
-        .filter(|(_, weight)| *weight > 0)
+        .filter(|(_, weight)| **weight > 0)
         .map(|(node, weight)| (node_score(key, node, *weight), node))
         .collect();
     // Highest score first; ties broken by node id (ascending) for determinism.
@@ -140,8 +149,8 @@ mod tests {
         format!("key-{i}")
     }
 
-    /// A random member set of `n` nodes, each weight in `1..=max_weight`.
-    fn members(rng: &mut Rng, n: u32, max_weight: u32) -> Vec<(NodeId, u32)> {
+    /// A random member map of `n` nodes, each weight in `1..=max_weight`.
+    fn members(rng: &mut Rng, n: u32, max_weight: u32) -> BTreeMap<NodeId, u32> {
         (0..n)
             .map(|i| (node(i), 1 + rng.below(max_weight)))
             .collect()
@@ -153,7 +162,7 @@ mod tests {
         for _ in 0..200 {
             let n = 1 + rng.below(10);
             let set: BTreeSet<NodeId> = (0..n).map(node).collect();
-            let unit: Vec<(NodeId, u32)> = set.iter().map(|id| (id.clone(), 1)).collect();
+            let unit: BTreeMap<NodeId, u32> = set.iter().map(|id| (id.clone(), 1)).collect();
             for k in 0..50 {
                 let key = key(rng.next_u64() ^ k);
                 assert_eq!(owner(&key, &set), owners(&key, &unit, 1).into_iter().next());
@@ -161,18 +170,21 @@ mod tests {
         }
     }
 
+    /// The map is built from members listed in any order, so the ranking can
+    /// never depend on the order a caller happened to insert them.
     #[test]
-    fn deterministic_and_order_independent() {
+    fn deterministic_and_insertion_order_independent() {
         let mut rng = Rng::new(2);
         for _ in 0..300 {
             let n = 1 + rng.below(12);
             let m = members(&mut rng, n, 5);
-            let mut shuffled = m.clone();
+            let mut listed: Vec<(NodeId, u32)> = m.iter().map(|(id, w)| (id.clone(), *w)).collect();
             // Fisher-Yates with the deterministic rng.
-            for i in (1..shuffled.len()).rev() {
+            for i in (1..listed.len()).rev() {
                 let bound = u32::try_from(i).expect("member sets here are tiny") + 1;
-                shuffled.swap(i, rng.below(bound) as usize);
+                listed.swap(i, rng.below(bound) as usize);
             }
+            let shuffled: BTreeMap<NodeId, u32> = listed.into_iter().collect();
             let r = 1 + rng.below(4) as usize;
             let k = key(rng.next_u64());
             assert_eq!(owners(&k, &m, r), owners(&k, &shuffled, r));
@@ -201,7 +213,7 @@ mod tests {
     )]
     fn unit_weights_spread_load_uniformly() {
         let n = 10u32;
-        let m: Vec<(NodeId, u32)> = (0..n).map(|i| (node(i), 1)).collect();
+        let m: BTreeMap<NodeId, u32> = (0..n).map(|i| (node(i), 1)).collect();
         let keys = 50_000u64;
         let mut counts = vec![0u64; n as usize];
         for k in 0..keys {
@@ -233,7 +245,7 @@ mod tests {
         // Weights 1,1,2,4 → expected shares 1/8, 1/8, 2/8, 4/8.
         let weights = [1u32, 1, 2, 4];
         let total: u32 = weights.iter().sum();
-        let m: Vec<(NodeId, u32)> = (0u32..).zip(weights).map(|(i, w)| (node(i), w)).collect();
+        let m: BTreeMap<NodeId, u32> = (0u32..).zip(weights).map(|(i, w)| (node(i), w)).collect();
         let keys = 120_000u64;
         let mut counts = vec![0u64; weights.len()];
         for k in 0..keys {
@@ -263,9 +275,9 @@ mod tests {
         for _ in 0..100 {
             let n = 2 + rng.below(8);
             let m = members(&mut rng, n, 4);
-            let victim = rng.below(n) as usize;
+            let removed = node(rng.below(n));
             let mut reduced = m.clone();
-            let removed = reduced.remove(victim).0;
+            reduced.remove(&removed);
 
             for k in 0..2_000u64 {
                 let key = key(rng.next_u64() ^ k);
@@ -291,7 +303,7 @@ mod tests {
             let before_members = members(&mut rng, n, 4);
             let newcomer = (node(1000), 1 + rng.below(4));
             let mut after_members = before_members.clone();
-            after_members.push(newcomer.clone());
+            after_members.insert(newcomer.0.clone(), newcomer.1);
 
             for k in 0..2_000u64 {
                 let key = key(rng.next_u64() ^ k);
@@ -312,9 +324,9 @@ mod tests {
         for _ in 0..100 {
             let n = 4 + rng.below(6);
             let m = members(&mut rng, n, 4);
-            let victim = rng.below(n) as usize;
+            let removed = node(rng.below(n));
             let mut reduced = m.clone();
-            let removed = reduced.remove(victim).0;
+            reduced.remove(&removed);
 
             for k in 0..1_500u64 {
                 let key = key(rng.next_u64() ^ k);
@@ -340,7 +352,7 @@ mod tests {
         }
     }
 
-    fn owner_of(key: &str, members: &[(NodeId, u32)]) -> NodeId {
+    fn owner_of(key: &str, members: &BTreeMap<NodeId, u32>) -> NodeId {
         owners(key, members, 1).into_iter().next().unwrap()
     }
 }

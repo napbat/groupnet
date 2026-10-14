@@ -89,10 +89,10 @@ fn proof(scope: &Scope, head: u64, retained: u64) -> SourceProof {
 fn policy() -> RetentionPolicy {
     RetentionPolicy {
         fingerprint: vec![7],
-        max_bytes: 4096,
-        max_events: 128,
+        max_bytes: std::num::NonZeroU64::new(4096).unwrap(),
+        max_events: std::num::NonZeroU64::new(128).unwrap(),
         max_age_ms: 60_000,
-        max_lag_events: 128,
+        max_lag_events: std::num::NonZeroU64::new(128).unwrap(),
     }
 }
 
@@ -405,7 +405,7 @@ fn limits() -> Limits {
     limits.core.tail_check_ms = 20;
     limits.core.retry_ms = 10;
     limits.core.attempt_timeout_ms = 500;
-    limits.core.max_batch_bytes = 1024;
+    limits.core.max_batch_bytes = std::num::NonZeroUsize::new(1024).unwrap();
     limits.max_inflight_bytes = 2048;
     limits
 }
@@ -641,7 +641,7 @@ async fn two_names_progress_with_one_operation_and_one_batch_of_bytes() {
     let mut bounds = limits();
     bounds.max_scopes = 2;
     bounds.max_parallel_ops = 1;
-    bounds.max_inflight_bytes = bounds.core.max_batch_bytes;
+    bounds.max_inflight_bytes = bounds.core.max_batch_bytes.get();
     let source = MemSource::default();
     let sink = MemSink::default();
     let manager = Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, bounds)

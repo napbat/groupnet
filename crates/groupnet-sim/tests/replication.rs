@@ -182,7 +182,7 @@ fn seeded_loss_reorder_partition_and_restart_preserve_replay_safety() {
             tail_check_ms: 10,
             retry_ms: 10,
             attempt_timeout_ms: 200,
-            max_retries: 8,
+            max_retries: std::num::NonZeroU32::new(8).unwrap(),
             ..Config::default()
         };
         let mut nodes: Vec<_> = (0..3)

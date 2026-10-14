@@ -28,6 +28,7 @@
 //!   yielded rounds rather than one per anti-entropy interval for ever.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
 use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
@@ -52,17 +53,12 @@ fn hosted(activation: Activation) -> Config {
         probe_timeout_ms: 40,
         suspect_timeout_ms: 120,
         dead_timeout_ms: 1_000,
-        indirect_probes: 2,
-        fanout: 4,
-        anti_entropy_interval_ms: GOSSIP_INTERVAL_MS,
-        anti_entropy_fanout: 2,
-        eager_push: true,
-        full_digest_every: 4,
-        max_delta_frame_bytes: 4_096,
+        max_delta_frame_bytes: NonZeroUsize::new(4_096).expect("nonzero"),
         mode: GroupMode::Hosted(HostedConfig {
             activation,
             lease_ms: LEASE_MS,
         }),
+        ..Config::default()
     }
 }
 
@@ -85,14 +81,15 @@ fn cluster(group: &str, members: &BTreeSet<NodeId>, config: &Config) -> Simulati
     sim.enable_anchor(LEASE_MS, STEAL_MARGIN_MS);
     sim.set_anchor_latency(ANCHOR_LATENCY_MS);
     for id in members {
-        sim.add(engine(group, id, members, config));
+        sim.add(engine(group, id, members, config))
+            .expect("distinct node");
     }
     sim
 }
 
 fn engine(group: &str, id: &NodeId, peers: &BTreeSet<NodeId>, config: &Config) -> GroupEngine {
     let seeds = peers.iter().filter(|x| *x != id).cloned();
-    GroupEngine::new(GroupId::new(group), id.clone(), seeds, config.clone())
+    GroupEngine::new(GroupId::new(group), id.clone(), seeds, config.clone()).expect("valid config")
 }
 
 /// An `(epoch, host)` pair: the unit that names a serializer.
@@ -211,7 +208,11 @@ fn a_group_whose_top_ranked_node_lost_the_anchor_stays_hostless() {
     // The premise, asserted rather than assumed: the group is *healthy*. Every
     // node sees every other, and the pinned node is the rendezvous owner.
     for node in &members {
-        assert_eq!(sim.members_of(node), members, "{node} lost sight of a peer");
+        assert_eq!(
+            sim.members_of(node).expect("member is in the simulation"),
+            members,
+            "{node} lost sight of a peer"
+        );
     }
 
     // Heal it, and the group is elected on the next prompt.
@@ -260,7 +261,7 @@ fn a_returning_top_ranked_node_without_the_anchor_unseats_a_working_host() {
     sim.run_until(Time(2_000));
     assert_eq!(sole_host(&sim, label), top, "the premise: rank elected it");
 
-    sim.crash(&top);
+    sim.crash(&top).expect("live node");
     sim.run_until(Time(5_000));
     let incumbent = sole_host(&sim, &format!("{label} (after the crash)"));
     assert_ne!(incumbent, top);
@@ -276,7 +277,8 @@ fn a_returning_top_ranked_node_without_the_anchor_unseats_a_working_host() {
     // the incumbent regardless, which is all row X7 reads.
     let back_at = 5_000;
     sim.block_anchor(&top);
-    sim.add(engine(group, &top, &members, &cfg()));
+    sim.add(engine(group, &top, &members, &cfg()))
+        .expect("distinct node");
 
     let mut lapsed_at = None;
     step_through(&mut sim, back_at + 8_000, |sim, at| {
@@ -310,7 +312,11 @@ fn a_returning_top_ranked_node_without_the_anchor_unseats_a_working_host() {
     // The premise, asserted rather than assumed: the deposed incumbent is
     // healthy, connected, and could have reached the anchor the whole time.
     for node in &members {
-        assert_eq!(sim.members_of(node), members, "{node} lost sight of a peer");
+        assert_eq!(
+            sim.members_of(node).expect("member is in the simulation"),
+            members,
+            "{node} lost sight of a peer"
+        );
     }
     assert!(
         rounds_by(&sim, &incumbent, AnchorEvent::Renew, back_at - 1_000) > 0,
@@ -399,7 +405,7 @@ fn an_incumbent_that_loses_rank_lapses_and_the_rendezvous_top_takes_it_back() {
     sim.run_until(Time(2_000));
     assert_eq!(sole_host(&sim, label), top, "the premise: rank elected it");
 
-    sim.crash(&top);
+    sim.crash(&top).expect("live node");
     sim.run_until(Time(5_000));
     let successor = sole_host(&sim, &format!("{label} (after the crash)"));
     assert_ne!(successor, top);
@@ -408,7 +414,8 @@ fn an_incumbent_that_loses_rank_lapses_and_the_rendezvous_top_takes_it_back() {
     // The top-ranked node returns. It outranks the incumbent again the moment
     // gossip re-admits it — and from that instant nothing prompts the incumbent.
     let back_at = 5_000;
-    sim.add(engine(group, &top, &members, &cfg()));
+    sim.add(engine(group, &top, &members, &cfg()))
+        .expect("distinct node");
     let (mut lapsed_at, mut retaken_at) = (None, None);
     step_through(&mut sim, back_at + 10_000, |sim, at| {
         if lapsed_at.is_none() && sim.role_of(&successor) != Some(Role::Host) {
@@ -429,7 +436,11 @@ fn an_incumbent_that_loses_rank_lapses_and_the_rendezvous_top_takes_it_back() {
     );
 
     assert!(
-        sim.is_member(&successor, &top) && sim.is_member(&top, &successor),
+        sim.is_member(&successor, &top)
+            .expect("successor is in the simulation")
+            && sim
+                .is_member(&top, &successor)
+                .expect("top is in the simulation"),
         "premise: the returning node is a live member again"
     );
     assert_eq!(

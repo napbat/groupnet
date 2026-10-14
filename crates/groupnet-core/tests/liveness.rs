@@ -39,10 +39,10 @@ fn two_node_probe_leads_to_suspect_then_dead() {
         probe_timeout_ms: 50,
         suspect_timeout_ms: 200,
         gossip_interval_ms: 100,
-        anti_entropy_interval_ms: 100,
         ..Config::default()
     };
-    let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [NodeId::new("b")], cfg);
+    let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [NodeId::new("b")], cfg)
+        .expect("valid config");
     a.on_message(
         NodeId::new("b"),
         &digest_frame(vec![ndigest("b", 0, Status::Alive, 0)], vec![]),
@@ -68,7 +68,8 @@ fn direct_miss_escalates_to_indirect_before_suspecting() {
         probe_timeout_ms: 50,
         ..Config::default()
     };
-    let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], cfg);
+    let mut a =
+        GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], cfg).expect("valid config");
     // Learn b and c.
     a.on_message(
         NodeId::new("b"),
@@ -182,7 +183,6 @@ fn since_cfg() -> Config {
         probe_timeout_ms: 50,
         suspect_timeout_ms: 200,
         gossip_interval_ms: 100,
-        anti_entropy_interval_ms: 100,
         ..Config::default()
     }
 }
@@ -195,7 +195,8 @@ fn engine_knowing_b() -> GroupEngine {
         NodeId::new("a"),
         [NodeId::new("b")],
         since_cfg(),
-    );
+    )
+    .expect("valid config");
     a.on_message(
         NodeId::new("b"),
         &digest_frame(vec![ndigest("b", 0, Status::Alive, 0)], vec![]),

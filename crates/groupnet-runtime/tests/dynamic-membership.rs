@@ -9,6 +9,7 @@ use groupnet_transport::admission::{
 };
 use groupnet_transport::link::{AdmittedInbound, BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
+use std::num::NonZeroU64;
 use std::{io, time::Duration};
 use tokio::sync::{Mutex, mpsc};
 
@@ -96,8 +97,7 @@ async fn start(endpoint: Endpoint) -> io::Result<Node> {
         })
         .config(Config {
             gossip_interval_ms: 30,
-            anti_entropy_interval_ms: 30,
-            full_digest_every: 1,
+            full_digest_every: NonZeroU64::MIN,
             probe_interval_ms: 30,
             probe_timeout_ms: 20,
             suspect_timeout_ms: 60,

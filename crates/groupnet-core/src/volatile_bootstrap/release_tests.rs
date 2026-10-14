@@ -8,9 +8,9 @@ const GRACE_MS: u64 = 8 + 12 + 5;
 
 fn config() -> BootstrapConfig {
     BootstrapConfig {
-        max_members: 8,
-        max_member_bytes: 32,
-        max_scope_bytes: 64,
+        max_members: std::num::NonZeroUsize::new(8).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+        max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
         settle_ms: 3,
         renew_ms: 4,
         claim_ttl_ms: 12,

@@ -192,7 +192,7 @@ pub(super) struct Election {
     /// cursor, deliberately not the anti-entropy round's.
     ///
     /// Both fire on the same tick and both would advance one shared cursor by
-    /// `anti_entropy_fanout`, so over a candidate list of `2 · fanout` peers
+    /// `gossip_fanout`, so over a candidate list of `2 · gossip_fanout` peers
     /// (four, at the default fanout of two) the stride aliases exactly: each
     /// call is pinned to a fixed window and the beacon re-teaches the same
     /// peers forever. The peers outside it never hear the adopted pair again
@@ -523,7 +523,7 @@ impl GroupEngine {
         effects
     }
 
-    /// Row 7's targets: `anti_entropy_fanout` dissemination targets, rotated on
+    /// Row 7's targets: `gossip_fanout` dissemination targets, rotated on
     /// [`Election::beacon_cursor`] so successive rounds cover every peer.
     ///
     /// Same selection as the anti-entropy round's, on a cursor of its own —
@@ -535,7 +535,7 @@ impl GroupEngine {
         if n == 0 {
             return Vec::new();
         }
-        let k = self.config.anti_entropy_fanout.max(1).min(n);
+        let k = self.config.gossip_fanout.get().min(n);
         let start = self.election.as_ref().map_or(0, |el| el.beacon_cursor);
         if let Some(el) = self.election.as_mut() {
             el.beacon_cursor = start.wrapping_add(k);

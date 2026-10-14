@@ -1,3 +1,5 @@
+use std::num::{NonZeroU32, NonZeroUsize};
+
 use super::*;
 use crate::NodeId;
 use crate::Status;
@@ -44,18 +46,18 @@ fn member(name: &str, session: u64) -> BootstrapMemberIdentity {
 
 fn config() -> TransferConfig {
     TransferConfig {
-        expected_schema: 1,
-        max_metadata_bytes: 32,
-        max_encoded_bytes: 16,
-        max_decoded_bytes: 16,
-        max_chunk_bytes: 8,
-        max_chunks: 4,
-        max_batch_bytes: 16,
-        max_batch_events: 3,
-        max_replay_events: 5,
-        max_native_buffer_bytes: 8,
-        max_members: 2,
-        max_cuts: 1,
+        expected_schema: NonZeroU32::MIN,
+        max_metadata_bytes: NonZeroUsize::new(32).unwrap(),
+        max_encoded_bytes: NonZeroUsize::new(16).unwrap(),
+        max_decoded_bytes: NonZeroUsize::new(16).unwrap(),
+        max_chunk_bytes: NonZeroUsize::new(8).unwrap(),
+        max_chunks: NonZeroUsize::new(4).unwrap(),
+        max_batch_bytes: NonZeroUsize::new(16).unwrap(),
+        max_batch_events: NonZeroUsize::new(3).unwrap(),
+        max_replay_events: NonZeroUsize::new(5).unwrap(),
+        max_native_buffer_bytes: NonZeroUsize::new(8).unwrap(),
+        max_members: NonZeroUsize::new(2).unwrap(),
+        max_cuts: NonZeroUsize::MIN,
         coverage_poll_ms: 2,
     }
 }
@@ -715,7 +717,7 @@ fn local_identity_and_schema_must_match_before_stage_admission() {
     wrong_local.follower.session = 10;
     assert_eq!(
         TransferSession::new(config(), wrong_local, Time(0)).map(|_| ()),
-        Err(TransferError::InvalidConfig)
+        Err(TransferError::InvalidBinding)
     );
     let mut engine = TransferSession::new(config(), binding(), Time(0)).unwrap();
     let mut next = 1;

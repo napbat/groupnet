@@ -57,12 +57,10 @@ fn run(seed: u64) {
     };
     for id in &ids {
         let seeds = all.iter().filter(|x| *x != id).cloned();
-        sim.add(GroupEngine::new(
-            group.clone(),
-            id.clone(),
-            seeds,
-            cfg.clone(),
-        ));
+        sim.add(
+            GroupEngine::new(group.clone(), id.clone(), seeds, cfg.clone()).expect("valid config"),
+        )
+        .expect("distinct node");
     }
 
     // Each node accumulates its own increments/decrements (its CRDT contribution).
@@ -91,7 +89,8 @@ fn run(seed: u64) {
                 } else {
                     dec[i] += 1;
                 }
-                sim.command(&ids[i], Command::SetLocalState(encode(inc[i], dec[i])));
+                sim.command(&ids[i], Command::SetLocalState(encode(inc[i], dec[i])))
+                    .expect("live node");
             }
         }
     }

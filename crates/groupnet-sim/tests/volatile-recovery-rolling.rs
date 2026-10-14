@@ -348,9 +348,9 @@ fn handoff(recovery: RecoveryOperation) -> NativeHandoffReceipt {
 /// s3cache's production recovery configuration.
 fn config() -> RecoveryConfig {
     RecoveryConfig {
-        max_members: 256,
-        max_member_bytes: 256,
-        max_barrier_rounds: 4,
+        max_members: std::num::NonZeroUsize::new(256).unwrap(),
+        max_member_bytes: std::num::NonZeroUsize::new(256).unwrap(),
+        max_barrier_rounds: std::num::NonZeroU32::new(4).unwrap(),
         total_ms: 600_000,
         attempt_ms: 60_000,
         settle_ms: LEASE_MS,

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::config::{Config, GroupMode};
+use crate::config::{Config, ConfigError, GroupMode};
 use crate::membership::{Member, Status};
 use crate::{GroupId, NodeId, Time, placement, wire};
 
@@ -137,12 +137,18 @@ impl GroupEngine {
     ///
     /// `seeds` are contact nodes to bootstrap against; membership starts as just
     /// `{local}` (alive) and grows as gossip converges.
+    ///
+    /// # Errors
+    ///
+    /// The [`ConfigError`] from [`Config::validate`] when `config` breaks one of
+    /// its rules. The engine never corrects a value it was given.
     pub fn new(
         group: GroupId,
         local: NodeId,
         seeds: impl IntoIterator<Item = NodeId>,
         config: Config,
-    ) -> Self {
+    ) -> Result<Self, ConfigError> {
+        config.validate()?;
         let mut members = BTreeMap::new();
         // Construction has no clock of its own; the local node has been Alive
         // since the origin of this engine's logical timeline.
@@ -183,7 +189,7 @@ impl GroupEngine {
             stats: NetStats::default(),
         };
         engine.coordinator = engine.compute_coordinator();
-        engine
+        Ok(engine)
     }
 
     /// Cumulative anti-entropy traffic counters (see [`NetStats`]).
@@ -414,7 +420,7 @@ impl GroupEngine {
     /// current time.
     pub fn start(&mut self, now: Time) -> Vec<Effect> {
         self.now_hint = self.now_hint.max(now);
-        self.next_anti_entropy = now.saturating_add(self.anti_entropy_interval());
+        self.next_anti_entropy = now.saturating_add(self.config.gossip_interval_ms);
         self.next_probe = now.saturating_add(self.config.probe_interval_ms);
         self.election_start(now);
         let mut effects = self.disseminate_digest(now);
@@ -574,7 +580,7 @@ impl GroupEngine {
         // 5. Run the anti-entropy digest round.
         let anti_entropy_due = now >= self.next_anti_entropy;
         if anti_entropy_due {
-            self.next_anti_entropy = now.saturating_add(self.anti_entropy_interval());
+            self.next_anti_entropy = now.saturating_add(self.config.gossip_interval_ms);
             effects.extend(self.disseminate_digest(now));
         }
 

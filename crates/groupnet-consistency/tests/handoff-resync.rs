@@ -96,7 +96,7 @@ fn decode(bytes: &[u8]) -> Option<String> {
 /// claim guard reads, so the first entry is the node that will bid and the
 /// **last** is one that can never claim while anything above it lives.
 fn ranked(group: &str, ids: &[&str]) -> Vec<NodeId> {
-    let members: Vec<(NodeId, u32)> = ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
+    let members: BTreeMap<NodeId, u32> = ids.iter().map(|id| (NodeId::new(*id), 1)).collect();
     placement::owners(group, &members, ids.len())
 }
 

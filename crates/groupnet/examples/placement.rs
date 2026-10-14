@@ -8,7 +8,7 @@
 //! cargo run --example placement
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use groupnet::core::NodeId;
 use groupnet::core::placement::{owner, owners};
@@ -16,7 +16,7 @@ use groupnet::core::placement::{owner, owners};
 fn main() {
     // Members with capacity weights: node-c is twice as beefy, so it should win
     // roughly twice as many keys.
-    let members: Vec<(NodeId, u32)> = [("node-a", 1), ("node-b", 1), ("node-c", 2)]
+    let members: BTreeMap<NodeId, u32> = [("node-a", 1), ("node-b", 1), ("node-c", 2)]
         .into_iter()
         .map(|(id, weight)| (NodeId::new(id), weight))
         .collect();
@@ -33,10 +33,10 @@ fn main() {
     // Rendezvous hashing's defining property: removing a node moves only the keys
     // it owned — every other key stays put.
     println!("\nRemove node-c; only its keys move:");
-    let reduced: Vec<(NodeId, u32)> = members
+    let reduced: BTreeMap<NodeId, u32> = members
         .iter()
         .filter(|(n, _)| n.as_str() != "node-c")
-        .cloned()
+        .map(|(n, w)| (n.clone(), *w))
         .collect();
     for key in keys {
         let before = owners(key, &members, 1)[0].clone();
@@ -47,7 +47,7 @@ fn main() {
 
     // The group coordinator is just the single owner of the group id among live
     // members — the same math, unweighted.
-    let live: BTreeSet<NodeId> = members.iter().map(|(n, _)| n.clone()).collect();
+    let live: BTreeSet<NodeId> = members.keys().cloned().collect();
     let coord = owner("shard-42", &live).expect("non-empty membership");
     println!("\nCoordinator of \"shard-42\" = {coord}");
 }

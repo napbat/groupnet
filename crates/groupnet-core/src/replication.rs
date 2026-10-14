@@ -4,6 +4,12 @@
 //! state. A source adapter supplies scoped, proof-bound comparisons and
 //! contiguous batches; an application adapter reports completed materialization.
 //! The driver executes effects and returns their generation and operation token.
+//!
+//! Every limits value ([`Config`], [`SnapshotConfig`], [`IdlePolicy`],
+//! [`AckWaitLimits`], [`SubscriptionLimits`], [`RetentionPolicy`] and
+//! [`admission::AdmissionPolicy`]) carries its nonzero counts and byte caps as
+//! `NonZero*` fields and checks its remaining millisecond and cross-field
+//! rules in `validate`, returning a typed error whose variant names the field.
 
 mod ack_types;
 pub mod admission;
@@ -16,19 +22,20 @@ mod subscription;
 mod types;
 
 pub use ack_types::{
-    AckEvidence, AckKind, AckTarget, AckWaitError, AckWaitLimits, AckWaitOutcome, AckWaitRequest,
-    CertifiedRoster, RequiredSubscriber,
+    AckEvidence, AckKind, AckTarget, AckWaitError, AckWaitLimits, AckWaitLimitsError,
+    AckWaitOutcome, AckWaitRequest, CertifiedRoster, RequiredSubscriber,
 };
 pub use identity::{Cursor, IdentityError, Scope, SourceHistory, Stream};
-pub use idle::IdlePolicy;
+pub use idle::{IdlePolicy, IdlePolicyError};
 pub use proof::{BoundComparison, Comparison, Coverage, ProofId, SourceProof};
 pub use session::SessionEngine;
-pub use snapshot::{ChunkReceipt, HoldReceipt, SnapshotConfig, SnapshotOffer};
+pub use snapshot::{ChunkReceipt, HoldReceipt, SnapshotConfig, SnapshotConfigError, SnapshotOffer};
 pub use subscription::{
     CommitSubscriberAck, DurableDeliveryReceipt, FencedCheckpoint, RegisterReceipt,
-    RegisterSubscriber, ResumeSubscriber, RetentionPolicy, SourceSubscriberState,
-    SubscriberAckReceipt, SubscriberId, SubscriberKey, SubscriptionEpoch, SubscriptionError,
-    SubscriptionLimits, TerminalReason, TerminalReceipt, TerminalRequest,
+    RegisterSubscriber, ResumeSubscriber, RetentionPolicy, RetentionPolicyError,
+    SourceSubscriberState, SubscriberAckReceipt, SubscriberId, SubscriberKey, SubscriptionEpoch,
+    SubscriptionError, SubscriptionLimits, SubscriptionLimitsError, TerminalReason,
+    TerminalReceipt, TerminalRequest,
 };
 pub use types::{
     ApplyReceipt, Batch, Config, ConfigError, Effect, Event, Mode, Operation, ReadDecision,

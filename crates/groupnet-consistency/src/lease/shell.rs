@@ -192,7 +192,7 @@ fn publish_serve(
 /// The interval a node must have participated before "nobody here holds a
 /// lease" is a fact rather than an artefact of not having looked long enough:
 /// one failure-detection window (so every member it will ever learn about has
-/// had time to appear) plus two anti-entropy rounds (so their entries have had
+/// had time to appear) plus two gossip rounds (so their entries have had
 /// time to arrive).
 ///
 /// Both halves measure against it, for the same reason from opposite ends: a
@@ -205,7 +205,7 @@ fn warmup_window(config: &Config, members: usize) -> Duration {
     Duration::from_millis(
         config
             .detection_window_ms(members)
-            .saturating_add(config.anti_entropy_interval_ms.saturating_mul(2)),
+            .saturating_add(config.gossip_interval_ms.saturating_mul(2)),
     )
 }
 
@@ -766,9 +766,9 @@ mod tests {
     use super::warmup_window;
 
     #[test]
-    fn the_warmup_window_is_one_detection_window_plus_two_anti_entropy_rounds() {
+    fn the_warmup_window_is_one_detection_window_plus_two_gossip_rounds() {
         let cfg = Config::default();
-        // 2 peers × (100 + 2×50) + 500 suspect = 900, + 2×200 anti-entropy.
+        // 2 peers × (100 + 2×50) + 500 suspect = 900, + 2×200 gossip.
         assert_eq!(cfg.detection_window_ms(3), 900);
         assert_eq!(warmup_window(&cfg, 3), Duration::from_millis(1_300));
         // A group of one has nobody to detect, so the window degenerates to
@@ -786,7 +786,7 @@ mod tests {
             probe_interval_ms: 20,
             probe_timeout_ms: 10,
             suspect_timeout_ms: 50,
-            anti_entropy_interval_ms: 25,
+            gossip_interval_ms: 25,
             ..Config::default()
         };
         // 2 × (20 + 20) + 50 = 130, + 50.
@@ -798,7 +798,7 @@ mod tests {
     fn an_absurd_config_saturates_rather_than_wrapping_to_no_warmup_at_all() {
         let absurd = Config {
             probe_interval_ms: u64::MAX,
-            anti_entropy_interval_ms: u64::MAX,
+            gossip_interval_ms: u64::MAX,
             ..Config::default()
         };
         assert_eq!(warmup_window(&absurd, 3), Duration::from_millis(u64::MAX));

@@ -12,9 +12,9 @@ use groupnet_core::{NodeId, Time};
 use groupnet_sim::SplitMix64;
 
 const CONFIG: BootstrapConfig = BootstrapConfig {
-    max_members: 8,
-    max_member_bytes: 32,
-    max_scope_bytes: 64,
+    max_members: std::num::NonZeroUsize::new(8).unwrap(),
+    max_member_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+    max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
     settle_ms: 3,
     renew_ms: 2,
     claim_ttl_ms: 6,

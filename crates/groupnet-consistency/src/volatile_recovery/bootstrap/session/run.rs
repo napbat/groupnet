@@ -67,8 +67,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         let op = self.engine.begin_roster_observation().ok()?;
         let operation_due = self.operation_due(op, due)?;
         let limits = self.claim_limits(
-            self.config.claim.max_members,
-            self.config.claim.max_member_bytes,
+            self.config.claim.max_members.get(),
+            self.config.claim.max_member_bytes.get(),
         );
         let snapshot = tokio::time::timeout_at(
             tokio::time::Instant::from_std(operation_due),
@@ -525,8 +525,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             BootstrapEffect::ObserveSelectedClaim { op, selected } => {
                 let operation_due = self.operation_due(op, due)?;
                 let limits = self.claim_limits(
-                    self.config.claim.max_members,
-                    self.config.claim.max_member_bytes,
+                    self.config.claim.max_members.get(),
+                    self.config.claim.max_member_bytes.get(),
                 );
                 let observed = tokio::time::timeout_at(
                     tokio::time::Instant::from_std(operation_due),
