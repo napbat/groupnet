@@ -200,7 +200,8 @@ so. The contract, as built:
 
 * **The promise.** `seal()` marks the feed life ended at the position after its
   last write and resolves to that token. It promises that this life publishes
-  nothing more; `publish` after a seal panics, and sealing again resolves to
+  nothing more; `publish` after a seal returns `PublishError::Sealed` and
+  records nothing, and sealing again resolves to
   the same token. Seal only once every write the application made durable has
   been published through the feed — a durable write that bypassed the feed is
   exactly the loss the restart gap covers, and a seal would hide it.
@@ -252,8 +253,28 @@ Two consumers of the crossing sit outside the feed and honor it the same way:
 
 ### T2 — Write-coherence tier (`consistency-acks` feature; today)
 
-Applied-watermark ledgers; `applied_cluster_wide` waits on every member the
-writer currently believes Alive. Bounded-time (not absolute) under asymmetric
+Applied-watermark ledgers. A writer waits over a selection it names, and every
+wait resolves to an `AckOutcome` — the selection basis plus the selected,
+acknowledged and missing members (and, for a selector, the alive members it
+skipped), with `is_complete()` and `is_vacuous()`:
+
+* `applied_cluster_wide` — every member the writer currently believes Alive
+  (`AckBasis::AliveMembers`, re-evaluated per poll);
+* `applied_by_selected` — the Alive members a selector admits
+  (`AckBasis::AliveSelected`); a participant whose `CAP_ACKS` advertisement
+  has not converged is reported in `skipped` rather than silently dropped, and
+  an empty selection is `is_vacuous()` rather than indistinguishable from a
+  full acknowledgement;
+* `applied_by_roster` — a fixed roster the caller names
+  (`AckBasis::FixedRoster`), the only known denominator: liveness neither adds
+  to nor removes from it.
+
+`AckLedger::record` reports only the local operation: `Ok(Recorded::Advanced)`
+(advanced and enqueued), `Ok(Recorded::Covered)` (nothing changed), or
+`Err(CommandRejected)` (advanced locally, enqueue refused — retry with
+`AckLedger::republish`). Nothing claims gossip delivery.
+
+The live-membership waits are bounded-time (not absolute) under asymmetric
 partition inside the probe window — the crate's honesty box stays verbatim.
 At the August 2026 consumer review, s3cache's strong mode was built on this
 tier; the owner judged that construction brittle, motivating the implemented
@@ -304,7 +325,7 @@ protocol refines the sketch above in ways that are now contract:
 
 * **Renewal is confirmed, not asserted.** A reader's serving right derives
   only from renewals that came back: every member folds the renewals it has
-  *adopted* into a wholesale grant-map entry (`~lease:g`), and the reader
+  *adopted* into a wholesale grant-map entry (`~lease/g/<set>`), and the reader
   serves until `D − rate_margin` after the publish instant of the newest
   renewal confirmed by **every** granter it counts. A reader that merely
   re-publishes cannot extend its own lease — the unilateral-extension hole a
@@ -375,6 +396,17 @@ protocol refines the sketch above in ways that are now contract:
   liveness seeds) and `tests/lease-dst-divergence.rs` (96 seeds of
   partitions past the reap horizon, departures and clock-rate skew within the
   margin: no serving reader ever misses a write any node completed).
+* **Construction and entries.** `Leases::new(group, me, cfg)` and
+  `Leases::builder(group, me).name(..).epoch(..).config(..).start()` validate
+  before anything runs: a config outside `LeaseConfig::validate` is
+  `LeaseStartError::InvalidConfig` (one `LeaseConfigError` variant per rule,
+  naming the field — nothing is clamped), no Tokio runtime is
+  `LeaseStartError::NoRuntime`, and either way no task is spawned and nothing
+  is published. The epoch and set name are fixed before the tasks start, so
+  the first renewal on the wire already carries a durable epoch. Entries are
+  `~lease/r/<set>` (renewal) and `~lease/g/<set>` (grant map), where `<set>`
+  is `d` for the default set and `n<len>:<name>` for a named one — no set name
+  is reserved and none can alias another set's entries.
 
 ### M3 — Hosted mode
 
@@ -757,9 +789,10 @@ host. Four reasons this is the right cut, each load-bearing:
 table promised for a minority side: this node is not the host and believes the
 group has none. `NotHost { host: Some(peer) }` is the redirect.
 `Deposed { epoch }` is a fence hit mid-write. `Recovering` is the gate above.
-`Rejected` is reserved for a path that reports bounded-inbox backpressure;
-the current `publish` / `publish_committed` path does **not** return it. Its
-feed advertisement is best-effort and is re-carried on later publication.
+There is no backpressure variant: every `HostedError` is a refusal before the
+write entered the feed. Once admitted, the write is in the feed ring and its
+advertisement is re-carried on later publication even if the group actor's
+inbox refused this one.
 After admission and publication, `publish_committed` reports `Committed`,
 `Deposed` or `TimedOut` through the receipt's outcome, not a pre-publication
 error; a client may be acknowledged only for `Committed`.
@@ -881,7 +914,9 @@ never publishes is invisible to both, so the contract is explicit:
 > (`HostedReads`), apply each event, and call `CommitLedger::record(&host,
 > token)` **after** the apply — and on a `Migrated` event call
 > `CommitLedger::refresh()`, so the stamp tracks the epoch the voter has
-> adopted even while no new writes are arriving. **Bind the subscriber to the
+> adopted even while no new writes are arriving. Both report a refused enqueue
+> as `Err(CommandRejected)` with the advance kept locally; retry with
+> `refresh()`, which re-carries the whole ledger. **Bind the subscriber to the
 > node's own write path** (`HostedWrites::bind`, one line before the loop takes
 > the handle), so that a voter which becomes host cuts its predecessor's lineage
 > at the instant it starts serving — see deviation 2b.
@@ -1528,6 +1563,19 @@ neighbour. Peers upgrade together, so an unknown version is a mis-deployed
 peer: the codec rejects it as `HandoffError::Protocol` and no refusal code
 answers it in-band.
 
+**A chunk is bounded at the donor, before it is sent.** One chunk is one
+data-plane frame behind the six-byte prefix, so `ChunkLimit::MAX` is
+`MAX_FRAME_BYTES` less that prefix. A donor's `Handoff` carries a `ChunkLimit`
+(`MAX` by default, smaller via `with_chunk_limit`) and hands it to
+`SnapshotSource::open(limit)`, so the source sizes its image to a bound it can
+see in the signature rather than read in prose. `offer` checks every chunk
+against that limit before framing it: an oversized chunk never reaches the
+wire, the donor's caller gets `HandoffError::ChunkTooLarge { len, limit }`, and
+the requester sees the stream end without `Done` — `Truncated`, sink dropped,
+nothing installed. The requester needs no matching setting: it accepts any
+chunk up to `MAX`, and the framing's own receive ceiling stays the fail-closed
+check against a donor that skips the limit.
+
 ##### Three verification points, and what they prove
 
 | Point | Check | Refusing means |
@@ -1980,7 +2028,14 @@ the following surfaces; consumers still own policy and migration:
    per-node, per-key consumer-space `u64` floors with TTL, max-folding within
    one publisher life and fallback on an absent/expired/undecodable claim.
    These are routing hints, not durable replay positions or cross-writer
-   aggregates; wrappers such as shard LSN types remain the consumer's.
+   aggregates; wrappers such as shard LSN types remain the consumer's. Each key
+   is its own entry, `~floor/d/<key>` in the default set and
+   `~floor/n<len>:<name>/<key>` in a named one: the explicit default
+   discriminator and the length-prefixed name make the layout injective, so a
+   default-set key can never alias a named set's key (the former
+   `~floor:lsn:s7` collision) and set names are unrestricted. Construction
+   refuses a TTL under 1 ms (`SeqFloorsError::TtlTooShort`) instead of raising
+   it.
 
 Source evidence: `groupnet-runtime/src/group.rs`, `node.rs` and `capability.rs`,
 and `groupnet-consistency/src/floor.rs`. The runtime `capabilities.rs` and

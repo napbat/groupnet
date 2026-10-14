@@ -54,7 +54,7 @@ fn limits() -> BulkLimits {
             max_identity_bytes: 32,
             max_effect_bytes: 128,
         },
-        server_request_ms: 1000,
+        server_request: Duration::from_secs(1),
     }
 }
 

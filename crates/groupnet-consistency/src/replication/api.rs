@@ -3,89 +3,9 @@
 use std::error::Error;
 use std::future::Future;
 
-use groupnet_core::replication::{
-    BoundComparison, Config as CoreConfig, Cursor, ProofId, Refusal, Scope, SourceProof,
-};
+use groupnet_core::replication::{BoundComparison, Cursor, ProofId, Refusal, Scope, SourceProof};
 
 use super::fence::{InstallPermit, RevocationPermit};
-
-/// Bounded shell capacity in addition to the sans-IO core's batch limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    /// Core cursor, batch, retry, and tail cadence limits.
-    pub core: CoreConfig,
-    /// Maximum registered local scopes/tasks.
-    pub max_scopes: usize,
-    /// Maximum concurrent source/application operations across all scopes.
-    pub max_parallel_ops: usize,
-    /// Total reserved native-batch bytes across all scopes.
-    pub max_inflight_bytes: usize,
-    /// Maximum private recoverable checkpoint candidate per scope.
-    pub max_checkpoint_bytes: usize,
-    /// Global reserve for private checkpoint candidates awaiting install.
-    pub max_checkpoint_inflight_bytes: usize,
-    /// Bounded command queue per scope; floor requests return backpressure.
-    pub queue_depth: usize,
-}
-
-/// Invalid shell capacity or incompatible replay byte reserve.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LimitsError;
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            core: CoreConfig::default(),
-            max_scopes: 1024,
-            max_parallel_ops: 16,
-            max_inflight_bytes: 32 * 1024 * 1024,
-            max_checkpoint_bytes: 64 * 1024 * 1024,
-            max_checkpoint_inflight_bytes: 256 * 1024 * 1024,
-            queue_depth: 32,
-        }
-    }
-}
-
-impl Limits {
-    /// Checks all nonzero limits and the global byte reserve.
-    ///
-    /// # Errors
-    /// Returns [`LimitsError`] for a zero bound, a byte budget smaller than one batch,
-    /// or a batch reserve that cannot fit a Tokio semaphore permit count.
-    pub fn validate(self) -> Result<Self, LimitsError> {
-        self.core.validate().map_err(|_| LimitsError)?;
-        if self.max_scopes == 0
-            || self.max_parallel_ops == 0
-            || self.max_parallel_ops > tokio::sync::Semaphore::MAX_PERMITS
-            || self.max_inflight_bytes < self.core.max_batch_bytes
-            || self.max_inflight_bytes > tokio::sync::Semaphore::MAX_PERMITS
-            || self.max_checkpoint_bytes == 0
-            || u32::try_from(self.max_checkpoint_bytes).is_err()
-            || self.max_checkpoint_inflight_bytes < self.max_checkpoint_bytes
-            || self.max_checkpoint_inflight_bytes > tokio::sync::Semaphore::MAX_PERMITS
-            || self.queue_depth == 0
-            || self.queue_depth > tokio::sync::Semaphore::MAX_PERMITS
-            || u32::try_from(self.core.max_batch_bytes).is_err()
-            || self.core.snapshot.is_some_and(|snapshot| {
-                self.max_parallel_ops < 2
-                    || self
-                        .core
-                        .max_batch_bytes
-                        .checked_add(snapshot.max_chunk_bytes.max(self.core.max_batch_bytes))
-                        .is_none_or(|sum| sum > self.max_inflight_bytes)
-                    || snapshot.max_candidate_bytes > self.max_checkpoint_bytes as u64
-                    || usize::try_from(snapshot.max_candidate_bytes)
-                        .ok()
-                        .and_then(|candidate| self.max_checkpoint_bytes.checked_add(candidate))
-                        .is_none_or(|sum| sum > self.max_checkpoint_inflight_bytes)
-                    || u32::try_from(snapshot.max_chunk_bytes).is_err()
-            })
-        {
-            return Err(LimitsError);
-        }
-        Ok(self)
-    }
-}
 
 /// Classification of an adapter failure, preserved in session outcomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,43 +264,4 @@ pub trait ApplicationAdapter<P, B>: Send + Sync + 'static {
     /// its gate, while this predicate remains the application's final veto.
     /// This method does not schedule recovery.
     fn may_serve(&self, scope: &Scope, through: &P) -> bool;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Limits;
-
-    #[test]
-    fn semaphore_and_batch_limits_reject_invalid_reserves() {
-        let mut limits = Limits::default();
-        limits.max_inflight_bytes = limits.core.max_batch_bytes - 1;
-        assert!(limits.validate().is_err());
-
-        let limits = Limits {
-            max_parallel_ops: tokio::sync::Semaphore::MAX_PERMITS + 1,
-            ..Limits::default()
-        };
-        assert!(limits.validate().is_err());
-
-        let limits = Limits {
-            queue_depth: 0,
-            ..Limits::default()
-        };
-        assert!(limits.validate().is_err());
-
-        let limits = Limits {
-            max_checkpoint_inflight_bytes: 1,
-            ..Limits::default()
-        };
-        assert!(limits.validate().is_err());
-
-        if let Ok(beyond_u32) = usize::try_from(u64::from(u32::MAX) + 1) {
-            let limits = Limits {
-                max_checkpoint_bytes: beyond_u32,
-                max_checkpoint_inflight_bytes: beyond_u32,
-                ..Limits::default()
-            };
-            assert!(limits.validate().is_err());
-        }
-    }
 }

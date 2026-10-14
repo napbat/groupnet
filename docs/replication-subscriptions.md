@@ -381,12 +381,11 @@ mode signatures stay source compatible. The public shape is:
 
 ```rust,ignore
 pub trait AckEvidenceSource: Send + Sync + 'static {
-    fn certify<'a>(&'a self, request: &'a NamedAckRequest,
-                   limits: AckWaitLimits)
-        -> Pin<Box<dyn Future<Output = Result<(), AckSourceFailure>> + Send + 'a>>;
-    fn observe<'a>(&'a self, request: &'a AckWaitRequest, poll: Operation,
-                   waiting: &'a [RequiredSubscriber], limits: AckWaitLimits)
-        -> Pin<Box<dyn Future<Output = Result<AckObservation, AckSourceFailure>> + Send + 'a>>;
+    fn certify(&self, request: &NamedAckRequest, limits: AckWaitLimits)
+        -> impl Future<Output = Result<(), AckSourceFailure>> + Send;
+    fn observe(&self, request: &AckWaitRequest, poll: Operation,
+               waiting: &[RequiredSubscriber], limits: AckWaitLimits)
+        -> impl Future<Output = Result<AckObservation, AckSourceFailure>> + Send;
 }
 pub enum AckObservation {
     Evidence(Box<AckEvidence>),
@@ -397,13 +396,21 @@ let manager = manager.with_ack_evidence(source, limits)?; // before open()
 handle.wait_named(request, deadline).await;
 ```
 
+`with_ack_evidence` checks the limits first and reports the violated rule as
+`OpenError::InvalidAckLimits(AckWaitLimitsError)` (zero bound, `poll_ms` above
+`max_wait_ms`, or an identity/certificate cap above `max_metadata_bytes`). A
+second attachment is `OpenError::AckEvidenceAlreadyAttached`, and attaching
+after a session opened is `OpenError::SessionsStarted`.
+
 `certify` verifies the certificate and every pinned registration against the
 source, including scope, history, target, proof kind, policy version, and
 source epoch. `observe` checks the same binding for each acknowledgement;
 the sans-IO core additionally checks exact equality against the active wait
 and rejects duplicate, stale, wrong-kind, and cross-generation evidence. A
-peer's unsigned assertion is never passed as trusted evidence. The bridge
-uses boxed **standard futures** for object-safe opt-in dispatch; it stores no
+peer's unsigned assertion is never passed as trusted evidence. Adapters
+implement the trait with plain `async fn`s or `impl Future`; the manager,
+whose type is fixed before the bridge is attached, boxes only its own
+per-poll calls behind a private object-safe wrapper. It stores no
 erased native records and uses no runtime downcasts. Invalid source evidence
 fails closed as authority loss or terminal adapter failure. Source uncertainty
 never counts as an acknowledgement.

@@ -3,22 +3,21 @@
 #![cfg(feature = "replication")]
 
 use std::collections::BTreeSet;
+use std::error::Error;
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AckEvidenceSource, AckObservation, AckSourceFailure, AckSourceFuture, AckWaitStartError,
-    AdapterFailure, ApplicationAdapter, CatchUp, Checkpoint, CheckpointLimit, InstallPermit,
-    Limits, Materialized, NamedAckRequest, NamedAckResult, Replication, RevocationPermit,
-    ScanLimit, SourceAdapter, SourceBatch, TailLimit,
-};
-use groupnet_core::replication::{
-    AckEvidence, AckKind, AckTarget, AckWaitLimits, AckWaitOutcome, AckWaitRequest,
-    BoundComparison, CertifiedRoster, Comparison, Cursor, Operation, ProofId, RequiredSubscriber,
-    Scope, SourceHistory, SourceProof, Stream,
+    AckEvidence, AckEvidenceSource, AckKind, AckObservation, AckSourceFailure, AckTarget,
+    AckWaitLimits, AckWaitLimitsError, AckWaitOutcome, AckWaitRequest, AckWaitStartError,
+    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, CertifiedRoster, Checkpoint,
+    CheckpointLimit, Comparison, Cursor, InstallPermit, Limits, Materialized, NamedAckRequest,
+    NamedAckResult, OpenError, Operation, ProofId, Replication, RequiredSubscriber,
+    RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory, SourceProof,
+    Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -303,58 +302,54 @@ impl EvidenceSource {
 }
 
 impl AckEvidenceSource for EvidenceSource {
-    fn certify<'a>(
-        &'a self,
-        request: &'a NamedAckRequest,
+    async fn certify(
+        &self,
+        request: &NamedAckRequest,
         _limits: AckWaitLimits,
-    ) -> AckSourceFuture<'a, ()> {
-        Box::pin(async move {
-            self.certifications.fetch_add(1, Ordering::AcqRel);
-            self.cert_inflight.fetch_add(1, Ordering::AcqRel);
-            let _flight = Flight(Arc::clone(&self.cert_inflight));
-            self.cert_pause.wait().await;
-            if request.roster.certificate != b"cert" {
-                return Err(AckSourceFailure::AuthorityLost);
-            }
-            Ok(())
-        })
+    ) -> Result<(), AckSourceFailure> {
+        self.certifications.fetch_add(1, Ordering::AcqRel);
+        self.cert_inflight.fetch_add(1, Ordering::AcqRel);
+        let _flight = Flight(Arc::clone(&self.cert_inflight));
+        self.cert_pause.wait().await;
+        if request.roster.certificate != b"cert" {
+            return Err(AckSourceFailure::AuthorityLost);
+        }
+        Ok(())
     }
 
-    fn observe<'a>(
-        &'a self,
-        request: &'a AckWaitRequest,
+    async fn observe(
+        &self,
+        request: &AckWaitRequest,
         poll: Operation,
-        waiting: &'a [RequiredSubscriber],
+        waiting: &[RequiredSubscriber],
         _limits: AckWaitLimits,
-    ) -> AckSourceFuture<'a, AckObservation> {
-        Box::pin(async move {
-            self.observations.fetch_add(1, Ordering::AcqRel);
-            self.observe_pause.wait().await;
-            let available = self.available.lock().expect("evidence lock");
-            let Some(subscriber) = waiting
-                .iter()
-                .find(|member| available.contains(&member.name))
-            else {
-                return Ok(AckObservation::Pending);
-            };
-            let kind = if self.bad_kind.load(Ordering::Acquire) {
-                AckKind::Materialized
-            } else {
-                request.kind
-            };
-            let mut subscriber = (*subscriber).clone();
-            if self.bad_epoch.load(Ordering::Acquire) {
-                subscriber.epoch = vec![99];
-            }
-            Ok(AckObservation::Evidence(Box::new(AckEvidence {
-                op: poll,
-                request_id: request.request_id.clone(),
-                target: request.target.clone(),
-                kind,
-                roster_certificate: request.roster.certificate.clone(),
-                subscriber,
-            })))
-        })
+    ) -> Result<AckObservation, AckSourceFailure> {
+        self.observations.fetch_add(1, Ordering::AcqRel);
+        self.observe_pause.wait().await;
+        let available = self.available.lock().expect("evidence lock");
+        let Some(subscriber) = waiting
+            .iter()
+            .find(|member| available.contains(&member.name))
+        else {
+            return Ok(AckObservation::Pending);
+        };
+        let kind = if self.bad_kind.load(Ordering::Acquire) {
+            AckKind::Materialized
+        } else {
+            request.kind
+        };
+        let mut subscriber = (*subscriber).clone();
+        if self.bad_epoch.load(Ordering::Acquire) {
+            subscriber.epoch = vec![99];
+        }
+        Ok(AckObservation::Evidence(Box::new(AckEvidence {
+            op: poll,
+            request_id: request.request_id.clone(),
+            target: request.target.clone(),
+            kind,
+            roster_certificate: request.roster.certificate.clone(),
+            subscriber,
+        })))
     }
 }
 
@@ -390,7 +385,7 @@ fn limits() -> (Limits, AckWaitLimits) {
     let mut replay = Limits::default();
     replay.core.attempt_timeout_ms = 80;
     replay.core.tail_check_ms = 50;
-    replay.max_parallel_ops = 2;
+    replay.max_parallel_ops = NonZeroUsize::new(2).expect("nonzero");
     let ack = AckWaitLimits {
         max_required: 2,
         max_identity_bytes: 64,
@@ -818,4 +813,52 @@ async fn replay_operation_keeps_its_own_deadline_while_ack_poll_timer_is_earlier
         "the ordinary tail future must not inherit the earlier ack poll deadline"
     );
     wait.abort();
+}
+
+#[tokio::test]
+async fn ack_capability_reports_invalid_limits_repeat_and_late_attachment() {
+    let cluster = MemCluster::builder(&["reader"]).group("acks").spawn().await;
+    let (limits, ack_limits) = limits();
+    let manager = || {
+        Replication::new(
+            cluster.groups[0].clone(),
+            Source::default(),
+            App::default(),
+            limits,
+        )
+        .expect("manager")
+    };
+    let late_poll = AckWaitLimits {
+        poll_ms: ack_limits.max_wait_ms + 1,
+        ..ack_limits
+    };
+    let error = manager()
+        .with_ack_evidence(EvidenceSource::default(), late_poll)
+        .expect_err("poll beyond the wait");
+    assert_eq!(
+        error,
+        OpenError::InvalidAckLimits(AckWaitLimitsError::PollExceedsMaxWait)
+    );
+    assert_eq!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<AckWaitLimitsError>()),
+        Some(&AckWaitLimitsError::PollExceedsMaxWait)
+    );
+
+    let error = manager()
+        .with_ack_evidence(EvidenceSource::default(), ack_limits)
+        .expect("first attachment")
+        .with_ack_evidence(EvidenceSource::default(), ack_limits)
+        .expect_err("second attachment");
+    assert_eq!(error, OpenError::AckEvidenceAlreadyAttached);
+
+    let started = manager();
+    let _session = started
+        .open(scope("one"), NonZeroU64::new(1).expect("nonzero"))
+        .expect("session");
+    let error = started
+        .with_ack_evidence(EvidenceSource::default(), ack_limits)
+        .expect_err("session already started");
+    assert_eq!(error, OpenError::SessionsStarted);
 }

@@ -1,12 +1,13 @@
 //! A node's own origin scan must not take its presence down with it.
 
 use super::{
-    AdapterError, AdmissionLimits, Arc, AtomicBool, AtomicUsize, BootId, BootstrapCapabilities,
-    BootstrapScope, BootstrapSession, BoxRecoveryFuture, ByteAdmission, Claims, Duration, Instant,
-    Mark, NodeId, Ordering, OriginDonor, PeerObservation, PublicationPermit, RecoveryAdapter,
-    RecoveryConfig, RecoveryHandle, RecoveryMode, RecoveryOperation, SETTLE, bootstrap_config,
-    eventually_within,
+    AdapterError, AdapterErrorKind, AdmissionLimits, Arc, AtomicBool, AtomicUsize, BootId,
+    BootstrapCapabilities, BootstrapScope, BootstrapSession, ByteAdmission, Claims, Duration,
+    Instant, Mark, NodeId, Ordering, OriginDonor, PeerObservation, PublicationPermit,
+    RecoveryAdapter, RecoveryConfig, RecoveryFallback, RecoveryHandle, RecoveryMode,
+    RecoveryOperation, RecoveryStage, SETTLE, bootstrap_config, eventually_within,
 };
+use std::future::ready;
 
 const PAGES: usize = 25;
 const PAGE_MS: u64 = 100;
@@ -27,54 +28,49 @@ impl RecoveryAdapter for SlowOrigin {
         _op: RecoveryOperation,
         _distrust_bodies: bool,
         _permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async { Ok(()) })
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Ok(()))
     }
 
-    fn rebuild_origin(
+    async fn rebuild_origin(
         &self,
         _op: RecoveryOperation,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            self.scanning.store(true, Ordering::SeqCst);
-            for _ in 0..PAGES {
-                tokio::time::sleep(Duration::from_millis(PAGE_MS)).await;
-                permit.publish(|| ()).ok_or(AdapterError)?;
-                permit.progress();
-            }
-            self.scans.fetch_add(1, Ordering::SeqCst);
-            self.scanning.store(false, Ordering::SeqCst);
-            Ok(())
-        })
+    ) -> Result<(), AdapterError> {
+        self.scanning.store(true, Ordering::SeqCst);
+        for _ in 0..PAGES {
+            tokio::time::sleep(Duration::from_millis(PAGE_MS)).await;
+            permit.publish(|| ()).ok_or(AdapterErrorKind::Fenced)?;
+            permit.progress();
+        }
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.scanning.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     fn observe_peers(
         &self,
         _op: RecoveryOperation,
         _limits: RecoveryConfig,
-    ) -> BoxRecoveryFuture<'_, PeerObservation> {
-        Box::pin(async { Ok((Vec::new(), None::<Mark>)) })
+    ) -> impl Future<Output = PeerObservation> + Send {
+        ready(Ok((Vec::new(), None::<Mark>)))
     }
 
     fn wait_frontiers(
         &self,
         _op: RecoveryOperation,
         _heads: Vec<(NodeId, Mark)>,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async { Ok(()) })
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Ok(()))
     }
 
     fn affirm(&self, _op: RecoveryOperation) -> bool {
         true
     }
 
-    fn fell_back(
-        &self,
-        _from: groupnet_consistency::volatile_recovery::RecoveryStage,
-        _reason: groupnet_consistency::volatile_recovery::RecoveryFallback,
-    ) {
-    }
+    fn operation_failed(&self, _stage: RecoveryStage, _error: AdapterError) {}
+
+    fn fell_back(&self, _from: RecoveryStage, _reason: RecoveryFallback) {}
 }
 
 /// The bootstrap child declines (its donor cannot admit a local capture), so

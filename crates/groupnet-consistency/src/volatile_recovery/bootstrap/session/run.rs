@@ -207,12 +207,13 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         op: groupnet_core::volatile_bootstrap::BootstrapOperation,
         build: Option<(&ClaimIdentity, &PublicationPermit)>,
         outer: impl Fn() -> Option<Instant>,
-        mut work: crate::volatile_recovery::BoxRecoveryFuture<'_, T>,
+        work: impl Future<Output = T>,
     ) -> Option<T> {
         let mut reported = match build {
             Some((_, permit)) => Some(permit.progress_reports()?),
             None => None,
         };
+        tokio::pin!(work);
         loop {
             let operation_due = self.operation_due(op, outer()?)?;
             if Instant::now() >= operation_due {

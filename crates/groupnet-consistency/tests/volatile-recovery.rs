@@ -1,13 +1,16 @@
 //! In-memory driver checks for volatile coherence recovery.
 #![cfg(feature = "volatile-recovery")]
 
+use std::error::Error as _;
+use std::future::ready;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::volatile_recovery::{
-    AdapterError, BoxRecoveryFuture, Mark, PeerObservation, PublicationPermit, RecoveryAdapter,
-    RecoveryConfig, RecoveryHandle, RecoveryMode, RecoveryOperation,
+    AdapterError, AdapterErrorKind, Mark, PeerObservation, PublicationPermit, RecoveryAdapter,
+    RecoveryConfig, RecoveryFallback, RecoveryHandle, RecoveryMode, RecoveryOperation,
+    RecoveryStage,
 };
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
@@ -27,8 +30,12 @@ struct MemoryAdapter {
     pages: AtomicUsize,
     page_ms: AtomicU64,
     report_progress: AtomicBool,
+    /// Every failure the core consumed: its stage, class, and source text.
+    failures: Mutex<Vec<(RecoveryStage, AdapterErrorKind, Option<String>)>>,
 }
 
+/// The statically dispatched adapter needs no boxing: its asynchronous
+/// operations are plain `async fn`s or ready futures.
 impl RecoveryAdapter for MemoryAdapter {
     fn revoke_serving(&self) {
         self.revoked.fetch_add(1, Ordering::SeqCst);
@@ -39,70 +46,74 @@ impl RecoveryAdapter for MemoryAdapter {
         _op: RecoveryOperation,
         _distrust_bodies: bool,
         _permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
         self.invalidations.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(()) })
+        ready(Ok(()))
     }
 
-    fn rebuild_origin(
+    async fn rebuild_origin(
         &self,
         _op: RecoveryOperation,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            self.rebuilds.fetch_add(1, Ordering::SeqCst);
-            let pages = self.pages.load(Ordering::SeqCst);
-            if pages > 0 {
-                let page = Duration::from_millis(self.page_ms.load(Ordering::SeqCst));
-                for _ in 0..pages {
-                    tokio::time::sleep(page).await;
-                    permit
-                        .publish(|| self.published.fetch_add(1, Ordering::SeqCst))
-                        .ok_or(AdapterError)?;
-                    if self.report_progress.load(Ordering::SeqCst) {
-                        permit.progress();
-                    }
+    ) -> Result<(), AdapterError> {
+        self.rebuilds.fetch_add(1, Ordering::SeqCst);
+        let pages = self.pages.load(Ordering::SeqCst);
+        if pages > 0 {
+            let page = Duration::from_millis(self.page_ms.load(Ordering::SeqCst));
+            for _ in 0..pages {
+                tokio::time::sleep(page).await;
+                permit
+                    .publish(|| self.published.fetch_add(1, Ordering::SeqCst))
+                    .ok_or(AdapterErrorKind::Fenced)?;
+                if self.report_progress.load(Ordering::SeqCst) {
+                    permit.progress();
                 }
-                return Ok(());
             }
-            if self.fail_first.swap(false, Ordering::SeqCst) {
-                *self.first_permit.lock().unwrap() = Some(permit);
-                return Err(AdapterError);
-            }
-            if self.fail_all.load(Ordering::SeqCst) {
-                return Err(AdapterError);
-            }
-            let applied = permit.publish(|| self.published.fetch_add(1, Ordering::SeqCst));
-            applied.map_or(Err(AdapterError), |_| Ok(()))
-        })
+            return Ok(());
+        }
+        if self.fail_first.swap(false, Ordering::SeqCst) {
+            *self.first_permit.lock().unwrap() = Some(permit);
+            return Err(AdapterError::with_source(
+                AdapterErrorKind::Unavailable,
+                std::io::Error::other("origin LIST refused"),
+            ));
+        }
+        if self.fail_all.load(Ordering::SeqCst) {
+            return Err(AdapterErrorKind::Unavailable.into());
+        }
+        let applied = permit.publish(|| self.published.fetch_add(1, Ordering::SeqCst));
+        applied.map_or(Err(AdapterErrorKind::Fenced.into()), |_| Ok(()))
     }
 
     fn observe_peers(
         &self,
         _op: RecoveryOperation,
         _limits: RecoveryConfig,
-    ) -> BoxRecoveryFuture<'_, PeerObservation> {
-        Box::pin(async { Err(AdapterError) })
+    ) -> impl Future<Output = PeerObservation> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
     fn wait_frontiers(
         &self,
         _op: RecoveryOperation,
         _heads: Vec<(NodeId, Mark)>,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
     fn affirm(&self, _op: RecoveryOperation) -> bool {
         true
     }
 
-    fn fell_back(
-        &self,
-        _from: groupnet_consistency::volatile_recovery::RecoveryStage,
-        _reason: groupnet_consistency::volatile_recovery::RecoveryFallback,
-    ) {
+    fn operation_failed(&self, stage: RecoveryStage, error: AdapterError) {
+        self.failures.lock().unwrap().push((
+            stage,
+            error.kind(),
+            error.source().map(ToString::to_string),
+        ));
     }
+
+    fn fell_back(&self, _from: RecoveryStage, _reason: RecoveryFallback) {}
 }
 
 fn config() -> RecoveryConfig {
@@ -145,6 +156,15 @@ async fn failed_full_scan_retries_and_old_page_cannot_publish() {
             .is_none()
     );
     assert_eq!(adapter.published.load(Ordering::SeqCst), 1);
+    // The failed scan's cause reached the operator hook intact.
+    assert_eq!(
+        *adapter.failures.lock().unwrap(),
+        [(
+            RecoveryStage::Rebuilding,
+            AdapterErrorKind::Unavailable,
+            Some("origin LIST refused".to_owned()),
+        )]
+    );
     handle.cancel().unwrap();
 }
 

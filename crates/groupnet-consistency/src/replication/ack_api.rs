@@ -1,5 +1,7 @@
 //! Optional source-certified evidence for bounded named acknowledgement waits.
 
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -146,9 +148,90 @@ pub enum AckWaitStartError {
     Closed,
 }
 
-/// Boxed standard future used only by the opt-in metadata evidence bridge.
-pub type AckSourceFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, AckSourceFailure>> + Send + 'a>>;
+/// The first [`AckWaitLimits`] rule a configuration violates, naming its field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckWaitLimitsError {
+    /// `max_required` is zero.
+    ZeroMaxRequired,
+    /// `max_identity_bytes` is zero.
+    ZeroMaxIdentityBytes,
+    /// `max_certificate_bytes` is zero.
+    ZeroMaxCertificateBytes,
+    /// `max_metadata_bytes` is zero.
+    ZeroMaxMetadataBytes,
+    /// `max_wait_ms` is zero.
+    ZeroMaxWait,
+    /// `poll_ms` is zero.
+    ZeroPoll,
+    /// `poll_ms` exceeds `max_wait_ms`, so no poll fits in one wait.
+    PollExceedsMaxWait,
+    /// `max_identity_bytes` exceeds `max_metadata_bytes`.
+    IdentityExceedsMetadata,
+    /// `max_certificate_bytes` exceeds `max_metadata_bytes`.
+    CertificateExceedsMetadata,
+}
+
+impl fmt::Display for AckWaitLimitsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroMaxRequired => "ack wait limits: max_required is zero",
+            Self::ZeroMaxIdentityBytes => "ack wait limits: max_identity_bytes is zero",
+            Self::ZeroMaxCertificateBytes => "ack wait limits: max_certificate_bytes is zero",
+            Self::ZeroMaxMetadataBytes => "ack wait limits: max_metadata_bytes is zero",
+            Self::ZeroMaxWait => "ack wait limits: max_wait_ms is zero",
+            Self::ZeroPoll => "ack wait limits: poll_ms is zero",
+            Self::PollExceedsMaxWait => "ack wait limits: poll_ms exceeds max_wait_ms",
+            Self::IdentityExceedsMetadata => {
+                "ack wait limits: max_identity_bytes exceeds max_metadata_bytes"
+            }
+            Self::CertificateExceedsMetadata => {
+                "ack wait limits: max_certificate_bytes exceeds max_metadata_bytes"
+            }
+        })
+    }
+}
+
+impl Error for AckWaitLimitsError {}
+
+/// Checks named-wait limits before a manager accepts them; nothing is clamped.
+pub(crate) fn validate_ack_limits(limits: &AckWaitLimits) -> Result<(), AckWaitLimitsError> {
+    let rules = [
+        (
+            limits.max_required == 0,
+            AckWaitLimitsError::ZeroMaxRequired,
+        ),
+        (
+            limits.max_identity_bytes == 0,
+            AckWaitLimitsError::ZeroMaxIdentityBytes,
+        ),
+        (
+            limits.max_certificate_bytes == 0,
+            AckWaitLimitsError::ZeroMaxCertificateBytes,
+        ),
+        (
+            limits.max_metadata_bytes == 0,
+            AckWaitLimitsError::ZeroMaxMetadataBytes,
+        ),
+        (limits.max_wait_ms == 0, AckWaitLimitsError::ZeroMaxWait),
+        (limits.poll_ms == 0, AckWaitLimitsError::ZeroPoll),
+        (
+            limits.poll_ms > limits.max_wait_ms,
+            AckWaitLimitsError::PollExceedsMaxWait,
+        ),
+        (
+            limits.max_identity_bytes > limits.max_metadata_bytes,
+            AckWaitLimitsError::IdentityExceedsMetadata,
+        ),
+        (
+            limits.max_certificate_bytes > limits.max_metadata_bytes,
+            AckWaitLimitsError::CertificateExceedsMetadata,
+        ),
+    ];
+    rules
+        .into_iter()
+        .find_map(|(violated, error)| violated.then_some(error))
+        .map_or(Ok(()), Err)
+}
 
 /// Trusted local adapter that checks named rosters and individual evidence
 /// against the authoritative source, never against gossip or peer assertions.
@@ -160,27 +243,68 @@ pub type AckSourceFuture<'a, T> =
 /// allocations after their deadline or handle is dropped.
 pub trait AckEvidenceSource: Send + Sync + 'static {
     /// Validates even an empty fixed roster before the core starts the wait.
-    fn certify<'a>(
-        &'a self,
-        request: &'a NamedAckRequest,
+    fn certify(
+        &self,
+        request: &NamedAckRequest,
         limits: AckWaitLimits,
-    ) -> AckSourceFuture<'a, ()>;
+    ) -> impl Future<Output = Result<(), AckSourceFailure>> + Send;
 
     /// Reads at most one verified acknowledgement for this exact poll token.
     /// Empty checks return [`AckObservation::Pending`] so the core schedules
     /// the next source-tail check without requiring a feed hint.
-    fn observe<'a>(
+    fn observe(
+        &self,
+        request: &AckWaitRequest,
+        poll: Operation,
+        waiting: &[RequiredSubscriber],
+        limits: AckWaitLimits,
+    ) -> impl Future<Output = Result<AckObservation, AckSourceFailure>> + Send;
+}
+
+type ErasedAckFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, AckSourceFailure>> + Send + 'a>>;
+
+/// Object-safe bridge for the manager, whose type is fixed before the
+/// optional evidence source is attached; only polls through it are boxed.
+pub(crate) trait ErasedAckSource: Send + Sync + 'static {
+    fn certify_erased<'a>(
+        &'a self,
+        request: &'a NamedAckRequest,
+        limits: AckWaitLimits,
+    ) -> ErasedAckFuture<'a, ()>;
+
+    fn observe_erased<'a>(
         &'a self,
         request: &'a AckWaitRequest,
         poll: Operation,
         waiting: &'a [RequiredSubscriber],
         limits: AckWaitLimits,
-    ) -> AckSourceFuture<'a, AckObservation>;
+    ) -> ErasedAckFuture<'a, AckObservation>;
+}
+
+impl<T: AckEvidenceSource> ErasedAckSource for T {
+    fn certify_erased<'a>(
+        &'a self,
+        request: &'a NamedAckRequest,
+        limits: AckWaitLimits,
+    ) -> ErasedAckFuture<'a, ()> {
+        Box::pin(self.certify(request, limits))
+    }
+
+    fn observe_erased<'a>(
+        &'a self,
+        request: &'a AckWaitRequest,
+        poll: Operation,
+        waiting: &'a [RequiredSubscriber],
+        limits: AckWaitLimits,
+    ) -> ErasedAckFuture<'a, AckObservation> {
+        Box::pin(self.observe(request, poll, waiting, limits))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NamedAckRequest, validate_named};
+    use super::{AckWaitLimitsError, NamedAckRequest, validate_ack_limits, validate_named};
     use groupnet_core::replication::{
         AckKind, AckTarget, AckWaitError, AckWaitLimits, CertifiedRoster, RequiredSubscriber,
         Scope, SourceHistory, Stream,
@@ -258,5 +382,47 @@ mod tests {
             validate_named(&request, &scope, limits),
             Err(AckWaitError::Backpressure)
         );
+    }
+
+    type BreakRule = fn(&mut AckWaitLimits);
+
+    #[test]
+    fn ack_limits_report_each_violated_field() {
+        let (_, valid, _) = request();
+        assert_eq!(validate_ack_limits(&valid), Ok(()));
+        let cases: [(BreakRule, AckWaitLimitsError); 9] = [
+            (|l| l.max_required = 0, AckWaitLimitsError::ZeroMaxRequired),
+            (
+                |l| l.max_identity_bytes = 0,
+                AckWaitLimitsError::ZeroMaxIdentityBytes,
+            ),
+            (
+                |l| l.max_certificate_bytes = 0,
+                AckWaitLimitsError::ZeroMaxCertificateBytes,
+            ),
+            (
+                |l| l.max_metadata_bytes = 0,
+                AckWaitLimitsError::ZeroMaxMetadataBytes,
+            ),
+            (|l| l.max_wait_ms = 0, AckWaitLimitsError::ZeroMaxWait),
+            (|l| l.poll_ms = 0, AckWaitLimitsError::ZeroPoll),
+            (
+                |l| l.poll_ms = l.max_wait_ms + 1,
+                AckWaitLimitsError::PollExceedsMaxWait,
+            ),
+            (
+                |l| l.max_identity_bytes = l.max_metadata_bytes + 1,
+                AckWaitLimitsError::IdentityExceedsMetadata,
+            ),
+            (
+                |l| l.max_certificate_bytes = l.max_metadata_bytes + 1,
+                AckWaitLimitsError::CertificateExceedsMetadata,
+            ),
+        ];
+        for (break_rule, expected) in cases {
+            let mut limits = valid;
+            break_rule(&mut limits);
+            assert_eq!(validate_ack_limits(&limits), Err(expected));
+        }
     }
 }

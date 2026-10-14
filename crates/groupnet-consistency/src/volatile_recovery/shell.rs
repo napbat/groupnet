@@ -1,7 +1,5 @@
 //! Synchronous safety gate and bounded asynchronous effect driver.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -14,6 +12,7 @@ use groupnet_core::volatile_recovery::{
 };
 use tokio::sync::Notify;
 
+use super::AdapterError;
 use super::bootstrap::driver::BootstrapDriver;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -21,13 +20,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-
-/// One adapter operation, bounded by the current core operation deadline.
-pub type BoxRecoveryFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// A failed source or application operation. The core chooses its fallback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AdapterError;
 
 /// Bounded native membership, lease confirmation, and feed-head sample.
 pub type PeerObservation = Result<(Vec<Peer>, Option<Mark>), AdapterError>;
@@ -41,6 +33,10 @@ pub type PeerObservation = Result<(Vec<Peer>, Option<Mark>), AdapterError>;
 /// `revoke_serving` and `affirm` run while the shell holds its short control
 /// lock: they must not call this handle's status/signal methods or a permit's
 /// methods, and they must not block on I/O.
+///
+/// The asynchronous operations return `Send` futures; implement them as
+/// `async fn` or with an `async move` body. The worker drives each one only
+/// until the core's current deadline for that operation.
 pub trait RecoveryAdapter: Send + Sync + 'static {
     /// Immediately revoke any independent lease or application serve grant.
     /// Called under the same short lock that closes the shell's read gate.
@@ -52,14 +48,14 @@ pub trait RecoveryAdapter: Send + Sync + 'static {
         op: RecoveryOperation,
         distrust_bodies: bool,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 
     /// Build an origin index privately and publish through the permit.
     fn rebuild_origin(
         &self,
         op: RecoveryOperation,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 
     /// Observe at most `limits.max_members` complete native peer facts.
     ///
@@ -70,19 +66,28 @@ pub trait RecoveryAdapter: Send + Sync + 'static {
         &self,
         op: RecoveryOperation,
         limits: RecoveryConfig,
-    ) -> BoxRecoveryFuture<'_, PeerObservation>;
+    ) -> impl Future<Output = PeerObservation> + Send;
 
     /// Wait for every sampled native writer head to be applied locally.
     fn wait_frontiers(
         &self,
         op: RecoveryOperation,
         heads: Vec<(NodeId, Mark)>,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>>;
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 
     /// Atomically attempt the independent lease/application affirmation.
     /// This method is synchronous and must not block on network or origin I/O.
     /// It runs under the same short lock as public gate closure.
     fn affirm(&self, op: RecoveryOperation) -> bool;
+
+    /// An operation this adapter ran in `stage` failed with `error`, and the
+    /// core consumed that failure for the current episode. The core then
+    /// retries the stage or falls back; a fallback is reported separately
+    /// through [`Self::fell_back`]. A failure the core no longer accepts
+    /// (fenced by a gap, lapse, cancellation, or deadline) is not reported.
+    /// Informational: report it in the operator log. It runs on the worker and
+    /// must return promptly.
+    fn operation_failed(&self, stage: RecoveryStage, error: AdapterError);
 
     /// The episode abandoned its path in stage `from` for `reason` and
     /// started the fallback the core chose. Informational: report it in the
@@ -511,6 +516,18 @@ pub enum RecoveryOpenError {
     /// No Tokio executor is active to drive the bounded worker.
     NoRuntime,
 }
+
+impl std::fmt::Display for RecoveryOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Core(error) => write!(formatter, "recovery core rejected the open: {error:?}"),
+            Self::ClockRange => formatter.write_str("recovery deadline exceeds the clock range"),
+            Self::NoRuntime => formatter.write_str("no Tokio runtime is active"),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryOpenError {}
 
 /// Public handle to one per-domain recovery driver.
 pub struct RecoveryHandle<A: RecoveryAdapter> {

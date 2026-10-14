@@ -1,6 +1,5 @@
 //! Bounded one-operation-per-stream donor client and worker-owned listener.
 
-use std::future::Future;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 
@@ -17,6 +16,7 @@ use super::{
 use crate::volatile_recovery::bootstrap::admission::{AdmissionClass, Admitted, ByteAdmission};
 use crate::volatile_recovery::bootstrap::inbox::{DonorInboxError, DonorSender};
 use crate::volatile_recovery::bootstrap::ports::DonorRequest;
+use crate::volatile_recovery::{AdapterError, AdapterErrorKind};
 
 /// Finite network and decode limits for one transfer operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,11 +26,11 @@ pub struct BulkLimits {
     /// Typed request/reply collection limits.
     pub phase: PhaseLimits,
     /// Independent server-side maximum for one accepted request.
-    pub server_request_ms: u64,
+    pub server_request: Duration,
 }
 
 impl BulkLimits {
-    pub(crate) fn decoded_charge(self) -> Result<usize, BulkError> {
+    pub(crate) fn decoded_charge(self) -> Result<usize, BulkLimitsError> {
         // The body cap covers variable identity/effect/string bytes. These
         // terms cover the owned enum/header and bounded Vec elements, whose
         // in-memory size need not equal their encoded representation. Scope
@@ -47,7 +47,7 @@ impl BulkLimits {
             .phase
             .max_members
             .checked_add(12)
-            .ok_or(BulkError::Config)?;
+            .ok_or(BulkLimitsError::ChargeOverflow)?;
         self.phase
             .max_body_bytes
             .checked_add(header)
@@ -69,10 +69,10 @@ impl BulkLimits {
                 )
             })
             .and_then(|value| value.checked_add(arc_count.checked_mul(2 * size_of::<usize>())?))
-            .ok_or(BulkError::Config)
+            .ok_or(BulkLimitsError::ChargeOverflow)
     }
 
-    fn envelope_charge(self) -> Result<usize, BulkError> {
+    fn envelope_charge(self) -> Result<usize, BulkLimitsError> {
         // Scope's two String headers are in Envelope. The encoded cap covers
         // variable bytes; four Arc-header slots conservatively cover its two
         // NodeIds and any refcounted identity copy.
@@ -80,64 +80,159 @@ impl BulkLimits {
             .max_frame_bytes
             .checked_add(size_of::<Envelope>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
-            .ok_or(BulkError::Config)
+            .ok_or(BulkLimitsError::ChargeOverflow)
     }
 
-    fn tracker_charge(self) -> Result<usize, BulkError> {
+    fn tracker_charge(self) -> Result<usize, BulkLimitsError> {
         self.wire
             .max_frame_bytes
             .checked_add(size_of::<ReplyTracker>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
-            .ok_or(BulkError::Config)
+            .ok_or(BulkLimitsError::ChargeOverflow)
     }
 
-    pub(crate) fn correlation_charge(self) -> Result<usize, BulkError> {
+    pub(crate) fn correlation_charge(self) -> Result<usize, BulkLimitsError> {
         self.wire
             .max_frame_bytes
             .checked_add(size_of::<Correlation>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
-            .ok_or(BulkError::Config)
+            .ok_or(BulkLimitsError::ChargeOverflow)
     }
 
     /// Rejects unusable or contradictory finite bounds.
     ///
     /// # Errors
-    /// Returns `Config` for zero, excessive transport, or inverted caps.
-    pub fn validate(self) -> Result<Self, BulkError> {
-        if self.wire.max_frame_bytes == 0
-            || self.wire.max_frame_bytes > groupnet_transport::framing::MAX_FRAME_BYTES
-            || self.wire.max_scope_bytes == 0
-            || self.wire.max_node_bytes == 0
-            || self.wire.max_payload_bytes == 0
-            || self.phase.max_body_bytes == 0
-            || self.phase.max_body_bytes > self.wire.max_payload_bytes
-            || self.phase.max_scope_bytes == 0
-            || self.phase.max_scope_bytes > self.wire.max_scope_bytes
-            || self.phase.max_node_bytes == 0
-            || self.phase.max_node_bytes > self.wire.max_node_bytes
-            || self.phase.max_cuts == 0
-            || self.phase.max_members == 0
-            || self.phase.max_events == 0
-            || self.phase.max_identity_bytes == 0
-            || self.phase.max_effect_bytes == 0
-            || self.phase.max_writer_bytes == 0
-            || self.server_request_ms == 0
-        {
-            return Err(BulkError::Config);
+    /// Names the first zero, excessive, or inverted bound, or the derived
+    /// memory charge that overflows.
+    pub fn validate(&self) -> Result<(), BulkLimitsError> {
+        let (wire, phase) = (self.wire, self.phase);
+        let rules = [
+            (
+                wire.max_frame_bytes == 0
+                    || wire.max_frame_bytes > groupnet_transport::framing::MAX_FRAME_BYTES,
+                BulkLimitsError::FrameBytes,
+            ),
+            (wire.max_scope_bytes == 0, BulkLimitsError::ZeroWireScope),
+            (wire.max_node_bytes == 0, BulkLimitsError::ZeroWireNode),
+            (wire.max_payload_bytes == 0, BulkLimitsError::ZeroPayload),
+            (
+                phase.max_body_bytes == 0 || phase.max_body_bytes > wire.max_payload_bytes,
+                BulkLimitsError::BodyBytes,
+            ),
+            (
+                phase.max_scope_bytes == 0 || phase.max_scope_bytes > wire.max_scope_bytes,
+                BulkLimitsError::PhaseScopeBytes,
+            ),
+            (
+                phase.max_node_bytes == 0 || phase.max_node_bytes > wire.max_node_bytes,
+                BulkLimitsError::PhaseNodeBytes,
+            ),
+            (phase.max_cuts == 0, BulkLimitsError::ZeroCuts),
+            (phase.max_members == 0, BulkLimitsError::ZeroMembers),
+            (phase.max_events == 0, BulkLimitsError::ZeroEvents),
+            (
+                phase.max_identity_bytes == 0,
+                BulkLimitsError::ZeroIdentityBytes,
+            ),
+            (
+                phase.max_effect_bytes == 0,
+                BulkLimitsError::ZeroEffectBytes,
+            ),
+            (
+                phase.max_writer_bytes == 0,
+                BulkLimitsError::ZeroWriterBytes,
+            ),
+            (
+                self.server_request.is_zero(),
+                BulkLimitsError::ZeroServerRequest,
+            ),
+        ];
+        if let Some((_, error)) = rules.into_iter().find(|(violated, _)| *violated) {
+            return Err(error);
         }
         self.decoded_charge()?;
         self.envelope_charge()?;
         self.tracker_charge()?;
         self.correlation_charge()?;
-        Ok(self)
+        Ok(())
+    }
+}
+
+/// A [`BulkLimits`] rule that [`BulkLimits::validate`] rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BulkLimitsError {
+    /// `wire.max_frame_bytes` is zero or exceeds the transport frame cap.
+    FrameBytes,
+    /// `wire.max_scope_bytes` is zero.
+    ZeroWireScope,
+    /// `wire.max_node_bytes` is zero.
+    ZeroWireNode,
+    /// `wire.max_payload_bytes` is zero.
+    ZeroPayload,
+    /// `phase.max_body_bytes` is zero or exceeds `wire.max_payload_bytes`.
+    BodyBytes,
+    /// `phase.max_scope_bytes` is zero or exceeds `wire.max_scope_bytes`.
+    PhaseScopeBytes,
+    /// `phase.max_node_bytes` is zero or exceeds `wire.max_node_bytes`.
+    PhaseNodeBytes,
+    /// `phase.max_cuts` is zero.
+    ZeroCuts,
+    /// `phase.max_members` is zero.
+    ZeroMembers,
+    /// `phase.max_events` is zero.
+    ZeroEvents,
+    /// `phase.max_identity_bytes` is zero.
+    ZeroIdentityBytes,
+    /// `phase.max_effect_bytes` is zero.
+    ZeroEffectBytes,
+    /// `phase.max_writer_bytes` is zero.
+    ZeroWriterBytes,
+    /// `server_request` is zero.
+    ZeroServerRequest,
+    /// `server_request` from now is not representable by the clock.
+    ServerRequestRange,
+    /// A memory charge derived from these limits overflows `usize`.
+    ChargeOverflow,
+}
+
+impl std::fmt::Display for BulkLimitsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::FrameBytes => "wire.max_frame_bytes is zero or exceeds the transport frame cap",
+            Self::ZeroWireScope => "wire.max_scope_bytes is zero",
+            Self::ZeroWireNode => "wire.max_node_bytes is zero",
+            Self::ZeroPayload => "wire.max_payload_bytes is zero",
+            Self::BodyBytes => "phase.max_body_bytes is zero or exceeds wire.max_payload_bytes",
+            Self::PhaseScopeBytes => {
+                "phase.max_scope_bytes is zero or exceeds wire.max_scope_bytes"
+            }
+            Self::PhaseNodeBytes => "phase.max_node_bytes is zero or exceeds wire.max_node_bytes",
+            Self::ZeroCuts => "phase.max_cuts is zero",
+            Self::ZeroMembers => "phase.max_members is zero",
+            Self::ZeroEvents => "phase.max_events is zero",
+            Self::ZeroIdentityBytes => "phase.max_identity_bytes is zero",
+            Self::ZeroEffectBytes => "phase.max_effect_bytes is zero",
+            Self::ZeroWriterBytes => "phase.max_writer_bytes is zero",
+            Self::ZeroServerRequest => "server_request is zero",
+            Self::ServerRequestRange => "server_request exceeds the clock range",
+            Self::ChargeOverflow => "a memory charge derived from the bulk limits overflows",
+        })
+    }
+}
+
+impl std::error::Error for BulkLimitsError {}
+
+impl From<BulkLimitsError> for BulkError {
+    fn from(error: BulkLimitsError) -> Self {
+        Self::Limits(error)
     }
 }
 
 /// A finite transport, codec, source, or deadline failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BulkError {
-    /// Invalid public finite configuration.
-    Config,
+    /// The finite limits violate the named rule.
+    Limits(BulkLimitsError),
     /// Global memory or donor inbox admission was exhausted.
     Capacity,
     /// Stream connect, read, or write failed.
@@ -150,6 +245,52 @@ pub enum BulkError {
     Refused(Refusal),
     /// The owning recovery worker has closed its donor inbox.
     Closed,
+}
+
+impl std::fmt::Display for BulkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Limits(_) => formatter.write_str("invalid bulk bootstrap limits"),
+            Self::Capacity => formatter.write_str("bulk admission or donor inbox exhausted"),
+            Self::Transport => formatter.write_str("bulk stream connect, read, or write failed"),
+            Self::Protocol => formatter.write_str("invalid bulk bootstrap wire exchange"),
+            Self::Expired => formatter.write_str("bulk operation deadline elapsed"),
+            Self::Refused(refusal) => write!(formatter, "donor refused the request: {refusal:?}"),
+            Self::Closed => formatter.write_str("donor inbox closed"),
+        }
+    }
+}
+
+impl std::error::Error for BulkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Limits(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Classifies a bulk failure for the adapter that drove it, keeping the bulk
+/// error as the source.
+impl From<BulkError> for AdapterError {
+    fn from(error: BulkError) -> Self {
+        let kind = match error {
+            BulkError::Limits(_) => AdapterErrorKind::InvalidInput,
+            BulkError::Capacity => AdapterErrorKind::Capacity,
+            BulkError::Transport | BulkError::Refused(_) => AdapterErrorKind::Unavailable,
+            BulkError::Protocol => AdapterErrorKind::Malformed,
+            BulkError::Expired => AdapterErrorKind::Expired,
+            BulkError::Closed => AdapterErrorKind::Fenced,
+        };
+        Self::with_source(kind, error)
+    }
+}
+
+/// A limit-derived charge failure seen by the adapter driving the transfer.
+impl From<BulkLimitsError> for AdapterError {
+    fn from(error: BulkLimitsError) -> Self {
+        Self::with_source(AdapterErrorKind::Capacity, error)
+    }
 }
 
 async fn before<T>(deadline: Instant, future: impl Future<Output = T>) -> Result<T, BulkError> {
@@ -223,16 +364,17 @@ impl<B: BulkTransport> BootstrapBulkClient<B> {
     /// Binds a data plane and the existing shared global admission pool.
     ///
     /// # Errors
-    /// Rejects invalid finite network or phase limits.
+    /// Names the invalid finite network or phase limit.
     pub fn new(
         plane: DataPlane<B>,
         admission: ByteAdmission,
         limits: BulkLimits,
-    ) -> Result<Self, BulkError> {
+    ) -> Result<Self, BulkLimitsError> {
+        limits.validate()?;
         Ok(Self {
             plane,
             admission,
-            limits: limits.validate()?,
+            limits,
         })
     }
 
@@ -261,7 +403,8 @@ impl<B: BulkTransport> BootstrapBulkClient<B> {
         let mut tracker = ReplyTracker::new(
             envelope.get(),
             1,
-            u64::try_from(self.limits.phase.max_body_bytes).map_err(|_| BulkError::Config)?,
+            u64::try_from(self.limits.phase.max_body_bytes)
+                .map_err(|_| BulkLimitsError::ChargeOverflow)?,
         )
         .map_err(|_| BulkError::Protocol)?;
         let mut stream = before(
@@ -333,18 +476,19 @@ impl<B: BulkTransport> BootstrapBulkListener<B> {
     /// read at each request, so a new capture/attempt needs no new listener.
     ///
     /// # Errors
-    /// Rejects invalid finite network limits.
+    /// Names the invalid finite network or phase limit.
     pub fn new(
         plane: DataPlane<B>,
         sender: DonorSender,
         admission: ByteAdmission,
         limits: BulkLimits,
-    ) -> Result<Self, BulkError> {
+    ) -> Result<Self, BulkLimitsError> {
+        limits.validate()?;
         Ok(Self {
             plane,
             sender,
             admission,
-            limits: limits.validate()?,
+            limits,
         })
     }
 
@@ -363,8 +507,8 @@ impl<B: BulkTransport> BootstrapBulkListener<B> {
                 _ = shutdown.changed() => return Ok(()),
             };
             let deadline = Instant::now()
-                .checked_add(Duration::from_millis(self.limits.server_request_ms))
-                .ok_or(BulkError::Config)?;
+                .checked_add(self.limits.server_request)
+                .ok_or(BulkLimitsError::ServerRequestRange)?;
             // Individual malformed or expired peers cannot end donor service.
             tokio::select! {
                 _ = shutdown.changed() => return Ok(()),
@@ -495,13 +639,14 @@ mod tests {
                 max_identity_bytes: 32,
                 max_effect_bytes: 128,
             },
-            server_request_ms: 1000,
+            server_request: Duration::from_secs(1),
         }
     }
 
     #[test]
     fn decoded_collection_and_header_charges_are_finite_and_checked() {
-        let limits = limits().validate().unwrap();
+        let limits = limits();
+        limits.validate().unwrap();
         assert!(limits.decoded_charge().unwrap() > limits.phase.max_body_bytes);
         assert!(limits.envelope_charge().unwrap() > limits.wire.max_frame_bytes);
         assert!(limits.tracker_charge().unwrap() > limits.wire.max_frame_bytes);
@@ -515,7 +660,25 @@ mod tests {
                 ..limits
             }
             .validate(),
-            Err(BulkError::Config)
+            Err(BulkLimitsError::ChargeOverflow)
         );
+        assert_eq!(
+            BulkLimits {
+                server_request: Duration::ZERO,
+                ..limits
+            }
+            .validate(),
+            Err(BulkLimitsError::ZeroServerRequest)
+        );
+        let inverted = BulkLimits {
+            phase: PhaseLimits {
+                max_body_bytes: limits.wire.max_payload_bytes + 1,
+                ..limits.phase
+            },
+            ..limits
+        };
+        let error = BulkError::from(inverted.validate().unwrap_err());
+        assert_eq!(error, BulkError::Limits(BulkLimitsError::BodyBytes));
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

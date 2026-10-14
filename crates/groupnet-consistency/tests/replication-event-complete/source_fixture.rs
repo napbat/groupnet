@@ -1,6 +1,7 @@
 //! Durable source fixture with conditional registration and ack ledgers.
 
 use super::*;
+use groupnet_consistency::replication::{TerminalReason, TerminalRequest};
 
 #[expect(
     clippy::unused_async_trait_impl,
@@ -174,7 +175,7 @@ impl DurableSubscriptionSource for MemSource {
         if state.terminal_requests.values().any(|receipt| {
             receipt.request.key == registration.key
                 && receipt.request.epoch == registration.epoch
-                && receipt.request.reason == groupnet_core::replication::TerminalReason::Expired
+                && receipt.request.reason == TerminalReason::Expired
         }) {
             return SubscriptionSourceResult::Rejected(SubscriptionError::Expired);
         }
@@ -280,8 +281,8 @@ impl DurableSubscriptionSource for MemSource {
 
     async fn commit_subscriber_terminal(
         &self,
-        request: groupnet_core::replication::TerminalRequest,
-    ) -> SubscriptionSourceResult<groupnet_core::replication::TerminalReceipt, io::Error> {
+        request: TerminalRequest,
+    ) -> SubscriptionSourceResult<TerminalReceipt, io::Error> {
         self.terminal_calls.fetch_add(1, Ordering::AcqRel);
         let receipt = {
             let mut state = self.state.lock().expect("source lock");
@@ -298,7 +299,7 @@ impl DurableSubscriptionSource for MemSource {
             {
                 return SubscriptionSourceResult::Rejected(SubscriptionError::ConditionalMismatch);
             }
-            let receipt = groupnet_core::replication::TerminalReceipt {
+            let receipt = TerminalReceipt {
                 tombstone_ordinal: request.epoch.ordinal,
                 request,
                 durable: true,
@@ -346,9 +347,8 @@ impl DurableSubscriptionSource for MemSource {
 
     async fn read_subscriber_terminal(
         &self,
-        request: groupnet_core::replication::TerminalRequest,
-    ) -> SubscriptionSourceResult<Option<groupnet_core::replication::TerminalReceipt>, io::Error>
-    {
+        request: TerminalRequest,
+    ) -> SubscriptionSourceResult<Option<TerminalReceipt>, io::Error> {
         SubscriptionSourceResult::Accepted(
             self.state
                 .lock()
@@ -362,8 +362,7 @@ impl DurableSubscriptionSource for MemSource {
     async fn read_current_terminal(
         &self,
         key: SubscriberKey,
-    ) -> SubscriptionSourceResult<Option<groupnet_core::replication::TerminalReceipt>, io::Error>
-    {
+    ) -> SubscriptionSourceResult<Option<TerminalReceipt>, io::Error> {
         let state = self.state.lock().expect("source lock");
         let current = state
             .terminal_requests

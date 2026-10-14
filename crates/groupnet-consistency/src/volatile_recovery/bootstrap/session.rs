@@ -6,22 +6,23 @@ use std::time::{Duration, Instant};
 
 use groupnet_core::volatile_bootstrap::transfer::{TransferConfig, TransferEffect, TransferEvent};
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMemberIdentity,
-    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity,
+    BootId, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
+    BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine,
+    ClaimIdentity,
 };
 use groupnet_core::volatile_recovery::RecoveryOperation;
 use groupnet_core::{NodeId, Time};
 use tokio::sync::Notify;
 
 use super::admission::{AdmissionClass, AdmissionError, Reservation};
-use super::driver::{AcquisitionBinding, BootstrapDriver, BootstrapOutcome};
+use super::driver::{AcquisitionBinding, BootstrapDriver, BootstrapFuture, BootstrapOutcome};
 use super::inbox::{DonorInbox, DonorInboxError, DonorSender};
 use super::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSource, DonorCapture, DonorPort,
     LogicalClock, TransferContext, TransferResources,
 };
 use super::report::{BootstrapDecision, BootstrapObserver, DeclineReason, RecaptureDecline};
-use crate::volatile_recovery::{BoxRecoveryFuture, PublicationPermit, ReadyCapturePermit};
+use crate::volatile_recovery::{AdapterErrorKind, PublicationPermit, ReadyCapturePermit};
 
 const MAX_DONOR_SERVICE_BATCH: usize = 32;
 
@@ -48,14 +49,59 @@ pub struct BootstrapRuntimeConfig {
 /// Opening the optional child failed before it could publish a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootstrapSessionError {
-    /// Core identity or finite policy was invalid.
-    Core,
+    /// The claim core rejected `config.claim`, `scope`, or the local identity.
+    Claim(BootstrapError),
+    /// The claim core rejected `config.transfer`.
+    Transfer(BootstrapError),
+    /// The claim core refused `config.require_participation`.
+    Participation(BootstrapError),
+    /// `config.max_claim_metadata_bytes` is zero.
+    ZeroClaimMetadata,
+    /// The retained core-metadata charge derived from `config` overflows.
+    MetadataOverflow,
     /// Aggregate memory admission could not reserve retained core metadata.
     Admission(AdmissionError),
     /// Donor ingress capacity was invalid.
     Inbox(DonorInboxError),
     /// A required finite absolute deadline is not representable.
     ClockRange,
+}
+
+impl std::fmt::Display for BootstrapSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claim(error) => write!(formatter, "claim core rejected the session: {error:?}"),
+            Self::Transfer(error) => {
+                write!(
+                    formatter,
+                    "claim core rejected the transfer config: {error:?}"
+                )
+            }
+            Self::Participation(error) => {
+                write!(
+                    formatter,
+                    "claim core refused required participation: {error:?}"
+                )
+            }
+            Self::ZeroClaimMetadata => formatter.write_str("max_claim_metadata_bytes is zero"),
+            Self::MetadataOverflow => {
+                formatter.write_str("retained core metadata charge overflows")
+            }
+            Self::Admission(_) => formatter.write_str("core metadata admission refused"),
+            Self::Inbox(_) => formatter.write_str("invalid donor inbox capacity"),
+            Self::ClockRange => formatter.write_str("bootstrap deadline exceeds the clock range"),
+        }
+    }
+}
+
+impl std::error::Error for BootstrapSessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Inbox(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// `ClaimEngine`, `TransferSession`, and actual resource owners in one worker.
@@ -115,7 +161,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
     /// Creates one child and its bounded donor request sender.
     ///
     /// # Errors
-    /// Rejects invalid identity, limits, global admission, or clock range.
+    /// Names the rejected identity or limit, the refused admission, or the
+    /// unrepresentable clock range.
     pub fn new(
         capabilities: BootstrapCapabilities<C, D>,
         config: BootstrapRuntimeConfig,
@@ -125,17 +172,17 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         session: u64,
     ) -> Result<(Self, DonorSender), BootstrapSessionError> {
         let mut engine = ClaimEngine::new(config.claim, scope.clone(), me.clone(), boot, session)
-            .map_err(|_| BootstrapSessionError::Core)?;
+            .map_err(BootstrapSessionError::Claim)?;
         engine
             .enable_transfer(config.transfer)
-            .map_err(|_| BootstrapSessionError::Core)?;
+            .map_err(BootstrapSessionError::Transfer)?;
         if config.require_participation {
             engine
                 .require_participation()
-                .map_err(|_| BootstrapSessionError::Core)?;
+                .map_err(BootstrapSessionError::Participation)?;
         }
         if config.max_claim_metadata_bytes == 0 {
-            return Err(BootstrapSessionError::Core);
+            return Err(BootstrapSessionError::ZeroClaimMetadata);
         }
         // Core retains an observed claim map plus binding, offer, barrier,
         // coverage, an effect copy, and transient completion copies. Twelve
@@ -152,7 +199,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             .and_then(|value| value.checked_add(config.claim.max_members.checked_mul(128)?))
             .and_then(|value| value.checked_add(config.transfer.max_cuts.checked_mul(64)?))
             .and_then(|value| value.checked_add(512))
-            .ok_or(BootstrapSessionError::Core)?;
+            .ok_or(BootstrapSessionError::MetadataOverflow)?;
         let core_metadata = capabilities
             .admission
             .reserve(AdmissionClass::Inflight, core_bytes)
@@ -339,7 +386,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                             .map_or(Some(due), |deadline| Some(due.min(deadline)))
                     });
                 if !matches!(due, Some(due) if self.current_participation(due).await.is_some()) {
-                    incoming.respond(Err(crate::volatile_recovery::AdapterError));
+                    incoming.respond(Err(AdapterErrorKind::Fenced.into()));
                     self.retire_donor_capture();
                     served += 1;
                     continue;
@@ -359,7 +406,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                         .prepare_follower(incoming.request(), capture, now, &self.admission)
                 })
             });
-            incoming.respond(reply.unwrap_or(Err(crate::volatile_recovery::AdapterError)));
+            incoming.respond(reply.unwrap_or_else(|| Err(AdapterErrorKind::Fenced.into())));
             served += 1;
         }
         if served == budget || !self.effects.is_empty() {
@@ -404,11 +451,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
         &mut self,
         recovery: RecoveryOperation,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, BootstrapOutcome> {
+    ) -> BootstrapFuture<'_, BootstrapOutcome> {
         Box::pin(async move { self.run_acquisition(recovery, permit).await })
     }
 
-    fn cancel(&mut self, recovery: RecoveryOperation) -> BoxRecoveryFuture<'_, ()> {
+    fn cancel(&mut self, recovery: RecoveryOperation) -> BootstrapFuture<'_, ()> {
         Box::pin(async move {
             if self.recovery != Some(recovery) {
                 return;
@@ -425,7 +472,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
         })
     }
 
-    fn shutdown(&mut self) -> BoxRecoveryFuture<'_, ()> {
+    fn shutdown(&mut self) -> BootstrapFuture<'_, ()> {
         Box::pin(async move {
             let _ = self.accept(BootstrapEvent::Cancel);
             self.retire_cancel_effects().await;
@@ -439,7 +486,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
         })
     }
 
-    fn suspend_local(&mut self, recovery: RecoveryOperation) -> BoxRecoveryFuture<'_, ()> {
+    fn suspend_local(&mut self, recovery: RecoveryOperation) -> BootstrapFuture<'_, ()> {
         Box::pin(async move {
             if self.recovery != Some(recovery)
                 || self.engine.stage() != BootstrapStage::DonorAvailable
@@ -490,7 +537,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
     fn peer_roster(
         &mut self,
         due: Instant,
-    ) -> BoxRecoveryFuture<'_, Option<Vec<BootstrapMemberIdentity>>> {
+    ) -> BootstrapFuture<'_, Option<Vec<BootstrapMemberIdentity>>> {
         Box::pin(async move {
             if !self.config.require_participation {
                 return None;
@@ -520,7 +567,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapDriver for BootstrapSession<C, D> {
         &mut self,
         now: Instant,
         ready: Option<ReadyCapturePermit>,
-    ) -> BoxRecoveryFuture<'_, ()> {
+    ) -> BootstrapFuture<'_, ()> {
         Box::pin(async move {
             let claim_timer_due = self
                 .engine

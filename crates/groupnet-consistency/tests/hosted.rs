@@ -151,14 +151,13 @@ impl Voter {
             .advertise_capabilities([CAP_HOSTED])
             .expect("the advertisement is enqueued");
         let ledger = Arc::new(CommitLedger::new(handle.clone()));
-        let writes = HostedWrites::committed(
-            handle.clone(),
-            id.clone(),
-            cap(RING),
-            |key: &String| key.clone().into_bytes(),
-            Arc::clone(&ledger),
-        )
-        .expect("a Quorum group supports the committed regime");
+        let writes =
+            HostedWrites::builder(handle.clone(), id.clone(), cap(RING), |key: &String| {
+                key.clone().into_bytes()
+            })
+            .committed(Arc::clone(&ledger))
+            .build()
+            .expect("a Quorum group supports the committed regime");
         Self {
             id,
             node: Some(node),
@@ -203,19 +202,19 @@ impl Voter {
                     } => {
                         // The apply happens here, before the record — that
                         // ordering is the whole meaning of a watermark.
-                        ledger.record(&writer, token).await;
+                        ledger.record(&writer, token).await.expect("enqueued");
                     }
                     HostedRead::Gap { missed_through } => {
                         // Coarse remediation would go here; the watermark it
                         // raises belongs to the lineage's host, which the
                         // preceding `Migrated` named.
                         if let Some(host) = &host {
-                            ledger.record(host, missed_through).await;
+                            ledger.record(host, missed_through).await.expect("enqueued");
                         }
                     }
                     HostedRead::Migrated { host: adopted, .. } => {
                         host = adopted;
-                        ledger.refresh().await;
+                        ledger.refresh().await.expect("enqueued");
                     }
                 }
             }

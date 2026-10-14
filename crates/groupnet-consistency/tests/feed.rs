@@ -73,11 +73,11 @@ async fn peer_writes_arrive_in_order_and_apply_locally() {
     let epoch = feed.epoch();
     assert_eq!(
         feed.publish(&"user:1".to_owned()).await,
-        WriteToken { epoch, seq: 1 }
+        Ok(WriteToken { epoch, seq: 1 })
     );
     assert_eq!(
         feed.publish(&"user:2".to_owned()).await,
-        WriteToken { epoch, seq: 2 }
+        Ok(WriteToken { epoch, seq: 2 })
     );
     assert_eq!(feed.last_token(), Some(WriteToken { epoch, seq: 2 }));
 
@@ -120,7 +120,7 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
     let epoch = feed.epoch();
 
     // B tracks the feed normally first (cursor lands at w1's end)…
-    feed.publish(&"w1".to_owned()).await;
+    feed.publish(&"w1".to_owned()).await.expect("advertised");
     match next_event(&mut peers).await {
         PeerWrite::Wrote { key, .. } => assert_eq!(key, "w1"),
         other => panic!("no gap yet: {other:?}"),
@@ -128,7 +128,7 @@ async fn ring_overflow_degrades_to_an_explicit_gap() {
 
     // …then A writes three more without B draining: w2 falls off the ring.
     for key in ["w2", "w3", "w4"] {
-        feed.publish(&key.to_owned()).await;
+        feed.publish(&key.to_owned()).await.expect("advertised");
     }
     tokio::time::sleep(Duration::from_millis(300)).await; // let gossip settle
 
@@ -176,16 +176,16 @@ async fn retired_prefix_gaps_then_delivers_the_anchor_and_tail() {
     })
     .with_epoch(17);
 
-    let baseline = feed.publish(&"w1".to_owned()).await;
+    let baseline = feed.publish(&"w1".to_owned()).await.expect("advertised");
     assert_eq!(baseline, WriteToken { epoch: 17, seq: 1 });
     assert!(matches!(
         next_event(&mut peers).await,
         PeerWrite::Wrote { token, .. } if token == baseline
     ));
 
-    let w2 = feed.publish(&"w2".to_owned()).await;
-    let retired = feed.publish(&"w3".to_owned()).await;
-    let anchor = feed.publish(&"w4".to_owned()).await;
+    let w2 = feed.publish(&"w2".to_owned()).await.expect("advertised");
+    let retired = feed.publish(&"w3".to_owned()).await.expect("advertised");
+    let anchor = feed.publish(&"w4".to_owned()).await.expect("advertised");
     assert_eq!(w2.seq, 2);
     assert_eq!(retired.seq, 3);
     assert_eq!(anchor.seq, 4);
@@ -194,14 +194,14 @@ async fn retired_prefix_gaps_then_delivers_the_anchor_and_tail() {
     // compact current ring rather than restore the prefix it retired first.
     let older_ack = feed.retire_through(w2);
     let newer_ack = feed.retire_through(retired);
-    newer_ack.await;
+    newer_ack.await.expect("advertised");
     eventually_within("newer retirement window", SETTLE, || {
         advertised_head(&b_group, &a_id) == Some(anchor)
             && advertised_first_seq(&b_group, &a_id) == Some(anchor.seq)
     })
     .await;
 
-    older_ack.await;
+    older_ack.await.expect("advertised");
     // This command is enqueued behind the older acknowledgement's feed
     // advertisement. Observing it remotely proves that late advertisement was
     // processed before we assert the window did not grow backward.
@@ -215,7 +215,7 @@ async fn retired_prefix_gaps_then_delivers_the_anchor_and_tail() {
     assert_eq!(advertised_head(&b_group, &a_id), Some(anchor));
     assert_eq!(advertised_first_seq(&b_group, &a_id), Some(anchor.seq));
 
-    let tail = feed.publish(&"w5".to_owned()).await;
+    let tail = feed.publish(&"w5".to_owned()).await.expect("advertised");
     assert_eq!(tail, WriteToken { epoch: 17, seq: 5 });
     assert_eq!(feed.last_token(), Some(tail));
     eventually_within("post-retirement feed head", SETTLE, || {
@@ -264,7 +264,9 @@ async fn encoded_feed_budget_degrades_to_an_explicit_gap() {
     let mut peers = PeerWrites::new(b_group.clone(), b_id, decode);
     let feed =
         WriteFeed::new(a_group, cap(4_096), |key: &String| key.clone().into_bytes()).with_epoch(11);
-    feed.publish(&"baseline".to_owned()).await;
+    feed.publish(&"baseline".to_owned())
+        .await
+        .expect("advertised");
     assert!(matches!(
         next_event(&mut peers).await,
         PeerWrite::Wrote {
@@ -276,9 +278,9 @@ async fn encoded_feed_budget_degrades_to_an_explicit_gap() {
     let mut last = WriteToken { epoch: 11, seq: 1 };
     for seq in 2..=24 {
         let key = format!("{seq:04}-{}", "x".repeat(256));
-        last = feed.publish(&key).await;
+        last = feed.publish(&key).await.expect("advertised");
     }
-    feed.republish().await;
+    feed.republish().await.expect("advertised");
     eventually_within("byte-bounded feed head", SETTLE, || {
         advertised_head(&b_group, &a_id) == Some(last)
     })
@@ -330,8 +332,8 @@ async fn advertised_head_tracks_the_feed() {
 
     let feed =
         WriteFeed::new(a_group, cap(8), |key: &String| key.clone().into_bytes()).with_epoch(9);
-    feed.publish(&"w1".to_owned()).await;
-    let last = feed.publish(&"w2".to_owned()).await;
+    feed.publish(&"w1".to_owned()).await.expect("advertised");
+    let last = feed.publish(&"w2".to_owned()).await.expect("advertised");
 
     for _ in 0..300 {
         if advertised_head(&b_group, &a_id) == Some(last) {
@@ -377,7 +379,7 @@ async fn own_writes_are_ignored() {
         key.clone().into_bytes()
     });
     let mut own = PeerWrites::new(a_group, a_id, decode);
-    feed.publish(&"local".to_owned()).await;
+    feed.publish(&"local".to_owned()).await.expect("advertised");
 
     // Nothing may arrive: a node does not notify itself.
     let quiet = tokio::time::timeout(Duration::from_millis(300), own.next()).await;
@@ -419,7 +421,10 @@ async fn read_your_writes_barrier_waits_for_the_applied_frontier() {
 
     // Node A writes; the returned token is the client's session token.
     let feed = WriteFeed::new(a_group, cap(64), |key: &String| key.clone().into_bytes());
-    let token = feed.publish(&"user:1".to_owned()).await;
+    let token = feed
+        .publish(&"user:1".to_owned())
+        .await
+        .expect("advertised");
 
     // A client carrying (a, token) reads on B: the barrier resolves only
     // after the apply loop has actually applied — never a stale read.
@@ -458,7 +463,7 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
     .with_epoch(1);
     let mut old_life_last = WriteToken { epoch: 0, seq: 0 };
     for key in ["w1", "w2", "w3"] {
-        old_life_last = feed.publish(&key.to_owned()).await;
+        old_life_last = feed.publish(&key.to_owned()).await.expect("advertised");
     }
     for _ in 0..3 {
         match next_event(&mut peers).await {
@@ -479,7 +484,7 @@ async fn writer_restart_surfaces_as_a_gap_and_barriers_stay_honest() {
         key.clone().into_bytes()
     })
     .with_epoch(2);
-    let new_token = feed2.publish(&"n1".to_owned()).await;
+    let new_token = feed2.publish(&"n1".to_owned()).await.expect("advertised");
     assert_eq!(new_token, WriteToken { epoch: 2, seq: 1 });
 
     // B first sees the epoch change as a gap covering the whole old life…
@@ -540,8 +545,14 @@ async fn named_feeds_do_not_cross_talk() {
     let mut docs = PeerWrites::named("docs", b_group.clone(), b_id.clone(), decode);
     let mut index = PeerWrites::named("index", b_group, b_id, decode);
 
-    docs_feed.publish(&"d1".to_owned()).await;
-    index_feed.publish(&"i1".to_owned()).await;
+    docs_feed
+        .publish(&"d1".to_owned())
+        .await
+        .expect("advertised");
+    index_feed
+        .publish(&"i1".to_owned())
+        .await
+        .expect("advertised");
 
     match next_event(&mut docs).await {
         PeerWrite::Wrote { key, .. } => assert_eq!(key, "d1"),

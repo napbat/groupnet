@@ -4,15 +4,18 @@
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, ByteAdmission,
 };
-use groupnet_consistency::volatile_recovery::bootstrap::native_claims::NativeClaimSource;
+use groupnet_consistency::volatile_recovery::bootstrap::native_claims::{
+    NativeClaimSource, NativeClaimSourceError,
+};
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
     ClaimObservationLimits, ClaimSource,
 };
-use groupnet_core::Status;
-use groupnet_core::volatile_bootstrap::{
+use groupnet_consistency::volatile_recovery::bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapOperation, BootstrapPresence, BootstrapScope,
-    ClaimIdentity, ClaimPhase, PresenceIdentity, claim_entry_key, presence_entry_key,
+    ClaimIdentity, ClaimPhase, PresenceIdentity,
 };
+use groupnet_core::Status;
+use groupnet_core::volatile_bootstrap::{claim_entry_key, presence_entry_key};
 use groupnet_testkit::cluster::{MemCluster, eventually};
 
 fn policy() -> BootstrapConfig {
@@ -82,6 +85,48 @@ fn presence(node: groupnet_core::NodeId, boot: u128, session: u64) -> BootstrapP
         renewal: 1,
         remaining_ms: policy().claim_ttl_ms,
     }
+}
+
+/// Each violated construction rule is named, never collapsed into one error.
+#[tokio::test]
+async fn construction_names_each_rejected_argument() {
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
+    let group = &cluster.groups[0];
+    let open = |scope, policy, max_key_bytes, max_value_bytes| {
+        NativeClaimSource::new(
+            group.clone(),
+            scope,
+            policy,
+            max_key_bytes,
+            max_value_bytes,
+            admission(),
+        )
+        .unwrap_err()
+    };
+    assert_eq!(
+        open(scope(), policy(), 128, 0),
+        NativeClaimSourceError::ZeroValueBytes
+    );
+    let long = BootstrapScope {
+        domain: "d".repeat(64),
+        partition: "p".into(),
+    };
+    assert_eq!(
+        open(long, policy(), 128, 256),
+        NativeClaimSourceError::ScopeTooLong
+    );
+    let invalid = BootstrapConfig {
+        max_members: 0,
+        ..policy()
+    };
+    assert!(matches!(
+        open(scope(), invalid, 128, 256),
+        NativeClaimSourceError::Policy(_)
+    ));
+    assert!(matches!(
+        open(scope(), policy(), 4, 256),
+        NativeClaimSourceError::ClaimKey(_)
+    ));
 }
 
 /// A process restarted under the same member name publishes its new life's

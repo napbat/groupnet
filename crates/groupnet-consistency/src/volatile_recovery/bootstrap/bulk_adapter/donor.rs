@@ -5,9 +5,15 @@ use groupnet_core::volatile_bootstrap::journal::JournalError;
 use groupnet_transport::bulk::BulkTransport;
 
 use super::{BootstrapStatePort, BulkDonorPort};
-use crate::volatile_recovery::AdapterError;
 use crate::volatile_recovery::bootstrap::admission::{AdmissionClass, ByteAdmission};
 use crate::volatile_recovery::bootstrap::ports::{DonorCapture, DonorReply, DonorRequest};
+use crate::volatile_recovery::{AdapterError, AdapterErrorKind};
+
+/// A follower request outside this donor's policy or capture.
+const INVALID: AdapterError = AdapterError::new(AdapterErrorKind::InvalidInput);
+
+/// The journal refused the request as stale or out of stage.
+const FENCED: AdapterError = AdapterError::new(AdapterErrorKind::Fenced);
 
 impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
     #[expect(
@@ -21,8 +27,11 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         now: Time,
         admission: &ByteAdmission,
     ) -> Result<DonorReply, AdapterError> {
-        if !self.admission.same_pool(admission) || !capture.is_active() {
-            return Err(AdapterError);
+        if !self.admission.same_pool(admission) {
+            return Err(INVALID);
+        }
+        if !capture.is_active() {
+            return Err(FENCED);
         }
         let compatible = capture.ingress().with_journal(|journal| {
             let config = journal.config();
@@ -35,12 +44,12 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 && config.max_batch_events <= self.policy.max_batch_events
         });
         if !compatible {
-            return Err(AdapterError);
+            return Err(INVALID);
         }
         match request {
             DonorRequest::Offer { max_metadata_bytes } => {
                 if *max_metadata_bytes != self.policy.max_metadata_bytes {
-                    return Err(AdapterError);
+                    return Err(INVALID);
                 }
                 let offer = self
                     .state
@@ -65,13 +74,13 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                             .try_fold(bytes, |sum, cut| sum.checked_add(cut.writer.len()))
                     });
                 if variable_bytes.is_none_or(|bytes| bytes > *max_metadata_bytes) {
-                    return Err(AdapterError);
+                    return Err(AdapterErrorKind::Malformed.into());
                 }
                 if !capture
                     .ingress()
                     .with_journal(|journal| offer.get().capture == *journal.id())
                 {
-                    return Err(AdapterError);
+                    return Err(FENCED);
                 }
                 Ok(DonorReply::Offer(offer))
             }
@@ -89,15 +98,17 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                         && journal.acknowledged(now, reservation).is_ok()
                 });
                 drop(cursor_charge);
-                if *max_bytes == 0 || *max_bytes > self.policy.max_chunk_bytes || !valid_reservation
-                {
-                    return Err(AdapterError);
+                if *max_bytes == 0 || *max_bytes > self.policy.max_chunk_bytes {
+                    return Err(INVALID);
+                }
+                if !valid_reservation {
+                    return Err(FENCED);
                 }
                 let chunk = self
                     .state
                     .image_chunk(capture, *sequence, *max_bytes, admission)?;
                 if chunk.get().is_empty() || chunk.get().len() > *max_bytes {
-                    return Err(AdapterError);
+                    return Err(AdapterErrorKind::Malformed.into());
                 }
                 Ok(DonorReply::Chunk(chunk))
             }
@@ -109,7 +120,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                         Some(id) => Ok(id),
                         None => journal.reserve(now, follower.clone(), cut),
                     })
-                    .map_err(|_| AdapterError)?;
+                    .map_err(|_| FENCED)?;
                 Ok(DonorReply::Reserved(charge.hold(id)))
             }
             DonorRequest::Attach { reservation } => {
@@ -125,7 +136,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                         journal.confirm_attach(now, &token)?;
                         Ok::<_, JournalError>(token)
                     })
-                    .map_err(|_| AdapterError)?;
+                    .map_err(|_| FENCED)?;
                 Ok(DonorReply::Attached(charge.hold(token)))
             }
             DonorRequest::Barrier {
@@ -133,7 +144,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 max_metadata_bytes,
             } => {
                 if *max_metadata_bytes != self.policy.max_metadata_bytes {
-                    return Err(AdapterError);
+                    return Err(INVALID);
                 }
                 let charge = self.reply_charge(admission)?;
                 let receipt = capture
@@ -145,7 +156,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                         }
                         Ok(receipt)
                     })
-                    .map_err(|_| AdapterError)?;
+                    .map_err(|_| FENCED)?;
                 Ok(DonorReply::Barrier(charge.hold(receipt)))
             }
             DonorRequest::AdvanceBarrier {
@@ -153,7 +164,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 max_metadata_bytes,
             } => {
                 if *max_metadata_bytes != self.policy.max_metadata_bytes {
-                    return Err(AdapterError);
+                    return Err(INVALID);
                 }
                 let charge = self.reply_charge(admission)?;
                 let receipt = capture
@@ -161,7 +172,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                     .with_journal(|journal| {
                         journal.advance_barrier(now, &expected.reservation, expected)
                     })
-                    .map_err(|_| AdapterError)?;
+                    .map_err(|_| FENCED)?;
                 Ok(DonorReply::Barrier(charge.hold(receipt)))
             }
             DonorRequest::Batch {
@@ -172,16 +183,16 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 if *max_bytes != self.policy.max_batch_bytes
                     || *max_events != self.policy.max_batch_events
                 {
-                    return Err(AdapterError);
+                    return Err(INVALID);
                 }
                 let charge = self.reply_charge(admission)?;
                 let batch = capture
                     .ingress()
                     .with_journal(|journal| journal.read_batch(now, &barrier.reservation, barrier))
-                    .map_err(|_| AdapterError)?
-                    .ok_or(AdapterError)?;
+                    .map_err(|_| FENCED)?
+                    .ok_or(FENCED)?;
                 if batch.bytes > *max_bytes || batch.deltas.len() > *max_events {
-                    return Err(AdapterError);
+                    return Err(AdapterErrorKind::Malformed.into());
                 }
                 Ok(DonorReply::Batch(charge.hold(batch)))
             }
@@ -196,9 +207,9 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                     .with_journal(|journal| {
                         journal.ack_batch(now, reservation, *batch_operation, through)
                     })
-                    .map_err(|_| AdapterError)?;
+                    .map_err(|_| FENCED)?;
                 if confirmed != *through {
-                    return Err(AdapterError);
+                    return Err(FENCED);
                 }
                 drop(confirmed);
                 drop(cursor_charge);
@@ -208,7 +219,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 capture
                     .ingress()
                     .with_journal(|journal| journal.release(now, reservation))
-                    .map_err(|_| AdapterError)?;
+                    .map_err(|_| FENCED)?;
                 Ok(DonorReply::Released)
             }
         }
@@ -218,9 +229,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         &self,
         admission: &ByteAdmission,
     ) -> Result<crate::volatile_recovery::bootstrap::admission::Reservation, AdapterError> {
-        let bytes = self.limits.decoded_charge().map_err(|_| AdapterError)?;
-        admission
-            .reserve(AdmissionClass::Inflight, bytes)
-            .map_err(|_| AdapterError)
+        let bytes = self.limits.decoded_charge()?;
+        Ok(admission.reserve(AdmissionClass::Inflight, bytes)?)
     }
 }

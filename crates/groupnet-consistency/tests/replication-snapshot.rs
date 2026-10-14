@@ -4,20 +4,18 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, CatchUp, Checkpoint, CheckpointLimit, InstallPermit,
-    Limits, Materialized, NativeSnapshot, ReadVerdict, Replication, RevocationPermit, ScanLimit,
-    SnapshotApplicationAdapter, SnapshotAttachment, SnapshotHold, SnapshotImage,
-    SnapshotSourceAdapter, SnapshotStage, SourceAdapter, SourceBatch, TailLimit,
-};
-use groupnet_core::replication::{
-    BoundComparison, Comparison, Cursor, HoldReceipt, Operation, ProofId, Scope, SnapshotConfig,
-    SnapshotOffer, SourceHistory, SourceProof, Stream,
+    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
+    Comparison, Cursor, HoldReceipt, InstallPermit, Limits, Materialized, NativeSnapshot,
+    Operation, ProofId, ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope,
+    SnapshotApplicationAdapter, SnapshotAttachment, SnapshotConfig, SnapshotHold, SnapshotImage,
+    SnapshotOffer, SnapshotSourceAdapter, SnapshotStage, SourceAdapter, SourceBatch, SourceHistory,
+    SourceProof, Stream, TailLimit, Time,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -275,7 +273,7 @@ impl SnapshotSourceAdapter for Source {
         &self,
         scope: Scope,
         request: Operation,
-        total_due: groupnet_core::Time,
+        total_due: Time,
         wall_deadline: Instant,
         _limit: SnapshotConfig,
     ) -> Result<SnapshotHold<Hold>, AdapterFailure<io::Error>> {
@@ -603,10 +601,10 @@ fn limits() -> Limits {
     limits.core.max_batch_bytes = 8;
     limits.core.attempt_timeout_ms = 500;
     limits.core.tail_check_ms = 100;
-    limits.max_inflight_bytes = 32;
-    limits.max_checkpoint_bytes = 64;
-    limits.max_checkpoint_inflight_bytes = 128;
-    limits.max_parallel_ops = 2;
+    limits.max_inflight_bytes = NonZeroUsize::new(32).expect("nonzero");
+    limits.max_checkpoint_bytes = NonZeroUsize::new(64).expect("nonzero");
+    limits.max_checkpoint_inflight_bytes = NonZeroUsize::new(128).expect("nonzero");
+    limits.max_parallel_ops = NonZeroUsize::new(2).expect("nonzero");
     limits
 }
 

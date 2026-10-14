@@ -9,9 +9,8 @@ use groupnet_core::volatile_recovery::{
     RecoveryConfig, RecoveryEffect, RecoveryEngine, RecoveryEvent, RecoveryOperation,
 };
 
-use super::{
-    AdapterError, BoxRecoveryFuture, RecoveryAdapter, Shared, lock, pending_event, signal_effects,
-};
+use super::{RecoveryAdapter, Shared, lock, pending_event, signal_effects};
+use crate::volatile_recovery::AdapterError;
 use crate::volatile_recovery::bootstrap::driver::{BootstrapDriver, BootstrapOutcome};
 
 fn logical_now(start: Instant) -> Time {
@@ -294,8 +293,12 @@ pub(super) async fn run<A: RecoveryAdapter>(
                             bootstrap.as_mut().map(|child| (&config, child)),
                         )
                         .await
-                        .map(|observed| observed.map(|(peers, _)| (peers, identities))),
-                        Some(None) => Some(Err(AdapterError)),
+                        .map(|observed| {
+                            observed.map(|(peers, _)| (peers, identities)).map_err(Some)
+                        }),
+                        // No participation roster: the check fails closed
+                        // without an adapter failure to report.
+                        Some(None) => Some(Err(None)),
                         None => None,
                     };
                     if let Some(result) = response {
@@ -315,7 +318,8 @@ pub(super) async fn run<A: RecoveryAdapter>(
                                                 identities,
                                             }
                                         }
-                                        Err(_) => RecoveryEvent::Failed { op },
+                                        Err(Some(error)) => failed(&shared, &engine, op, error),
+                                        Err(None) => RecoveryEvent::Failed { op },
                                     })
                                     .effects,
                             );
@@ -362,7 +366,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                                 engine
                                     .step(match result {
                                         Ok(()) => RecoveryEvent::Invalidated { op },
-                                        Err(_) => RecoveryEvent::Failed { op },
+                                        Err(error) => failed(&shared, &engine, op, error),
                                     })
                                     .effects,
                             );
@@ -406,7 +410,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                                 engine
                                     .step(match result {
                                         Ok(()) => RecoveryEvent::Materialized { op },
-                                        Err(_) => RecoveryEvent::Failed { op },
+                                        Err(error) => failed(&shared, &engine, op, error),
                                     })
                                     .effects,
                             );
@@ -442,7 +446,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                                             peers,
                                             confirmed,
                                         },
-                                        Err(_) => RecoveryEvent::Failed { op },
+                                        Err(error) => failed(&shared, &engine, op, error),
                                     })
                                     .effects,
                             );
@@ -474,7 +478,7 @@ pub(super) async fn run<A: RecoveryAdapter>(
                                 engine
                                     .step(match result {
                                         Ok(()) => RecoveryEvent::FrontiersReached { op },
-                                        Err(_) => RecoveryEvent::Failed { op },
+                                        Err(error) => failed(&shared, &engine, op, error),
                                     })
                                     .effects,
                             );
@@ -559,6 +563,18 @@ pub(super) async fn run<A: RecoveryAdapter>(
     }
 }
 
+/// Hand a consumed adapter failure, with its cause, to the adapter's operator
+/// log before the core decides its retry or fallback.
+fn failed<A: RecoveryAdapter>(
+    shared: &Shared<A>,
+    engine: &RecoveryEngine,
+    op: RecoveryOperation,
+    error: AdapterError,
+) -> RecoveryEvent {
+    shared.adapter.operation_failed(engine.state().stage, error);
+    RecoveryEvent::Failed { op }
+}
+
 async fn maintain_child<A: RecoveryAdapter>(
     shared: &Shared<A>,
     config: &RecoveryConfig,
@@ -596,7 +612,7 @@ async fn await_operation<A: RecoveryAdapter, T>(
     started: Instant,
     (active_version, op): (u64, RecoveryOperation),
     effects: &mut VecDeque<RecoveryEffect>,
-    future: BoxRecoveryFuture<'_, T>,
+    future: impl Future<Output = T>,
     mut child: Maintained<'_>,
 ) -> Option<T> {
     let due = engine.next_deadline()?;

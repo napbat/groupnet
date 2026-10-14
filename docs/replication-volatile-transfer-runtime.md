@@ -89,7 +89,10 @@ reason }` (`EpisodeExpired`, `OperationExpired`, `OperationFailed`,
 `BaselineDeclined`, `HandoffRejected`, `EvidenceRejected`,
 `MembershipChanged`, `BarrierExhausted` or `Exhausted`). The shell delivers it
 to the required `RecoveryAdapter::fell_back(from, reason)`, also when a signal
-supersedes the queued fallback work, so no origin fallback is silent. A local provisional
+supersedes the queued fallback work, so no origin fallback is silent. The
+adapter failure behind an `OperationFailed` fallback, or behind an in-place
+retry that reports no fallback, reaches `RecoveryAdapter::operation_failed(stage,
+error)` first, with its `AdapterError` cause intact. A local provisional
 builder also uses the existing `rebuild_origin` callback and publication
 permit; its correlated success supplies the local baseline and may publish
 `Ready` as donor availability, never as read authority. It reports

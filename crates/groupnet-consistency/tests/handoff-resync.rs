@@ -50,17 +50,16 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
-use groupnet_consistency::hosted::hosted_feed_name;
+use groupnet_consistency::hosted::handoff::{Bytes, DataPlane};
+use groupnet_consistency::hosted::{Watermarks, hosted_feed_name};
 use groupnet_consistency::{
-    CAP_HOSTED, Commit, CommitLedger, CommitOutcome, Frontier, FrontierView, Handoff,
+    CAP_HOSTED, ChunkLimit, Commit, CommitLedger, CommitOutcome, Frontier, FrontierView, Handoff,
     HandoffReceipt, HostedRead, HostedReads, HostedWrites, Snapshot, SnapshotChunks, SnapshotSink,
-    SnapshotSource, Watermarks, WriteToken, advertised_head_named,
+    SnapshotSource, WriteToken, advertised_head_named,
 };
 use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster, placement};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node, Role};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
-use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, Network};
 use tokio::task::JoinHandle;
 
@@ -201,7 +200,10 @@ struct ReplicaSource(Arc<Mutex<Replica>>);
 impl SnapshotSource for ReplicaSource {
     type Chunks = ImageChunks;
 
-    fn open(&self) -> impl std::future::Future<Output = io::Result<Snapshot<ImageChunks>>> + Send {
+    fn open(
+        &self,
+        _limit: ChunkLimit,
+    ) -> impl Future<Output = io::Result<Snapshot<ImageChunks>>> + Send {
         let (covers, chunks) = self.0.lock().expect("replica").image();
         std::future::ready(Ok(Snapshot {
             covers,
@@ -214,7 +216,7 @@ impl SnapshotSource for ReplicaSource {
 struct ImageChunks(std::vec::IntoIter<Bytes>);
 
 impl SnapshotChunks for ImageChunks {
-    fn next(&mut self) -> impl std::future::Future<Output = io::Result<Option<Bytes>>> + Send {
+    fn next(&mut self) -> impl Future<Output = io::Result<Option<Bytes>>> + Send {
         std::future::ready(Ok(self.0.next()))
     }
 }
@@ -228,12 +230,12 @@ struct ReplicaSink {
 }
 
 impl SnapshotSink for ReplicaSink {
-    fn apply(&mut self, chunk: Bytes) -> impl std::future::Future<Output = io::Result<()>> + Send {
+    fn apply(&mut self, chunk: Bytes) -> impl Future<Output = io::Result<()>> + Send {
         self.staged.extend_from_slice(&chunk);
         std::future::ready(Ok(()))
     }
 
-    fn finish(self) -> impl std::future::Future<Output = io::Result<()>> + Send {
+    fn finish(self) -> impl Future<Output = io::Result<()>> + Send {
         let ReplicaSink { replica, staged } = self;
         std::future::ready(replica.lock().expect("replica").install(&staged))
     }
@@ -280,14 +282,13 @@ impl Voter {
             .advertise_capabilities([CAP_HOSTED])
             .expect("the advertisement is enqueued");
         let ledger = Arc::new(CommitLedger::new(handle.clone()));
-        let writes = HostedWrites::committed(
-            handle.clone(),
-            id.clone(),
-            cap(RING),
-            |key: &String| key.clone().into_bytes(),
-            Arc::clone(&ledger),
-        )
-        .expect("a Quorum group supports the committed regime");
+        let writes =
+            HostedWrites::builder(handle.clone(), id.clone(), cap(RING), |key: &String| {
+                key.clone().into_bytes()
+            })
+            .committed(Arc::clone(&ledger))
+            .build()
+            .expect("a Quorum group supports the committed regime");
         let (frontier, view) = Frontier::new();
         Self {
             id,
@@ -343,7 +344,7 @@ impl Voter {
                         // hole cannot make that assertion honestly.
                         if whole {
                             frontier.advance(&writer, token);
-                            ledger.record(&writer, token).await;
+                            ledger.record(&writer, token).await.expect("enqueued");
                         }
                     }
                     HostedRead::Gap { missed_through } => {
@@ -354,7 +355,7 @@ impl Voter {
                         if Replica::absorbs(missed_through) {
                             if let Some(host) = &host {
                                 frontier.advance(host, missed_through);
-                                ledger.record(host, missed_through).await;
+                                ledger.record(host, missed_through).await.expect("enqueued");
                             }
                         } else {
                             replica.lock().expect("replica").hole = true;
@@ -365,7 +366,7 @@ impl Voter {
                         epoch: _,
                     } => {
                         host = adopted;
-                        ledger.refresh().await;
+                        ledger.refresh().await.expect("enqueued");
                     }
                 }
             }
@@ -430,7 +431,9 @@ impl Voter {
             }
             replica.hole = false;
         }
-        Handoff::seed(receipt, &self.ledger, &self.frontier).await;
+        Handoff::seed(receipt, &self.ledger, &self.frontier)
+            .await
+            .expect("the seeded ledger is enqueued");
     }
 
     /// This node's replica as a comparable image: key -> the token that wrote it.

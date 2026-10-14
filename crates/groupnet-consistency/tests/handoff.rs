@@ -13,7 +13,9 @@
 //!   image, so nothing crosses the link to be thrown away;
 //! * a donor that dies mid-stream is a truncation, and what did cross is
 //!   discarded rather than half-installed;
-//! * `is_request` tells a handoff opener from anything else on a shared plane.
+//! * `is_request` tells a handoff opener from anything else on a shared plane;
+//! * a chunk past the donor's [`ChunkLimit`] is refused at the donor before it
+//!   is sent, while one exactly at the limit crosses.
 //!
 //! Everything here runs over a plain (`Eventual`) group, and that is the point
 //! of the split: a hostless group stamps `(0, None)` at both ends, the staleness
@@ -30,20 +32,22 @@
 #![cfg(feature = "handoff")]
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures_util::io::{AsyncRead, AsyncWrite};
-use groupnet_consistency::hosted::handoff::is_request;
+use groupnet_consistency::hosted::Watermarks;
+use groupnet_consistency::hosted::handoff::{
+    Bytes, DataPlane, DataStream, Offered, RefusalCode, is_request,
+};
 use groupnet_consistency::{
-    CommitLedger, Frontier, Handoff, HandoffError, Offered, Snapshot, SnapshotChunks, SnapshotSink,
-    SnapshotSource, Watermarks, WriteToken,
+    ChunkLimit, CommitLedger, Frontier, Handoff, HandoffError, Snapshot, SnapshotChunks,
+    SnapshotSink, SnapshotSource, WriteToken,
 };
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
-use groupnet_transport::bulk::{DataPlane, DataStream};
 use groupnet_transport_mem::MemBulkNet;
 use tokio::sync::watch;
 
@@ -80,6 +84,8 @@ fn marks(pairs: &[(&str, u64, u64)]) -> Watermarks {
 struct SourceProbe {
     opens: AtomicUsize,
     polls: AtomicUsize,
+    /// The chunk limit the most recent `open` was handed.
+    limit: Mutex<Option<ChunkLimit>>,
 }
 
 impl SourceProbe {
@@ -91,6 +97,11 @@ impl SourceProbe {
     /// never *read*, which is the whole assertion behind an early refusal.
     fn polls(&self) -> usize {
         self.polls.load(Ordering::Relaxed)
+    }
+
+    /// The limit the donor handed to `open`, or `None` if it never opened.
+    fn limit(&self) -> Option<ChunkLimit> {
+        *self.limit.lock().expect("source probe")
     }
 }
 
@@ -131,8 +142,12 @@ impl TestSource {
 impl SnapshotSource for TestSource {
     type Chunks = TestChunks;
 
-    fn open(&self) -> impl std::future::Future<Output = io::Result<Snapshot<TestChunks>>> + Send {
+    fn open(
+        &self,
+        limit: ChunkLimit,
+    ) -> impl Future<Output = io::Result<Snapshot<TestChunks>>> + Send {
         self.probe.opens.fetch_add(1, Ordering::Relaxed);
+        *self.probe.limit.lock().expect("source probe") = Some(limit);
         std::future::ready(Ok(Snapshot {
             covers: self.covers.clone(),
             chunks: TestChunks {
@@ -229,13 +244,13 @@ struct TestSink {
 }
 
 impl SnapshotSink for TestSink {
-    fn apply(&mut self, chunk: Bytes) -> impl std::future::Future<Output = io::Result<()>> + Send {
+    fn apply(&mut self, chunk: Bytes) -> impl Future<Output = io::Result<()>> + Send {
         self.pending.extend_from_slice(&chunk);
         self.state.lock().expect("sink state").staged += 1;
         std::future::ready(Ok(()))
     }
 
-    fn finish(self) -> impl std::future::Future<Output = io::Result<()>> + Send {
+    fn finish(self) -> impl Future<Output = io::Result<()>> + Send {
         let TestSink { state, pending } = self;
         let mut state = state.lock().expect("sink state");
         state.installed = Some(pending);
@@ -353,6 +368,11 @@ async fn a_covering_snapshot_crosses_whole_and_seeds_the_receiving_node() {
         }
     );
     assert_eq!(source_probe.opens(), 1, "one image per served request");
+    assert_eq!(
+        source_probe.limit(),
+        Some(ChunkLimit::MAX),
+        "an unconfigured donor sizes its image to the protocol ceiling"
+    );
 
     // ...and the bytes are the bytes.
     assert_eq!(sink.staged(), 3, "every chunk applied, in its own call");
@@ -362,7 +382,9 @@ async fn a_covering_snapshot_crosses_whole_and_seeds_the_receiving_node() {
     // The fold that turns a transfer into a recovery.
     let ledger = CommitLedger::new(wire.cluster.groups[0].clone());
     let (frontier, view) = Frontier::new();
-    Handoff::seed(&receipt, &ledger, &frontier).await;
+    Handoff::seed(&receipt, &ledger, &frontier)
+        .await
+        .expect("the seeded ledger is enqueued");
     assert_eq!(
         ledger.watermarks(),
         covers,
@@ -378,7 +400,9 @@ async fn a_covering_snapshot_crosses_whole_and_seeds_the_receiving_node() {
     }
     // Both folds are monotone, so a retried handoff is a no-op, never a
     // regression.
-    Handoff::seed(&receipt, &ledger, &frontier).await;
+    Handoff::seed(&receipt, &ledger, &frontier)
+        .await
+        .expect("the seeded ledger is enqueued");
     assert_eq!(ledger.watermarks(), covers);
 }
 
@@ -559,4 +583,160 @@ async fn is_request_tells_a_handoff_opener_from_anything_else() {
     ] {
         assert!(!is_request(foreign), "{foreign:?} is not a handoff opener");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 5. The chunk limit.
+// ---------------------------------------------------------------------------
+
+/// The small donor limit both chunk-limit tests run under, so an at-limit and a
+/// one-byte-over chunk cost bytes rather than the protocol ceiling's 256 MiB.
+fn small_limit() -> ChunkLimit {
+    ChunkLimit::new(NonZeroUsize::new(64).expect("nonzero")).expect("under the ceiling")
+}
+
+/// Chunks exactly at the donor's limit cross like any other: the limit is an
+/// inclusive bound, and the source is handed the one its donor runs under.
+#[tokio::test]
+async fn chunks_at_the_donors_limit_cross_whole() {
+    let wire = Wire::build("handoff-at-limit", ["hl-req", "hl-donor"]).await;
+    let chunks = vec![
+        Bytes::from(vec![1u8; 64]),
+        Bytes::new(),
+        Bytes::from(vec![2u8; 64]),
+    ];
+    let whole: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    let covers = marks(&[("w-a", 1, 4)]);
+    let source = TestSource::new(covers.clone(), chunks);
+    let source_probe = source.probe();
+    let sink = SinkProbe::default();
+
+    let (mut to_donor, mut at_donor) = wire.linked().await;
+    let donor = wire.donor().with_chunk_limit(small_limit());
+    assert_eq!(donor.chunk_limit(), small_limit());
+    let served = tokio::spawn(async move { donor.offer(&mut at_donor, &source).await });
+
+    wire.requester()
+        .fetch_on(&mut to_donor, &covers, sink.sink())
+        .await
+        .expect("at-limit chunks are within bounds");
+    let offered = served
+        .await
+        .expect("the donor task")
+        .expect("the donor served");
+
+    assert_eq!(source_probe.limit(), Some(small_limit()));
+    assert_eq!((offered.chunks, offered.bytes), (3, 128));
+    assert_eq!(sink.installed(), Some(whole));
+}
+
+/// A chunk one byte past the donor's limit is refused **at the donor, before it
+/// is sent**, with an error naming both sizes. The transfer ends there: what
+/// crossed before it is discarded with the sink, the requester reads a stream
+/// that never said `Done`, and the source is not read past the offender.
+#[tokio::test]
+async fn a_chunk_past_the_donors_limit_is_refused_before_it_is_sent() {
+    let wire = Wire::build("handoff-over-limit", ["ho-req", "ho-donor"]).await;
+    let source = TestSource::new(
+        marks(&[("w-a", 1, 4)]),
+        vec![
+            Bytes::from(vec![1u8; 64]),
+            Bytes::from(vec![2u8; 65]),
+            Bytes::from(vec![3u8; 8]),
+        ],
+    );
+    let source_probe = source.probe();
+    let sink = SinkProbe::default();
+    let need = marks(&[("w-a", 1, 4)]);
+
+    let (mut to_donor, mut at_donor) = wire.linked().await;
+    let donor = wire.donor().with_chunk_limit(small_limit());
+    // The donor task ends with `offer`, dropping its end of the stream — exactly
+    // what an accept loop does with a stream that carried no snapshot.
+    let served = tokio::spawn(async move { donor.offer(&mut at_donor, &source).await });
+
+    let err = wire
+        .requester()
+        .fetch_on(&mut to_donor, &need, sink.sink())
+        .await
+        .expect_err("a transfer the donor abandoned is never adopted");
+    assert!(matches!(err, HandoffError::Truncated), "{err:?}");
+
+    match served.await.expect("the donor task") {
+        Err(HandoffError::ChunkTooLarge { len, limit }) => {
+            assert_eq!(len, 65, "the offending chunk's own size");
+            assert_eq!(limit, small_limit(), "the limit it broke");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(source_probe.limit(), Some(small_limit()));
+    assert_eq!(
+        source_probe.polls(),
+        2,
+        "the source is not read past the oversized chunk"
+    );
+    assert_eq!(
+        sink.staged(),
+        1,
+        "only the at-limit chunk crossed; the oversized one never reached the wire"
+    );
+    assert!(sink.installed_nothing(), "and nothing was adopted");
+}
+
+// ---------------------------------------------------------------------------
+// 6. Write path names.
+// ---------------------------------------------------------------------------
+
+/// A write path name is any string: it travels length-prefixed and selects the
+/// ledger key `~hosted:applied:<name>`, which is distinct for every distinct
+/// name — so a `:` inside one is ordinary input, not a programming error. Two
+/// ends under the same such name transfer; an end under a different name is
+/// refused as `BadRequest`.
+#[tokio::test]
+async fn a_write_path_name_with_a_colon_is_ordinary_input() {
+    let wire = Wire::build("handoff-named", ["hp-req", "hp-donor"]).await;
+    let (req_group, donor_group) = (
+        wire.cluster.groups[0].clone(),
+        wire.cluster.groups[1].clone(),
+    );
+    let (req_id, donor_id) = (wire.cluster.ids[0].clone(), wire.cluster.ids[1].clone());
+    let covers = marks(&[("w-a", 1, 2)]);
+
+    // Same name at both ends: the transfer goes through.
+    let source = TestSource::new(covers.clone(), vec![Bytes::from_static(b"docs")]);
+    let sink = SinkProbe::default();
+    let (mut to_donor, mut at_donor) = wire.linked().await;
+    let donor = Handoff::named("docs:hot", donor_group.clone(), donor_id.clone());
+    let served = tokio::spawn(async move { donor.offer(&mut at_donor, &source).await });
+    Handoff::named("docs:hot", req_group.clone(), req_id.clone())
+        .fetch_on(&mut to_donor, &covers, sink.sink())
+        .await
+        .expect("matching names transfer");
+    served
+        .await
+        .expect("the donor task")
+        .expect("the donor served");
+    assert_eq!(sink.installed(), Some(b"docs".to_vec()));
+
+    // A neighbouring name is a different path, colon or no colon.
+    let source = TestSource::new(covers.clone(), vec![Bytes::from_static(b"docs")]);
+    let sink = SinkProbe::default();
+    let (mut to_donor, mut at_donor) = wire.linked().await;
+    let donor = Handoff::named("docs", donor_group, donor_id);
+    let served = tokio::spawn(async move { donor.offer(&mut at_donor, &source).await });
+    let err = Handoff::named("docs:hot", req_group, req_id)
+        .fetch_on(&mut to_donor, &covers, sink.sink())
+        .await
+        .expect_err("a different write path is refused");
+    assert!(
+        matches!(
+            err,
+            HandoffError::Refused {
+                code: RefusalCode::BadRequest
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(served.await.expect("the donor task").is_err());
+    assert!(sink.installed_nothing());
 }

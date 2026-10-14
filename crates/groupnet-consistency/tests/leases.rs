@@ -12,13 +12,13 @@
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use groupnet_consistency::lease::{grant_entry_key, renewal_entry_key};
+use groupnet_consistency::lease::{decode_renewal, grant_entry_key, renewal_entry_key};
 use groupnet_consistency::{
-    AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseState, LeaseView, Leases,
-    PeerWrite, PeerWrites, WriteFeed, WriteToken, applied_by,
+    AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Group, LeaseConfig, LeaseConfigError,
+    LeaseStartError, LeaseState, LeaseView, Leases, PeerWrite, PeerWrites, WriteFeed, WriteToken,
+    applied_by,
 };
 use groupnet_core::NodeId;
-use groupnet_runtime::Group;
 use groupnet_testkit::cluster::{
     MemCluster, NodeOpts, converged_within, eventually_within, spawn_mem_node,
 };
@@ -64,20 +64,20 @@ fn apply_loop(group: &Group, me: &NodeId) -> JoinHandle<()> {
     let ledger = AckLedger::new(group.clone());
     tokio::spawn(async move {
         while let Some(event) = peers.next().await {
-            match event {
+            let (peer, token) = match event {
                 PeerWrite::Wrote { peer, token, .. } | PeerWrite::Sealed { peer, token } => {
-                    ledger.record(&peer, token).await;
+                    (peer, token)
                 }
                 PeerWrite::Gap {
                     peer,
                     missed_through,
-                } => ledger.record(&peer, missed_through).await,
-                PeerWrite::Renewed { peer, epoch, .. } => {
-                    ledger
-                        .record(&peer, groupnet_consistency::WriteToken { epoch, seq: 0 })
-                        .await;
-                }
-            }
+                } => (peer, missed_through),
+                PeerWrite::Renewed { peer, epoch, .. } => (peer, WriteToken { epoch, seq: 0 }),
+            };
+            ledger
+                .record(&peer, token)
+                .await
+                .expect("the ledger is enqueued");
         }
     })
 }
@@ -89,7 +89,7 @@ fn participate(group: &Group, me: &NodeId) -> (Leases, JoinHandle<()>) {
     group
         .advertise_capabilities([CAP_ACKS, CAP_LEASE])
         .expect("the advertisement is enqueued");
-    let leases = Leases::new(group.clone(), me.clone(), lease_cfg());
+    let leases = Leases::new(group.clone(), me.clone(), lease_cfg()).expect("a valid lease set");
     (leases, apply_loop(group, me))
 }
 
@@ -160,7 +160,7 @@ async fn a_healthy_group_serves_under_leases_and_invalidates_at_ack_speed() {
     let feed = WriteFeed::new(cluster.groups[0].clone(), cap(8), |key: &String| {
         key.clone().into_bytes()
     });
-    let token = feed.publish(&"k1".to_owned()).await;
+    let token = feed.publish(&"k1".to_owned()).await.expect("advertised");
 
     let started = Instant::now();
     let outcome = sets[0]
@@ -238,7 +238,7 @@ async fn a_silent_readers_lease_lapses_and_it_must_resync_before_serving_again()
     let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
         key.clone().into_bytes()
     });
-    let token = feed.publish(&"k1".to_owned()).await;
+    let token = feed.publish(&"k1".to_owned()).await.expect("advertised");
 
     let started = Instant::now();
     let outcome = a_leases
@@ -291,7 +291,7 @@ async fn a_silent_readers_lease_lapses_and_it_must_resync_before_serving_again()
     let (b_leases, _b_apply) = participate(&b_group, &b_id);
     let b_view = b_leases.view();
     assert!(!b_view.valid(), "a fresh lease life starts out of service");
-    let caught_up = feed.publish(&"k2".to_owned()).await;
+    let caught_up = feed.publish(&"k2".to_owned()).await.expect("advertised");
     eventually_within(
         "the restarted reader applies the writer's feed",
         SETTLE,
@@ -339,7 +339,8 @@ async fn a_reader_that_renews_but_never_applies_lapses_under_a_write() {
     b_group
         .advertise_capabilities([CAP_ACKS, CAP_LEASE])
         .expect("the advertisement is enqueued");
-    let b_leases = Leases::new(b_group.clone(), b_id.clone(), lease_cfg());
+    let b_leases =
+        Leases::new(b_group.clone(), b_id.clone(), lease_cfg()).expect("a valid lease set");
     let b_view = b_leases.view();
     serving("the reader that will stall", &b_view).await;
     eventually_within("the writer sees the reader's lease", SETTLE, || {
@@ -350,7 +351,7 @@ async fn a_reader_that_renews_but_never_applies_lapses_under_a_write() {
     let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
         key.clone().into_bytes()
     });
-    let token = feed.publish(&"k1".to_owned()).await;
+    let token = feed.publish(&"k1".to_owned()).await.expect("advertised");
     let started = Instant::now();
     let outcome = a_leases
         .invalidated_coherently(&a_id, token, LEASE * 4)
@@ -417,7 +418,7 @@ async fn a_node_without_the_lease_tier_neither_blocks_writes_nor_serves() {
     )
     .await;
     assert_eq!(
-        a_group.node_entry(&c_id, &renewal_entry_key("")),
+        a_group.node_entry(&c_id, &renewal_entry_key(None)),
         None,
         "a node with no lease set publishes no renewal, so nobody ever waits on it"
     );
@@ -426,7 +427,7 @@ async fn a_node_without_the_lease_tier_neither_blocks_writes_nor_serves() {
     let feed = WriteFeed::new(a_group.clone(), cap(8), |key: &String| {
         key.clone().into_bytes()
     });
-    let token = feed.publish(&"k1".to_owned()).await;
+    let token = feed.publish(&"k1".to_owned()).await.expect("advertised");
 
     let started = Instant::now();
     let outcome = a_leases
@@ -460,7 +461,8 @@ async fn a_fresh_writer_refuses_the_no_holders_fast_path_until_it_has_warmed_up(
     let net = Network::new();
     let born = Instant::now();
     let (w_id, _w_node, w_group) = spawn_mem_node(&net, "warm-w", &["warm-p"], &opts()).await;
-    let w_leases = Leases::new(w_group.clone(), w_id.clone(), lease_cfg());
+    let w_leases =
+        Leases::new(w_group.clone(), w_id.clone(), lease_cfg()).expect("a valid lease set");
     w_group
         .advertise_capabilities([CAP_ACKS, CAP_LEASE])
         .unwrap();
@@ -512,7 +514,7 @@ async fn a_fresh_writer_refuses_the_no_holders_fast_path_until_it_has_warmed_up(
     let feed = WriteFeed::new(w_group.clone(), cap(8), |key: &String| {
         key.clone().into_bytes()
     });
-    let real = feed.publish(&"k1".to_owned()).await;
+    let real = feed.publish(&"k1".to_owned()).await.expect("advertised");
     let started = Instant::now();
     let outcome = w_leases
         .invalidated_coherently(&w_id, real, LEASE * 3)
@@ -617,7 +619,75 @@ async fn leaving_retracts_the_renewal_and_closes_the_departing_readers_window() 
     // published, and a reader's confirmation is capped at what it published, so
     // a retired grant map cannot extend anyone's window.
     assert!(
-        a_group.node_entry(&b_id, &grant_entry_key("")).is_some(),
+        a_group.node_entry(&b_id, &grant_entry_key(None)).is_some(),
         "the grant map survives a departure, and costs nothing when it does"
     );
+}
+
+/// Construction validates before anything runs: an invalid config, or no
+/// runtime to own the tasks, is a typed error and publishes nothing. A named
+/// set and a durable epoch are configured *before* the tasks start, so the
+/// very first renewal on the wire carries that epoch under that set's entry —
+/// and no name is reserved, `g` included.
+#[tokio::test]
+async fn lease_sets_validate_before_starting_and_start_fully_configured() {
+    let net = Network::new();
+    let (me, _node, group) = spawn_mem_node(&net, "cfg-a", &[], &opts()).await;
+
+    let spinning = LeaseConfig {
+        renew_every: Duration::ZERO,
+        ..lease_cfg()
+    };
+    match Leases::new(group.clone(), me.clone(), spinning) {
+        Err(LeaseStartError::InvalidConfig(LeaseConfigError::RenewEveryZero)) => {}
+        other => panic!("expected an invalid-config error, got {other:?}"),
+    }
+    let too_short = Leases::builder(group.clone(), me.clone())
+        .config(LeaseConfig::for_duration(Duration::from_micros(300)))
+        .start()
+        .expect_err("a sub-millisecond lease is refused, not clamped");
+    assert!(std::error::Error::source(&too_short).is_some());
+
+    let (outside_group, outside_me) = (group.clone(), me.clone());
+    let outside = std::thread::spawn(move || Leases::new(outside_group, outside_me, lease_cfg()))
+        .join()
+        .expect("the thread runs");
+    assert!(
+        matches!(outside, Err(LeaseStartError::NoRuntime(_))),
+        "{outside:?}"
+    );
+    tokio::time::sleep(LEASE / 3).await;
+    assert_eq!(
+        group.node_entry(&me, &renewal_entry_key(None)),
+        None,
+        "a refused start published nothing"
+    );
+
+    let leases = Leases::builder(group.clone(), me.clone())
+        .name("g")
+        .epoch(42)
+        .config(lease_cfg())
+        .start()
+        .expect("a valid lease set");
+    assert_eq!(leases.epoch(), 42);
+    eventually_within("the named set's first renewal lands", SETTLE, || {
+        group
+            .node_entry(&me, &renewal_entry_key(Some("g")))
+            .is_some()
+    })
+    .await;
+    let first = group
+        .node_entry(&me, &renewal_entry_key(Some("g")))
+        .and_then(|bytes| decode_renewal(&bytes))
+        .expect("a renewal");
+    assert_eq!(
+        first.epoch, 42,
+        "no boot-epoch renewal precedes the chosen one"
+    );
+    assert_eq!(
+        group.node_entry(&me, &grant_entry_key(None)),
+        None,
+        "a set named `g` never writes into the default set's grant entry"
+    );
+    assert_eq!(group.node_entry(&me, &renewal_entry_key(None)), None);
 }

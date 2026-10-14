@@ -139,7 +139,11 @@ port argument, not a fresh duration derived inside a network adapter.
 `BulkDonorPort<A, B>` wraps a consumer `A: BootstrapStatePort` and a
 `BootstrapBulkClient<B: BulkTransport>`; it implements `DonorPort` for the
 existing worker without a new task, timer, map of stages, or operation
-allocator. Construction also pins a complete `BootstrapScope` and bulk limits.
+allocator. Construction also pins a complete `BootstrapScope` and bulk limits;
+`BulkDonorPort::new` names the violated rule as a `BulkDonorPortError`, and
+`BulkLimits::validate` names each zero or inverted bound as a
+`BulkLimitsError`. The responder's per-request bound is the `Duration`
+`BulkLimits::server_request`.
 It constructs the client from the **same** admission handle passed to the
 worker, or rejects a separately supplied handle whose pool identity differs;
 a mismatched pool cannot evade the global cap. Local capture and guarded

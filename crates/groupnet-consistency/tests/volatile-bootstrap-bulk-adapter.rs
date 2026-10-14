@@ -2,6 +2,7 @@
 
 #![cfg(feature = "volatile-bootstrap-bulk")]
 
+use std::future::ready;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,29 +10,24 @@ use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, Admitted, ByteAdmission,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_adapter::{
-    BootstrapStatePort, BulkDonorPort,
+    BootstrapStatePort, BulkDonorPort, BulkDonorPortError,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
-    BootstrapBulkListener, BulkLimits, PhaseLimits, WireLimits,
+    BootstrapBulkListener, BulkLimits, BulkLimitsError, PhaseLimits, WireLimits,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::inbox::DonorInbox;
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
     DonorCapture, DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureOutcome,
     LocalCaptureRequest, TransferContext, TransferResources,
 };
-use groupnet_consistency::volatile_recovery::{AdapterError, BoxRecoveryFuture, PublicationPermit};
+use groupnet_consistency::volatile_recovery::bootstrap::{
+    AttachToken, BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, CaptureId,
+    ClaimIdentity, DeltaIdentity, DonorJournal, JournalBatch, JournalConfig, JournalCursor,
+    PresenceIdentity, ReservationId, TransferConfig, TransferOffer,
+};
+use groupnet_consistency::volatile_recovery::{AdapterError, AdapterErrorKind, PublicationPermit};
 use groupnet_core::Time;
-use groupnet_core::volatile_bootstrap::journal::{
-    AttachToken, CaptureId, DeltaIdentity, DonorJournal, JournalBatch, JournalConfig,
-    JournalCursor, ReservationId,
-};
-use groupnet_core::volatile_bootstrap::transfer::{
-    TransferConfig, TransferEffect, TransferEvent, TransferOffer,
-};
-use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity,
-    PresenceIdentity,
-};
+use groupnet_core::volatile_bootstrap::transfer::{TransferEffect, TransferEvent};
 use groupnet_core::{NodeId, Status};
 use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_mem::MemBulkNet;
@@ -58,12 +54,12 @@ impl BootstrapStatePort for PrivateState {
     type Stage = Vec<u8>;
     type NativeBuffer = Vec<u8>;
 
-    fn build_local_capture<'a>(
-        &'a self,
+    fn build_local_capture(
+        &self,
         _request: LocalCaptureRequest,
-        _admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+        _admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<LocalCaptureOutcome<Self::Image>, AdapterError>> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
     fn retire_local_capture(&self, _capture: &DonorCapture<Self::Image>) {}
@@ -74,9 +70,7 @@ impl BootstrapStatePort for PrivateState {
         _max_metadata_bytes: usize,
         admission: &ByteAdmission,
     ) -> Result<Admitted<TransferOffer>, AdapterError> {
-        let charge = admission
-            .reserve(AdmissionClass::Inflight, 512)
-            .map_err(|_| AdapterError)?;
+        let charge = admission.reserve(AdmissionClass::Inflight, 512)?;
         let id = capture
             .ingress()
             .with_journal(|journal| journal.id().clone());
@@ -104,51 +98,47 @@ impl BootstrapStatePort for PrivateState {
         _max_bytes: usize,
         admission: &ByteAdmission,
     ) -> Result<Admitted<Vec<u8>>, AdapterError> {
-        let charge = admission
-            .reserve(AdmissionClass::Inflight, 8)
-            .map_err(|_| AdapterError)?;
+        let charge = admission.reserve(AdmissionClass::Inflight, 8)?;
         Ok(charge.hold(capture.image().clone()))
     }
 
-    fn execute_local<'a>(
-        &'a self,
-        _context: &'a TransferContext,
+    fn execute_local(
+        &self,
+        _context: &TransferContext,
         _effect: TransferEffect,
-        _resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-        _admission: &'a ByteAdmission,
+        _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+        _admission: &ByteAdmission,
         _permit: Option<PublicationPermit>,
         _deadline: Instant,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TransferEvent>>, AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+    ) -> impl Future<Output = Result<Option<Admitted<TransferEvent>>, AdapterError>> + Send {
+        ready(Err(AdapterErrorKind::Unsupported.into()))
     }
 
-    fn store_chunk<'a>(
-        &'a self,
+    fn store_chunk(
+        &self,
         sequence: usize,
-        chunk: &'a Admitted<Vec<u8>>,
-        _resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<usize, AdapterError>> {
-        Box::pin(async move {
-            assert_eq!(sequence, 0);
-            assert_eq!(chunk.get(), &[9]);
-            Ok(1)
-        })
+        chunk: &Admitted<Vec<u8>>,
+        _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<usize, AdapterError>> + Send {
+        assert_eq!(sequence, 0);
+        assert_eq!(chunk.get(), &[9]);
+        ready(Ok(1))
     }
 
-    fn stage_batch<'a>(
-        &'a self,
-        _batch: &'a Admitted<JournalBatch>,
-        _resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>> {
-        Box::pin(async { Ok(()) })
+    fn stage_batch(
+        &self,
+        _batch: &Admitted<JournalBatch>,
+        _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Ok(()))
     }
 
-    fn detach<'a>(
-        &'a self,
+    fn detach(
+        &self,
         _token: AttachToken,
-        _resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>> {
-        Box::pin(async { Ok(()) })
+        _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        ready(Ok(()))
     }
 }
 
@@ -184,7 +174,7 @@ fn limits() -> BulkLimits {
             max_identity_bytes: 32,
             max_effect_bytes: 128,
         },
-        server_request_ms: 1000,
+        server_request: Duration::from_secs(1),
     }
 }
 
@@ -296,9 +286,51 @@ async fn wrong_admission_pool_is_rejected_before_network_allocation() {
             Instant::now() + Duration::from_secs(1),
         )
         .await;
-    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().kind(), AdapterErrorKind::InvalidInput);
     assert_eq!(owned.usage().0, 0);
     assert_eq!(foreign.usage().0, 0);
+}
+
+/// Each violated construction rule is named, never collapsed into one error.
+#[test]
+fn construction_names_each_rejected_rule() {
+    let net = MemBulkNet::new();
+    let open = |scope, policy, limits| {
+        BulkDonorPort::new(
+            Arc::new(PrivateState),
+            DataPlane::new(net.endpoint(NodeId::from("follower"))),
+            admission(),
+            scope,
+            policy,
+            limits,
+        )
+        .err()
+    };
+    let (scope, ..) = setup();
+    let empty = BootstrapScope {
+        domain: String::new(),
+        partition: "bucket".into(),
+    };
+    assert_eq!(
+        open(empty, policy(), limits()),
+        Some(BulkDonorPortError::EmptyScope)
+    );
+    let wide = TransferConfig {
+        max_metadata_bytes: 4096,
+        ..policy()
+    };
+    assert_eq!(
+        open(scope.clone(), wide, limits()),
+        Some(BulkDonorPortError::MetadataExceedsBody)
+    );
+    let mut zero_frame = limits();
+    zero_frame.wire.max_frame_bytes = 0;
+    let rejected = open(scope, policy(), zero_frame).unwrap();
+    assert_eq!(
+        rejected,
+        BulkDonorPortError::Limits(BulkLimitsError::FrameBytes)
+    );
+    assert!(std::error::Error::source(&rejected).is_some());
 }
 
 #[tokio::test]

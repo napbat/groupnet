@@ -9,19 +9,23 @@ use std::time::Instant;
 use groupnet_core::Time;
 use groupnet_core::volatile_bootstrap::BootstrapScope;
 use groupnet_core::volatile_bootstrap::journal::{AttachToken, JournalBatch};
-use groupnet_core::volatile_bootstrap::transfer::{TransferConfig, TransferEffect, TransferEvent};
+use groupnet_core::volatile_bootstrap::transfer::{
+    TransferConfig, TransferEffect, TransferError, TransferEvent,
+};
 use groupnet_transport::bulk::{BulkTransport, DataPlane};
 
 use super::admission::{AdmissionClass, Admitted, ByteAdmission, Reservation};
-use super::bulk_wire::{BootstrapBulkClient, BulkLimits, Correlation};
+use super::bulk_wire::{BootstrapBulkClient, BulkLimits, BulkLimitsError, Correlation};
 use super::ports::{
     DonorCapture, DonorPort, DonorReply, DonorRequest, LocalCaptureOutcome, LocalCaptureRequest,
     ReadyCaptureRequest, TransferContext, TransferResources,
 };
-use crate::volatile_recovery::{AdapterError, BoxRecoveryFuture, PublicationPermit};
+use crate::volatile_recovery::{AdapterError, AdapterErrorKind, PublicationPermit};
 
 /// Application-only behavior required for a peer bootstrap. It never chooses
 /// a donor request, allocates a transfer operation, or schedules a retry.
+/// The asynchronous methods return `Send` futures; implement them as
+/// `async fn` or with an `async move` body.
 pub trait BootstrapStatePort: Send + Sync + 'static {
     /// Private encoded image retained by the local donor.
     type Image: Send + 'static;
@@ -31,20 +35,22 @@ pub trait BootstrapStatePort: Send + Sync + 'static {
     type NativeBuffer: Send + 'static;
 
     /// Complete one origin scan, optionally retaining a guarded donor capture.
-    fn build_local_capture<'a>(
-        &'a self,
+    fn build_local_capture(
+        &self,
         request: LocalCaptureRequest,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>>;
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<LocalCaptureOutcome<Self::Image>, AdapterError>> + Send;
 
     /// Recapture an already-Ready complete application index through the
-    /// fresh recovery-generation guard, without another origin scan.
-    fn recapture_current_index<'a>(
-        &'a self,
-        _request: ReadyCaptureRequest,
-        _admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
-        Box::pin(async { Err(AdapterError) })
+    /// fresh recovery-generation guard, without another origin scan. The
+    /// default port fails with [`AdapterErrorKind::Unsupported`].
+    fn recapture_current_index(
+        &self,
+        request: ReadyCaptureRequest,
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<DonorCapture<Self::Image>, AdapterError>> + Send {
+        let _ = (request, admission);
+        async { Err(AdapterErrorKind::Unsupported.into()) }
     }
 
     /// Unlink this exact capture before its charged image is retired.
@@ -75,39 +81,105 @@ pub trait BootstrapStatePort: Send + Sync + 'static {
 
     /// Execute only `ReserveStage`, `VerifyImage`, `CheckNativeCoverage`,
     /// `InstallCandidate`, or `DiscardStage` under the worker's deadline.
-    fn execute_local<'a>(
-        &'a self,
-        context: &'a TransferContext,
+    fn execute_local(
+        &self,
+        context: &TransferContext,
         effect: TransferEffect,
-        resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-        admission: &'a ByteAdmission,
+        resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+        admission: &ByteAdmission,
         permit: Option<PublicationPermit>,
         deadline: Instant,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TransferEvent>>, AdapterError>>;
+    ) -> impl Future<Output = Result<Option<Admitted<TransferEvent>>, AdapterError>> + Send;
 
     /// Privately verify and store one admitted encoded image chunk. The
     /// charge stays live through this callback; no decoded buffer escapes it.
-    fn store_chunk<'a>(
-        &'a self,
+    fn store_chunk(
+        &self,
         sequence: usize,
-        chunk: &'a Admitted<Vec<u8>>,
-        resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<usize, AdapterError>>;
+        chunk: &Admitted<Vec<u8>>,
+        resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<usize, AdapterError>> + Send;
 
     /// Apply one admitted donor batch to the private stage. No source ack is
     /// sent until this callback succeeds and the core accepts `BatchStaged`.
-    fn stage_batch<'a>(
-        &'a self,
-        batch: &'a Admitted<JournalBatch>,
-        resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>>;
+    fn stage_batch(
+        &self,
+        batch: &Admitted<JournalBatch>,
+        resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
 
     /// Retire the exact logical attachment after source cancellation.
-    fn detach<'a>(
-        &'a self,
+    fn detach(
+        &self,
         token: AttachToken,
-        resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>>;
+        resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send;
+}
+
+/// A [`BulkDonorPort`] configuration rule that [`BulkDonorPort::new`] rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BulkDonorPortError {
+    /// `scope.domain` or `scope.partition` is empty.
+    EmptyScope,
+    /// `policy` failed [`TransferConfig::validate`].
+    Policy(TransferError),
+    /// `scope` exceeds `limits.wire.max_scope_bytes` or
+    /// `limits.phase.max_scope_bytes`.
+    ScopeTooLong,
+    /// `policy.max_metadata_bytes` exceeds `limits.phase.max_body_bytes`.
+    MetadataExceedsBody,
+    /// `policy.max_chunk_bytes` exceeds `limits.phase.max_body_bytes`.
+    ChunkExceedsBody,
+    /// `policy.max_batch_bytes` exceeds `limits.phase.max_body_bytes`.
+    BatchBytesExceedBody,
+    /// `policy.max_batch_events` exceeds `limits.phase.max_events`.
+    BatchEventsExceedPhase,
+    /// `policy.max_members` exceeds `limits.phase.max_members`.
+    MembersExceedPhase,
+    /// `policy.max_cuts` exceeds `limits.phase.max_cuts`.
+    CutsExceedPhase,
+    /// `limits` failed [`BulkLimits::validate`].
+    Limits(BulkLimitsError),
+}
+
+impl std::fmt::Display for BulkDonorPortError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyScope => formatter.write_str("bootstrap scope domain or partition is empty"),
+            Self::Policy(error) => write!(formatter, "invalid transfer policy: {error:?}"),
+            Self::ScopeTooLong => {
+                formatter.write_str("bootstrap scope exceeds the bulk scope limit")
+            }
+            Self::MetadataExceedsBody => {
+                formatter.write_str("policy.max_metadata_bytes exceeds limits.phase.max_body_bytes")
+            }
+            Self::ChunkExceedsBody => {
+                formatter.write_str("policy.max_chunk_bytes exceeds limits.phase.max_body_bytes")
+            }
+            Self::BatchBytesExceedBody => {
+                formatter.write_str("policy.max_batch_bytes exceeds limits.phase.max_body_bytes")
+            }
+            Self::BatchEventsExceedPhase => {
+                formatter.write_str("policy.max_batch_events exceeds limits.phase.max_events")
+            }
+            Self::MembersExceedPhase => {
+                formatter.write_str("policy.max_members exceeds limits.phase.max_members")
+            }
+            Self::CutsExceedPhase => {
+                formatter.write_str("policy.max_cuts exceeds limits.phase.max_cuts")
+            }
+            Self::Limits(_) => formatter.write_str("invalid bulk limits"),
+        }
+    }
+}
+
+impl std::error::Error for BulkDonorPortError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Limits(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// Reusable mapping from core transfer effects to bounded bulk exchanges.
@@ -125,7 +197,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
     /// Binds the client to the worker's one shared admission pool.
     ///
     /// # Errors
-    /// Rejects invalid scope, policy, or transport limits.
+    /// Names the first scope, policy, or transport-limit rule violated.
     pub fn new(
         state: Arc<A>,
         plane: DataPlane<B>,
@@ -133,11 +205,11 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         scope: BootstrapScope,
         policy: TransferConfig,
         limits: BulkLimits,
-    ) -> Result<Self, AdapterError> {
+    ) -> Result<Self, BulkDonorPortError> {
         if scope.domain.is_empty() || scope.partition.is_empty() {
-            return Err(AdapterError);
+            return Err(BulkDonorPortError::EmptyScope);
         }
-        let policy = policy.validate().map_err(|_| AdapterError)?;
+        let policy = policy.validate().map_err(BulkDonorPortError::Policy)?;
         if scope
             .domain
             .len()
@@ -145,17 +217,41 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
             .is_none_or(|bytes| {
                 bytes > limits.wire.max_scope_bytes || bytes > limits.phase.max_scope_bytes
             })
-            || policy.max_metadata_bytes > limits.phase.max_body_bytes
-            || policy.max_chunk_bytes > limits.phase.max_body_bytes
-            || policy.max_batch_bytes > limits.phase.max_body_bytes
-            || policy.max_batch_events > limits.phase.max_events
-            || policy.max_members > limits.phase.max_members
-            || policy.max_cuts > limits.phase.max_cuts
         {
-            return Err(AdapterError);
+            return Err(BulkDonorPortError::ScopeTooLong);
         }
-        let client =
-            BootstrapBulkClient::new(plane, admission.clone(), limits).map_err(|_| AdapterError)?;
+        let body = limits.phase.max_body_bytes;
+        let rules = [
+            (
+                policy.max_metadata_bytes > body,
+                BulkDonorPortError::MetadataExceedsBody,
+            ),
+            (
+                policy.max_chunk_bytes > body,
+                BulkDonorPortError::ChunkExceedsBody,
+            ),
+            (
+                policy.max_batch_bytes > body,
+                BulkDonorPortError::BatchBytesExceedBody,
+            ),
+            (
+                policy.max_batch_events > limits.phase.max_events,
+                BulkDonorPortError::BatchEventsExceedPhase,
+            ),
+            (
+                policy.max_members > limits.phase.max_members,
+                BulkDonorPortError::MembersExceedPhase,
+            ),
+            (
+                policy.max_cuts > limits.phase.max_cuts,
+                BulkDonorPortError::CutsExceedPhase,
+            ),
+        ];
+        if let Some((_, error)) = rules.into_iter().find(|(violated, _)| *violated) {
+            return Err(error);
+        }
+        let client = BootstrapBulkClient::new(plane, admission.clone(), limits)
+            .map_err(BulkDonorPortError::Limits)?;
         Ok(Self {
             state,
             client,
@@ -171,25 +267,19 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         // await. Neither can borrow the other's decoded/response reservation.
         let bytes = self
             .limits
-            .decoded_charge()
-            .map_err(|_| AdapterError)?
-            .checked_add(self.limits.correlation_charge().map_err(|_| AdapterError)?)
-            .ok_or(AdapterError)?;
-        self.admission
-            .reserve(AdmissionClass::Inflight, bytes)
-            .map_err(|_| AdapterError)
+            .decoded_charge()?
+            .checked_add(self.limits.correlation_charge()?)
+            .ok_or(AdapterErrorKind::Capacity)?;
+        Ok(self.admission.reserve(AdmissionClass::Inflight, bytes)?)
     }
 
     fn retained_charge(&self) -> Result<Reservation, AdapterError> {
         let bytes = self
             .limits
-            .decoded_charge()
-            .map_err(|_| AdapterError)?
+            .decoded_charge()?
             .checked_mul(2)
-            .ok_or(AdapterError)?;
-        self.admission
-            .reserve(AdmissionClass::Inflight, bytes)
-            .map_err(|_| AdapterError)
+            .ok_or(AdapterErrorKind::Capacity)?;
+        Ok(self.admission.reserve(AdmissionClass::Inflight, bytes)?)
     }
 
     fn correlation(
@@ -213,19 +303,19 @@ impl<A: BootstrapStatePort, B: BulkTransport> DonorPort for BulkDonorPort<A, B> 
     type Attachment = AttachToken;
     type NativeBuffer = A::NativeBuffer;
 
-    fn build_local_capture<'a>(
-        &'a self,
+    fn build_local_capture(
+        &self,
         request: LocalCaptureRequest,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<LocalCaptureOutcome<Self::Image>, AdapterError>> + Send {
         self.state.build_local_capture(request, admission)
     }
 
-    fn recapture_current_index<'a>(
-        &'a self,
+    fn recapture_current_index(
+        &self,
         request: ReadyCaptureRequest,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
+        admission: &ByteAdmission,
+    ) -> impl Future<Output = Result<DonorCapture<Self::Image>, AdapterError>> + Send {
         self.state.recapture_current_index(request, admission)
     }
 
@@ -243,29 +333,27 @@ impl<A: BootstrapStatePort, B: BulkTransport> DonorPort for BulkDonorPort<A, B> 
         self.prepare_donor_request(request, capture, now, admission)
     }
 
-    fn execute<'a>(
-        &'a self,
-        context: &'a TransferContext,
+    async fn execute(
+        &self,
+        context: &TransferContext,
         effect: TransferEffect,
-        resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-        admission: &'a ByteAdmission,
+        resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
+        admission: &ByteAdmission,
         permit: Option<PublicationPermit>,
         deadline: Instant,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TransferEvent>>, AdapterError>> {
-        Box::pin(async move {
-            if !self.admission.same_pool(admission) || !self.client.uses_admission(admission) {
-                return Err(AdapterError);
-            }
-            self.execute_one(context, effect, resources, admission, permit, deadline)
-                .await
-        })
+    ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
+        if !self.admission.same_pool(admission) || !self.client.uses_admission(admission) {
+            return Err(AdapterErrorKind::InvalidInput.into());
+        }
+        self.execute_one(context, effect, resources, admission, permit, deadline)
+            .await
     }
 
-    fn detach<'a>(
-        &'a self,
+    fn detach(
+        &self,
         token: AttachToken,
-        resources: &'a mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>> {
+        resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
         self.state.detach(token, resources)
     }
 }

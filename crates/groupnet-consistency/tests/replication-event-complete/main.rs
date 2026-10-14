@@ -4,27 +4,26 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, Checkpoint, CheckpointLimit, DurableEventSink,
-    DurableSubscriptionSource, InstallPermit, Limits, Materialized, OpenError, Replication,
-    RevocationPermit, ScanLimit, SourceAdapter, SourceBatch, SubscriptionSourceResult,
-    SubscriptionStart, TailLimit,
-};
-use groupnet_core::replication::{
-    BoundComparison, CommitSubscriberAck, Comparison, Cursor, DurableDeliveryReceipt,
-    FencedCheckpoint, ProofId, RegisterReceipt, RegisterSubscriber, RetentionPolicy, Scope,
-    SourceHistory, SourceProof, SourceSubscriberState, Stream, SubscriberAckReceipt, SubscriberId,
-    SubscriberKey, SubscriptionEpoch, SubscriptionError, SubscriptionLimits,
+    AdapterFailure, ApplicationAdapter, BoundComparison, Checkpoint, CheckpointLimit,
+    CommitSubscriberAck, Comparison, Cursor, DurableDeliveryReceipt, DurableEventSink,
+    DurableSubscriptionSource, FencedCheckpoint, InstallPermit, Limits, Materialized, OpenError,
+    ProofId, RegisterReceipt, RegisterSubscriber, Replication, RetentionPolicy, RevocationPermit,
+    ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory, SourceProof,
+    SourceSubscriberState, Stage, Stream, SubscriberAckReceipt, SubscriberId, SubscriberKey,
+    SubscriptionEpoch, SubscriptionError, SubscriptionLimits, SubscriptionSourceResult,
+    SubscriptionStart, TailLimit, TerminalReceipt,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 
 const SETTLE: Duration = Duration::from_secs(3);
 
+mod open_errors;
 mod snapshot_composition;
 mod source_fixture;
 mod terminal_lifecycle;
@@ -105,8 +104,7 @@ struct Log {
     source_ack: HashMap<SubscriberKey, u64>,
     registration_requests: HashMap<Vec<u8>, RegisterReceipt>,
     ack_requests: HashMap<(SubscriberKey, Vec<u8>), SubscriberAckReceipt>,
-    terminal_requests:
-        HashMap<(SubscriberKey, Vec<u8>), groupnet_core::replication::TerminalReceipt>,
+    terminal_requests: HashMap<(SubscriberKey, Vec<u8>), TerminalReceipt>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -377,7 +375,7 @@ async fn failed_sink_operation_retires_its_cloned_permit_before_retry() {
             .lock()
             .expect("permit lock")
             .is_some()
-            && handle.status().stage == groupnet_core::replication::Stage::RetryWait
+            && handle.status().stage == Stage::RetryWait
     })
     .await;
     let stale = sink
@@ -394,10 +392,7 @@ async fn failed_sink_operation_retires_its_cloned_permit_before_retry() {
             .is_none()
     );
     handle.cancel();
-    assert_eq!(
-        handle.status().stage,
-        groupnet_core::replication::Stage::Cancelled
-    );
+    assert_eq!(handle.status().stage, Stage::Cancelled);
 }
 
 fn limits() -> Limits {
@@ -406,7 +401,7 @@ fn limits() -> Limits {
     limits.core.retry_ms = 10;
     limits.core.attempt_timeout_ms = 500;
     limits.core.max_batch_bytes = 1024;
-    limits.max_inflight_bytes = 2048;
+    limits.max_inflight_bytes = NonZeroUsize::new(2048).expect("nonzero");
     limits
 }
 
@@ -455,7 +450,7 @@ async fn first_operation_budget_starts_before_blocked_cursor_encoding() {
     gate.release();
     let handle = opening.await.expect("opening task").expect("named open");
     eventually_within("expired initial registration backed off", SETTLE, || {
-        handle.status().stage == groupnet_core::replication::Stage::RetryWait
+        handle.status().stage == Stage::RetryWait
     })
     .await;
     assert_eq!(source.register_calls.load(Ordering::Acquire), 0);
@@ -563,7 +558,7 @@ async fn two_names_share_native_scope_and_global_registry_capacity() {
         .spawn()
         .await;
     let mut bounds = limits();
-    bounds.max_scopes = 2;
+    bounds.max_scopes = NonZeroUsize::new(2).expect("nonzero");
     let source = MemSource::default();
     let sink = MemSink::default();
     let manager = Replication::new(cluster.groups[0].clone(), source, StubApp, bounds)
@@ -639,9 +634,9 @@ async fn two_names_progress_with_one_operation_and_one_batch_of_bytes() {
         .spawn()
         .await;
     let mut bounds = limits();
-    bounds.max_scopes = 2;
-    bounds.max_parallel_ops = 1;
-    bounds.max_inflight_bytes = bounds.core.max_batch_bytes;
+    bounds.max_scopes = NonZeroUsize::new(2).expect("nonzero");
+    bounds.max_parallel_ops = NonZeroUsize::MIN;
+    bounds.max_inflight_bytes = NonZeroUsize::new(bounds.core.max_batch_bytes).expect("nonzero");
     let source = MemSource::default();
     let sink = MemSink::default();
     let manager = Replication::new(cluster.groups[0].clone(), source.clone(), StubApp, bounds)
@@ -684,12 +679,6 @@ async fn two_names_progress_with_one_operation_and_one_batch_of_bytes() {
             && sink.applied(second.key()) == HashSet::from([1, 2])
     })
     .await;
-    assert_ne!(
-        first.status().stage,
-        groupnet_core::replication::Stage::RetryWait
-    );
-    assert_ne!(
-        second.status().stage,
-        groupnet_core::replication::Stage::RetryWait
-    );
+    assert_ne!(first.status().stage, Stage::RetryWait);
+    assert_ne!(second.status().stage, Stage::RetryWait);
 }

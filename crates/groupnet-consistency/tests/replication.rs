@@ -3,18 +3,16 @@
 #![cfg(feature = "replication")]
 
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, CatchUp, Checkpoint, CheckpointLimit, InstallPermit,
-    Limits, Materialized, OpenError, ReadVerdict, Replication, RevocationPermit, ScanLimit,
-    SourceAdapter, SourceBatch, TailLimit,
-};
-use groupnet_core::replication::{
-    BoundComparison, Comparison, Cursor, ProofId, Scope, SourceHistory, SourceProof, Stage, Stream,
+    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
+    Comparison, Cursor, InstallPermit, Limits, Materialized, OpenError, ProofId, ReadVerdict,
+    Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory,
+    SourceProof, Stage, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -387,7 +385,7 @@ fn limits() -> Limits {
     limits.core.retry_ms = 20;
     limits.core.max_batch_events = 2;
     limits.core.max_batch_bytes = 8;
-    limits.max_inflight_bytes = 8;
+    limits.max_inflight_bytes = NonZeroUsize::new(8).expect("nonzero");
     limits
 }
 
@@ -774,7 +772,7 @@ async fn slow_scope_cannot_hold_global_admission_forever() {
     let mut bounded = limits();
     bounded.core.attempt_timeout_ms = 80;
     bounded.core.max_retries = 10;
-    bounded.max_parallel_ops = 2;
+    bounded.max_parallel_ops = NonZeroUsize::new(2).expect("nonzero");
     let manager = Replication::new(
         cluster.groups[0].clone(),
         source.clone(),
@@ -848,7 +846,7 @@ async fn bounded_scope_registry_reports_backpressure_and_reclaims_capacity() {
         .spawn()
         .await;
     let mut bounded = limits();
-    bounded.max_scopes = 1;
+    bounded.max_scopes = NonZeroUsize::MIN;
     let manager = Replication::new(
         cluster.groups[0].clone(),
         MemSource::new(),

@@ -10,7 +10,13 @@ use groupnet_runtime::{
     EntryInspectionLimits, EntryMutationLimits, EntryRevision, InspectedPair, InspectedPairEntry,
 };
 
-use super::{AdapterError, AdmissionClass, Admitted, NativeClaimSource};
+use super::{
+    AdapterError, AdapterErrorKind, AdmissionClass, Admitted, CAPACITY, MALFORMED,
+    NativeClaimSource, UNAVAILABLE,
+};
+
+/// A newer or concurrent presence for this member holds the entry.
+const FENCED: AdapterError = AdapterError::new(AdapterErrorKind::Fenced);
 
 /// Confirmed CAS rejections re-inspected per publication. Each attempt is two
 /// bounded actor round trips inside the caller's own operation deadline.
@@ -21,15 +27,15 @@ impl NativeClaimSource {
         let per_member = size_of::<InspectedPairEntry>()
             .checked_add(self.policy.max_member_bytes)
             .and_then(|bytes| bytes.checked_add(self.max_value_bytes.checked_mul(2)?))
-            .ok_or(AdapterError)?;
+            .ok_or(CAPACITY)?;
         let max_response_bytes = size_of::<InspectedPair>()
             .checked_add(
                 self.policy
                     .max_members
                     .checked_mul(per_member)
-                    .ok_or(AdapterError)?,
+                    .ok_or(CAPACITY)?,
             )
-            .ok_or(AdapterError)?;
+            .ok_or(CAPACITY)?;
         Ok(EntryInspectionLimits {
             max_key_bytes: self.key.len().max(self.presence_key.len()),
             max_members: self.policy.max_members,
@@ -45,16 +51,13 @@ impl NativeClaimSource {
             .max_response_bytes
             .checked_add(self.presence_key.len())
             .and_then(|bytes| bytes.checked_add(self.key.len()))
-            .ok_or(AdapterError)?;
-        let budget = self
-            .admission
-            .reserve(AdmissionClass::Inflight, charge)
-            .map_err(|_| AdapterError)?;
+            .ok_or(CAPACITY)?;
+        let budget = self.admission.reserve(AdmissionClass::Inflight, charge)?;
         let (observed, budget) = self
             .group
             .inspect_scoped_pair(&self.presence_key, &self.key, limits, budget)
             .await
-            .map_err(|_| AdapterError)?;
+            .map_err(|_| UNAVAILABLE)?;
         Ok(budget.hold(observed))
     }
 
@@ -69,34 +72,32 @@ impl NativeClaimSource {
         if &presence.identity.node != self.group.local_node()
             || presence.remaining_ms != self.policy.claim_ttl_ms
         {
-            return Err(AdapterError);
+            return Err(AdapterErrorKind::InvalidInput.into());
         }
         let mut published = self.presence_published.lock().await;
         if published
             .as_ref()
             .is_some_and(|(identity, _)| identity != &presence.identity)
         {
-            return Err(AdapterError);
+            return Err(FENCED);
         }
         let value_len =
             encoded_presence_len(&self.scope, self.policy, &presence, self.max_value_bytes)
-                .map_err(|_| AdapterError)?;
+                .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
         let queued_bytes = self
             .presence_key
             .len()
             .checked_add(value_len)
-            .ok_or(AdapterError)?;
+            .ok_or(CAPACITY)?;
         let mut queued = self
             .admission
-            .reserve(AdmissionClass::Inflight, queued_bytes)
-            .map_err(|_| AdapterError)?;
+            .reserve(AdmissionClass::Inflight, queued_bytes)?;
         let retained = self
             .admission
-            .reserve(AdmissionClass::Inflight, value_len)
-            .map_err(|_| AdapterError)?;
+            .reserve(AdmissionClass::Inflight, value_len)?;
         let value =
             encode_presence_value(&self.scope, self.policy, &presence, self.max_value_bytes)
-                .map_err(|_| AdapterError)?;
+                .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
         let value = retained.hold(value);
         let mut attempts = 0;
         loop {
@@ -107,7 +108,7 @@ impl NativeClaimSource {
                 .entries
                 .iter()
                 .find(|entry| &entry.node == self.group.local_node())
-                .ok_or(AdapterError)?;
+                .ok_or(MALFORMED)?;
             if let Some(existing) = &local.first {
                 let existing = decode_presence_value(
                     &self.scope,
@@ -116,7 +117,7 @@ impl NativeClaimSource {
                     existing,
                     self.max_value_bytes,
                 )
-                .map_err(|_| AdapterError)?;
+                .map_err(|_| MALFORMED)?;
                 if existing.identity != presence.identity {
                     // The same boot token is another live session of this
                     // process, or this session already confirmed its own. A
@@ -125,13 +126,13 @@ impl NativeClaimSource {
                     // its TTL lapses; this life supersedes it at the observed
                     // revision.
                     if existing.identity.boot == presence.identity.boot || published.is_some() {
-                        return Err(AdapterError);
+                        return Err(FENCED);
                     }
                 } else if existing.renewal > presence.renewal {
-                    return Err(AdapterError);
+                    return Err(FENCED);
                 } else if existing.renewal == presence.renewal {
                     if local.first_remaining_ttl_ms.is_none_or(|ttl| ttl == 0) {
-                        return Err(AdapterError);
+                        return Err(FENCED);
                     }
                     *published = Some((presence.identity, value));
                     return Ok(());
@@ -139,7 +140,7 @@ impl NativeClaimSource {
             } else if published.is_some() {
                 // A previously confirmed local presence lapsed. Do not silently
                 // re-create it with a later renewal after the peer proof broke.
-                return Err(AdapterError);
+                return Err(FENCED);
             }
             let expected = EntryRevision {
                 key: local.first_version,
@@ -172,7 +173,7 @@ impl NativeClaimSource {
                     // fresh cut and re-run every check above; a retained key
                     // revision or a newer presence still refuses.
                     if attempts >= MAX_PRESENCE_ATTEMPTS {
-                        return Err(AdapterError);
+                        return Err(FENCED);
                     }
                     queued = budget;
                 }
@@ -186,7 +187,7 @@ impl NativeClaimSource {
                             && entry.first_remaining_ttl_ms.is_some_and(|ttl| ttl > 0)
                     });
                     if !matches {
-                        return Err(AdapterError);
+                        return Err(UNAVAILABLE);
                     }
                     break;
                 }
@@ -211,11 +212,10 @@ impl NativeClaimSource {
             .presence_key
             .len()
             .checked_add(value.get().len())
-            .ok_or(AdapterError)?;
+            .ok_or(CAPACITY)?;
         let queued = self
             .admission
-            .reserve(AdmissionClass::Inflight, queued_bytes)
-            .map_err(|_| AdapterError)?;
+            .reserve(AdmissionClass::Inflight, queued_bytes)?;
         let result = self
             .group
             .delete_entry_if_value(
@@ -234,7 +234,7 @@ impl NativeClaimSource {
                 &entry.node == self.group.local_node()
                     && entry.first.as_deref() == Some(value.get().as_slice())
             }) {
-                return Err(AdapterError);
+                return Err(UNAVAILABLE);
             }
         }
         *published = None;

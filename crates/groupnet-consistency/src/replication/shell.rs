@@ -16,9 +16,13 @@ use groupnet_runtime::Group;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use super::ack_api::{AckEvidenceSource, AckWaitStartError, NamedAckRequest};
-use super::api::{ApplicationAdapter, CatchUp, FailureClass, Limits, ReadVerdict, SourceAdapter};
+use super::ack_api::{
+    AckEvidenceSource, AckWaitStartError, ErasedAckSource, NamedAckRequest, validate_ack_limits,
+};
+use super::api::{ApplicationAdapter, CatchUp, FailureClass, ReadVerdict, SourceAdapter};
 use super::fence::OperationFence;
+use super::limits::Limits;
+use super::open_error::OpenError;
 use super::snapshot_api::{
     NativeSnapshot, ReplayOnly, SnapshotApplicationAdapter, SnapshotSourceAdapter,
 };
@@ -34,23 +38,6 @@ pub use event_complete::{
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Failure to register a local state-sync scope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OpenError {
-    /// Configuration is zero or exceeds the global reserve.
-    InvalidConfig,
-    /// Scope belongs to another Groupnet group.
-    WrongGroup,
-    /// A session for the scope already exists.
-    AlreadyOpen,
-    /// A session incarnation is already active in this manager.
-    DuplicateSession,
-    /// The configured local scope registry is full.
-    Backpressured,
-    /// No Tokio executor is running.
-    NoRuntime,
 }
 
 /// Typed progress visible to readers and observers.
@@ -123,7 +110,7 @@ impl fmt::Debug for Command {
 }
 
 struct AckCapability {
-    source: Arc<dyn AckEvidenceSource>,
+    source: Arc<dyn ErasedAckSource>,
     limits: AckWaitLimits,
 }
 
@@ -229,7 +216,7 @@ where
         if admission.session_ids.contains(&session_id) {
             return Err(OpenError::DuplicateSession);
         }
-        if admission.active >= self.limits.max_scopes {
+        if admission.active >= self.limits.max_scopes.get() {
             return Err(OpenError::Backpressured);
         }
         admission.active += 1;
@@ -289,7 +276,9 @@ where
     /// Builds a bounded manager. It starts no source work until [`Self::open`].
     ///
     /// # Errors
-    /// Returns [`OpenError::InvalidConfig`] for zero or inconsistent limits.
+    /// Returns [`OpenError::InvalidLimits`] naming the violated limit, or
+    /// [`OpenError::SnapshotLimitsUnsupported`] when `limits.core.snapshot`
+    /// is set.
     pub fn new(group: Group, source: S, app: A, limits: Limits) -> Result<Self, OpenError> {
         Self::build(group, source, app, limits)
     }
@@ -303,7 +292,9 @@ where
     /// Builds a manager with source-native snapshot recovery enabled.
     ///
     /// # Errors
-    /// Returns [`OpenError::InvalidConfig`] unless finite snapshot limits are set.
+    /// Returns [`OpenError::InvalidLimits`] naming the violated limit, or
+    /// [`OpenError::SnapshotLimitsRequired`] unless `limits.core.snapshot`
+    /// sets finite snapshot bounds.
     pub fn new_native(group: Group, source: S, app: A, limits: Limits) -> Result<Self, OpenError> {
         Self::build(group, source, app, limits)
     }
@@ -320,10 +311,15 @@ where
     M: SnapshotMode<S, A>,
 {
     fn build(group: Group, source: S, app: A, limits: Limits) -> Result<Self, OpenError> {
-        let limits = limits.validate().map_err(|_| OpenError::InvalidConfig)?;
-        if M::ENABLED != limits.core.snapshot.is_some() {
-            return Err(OpenError::InvalidConfig);
+        limits.validate()?;
+        match (M::ENABLED, limits.core.snapshot.is_some()) {
+            (true, false) => return Err(OpenError::SnapshotLimitsRequired),
+            (false, true) => return Err(OpenError::SnapshotLimitsUnsupported),
+            _ => {}
         }
+        let max_parallel_ops = limits.max_parallel_ops.get();
+        let max_inflight_bytes = limits.max_inflight_bytes.get();
+        let max_checkpoint_inflight_bytes = limits.max_checkpoint_inflight_bytes.get();
         Ok(Self {
             inner: Arc::new(Manager {
                 group,
@@ -332,14 +328,12 @@ where
                 limits,
                 sessions: Mutex::new(HashMap::new()),
                 admission: Mutex::new(RegistrationAdmission::default()),
-                operations: Arc::new(Semaphore::new(limits.max_parallel_ops)),
-                bytes: Arc::new(Semaphore::new(limits.max_inflight_bytes)),
-                checkpoint_bytes: Arc::new(Semaphore::new(limits.max_checkpoint_inflight_bytes)),
-                snapshot_ops: Arc::new(Semaphore::new(
-                    limits.max_parallel_ops - usize::from(M::ENABLED),
-                )),
+                operations: Arc::new(Semaphore::new(max_parallel_ops)),
+                bytes: Arc::new(Semaphore::new(max_inflight_bytes)),
+                checkpoint_bytes: Arc::new(Semaphore::new(max_checkpoint_inflight_bytes)),
+                snapshot_ops: Arc::new(Semaphore::new(max_parallel_ops - usize::from(M::ENABLED))),
                 snapshot_bytes: Arc::new(Semaphore::new(
-                    limits.max_inflight_bytes
+                    max_inflight_bytes
                         - if M::ENABLED {
                             limits.core.max_batch_bytes
                         } else {
@@ -347,9 +341,9 @@ where
                         },
                 )),
                 snapshot_checkpoint_bytes: Arc::new(Semaphore::new(
-                    limits.max_checkpoint_inflight_bytes
+                    max_checkpoint_inflight_bytes
                         - if M::ENABLED {
-                            limits.max_checkpoint_bytes
+                            limits.max_checkpoint_bytes.get()
                         } else {
                             0
                         },
@@ -365,28 +359,18 @@ where
     /// unchanged; no lease-holder roster is inferred from gossip.
     ///
     /// # Errors
-    /// Returns an invalid-configuration error if the manager is already
-    /// shared/open, configured twice, or given zero/inconsistent bounds.
+    /// Returns [`OpenError::InvalidAckLimits`] naming the violated limit,
+    /// [`OpenError::SessionsStarted`] once a session has opened, or
+    /// [`OpenError::AckEvidenceAlreadyAttached`] on a second attachment.
     pub fn with_ack_evidence<E: AckEvidenceSource>(
         mut self,
         source: E,
         limits: AckWaitLimits,
     ) -> Result<Self, OpenError> {
-        if limits.max_required == 0
-            || limits.max_identity_bytes == 0
-            || limits.max_certificate_bytes == 0
-            || limits.max_metadata_bytes == 0
-            || limits.max_wait_ms == 0
-            || limits.poll_ms == 0
-            || limits.poll_ms > limits.max_wait_ms
-            || limits.max_identity_bytes > limits.max_metadata_bytes
-            || limits.max_certificate_bytes > limits.max_metadata_bytes
-        {
-            return Err(OpenError::InvalidConfig);
-        }
-        let manager = Arc::get_mut(&mut self.inner).ok_or(OpenError::InvalidConfig)?;
+        validate_ack_limits(&limits)?;
+        let manager = Arc::get_mut(&mut self.inner).ok_or(OpenError::SessionsStarted)?;
         if manager.ack.is_some() {
-            return Err(OpenError::InvalidConfig);
+            return Err(OpenError::AckEvidenceAlreadyAttached);
         }
         manager.ack = Some(AckCapability {
             source: Arc::new(source),
@@ -422,9 +406,9 @@ where
             self.inner.limits.core,
             session_id.get(),
         )
-        .map_err(|_| OpenError::InvalidConfig)?;
+        .map_err(OpenError::InvalidScope)?;
         let reservation = self.inner.reserve_registration(session_id)?;
-        let (commands, receiver) = mpsc::channel(self.inner.limits.queue_depth);
+        let (commands, receiver) = mpsc::channel(self.inner.limits.queue_depth.get());
         let initial = Published {
             state: engine.state().clone(),
             decision: CoreReadDecision::Refuse(Refusal::Unready),

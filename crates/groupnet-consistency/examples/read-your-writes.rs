@@ -1,24 +1,20 @@
-//! Read-your-writes across two nodes: one writes, the other serves reads out of
-//! a local cache, and a session token makes the read honest.
+//! Read-your-writes across two nodes: one writes, the other serves reads from a
+//! local cache, and a session token makes the read honest.
 //!
-//! `node-a` owns the records. `node-b` answers reads from a cache that can go
-//! stale the moment `node-a` writes. The fix is not a lock and not a quorum: it
-//! is a [`WriteFeed`] on the writer, a `PeerWrites` apply loop on the reader, and
-//! a [`Frontier`] the reader barriers on before serving.
+//! `node-a` publishes every write into a [`WriteFeed`] and hands the returned
+//! token to its client. `node-b` runs the application's apply loop over
+//! [`PeerWrites`] and advances a [`Frontier`] only once a write is *applied* to
+//! its cache. The run makes two points:
 //!
-//! The point the run makes twice over:
+//! * **Applied, not delivered.** The apply loop takes visible time; a read issued
+//!   straight after the write sees the stale value, and the same read behind
+//!   [`FrontierView::reached`](groupnet_consistency::FrontierView::reached)
+//!   cannot.
+//! * **Missed writes are detected, never silent.** A burst that overflows the
+//!   writer's two-slot ring reaches the reader as a [`PeerWrite::Gap`]; it
+//!   flushes its cache, and its barrier stays truthful across the hole.
 //!
-//! * The frontier means **applied**, not merely delivered. The apply loop here
-//!   takes visible time (a real one invalidates a tier, refetches a row); a read
-//!   issued straight after the write sees the stale value, and the same read
-//!   behind [`FrontierView::reached`] cannot.
-//! * Missed writes are **detected, never silent**. Overflow the writer's small
-//!   ring while the reader is busy and the reader is told exactly how much it
-//!   lost, so it can remediate coarsely — and its barriers stay truthful across
-//!   the hole.
-//!
-//! Two `Node`s over the in-memory transport stand in for two machines; swap it
-//! for `groupnet-transport-udp` and nothing here changes.
+//! Two `Node`s over the in-memory transport stand in for two machines.
 //!
 //! ```text
 //! cargo run -p groupnet-consistency --example read-your-writes
@@ -30,194 +26,148 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use groupnet_consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed};
+use groupnet_consistency::{Frontier, Group, PeerWrite, PeerWrites, WriteFeed, WriteToken};
 use groupnet_core::NodeId;
-use groupnet_network::RouterConfig;
-use groupnet_runtime::{Group, Node};
+use groupnet_runtime::Node;
 use groupnet_transport_mem::{MemLink, Network};
 
-const GROUP: &str = "stores";
-
-/// The writer's ring: deliberately tiny, so a short burst can overflow it and
-/// show what an unrecoverable lag looks like. Size it for your write rate.
+/// The writer's ring: tiny, so a short burst overflows it. Size it for your
+/// write rate.
 const RING: usize = 2;
 
-/// Stands in for the cost of actually applying an invalidation — evicting a
-/// tier, refetching a row. It is what makes "applied" different from
-/// "delivered", and the whole reason the frontier is advanced by the apply loop
-/// rather than by delivery.
+/// Stands in for really applying an invalidation (evicting a tier, refetching a
+/// row) — the cost that makes "applied" differ from "delivered".
 const APPLY_COST: Duration = Duration::from_millis(150);
 
-/// A key the reader has cached.
-type Key = String;
+/// The reader's cache: key -> cached value.
+type Cache = Arc<Mutex<HashMap<String, String>>>;
 
 #[tokio::main]
 async fn main() {
     let net = Network::new();
-    let (writer_id, _writer_node, writer_group) = spawn(&net, "node-a", "node-b").await;
-    let (reader_id, _reader_node, reader_group) = spawn(&net, "node-b", "node-a").await;
-    wait_until(|| writer_group.members().len() == 2 && reader_group.members().len() == 2).await;
-    println!("== two nodes, one group \"{GROUP}\" ==");
-    println!("  {writer_id} owns the records; {reader_id} serves reads from a cache");
+    let (writer, _writer_node, writer_group) = spawn(&net, "node-a", "node-b").await;
+    let (reader, _reader_node, reader_group) = spawn(&net, "node-b", "node-a").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while writer_group.members().len() < 2 || reader_group.members().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("membership converges");
 
-    // ---- the reader: a cache, an apply loop, and a frontier ----------------
-    let cache: Arc<Mutex<HashMap<Key, String>>> = Arc::default();
-    cache
-        .lock()
-        .expect("lock")
-        .insert("user:1".to_owned(), "Ada Lovelace (cached)".to_owned());
-
-    let mut peers = PeerWrites::new(reader_group, reader_id, |bytes: &[u8]| {
+    // The reader: a cache, an apply loop, and a frontier the loop advances only
+    // once the cache really is coherent.
+    let cache: Cache = Arc::default();
+    put(&cache, "user:1", "Ada Lovelace (stale)");
+    let (frontier, view) = Frontier::new();
+    let gap_seen = Arc::new(AtomicBool::new(false));
+    let mut peers = PeerWrites::new(reader_group, reader, |bytes: &[u8]| {
         String::from_utf8(bytes.to_vec()).ok()
     });
-    let (frontier, view) = Frontier::new();
-
-    // The apply loop is the application's, not the library's — which is exactly
-    // why the frontier advances only once the local state really is coherent.
-    // The flag lets the closing narrative report what this run actually saw.
-    let gap_seen = Arc::new(AtomicBool::new(false));
-    let applied = Arc::clone(&cache);
-    let saw = Arc::clone(&gap_seen);
+    let (applied, saw_gap) = (Arc::clone(&cache), Arc::clone(&gap_seen));
     tokio::spawn(async move {
         while let Some(event) = peers.next().await {
             match event {
                 PeerWrite::Wrote { peer, token, key } => {
                     tokio::time::sleep(APPLY_COST).await;
                     applied.lock().expect("lock").remove(&key);
-                    println!("  [apply] {peer} wrote {key} at {token:?} -> evicted");
                     frontier.advance(&peer, token);
                 }
                 PeerWrite::Gap {
                     peer,
                     missed_through,
                 } => {
-                    // Coarse remediation: we cannot know *which* keys were
-                    // missed, so nothing cached may be trusted.
-                    saw.store(true, Ordering::Relaxed);
-                    tokio::time::sleep(APPLY_COST).await;
+                    // Which keys were missed is unknowable, so nothing cached
+                    // may be trusted: coarse remediation.
+                    saw_gap.store(true, Ordering::Relaxed);
                     applied.lock().expect("lock").clear();
-                    println!(
-                        "  [apply] gap: {peer}'s writes through {missed_through:?} were missed \
-                         -> flushed the whole cache"
-                    );
+                    println!("  [apply] gap through {missed_through:?} -> flushed the cache");
                     frontier.advance(&peer, missed_through);
                 }
-                // A sealed life delivered in full: nothing was missed, so
-                // nothing cached is suspect.
+                // A sealed life delivered in full: nothing was missed.
                 PeerWrite::Sealed { peer, token } => frontier.advance(&peer, token),
                 PeerWrite::Renewed { peer, epoch, .. } => {
-                    frontier.advance(&peer, groupnet_consistency::WriteToken { epoch, seq: 0 });
+                    frontier.advance(&peer, WriteToken { epoch, seq: 0 });
                 }
             }
         }
     });
 
-    // ---- act 1: a write, an unbarriered read, and a barriered one ----------
+    // The writer. A durable epoch (a WAL generation, a boot counter) beats the
+    // wall-clock default, and keeps these tokens readable.
     let feed = WriteFeed::new(
         writer_group,
         NonZeroUsize::new(RING).expect("nonzero"),
-        |key: &Key| key.clone().into_bytes(),
+        |key: &String| key.clone().into_bytes(),
     )
-    // Every feed life carries an epoch so a restart cannot be mistaken for a
-    // rewind. The default is the wall clock; a durable counter (a WAL
-    // generation, a boot counter) is better where you have one — and it keeps
-    // this demo's tokens readable.
     .with_epoch(1);
 
-    println!("\n== act 1: the barrier is the difference ==");
-    let token = feed.publish(&"user:1".to_owned()).await;
-    println!("  [write] {writer_id} wrote user:1, session token {token:?}");
-    println!("  [read ] without a barrier: {}", read(&cache, "user:1"));
-
-    let reached = view.reached(&writer_id, token).await;
+    println!("== the barrier is the difference ==");
+    let token = feed
+        .publish(&"user:1".to_owned())
+        .await
+        .expect("an idle group accepts the advertisement");
+    println!("  {writer} wrote user:1, session token {token:?}");
+    println!("  read without a barrier: {}", get(&cache, "user:1"));
+    let reached = view.reached(&writer, token).await;
     println!(
-        "  [read ] after reached(..) = {reached}: {}",
-        read(&cache, "user:1")
+        "  read after reached = {reached}: {}",
+        get(&cache, "user:1")
     );
-    println!("  the second read could not have been stale: the barrier waited for the apply");
 
-    // ---- act 2: outrun the ring, and be told so ----------------------------
-    println!("\n== act 2: a lag the ring cannot cover ==");
-    println!(
-        "  the reader is mid-apply while {writer_id} publishes 4 more writes into {RING} slots"
-    );
-    cache.lock().expect("lock").extend([
-        ("user:2".to_owned(), "Grace Hopper (cached)".to_owned()),
-        (
-            "user:9".to_owned(),
-            "Karen Spärck Jones (cached)".to_owned(),
-        ),
-    ]);
+    println!("\n== a lag the ring cannot cover ==");
+    put(&cache, "user:2", "Grace Hopper (stale)");
     let mut last = token;
-    for key in ["user:2", "user:3", "user:4", "user:9"] {
-        last = feed.publish(&key.to_owned()).await;
+    for key in ["user:2", "user:3", "user:4", "user:5"] {
+        last = feed
+            .publish(&key.to_owned())
+            .await
+            .expect("an idle group accepts the advertisement");
     }
-    println!("  [write] latest session token {last:?}");
-
-    let reached = view.reached(&writer_id, last).await;
+    println!("  4 writes into {RING} slots, latest token {last:?}");
+    let reached = view.reached(&writer, last).await;
     println!(
-        "  [read ] after reached(..) = {reached}: user:2 -> {}",
-        read(&cache, "user:2")
-    );
-    println!(
-        "  [read ] after reached(..) = {reached}: user:9 -> {}",
-        read(&cache, "user:9")
+        "  read after reached = {reached}: {}",
+        get(&cache, "user:2")
     );
     if gap_seen.load(Ordering::Relaxed) {
-        println!(
-            "  writes fell off the ring — the reader was told, flushed, and its\n  \
-             barrier still means what it says. Silence was never an option."
-        );
+        println!("  writes fell off the ring: the reader was told, flushed, and its barrier held");
     } else {
-        println!(
-            "  the reader kept pace this run, so nothing fell off the ring — when it\n  \
-             cannot, the loss arrives as an explicit gap, never silence."
-        );
+        println!("  the reader kept pace this run; had it not, the loss would arrive as a Gap");
     }
 }
 
-/// Brings up one node on `net` seeded with `seed`, joined to [`GROUP`]. The
-/// returned [`Node`] must be kept alive: dropping it stops the node.
-async fn spawn(net: &Network, id: &str, seed: &str) -> (NodeId, Node, Group) {
+/// One node on `net`, seeded with its peer and joined to the `stores` group.
+/// Keep the [`Node`]: dropping it stops the node.
+async fn spawn(net: &Network, id: &str, peer: &str) -> (NodeId, Node, Group) {
     let me = NodeId::new(id);
     let node = Node::builder(me.clone())
         .link(MemLink::new(
             net.endpoint(me.clone()),
-            vec![NodeId::new(seed)],
+            vec![NodeId::new(peer)],
         ))
-        .routing(RouterConfig {
-            announce_interval: Duration::from_millis(10),
-            ..RouterConfig::default()
-        })
-        .seed(NodeId::new(seed))
-        // Brisk cadences so a demo does not spend its life waiting for gossip.
+        .seed(NodeId::new(peer))
         .gossip_interval_ms(10)
         .start()
         .await
         .expect("the memory link binds");
-    let group = node.join_group(GROUP);
+    let group = node.join_group("stores");
     (me, node, group)
 }
 
-/// Polls `cond` until it holds, panicking after a generous deadline — a demo
-/// that cannot converge should fail loudly, not hang on a later await.
-/// Membership is gossiped, so a demo waits for it rather than assuming it.
-async fn wait_until(mut cond: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for the cluster to settle");
+fn put(cache: &Cache, key: &str, value: &str) {
+    cache
+        .lock()
+        .expect("lock")
+        .insert(key.to_owned(), value.to_owned());
 }
 
 /// What the reader would serve for `key` right now.
-fn read(cache: &Mutex<HashMap<Key, String>>, key: &str) -> String {
+fn get(cache: &Cache, key: &str) -> String {
     cache
         .lock()
         .expect("lock")
         .get(key)
         .cloned()
-        .unwrap_or_else(|| "<miss — read through to the store>".to_owned())
+        .unwrap_or_else(|| "<miss: read through to the store>".to_owned())
 }

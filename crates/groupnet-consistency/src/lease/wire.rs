@@ -3,7 +3,7 @@
 //!
 //! # Two entries, one protocol
 //!
-//! * **The renewal**, `~lease` (`~lease:<name>` for a named set), authored by
+//! * **The renewal**, `~lease/r/<set>`, authored by
 //!   the **reader** and carrying one [`RenewalId`] under a TTL of one lease
 //!   duration. Its expiry *at each receiver* is the granter-side half of the
 //!   lease: the engine arms `now + ttl_ms` against the receiver's own clock at
@@ -11,7 +11,7 @@
 //!   earlier than one duration after the reader recorded the publish instant.
 //!   That inequality is what makes the reader's own arithmetic
 //!   ([`LeaseCore`](super::LeaseCore)) conservative rather than hopeful.
-//! * **The grant map**, `~lease:g` (`~lease:g:<name>`), authored by **every**
+//! * **The grant map**, `~lease/g/<set>`, authored by **every**
 //!   member and carrying the newest renewal it has adopted from each reader it
 //!   can see. Written **wholesale** on every change — replace semantics,
 //!   exactly like `~caps`, and for the same reason: the engine's restart
@@ -20,6 +20,11 @@
 //!   unless one write authors over the whole map this boot. Per-reader keys
 //!   would leave a retired grant with no key to overwrite, and it would haunt
 //!   the group.
+//!
+//! `<set>` is `d` for the default set and `n<len>:<name>` for a named one
+//! (`<len>` the name's byte length), so the renewal and grant halves never
+//! share an entry and no set name is reserved: any name, `:` and `g`
+//! included, addresses its own pair of entries.
 //!
 //! # Wire format
 //!
@@ -58,13 +63,14 @@ use std::collections::BTreeMap;
 
 use groupnet_core::NodeId;
 
-/// The reserved group entry prefix the tier occupies (`~`-prefixed like the
-/// runtime's other reserved entries: `~caps`, `~applied`, `~writes`).
-const LEASE_KEY: &str = "~lease";
+use crate::entry::set_key;
 
-/// The sub-key distinguishing a granter's grant map from a reader's renewal.
-/// **Reserved as a set name** — see [`validate_name`].
-const GRANT_TAG: &str = "g";
+/// The reserved group entry base of a reader's renewal (`~`-prefixed like the
+/// runtime's other reserved entries: `~caps`, `~applied`, `~writes`).
+const RENEWAL_KEY: &str = "~lease/r";
+
+/// The reserved group entry base of a granter's grant map.
+const GRANT_KEY: &str = "~lease/g";
 
 /// One reader's renewal of its right to serve: the reader's lease life
 /// (`epoch`) and the renewal's sequence number within it.
@@ -149,46 +155,18 @@ impl GranterLife {
     }
 }
 
-/// The entry key a reader's renewal occupies: `~lease` for the default set,
-/// `~lease:<name>` for a named one.
+/// The entry key a reader's renewal occupies in lease set `set` (`None`: the
+/// default set) — `~lease/r/d`, or `~lease/r/n<len>:<name>`.
 #[must_use]
-pub fn renewal_entry_key(name: &str) -> String {
-    if name.is_empty() {
-        LEASE_KEY.to_owned()
-    } else {
-        format!("{LEASE_KEY}:{name}")
-    }
+pub fn renewal_entry_key(set: Option<&str>) -> String {
+    set_key(RENEWAL_KEY, set)
 }
 
-/// The entry key a granter's grant map occupies: `~lease:g` for the default
-/// set, `~lease:g:<name>` for a named one.
+/// The entry key a granter's grant map occupies in lease set `set` (`None`:
+/// the default set) — `~lease/g/d`, or `~lease/g/n<len>:<name>`.
 #[must_use]
-pub fn grant_entry_key(name: &str) -> String {
-    if name.is_empty() {
-        format!("{LEASE_KEY}:{GRANT_TAG}")
-    } else {
-        format!("{LEASE_KEY}:{GRANT_TAG}:{name}")
-    }
-}
-
-/// Rejects set names that would collide inside the entry layout.
-///
-/// # Panics
-/// If `name` contains `:` (the layout's own separator, so the name would merge
-/// with a neighbouring set's key space), or if it is exactly `"g"` — the
-/// grant-map tag. A set named `g` would put its *renewal* entry at
-/// `~lease:g`, which is the **default** set's *grant* entry: two different
-/// payloads authored by the same node under one key.
-pub fn validate_name(name: &str) {
-    assert!(
-        !name.contains(':'),
-        "lease set names must not contain ':' (got {name:?})"
-    );
-    assert!(
-        name != GRANT_TAG,
-        "lease set name {GRANT_TAG:?} is reserved: it collides with the \
-         default set's grant entry"
-    );
+pub fn grant_entry_key(set: Option<&str>) -> String {
+    set_key(GRANT_KEY, set)
 }
 
 /// `(u64 epoch, u64 seq)` little-endian, 16 bytes — dep-free.
@@ -272,7 +250,7 @@ fn decode_grants_checked(bytes: &[u8]) -> Option<GrantMap> {
 mod tests {
     use super::{
         GrantMap, GranterLife, RenewalId, decode_grants, decode_renewal, encode_grants,
-        encode_renewal, grant_entry_key, renewal_entry_key, validate_name,
+        encode_renewal, grant_entry_key, renewal_entry_key,
     };
     use groupnet_core::NodeId;
 
@@ -304,39 +282,37 @@ mod tests {
 
     #[test]
     fn set_names_map_to_distinct_entries() {
-        assert_eq!(renewal_entry_key(""), "~lease");
-        assert_eq!(renewal_entry_key("pages"), "~lease:pages");
-        assert_eq!(grant_entry_key(""), "~lease:g");
-        assert_eq!(grant_entry_key("pages"), "~lease:g:pages");
+        assert_eq!(renewal_entry_key(None), "~lease/r/d");
+        assert_eq!(renewal_entry_key(Some("pages")), "~lease/r/n5:pages");
+        assert_eq!(grant_entry_key(None), "~lease/g/d");
+        assert_eq!(grant_entry_key(Some("pages")), "~lease/g/n5:pages");
         // A renewal and a grant map never share an entry, and neither do two
         // sets: the reader half and the granter half are different payloads
         // authored by (potentially) the same node.
-        assert_ne!(renewal_entry_key(""), grant_entry_key(""));
-        assert_ne!(renewal_entry_key("pages"), grant_entry_key("pages"));
-        assert_ne!(renewal_entry_key("a"), renewal_entry_key("b"));
-        assert_ne!(grant_entry_key("a"), grant_entry_key("b"));
+        assert_ne!(renewal_entry_key(None), grant_entry_key(None));
+        assert_ne!(
+            renewal_entry_key(Some("pages")),
+            grant_entry_key(Some("pages"))
+        );
+        assert_ne!(renewal_entry_key(Some("a")), renewal_entry_key(Some("b")));
+        assert_ne!(grant_entry_key(Some("a")), grant_entry_key(Some("b")));
     }
 
     #[test]
-    fn legal_set_names_validate() {
-        for name in ["", "pages", "blobs-v2", "gg", "G"] {
-            validate_name(name);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "must not contain ':'")]
-    fn a_colon_in_a_set_name_panics() {
-        validate_name("pages:hot");
-    }
-
-    #[test]
-    #[should_panic(expected = "is reserved")]
-    fn the_grant_tag_is_a_reserved_set_name() {
-        // `~lease:g` is the default set's grant entry; a set named `g` would
-        // author its renewals into it.
-        assert_eq!(renewal_entry_key("g"), grant_entry_key(""));
-        validate_name("g");
+    fn no_set_name_is_reserved() {
+        // Under the old `~lease:<name>` / `~lease:g[:<name>]` layout a set
+        // named `g` renewed into the default set's grant entry, and `:` merged
+        // neighbouring sets; both had to panic. Every name is now its own
+        // pair of entries, distinct from every other set's and the default's.
+        let names = [None, Some(""), Some("g"), Some("g:pages"), Some("pages")];
+        let mut keys: Vec<String> = names
+            .iter()
+            .flat_map(|set| [renewal_entry_key(*set), grant_entry_key(*set)])
+            .collect();
+        let total = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "{keys:?}");
     }
 
     #[test]

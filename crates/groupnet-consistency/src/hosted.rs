@@ -205,7 +205,7 @@ pub use self::ledger::{
 pub use self::lineage::HostedRead;
 pub use self::reads::HostedReads;
 pub use self::recovery::{Completeness, CompletenessCore};
-pub use self::writes::{HostedSetupError, HostedWrites, hosted_feed_name};
+pub use self::writes::{HostedSetupError, HostedWrites, HostedWritesBuilder, hosted_feed_name};
 use crate::token::WriteToken;
 
 /// The capability a node advertises (via
@@ -325,10 +325,6 @@ pub enum HostedError {
     /// transient by construction — or surface it as "leader elected, not
     /// ready". See [`CompletenessCore`] and the module docs.
     Recovering,
-    /// The group actor's bounded inbox refused the enqueue. Backpressure, never
-    /// a consistency verdict: the write did not happen, and retrying after a
-    /// beat is correct.
-    Rejected,
 }
 
 impl fmt::Display for HostedError {
@@ -347,7 +343,6 @@ impl fmt::Display for HostedError {
             HostedError::Recovering => {
                 f.write_str("host is recovering: not serving at this epoch yet")
             }
-            HostedError::Rejected => f.write_str("the group actor's inbox refused the write"),
         }
     }
 }

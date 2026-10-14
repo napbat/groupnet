@@ -102,8 +102,9 @@ use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
 
 use super::wire::{self, Frame};
 use super::{
-    Coverage, DoneCheck, DoneCounts, HandoffCore, HandoffError, HandoffPhase, HandoffReceipt,
-    HandoffStep, RefusalCode, Snapshot, SnapshotChunks, SnapshotSink, SnapshotSource, Staleness,
+    ChunkLimit, Coverage, DoneCheck, DoneCounts, HandoffCore, HandoffError, HandoffPhase,
+    HandoffReceipt, HandoffStep, RefusalCode, Snapshot, SnapshotChunks, SnapshotSink,
+    SnapshotSource, Staleness,
 };
 use crate::Frontier;
 use crate::hosted::{CommitLedger, Watermarks, commit_reading_named};
@@ -139,6 +140,7 @@ pub struct Handoff {
     group: Group,
     me: NodeId,
     name: String,
+    chunk_limit: ChunkLimit,
 }
 
 impl fmt::Debug for Handoff {
@@ -147,12 +149,14 @@ impl fmt::Debug for Handoff {
             .field("group", &self.group.id())
             .field("me", &self.me)
             .field("name", &self.name)
+            .field("chunk_limit", &self.chunk_limit)
             .finish_non_exhaustive()
     }
 }
 
 impl Handoff {
-    /// A handoff over `group`'s default write path.
+    /// A handoff over `group`'s default write path, serving chunks up to
+    /// [`ChunkLimit::MAX`].
     ///
     /// `me` is this node's id, in the same position
     /// [`HostedWrites::new`](crate::hosted::HostedWrites::new) and
@@ -165,27 +169,43 @@ impl Handoff {
 
     /// A handoff over a named write path — the counterpart of
     /// [`CommitLedger::named`] and
-    /// [`HostedWrites::named`](crate::hosted::HostedWrites::named) under the
-    /// same name.
+    /// [`HostedWritesBuilder::name`](crate::hosted::HostedWritesBuilder::name)
+    /// under the same name.
     ///
-    /// `name` must not contain `:`, which is the layout's own separator (a name
-    /// that does would merge with a neighbouring path's key space); an empty
-    /// name is the default path. It travels on the wire, and a donor refuses a
-    /// request naming a path it does not serve with
-    /// [`RefusalCode::BadRequest`].
+    /// An empty name is the default path. The name selects the commit ledger
+    /// [`donors`](Self::donors) reads (its entry key is
+    /// [`ledger_entry_key`](crate::hosted::ledger_entry_key)`(name)`, distinct
+    /// for every distinct name) and travels on the wire length-prefixed, so any
+    /// string is representable here. A donor refuses a request naming a path it
+    /// does not serve with [`RefusalCode::BadRequest`].
     ///
     /// `me` is this node's id — see [`new`](Self::new).
     #[must_use]
     pub fn named(name: &str, group: Group, me: NodeId) -> Self {
-        debug_assert!(
-            !name.contains(':'),
-            "a write path name must not contain ':' — it is the layout's separator"
-        );
         Self {
             group,
             me,
             name: name.to_owned(),
+            chunk_limit: ChunkLimit::MAX,
         }
+    }
+
+    /// This handoff, serving chunks of at most `limit` bytes when it donates.
+    ///
+    /// The limit is the donor's alone: [`offer`](Self::offer) hands it to
+    /// [`SnapshotSource::open`] and refuses, before sending, any chunk past it.
+    /// A requester accepts every chunk up to [`ChunkLimit::MAX`] whatever its
+    /// own setting, so the two ends need not agree.
+    #[must_use]
+    pub fn with_chunk_limit(mut self, limit: ChunkLimit) -> Self {
+        self.chunk_limit = limit;
+        self
+    }
+
+    /// The longest chunk [`offer`](Self::offer) will send.
+    #[must_use]
+    pub fn chunk_limit(&self) -> ChunkLimit {
+        self.chunk_limit
     }
 
     /// Serves one accepted stream: reads its request, and streams `source`'s
@@ -206,9 +226,12 @@ impl Handoff {
     /// [`RefusalCode::Unavailable`] when [`SnapshotSource::open`] fails, or with
     /// [`RefusalCode::BadRequest`] when the request names another group or write
     /// path; [`HandoffError::Protocol`] when the opener is not a request;
-    /// [`HandoffError::Truncated`] when the opener never arrives whole; and
-    /// [`HandoffError::Io`] for a transport or source failure — which the
-    /// requester sees as a stream that ended without saying `Done`.
+    /// [`HandoffError::Truncated`] when the opener never arrives whole;
+    /// [`HandoffError::ChunkTooLarge`] when the source produces a chunk past
+    /// [`chunk_limit`](Self::chunk_limit) — refused before a byte of it is
+    /// written; and [`HandoffError::Io`] for a transport or source failure. The
+    /// requester sees either of the last two as a stream that ended without
+    /// saying `Done`.
     pub async fn offer<S, Src>(
         &self,
         stream: &mut DataStream<S>,
@@ -226,7 +249,7 @@ impl Handoff {
         }
         // A source that cannot open is not a donor. The requester tries the next
         // one, which is why this is transient by construction.
-        let Ok(snapshot) = source.open().await else {
+        let Ok(snapshot) = source.open(self.chunk_limit).await else {
             return Err(refuse(stream, RefusalCode::Unavailable, Watermarks::new()).await);
         };
         let Snapshot { covers, mut chunks } = snapshot;
@@ -249,6 +272,15 @@ impl Handoff {
 
         let mut sent = DoneCounts::default();
         while let Some(chunk) = chunks.next().await? {
+            // Checked before the chunk is framed: an oversized chunk never costs
+            // the copy into a frame, never reaches the wire, and ends the
+            // transfer here — the requester reads a stream without `Done`.
+            if !self.chunk_limit.admits(chunk.len()) {
+                return Err(HandoffError::ChunkTooLarge {
+                    len: chunk.len(),
+                    limit: self.chunk_limit,
+                });
+            }
             sent.chunks = sent.chunks.saturating_add(1);
             sent.bytes = sent.bytes.saturating_add(payload_len(&chunk));
             stream.send(wire::encode(&Frame::Chunk(chunk))).await?;
@@ -468,13 +500,24 @@ impl Handoff {
     /// [`refresh`](CommitLedger::refresh) is the freshness half of the
     /// deployment contract: it re-stamps with the group's current leadership
     /// epoch, which is what makes the new reading count for a recovering host
-    /// even when no watermark moved.
-    pub async fn seed(receipt: &HandoffReceipt, ledger: &CommitLedger, frontier: &Frontier) {
+    /// even when no watermark moved. It also re-carries the whole ledger, so a
+    /// per-writer record whose enqueue was refused is covered by it.
+    ///
+    /// # Errors
+    /// [`CommandRejected`](crate::CommandRejected) when the closing refresh's
+    /// enqueue was refused: the ledger and frontier advanced locally, but the
+    /// group has not been told — call [`CommitLedger::refresh`] again.
+    pub async fn seed(
+        receipt: &HandoffReceipt,
+        ledger: &CommitLedger,
+        frontier: &Frontier,
+    ) -> Result<(), groupnet_runtime::CommandRejected> {
         for (writer, token) in &receipt.covers {
-            ledger.record(writer, *token).await;
+            // A refused enqueue here is re-carried by the refresh below.
+            let _ = ledger.record(writer, *token).await;
             frontier.advance(writer, *token);
         }
-        ledger.refresh().await;
+        ledger.refresh().await
     }
 
     /// [`HandoffCore::staleness`] against a **freshly read** adopted pair, as

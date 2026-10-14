@@ -23,13 +23,14 @@
 //!
 //! # Two regimes, and why the committed one takes your ledger
 //!
-//! [`new`](HostedWrites::new) / [`named`](HostedWrites::named) build the
+//! [`new`](HostedWrites::new) (or [`builder`](HostedWrites::builder) with a
+//! [`name`](HostedWritesBuilder::name)) builds the
 //! **Local-only** regime: no recovery gate, no ledger, no roster. Right for
 //! `Settle` × [`Commit::Local`] — the lobby shape the mode was named for.
 //!
-//! [`committed`](HostedWrites::committed) /
-//! [`named_committed`](HostedWrites::named_committed) build the **committed**
-//! regime, and refuse to build at all unless the group is
+//! [`builder`](HostedWrites::builder) with
+//! [`committed`](HostedWritesBuilder::committed) builds the **committed**
+//! regime, and refuses to build at all unless the group is
 //! [`Hosted`](groupnet_core::GroupMode::Hosted) with
 //! [`Quorum`](groupnet_core::Activation::Quorum) activation — because
 //! [`Commit::QuorumApplied`]'s denominator is that activation's static voter
@@ -93,7 +94,7 @@ use super::{
     CAP_HOSTED, Commit, CommitCore, CommitOutcome, CommitReceipt, CommitVerdict, CompletenessCore,
     Fence, HostedError,
 };
-use crate::WriteFeed;
+use crate::feed::{PublishError, WriteFeed};
 use crate::token::WriteToken;
 
 /// How often a committed write re-examines the gossiped ledgers — the same
@@ -317,6 +318,98 @@ fn admit(
     }
 }
 
+/// Configures a hosted write path beyond the default Local-only one: a name,
+/// the committed regime, or both. [`build`](Self::build) checks the whole
+/// configuration at once.
+pub struct HostedWritesBuilder<K> {
+    group: Group,
+    me: NodeId,
+    capacity: NonZeroUsize,
+    encode: Arc<EncodeFn<K>>,
+    name: String,
+    ledger: Option<Arc<CommitLedger>>,
+}
+
+impl<K> fmt::Debug for HostedWritesBuilder<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedWritesBuilder")
+            .field("group", &self.group.id())
+            .field("me", &self.me)
+            .field("name", &self.name)
+            .field("committed", &self.ledger.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: 'static> HostedWritesBuilder<K> {
+    /// A named hosted write path — independent subsystems sharing one group
+    /// must name their paths so their feeds and ledgers stay apart. Any name is
+    /// valid; without this the path is the default one.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// The **committed** regime: the recovery gate is armed, and
+    /// [`Commit::QuorumApplied`] is denominated over the group's static voter
+    /// roster.
+    ///
+    /// `ledger` is this node's own [`CommitLedger`] — the very one its follower
+    /// loop feeds, built for the same path name. See the module docs for why
+    /// the coupling is a parameter rather than something this type builds for
+    /// itself.
+    #[must_use]
+    pub fn committed(mut self, ledger: Arc<CommitLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Builds the write path.
+    ///
+    /// # Errors
+    /// Only in the committed regime: [`HostedSetupError::NotHosted`] if the
+    /// group elects no host, [`HostedSetupError::NotQuorum`] if it elects one
+    /// without a static voter roster, and [`HostedSetupError::LedgerMismatch`]
+    /// if the ledger publishes under a different write path's key.
+    pub fn build(mut self) -> Result<HostedWrites<K>, HostedSetupError> {
+        let committed = match self.ledger.take() {
+            None => None,
+            Some(ledger) => {
+                let voters = quorum_roster(&self.group)?;
+                let expected = ledger_entry_key(&self.name);
+                if ledger.entry_key() != expected {
+                    return Err(HostedSetupError::LedgerMismatch {
+                        expected,
+                        found: ledger.entry_key().to_owned(),
+                    });
+                }
+                Some(Committed { voters, ledger })
+            }
+        };
+        Ok(self.assemble(committed))
+    }
+
+    fn assemble(self, committed: Option<Committed>) -> HostedWrites<K> {
+        HostedWrites {
+            group: self.group,
+            me: self.me,
+            feed_name: hosted_feed_name(&self.name),
+            name: self.name,
+            capacity: self.capacity,
+            encode: self.encode,
+            committed,
+            serving: Arc::new(AtomicU64::new(0)),
+            state: Mutex::new(State {
+                feed: None,
+                feed_epoch: 0,
+                last_hosted: None,
+                recovered_at: None,
+            }),
+        }
+    }
+}
+
 /// `K: 'static` throughout: a feed life is rebuilt per epoch from a stored
 /// encoder, so the encoder — and therefore the datum it encodes — outlives every
 /// individual feed.
@@ -335,99 +428,33 @@ impl<K: 'static> HostedWrites<K> {
     /// [`Commit::AllApplied`] works normally (its set is rumour-derived), while
     /// [`Commit::QuorumApplied`] has an **empty** view and can therefore only
     /// ever run out the caller's deadline — the same fail-safe an empty roster
-    /// gets everywhere in this tier. Use [`committed`](Self::committed) for that
-    /// level.
+    /// gets everywhere in this tier. Use
+    /// [`HostedWritesBuilder::committed`] for that level.
     pub fn new(
         group: Group,
         me: NodeId,
         capacity: NonZeroUsize,
         encode: impl Fn(&K) -> Vec<u8> + Send + Sync + 'static,
     ) -> Self {
-        Self::named("", group, me, capacity, encode)
+        Self::builder(group, me, capacity, encode).assemble(None)
     }
 
-    /// A named hosted write path — independent subsystems sharing one group must
-    /// name their paths so their feeds and ledgers stay apart.
-    ///
-    /// `name` must not contain `:`, which is the layout's own separator (a name
-    /// that does would merge with a neighbouring path's key space); an empty
-    /// name is the default path.
-    pub fn named(
-        name: &str,
+    /// Configures a named and/or committed write path; nothing is checked until
+    /// [`HostedWritesBuilder::build`].
+    pub fn builder(
         group: Group,
         me: NodeId,
         capacity: NonZeroUsize,
         encode: impl Fn(&K) -> Vec<u8> + Send + Sync + 'static,
-    ) -> Self {
-        debug_assert!(
-            !name.contains(':'),
-            "a write path name must not contain ':' — it is the layout's separator"
-        );
-        Self {
+    ) -> HostedWritesBuilder<K> {
+        HostedWritesBuilder {
             group,
             me,
-            name: name.to_owned(),
-            feed_name: hosted_feed_name(name),
             capacity,
             encode: Arc::new(encode),
-            committed: None,
-            serving: Arc::new(AtomicU64::new(0)),
-            state: Mutex::new(State {
-                feed: None,
-                feed_epoch: 0,
-                last_hosted: None,
-                recovered_at: None,
-            }),
+            name: String::new(),
+            ledger: None,
         }
-    }
-
-    /// The default hosted write path in the **committed** regime: the recovery
-    /// gate is armed, and [`Commit::QuorumApplied`] is denominated over the
-    /// group's static voter roster.
-    ///
-    /// `ledger` is this node's own [`CommitLedger`] — the very one its follower
-    /// loop feeds. See the module docs for why the coupling is a parameter
-    /// rather than something this type builds for itself.
-    ///
-    /// # Errors
-    /// [`HostedSetupError::NotHosted`] if the group elects no host,
-    /// [`HostedSetupError::NotQuorum`] if it elects one without a static voter
-    /// roster, and [`HostedSetupError::LedgerMismatch`] if `ledger` publishes
-    /// under a different write path's key.
-    pub fn committed(
-        group: Group,
-        me: NodeId,
-        capacity: NonZeroUsize,
-        encode: impl Fn(&K) -> Vec<u8> + Send + Sync + 'static,
-        ledger: Arc<CommitLedger>,
-    ) -> Result<Self, HostedSetupError> {
-        Self::named_committed("", group, me, capacity, encode, ledger)
-    }
-
-    /// [`committed`](Self::committed) for a named write path. `ledger` must be
-    /// the [`CommitLedger::named`] of the same name.
-    ///
-    /// # Errors
-    /// As [`committed`](Self::committed).
-    pub fn named_committed(
-        name: &str,
-        group: Group,
-        me: NodeId,
-        capacity: NonZeroUsize,
-        encode: impl Fn(&K) -> Vec<u8> + Send + Sync + 'static,
-        ledger: Arc<CommitLedger>,
-    ) -> Result<Self, HostedSetupError> {
-        let voters = quorum_roster(&group)?;
-        let expected = ledger_entry_key(name);
-        if ledger.entry_key() != expected {
-            return Err(HostedSetupError::LedgerMismatch {
-                expected,
-                found: ledger.entry_key().to_owned(),
-            });
-        }
-        let mut path = Self::named(name, group, me, capacity, encode);
-        path.committed = Some(Committed { voters, ledger });
-        Ok(path)
     }
 
     /// The fencing token for this node's *current* authority, or `None` when it
@@ -516,18 +543,27 @@ impl<K: 'static> HostedWrites<K> {
     /// # Errors
     /// [`HostedError::NotHost`] (with `host: None` as the promised `NoLeader`),
     /// [`HostedError::Deposed`], or [`HostedError::Recovering`] — see
-    /// the admission table in this module's source.
-    /// [`HostedError::Rejected`] is **not** produced here:
-    /// the feed is best-effort under the group actor's backpressure and
-    /// re-carries a dropped advertisement on the next publish (the ring is
-    /// state, not a log), so there is no enqueue failure for this path to
-    /// report. The variant is reserved for a write path that cannot make that
-    /// promise.
+    /// the admission table in this module's source. Every error is a refusal
+    /// before the write entered the feed. A write that entered the feed but
+    /// whose advertisement (or self-record) the group actor's bounded inbox
+    /// refused is still `Ok`: the feed ring and the ledger are state, not logs,
+    /// so the next publish re-carries both, and a committed level reports a
+    /// write nobody could see as [`CommitOutcome::TimedOut`] rather than as
+    /// committed.
     pub async fn publish(&self, op: &K) -> Result<WriteToken, HostedError> {
         let epoch = self.admit_now()?;
-        let token = self.feed_for(epoch).publish(op).await;
+        let token = match self.feed_for(epoch).publish(op).await {
+            Ok(token) => token,
+            Err(PublishError::Unadvertised(unadvertised)) => unadvertised.token,
+            // Each hosted feed life ends by being replaced at the next epoch,
+            // never by a seal; a sealed feed here means this epoch's life is
+            // over, which is exactly a deposition.
+            Err(PublishError::Sealed) => return Err(HostedError::Deposed { epoch }),
+        };
         if let Some(committed) = &self.committed {
-            committed.ledger.record(&self.me, token).await;
+            // A refused self-record is re-carried by the next record or
+            // refresh; until then this host simply does not count itself.
+            let _ = committed.ledger.record(&self.me, token).await;
         }
         Ok(token)
     }

@@ -98,8 +98,12 @@ const KIND_REFUSE: u8 = 3;
 const KIND_CHUNK: u8 = 4;
 const KIND_DONE: u8 = 5;
 
-/// Magic + version + kind: the fixed prefix of every frame.
-const PREFIX: usize = MAGIC.len() + 2;
+/// Magic + version + kind: the fixed prefix of every frame, and so the bytes a
+/// chunk's frame carries beyond its payload ([`ChunkLimit::MAX`] is the frame
+/// ceiling less this).
+///
+/// [`ChunkLimit::MAX`]: super::ChunkLimit::MAX
+pub(super) const PREFIX: usize = MAGIC.len() + 2;
 
 /// One frame of the handoff protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]

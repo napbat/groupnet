@@ -154,6 +154,24 @@ the handle's status/signal methods or a permit method and must not block on
 network or origin I/O. The last public handle drop fences serving and stops
 the worker; an unexpected worker exit also closes it.
 
+`RecoveryAdapter` is statically dispatched: `RecoveryHandle<A>` is generic
+over the concrete adapter, and each asynchronous operation returns
+`impl Future + Send`, so an implementation writes plain `async fn` bodies
+without boxing. The bootstrap `ClaimSource`, `DonorPort`, and
+`BootstrapStatePort` follow the same pattern; only the worker's
+`Box<dyn BootstrapDriver>` child returns boxed `BootstrapFuture`s, because the
+handle's type does not change with an optional child. Every adapter and port
+failure is an `AdapterError`: a diagnostic `AdapterErrorKind` (`Unavailable`,
+`Malformed`, `InvalidInput`, `Capacity`, `Fenced`, `Expired`, `Unsupported`)
+plus an optional underlying cause exposed through `Error::source`. The core
+treats every failure alike and chooses its own retry or fallback. Once it has
+consumed a current operation's failure, the worker hands the error, with the
+stage it failed in, to the required `RecoveryAdapter::operation_failed(stage,
+error)`; a fallback the core then takes is reported separately through
+`fell_back`. The tier module re-exports the core types its signatures name,
+including `RecoveryState`; the engine, its events, effects, and steps stay
+in `groupnet_core::volatile_recovery`.
+
 By default, at `OriginOnly` serving stays closed until an explicit `restart`
 starts a new full turn, or a new handle/session is opened. `Cancel` is terminal for that
 handle: subsequent automatic signals and `restart` reject, and reopening
