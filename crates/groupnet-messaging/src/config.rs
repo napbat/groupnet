@@ -1,12 +1,11 @@
 //! Node-wide application queue, retry and duplicate-retention bounds.
 
-use std::{fmt, io, num::NonZeroUsize, time::Duration};
+use std::{fmt, io, num::NonZeroUsize, ops::Deref, time::Duration};
 
 use groupnet_transport::QueueCapacity;
 
 use crate::{
-    DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, Delivery,
-    SendOptions,
+    DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, SendOptions,
 };
 
 /// Finite operational bounds shared by all handles of a messaging endpoint.
@@ -71,7 +70,7 @@ impl MessagingConfig {
             ("max_timeout", self.max_timeout),
             ("dedup_retention", self.dedup_retention),
         ] {
-            if timeout_ms(timer).is_err() || now.checked_add(timer).is_none() {
+            if timeout_ms(timer).is_none() || now.checked_add(timer).is_none() {
                 return Err(MessagingConfigError::UnrepresentableTimer { field });
             }
         }
@@ -86,8 +85,13 @@ impl MessagingConfig {
     /// Validates an operation against this endpoint's configured bounds.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for oversized payloads or acknowledgement deadlines.
-    pub fn validate_send(&self, options: SendOptions, payload_len: usize) -> io::Result<()> {
+    /// Returns the [`SendValidationError`] naming an oversized payload or an
+    /// acknowledgement deadline outside `(0, max_timeout]`.
+    pub fn validate_send(
+        &self,
+        options: SendOptions,
+        payload_len: usize,
+    ) -> Result<(), SendValidationError> {
         self.retry_horizon_ms(options, payload_len).map(drop)
     }
 
@@ -99,23 +103,26 @@ impl MessagingConfig {
         &self,
         options: SendOptions,
         payload_len: usize,
-    ) -> io::Result<u64> {
-        let invalid = || {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "application send exceeds messaging bounds",
-            )
-        };
+    ) -> Result<u64, SendValidationError> {
         if payload_len > self.max_payload.get() {
-            return Err(invalid());
+            return Err(SendValidationError::PayloadTooLarge {
+                len: payload_len,
+                max: self.max_payload,
+            });
         }
-        if options.delivery == Delivery::BestEffort {
+        let Some(timeout) = options.timeout() else {
             return Ok(0);
+        };
+        if timeout.is_zero() {
+            return Err(SendValidationError::ZeroTimeout);
         }
-        if options.timeout.is_zero() || options.timeout > self.max_timeout {
-            return Err(invalid());
+        if timeout > self.max_timeout {
+            return Err(SendValidationError::TimeoutAboveMax {
+                timeout,
+                max: self.max_timeout,
+            });
         }
-        timeout_ms(options.timeout)
+        Ok(timeout_ms(timeout).expect("a timeout within the validated max_timeout fits"))
     }
 
     pub(crate) fn retention_ms(&self) -> u64 {
@@ -128,13 +135,90 @@ impl MessagingConfig {
     }
 }
 
-pub(crate) fn timeout_ms(timeout: Duration) -> io::Result<u64> {
-    u64::try_from(timeout.as_nanos().div_ceil(1_000_000)).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "application retry horizon overflow",
-        )
-    })
+/// Whole milliseconds covering `timeout`, or `None` beyond `u64` milliseconds.
+pub(crate) fn timeout_ms(timeout: Duration) -> Option<u64> {
+    u64::try_from(timeout.as_nanos().div_ceil(1_000_000)).ok()
+}
+
+/// A [`MessagingConfig`] that passed [`MessagingConfig::validate`].
+///
+/// Constructible only through `TryFrom<MessagingConfig>`, it lets a caller that
+/// must reject invalid bounds before other side effects (a node builder)
+/// validate once and hand the proof to
+/// [`Messaging::with_validated`](crate::Messaging::with_validated), which does
+/// not check again. Dereferences to the validated configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidMessagingConfig(MessagingConfig);
+
+impl TryFrom<MessagingConfig> for ValidMessagingConfig {
+    type Error = MessagingConfigError;
+
+    /// # Errors
+    /// Returns the first violated [`MessagingConfigError`] rule.
+    fn try_from(config: MessagingConfig) -> Result<Self, Self::Error> {
+        config.validate()?;
+        Ok(Self(config))
+    }
+}
+
+impl Deref for ValidMessagingConfig {
+    type Target = MessagingConfig;
+
+    fn deref(&self) -> &MessagingConfig {
+        &self.0
+    }
+}
+
+impl ValidMessagingConfig {
+    /// The validated configuration.
+    pub(crate) fn into_inner(self) -> MessagingConfig {
+        self.0
+    }
+}
+
+/// A send that violates its endpoint's [`MessagingConfig`] bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendValidationError {
+    /// The payload exceeds `max_payload`.
+    PayloadTooLarge {
+        /// The rejected payload length.
+        len: usize,
+        /// The configured `max_payload`.
+        max: NonZeroUsize,
+    },
+    /// An acknowledged send's deadline is zero.
+    ZeroTimeout,
+    /// An acknowledged send's deadline exceeds `max_timeout`.
+    TimeoutAboveMax {
+        /// The rejected deadline.
+        timeout: Duration,
+        /// The configured `max_timeout`.
+        max: Duration,
+    },
+}
+
+impl fmt::Display for SendValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge { len, max } => write!(
+                f,
+                "application payload of {len} bytes exceeds max_payload {max}"
+            ),
+            Self::ZeroTimeout => f.write_str("acknowledged send timeout must be nonzero"),
+            Self::TimeoutAboveMax { timeout, max } => write!(
+                f,
+                "acknowledged send timeout {timeout:?} exceeds max_timeout {max:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SendValidationError {}
+
+impl From<SendValidationError> for io::Error {
+    fn from(error: SendValidationError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
 }
 
 /// A violated [`MessagingConfig`] rule, naming the offending field.
@@ -202,8 +286,7 @@ mod tests {
         config.validate().unwrap();
         config
             .validate_send(
-                SendOptions {
-                    delivery: Delivery::Applied,
+                SendOptions::Applied {
                     timeout: Duration::from_secs(90),
                 },
                 DEFAULT_MAX_MESSAGE_BYTES + 1,
@@ -266,12 +349,13 @@ mod tests {
 
     #[test]
     fn timer_rounding_keeps_retention_strictly_past_the_wire_retry_horizon() {
-        assert_eq!(timeout_ms(Duration::from_nanos(1)).unwrap(), 1);
-        assert_eq!(timeout_ms(Duration::from_millis(50)).unwrap(), 50);
+        assert_eq!(timeout_ms(Duration::from_nanos(1)), Some(1));
+        assert_eq!(timeout_ms(Duration::from_millis(50)), Some(50));
         assert_eq!(
-            timeout_ms(Duration::from_millis(50) + Duration::from_nanos(1)).unwrap(),
-            51
+            timeout_ms(Duration::from_millis(50) + Duration::from_nanos(1)),
+            Some(51)
         );
+        assert_eq!(timeout_ms(Duration::MAX), None);
         let mut config = MessagingConfig {
             retry_interval: Duration::from_nanos(1),
             max_timeout: Duration::from_nanos(1),
@@ -287,43 +371,67 @@ mod tests {
     }
 
     #[test]
-    fn one_send_check_yields_the_wire_horizon_or_rejects() {
+    fn one_send_check_yields_the_wire_horizon_or_a_typed_rejection() {
         let config = MessagingConfig::default();
-        let send = |delivery, timeout| SendOptions { delivery, timeout };
+        assert_eq!(config.retry_horizon_ms(SendOptions::BestEffort, 0), Ok(0));
         assert_eq!(
-            config
-                .retry_horizon_ms(send(Delivery::BestEffort, Duration::ZERO), 0)
-                .unwrap(),
-            0
+            config.retry_horizon_ms(
+                SendOptions::Applied {
+                    timeout: Duration::from_micros(1_500)
+                },
+                config.max_payload.get()
+            ),
+            Ok(2)
         );
-        assert_eq!(
-            config
-                .retry_horizon_ms(
-                    send(Delivery::Applied, Duration::from_micros(1_500)),
-                    config.max_payload.get()
-                )
-                .unwrap(),
-            2
-        );
-        for (options, length) in [
-            (send(Delivery::Delivered, Duration::ZERO), 0),
+        let above = config.max_timeout + Duration::from_nanos(1);
+        for (options, length, expected) in [
             (
-                send(
-                    Delivery::Applied,
-                    config.max_timeout + Duration::from_nanos(1),
-                ),
+                SendOptions::Delivered {
+                    timeout: Duration::ZERO,
+                },
                 0,
+                SendValidationError::ZeroTimeout,
             ),
             (
-                send(Delivery::BestEffort, Duration::ZERO),
+                SendOptions::Applied { timeout: above },
+                0,
+                SendValidationError::TimeoutAboveMax {
+                    timeout: above,
+                    max: config.max_timeout,
+                },
+            ),
+            (
+                SendOptions::BestEffort,
                 config.max_payload.get() + 1,
+                SendValidationError::PayloadTooLarge {
+                    len: config.max_payload.get() + 1,
+                    max: config.max_payload,
+                },
             ),
         ] {
+            assert_eq!(config.validate_send(options, length), Err(expected));
+            let error = io::Error::from(expected);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(
-                config.retry_horizon_ms(options, length).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<SendValidationError>()),
+                Some(&expected)
             );
-            assert!(config.validate_send(options, length).is_err());
         }
+    }
+
+    #[test]
+    fn only_a_validated_configuration_becomes_a_construction_proof() {
+        let valid = ValidMessagingConfig::try_from(MessagingConfig::default()).unwrap();
+        assert_eq!(*valid, MessagingConfig::default());
+        let invalid = MessagingConfig {
+            retry_interval: Duration::ZERO,
+            ..MessagingConfig::default()
+        };
+        assert_eq!(
+            ValidMessagingConfig::try_from(invalid),
+            Err(MessagingConfigError::ZeroRetryInterval)
+        );
     }
 }

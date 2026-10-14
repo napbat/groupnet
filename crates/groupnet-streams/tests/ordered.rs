@@ -5,7 +5,7 @@ use std::{io, time::Duration};
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
 use groupnet_network::{
-    RouterConfig,
+    TunnelConfig,
     tunnel::{PeerIdentity, TlsIdentity},
 };
 // The network types this crate's signatures take come from its own re-exports.
@@ -31,8 +31,8 @@ struct Fabric {
 impl Fabric {
     async fn new() -> Self {
         let network = Network::new();
-        let left = Router::new(NodeId::new("left"), RouterConfig::default()).unwrap();
-        let right = Router::new(NodeId::new("right"), RouterConfig::default()).unwrap();
+        let left = Router::new(NodeId::new("left")).unwrap();
+        let right = Router::new(NodeId::new("right")).unwrap();
         left.add_transport(
             network.endpoint(left.local_id().clone()),
             LinkConfig::new(vec![right.local_id().clone()]),
@@ -49,16 +49,20 @@ impl Fabric {
         })
         .await;
         let ((left_identity, left_leaf), (right_identity, right_leaf)) = credentials();
-        let sender = TunnelTransport::new(
+        let sender = TunnelTransport::with_config(
             left.clone(),
-            left_identity,
-            vec![PeerIdentity::new(right.local_id().clone(), &right_leaf).unwrap()],
+            TunnelConfig::new(
+                left_identity,
+                vec![PeerIdentity::new(right.local_id().clone(), &right_leaf).unwrap()],
+            ),
         )
         .unwrap();
-        let receiver = TunnelTransport::new(
+        let receiver = TunnelTransport::with_config(
             right.clone(),
-            right_identity,
-            vec![PeerIdentity::new(left.local_id().clone(), &left_leaf).unwrap()],
+            TunnelConfig::new(
+                right_identity,
+                vec![PeerIdentity::new(left.local_id().clone(), &left_leaf).unwrap()],
+            ),
         )
         .unwrap();
         Self {
@@ -222,12 +226,14 @@ async fn node_shutdown_notifies_endpoint_and_interrupts_accept() {
 #[tokio::test]
 async fn cancelled_connect_releases_endpoint_sessions_without_cancelling_shared_transport() {
     let ((identity, _), (_, peer_leaf)) = credentials();
-    let router = Router::new(NodeId::new("isolated"), RouterConfig::default()).unwrap();
+    let router = Router::new(NodeId::new("isolated")).unwrap();
     let peer = NodeId::new("unreachable");
-    let tunnels = TunnelTransport::new(
+    let tunnels = TunnelTransport::with_config(
         router.clone(),
-        identity,
-        vec![PeerIdentity::new(peer.clone(), &peer_leaf).unwrap()],
+        TunnelConfig::new(
+            identity,
+            vec![PeerIdentity::new(peer.clone(), &peer_leaf).unwrap()],
+        ),
     )
     .unwrap();
     let endpoint = OrderedProtocol::new(tunnels.clone());

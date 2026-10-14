@@ -22,7 +22,7 @@ struct Header {
     credit: U32,
 }
 
-pub(super) const HEADER: usize = size_of::<Header>();
+pub(crate) const HEADER: usize = size_of::<Header>();
 
 /// Protocol-wide segment ceiling: the ciphertext a default routing envelope
 /// carries between one-byte identities. Every receiver accepts segments up to
@@ -143,6 +143,7 @@ impl Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunnel::SegmentSize;
     use crate::{Router, RouterConfig};
     use groupnet_core::NodeId;
 
@@ -158,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_header_roundtrip_retains_owned_ciphertext_and_byte_credit() {
-        let router = Router::new(NodeId::new("a"), RouterConfig::default()).unwrap();
+        let router = Router::new(NodeId::new("a")).unwrap();
         for credit in [0, 1, 16 << 20, u32::MAX] {
             let mut encoded = router
                 .tunnel_packet_buffer(&NodeId::new("b"), HEADER + 512)
@@ -226,18 +227,31 @@ mod tests {
 
     #[tokio::test]
     async fn receive_bound_is_the_largest_segment_a_default_envelope_carries() {
-        let router = Router::new(NodeId::new("a"), RouterConfig::default()).unwrap();
+        let router = Router::new(NodeId::new("a")).unwrap();
         let peer = NodeId::new("b");
-        assert!(
-            router
-                .validate_tunnel_payload(&peer, HEADER + MAX_SEGMENT)
-                .is_ok()
+        assert_eq!(MAX_SEGMENT, SegmentSize::MAX.get());
+        let fits = |router: &Router| {
+            crate::TunnelConfig::check_peer(
+                router.local_id(),
+                router.max_frame(),
+                &peer,
+                SegmentSize::MAX,
+            )
+        };
+        assert_eq!(fits(&router), Ok(()));
+        let tight = Router::with_config(
+            NodeId::new("a"),
+            RouterConfig {
+                max_frame: std::num::NonZeroUsize::new(router.max_frame() - 1).unwrap(),
+                ..RouterConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fits(&tight),
+            Err(crate::TunnelConfigError::PayloadAboveRouterFrame { node: peer.clone() })
         );
-        assert!(
-            router
-                .validate_tunnel_payload(&peer, HEADER + MAX_SEGMENT + 1)
-                .is_err()
-        );
+        tight.close().await;
         let mut encoded = router
             .tunnel_packet_buffer(&peer, HEADER + MAX_SEGMENT)
             .unwrap();

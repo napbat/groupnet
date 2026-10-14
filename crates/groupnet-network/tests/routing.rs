@@ -6,10 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-// The link contract types the router takes come from this crate's re-exports.
-use groupnet_network::{LinkConfig, Router, RouterConfig, TransportId};
+// The transport contract types the router takes come from this crate's re-exports.
+use groupnet_network::{LinkConfig, Router, RouterConfig, Transport, TransportId};
 use groupnet_testkit::cluster::eventually_within;
-use groupnet_transport::Transport;
 use groupnet_transport_ipc::{IpcAddress, IpcTransport};
 use groupnet_transport_mem::Network;
 use groupnet_transport_tcp::TcpMsgTransport;
@@ -18,7 +17,7 @@ const WAIT: Duration = Duration::from_secs(10);
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
 fn router(name: &str) -> io::Result<Router> {
-    Router::new(
+    Router::with_config(
         NodeId::new(name),
         RouterConfig {
             announce_interval: Duration::from_millis(30),
@@ -131,7 +130,7 @@ async fn route_failover_and_stale_transport_handles_do_not_disconnect_replacemen
 #[tokio::test]
 async fn endpoint_only_mode_blocks_transit_and_shutdown_wakes_receivers() -> io::Result<()> {
     let a = router("a")?;
-    let b = Router::new(
+    let b = Router::with_config(
         NodeId::new("b"),
         RouterConfig {
             forwarding: false,

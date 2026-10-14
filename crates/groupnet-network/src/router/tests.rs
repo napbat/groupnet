@@ -69,7 +69,7 @@ fn endpoint(peers: Vec<NodeId>) -> (BoundLink, Arc<Probe>, mpsc::Sender<Inbound>
 #[tokio::test]
 async fn address_updates_reach_only_pre_admitted_links_and_never_admit_a_source() -> io::Result<()>
 {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     let peer = NodeId::new("peer");
     let other = NodeId::new("other");
     let unknown = NodeId::new("unknown");
@@ -112,7 +112,7 @@ async fn address_updates_reach_only_pre_admitted_links_and_never_admit_a_source(
 
 #[tokio::test]
 async fn close_releases_endpoints_while_router_and_controls_survive() -> io::Result<()> {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     let peer = NodeId::new("peer");
     let (link, probe, _incoming) = endpoint(vec![peer.clone()]);
     let control = link.driver.control();
@@ -150,7 +150,7 @@ impl LinkLifecycle for DrainGate {
 
 #[tokio::test]
 async fn cancelled_signals_initiation_without_waiting_for_protocol_drain() -> io::Result<()> {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     let gate = Arc::new(DrainGate::default());
     let (link, probe, _incoming) = endpoint(vec![NodeId::new("peer")]);
     router.add_link(link.with_lifecycle(gate.clone())).await?;
@@ -180,7 +180,7 @@ async fn cancelled_signals_initiation_without_waiting_for_protocol_drain() -> io
 
 #[tokio::test]
 async fn protocol_namespaces_are_exclusive_isolated_and_generation_safe() -> io::Result<()> {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     let application = router.bind_protocol(1)?;
     let other = router.bind_protocol(2)?;
     assert_eq!(
@@ -230,7 +230,7 @@ async fn protocol_namespaces_are_exclusive_isolated_and_generation_safe() -> io:
 
 #[tokio::test]
 async fn protocol_capacity_and_unknown_destination_fail_closed() -> io::Result<()> {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     assert!(
         router
             .inner
@@ -266,7 +266,7 @@ async fn protocol_capacity_and_unknown_destination_fail_closed() -> io::Result<(
 async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_namespace()
 -> io::Result<()> {
     for length in [1, 255] {
-        let router = Router::new(NodeId::new("n".repeat(length)), RouterConfig::default())?;
+        let router = Router::new(NodeId::new("n".repeat(length)))?;
         let application = router.bind_protocol(42)?;
         let tunnels = Arc::new(TunnelCapture::default());
         router.claim_tunnels(tunnels.clone())?;
@@ -315,7 +315,7 @@ async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_nam
 
 #[tokio::test]
 async fn sent_packet_storage_returns_to_the_pool_when_its_last_view_drops() -> io::Result<()> {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     let peer = NodeId::new("peer");
     let segment = 16 * 1024;
     let packet = router.tunnel_packet_buffer(&peer, segment)?;
@@ -361,7 +361,7 @@ async fn sent_packet_storage_returns_to_the_pool_when_its_last_view_drops() -> i
 
 #[tokio::test]
 async fn owned_protocol_send_and_receive_preserve_headroom_allocation() -> io::Result<()> {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     let application = router.bind_protocol(42)?;
     let mut encoded = application.packet_buffer(router.local_id(), 8)?;
     encoded.extend_from_slice(b"original");
@@ -415,10 +415,10 @@ async fn configured_protocol_and_queue_capacities_replace_operational_constants(
     let config = RouterConfig {
         max_protocols: std::num::NonZeroUsize::new(40).unwrap(),
         protocol_queue: QueueCapacity::of(2),
-        max_frame: 70_000,
+        max_frame: std::num::NonZeroUsize::new(70_000).unwrap(),
         ..RouterConfig::default()
     };
-    let router = Router::new(NodeId::new("local"), config)?;
+    let router = Router::with_config(NodeId::new("local"), config)?;
     let mut endpoints = Vec::new();
     for id in 0..40 {
         endpoints.push(router.bind_protocol(id)?);
@@ -461,14 +461,14 @@ fn routing_policy_rejects_each_invalid_wire_or_timer_bound_by_field() {
     let cases = [
         (
             RouterConfig {
-                max_hops: 256,
+                max_hops: std::num::NonZeroU8::MIN,
                 ..RouterConfig::default()
             },
-            RouterConfigError::MaxHopsOutOfRange,
+            RouterConfigError::MaxHopsBelowTwo,
         ),
         (
             RouterConfig {
-                max_frame: wire::MAX_DATA_HEADER - 1,
+                max_frame: NonZeroUsize::new(wire::MAX_DATA_HEADER - 1).unwrap(),
                 ..RouterConfig::default()
             },
             RouterConfigError::MaxFrameOutOfRange,
@@ -488,7 +488,7 @@ fn routing_policy_rejects_each_invalid_wire_or_timer_bound_by_field() {
                 },
                 ..RouterConfig::default()
             },
-            RouterConfigError::ZeroReassemblyTimeout,
+            RouterConfigError::Reassembly(ReassemblyConfigError::ZeroTimeout),
         ),
         (
             RouterConfig {
@@ -523,7 +523,7 @@ fn routing_policy_rejects_each_invalid_wire_or_timer_bound_by_field() {
     ];
     for (config, expected) in cases {
         assert_eq!(config.validate(), Err(expected));
-        let error = Router::new(NodeId::new("local"), config).unwrap_err();
+        let error = Router::with_config(NodeId::new("local"), config).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             error
@@ -537,11 +537,38 @@ fn routing_policy_rejects_each_invalid_wire_or_timer_bound_by_field() {
     }
 }
 
+#[test]
+fn reassembly_policy_validates_alone_and_composes_into_routing_policy() {
+    let reassembly = |timeout| ReassemblyConfig {
+        timeout,
+        ..ReassemblyConfig::default()
+    };
+    assert!(ReassemblyConfig::default().validate().is_ok());
+    for (timeout, expected) in [
+        (Duration::ZERO, ReassemblyConfigError::ZeroTimeout),
+        (Duration::MAX, ReassemblyConfigError::UnrepresentableTimeout),
+    ] {
+        assert_eq!(reassembly(timeout).validate(), Err(expected));
+        let nested = RouterConfig {
+            reassembly: reassembly(timeout),
+            ..RouterConfig::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(nested, RouterConfigError::Reassembly(expected));
+        assert_eq!(
+            std::error::Error::source(&nested)
+                .and_then(|source| source.downcast_ref::<ReassemblyConfigError>()),
+            Some(&expected)
+        );
+    }
+}
+
 #[tokio::test]
 async fn foreign_packet_headroom_is_rejected_for_longer_and_shorter_sources() -> io::Result<()> {
     for (creator, sender) in [("a", "longer-source"), ("longer-source", "a")] {
-        let creator = Router::new(NodeId::new(creator), RouterConfig::default())?;
-        let sender = Router::new(NodeId::new(sender), RouterConfig::default())?;
+        let creator = Router::new(NodeId::new(creator))?;
+        let sender = Router::new(NodeId::new(sender))?;
         let origin = creator.bind_protocol(42)?;
         let destination = sender.bind_protocol(42)?;
         let mut packet = origin.packet_buffer(sender.local_id(), 7)?;

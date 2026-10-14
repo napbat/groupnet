@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use super::{
     UnorderedConfigError,
     UnorderedDelivery::{Reliable, Unreliable},
-    UnorderedOptions,
+    UnorderedOptions, UnorderedOptionsError, ValidUnorderedConfig,
     wire::{self, Kind, TxCrypto, Window},
 };
 use fabric::{DROP_ALL, DROP_FIRST, Fabric, HOLD_FIRST, PASS, TAMPER_FIRST, config};
@@ -525,7 +525,18 @@ async fn last_endpoint_drop_cancels_sessions_and_releases_only_its_namespace() {
         !ar.cancellation().is_cancelled(),
         "endpoint drop must not close the router"
     );
-    let rebound = super::UnorderedProtocol::new(&ar, at.clone(), config()).unwrap();
+    // The namespace is free again: default-policy and pre-validated
+    // construction both bind it.
+    let rebound = super::UnorderedProtocol::new(&ar, at.clone()).unwrap();
+    assert!(
+        rebound
+            .validate_options(&UnorderedOptions::default())
+            .is_ok()
+    );
+    rebound.shutdown();
+    rebound.closed().await;
+    let proven = ValidUnorderedConfig::try_from(config()).unwrap();
+    let rebound = super::UnorderedProtocol::with_validated(&ar, at.clone(), proven).unwrap();
     rebound.shutdown();
     rebound.closed().await;
     b.shutdown();
@@ -625,6 +636,67 @@ fn invalid_capacity_policy_and_timer_configuration_is_rejected_by_field() {
             Some(&expected)
         );
     }
+}
+
+#[test]
+fn only_a_validated_policy_becomes_a_construction_proof() {
+    let valid = ValidUnorderedConfig::try_from(config()).unwrap();
+    assert_eq!(*valid, config());
+    let mut invalid = config();
+    invalid.allow_reliable = false;
+    invalid.allow_unreliable = false;
+    assert_eq!(
+        ValidUnorderedConfig::try_from(invalid),
+        Err(UnorderedConfigError::NoPolicyAllowed)
+    );
+}
+
+#[tokio::test]
+async fn options_beyond_node_policy_are_rejected_by_type_not_shortened() {
+    let mut policy = config();
+    policy.allow_unreliable = false;
+    let options = |delivery, timeout| UnorderedOptions { delivery, timeout };
+    let longer = policy.setup_timeout + Duration::from_nanos(1);
+    let too_long = UnorderedOptionsError::TimeoutAboveSetupTimeout {
+        timeout: longer,
+        setup_timeout: policy.setup_timeout,
+    };
+    assert_eq!(
+        options(Reliable, policy.setup_timeout).validate(&policy),
+        Ok(())
+    );
+    for (rejected, expected) in [
+        (
+            options(Unreliable, BOUND),
+            UnorderedOptionsError::DeliveryNotAllowed(Unreliable),
+        ),
+        (
+            options(Reliable, Duration::ZERO),
+            UnorderedOptionsError::ZeroTimeout,
+        ),
+        (options(Reliable, longer), too_long),
+    ] {
+        assert_eq!(rejected.validate(&policy), Err(expected));
+    }
+    let fabric = Fabric::new(policy).await;
+    let excessive = options(Reliable, longer);
+    assert_eq!(fabric.a.validate_options(&excessive), Err(too_long));
+    let typed = |error: io::Error| {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<UnorderedOptionsError>())
+            .copied()
+    };
+    let connect = fabric
+        .a
+        .connect(fabric.br.local_id(), excessive.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(typed(connect), Some(too_long));
+    let accept = fabric.b.accept_with_options(excessive).await.unwrap_err();
+    assert_eq!(typed(accept), Some(too_long));
+    fabric.close().await;
 }
 
 #[tokio::test]

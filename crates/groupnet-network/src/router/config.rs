@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::io;
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::{NonZeroU8, NonZeroU16, NonZeroUsize};
 use std::time::Duration;
 
 use groupnet_transport::QueueCapacity;
@@ -30,6 +30,51 @@ impl Default for ReassemblyConfig {
     }
 }
 
+impl ReassemblyConfig {
+    /// Validates the expiry timer; counts carry their own nonzero range.
+    ///
+    /// # Errors
+    /// Returns the first violated [`ReassemblyConfigError`] rule.
+    pub fn validate(&self) -> Result<(), ReassemblyConfigError> {
+        if self.timeout.is_zero() {
+            return Err(ReassemblyConfigError::ZeroTimeout);
+        }
+        if tokio::time::Instant::now()
+            .checked_add(self.timeout)
+            .is_none()
+        {
+            return Err(ReassemblyConfigError::UnrepresentableTimeout);
+        }
+        Ok(())
+    }
+}
+
+/// A violated [`ReassemblyConfig`] rule, naming the offending field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReassemblyConfigError {
+    /// `timeout` is zero.
+    ZeroTimeout,
+    /// `timeout` cannot extend the current monotonic instant.
+    UnrepresentableTimeout,
+}
+
+impl fmt::Display for ReassemblyConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroTimeout => "reassembly timeout must be nonzero",
+            Self::UnrepresentableTimeout => "reassembly timeout exceeds the monotonic clock",
+        })
+    }
+}
+
+impl std::error::Error for ReassemblyConfigError {}
+
+impl From<ReassemblyConfigError> for io::Error {
+    fn from(error: ReassemblyConfigError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
 /// Routing and resource policy for one node.
 ///
 /// Queue sizing: one saturated tunnel stream keeps about
@@ -54,9 +99,10 @@ pub struct RouterConfig {
     pub announce_interval: Duration,
     /// Largest complete routing envelope: at least the largest data header and
     /// at most the fragment `u32` total.
-    pub max_frame: usize,
-    /// Maximum path length and data hop budget, within `2..=255`.
-    pub max_hops: usize,
+    pub max_frame: NonZeroUsize,
+    /// Maximum path length and data hop budget; at least 2. The wire carries a
+    /// `u8` hop count.
+    pub max_hops: NonZeroU8,
     /// Retained incomplete-fragment bounds.
     pub reassembly: ReassemblyConfig,
     /// Maximum exclusive application namespaces; at most the 65,536 `u16` IDs.
@@ -89,8 +135,8 @@ impl Default for RouterConfig {
             max_transports: const { NonZeroUsize::new(16).unwrap() },
             route_ttl: Duration::from_secs(6),
             announce_interval: Duration::from_secs(1),
-            max_frame: wire::MAX_FRAME,
-            max_hops: wire::MAX_HOPS,
+            max_frame: const { NonZeroUsize::new(wire::MAX_FRAME).unwrap() },
+            max_hops: const { NonZeroU8::new(wire::MAX_HOPS).unwrap() },
             reassembly: ReassemblyConfig::default(),
             max_protocols: const { NonZeroUsize::new(32).unwrap() },
             protocol_queue: QueueCapacity::of(128),
@@ -105,27 +151,29 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
-    /// Validates wire representability and timer relationships; counts and
-    /// queue capacities carry their own nonzero range.
+    /// Validates wire representability and timer relationships, including the
+    /// nested [`ReassemblyConfig::validate`]; counts and queue capacities carry
+    /// their own nonzero range.
     ///
     /// # Errors
     /// Returns the first violated [`RouterConfigError`] rule.
     pub fn validate(&self) -> Result<(), RouterConfigError> {
-        if self.max_frame < wire::MAX_DATA_HEADER
-            || u32::try_from(self.max_frame).is_err()
-            || self.max_frame > isize::MAX.unsigned_abs()
+        let max_frame = self.max_frame.get();
+        if max_frame < wire::MAX_DATA_HEADER
+            || u32::try_from(max_frame).is_err()
+            || max_frame > isize::MAX.unsigned_abs()
         {
             return Err(RouterConfigError::MaxFrameOutOfRange);
         }
-        if !(2..=usize::from(u8::MAX)).contains(&self.max_hops) {
-            return Err(RouterConfigError::MaxHopsOutOfRange);
+        if self.max_hops.get() < 2 {
+            return Err(RouterConfigError::MaxHopsBelowTwo);
         }
         if self.max_protocols.get() > usize::from(u16::MAX) + 1 {
             return Err(RouterConfigError::MaxProtocolsAboveIdSpace);
         }
-        if self.reassembly.timeout.is_zero() {
-            return Err(RouterConfigError::ZeroReassemblyTimeout);
-        }
+        self.reassembly
+            .validate()
+            .map_err(RouterConfigError::Reassembly)?;
         if self.send_timeout.is_zero() {
             return Err(RouterConfigError::ZeroSendTimeout);
         }
@@ -137,7 +185,6 @@ impl RouterConfig {
         }
         let now = tokio::time::Instant::now();
         for (field, timer) in [
-            ("reassembly.timeout", self.reassembly.timeout),
             ("send_timeout", self.send_timeout),
             ("announce_interval", self.announce_interval),
             ("route_ttl", self.route_ttl),
@@ -156,12 +203,12 @@ pub enum RouterConfigError {
     /// `max_frame` is below the largest data header or above the `u32`
     /// fragment total.
     MaxFrameOutOfRange,
-    /// `max_hops` is outside `2..=255`.
-    MaxHopsOutOfRange,
+    /// `max_hops` is below 2.
+    MaxHopsBelowTwo,
     /// `max_protocols` exceeds the 65,536 IDs of the `u16` namespace.
     MaxProtocolsAboveIdSpace,
-    /// `reassembly.timeout` is zero.
-    ZeroReassemblyTimeout,
+    /// `reassembly` violates a [`ReassemblyConfig`] rule.
+    Reassembly(ReassemblyConfigError),
     /// `send_timeout` is zero.
     ZeroSendTimeout,
     /// `announce_interval` is zero.
@@ -181,11 +228,11 @@ impl fmt::Display for RouterConfigError {
             Self::MaxFrameOutOfRange => f.write_str(
                 "router max_frame must hold a data header and fit the u32 fragment total",
             ),
-            Self::MaxHopsOutOfRange => f.write_str("router max_hops must be within 2..=255"),
+            Self::MaxHopsBelowTwo => f.write_str("router max_hops must be at least 2"),
             Self::MaxProtocolsAboveIdSpace => {
                 f.write_str("router max_protocols exceeds the 65,536 u16 protocol IDs")
             }
-            Self::ZeroReassemblyTimeout => f.write_str("router reassembly.timeout must be nonzero"),
+            Self::Reassembly(_) => f.write_str("router reassembly policy is invalid"),
             Self::ZeroSendTimeout => f.write_str("router send_timeout must be nonzero"),
             Self::ZeroAnnounceInterval => f.write_str("router announce_interval must be nonzero"),
             Self::RouteTtlNotAboveAnnounceInterval => {
@@ -198,7 +245,14 @@ impl fmt::Display for RouterConfigError {
     }
 }
 
-impl std::error::Error for RouterConfigError {}
+impl std::error::Error for RouterConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Reassembly(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<RouterConfigError> for io::Error {
     fn from(error: RouterConfigError) -> Self {

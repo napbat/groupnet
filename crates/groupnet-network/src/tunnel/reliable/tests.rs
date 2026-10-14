@@ -15,7 +15,7 @@ use super::{
     receive::{CREDIT_GROWTH, Receiver},
 };
 use crate::{
-    PacketBuffer, Router, RouterConfig,
+    PacketBuffer, Router,
     tunnel::{
         TunnelLimits,
         budget::MemoryBudget,
@@ -81,7 +81,7 @@ impl Harness {
         let budget = MemoryBudget::new(&limits);
         let (send, receive) = (budget.reserve(FLOOR), budget.reserve(FLOOR));
         Self {
-            router: Router::new(NodeId::new("local"), RouterConfig::default()).unwrap(),
+            router: Router::new(NodeId::new("local")).unwrap(),
             peer: NodeId::new("peer"),
             budget,
             state: Reliability::new(ID, Role::Responder, limits, send, receive),

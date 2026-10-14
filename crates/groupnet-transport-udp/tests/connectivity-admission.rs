@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_network::{Router, RouterConfig};
+use groupnet_network::Router;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::admission::{
@@ -52,12 +52,8 @@ async fn keyless_unknown_identities_discover_route_relay_withdraw_and_reconnect(
         .await
         .unwrap();
     let address = relay.local_addr();
-    let a = Router::new(
-        "6adfa0df-40af-4470-a125-7c4c1f122989".into(),
-        RouterConfig::default(),
-    )
-    .unwrap();
-    let b = Router::new("application/string-id".into(), RouterConfig::default()).unwrap();
+    let a = Router::new("6adfa0df-40af-4470-a125-7c4c1f122989".into()).unwrap();
+    let b = Router::new("application/string-id".into()).unwrap();
     attach(&a, address).await;
     attach(&b, address).await;
     eventually_within("dynamic open routing convergence", SETTLE, || {
@@ -84,7 +80,7 @@ async fn keyless_unknown_identities_discover_route_relay_withdraw_and_reconnect(
         || a.route_to(b.local_id()).is_none(),
     )
     .await;
-    let replacement = Router::new(b.local_id().clone(), RouterConfig::default()).unwrap();
+    let replacement = Router::new(b.local_id().clone()).unwrap();
     attach(&replacement, address).await;
     eventually_within("fresh generation rejoins", SETTLE, || {
         a.route_to(replacement.local_id()).is_some() && replacement.route_to(a.local_id()).is_some()

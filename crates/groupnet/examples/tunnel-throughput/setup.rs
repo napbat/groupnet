@@ -109,8 +109,11 @@ impl Credentials {
             .into_iter()
             .zip(&self.leaves)
             .map(|(name, (leaf, _))| PeerIdentity::new(NodeId::new(name), leaf))
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(TunnelConfig::new(identity, pins).with_limits(limits.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TunnelConfig {
+            limits: limits.clone(),
+            ..TunnelConfig::new(identity, pins)
+        })
     }
 
     /// The same mutually authenticated TLS 1.3 policy the tunnel enforces,

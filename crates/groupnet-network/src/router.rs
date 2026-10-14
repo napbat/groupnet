@@ -8,7 +8,7 @@ mod protocol;
 mod replay;
 mod routing;
 
-pub use config::{ReassemblyConfig, RouterConfig, RouterConfigError};
+pub use config::{ReassemblyConfig, ReassemblyConfigError, RouterConfig, RouterConfigError};
 pub use packet::PacketBuffer;
 pub(crate) use packet::TunnelBuffers;
 
@@ -217,17 +217,33 @@ impl fmt::Debug for Router {
 }
 
 impl Router {
-    /// Starts a routing actor on the current Tokio runtime.
+    /// Starts a routing actor with the default [`RouterConfig`] on the current
+    /// Tokio runtime.
     ///
     /// # Errors
-    /// Rejects invalid identifiers/bounds or unavailable OS randomness.
+    /// Rejects an invalid local identifier or unavailable OS randomness.
     /// # Panics
     /// Panics if called outside a Tokio runtime.
-    pub fn new(local: NodeId, config: RouterConfig) -> io::Result<Self> {
+    pub fn new(local: NodeId) -> io::Result<Self> {
+        Self::with_config(local, RouterConfig::default())
+    }
+
+    /// Starts a routing actor with explicit routing policy on the current
+    /// Tokio runtime. Nothing starts when validation fails.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` wrapping a [`RouterConfigError`], rejects an
+    /// invalid local identifier or unavailable OS randomness.
+    /// # Panics
+    /// Panics if called outside a Tokio runtime.
+    pub fn with_config(local: NodeId, config: RouterConfig) -> io::Result<Self> {
         config.validate()?;
-        if !wire::id_valid(&local) {
-            return Err(wire::invalid("invalid router identity"));
-        }
+        validate_local(&local)?;
+        Self::start(local, config)
+    }
+
+    /// Starts a router whose identity and policy the caller already validated.
+    pub(crate) fn start(local: NodeId, config: RouterConfig) -> io::Result<Self> {
         let mut nonce = [0; 8];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -239,7 +255,10 @@ impl Router {
         let shared = Arc::new(Shared {
             local,
             inbound: Mutex::new(InboundState::new(&config)),
-            pool: Arc::new(pool::PacketPool::new(config.packet_pool, config.max_frame)),
+            pool: Arc::new(pool::PacketPool::new(
+                config.packet_pool,
+                config.max_frame.get(),
+            )),
             config,
             table: Mutex::new(Table::default()),
             events,
@@ -311,12 +330,10 @@ impl Router {
             return Err((error.into(), link));
         }
         let mtu = config.mtu.get();
+        let max_frame = shared.config.max_frame.get();
         if config.peers.len() > shared.config.max_routes.get()
-            || !(wire::FRAGMENT + 1..=shared.config.max_frame).contains(&mtu)
-            || shared
-                .config
-                .max_frame
-                .div_ceil(mtu.saturating_sub(wire::FRAGMENT).max(1))
+            || !(wire::FRAGMENT + 1..=max_frame).contains(&mtu)
+            || max_frame.div_ceil(mtu.saturating_sub(wire::FRAGMENT).max(1))
                 > usize::from(shared.config.reassembly.max_fragments.get())
         {
             return Err((wire::invalid("invalid link configuration"), link));
@@ -517,19 +534,9 @@ impl Router {
         Ok(retained)
     }
 
-    pub(crate) fn validate_tunnel_payload(&self, to: &NodeId, payload: usize) -> io::Result<()> {
-        if !wire::id_valid(to)
-            || payload
-                > self
-                    .inner
-                    .shared
-                    .config
-                    .max_frame
-                    .saturating_sub(PayloadKind::Tunnel.header_len(self.local_id(), to))
-        {
-            return Err(wire::invalid("tunnel payload exceeds router bound"));
-        }
-        Ok(())
+    /// The validated largest complete routing envelope.
+    pub(crate) fn max_frame(&self) -> usize {
+        self.inner.shared.config.max_frame.get()
     }
 
     /// Installs this router's single tunnel endpoint. Link workers hand it every
@@ -606,4 +613,12 @@ async fn receive(
 
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "router closed")
+}
+
+/// Rejects a local identity the routing wire cannot carry.
+pub(crate) fn validate_local(local: &NodeId) -> io::Result<()> {
+    if !wire::id_valid(local) {
+        return Err(wire::invalid("invalid router identity"));
+    }
+    Ok(())
 }

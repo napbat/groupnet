@@ -11,7 +11,7 @@ mod session;
 mod tests;
 mod wire;
 
-use std::{fmt, io, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{fmt, io, num::NonZeroUsize, ops::Deref, sync::Arc, time::Duration};
 
 use groupnet_core::NodeId;
 use groupnet_network::{Router, tunnel::TunnelTransport};
@@ -146,6 +146,34 @@ impl UnorderedConfig {
     }
 }
 
+/// An [`UnorderedConfig`] that passed [`UnorderedConfig::validate`].
+///
+/// Constructible only through `TryFrom<UnorderedConfig>`, it lets a caller that
+/// must reject invalid policy before other side effects (a node builder)
+/// validate once and hand the proof to [`UnorderedProtocol::with_validated`],
+/// which does not check again. Dereferences to the validated configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidUnorderedConfig(UnorderedConfig);
+
+impl TryFrom<UnorderedConfig> for ValidUnorderedConfig {
+    type Error = UnorderedConfigError;
+
+    /// # Errors
+    /// Returns the first violated [`UnorderedConfigError`] rule.
+    fn try_from(config: UnorderedConfig) -> Result<Self, Self::Error> {
+        config.validate()?;
+        Ok(Self(config))
+    }
+}
+
+impl Deref for ValidUnorderedConfig {
+    type Target = UnorderedConfig;
+
+    fn deref(&self) -> &UnorderedConfig {
+        &self.0
+    }
+}
+
 /// A violated [`UnorderedConfig`] rule, naming the offending field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnorderedConfigError {
@@ -217,7 +245,8 @@ impl From<UnorderedConfigError> for io::Error {
 pub struct UnorderedOptions {
     /// Requested policy; rejected explicitly if disallowed, never downgraded.
     pub delivery: UnorderedDelivery,
-    /// Maximum time to establish the session.
+    /// Maximum time to establish the session; nonzero and at most the node
+    /// policy's [`UnorderedConfig::setup_timeout`].
     pub timeout: Duration,
 }
 
@@ -230,6 +259,72 @@ impl Default for UnorderedOptions {
     }
 }
 
+impl UnorderedOptions {
+    /// Checks these options against a node-wide policy: the delivery must be
+    /// allowed and the setup deadline nonzero and within `setup_timeout`.
+    /// Nothing is downgraded or shortened.
+    ///
+    /// # Errors
+    /// Returns the first violated [`UnorderedOptionsError`] rule.
+    pub fn validate(&self, policy: &UnorderedConfig) -> Result<(), UnorderedOptionsError> {
+        if !policy.allows(self.delivery) {
+            return Err(UnorderedOptionsError::DeliveryNotAllowed(self.delivery));
+        }
+        if self.timeout.is_zero() {
+            return Err(UnorderedOptionsError::ZeroTimeout);
+        }
+        if self.timeout > policy.setup_timeout {
+            return Err(UnorderedOptionsError::TimeoutAboveSetupTimeout {
+                timeout: self.timeout,
+                setup_timeout: policy.setup_timeout,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// [`UnorderedOptions`] a node-wide [`UnorderedConfig`] does not admit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnorderedOptionsError {
+    /// The policy disallows this `delivery`.
+    DeliveryNotAllowed(UnorderedDelivery),
+    /// `timeout` is zero.
+    ZeroTimeout,
+    /// `timeout` exceeds the policy's `setup_timeout`.
+    TimeoutAboveSetupTimeout {
+        /// The rejected setup deadline.
+        timeout: Duration,
+        /// The policy's setup bound.
+        setup_timeout: Duration,
+    },
+}
+
+impl fmt::Display for UnorderedOptionsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeliveryNotAllowed(delivery) => {
+                write!(f, "unordered {delivery:?} delivery is disallowed locally")
+            }
+            Self::ZeroTimeout => f.write_str("unordered setup timeout must be nonzero"),
+            Self::TimeoutAboveSetupTimeout {
+                timeout,
+                setup_timeout,
+            } => write!(
+                f,
+                "unordered setup timeout {timeout:?} exceeds setup_timeout {setup_timeout:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnorderedOptionsError {}
+
+impl From<UnorderedOptionsError> for io::Error {
+    fn from(error: UnorderedOptionsError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
 /// A shared, bounded authenticated unordered protocol engine.
 #[derive(Clone, Debug)]
 pub struct UnorderedProtocol {
@@ -237,33 +332,62 @@ pub struct UnorderedProtocol {
 }
 
 impl UnorderedProtocol {
-    /// Binds routed protocol namespace 2 and the separate pinned TLS control plane.
+    /// Binds routed protocol namespace 2 and the separate pinned TLS control
+    /// plane with the default [`UnorderedConfig`].
     ///
     /// # Errors
-    /// Rejects invalid bounds, a claimed protocol namespace, or a missing Tokio runtime.
-    pub fn new(
+    /// Rejects a claimed protocol namespace or a missing Tokio runtime.
+    pub fn new(router: &Router, tunnels: TunnelTransport) -> io::Result<Self> {
+        Self::with_config(router, tunnels, UnorderedConfig::default())
+    }
+
+    /// Binds routed protocol namespace 2 and the separate pinned TLS control
+    /// plane with explicit bounds and policy admission. Nothing binds when
+    /// validation fails.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` wrapping an [`UnorderedConfigError`]; rejects a
+    /// claimed protocol namespace or a missing Tokio runtime.
+    pub fn with_config(
         router: &Router,
         tunnels: TunnelTransport,
         config: UnorderedConfig,
     ) -> io::Result<Self> {
-        config.validate()?;
-        tokio::runtime::Handle::try_current()
-            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "Tokio executor required"))?;
-        Ok(endpoint::new(router.bind_protocol(2)?, tunnels, config))
+        Self::with_validated(router, tunnels, ValidUnorderedConfig::try_from(config)?)
     }
 
-    /// Validates a selected policy and setup deadline against node-wide settings.
+    /// Binds with bounds and policy already proven valid, without checking them
+    /// again.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for a disallowed policy or zero setup deadline.
-    pub fn validate_options(&self, options: &UnorderedOptions) -> io::Result<()> {
-        endpoint::validate_options(&self.inner, options)
+    /// Rejects a claimed protocol namespace or a missing Tokio runtime.
+    pub fn with_validated(
+        router: &Router,
+        tunnels: TunnelTransport,
+        config: ValidUnorderedConfig,
+    ) -> io::Result<Self> {
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "Tokio executor required"))?;
+        Ok(endpoint::new(router.bind_protocol(2)?, tunnels, config.0))
+    }
+
+    /// Validates a selected policy and setup deadline against this engine's
+    /// node-wide [`UnorderedConfig`] ([`UnorderedOptions::validate`]).
+    ///
+    /// # Errors
+    /// Returns the violated [`UnorderedOptionsError`] rule.
+    pub fn validate_options(
+        &self,
+        options: &UnorderedOptions,
+    ) -> Result<(), UnorderedOptionsError> {
+        options.validate(endpoint::config(&self.inner))
     }
 
     /// Establishes a pinned, mutually authenticated session with an agreed policy.
     ///
     /// # Errors
-    /// Returns admission, policy, capacity, cancellation or finite setup deadline errors.
+    /// Returns `InvalidInput` wrapping an [`UnorderedOptionsError`] before any
+    /// setup, then admission, policy, capacity, cancellation or setup deadline errors.
     pub async fn connect(
         &self,
         to: &NodeId,
@@ -285,7 +409,8 @@ impl UnorderedProtocol {
     /// with accepts for the other policy but never consuming their sessions.
     ///
     /// # Errors
-    /// Returns policy validation or endpoint/network shutdown errors.
+    /// Returns `InvalidInput` wrapping an [`UnorderedOptionsError`], or
+    /// endpoint/network shutdown errors.
     pub async fn accept_with_options(
         &self,
         options: UnorderedOptions,

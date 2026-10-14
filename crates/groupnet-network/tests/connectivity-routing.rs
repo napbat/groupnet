@@ -15,7 +15,7 @@ use groupnet_transport_tcp::{PathPolicy, PeerPath, TcpLink, TcpMsgTransport, Tcp
 const WAIT: Duration = Duration::from_secs(15);
 
 fn router(id: &str) -> Router {
-    Router::new(
+    Router::with_config(
         NodeId::new(id),
         RouterConfig {
             announce_interval: Duration::from_millis(30),

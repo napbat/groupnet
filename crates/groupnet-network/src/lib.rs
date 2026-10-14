@@ -15,8 +15,8 @@
 //! A route or shared group name is not authorization to use an application resource.
 //!
 //! Routing and reliable streams live here. Link implementations live in their own
-//! crates and register through `groupnet_transport::link`; the link contract
-//! types this crate's signatures take ([`LinkProvider`], [`BoundLink`],
+//! crates and register through `groupnet_transport::link`; the transport types
+//! this crate's signatures take ([`Transport`], [`LinkProvider`], [`BoundLink`],
 //! [`LinkConfig`]) and the [`QueueCapacity`] bound are re-exported here. The
 //! sans-IO coordination core remains dependency-free.
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -34,10 +34,10 @@ pub mod testing;
 pub mod tunnel;
 
 pub use bytes::Bytes;
-pub use config::{Network, NetworkBuilder, TunnelConfig};
-pub use groupnet_transport::QueueCapacity;
+pub use config::{Network, NetworkBuilder, TunnelConfig, TunnelConfigError};
 pub use groupnet_transport::link::{BoundLink, LinkConfig, LinkProvider};
+pub use groupnet_transport::{QueueCapacity, Transport};
 pub use router::{
-    ApplicationPacket, PacketBuffer, ProtocolId, ProtocolIo, ReassemblyConfig, Route, Router,
-    RouterConfig, RouterConfigError, TransportId,
+    ApplicationPacket, PacketBuffer, ProtocolId, ProtocolIo, ReassemblyConfig,
+    ReassemblyConfigError, Route, Router, RouterConfig, RouterConfigError, TransportId,
 };

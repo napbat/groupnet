@@ -156,10 +156,18 @@ reordering or delivery to TLS, in both directions of every session.
   processing never block on memory. `TunnelTransport::reserved_memory()` reports
   the bytes currently reserved.
 
-`TunnelConfig::with_limits(TunnelLimits { .. })` configures peer/session admission,
+`TunnelConfig::new(identity, peers)` takes the mandatory TLS identity and
+admitted pins; its public `limits` field
+(`TunnelConfig { limits: TunnelLimits { .. }, ..TunnelConfig::new(identity, peers) }`)
+configures peer/session admission,
 the accept queue, TLS buffering, send segment, windows, memory budget, initial
 congestion window and setup/retransmission/heartbeat deadlines. Standalone
-endpoints use `TunnelTransport::with_limits`. Each field's range is its type:
+endpoints use `TunnelTransport::with_config(router, config)` (or
+`TunnelTransport::new(router, identity)` for default limits and no initial
+pins). `TunnelConfig::validate` names each violated admission rule as a
+`TunnelConfigError`: invalid limits, too many pins, an unroutable or duplicate
+alias; the router-aware checks also reject a peer whose `payload` segment does
+not fit the router's `max_frame` envelope. Each limits field's range is its type:
 `QueueCapacity` for the accept queue, `SegmentSize` for the send segment,
 `NonZeroU32` for the byte windows (the wire's u32 credit), nonzero counts and
 budget, and `RetransmitTimeouts`, whose constructor orders `min <= initial <= max`
@@ -170,8 +178,9 @@ segments; and a peer timeout longer than both the heartbeat interval and the
 retransmission cap. Each violated rule is its own `TunnelLimitsError` variant
 naming the field (also returned by `RetransmitTimeouts::new` and
 `SegmentSize::try_from`); I/O entry points wrap it in an `InvalidInput`
-`io::Error`. `NetworkBuilder::bind` and `NodeBuilder::start` validate the limits
-before binding any link. TLS ciphertext is initially read into routing-headroom
+`io::Error`. `NetworkBuilder::bind` and `NodeBuilder::start` validate the
+complete tunnel configuration, including every admitted peer's envelope, before
+constructing the router or binding any link. TLS ciphertext is initially read into routing-headroom
 storage; retransmissions retain ciphertext rather than re-encrypting application
 bytes.
 

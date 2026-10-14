@@ -341,8 +341,10 @@ async fn bound_message_policies_preserve_node_inbox_and_application_boundary() -
     let receiver = node.endpoint(Messages::best_effort())?;
     let applied = node.peer(node.id().clone(), Messages::applied(WAIT))?;
     let delivered = node.peer(node.id().clone(), Messages::delivered(WAIT))?;
-    assert_eq!(applied.options().delivery, Delivery::Applied);
-    assert_eq!(delivered.options().delivery, Delivery::Delivered);
+    assert_eq!(applied.options().delivery(), Delivery::Applied);
+    assert_eq!(delivered.options().delivery(), Delivery::Delivered);
+    assert_eq!(applied.options().timeout(), Some(WAIT));
+    assert_eq!(receiver.options().timeout(), None);
     let callback = receiver.on_recv(|_, _| async { Ok(()) })?;
     assert_eq!(
         node.recv().await.unwrap_err().kind(),

@@ -27,6 +27,7 @@ mod wire;
 
 pub(crate) use config::DEFAULT_STREAM_FRAMES;
 pub use config::{RetransmitTimeouts, SegmentSize, TunnelLimits, TunnelLimitsError};
+pub(crate) use wire::HEADER as SEGMENT_HEADER;
 
 #[cfg(test)]
 mod tests;
@@ -48,12 +49,12 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::Router;
+use crate::{Router, TunnelConfig};
 use bytes::Bytes;
 use wire::{Kind, Packet, SessionId};
 
 pub use stream::TunneledStream;
-pub use tls::{PeerIdentity, TlsIdentity};
+pub use tls::{PeerIdentity, PeerIdentityError, TlsIdentity, TlsIdentityError};
 
 /// Authenticated preamble; its digit is the tunnel protocol [`wire::VERSION`].
 const PREAMBLE: &[u8; 11] = b"GN-TUNNEL-3";
@@ -116,53 +117,55 @@ pub struct TunnelTransport {
 }
 
 impl TunnelTransport {
-    /// Claims this router's tunnel plane and starts its bounded dispatcher.
+    /// Claims this router's tunnel plane with no admitted peers and default
+    /// [`TunnelLimits`], and starts its bounded dispatcher. Admit peers with
+    /// [`admit_peer`](Self::admit_peer).
     ///
     /// # Errors
-    /// Rejects duplicate peers, oversized admission or an already-claimed router.
-    /// Requires a running Tokio executor.
-    pub fn new(
-        router: Router,
-        identity: TlsIdentity,
-        peers: Vec<PeerIdentity>,
-    ) -> io::Result<Self> {
-        Self::with_limits(router, identity, peers, TunnelLimits::default())
+    /// Rejects an already-claimed router or a missing Tokio executor.
+    pub fn new(router: Router, identity: TlsIdentity) -> io::Result<Self> {
+        Self::with_config(router, TunnelConfig::new(identity, []))
     }
 
-    /// Claims the tunnel plane using explicit bounded resource/reliability policy.
+    /// Claims the tunnel plane with explicit admitted peers and bounded
+    /// resource/reliability policy. Nothing starts when validation fails.
+    ///
     /// # Errors
-    /// Rejects invalid limits, admission, or an already-claimed router.
-    pub fn with_limits(
-        router: Router,
-        identity: TlsIdentity,
-        peers: Vec<PeerIdentity>,
-        limits: TunnelLimits,
-    ) -> io::Result<Self> {
-        limits.validate()?;
+    /// Returns `InvalidInput` wrapping a [`TunnelConfigError`](crate::TunnelConfigError)
+    /// for invalid limits, admission or an admitted peer whose segments exceed
+    /// this router's envelope; rejects an already-claimed router or a missing
+    /// Tokio executor.
+    pub fn with_config(router: Router, config: TunnelConfig) -> io::Result<Self> {
+        config.validate()?;
+        config.validate_envelopes(router.local_id(), router.max_frame())?;
+        Self::start(router, config)
+    }
+
+    /// Claims the tunnel plane with a configuration the caller already validated
+    /// against this router.
+    pub(crate) fn start(router: Router, config: TunnelConfig) -> io::Result<Self> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| error(io::ErrorKind::NotConnected, "Tokio executor required"))?;
-        if peers.len() > limits.max_peers.get() {
-            return Err(error(io::ErrorKind::InvalidInput, "too many TLS peers"));
-        }
+        let TunnelConfig {
+            identity,
+            peers,
+            limits,
+        } = config;
         let cancel = router.cancellation();
-        let mut state = State::default();
-        for peer in peers {
-            router.validate_tunnel_payload(&peer.node, limits.payload.get() + wire::HEADER)?;
-            let node = peer.node.clone();
-            if state
-                .peers
-                .insert(
-                    node,
-                    Arc::new(Admission {
+        let state = State {
+            peers: peers
+                .into_iter()
+                .map(|peer| {
+                    let node = peer.node.clone();
+                    let admission = Arc::new(Admission {
                         identity: peer,
                         cancel: cancel.child_token(),
-                    }),
-                )
-                .is_some()
-            {
-                return Err(error(io::ErrorKind::InvalidInput, "duplicate TLS peer"));
-            }
-        }
+                    });
+                    (node, admission)
+                })
+                .collect(),
+            sessions: HashMap::new(),
+        };
         let (incoming, accepts) = mpsc::channel(limits.accept_queue.get());
         let (control_incoming, control_accepts) = mpsc::channel(limits.accept_queue.get());
         let inner = Arc::new(Inner {
@@ -188,11 +191,17 @@ impl TunnelTransport {
     /// Re-registering an unchanged admitted pin preserves that generation.
     ///
     /// # Errors
-    /// Returns an error if closed, the state lock was poisoned, or admission is full.
+    /// Returns `InvalidInput` wrapping a [`TunnelConfigError`](crate::TunnelConfigError)
+    /// for an unroutable peer or one whose segments exceed this router's
+    /// envelope, and an error if closed, the state lock was poisoned, or
+    /// admission is full.
     pub fn admit_peer(&self, peer: PeerIdentity) -> io::Result<()> {
-        self.inner
-            .router
-            .validate_tunnel_payload(&peer.node, self.inner.limits.payload.get() + wire::HEADER)?;
+        TunnelConfig::check_peer(
+            self.inner.router.local_id(),
+            self.inner.router.max_frame(),
+            &peer.node,
+            self.inner.limits.payload,
+        )?;
         let mut state = self.inner.state.lock().map_err(|_| poisoned())?;
         if self.inner.cancel.is_cancelled() {
             return Err(closed());

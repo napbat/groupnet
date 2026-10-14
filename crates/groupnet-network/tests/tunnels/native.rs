@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
 use groupnet_network::tunnel::{PeerIdentity, TunnelTransport};
-use groupnet_network::{Router, RouterConfig};
+use groupnet_network::{Router, TunnelConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::admission::OpenAdmission;
 use groupnet_transport::bulk::BulkTransport;
@@ -59,8 +59,8 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
             left_udp.path_to(&right) == Some(path) && right_udp.path_to(&left) == Some(path)
         })
         .await;
-        let left_router = Router::new(left.clone(), RouterConfig::default()).unwrap();
-        let right_router = Router::new(right.clone(), RouterConfig::default()).unwrap();
+        let left_router = Router::new(left.clone()).unwrap();
+        let right_router = Router::new(right.clone()).unwrap();
         left_router
             .add_link(left_udp.clone().into_bound_link(NonZeroU32::MIN))
             .await
@@ -76,11 +76,16 @@ async fn native_direct_and_relay_paths_carry_pinned_tls_and_half_close() {
         let (left_tls, right_tls, _) = credentials();
         let client_pin = PeerIdentity::new(left.clone(), &left_tls.leaf).unwrap();
         let server_pin = PeerIdentity::new(right.clone(), &right_tls.leaf).unwrap();
-        let client_endpoint =
-            TunnelTransport::new(left_router.clone(), left_tls.identity, vec![server_pin]).unwrap();
-        let server_endpoint =
-            TunnelTransport::new(right_router.clone(), right_tls.identity, vec![client_pin])
-                .unwrap();
+        let client_endpoint = TunnelTransport::with_config(
+            left_router.clone(),
+            TunnelConfig::new(left_tls.identity, vec![server_pin]),
+        )
+        .unwrap();
+        let server_endpoint = TunnelTransport::with_config(
+            right_router.clone(),
+            TunnelConfig::new(right_tls.identity, vec![client_pin]),
+        )
+        .unwrap();
         exchange(&client_endpoint, &server_endpoint, &left, &right).await;
         client_endpoint.close().await;
         server_endpoint.close().await;
@@ -125,8 +130,8 @@ async fn native_tcp_relay_large_echo_half_closes_without_revoking_admission() {
             && right_tcp.path_to(&left) == Some(PeerPath::Relay)
     })
     .await;
-    let left_router = Router::new(left.clone(), RouterConfig::default()).unwrap();
-    let right_router = Router::new(right.clone(), RouterConfig::default()).unwrap();
+    let left_router = Router::new(left.clone()).unwrap();
+    let right_router = Router::new(right.clone()).unwrap();
     left_router
         .add_link(left_tcp.clone().into_bound_link(NonZeroU32::MIN))
         .await
@@ -142,10 +147,16 @@ async fn native_tcp_relay_large_echo_half_closes_without_revoking_admission() {
     let (left_tls, right_tls, _) = credentials();
     let client_pin = PeerIdentity::new(left.clone(), &left_tls.leaf).unwrap();
     let server_pin = PeerIdentity::new(right.clone(), &right_tls.leaf).unwrap();
-    let client_endpoint =
-        TunnelTransport::new(left_router.clone(), left_tls.identity, vec![server_pin]).unwrap();
-    let server_endpoint =
-        TunnelTransport::new(right_router.clone(), right_tls.identity, vec![client_pin]).unwrap();
+    let client_endpoint = TunnelTransport::with_config(
+        left_router.clone(),
+        TunnelConfig::new(left_tls.identity, vec![server_pin]),
+    )
+    .unwrap();
+    let server_endpoint = TunnelTransport::with_config(
+        right_router.clone(),
+        TunnelConfig::new(right_tls.identity, vec![client_pin]),
+    )
+    .unwrap();
 
     // 128 KiB requires more than the relay's 256-frame burst once TLS framing
     // and ACKs are included. Exhausting that budget must not revoke admission.

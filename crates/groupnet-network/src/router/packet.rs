@@ -30,7 +30,9 @@ impl PacketBuffer {
         kind: PayloadKind,
     ) -> io::Result<Self> {
         let headroom = kind.header_len(&shared.local, target);
-        if !wire::id_valid(target) || capacity > shared.config.max_frame.saturating_sub(headroom) {
+        if !wire::id_valid(target)
+            || capacity > shared.config.max_frame.get().saturating_sub(headroom)
+        {
             return Err(wire::invalid("routed packet capacity exceeds bound"));
         }
         let mut bytes = shared.pool.take(headroom + capacity);
@@ -86,7 +88,7 @@ impl PacketBuffer {
         if &self.target != target
             || self.kind != kind
             || self.headroom != kind.header_len(&shared.local, target)
-            || self.bytes.len() > shared.config.max_frame
+            || self.bytes.len() > shared.config.max_frame.get()
         {
             return Err(wire::invalid(
                 "routed packet target, headroom or bound mismatch",
@@ -95,7 +97,7 @@ impl PacketBuffer {
         wire::stamp(
             &mut self.bytes[..self.headroom],
             kind,
-            u8::try_from(shared.config.max_hops).expect("validated hop limit"),
+            shared.config.max_hops.get(),
             shared.id(),
             &shared.local,
             target,

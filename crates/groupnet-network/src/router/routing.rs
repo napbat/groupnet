@@ -45,6 +45,7 @@ impl Shared {
                 > self
                     .config
                     .max_frame
+                    .get()
                     .saturating_sub(kind.header_len(&self.local, to))
         {
             return Err(wire::invalid("routed message exceeds bound"));
@@ -153,14 +154,14 @@ impl Shared {
                 .keys()
                 .filter_map(|id| table.route(id, self.config.route_ttl))
             {
-                if route.path.len() < self.config.max_hops
+                if route.path.len() < usize::from(self.config.max_hops.get())
                     && 10
                         + route
                             .path
                             .iter()
                             .map(|node| 1 + node.as_str().len())
                             .sum::<usize>()
-                        <= self.config.max_frame
+                        <= self.config.max_frame.get()
                 {
                     routes.push(AdvertisedRoute {
                         path: route.path.clone(),
@@ -220,7 +221,7 @@ pub(super) struct InboundState {
 impl InboundState {
     pub(super) fn new(config: &RouterConfig) -> Self {
         Self {
-            fragments: Reassembly::new(config.reassembly.clone(), config.max_frame),
+            fragments: Reassembly::new(config.reassembly.clone(), config.max_frame.get()),
             replay: ReplayWindows::new(config.replay_capacity.get()),
         }
     }
@@ -273,8 +274,11 @@ impl Shared {
         else {
             return;
         };
-        let Ok(frame) = wire::decode_bounded(&bytes, self.config.max_frame, self.config.max_hops)
-        else {
+        let Ok(frame) = wire::decode_bounded(
+            &bytes,
+            self.config.max_frame.get(),
+            usize::from(self.config.max_hops.get()),
+        ) else {
             return;
         };
         if let Frame::Data { from, id, .. } = &frame
@@ -323,7 +327,7 @@ impl Shared {
     ) {
         if path.first() != Some(&neighbor)
             || path.contains(&self.local)
-            || path.len() >= self.config.max_hops
+            || path.len() >= usize::from(self.config.max_hops.get())
         {
             return;
         }

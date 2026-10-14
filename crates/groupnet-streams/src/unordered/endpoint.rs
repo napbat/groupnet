@@ -207,14 +207,9 @@ fn register(inner: &Inner, state: &Arc<State>) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_options(inner: &Inner, options: &UnorderedOptions) -> io::Result<()> {
-    if options.timeout.is_zero() || !inner.config.allows(options.delivery) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "unordered policy or setup timeout disallowed locally",
-        ));
-    }
-    Ok(())
+/// The node-wide policy this engine was bound with.
+pub(super) fn config(inner: &Inner) -> &UnorderedConfig {
+    &inner.config
 }
 
 fn policy_index(delivery: UnorderedDelivery) -> usize {
@@ -294,7 +289,7 @@ pub(super) async fn connect(
     tokio::select! {
         biased;
         () = inner.cancel.cancelled() => Err(aborted()),
-        result = timeout(options.timeout.min(inner.config.setup_timeout), operation) => {
+        result = timeout(options.timeout, operation) => {
             result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "unordered setup deadline"))?
         },
     }

@@ -4,6 +4,7 @@ mod budget;
 mod builder;
 mod failover;
 mod fixtures;
+mod identities;
 mod native;
 mod protocols;
 mod wan;
@@ -15,7 +16,7 @@ use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
 use groupnet_network as network;
 use groupnet_network::{
-    Router, RouterConfig,
+    Router, TunnelConfig,
     tunnel::{PeerIdentity, SegmentSize, TunnelLimits, TunnelTransport},
 };
 use groupnet_transport::bulk::BulkTransport;
@@ -36,8 +37,22 @@ async fn exchange_both_ways(a_limits: TunnelLimits, c_limits: TunnelLimits, leng
     let (a, c, _) = credentials();
     let ap = PeerIdentity::new(fabric.c.local_id().clone(), &c.leaf).unwrap();
     let cp = PeerIdentity::new(fabric.a.local_id().clone(), &a.leaf).unwrap();
-    let a = TunnelTransport::with_limits(fabric.a.clone(), a.identity, vec![ap], a_limits).unwrap();
-    let c = TunnelTransport::with_limits(fabric.c.clone(), c.identity, vec![cp], c_limits).unwrap();
+    let a = TunnelTransport::with_config(
+        fabric.a.clone(),
+        TunnelConfig {
+            limits: a_limits,
+            ..TunnelConfig::new(a.identity, vec![ap])
+        },
+    )
+    .unwrap();
+    let c = TunnelTransport::with_config(
+        fabric.c.clone(),
+        TunnelConfig {
+            limits: c_limits,
+            ..TunnelConfig::new(c.identity, vec![cp])
+        },
+    )
+    .unwrap();
     let payload = binary(length);
     for (sender, receiver, target, origin) in [
         (&a, &c, fabric.c.local_id(), fabric.a.local_id()),
@@ -211,8 +226,12 @@ async fn valid_ca_certificate_cannot_impersonate_routing_alias() {
             },
         )
         .unwrap();
-        let sender = TunnelTransport::new(fabric.a.clone(), a.identity, vec![ap]).unwrap();
-        let receiver = TunnelTransport::new(fabric.c.clone(), c.identity, vec![cp]).unwrap();
+        let sender =
+            TunnelTransport::with_config(fabric.a.clone(), TunnelConfig::new(a.identity, vec![ap]))
+                .unwrap();
+        let receiver =
+            TunnelTransport::with_config(fabric.c.clone(), TunnelConfig::new(c.identity, vec![cp]))
+                .unwrap();
         assert!(
             timeout(Duration::from_secs(12), sender.connect(fabric.c.local_id()))
                 .await
@@ -338,12 +357,14 @@ async fn healthy_idle_session_survives_peer_failure_deadline() {
 #[tokio::test]
 async fn setup_deadline_and_cancelled_connect_release_native_sessions() {
     let (a, c, _) = credentials();
-    let router = Router::new(NodeId::new("isolated"), RouterConfig::default()).unwrap();
+    let router = Router::new(NodeId::new("isolated")).unwrap();
     let peer = NodeId::new("unreachable");
-    let transport = TunnelTransport::new(
+    let transport = TunnelTransport::with_config(
         router.clone(),
-        a.identity,
-        vec![PeerIdentity::new(peer.clone(), &c.leaf).unwrap()],
+        TunnelConfig::new(
+            a.identity,
+            vec![PeerIdentity::new(peer.clone(), &c.leaf).unwrap()],
+        ),
     )
     .unwrap();
     for _ in 0..16 {

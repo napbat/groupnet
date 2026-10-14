@@ -15,7 +15,7 @@ use groupnet_core::NodeId;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{SegmentEnd, Taken, TlsEnd, pair};
-use crate::{Router, RouterConfig, tunnel::wire::HEADER};
+use crate::{Router, tunnel::wire::HEADER};
 
 const CAPACITY: usize = 32;
 const PAYLOAD: usize = 12;
@@ -39,7 +39,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let router = Router::new(NodeId::new("local"), RouterConfig::default()).unwrap();
+        let router = Router::new(NodeId::new("local")).unwrap();
         let (tls, segments) = pair(
             router.tunnel_buffers(&NodeId::new("peer")),
             CAPACITY,

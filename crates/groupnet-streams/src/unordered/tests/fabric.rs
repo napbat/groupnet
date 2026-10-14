@@ -10,7 +10,7 @@ use std::{
 
 use groupnet_core::NodeId;
 use groupnet_network::{
-    Router, RouterConfig,
+    Router, RouterConfig, TunnelConfig,
     tunnel::{PeerIdentity, TlsIdentity, TunnelTransport},
 };
 use groupnet_testkit::cluster::eventually;
@@ -203,9 +203,9 @@ impl Fabric {
             announce_interval: Duration::from_millis(50),
             ..RouterConfig::default()
         };
-        let ar = Router::new(a.clone(), router_config.clone()).unwrap();
-        let br = Router::new(b.clone(), router_config.clone()).unwrap();
-        let attacker = Router::new(evil.clone(), router_config).unwrap();
+        let ar = Router::with_config(a.clone(), router_config.clone()).unwrap();
+        let br = Router::with_config(b.clone(), router_config.clone()).unwrap();
+        let attacker = Router::with_config(evil.clone(), router_config).unwrap();
         let network = Network::new();
         let faults = Arc::new(Faults::default());
         ar.add_transport(
@@ -235,27 +235,25 @@ impl Fabric {
         })
         .await;
         let [(ai, ac), (bi, bc), (ei, ec)] = credentials();
-        let at = TunnelTransport::new(
+        let at = TunnelTransport::with_config(
             ar.clone(),
-            ai,
-            vec![PeerIdentity::new(b.clone(), &bc).unwrap()],
+            TunnelConfig::new(ai, vec![PeerIdentity::new(b.clone(), &bc).unwrap()]),
         )
         .unwrap();
         let mut b_peers = vec![PeerIdentity::new(a.clone(), &ac).unwrap()];
         if admit_attacker {
             b_peers.push(PeerIdentity::new(evil, &ec).unwrap());
         }
-        let bt = TunnelTransport::new(br.clone(), bi, b_peers).unwrap();
+        let bt = TunnelTransport::with_config(br.clone(), TunnelConfig::new(bi, b_peers)).unwrap();
         let attacker_tunnel = admit_attacker.then(|| {
-            TunnelTransport::new(
+            TunnelTransport::with_config(
                 attacker.clone(),
-                ei,
-                vec![PeerIdentity::new(b, &bc).unwrap()],
+                TunnelConfig::new(ei, vec![PeerIdentity::new(b, &bc).unwrap()]),
             )
             .unwrap()
         });
-        let a = UnorderedProtocol::new(&ar, at.clone(), a_config).unwrap();
-        let b = UnorderedProtocol::new(&br, bt.clone(), b_config).unwrap();
+        let a = UnorderedProtocol::with_config(&ar, at.clone(), a_config).unwrap();
+        let b = UnorderedProtocol::with_config(&br, bt.clone(), b_config).unwrap();
         let fabric = Self {
             a,
             b,

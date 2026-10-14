@@ -1,7 +1,7 @@
 //! Configurations that resolve the node's cached concrete protocols once.
 
 use super::{ManagedProtocol, Node, PeerImplementation};
-use groupnet_messaging::{Delivery, Messaging, SendOptions};
+use groupnet_messaging::{Messaging, SendOptions};
 use groupnet_streams::{OrderedProtocol, UnorderedDelivery, UnorderedOptions, UnorderedProtocol};
 use std::{io, time::Duration};
 
@@ -27,20 +27,14 @@ impl Messages {
     /// Waits for receiver inbox acceptance within a finite deadline.
     #[must_use]
     pub const fn delivered(timeout: Duration) -> Self {
-        Self::new(SendOptions {
-            delivery: Delivery::Delivered,
-            timeout,
-        })
+        Self::new(SendOptions::Delivered { timeout })
     }
 
     /// Waits for explicit receiver application completion within a finite deadline.
     /// A timeout leaves the outcome unknown, not known unapplied.
     #[must_use]
     pub const fn applied(timeout: Duration) -> Self {
-        Self::new(SendOptions {
-            delivery: Delivery::Applied,
-            timeout,
-        })
+        Self::new(SendOptions::Applied { timeout })
     }
 }
 

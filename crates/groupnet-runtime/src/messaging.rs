@@ -18,12 +18,14 @@ use std::io;
 use std::sync::Mutex;
 
 use groupnet_core::NodeId;
+use groupnet_messaging::ValidMessagingConfig;
 use groupnet_network::Router;
 use tokio::task::JoinHandle;
 
 pub use groupnet_messaging::{
     Bytes, DEFAULT_MAX_MESSAGE_BYTES, Delivery, Frame, MessageContext, MessageId, MessageProtocol,
     Messaging, MessagingConfig, MessagingConfigError, ProtocolId, Receipt, SendOptions,
+    SendValidationError,
 };
 pub use inbox::ReceiveHandle;
 
@@ -67,8 +69,8 @@ pub(crate) struct Hub {
 use inbox::Inbox;
 
 impl Hub {
-    pub(crate) fn new(router: &Router, config: MessagingConfig) -> io::Result<Self> {
-        let sender = Messaging::with_config(router, config)?;
+    pub(crate) fn new(router: &Router, config: ValidMessagingConfig) -> io::Result<Self> {
+        let sender = Messaging::with_validated(router, config)?;
         Ok(Self {
             node: Inbox::new(sender.cancellation(), sender.config().inbox_capacity.get()),
             sender,

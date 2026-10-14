@@ -72,7 +72,7 @@ async fn advertise(incoming: &mpsc::Sender<AdmittedInbound>, peer: &NodeId, id: 
 #[tokio::test]
 async fn blocked_and_router_queued_frames_cannot_cross_into_replacement_session() -> io::Result<()>
 {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     let peer = NodeId::new("peer");
     let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
     let first = registry.try_admit(AcceptedPeer::new(peer.clone()))?;
@@ -127,7 +127,7 @@ async fn blocked_and_router_queued_frames_cannot_cross_into_replacement_session(
 #[tokio::test]
 async fn remaining_fragments_keep_original_generation_and_stop_after_revocation() -> io::Result<()>
 {
-    let router = Router::new(NodeId::new("local"), RouterConfig::default())?;
+    let router = Router::new(NodeId::new("local"))?;
     let shared = router.inner.shared.clone();
     let peer = NodeId::new("peer");
     let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);

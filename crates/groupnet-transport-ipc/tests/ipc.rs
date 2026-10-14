@@ -5,7 +5,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_network::{Router, RouterConfig};
+use groupnet_network::Router;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::link::{LinkConfigError, LinkLifecycle, LinkProvider};
@@ -425,8 +425,8 @@ async fn windows_last_handle_drop_releases_the_reserved_pipe_name() {
 async fn provider_routes_bounded_frames_and_router_drains_listener() {
     let left_address = Address::new();
     let right_address = Address::new();
-    let left = Router::new(NodeId::new("left"), RouterConfig::default()).unwrap();
-    let right = Router::new(NodeId::new("right"), RouterConfig::default()).unwrap();
+    let left = Router::new(NodeId::new("left")).unwrap();
+    let right = Router::new(NodeId::new("right")).unwrap();
     let left_provider = IpcLink::new(
         left_address.ipc.clone(),
         vec![PeerEndpoint::new(
@@ -560,7 +560,7 @@ async fn provider_preflights_every_peer_before_opening_a_listener() {
 #[tokio::test]
 async fn rejected_router_registration_closes_provider_listener_before_returning() {
     let address = Address::new();
-    let router = Router::new(NodeId::new("local"), RouterConfig::default()).unwrap();
+    let router = Router::new(NodeId::new("local")).unwrap();
     router.close().await;
     let bound = Box::new(IpcLink::new(address.ipc.clone(), Vec::new()))
         .bind(router.local_id().clone())
