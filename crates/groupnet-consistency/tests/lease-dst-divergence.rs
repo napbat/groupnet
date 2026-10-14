@@ -237,8 +237,9 @@ impl Harness {
             let node = Node {
                 id: id.clone(),
                 ppm,
-                lease: LeaseCore::new(id.clone(), &lease_cfg(), 1),
-                ledger: GrantLedger::new(id.clone(), &lease_cfg(), 1, ClockMs::ZERO),
+                lease: LeaseCore::new(id.clone(), &lease_cfg(), 1).expect("valid lease config"),
+                ledger: GrantLedger::new(id.clone(), &lease_cfg(), 1, ClockMs::ZERO)
+                    .expect("valid lease config"),
                 coherence: CoherenceCore::new(id.clone()),
                 next_renew: phase,
                 converged_at: CONVERGE_MS,

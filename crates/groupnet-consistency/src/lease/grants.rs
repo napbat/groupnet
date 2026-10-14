@@ -54,9 +54,9 @@ use std::collections::BTreeMap;
 
 use groupnet_core::NodeId;
 
-use super::LeaseConfig;
 use super::core::ClockMs;
 use super::wire::{GrantMap, GranterLife, RenewalId};
+use super::{LeaseConfig, LeaseConfigError};
 use crate::token::WriteToken;
 
 /// What this node knows about one reader's lease.
@@ -86,7 +86,7 @@ struct Reader {
 #[derive(Debug)]
 pub struct GrantLedger {
     me: NodeId,
-    /// `duration` in milliseconds, never zero.
+    /// `duration` in milliseconds, nonzero because `cfg` was validated.
     duration_ms: u64,
     /// This node's lease life — the epoch its own row carries.
     life: u64,
@@ -108,11 +108,26 @@ pub struct GrantLedger {
 impl GrantLedger {
     /// A ledger for `me` in lease life `life` (the epoch its renewals carry),
     /// leasing under `cfg`, born at `now`.
-    #[must_use]
-    pub fn new(me: NodeId, cfg: &LeaseConfig, life: u64, now: ClockMs) -> Self {
+    ///
+    /// # Errors
+    /// [`LeaseConfigError`] when `cfg` fails [`LeaseConfig::validate`]: a
+    /// sub-millisecond duration would make every grant expire the instant it
+    /// is given.
+    pub fn new(
+        me: NodeId,
+        cfg: &LeaseConfig,
+        life: u64,
+        now: ClockMs,
+    ) -> Result<Self, LeaseConfigError> {
+        cfg.validate()?;
+        Ok(Self::from_validated(me, cfg, life, now))
+    }
+
+    /// [`new`](Self::new) for a `cfg` the caller has already validated.
+    pub(super) fn from_validated(me: NodeId, cfg: &LeaseConfig, life: u64, now: ClockMs) -> Self {
         Self {
             me,
-            duration_ms: cfg.duration_ms().max(1),
+            duration_ms: cfg.duration_ms(),
             life,
             born: now,
             departed: false,
@@ -295,9 +310,9 @@ mod tests {
     use groupnet_core::NodeId;
 
     use super::GrantLedger;
-    use crate::lease::LeaseConfig;
     use crate::lease::core::ClockMs;
     use crate::lease::wire::{GrantMap, GranterLife, RenewalId};
+    use crate::lease::{LeaseConfig, LeaseConfigError};
     use crate::token::WriteToken;
 
     /// D = 1000 ms.
@@ -323,7 +338,7 @@ mod tests {
 
     /// A writer `w` of lease life 5, born at 0.
     fn ledger() -> GrantLedger {
-        GrantLedger::new(node("w"), &cfg(), 5, ClockMs::ZERO)
+        GrantLedger::new(node("w"), &cfg(), 5, ClockMs::ZERO).expect("valid lease config")
     }
 
     /// The map reader `r` of life `life` publishes, granting `w`'s life-5
@@ -483,7 +498,8 @@ mod tests {
 
     #[test]
     fn a_new_life_presumes_its_previous_life_granted_at_birth() {
-        let mut ledger = GrantLedger::new(node("w"), &cfg(), 5, ClockMs(400));
+        let mut ledger =
+            GrantLedger::new(node("w"), &cfg(), 5, ClockMs(400)).expect("valid lease config");
         // Seen, counted, never granted by this life (a capped first fold).
         ledger.begin(&node("w"), token(1), ClockMs(400));
         let map = ledger.fold(ClockMs(450), [(node("r"), renewal(2, 1))], nothing_applied);
@@ -522,5 +538,19 @@ mod tests {
         };
         assert_eq!(open(&ledger, 1_099), vec![node("r")]);
         assert_eq!(open(&ledger, 1_100), Vec::<NodeId>::new());
+    }
+
+    #[test]
+    fn construction_rejects_a_sub_millisecond_duration_rather_than_flooring_it() {
+        let sub_ms = LeaseConfig {
+            duration: Duration::from_micros(500),
+            ..cfg()
+        };
+        assert_eq!(
+            GrantLedger::new(node("w"), &sub_ms, 5, ClockMs::ZERO).unwrap_err(),
+            LeaseConfigError::DurationTooShort {
+                duration: Duration::from_micros(500)
+            }
+        );
     }
 }

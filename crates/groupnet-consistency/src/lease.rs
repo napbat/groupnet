@@ -251,9 +251,9 @@ pub struct LeaseConfig {
     /// How long a granted serve-lease lasts (`D`). The writer's worst-case
     /// stall on a silent peer, and the reader's window between confirmations.
     pub duration: Duration,
-    /// How often the reader republishes its renewal. Must be nonzero and at
-    /// most `duration / 2` — the default is `duration / 3`, so two consecutive
-    /// lost renewals still leave the lease standing.
+    /// How often the reader republishes its renewal. Must be at least one
+    /// millisecond and at most `duration / 2` — the default is `duration / 3`,
+    /// so two consecutive lost renewals still leave the lease standing.
     pub renew_every: Duration,
     /// Reader-side safety margin subtracted from every serve window, for
     /// clock-*rate* skew between the reader and its granters. Must be below
@@ -264,7 +264,8 @@ pub struct LeaseConfig {
 
 /// Why a [`LeaseConfig`] cannot be honoured as written — one variant per
 /// violated rule, naming the field. [`Leases`] refuses to start on any of
-/// them; nothing is clamped or corrected.
+/// them, and [`LeaseCore::new`] and [`GrantLedger::new`] refuse to construct;
+/// nothing is clamped or corrected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseConfigError {
     /// `duration` is under one millisecond. Zero is the engine's "never
@@ -274,8 +275,11 @@ pub enum LeaseConfigError {
         /// The rejected `duration`.
         duration: Duration,
     },
-    /// `renew_every` is zero: a spinning ticker.
-    RenewEveryZero,
+    /// `renew_every` is under one millisecond: a spinning ticker.
+    RenewEveryTooShort {
+        /// The rejected `renew_every`.
+        renew_every: Duration,
+    },
     /// `renew_every` is past `duration / 2`, which leaves no room for a single
     /// lost renewal.
     RenewEveryTooLong {
@@ -300,7 +304,12 @@ impl fmt::Display for LeaseConfigError {
             LeaseConfigError::DurationTooShort { duration } => {
                 write!(f, "lease duration {duration:?} is under one millisecond")
             }
-            LeaseConfigError::RenewEveryZero => f.write_str("lease renew_every must be nonzero"),
+            LeaseConfigError::RenewEveryTooShort { renew_every } => {
+                write!(
+                    f,
+                    "lease renew_every {renew_every:?} is under one millisecond"
+                )
+            }
             LeaseConfigError::RenewEveryTooLong { renew_every, max } => write!(
                 f,
                 "lease renew_every {renew_every:?} exceeds half the duration ({max:?})"
@@ -349,8 +358,10 @@ impl LeaseConfig {
                 duration: self.duration,
             });
         }
-        if self.renew_every.is_zero() {
-            return Err(LeaseConfigError::RenewEveryZero);
+        if self.renew_every.as_millis() == 0 {
+            return Err(LeaseConfigError::RenewEveryTooShort {
+                renew_every: self.renew_every,
+            });
         }
         let max = self.duration / 2;
         if self.renew_every > max {
@@ -369,19 +380,21 @@ impl LeaseConfig {
     }
 
     /// The lease duration in whole milliseconds — the TTL the renewal carries.
-    /// Never zero for a validated config; the sans-IO cores also floor it at
-    /// 1 ms so that a core driven with an unvalidated config never asks the
-    /// engine for its "never expires" TTL.
+    /// A plain conversion (sub-millisecond remainders truncated, saturating
+    /// past [`u64::MAX`] ms) with no floor: it is nonzero only for a config
+    /// that passed [`validate`](Self::validate), which is the only kind the
+    /// sans-IO cores and the shell accept.
     #[must_use]
     pub fn duration_ms(&self) -> u64 {
-        clamp_ms(self.duration).max(1)
+        clamp_ms(self.duration)
     }
 
-    /// The renewal interval in whole milliseconds, floored at 1 ms like
-    /// [`duration_ms`](Self::duration_ms).
+    /// The renewal interval in whole milliseconds, converted like
+    /// [`duration_ms`](Self::duration_ms) and likewise nonzero only for a
+    /// validated config.
     #[must_use]
     pub fn renew_every_ms(&self) -> u64 {
-        clamp_ms(self.renew_every).max(1)
+        clamp_ms(self.renew_every)
     }
 
     /// The rate margin in milliseconds. Zero is allowed and means "these
@@ -512,7 +525,22 @@ mod tests {
             renew_every: Duration::ZERO,
             ..LeaseConfig::default()
         };
-        assert_eq!(spinning.validate(), Err(LeaseConfigError::RenewEveryZero));
+        assert_eq!(
+            spinning.validate(),
+            Err(LeaseConfigError::RenewEveryTooShort {
+                renew_every: Duration::ZERO
+            })
+        );
+        let sub_ms_renew = LeaseConfig {
+            renew_every: Duration::from_micros(999),
+            ..LeaseConfig::default()
+        };
+        assert_eq!(
+            sub_ms_renew.validate(),
+            Err(LeaseConfigError::RenewEveryTooShort {
+                renew_every: Duration::from_micros(999)
+            })
+        );
 
         let paranoid = LeaseConfig {
             rate_margin: Duration::from_secs(2),

@@ -633,7 +633,9 @@ async fn lease_sets_validate_before_starting_and_start_fully_configured() {
         ..lease_cfg()
     };
     match Leases::new(group.clone(), me.clone(), spinning) {
-        Err(LeaseStartError::InvalidConfig(LeaseConfigError::RenewEveryZero)) => {}
+        Err(LeaseStartError::InvalidConfig(LeaseConfigError::RenewEveryTooShort {
+            renew_every: Duration::ZERO,
+        })) => {}
         other => panic!("expected an invalid-config error, got {other:?}"),
     }
     let too_short = Leases::builder(group.clone(), me.clone())

@@ -274,8 +274,9 @@ impl Node {
         Self {
             id: id.clone(),
             boot,
-            lease: LeaseCore::new(id.clone(), &lease_cfg(), boot),
-            ledger: GrantLedger::new(id.clone(), &lease_cfg(), boot, ClockMs(joined)),
+            lease: LeaseCore::new(id.clone(), &lease_cfg(), boot).expect("valid lease config"),
+            ledger: GrantLedger::new(id.clone(), &lease_cfg(), boot, ClockMs(joined))
+                .expect("valid lease config"),
             coherence: CoherenceCore::new(id.clone()),
             published: BTreeMap::new(),
             roster: BTreeSet::new(),

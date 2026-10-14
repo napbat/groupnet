@@ -522,8 +522,9 @@ impl LeasesBuilder {
             config: cfg,
         } = self;
         let epoch = epoch.unwrap_or_else(wall_clock_epoch);
-        let core = LeaseCore::new(me.clone(), &cfg, epoch);
-        let ledger = GrantLedger::new(me.clone(), &cfg, epoch, ClockMs::ZERO);
+        // `cfg` passed `validate` above: the one validation point.
+        let core = LeaseCore::from_validated(me.clone(), &cfg, epoch);
+        let ledger = GrantLedger::from_validated(me.clone(), &cfg, epoch, ClockMs::ZERO);
         let (serve, _) = watch::channel(None);
         let shared = Arc::new(Shared {
             group,

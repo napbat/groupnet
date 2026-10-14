@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use groupnet_core::NodeId;
 
 use super::wire::{GrantMap, GranterLife, RenewalId};
-use super::{LeaseConfig, LeaseState};
+use super::{LeaseConfig, LeaseConfigError, LeaseState};
 
 /// How many publish instants one reader remembers. Renewals are `duration/3`
 /// apart by default, so this is hundreds of lease durations of history: a
@@ -103,7 +103,7 @@ pub struct LeaseCore {
     me: NodeId,
     /// This lease life's epoch (the reader's boot epoch).
     epoch: u64,
-    /// `duration` in milliseconds, never zero.
+    /// `duration` in milliseconds, nonzero because `cfg` was validated.
     duration_ms: u64,
     /// `rate_margin` in milliseconds.
     margin_ms: u64,
@@ -141,15 +141,22 @@ impl LeaseCore {
     /// [`WriteFeed`](crate::WriteFeed). Grants recorded against another epoch
     /// never confirm, so a stale grant from a previous life cannot open a
     /// window in this one.
-    #[must_use]
-    pub fn new(me: NodeId, cfg: &LeaseConfig, epoch: u64) -> Self {
+    ///
+    /// # Errors
+    /// [`LeaseConfigError`] when `cfg` fails [`LeaseConfig::validate`] — a
+    /// sub-millisecond duration, above all, would ask the engine for its
+    /// "never expires" TTL, the footgun the whole tier exists to avoid.
+    pub fn new(me: NodeId, cfg: &LeaseConfig, epoch: u64) -> Result<Self, LeaseConfigError> {
+        cfg.validate()?;
+        Ok(Self::from_validated(me, cfg, epoch))
+    }
+
+    /// [`new`](Self::new) for a `cfg` the caller has already validated.
+    pub(super) fn from_validated(me: NodeId, cfg: &LeaseConfig, epoch: u64) -> Self {
         Self {
             me,
             epoch,
-            // Zero would be the engine's "never expires" TTL — the footgun the
-            // whole tier exists to avoid. `LeaseConfig` clamps it too; this is
-            // the belt to that pair of braces.
-            duration_ms: cfg.duration_ms().max(1),
+            duration_ms: cfg.duration_ms(),
             margin_ms: cfg.rate_margin_ms(),
             next_seq: 1,
             published: BTreeMap::new(),
@@ -471,7 +478,7 @@ mod tests {
 
     use super::{ClockMs, LeaseCore};
     use crate::lease::wire::{GrantMap, GranterLife, RenewalId};
-    use crate::lease::{LeaseConfig, LeaseState};
+    use crate::lease::{LeaseConfig, LeaseConfigError, LeaseState};
 
     /// D = 1000 ms, margin = 10 ms — round numbers for readable arithmetic.
     fn cfg() -> LeaseConfig {
@@ -488,7 +495,7 @@ mod tests {
 
     /// A reader core with `granters` in its roster, boot epoch 7.
     fn reader(granters: &[&str]) -> LeaseCore {
-        let mut core = LeaseCore::new(node("reader"), &cfg(), 7);
+        let mut core = LeaseCore::new(node("reader"), &cfg(), 7).expect("valid lease config");
         core.set_roster(granters.iter().map(|g| node(g)));
         core
     }
@@ -538,21 +545,31 @@ mod tests {
     }
 
     #[test]
-    fn a_margin_at_or_past_the_duration_never_serves() {
-        // Fail-closed rather than clamped: an unsatisfiable margin is a
-        // configuration error `LeaseConfig::validate` reports, and the core
-        // must not quietly widen it back.
+    fn construction_rejects_an_invalid_config_rather_than_flooring_it() {
+        let sub_ms = LeaseConfig {
+            duration: Duration::from_micros(500),
+            ..cfg()
+        };
+        assert_eq!(
+            LeaseCore::new(node("reader"), &sub_ms, 7).unwrap_err(),
+            LeaseConfigError::DurationTooShort {
+                duration: Duration::from_micros(500)
+            }
+        );
+        // An unsatisfiable margin is refused too, rather than quietly widened
+        // back into a serve window.
         let paranoid = LeaseConfig {
             duration: Duration::from_millis(100),
             renew_every: Duration::from_millis(30),
             rate_margin: Duration::from_millis(100),
         };
-        let mut core = LeaseCore::new(node("reader"), &paranoid, 7);
-        core.set_roster(Vec::new());
-        let _ = core.on_renew(ClockMs(1_000));
-        assert_eq!(core.serve_until(), Some(ClockMs(1_000)));
-        assert!(!core.mark_caught_up(ClockMs(1_000)));
-        assert!(!core.valid(ClockMs(1_000)));
+        assert_eq!(
+            LeaseCore::new(node("reader"), &paranoid, 7).unwrap_err(),
+            LeaseConfigError::RateMarginTooLarge {
+                rate_margin: Duration::from_millis(100),
+                duration: Duration::from_millis(100),
+            }
+        );
     }
 
     #[test]
