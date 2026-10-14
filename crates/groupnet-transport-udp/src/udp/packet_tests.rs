@@ -129,6 +129,13 @@ async fn raw_owned_admitted_send_roundtrips_bytes() {
 async fn receive_reuses_scratch_and_retains_independent_owned_payloads() {
     let sender = bind("sender").await;
     let receiver = bind("receiver").await;
+    #[cfg_attr(
+        not(feature = "connectivity"),
+        expect(
+            clippy::infallible_destructuring_match,
+            reason = "the backend has a single variant without the connectivity feature"
+        )
+    )]
     let inner = match &receiver.backend {
         super::Backend::Direct(inner) => inner,
         #[cfg(feature = "connectivity")]

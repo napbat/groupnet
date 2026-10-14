@@ -1,5 +1,5 @@
-#![cfg(feature = "connectivity")]
 //! Native multi-socket candidates, privacy, address families, and bounded configuration.
+#![cfg(feature = "connectivity")]
 
 use std::io;
 use std::net::SocketAddr;

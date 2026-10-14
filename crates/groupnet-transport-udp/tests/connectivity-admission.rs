@@ -1,5 +1,5 @@
-#![cfg(feature = "connectivity")]
 //! Dynamic relay admission through real UDP sockets and the real router.
+#![cfg(feature = "connectivity")]
 
 use std::io;
 use std::net::SocketAddr;

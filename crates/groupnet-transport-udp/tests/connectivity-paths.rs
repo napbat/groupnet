@@ -1,5 +1,5 @@
-#![cfg(feature = "connectivity")]
 //! Explicit keyless path policy, real UDP delivery, and fresh-session reconnects.
+#![cfg(feature = "connectivity")]
 
 use std::io;
 use std::net::SocketAddr;

@@ -1,5 +1,5 @@
-#![cfg(feature = "connectivity")]
 //! Loopback-only native discovery, direct/relay delivery and lifecycle scenarios.
+#![cfg(feature = "connectivity")]
 
 use std::io;
 use std::net::SocketAddr;

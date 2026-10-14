@@ -21,8 +21,8 @@ mod server;
 mod sockets;
 mod wire;
 
-use crate::common::{closed, invalid, lock, random};
 use crate::PeerPath;
+use crate::common::{closed, invalid, lock, random};
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{

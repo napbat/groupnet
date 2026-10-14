@@ -32,7 +32,9 @@ pub(crate) fn field_header(bytes: &[u8]) -> io::Result<LengthHeader> {
 }
 
 /// Sends our node id as one length-prefixed field so the peer can attribute
-/// the connection.
+/// the connection. Bulk streams and managed sessions acknowledge identities;
+/// the raw message plane never does.
+#[cfg(any(feature = "bulk", feature = "link"))]
 pub(crate) async fn write_id(sock: &mut (impl AsyncWrite + Unpin), id: &NodeId) -> io::Result<()> {
     check_id(id)?;
     let id = id.as_str().as_bytes();
@@ -144,6 +146,7 @@ mod tests {
 
     /// The dialer's id survives the wire verbatim, in both directions and for
     /// multi-byte UTF-8 — this attribution is all the accepting side gets.
+    #[cfg(any(feature = "bulk", feature = "link"))]
     #[tokio::test]
     async fn id_round_trips_over_a_connection() {
         let (mut dialer, mut acceptor) = pair().await;
@@ -167,6 +170,7 @@ mod tests {
 
     /// The length cap is inclusive and shared with session admission: an id
     /// of exactly `MAX_NODE_ID_BYTES` bytes is still a legal handshake.
+    #[cfg(any(feature = "bulk", feature = "link"))]
     #[tokio::test]
     async fn an_id_at_the_length_cap_is_accepted() {
         let (mut dialer, mut acceptor) = pair().await;
@@ -182,6 +186,7 @@ mod tests {
     }
 
     /// An id the peer would reject is refused locally before any byte is sent.
+    #[cfg(any(feature = "bulk", feature = "link"))]
     #[tokio::test]
     async fn ids_outside_the_bound_are_never_written() {
         let mut sink = Vec::new();
@@ -222,6 +227,7 @@ mod tests {
     }
 
     /// The field layout is a big-endian u32 length then the bytes.
+    #[cfg(any(feature = "bulk", feature = "link"))]
     #[tokio::test]
     async fn id_field_keeps_the_network_layout() {
         let mut wire = Vec::new();
