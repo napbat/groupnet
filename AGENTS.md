@@ -327,6 +327,9 @@ cargo test -p groupnet --features rpc,tcp
 cargo clippy -p groupnet --all-targets --features rpc,tcp -- -D warnings
 cargo check -p groupnet --no-default-features --features rpc --all-targets
 RUSTDOCFLAGS='-D warnings' cargo doc -p groupnet-rpc --no-deps
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 ```
 
 The feature-specific Clippy runs are not redundant: no crate in the workspace turns `leases`,

@@ -3,8 +3,8 @@
 //! Providers bind typed protocol configuration without knowing about a router.
 //! Dynamic dispatch occurs at initialization and worker lifetime boundaries;
 //! individual transport send/receive futures remain statically dispatched.
-//! An already-bound [`BoundLink`](crate::link::BoundLink) is itself a
-//! [`LinkProvider`](crate::link::LinkProvider), so custom transports use the same
+//! An already-bound [`BoundLink`] is itself a
+//! [`LinkProvider`], so custom transports use the same
 //! initialization path as protocol providers.
 
 mod worker;

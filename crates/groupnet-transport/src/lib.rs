@@ -5,7 +5,7 @@
 //! * **Control plane** — the [`Transport`] trait below: best-effort,
 //!   message-oriented datagrams (gossip, membership, routing). Always available,
 //!   with `bytes` as the shared ownership buffer dependency.
-//! * **Data plane** — the [`bulk`] module (feature `bulk`): reliable, ordered
+//! * **Data plane** — the `bulk` module (feature `bulk`): reliable, ordered
 //!   byte *streams* for replication and bulk transfer. Opt-in, because it adds
 //!   `futures-io` / `zerocopy` — neither of which the control plane needs.
 //!
@@ -22,7 +22,7 @@
 //!
 //! | Crate | Endpoint | Construction | Default / custom config | Needs a Tokio runtime |
 //! |---|---|---|---|---|
-//! | `groupnet-transport-mem` | `Network` → `MemTransport`, `MemBulkNet` → `MemBulkTransport` | synchronous `new()` / `with_config(config)`, then `endpoint(id)` | `NetworkConfig`, `MemBulkConfig` | only to send and receive |
+//! | `groupnet-transport-mem` | `Network` → `MemTransport`, `MemBulkNet` → `MemBulkTransport` | synchronous `new()` / `with_config(config)`, then `endpoint(id)` | `NetworkConfig`, `MemBulkConfig` | no: channel and duplex primitives run on any executor (a managed link's workers run on the node's runtime) |
 //! | `groupnet-transport-ipc` | `IpcTransport` | synchronous `bind(id, &address)` / `bind_with(id, &address, config)` | `IpcConfig` | yes, at bind (spawns its listener task) |
 //! | `groupnet-transport-tcp` | `TcpMsgTransport`, `TcpBulkTransport` | `async` `bind(id, addr)` / `bind_with(id, addr, config)` | `TcpMsgConfig`, `TcpBulkConfig` | yes |
 //! | `groupnet-transport-udp` | `UdpTransport` | `async` `bind(id, addr)` | none (one socket) | yes |
@@ -76,16 +76,12 @@ pub use capacity::{QueueCapacity, QueueCapacityError};
 #[cfg(feature = "framing")]
 pub mod framing;
 
-/// Data-plane stream transport (feature `bulk`): `BulkTransport`, `DataStream`,
-/// `DataPlane`.
 #[cfg(feature = "bulk")]
 pub mod bulk;
 
-/// Protocol-neutral link registration, workers, and lifecycle (feature `link`).
 #[cfg(feature = "link")]
 pub mod link;
 
-/// Application admission and live adjacent-peer sessions (feature `link`).
 #[cfg(feature = "link")]
 pub mod admission;
 

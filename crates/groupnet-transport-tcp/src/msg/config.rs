@@ -12,8 +12,8 @@ use groupnet_transport::framing::MAX_FRAME_BYTES;
 /// up to the shared stream frame ceiling.
 const DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
 
-/// Tuning for [`TcpMsgTransport`](crate::TcpMsgTransport) and
-/// [`TcpLink`](crate::TcpLink). The default values suit a gossip control plane.
+/// Tuning for [`TcpMsgTransport`](crate::TcpMsgTransport) and the managed
+/// `TcpLink` (feature `link`). The default values suit a gossip control plane.
 /// Capacities are valid by type; the remaining bounds are checked by
 /// [`validate`](Self::validate), which every binding calls before opening a
 /// socket.

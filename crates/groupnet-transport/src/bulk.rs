@@ -4,24 +4,24 @@
 //! built on Groupnet needs — replicating writes to replicas, bootstrapping a
 //! fresh replica from a snapshot, bulk state transfer on rebalance.
 //!
-//! This is deliberately separate from the control-plane [`Transport`]
+//! This is deliberately separate from the control-plane [`Transport`](crate::Transport)
 //! (small, best-effort *datagrams* for gossip). The two planes have opposite
 //! requirements and are bound to their own physical connections — gossip over
 //! UDP, data over TCP/QUIC.
 //!
 //! ## What's here
 //!
-//! * [`BulkTransport`](crate::bulk::BulkTransport) — the trait you bind:
+//! * [`BulkTransport`] — the trait you bind:
 //!   open/accept reliable streams. The stream type is `futures-io`'s
-//!   runtime-agnostic [`AsyncRead`](futures_util::io::AsyncRead) +
-//!   [`AsyncWrite`](futures_util::io::AsyncWrite), so a real `TcpStream` (or QUIC
+//!   runtime-agnostic [`AsyncRead`] +
+//!   [`AsyncWrite`], so a real `TcpStream` (or QUIC
 //!   stream) adapts with zero overhead.
-//! * [`DataStream`](crate::bulk::DataStream) — length-delimited framing over any
+//! * [`DataStream`] — length-delimited framing over any
 //!   such stream, moving [`Bytes`](bytes::Bytes) with no payload copies and a
 //!   [`mod@zerocopy`]-parsed frame header.
-//! * [`DataPlane`](crate::bulk::DataPlane) — a small handle that turns a bound
-//!   [`BulkTransport`](crate::bulk::BulkTransport) into `connect` / `accept`
-//!   returning framed [`DataStream`](crate::bulk::DataStream)s.
+//! * [`DataPlane`] — a small handle that turns a bound
+//!   [`BulkTransport`] into `connect` / `accept`
+//!   returning framed [`DataStream`]s.
 
 mod framing;
 

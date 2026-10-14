@@ -8,6 +8,9 @@ use groupnet_core::{NodeId, Status};
 use super::{BoundedRosterError, Group};
 use crate::driver::now_since;
 
+#[cfg(doc)]
+use groupnet_core::Config;
+
 impl Group {
     /// The current live members (anything not `Dead`), in id order. Failed and
     /// departed nodes drop out once failure detection converges.
