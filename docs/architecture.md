@@ -19,7 +19,7 @@ flowchart TB
     subgraph Managed["Managed Node — shared lifetime across node clones"]
         Groups["Coordination groups\nMembership and metadata"]
         Messaging["Application messaging\nOpaque frames and delivery receipts"]
-        Tunnels["Optional TLS tunnels\nBulkTransport streams"]
+        Tunnels["Optional TLS tunnels\nOrdered / unordered sessions"]
         Router["Router\nDiscovery, path selection, forwarding"]
         Links["Registered link workers\nBounded physical-frame I/O"]
         Groups -->|"Best-effort messages"| Router
@@ -41,8 +41,8 @@ flowchart TB
 
 Routing is intrinsic to every runtime node. Applications and tests use
 `Node::builder(id).link(provider).start().await`; all protocol choices produce
-the same `Node` type. `NetworkConfig::bind` starts a standalone routed `Network`
-without the node's membership actors.
+the same `Node` type. `Network::builder().link(provider).bind(id)` starts a
+standalone routed `Network` without the node's membership actors.
 
 Applications such as docstore, docres, and s3cache use this domain-neutral layer
 for groups, peer-addressed traffic and coordination; application data and access
@@ -67,8 +67,9 @@ and deduplication. `groupnet-network` only routes opaque application packets
 through bounded protocol-ID queues; it never decodes the message body or
 interprets an application ACK. `groupnet-runtime` attaches node/group inboxes,
 serial callbacks, and membership-snapshot fanout reports to the endpoint.
-The static `MessageProtocol` trait allows protocol-specific options and receipts;
-`Frame<R>` and `MessageContext<R>` preserve those receipts without a payload copy.
+The static, send-only `MessageProtocol` trait allows protocol-specific options
+and receipts; `Frame<R>` and `MessageContext<R>` preserve those receipts without
+a payload copy.
 
 `send` defaults to best effort. Explicit delivery options distinguish receiver
 queue acceptance (`Delivered`) from application acknowledgement (`Applied`).
@@ -121,12 +122,17 @@ per-peer receive queue, or require dynamic dispatch. Node-wide capacities and
 timers are configured separately from per-handle options.
 
 The lower-level `MessageProtocol` and `SessionProtocol` traits retain concrete
-receipt/session types and static send/connect futures. Ordered sessions supply
-reliable TLS bytes; unordered sessions supply whole authenticated messages under
-an explicit reliable or unreliable policy. Reliable unordered messages
-acknowledge inbox acceptance and retry independently; missing earlier messages
-never block later arrivals. Unreliable messages add no data ACK/retry.
-Underlying TCP routes retain their native transport behavior.
+receipt/session types and static send/connect futures. Handles reach the
+built-in engines only through restricted `ManagedProtocol` views (operations and
+`closed()`, never the raw receive queue or engine shutdown), and a message
+binding receives only if it also implements `ReceiveBinding` over a single
+receive owner. Ordered sessions supply reliable TLS bytes; unordered sessions
+supply whole authenticated messages under an explicit reliable or unreliable
+policy, admitted by the node-wide `UnorderedConfig` fixed at
+`NodeBuilder::unordered`. Reliable unordered messages acknowledge inbox
+acceptance and retry independently; missing earlier messages never block later
+arrivals. Unreliable messages add no data ACK/retry. Underlying TCP routes
+retain their native transport behavior.
 
 Protocol state is shared per node, not replaced by an enum or multiplexed public
 receive type. Message endpoints receive from the existing runtime inbox and obey

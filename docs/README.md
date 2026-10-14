@@ -63,5 +63,7 @@ VPN interfaces are not implemented. Public-Internet NAT, Unix runtime behavior,
 and physical USB/YubiKey operation require deployment-specific qualification.
 
 For feature selection and public API examples, see the
-[repository README](../README.md). For engineering and verification rules, see
-[AGENTS.md](../AGENTS.md).
+[repository README](../README.md) (its Rust snippets compile as facade doctests);
+the full binding/capability feature table is in the
+[facade crate docs](../crates/groupnet/src/lib.rs). For engineering and
+verification rules, see [AGENTS.md](../AGENTS.md).
