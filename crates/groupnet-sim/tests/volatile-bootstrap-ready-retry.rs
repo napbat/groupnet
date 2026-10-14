@@ -2,7 +2,7 @@
 
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
-    BootstrapScope, BootstrapStep, ClaimEngine, ClaimIdentity, ClaimPhase,
+    BootstrapScope, BootstrapStep, ClaimEngine, ClaimIdentity, ClaimPhase, PresenceIdentity,
 };
 use groupnet_core::{NodeId, Time};
 use groupnet_sim::SplitMix64;
@@ -79,9 +79,11 @@ fn new_ready_attempt_can_win_but_never_extends_the_first_wait_budget() {
                 domain: "o".into(),
                 partition: "b".into(),
             },
-            NodeId::from("me"),
-            BootId(7),
-            1,
+            PresenceIdentity {
+                node: NodeId::from("me"),
+                boot: BootId(7),
+                session: 1,
+            },
         )
         .unwrap();
         let started = engine.step(BootstrapEvent::Start);
@@ -105,7 +107,7 @@ fn new_ready_attempt_can_win_but_never_extends_the_first_wait_budget() {
                 .iter()
                 .any(|effect| matches!(effect, BootstrapEffect::BuildOrigin { .. }))
         );
-        let sample_at = 4 + u64::from(rng.below(2));
+        let sample_at = 4 + u64::from(rng.up_to(1));
         let tick = engine.step(BootstrapEvent::Tick(Time(sample_at)));
         if let Some(renewed) = tick.effects.iter().find_map(|effect| match effect {
             BootstrapEffect::PublishClaim(claim) => Some(claim.clone()),

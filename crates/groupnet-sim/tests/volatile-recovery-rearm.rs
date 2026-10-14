@@ -49,9 +49,9 @@ fn bounded_rearms_remain_closed_under_noise_and_heal_after_failed_episodes() {
     let mut healed = 0;
     for seed in 0..64 {
         let mut rng = SplitMix64::new(seed);
-        let initial = 2 + u64::from(rng.below(5));
+        let initial = 2 + u64::from(rng.up_to(4));
         let cap = initial * 4;
-        let failures = 1 + rng.below(4);
+        let failures = 1 + rng.up_to(3);
         let mut recovery =
             RecoveryEngine::new(config(), RecoveryMode::Leased, NodeId::from("me"), seed + 1)
                 .unwrap()

@@ -174,7 +174,7 @@ fn seeded_source_model_keeps_delete_and_every_commit_through_attach() {
                     })
                 }
                 Effect::OfferSnapshot { op, .. } => {
-                    if rng.below(2) == 0 {
+                    if rng.up_to(1) == 0 {
                         m.commit(Some(2));
                     }
                     let cut = m.head();
@@ -318,7 +318,7 @@ fn seeded_source_model_keeps_delete_and_every_commit_through_attach() {
                 }
                 Effect::CheckTail { op, from, .. } => {
                     let from = from.expect("installed candidate").position[0];
-                    if rng.below(3) == 0 {
+                    if rng.up_to(2) == 0 {
                         m.commit(if seed % 2 == 0 { None } else { Some(10) });
                     }
                     let head = m.head();

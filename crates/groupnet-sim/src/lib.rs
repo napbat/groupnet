@@ -62,10 +62,12 @@
 
 mod anchor;
 mod error;
+mod percent;
 mod rng;
 mod simulation;
 
 pub use anchor::AnchorEvent;
 pub use error::SimError;
+pub use percent::{Percent, PercentError};
 pub use rng::SplitMix64;
 pub use simulation::Simulation;

@@ -1102,7 +1102,8 @@ Status: **Delivered (pending review).** What shipped, by layer:
 
 * **core** — `Activation::External { steal_margin_ms }`; the sans-IO anchor
   vocabulary in `groupnet-core/src/anchor.rs` (`AnchorRecord`, `stealable`,
-  `ClaimPlan`, `plan_claim`, `renewal_record`, `ambiguous_applied`);
+  `ClaimPlan`, `AnchorTerms::plan_claim`, `AnchorTerms::renewal_record`,
+  `ambiguous_applied`);
   `Effect::AnchorClaimDue`, `Command::AnchorActivated` /
   `Command::AnchorObserved`; the `X`-rows in `engine/election/external.rs`.
 * **runtime** — the `Anchor` trait (`load` + conditional `store`), `AnchorToken`
@@ -1172,7 +1173,8 @@ rather than groupnet adapting up to each.
 ##### The decision rules live in core, so the sim and the driver run one copy
 
 `groupnet-core/src/anchor.rs` is pure and clock-free: `AnchorRecord`,
-`AnchorRecord::stealable`, `ClaimPlan`, `plan_claim`, `renewal_record`,
+`AnchorRecord::stealable`, `ClaimPlan`, `AnchorTerms::plan_claim`,
+`AnchorTerms::renewal_record`,
 `ambiguous_applied`. It performs no I/O and reads no clock — `now_wall_ms`
 arrives as an argument, exactly as shardstore's epoch module takes it — so every
 branch (absent record, held by self, held by a live other, stealable at the exact

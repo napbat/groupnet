@@ -109,7 +109,7 @@ fn seeded_concurrent_commit_cut_barrier_attach_and_delayed_reply() {
         let mut e = engine(seed + 1);
         let hold = op(&e.step(Event::StartSnapshot));
         assert_eq!(e.read_decision(), ReadDecision::Refuse(Refusal::Unready));
-        let delay = u64::from(rng.below(11));
+        let delay = u64::from(rng.up_to(10));
         e.step(Event::Tick(Time(delay)));
         if delay >= 12 {
             unreachable!();

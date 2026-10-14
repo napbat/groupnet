@@ -36,9 +36,11 @@ impl Follower {
                 domain: "origin".to_owned(),
                 partition: "bucket".to_owned(),
             },
-            NodeId::from("b"),
-            BootId(2),
-            1,
+            PresenceIdentity {
+                node: NodeId::from("b"),
+                boot: BootId(2),
+                session: 1,
+            },
         )
         .unwrap();
         let mut follower = Self {

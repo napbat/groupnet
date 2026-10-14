@@ -4,7 +4,7 @@ use std::mem::size_of;
 
 use groupnet_core::Status;
 use groupnet_core::volatile_bootstrap::{
-    BootstrapMemberIdentity, decode_claim_value, decode_presence_value,
+    BootstrapMemberIdentity, ObservedEntry, decode_claim_value, decode_presence_value,
 };
 use groupnet_runtime::InspectedPair;
 
@@ -81,8 +81,10 @@ impl NativeClaimSource {
                 let presence = decode_presence_value(
                     &self.scope,
                     self.policy,
-                    &node,
-                    &value,
+                    ObservedEntry {
+                        author: &node,
+                        value: &value,
+                    },
                     self.max_value_bytes,
                 )
                 .map_err(|_| MALFORMED)?;
@@ -103,8 +105,10 @@ impl NativeClaimSource {
                 let mut claim = decode_claim_value(
                     &self.scope,
                     self.policy,
-                    &node,
-                    &value,
+                    ObservedEntry {
+                        author: &node,
+                        value: &value,
+                    },
                     self.max_value_bytes,
                 )
                 .map_err(|_| MALFORMED)?;

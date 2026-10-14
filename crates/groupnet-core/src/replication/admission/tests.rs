@@ -7,8 +7,9 @@ use crate::replication::{
 };
 
 use super::{
-    AckReceipt, AdmissionId, AdmissionPolicy, AdmissionRef, PolicyError, ReaderCore, ReaderError,
-    RecordBinding, RosterEntry, RosterReceipt, SourceReceipt, WriterCore, WriterError,
+    AckReceipt, AdmissionId, AdmissionPolicy, AdmissionRef, PolicyError, ProjectionReceipt,
+    ReaderCore, ReaderError, RecordBinding, RosterEntry, RosterReceipt, SourceReceipt, WriterCore,
+    WriterError,
 };
 
 fn scope() -> Scope {
@@ -85,10 +86,12 @@ fn projected(reader: &mut ReaderCore, token: (u64, u64), now: u64, admission: u8
         .projected(
             Time(now),
             token,
-            &cursor(head),
-            &p,
-            &cmp(&p, admission, head),
-            &cmp(&p, head, head),
+            &ProjectionReceipt {
+                applied: cursor(head),
+                proof: p.clone(),
+                admission_to_applied: cmp(&p, admission, head),
+                applied_to_head: cmp(&p, head, head),
+            },
         )
         .unwrap();
 }
@@ -207,10 +210,12 @@ fn stale_process_and_wrong_native_proofs_are_rejected() {
         reader.projected(
             Time(3),
             append.token,
-            &cursor(0),
-            &p,
-            &cmp(&p, 1, 0),
-            &cmp(&p, 0, 1),
+            &ProjectionReceipt {
+                applied: cursor(0),
+                proof: p.clone(),
+                admission_to_applied: cmp(&p, 1, 0),
+                applied_to_head: cmp(&p, 0, 1)
+            }
         ),
         Err(ReaderError::Proof)
     );
@@ -219,10 +224,12 @@ fn stale_process_and_wrong_native_proofs_are_rejected() {
         reader.projected(
             Time(4),
             append.token,
-            &cursor(1),
-            &p,
-            &cmp(&p, 1, 1),
-            &cmp(&p, 1, 1),
+            &ProjectionReceipt {
+                applied: cursor(1),
+                proof: p.clone(),
+                admission_to_applied: cmp(&p, 1, 1),
+                applied_to_head: cmp(&p, 1, 1)
+            }
         ),
         Err(ReaderError::Stale)
     );
@@ -312,6 +319,24 @@ fn policy_rejects_rate_overflow_instead_of_wrapping() {
     exact_rates.rate_numerator = 1;
     exact_rates.rate_denominator = 1;
     assert_eq!(exact_rates.expiry_wait_ms().unwrap(), 101);
+}
+
+/// The identity-only constructor yields a valid policy a reader accepts, and
+/// reports (never replaces) an empty identity.
+#[test]
+fn new_policy_is_valid_with_default_timing() {
+    let history = SourceHistory {
+        source: "authority".into(),
+        generation: 1,
+    };
+    let p = AdmissionPolicy::new(history.clone(), vec![7]);
+    assert_eq!(p.validate(), Ok(()));
+    assert_eq!(p.timing(), super::ExpiryTiming::default());
+    assert!(ReaderCore::new(scope(), p, "node".into(), 1).is_ok());
+    assert_eq!(
+        AdmissionPolicy::new(history, Vec::new()).validate(),
+        Err(PolicyError::EmptyFingerprint)
+    );
 }
 
 #[test]

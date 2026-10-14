@@ -53,9 +53,9 @@ fn install(step: &Step) -> Operation {
 fn seeded_delayed_load_install_and_cancel_never_publish_stale_checkpoint() {
     for seed in 0..128 {
         let mut rng = SplitMix64::new(seed);
-        let load_delay = u64::from(rng.below(18));
-        let install_delay = u64::from(rng.below(18));
-        let cancel_install = rng.below(4) == 0;
+        let load_delay = u64::from(rng.up_to(17));
+        let install_delay = u64::from(rng.up_to(17));
+        let cancel_install = rng.up_to(3) == 0;
         let mut engine = SessionEngine::new(
             scope(),
             Mode::StateSync,

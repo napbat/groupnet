@@ -3,6 +3,7 @@
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
     BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity,
+    PresenceIdentity,
 };
 use groupnet_core::{NodeId, Time};
 use groupnet_sim::SplitMix64;
@@ -81,9 +82,11 @@ fn delayed_old_capture_events_cannot_retire_replacement_or_presence() {
                 domain: "o".to_owned(),
                 partition: "b".to_owned(),
             },
-            NodeId::from("me"),
-            BootId(1),
-            1,
+            PresenceIdentity {
+                node: NodeId::from("me"),
+                boot: BootId(1),
+                session: 1,
+            },
         )
         .unwrap();
         let first = published_claim(&engine.step(BootstrapEvent::Start).effects);
@@ -106,14 +109,14 @@ fn delayed_old_capture_events_cannot_retire_replacement_or_presence() {
         assert_ne!(replacement.identity, first.identity);
         // A queued old-capture callback can arrive before or after the new
         // candidate becomes available, with duplicate delivery.
-        let early = rng.below(2) == 0;
+        let early = rng.up_to(1) == 0;
         if early {
             reject_old(&mut engine, &first.identity);
             stale_deliveries += 1;
         }
         build_local(&mut engine, &replacement, 4);
         replacement_donors += 1;
-        let duplicates = 1 + rng.below(3);
+        let duplicates = 1 + rng.up_to(2);
         for _ in 0..duplicates {
             reject_old(&mut engine, &first.identity);
             stale_deliveries += 1;
@@ -153,9 +156,11 @@ fn retired_peer_candidate_keeps_presence_and_rejects_old_capture_over_seeded_res
                 domain: "o".into(),
                 partition: "b".into(),
             },
-            NodeId::from("me"),
-            BootId(1),
-            1,
+            PresenceIdentity {
+                node: NodeId::from("me"),
+                boot: BootId(1),
+                session: 1,
+            },
         )
         .unwrap();
         let first = published_claim(&engine.step(BootstrapEvent::Start).effects);
@@ -173,14 +178,14 @@ fn retired_peer_candidate_keeps_presence_and_rejects_old_capture_over_seeded_res
                 .iter()
                 .any(|effect| matches!(effect, BootstrapEffect::WithdrawPresence(_)))
         );
-        let before = engine.step(BootstrapEvent::Tick(Time(3 + u64::from(rng.below(2)))));
+        let before = engine.step(BootstrapEvent::Tick(Time(3 + u64::from(rng.up_to(1)))));
         assert!(
             before
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, BootstrapEffect::PublishPresence(_)))
         );
-        if rng.below(2) == 0 {
+        if rng.up_to(1) == 0 {
             reject_old(&mut engine, &first.identity);
         }
         let second = published_claim(&engine.step(BootstrapEvent::Start).effects);

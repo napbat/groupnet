@@ -2,8 +2,8 @@
 
 use groupnet_core::Time;
 use groupnet_core::replication::admission::{
-    AckReceipt, AdmissionPolicy, AdmissionRef, ReaderCore, RecordBinding, RosterEntry,
-    RosterReceipt, SourceReceipt, WriterCore,
+    AckReceipt, AdmissionPolicy, AdmissionRef, ProjectionReceipt, ReaderCore, RecordBinding,
+    RosterEntry, RosterReceipt, SourceReceipt, WriterCore,
 };
 use groupnet_core::replication::{
     BoundComparison, Comparison, Coverage, Cursor, ProofId, Scope, SourceHistory, SourceProof,
@@ -116,10 +116,12 @@ fn clock_quantization_margin_prevents_release_before_reader_expiry() {
         .projected(
             reader_clock(0, 0),
             admission.token,
-            &cursor(1),
-            &p1,
-            &cmp(&p1, 1, 1),
-            &cmp(&p1, 1, 1),
+            &ProjectionReceipt {
+                applied: cursor(1),
+                proof: p1.clone(),
+                admission_to_applied: cmp(&p1, 1, 1),
+                applied_to_head: cmp(&p1, 1, 1),
+            },
         )
         .unwrap();
     let mut writer = WriterCore::new(scope(), policy(), 2, "mutation".into()).unwrap();
@@ -182,13 +184,13 @@ fn clock_quantization_margin_prevents_release_before_reader_expiry() {
 fn seeded_join_ack_loss_and_clock_skew_never_open_an_early_fence() {
     for seed in 0..128 {
         let mut rng = SplitMix64::new(seed);
-        let ack_delivered = rng.below(2) == 0;
-        let ack_at = 210 + u64::from(rng.below(750));
-        let new_admission_at = 210 + u64::from(rng.below(450));
-        let new_projection_delay = u64::from(rng.below(200));
-        let reader_phase = u64::from(rng.below(100));
-        let writer_phase = u64::from(rng.below(100));
-        let writer_rate = 10 + u64::from(rng.below(2));
+        let ack_delivered = rng.up_to(1) == 0;
+        let ack_at = 210 + u64::from(rng.up_to(749));
+        let new_admission_at = 210 + u64::from(rng.up_to(449));
+        let new_projection_delay = u64::from(rng.up_to(199));
+        let reader_phase = u64::from(rng.up_to(99));
+        let writer_phase = u64::from(rng.up_to(99));
+        let writer_rate = 10 + u64::from(rng.up_to(1));
 
         let mut old = ReaderCore::new(scope(), policy(), "node".into(), 1001).unwrap();
         let old_append = old.begin(reader_clock(0, reader_phase), 41).unwrap();
@@ -202,10 +204,12 @@ fn seeded_join_ack_loss_and_clock_skew_never_open_an_early_fence() {
         old.projected(
             reader_clock(20, reader_phase),
             old_append.token,
-            &cursor(1),
-            &p1,
-            &cmp(&p1, 1, 1),
-            &cmp(&p1, 1, 1),
+            &ProjectionReceipt {
+                applied: cursor(1),
+                proof: p1.clone(),
+                admission_to_applied: cmp(&p1, 1, 1),
+                applied_to_head: cmp(&p1, 1, 1),
+            },
         )
         .unwrap();
         // A queued duplicate append/readback reply cannot reactivate the
@@ -286,10 +290,12 @@ fn seeded_join_ack_loss_and_clock_skew_never_open_an_early_fence() {
                     .projected(
                         reader_now,
                         append.token,
-                        &cursor(3),
-                        &p3,
-                        &cmp(&p3, 3, 3),
-                        &cmp(&p3, 3, 3),
+                        &ProjectionReceipt {
+                            applied: cursor(3),
+                            proof: p3.clone(),
+                            admission_to_applied: cmp(&p3, 3, 3),
+                            applied_to_head: cmp(&p3, 3, 3),
+                        },
                     )
                     .unwrap();
                 assert!(
@@ -346,8 +352,8 @@ fn seeded_join_ack_loss_and_clock_skew_never_open_an_early_fence() {
 fn seeded_writer_restart_restarts_expiry_and_rejects_delayed_old_acks() {
     for seed in 128..192 {
         let mut rng = SplitMix64::new(seed);
-        let deliver_new_ack = rng.below(2) == 0;
-        let ack_at = 50 + u64::from(rng.below(40));
+        let deliver_new_ack = rng.up_to(1) == 0;
+        let ack_at = 50 + u64::from(rng.up_to(39));
         let mut reader = ReaderCore::new(scope(), policy(), "node".into(), 10).unwrap();
         let admission = reader.begin(Time(0), 1).unwrap();
         reader
@@ -362,10 +368,12 @@ fn seeded_writer_restart_restarts_expiry_and_rejects_delayed_old_acks() {
             .projected(
                 Time(2),
                 admission.token,
-                &cursor(1),
-                &p1,
-                &cmp(&p1, 1, 1),
-                &cmp(&p1, 1, 1),
+                &ProjectionReceipt {
+                    applied: cursor(1),
+                    proof: p1.clone(),
+                    admission_to_applied: cmp(&p1, 1, 1),
+                    applied_to_head: cmp(&p1, 1, 1),
+                },
             )
             .unwrap();
         let admission_ref = AdmissionRef {

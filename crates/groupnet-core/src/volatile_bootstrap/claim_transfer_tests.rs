@@ -59,7 +59,16 @@ fn ready_follower_with_wait(wait: u64) -> (ClaimEngine, BootstrapOperation, Clai
     let boot = BootId((1_u128 << 100) + 5);
     let mut limits = config();
     limits.donor_wait_ms = wait;
-    let mut engine = ClaimEngine::new(limits, scope(), NodeId::from(follower), boot, 9).unwrap();
+    let mut engine = ClaimEngine::new(
+        limits,
+        scope(),
+        PresenceIdentity {
+            node: NodeId::from(follower),
+            boot,
+            session: 9,
+        },
+    )
+    .unwrap();
     engine.enable_transfer(transfer_config()).unwrap();
     let start = engine.step(BootstrapEvent::Start);
     let local = start

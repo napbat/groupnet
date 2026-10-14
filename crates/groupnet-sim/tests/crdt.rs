@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use groupnet_core::Time;
 use groupnet_core::{Command, Config, GroupEngine, GroupId, NodeId};
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 /// Seeds the shared deterministic PRNG, decorrelating this test's seed space
 /// from any other that shares the same integer seeds.
@@ -45,11 +45,11 @@ fn pn_counter_on_per_node_state_converges_under_faults() {
 fn run(seed: u64) {
     let mut rng = rng(seed);
     let group = GroupId::new("counter");
-    let n = 3 + rng.below(4);
+    let n = 3 + rng.up_to(3);
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
 
-    let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
-    sim.set_loss(u8::try_from(rng.below(30)).expect("below(30) is 0..30"));
+    let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
+    sim.set_loss(Percent::try_from(rng.up_to(29)).expect("at most 29%"));
     let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
     let cfg = Config {
         gossip_interval_ms: 60,
@@ -69,12 +69,12 @@ fn run(seed: u64) {
 
     let mut now = 0u64;
     for _round in 0..50 {
-        now += u64::from(20 + rng.below(80));
+        now += u64::from(20 + rng.up_to(79));
         sim.run_until(Time(now));
-        match rng.below(5) {
+        match rng.up_to(4) {
             0 => {
-                let a = &ids[rng.below(n) as usize];
-                let b = &ids[rng.below(n) as usize];
+                let a = &ids[rng.up_to(n - 1) as usize];
+                let b = &ids[rng.up_to(n - 1) as usize];
                 if a != b {
                     sim.block(a, b);
                     sim.block(b, a);
@@ -83,8 +83,8 @@ fn run(seed: u64) {
             1 => sim.heal_all(),
             _ => {
                 // A random node applies an op and re-publishes its contribution.
-                let i = rng.below(n) as usize;
-                if rng.below(2) == 0 {
+                let i = rng.up_to(n - 1) as usize;
+                if rng.up_to(1) == 0 {
                     inc[i] += 1;
                 } else {
                     dec[i] += 1;
@@ -97,7 +97,7 @@ fn run(seed: u64) {
 
     // Heal, quiesce, and every node must compute the exact counter value.
     sim.heal_all();
-    sim.set_loss(0);
+    sim.set_loss(Percent::ZERO);
     sim.run_until(Time(now + 10_000));
 
     let oracle: i128 = (0..n as usize)

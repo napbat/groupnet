@@ -11,7 +11,7 @@ use groupnet_consistency::hosted::{
     ledger_entry_key,
 };
 use groupnet_core::{GroupEngine, GroupId, NodeId, RecoveredGrant, Status, Time};
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 use super::Count::{
     Acked, GapRecovered, Ghost, Migration, Recovered, Restart, RingGap, S5Obligation, Stalled,
@@ -58,9 +58,9 @@ impl Harness {
     fn new(tag: Tag, n: u32, rng: &mut SplitMix64, cap: u64) -> Self {
         let group = GroupId::new(format!("hosted-{}-{}", tag.0, tag.1));
         let all: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
-        let off = usize::try_from(rng.below(n)).expect("bounded by n");
+        let off = usize::try_from(rng.up_to(n - 1)).expect("bounded by n");
         let voters: BTreeSet<NodeId> = (0..3).map(|k| all[(off + k) % all.len()].clone()).collect();
-        let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
+        let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
         let mut nodes = BTreeMap::new();
         for id in &all {
             let seeds: Vec<NodeId> = all.iter().filter(|x| *x != id).cloned().collect();
@@ -446,7 +446,7 @@ impl Harness {
         // The group's writer, lowest id first, so the choice is deterministic.
         let serving = self.nodes.values().find(|node| node.hosting().is_some());
         let host = serving.map(|node| node.id.clone());
-        match (rng.below(SLOTS), host) {
+        match (rng.up_to(SLOTS - 1), host) {
             (0, Some(host)) if live.len() > 2 => self.kill(&host),
             (1, Some(host)) if live.len() > 1 => self.cut(&host, &live, false),
             (5 | 11, Some(host)) if live.len() > 1 => self.cut(&host, &live, true),
@@ -483,7 +483,7 @@ impl Harness {
             }
             (14, _) => {
                 let victim = pick(&live, rng);
-                self.nodes.get_mut(&victim).expect("live").stalled = 3 + rng.below(5);
+                self.nodes.get_mut(&victim).expect("live").stalled = 3 + rng.up_to(4);
                 self.stats.add(Stalled, 1);
             }
             _ => {
@@ -512,7 +512,7 @@ impl Harness {
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    let i = usize::try_from(rng.below(n)).expect("bounded by the set size");
+    let i = usize::try_from(rng.up_to(n - 1)).expect("bounded by the set size");
     v[i].clone()
 }
 
@@ -611,19 +611,19 @@ fn check_ack(view: &[LedgerView], host: &NodeId, token: WriteToken, majority: us
 /// is drawn per seed, so half this corpus runs the small one.
 pub(crate) fn chaos_scenario(seed: u64) -> Stats {
     let mut rng = rng(seed ^ 0x5a17);
-    let n = if rng.below(2) == 0 { 3 } else { 5 };
-    let cap = if rng.below(2) == 0 { SMALL_RING } else { RING };
+    let n = if rng.up_to(1) == 0 { 3 } else { 5 };
+    let cap = if rng.up_to(1) == 0 { SMALL_RING } else { RING };
     let mut h = Harness::new(("S5-chaos", seed), n, &mut rng, cap);
 
     // Elect first, on a fair fabric: the properties below are about a running
     // write path, not about bootstrap.
     h.run_rounds(24, 60);
     h.sim
-        .set_loss(u8::try_from(rng.below(23)).expect("below(23) is 0..23"));
-    h.sim.set_jitter(u64::from(rng.below(9)));
+        .set_loss(Percent::try_from(rng.up_to(22)).expect("at most 22%"));
+    h.sim.set_jitter(u64::from(rng.up_to(8)));
 
     for _ in 0..ROUNDS {
-        let step = u64::from(30 + rng.below(120));
+        let step = u64::from(30 + rng.up_to(119));
         h.step_to(h.now + step);
         h.inject_fault(&mut rng);
     }
@@ -631,7 +631,7 @@ pub(crate) fn chaos_scenario(seed: u64) -> Stats {
     // A fair fabric again, long enough for the survivors to elect, recover and
     // resolve every write still in flight.
     h.sim.heal_all();
-    h.sim.set_loss(0);
+    h.sim.set_loss(Percent::ZERO);
     h.sim.set_jitter(0);
     h.run_rounds(40, 60);
     h.finish()

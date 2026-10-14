@@ -140,15 +140,17 @@ fn follower_waits_out_builder_churn_and_finds_the_ready_donor() {
                 domain: "origin".to_owned(),
                 partition: "bucket".to_owned(),
             },
-            me.clone(),
-            BootId(7),
-            1,
+            PresenceIdentity {
+                node: me.clone(),
+                boot: BootId(7),
+                session: 1,
+            },
         )
         .unwrap();
         engine.require_participation().unwrap();
         // Far longer than the follower's grace and episode budget: only the
         // builder's advertised progress keeps the follower waiting.
-        let build_ms = 150 + u64::from(rng.below(150));
+        let build_ms = 150 + u64::from(rng.up_to(149));
         let mut builder = Builder {
             presence: PresenceIdentity {
                 node: NodeId::from("b-builder"),
@@ -175,9 +177,9 @@ fn follower_waits_out_builder_churn_and_finds_the_ready_donor() {
             // window opens only after a sample saw the builder, so the
             // builder stays visible within the follower's grace.
             if now >= 20 && saw_builder && now >= builder.suspect_until + 4 {
-                match rng.below(40) {
+                match rng.up_to(39) {
                     0 => {
-                        builder.suspect_until = now + 1 + u64::from(rng.below(8));
+                        builder.suspect_until = now + 1 + u64::from(rng.up_to(7));
                         builder.member_incarnation += 1;
                         suspect_windows += 1;
                         bumps += 1;
@@ -221,7 +223,7 @@ fn follower_waits_out_builder_churn_and_finds_the_ready_donor() {
                     // sample that saw the builder: the builder stays visible
                     // within the follower's grace, which a longer blackout
                     // rightly releases as a stall.
-                    let step = if now >= 20 && saw_builder && rng.below(4) == 0 {
+                    let step = if now >= 20 && saw_builder && rng.up_to(3) == 0 {
                         failed_samples += 1;
                         saw_builder = false;
                         engine.step(BootstrapEvent::ObservationFailed { op })
@@ -249,7 +251,7 @@ fn follower_waits_out_builder_churn_and_finds_the_ready_donor() {
                         }
                         BootstrapEffect::PublishClaim(claim) => my_claim = Some((claim, now)),
                         BootstrapEffect::ObserveClaims { op, .. } => {
-                            pending.push((now + u64::from(rng.below(2)), op));
+                            pending.push((now + u64::from(rng.up_to(1)), op));
                         }
                         BootstrapEffect::FollowBuilder { selected, .. } => {
                             assert_eq!(selected.node, builder.presence.node, "seed {seed}");

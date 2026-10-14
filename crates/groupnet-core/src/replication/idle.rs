@@ -7,6 +7,10 @@ use super::Scope;
 
 /// Finite idle source-check policy; the independent read freshness cadence
 /// remains `Config::tail_check_ms` even when polling backs off.
+///
+/// [`Default`] backs off after three unchanged checks to one check a minute
+/// with up to one second of jitter, valid against the default replication
+/// `Config::tail_check_ms` (5 s) and any cadence up to a minute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdlePolicy {
     /// Consecutive source-certified unchanged checks before backoff starts.
@@ -16,6 +20,16 @@ pub struct IdlePolicy {
     pub max_interval_ms: u64,
     /// Maximum deterministic positive jitter, at most `max_interval_ms`.
     pub jitter_ms: u64,
+}
+
+impl Default for IdlePolicy {
+    fn default() -> Self {
+        Self {
+            unchanged_checks: const { NonZeroU32::new(3).unwrap() },
+            max_interval_ms: 60_000,
+            jitter_ms: 1_000,
+        }
+    }
 }
 
 /// Invalid [`IdlePolicy`], naming the violated rule.
@@ -222,6 +236,20 @@ mod tests {
         assert_eq!(
             state.checked_interval(true, Some(policy), 10, &scope(), 1),
             Some(20)
+        );
+    }
+
+    #[test]
+    fn default_policy_is_valid_against_the_default_session_cadence() {
+        let tail_check_ms = crate::replication::Config::default().tail_check_ms;
+        assert_eq!(IdlePolicy::default().validate(tail_check_ms), Ok(()));
+        assert_eq!(
+            crate::replication::Config {
+                idle: Some(IdlePolicy::default()),
+                ..crate::replication::Config::default()
+            }
+            .validate(),
+            Ok(())
         );
     }
 

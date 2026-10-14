@@ -74,6 +74,14 @@ pub enum GroupMode {
 /// In production this rests on bounded clock-*rate* error between nodes — the
 /// standard lease assumption, stated plainly rather than assumed away. The
 /// simulator checks lease disjointness exactly, in virtual time.
+///
+/// # Default
+///
+/// [`Activation::Settle`] with a 600 ms settle window (three default gossip
+/// rounds) and a 1 000 ms lease, sized against [`Config::default`]: the lease
+/// stays below `detection_window_ms(members)` plus the settle window for every
+/// group of two or more members, so the default is split-brain-bounded as
+/// shipped. Retune both when the detector timings change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostedConfig {
     /// How an epoch is closed — which peers' agreement makes a claimant the
@@ -84,9 +92,9 @@ pub struct HostedConfig {
     /// [`HostedConfig`] — this is the number that bounds split-brain.
     ///
     /// Under [`Activation::External`] this one number is **both** the anchor
-    /// record's TTL (the `ttl_ms` a driver passes to
-    /// [`plan_claim`](crate::anchor::plan_claim) and
-    /// [`renewal_record`](crate::anchor::renewal_record), which sets the
+    /// record's TTL ([`AnchorTerms::ttl_ms`](crate::anchor::AnchorTerms::ttl_ms),
+    /// read off this config by
+    /// [`AnchorTerms::of`](crate::anchor::AnchorTerms::of), which sets the
     /// record's `expires_at_wall_ms`) **and** the engine lease that row 6
     /// steps down on. Deliberately one knob: the two describe the same
     /// authority seen from the two clocks, and letting them drift apart is how
@@ -94,6 +102,23 @@ pub struct HostedConfig {
     /// still owns. It doubles as the boot guard there too, exactly as it does
     /// under [`Activation::Quorum`].
     pub lease_ms: u64,
+}
+
+/// [`HostedConfig::default`]'s settle window.
+const DEFAULT_CLAIM_SETTLE_MS: u64 = 600;
+
+/// [`HostedConfig::default`]'s lease.
+const DEFAULT_LEASE_MS: u64 = 1_000;
+
+impl Default for HostedConfig {
+    fn default() -> Self {
+        Self {
+            activation: Activation::Settle {
+                claim_settle_ms: DEFAULT_CLAIM_SETTLE_MS,
+            },
+            lease_ms: DEFAULT_LEASE_MS,
+        }
+    }
 }
 
 /// How a [`GroupMode::Hosted`] group closes an epoch: what makes a claimant

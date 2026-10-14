@@ -3,6 +3,10 @@
 use super::PolicyError;
 
 /// Duration and clock-rate bounds for one finite source admission.
+///
+/// [`Default`] admits for at most 30 s, assumes the waiting clock runs at most
+/// 1 % faster than the holder's (`101 / 100`) and adds a 100 ms scheduling
+/// margin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpiryTiming {
     /// Maximum local admission duration in milliseconds.
@@ -13,6 +17,17 @@ pub struct ExpiryTiming {
     pub rate_denominator: u64,
     /// Nonzero timer quantization and scheduling margin in milliseconds.
     pub clock_margin_ms: u64,
+}
+
+impl Default for ExpiryTiming {
+    fn default() -> Self {
+        Self {
+            max_duration_ms: 30_000,
+            rate_numerator: 101,
+            rate_denominator: 100,
+            clock_margin_ms: 100,
+        }
+    }
 }
 
 impl ExpiryTiming {
@@ -69,6 +84,13 @@ impl ExpiryTiming {
 #[cfg(test)]
 mod tests {
     use super::{ExpiryTiming, PolicyError};
+
+    #[test]
+    fn default_timing_is_valid() {
+        let timing = ExpiryTiming::default();
+        assert_eq!(timing.validate(), Ok(()));
+        assert_eq!(timing.expiry_wait_ms(), Ok(30_400));
+    }
 
     #[test]
     fn rounded_wait_is_conservative_and_rejects_invalid_bounds() {

@@ -14,7 +14,7 @@ use std::num::NonZeroUsize;
 
 use super::*;
 use crate::Status;
-use crate::volatile_bootstrap::BootstrapParticipant;
+use crate::volatile_bootstrap::{BootstrapParticipant, ParticipationCut};
 
 const CONFIG: BootstrapConfig = BootstrapConfig {
     max_members: NonZeroUsize::new(4).unwrap(),
@@ -55,9 +55,11 @@ impl Donor {
                 domain: "o".to_owned(),
                 partition: "b".to_owned(),
             },
-            NodeId::from("me"),
-            BootId(7),
-            1,
+            PresenceIdentity {
+                node: NodeId::from("me"),
+                boot: BootId(7),
+                session: 1,
+            },
         )
         .unwrap();
         engine.require_participation().unwrap();
@@ -188,8 +190,15 @@ impl Donor {
     fn verify(&mut self) -> Result<(), BootstrapError> {
         let op = self.engine.begin_roster_observation()?;
         let (members, roster, participants, claims) = self.cut();
-        self.engine
-            .verify_participant_roster(op, &members, &roster, &participants, &claims)
+        self.engine.verify_participant_roster(
+            op,
+            ParticipationCut {
+                members: &members,
+                roster: &roster,
+                participants: &participants,
+                claims: &claims,
+            },
+        )
     }
 
     /// Offer one freshly verified cut to the pending recapture, as every
@@ -224,7 +233,15 @@ impl Donor {
         let op = donor.engine.begin_roster_observation().unwrap();
         donor
             .engine
-            .verify_participant_roster(op, &members, &roster, &participants, &claims)
+            .verify_participant_roster(
+                op,
+                ParticipationCut {
+                    members: &members,
+                    roster: &roster,
+                    participants: &participants,
+                    claims: &claims,
+                },
+            )
             .unwrap();
         // As after a completed transfer: the image was installed under the
         // verified cut, and no capture of this node's own is running.

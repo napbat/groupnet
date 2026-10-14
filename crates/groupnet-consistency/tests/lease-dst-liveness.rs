@@ -320,11 +320,11 @@ impl Harness {
     fn new(tag: Tag, n: u32, rng: &mut SplitMix64, resync_lag: u32) -> Self {
         let group = GroupId::new(format!("lease-{}", tag.seed));
         let all: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
-        let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
+        let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
         let mut nodes = BTreeMap::new();
         for id in &all {
             sim.add(engine(&group, id, &all)).expect("distinct node");
-            let phase = u64::from(rng.below(u32::try_from(RENEW_MS).unwrap_or(u32::MAX)));
+            let phase = u64::from(rng.up_to(u32::try_from(RENEW_MS - 1).unwrap_or(u32::MAX)));
             nodes.insert(id.clone(), Node::new(id, 1, 0, phase, resync_lag));
         }
         Self {
@@ -806,7 +806,7 @@ fn dst_lease_healthy_runs_serve_and_reestablish_after_a_heal() {
 
 fn healthy_scenario(seed: u64) -> Stats {
     let mut rng = rng(seed ^ 0x11ee);
-    let n = 3 + rng.below(5); // 3..=7 nodes
+    let n = 3 + rng.up_to(4); // 3..=7 nodes
     let tag = Tag {
         suite: "L-L1",
         seed,

@@ -14,7 +14,7 @@
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
     BootstrapMemberIdentity, BootstrapOperation, BootstrapParticipant, BootstrapPresence,
-    BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity,
+    BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity, ParticipationCut, PresenceIdentity,
 };
 use groupnet_core::{NodeId, Status, Time};
 use groupnet_sim::SplitMix64;
@@ -272,9 +272,11 @@ impl World {
                 domain: "origin".to_owned(),
                 partition: "bucket".to_owned(),
             },
-            name(node),
-            BootId(u128::from(self.seed) * 4 + u128::from(node == JOINER) + 1),
-            1,
+            PresenceIdentity {
+                node: name(node),
+                boot: BootId(u128::from(self.seed) * 4 + u128::from(node == JOINER) + 1),
+                session: 1,
+            },
         )
         .unwrap();
         engine.require_participation().unwrap();
@@ -365,10 +367,12 @@ impl World {
         engine
             .verify_participant_roster(
                 op,
-                &cut.members,
-                &cut.roster,
-                &cut.participants,
-                &cut.claims,
+                ParticipationCut {
+                    members: &cut.members,
+                    roster: &cut.roster,
+                    participants: &cut.participants,
+                    claims: &cut.claims,
+                },
             )
             .ok()?;
         Some(cut.roster)
@@ -392,18 +396,18 @@ impl World {
             return;
         }
         let rate = self.schedule.churn;
-        if self.rng.below(32) < rate {
+        if self.rng.up_to(31) < rate {
             // The donor's capture stalls it: the joiner suspects it and it
             // refutes, raising its own incarnation in its own view too.
             self.source.refute(DONOR);
             if self.joiner.following {
-                let until = now + 1 + u64::from(self.rng.below(4));
+                let until = now + 1 + u64::from(self.rng.up_to(3));
                 self.source.suspect(JOINER, DONOR, now, until);
             }
         }
-        if self.rng.below(32) < rate {
+        if self.rng.up_to(31) < rate {
             // The loaded joiner is suspected, and maybe declared Dead.
-            let until = now + 1 + u64::from(self.rng.below(6));
+            let until = now + 1 + u64::from(self.rng.up_to(5));
             self.source.suspect(DONOR, JOINER, now, until);
         }
     }
@@ -427,7 +431,7 @@ impl World {
             && end == now
         {
             self.donor.capture = None;
-            let fails = self.rng.below(4) < self.schedule.fail;
+            let fails = self.rng.up_to(3) < self.schedule.fail;
             match self.verify(DONOR, now) {
                 Some(after) if !fails => {
                     self.donor.status_churn |= at_c
@@ -545,17 +549,17 @@ fn swim_churn_during_encode_keeps_one_ready_recapture() {
     let (mut status_churn, mut incarnation_churn) = (0, 0);
     for seed in 0..96_u64 {
         let mut rng = SplitMix64::new(seed);
-        let build_len = 10 + u64::from(rng.below(6));
-        let join = CONFIG.settle_ms + 1 + u64::from(rng.below(3));
+        let build_len = 10 + u64::from(rng.up_to(5));
+        let join = CONFIG.settle_ms + 1 + u64::from(rng.up_to(2));
         let schedule = Schedule {
             build_len,
-            affirm: u64::from(rng.below(3)),
-            encode: 2 + u64::from(rng.below(5)),
+            affirm: u64::from(rng.up_to(2)),
+            encode: 2 + u64::from(rng.up_to(4)),
             join,
-            churn: 6 + rng.below(6),
+            churn: 6 + rng.up_to(5),
             fail: 0,
         };
-        let World { donor, joiner, .. } = run(seed, schedule, u64::from(rng.below(2)));
+        let World { donor, joiner, .. } = run(seed, schedule, u64::from(rng.up_to(1)));
         assert_eq!(
             donor.failures,
             [],
@@ -597,12 +601,12 @@ fn failed_recaptures_are_paced_inside_the_claim_window() {
     for seed in 0..96_u64 {
         let mut rng = SplitMix64::new(seed);
         let schedule = Schedule {
-            build_len: 10 + u64::from(rng.below(6)),
-            affirm: u64::from(rng.below(3)),
-            encode: 1 + u64::from(rng.below(3)),
-            join: CONFIG.settle_ms + 1 + u64::from(rng.below(3)),
-            churn: 6 + rng.below(6),
-            fail: 2 + rng.below(2),
+            build_len: 10 + u64::from(rng.up_to(5)),
+            affirm: u64::from(rng.up_to(2)),
+            encode: 1 + u64::from(rng.up_to(2)),
+            join: CONFIG.settle_ms + 1 + u64::from(rng.up_to(2)),
+            churn: 6 + rng.up_to(5),
+            fail: 2 + rng.up_to(1),
         };
         let encode = schedule.encode;
         let World {
@@ -610,7 +614,7 @@ fn failed_recaptures_are_paced_inside_the_claim_window() {
             joiner,
             source,
             ..
-        } = run(seed, schedule, u64::from(rng.below(2)));
+        } = run(seed, schedule, u64::from(rng.up_to(1)));
         let opened = donor.pending_at.expect("the local build completed");
         let window = opened + CONFIG.donor_wait_ms;
         // Every attempt after the first follows a failure by its backoff.

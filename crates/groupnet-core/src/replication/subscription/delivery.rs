@@ -27,21 +27,40 @@ pub struct DurableDeliveryReceipt {
     pub durable: bool,
 }
 
+/// The exact sink transaction the session requested with
+/// `Effect::ApplySubscriberBatch`: what a [`DurableDeliveryReceipt`] must
+/// answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryRequest<'a> {
+    /// Core-issued application operation.
+    pub operation: Operation,
+    /// Registration whose sink fence guards the transaction.
+    pub registration: &'a RegisterReceipt,
+    /// Durable sink cursor the transaction is conditional on.
+    pub previous_sink: &'a Cursor,
+    /// Source batch whose effects the transaction records.
+    pub batch: &'a Batch,
+}
+
 impl DurableDeliveryReceipt {
-    /// Checks exact sink-transaction identity and finite metadata. Cursor
-    /// ordering requires separate source-proof-bound comparisons in the event.
+    /// Checks exact sink-transaction identity against `request` and finite
+    /// metadata. Cursor ordering requires separate source-proof-bound
+    /// comparisons in the event.
     ///
     /// # Errors
     /// Returns a typed binding, bounds, or identity error on contradiction.
     pub fn validate_against(
         &self,
-        operation: Operation,
-        registration: &RegisterReceipt,
-        previous_sink: &Cursor,
-        batch: &Batch,
+        request: DeliveryRequest<'_>,
         max_cursor_bytes: usize,
         limits: SubscriptionLimits,
     ) -> Result<(), SubscriptionError> {
+        let DeliveryRequest {
+            operation,
+            registration,
+            previous_sink,
+            batch,
+        } = request;
         if !self.durable
             || self.operation != operation
             || self.key != registration.key

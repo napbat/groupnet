@@ -10,7 +10,8 @@
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
     BootstrapMemberIdentity, BootstrapOperation, BootstrapParticipant, BootstrapPresence,
-    BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity, ClaimPhase,
+    BootstrapScope, BootstrapStage, ClaimEngine, ClaimIdentity, ClaimPhase, ParticipationCut,
+    PresenceIdentity,
 };
 use groupnet_core::{NodeId, Status, Time};
 use groupnet_sim::SplitMix64;
@@ -196,9 +197,11 @@ impl World {
                 domain: "origin".to_owned(),
                 partition: "bucket".to_owned(),
             },
-            name(node),
-            BootId(u128::from(self.seed) * 4 + u128::from(node == JOINER) + 1),
-            1,
+            PresenceIdentity {
+                node: name(node),
+                boot: BootId(u128::from(self.seed) * 4 + u128::from(node == JOINER) + 1),
+                session: 1,
+            },
         )
         .unwrap();
         engine.require_participation().unwrap();
@@ -289,10 +292,12 @@ impl World {
         engine
             .verify_participant_roster(
                 op,
-                &cut.members,
-                &cut.roster,
-                &cut.participants,
-                &cut.claims,
+                ParticipationCut {
+                    members: &cut.members,
+                    roster: &cut.roster,
+                    participants: &cut.participants,
+                    claims: &cut.claims,
+                },
             )
             .is_ok()
     }
@@ -432,11 +437,11 @@ fn joiner_sampling_between_local_build_and_ready_claim_waits_for_the_donor() {
     for seed in 0..96_u64 {
         let mut rng = SplitMix64::new(seed);
         // At least 6 ms, so the joiner arrives after the donor's selection.
-        let build_len = 6 + u64::from(rng.below(4));
-        let (affirm, encode) = (rng.below(3), 1 + rng.below(4));
+        let build_len = 6 + u64::from(rng.up_to(3));
+        let (affirm, encode) = (rng.up_to(2), 1 + rng.up_to(3));
         // Selection settles at 3 and starts the build at once.
         let build_end = CONFIG.settle_ms + build_len;
-        let first_sample = build_end - 2 + u64::from(rng.below(affirm + encode + 5));
+        let first_sample = build_end - 2 + u64::from(rng.up_to(affirm + encode + 4));
         let (affirm, encode) = (u64::from(affirm), u64::from(encode));
         let schedule = Schedule {
             build_len,
@@ -445,7 +450,7 @@ fn joiner_sampling_between_local_build_and_ready_claim_waits_for_the_donor() {
             join: first_sample - CONFIG.settle_ms,
             lapse: None,
         };
-        let source = Source::new(u64::from(rng.below(3)), u64::from(rng.below(2)));
+        let source = Source::new(u64::from(rng.up_to(2)), u64::from(rng.up_to(1)));
         let World { donor, joiner, .. } = run(seed, &schedule, source);
         assert_eq!(
             joiner.build, None,
@@ -485,9 +490,9 @@ fn joiner_sampling_between_local_build_and_ready_claim_waits_for_the_donor() {
 fn unrecaptured_local_build_ends_its_claim_at_the_stall_bound_and_the_joiner_takes_over() {
     for seed in 0..48_u64 {
         let mut rng = SplitMix64::new(seed);
-        let build_len = 6 + u64::from(rng.below(4));
+        let build_len = 6 + u64::from(rng.up_to(3));
         let build_end = CONFIG.settle_ms + build_len;
-        let first_sample = build_end - 2 + u64::from(rng.below(4));
+        let first_sample = build_end - 2 + u64::from(rng.up_to(3));
         let schedule = Schedule {
             build_len,
             affirm: HORIZON,
@@ -500,7 +505,7 @@ fn unrecaptured_local_build_ends_its_claim_at_the_stall_bound_and_the_joiner_tak
             joiner,
             source,
             ..
-        } = run(seed, &schedule, Source::new(u64::from(rng.below(3)), 0));
+        } = run(seed, &schedule, Source::new(u64::from(rng.up_to(2)), 0));
         assert_eq!(donor.recaptures, 0, "seed {seed}");
         let claims = &source.claims[DONOR];
         let released = claims
@@ -548,13 +553,13 @@ fn recovery_lapse_retiring_the_capture_keeps_the_joiner_waiting() {
     let (mut in_lapse, mut waited, mut beyond_ttl, mut ready_retired) = (0, 0, 0, 0);
     for seed in 0..96_u64 {
         let mut rng = SplitMix64::new(seed);
-        let build_len = 6 + u64::from(rng.below(4));
-        let (affirm, encode) = (rng.below(3), 1 + rng.below(4));
+        let build_len = 6 + u64::from(rng.up_to(3));
+        let (affirm, encode) = (rng.up_to(2), 1 + rng.up_to(3));
         let build_end = CONFIG.settle_ms + build_len;
-        let start = build_end + u64::from(rng.below(affirm + encode + 3));
+        let start = build_end + u64::from(rng.up_to(affirm + encode + 2));
         // Shorter than the stall bound, so the pending claim outlives it.
-        let len = 1 + rng.below(9);
-        let first_sample = start + u64::from(rng.below(len));
+        let len = 1 + rng.up_to(8);
+        let first_sample = start + u64::from(rng.up_to(len - 1));
         let len = u64::from(len);
         let schedule = Schedule {
             build_len,
@@ -563,7 +568,7 @@ fn recovery_lapse_retiring_the_capture_keeps_the_joiner_waiting() {
             join: first_sample - CONFIG.settle_ms,
             lapse: Some((start, len)),
         };
-        let source = Source::new(u64::from(rng.below(3)), u64::from(rng.below(2)));
+        let source = Source::new(u64::from(rng.up_to(2)), u64::from(rng.up_to(1)));
         let World { donor, joiner, .. } = run(seed, &schedule, source);
         assert_eq!(
             joiner.build, None,

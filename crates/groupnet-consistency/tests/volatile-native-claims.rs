@@ -17,7 +17,7 @@ use groupnet_consistency::volatile_recovery::bootstrap::{
     BootstrapPresence, BootstrapScope, ClaimIdentity, ClaimPhase, PresenceIdentity,
 };
 use groupnet_core::Status;
-use groupnet_core::volatile_bootstrap::{claim_entry_key, presence_entry_key};
+use groupnet_core::volatile_bootstrap::{ObservedEntry, claim_entry_key, presence_entry_key};
 use groupnet_testkit::cluster::{MemCluster, eventually};
 
 const VALUE_BYTES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
@@ -221,9 +221,11 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
         groupnet_core::volatile_bootstrap::decode_presence_value(
             &scope(),
             policy(),
-            &cluster.ids[0],
-            &bytes,
-            256,
+            ObservedEntry {
+                author: &cluster.ids[0],
+                value: &bytes
+            },
+            256
         )
         .unwrap()
         .identity,
@@ -276,8 +278,10 @@ async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_a
     let visible = groupnet_core::volatile_bootstrap::decode_presence_value(
         &scope(),
         policy(),
-        &cluster.ids[0],
-        &bytes,
+        ObservedEntry {
+            author: &cluster.ids[0],
+            value: &bytes,
+        },
         256,
     )
     .unwrap();

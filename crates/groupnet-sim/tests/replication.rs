@@ -96,13 +96,13 @@ struct Queued {
 
 fn enqueue(rng: &mut SplitMix64, queue: &mut Vec<Queued>, now: u64, node: usize, event: Event) {
     queue.push(Queued {
-        at: now + u64::from(rng.below(3)) * 10,
+        at: now + u64::from(rng.up_to(2)) * 10,
         node,
         event: event.clone(),
     });
-    if rng.below(5) == 0 {
+    if rng.up_to(4) == 0 {
         queue.push(Queued {
-            at: now + u64::from(rng.below(4)) * 10,
+            at: now + u64::from(rng.up_to(3)) * 10,
             node,
             event,
         });
@@ -211,10 +211,10 @@ fn seeded_loss_reorder_partition_and_restart_preserve_replay_safety() {
         for tick in 0..180_u64 {
             let now = tick * 10;
             let partitioned = (15..35).contains(&tick);
-            if tick < 65 && rng.below(4) == 0 {
-                let id = rng.below(3) as usize;
+            if tick < 65 && rng.up_to(3) == 0 {
+                let id = rng.up_to(2) as usize;
                 heads[id] = heads[id].saturating_add(1);
-                if rng.below(2) == 0 {
+                if rng.up_to(1) == 0 {
                     let step = nodes[id].step(Event::Hint);
                     drive_effects(
                         &mut rng,

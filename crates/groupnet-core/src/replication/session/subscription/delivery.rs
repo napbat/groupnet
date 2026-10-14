@@ -3,8 +3,9 @@
 use super::SessionEngine;
 use crate::Time;
 use crate::replication::{
-    Batch, BoundComparison, CommitSubscriberAck, Comparison, DurableDeliveryReceipt, Effect, Mode,
-    Operation, Reject, SourceProof, Stage, Step, SubscriberAckReceipt,
+    Batch, BoundComparison, CommitSubscriberAck, Comparison, DeliveryRequest,
+    DurableDeliveryReceipt, Effect, Mode, Operation, Reject, SourceProof, Stage, Step,
+    SubscriberAckReceipt,
 };
 
 impl SessionEngine {
@@ -220,14 +221,15 @@ impl SessionEngine {
         ) else {
             return Step::reject(Reject::Stage);
         };
-        if let Err(error) = receipt.validate_against(
-            op,
+        let request = DeliveryRequest {
+            operation: op,
             registration,
-            &sink.cursor,
+            previous_sink: &sink.cursor,
             batch,
-            self.config.max_cursor_bytes.get(),
-            progress.limits,
-        ) {
+        };
+        if let Err(error) =
+            receipt.validate_against(request, self.config.max_cursor_bytes.get(), progress.limits)
+        {
             return Step::reject(Reject::Subscription(error));
         }
         let delivered_order =

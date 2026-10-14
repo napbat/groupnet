@@ -19,9 +19,11 @@ fn engine() -> ClaimEngine {
             domain: "o".to_owned(),
             partition: "b".to_owned(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap()
 }

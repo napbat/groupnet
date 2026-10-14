@@ -56,7 +56,7 @@ use groupnet_consistency::lease::{
     encode_renewal, grant_entry_key, renewal_entry_key,
 };
 use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Time};
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 /// The lease duration `D`.
 const LEASE_MS: u64 = 600;
@@ -124,7 +124,7 @@ fn engine(group: &GroupId, id: &NodeId, peers: &[NodeId]) -> GroupEngine {
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("a handful of nodes");
-    v[rng.below(n) as usize].clone()
+    v[rng.up_to(n - 1) as usize].clone()
 }
 
 fn encode_token(token: WriteToken) -> Vec<u8> {
@@ -227,13 +227,13 @@ impl Harness {
     fn new(seed: u64, n: u32, rng: &mut SplitMix64, resync_lag: u32) -> Self {
         let group = GroupId::new(format!("lease-div-{seed}"));
         let all: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
-        let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
+        let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
         let mut nodes = BTreeMap::new();
         let span = u32::try_from(2 * SKEW_PPM + 1).expect("small");
         for id in &all {
             sim.add(engine(&group, id, &all)).expect("distinct node");
-            let ppm = i64::from(rng.below(span)) - SKEW_PPM;
-            let phase = u64::from(rng.below(u32::try_from(RENEW_MS).expect("small")));
+            let ppm = i64::from(rng.up_to(span - 1)) - SKEW_PPM;
+            let phase = u64::from(rng.up_to(u32::try_from(RENEW_MS - 1).expect("small")));
             let node = Node {
                 id: id.clone(),
                 ppm,
@@ -297,7 +297,7 @@ impl Harness {
         let until = self.now + ms;
         while self.now < until {
             self.step_to(self.now + every_ms);
-            if writes.below(3) == 0 {
+            if writes.up_to(2) == 0 {
                 let live: BTreeSet<NodeId> = self.nodes.keys().cloned().collect();
                 let node = pick(&live, writes);
                 self.start_write(&node);
@@ -570,7 +570,7 @@ impl Harness {
     fn partition(&mut self, rng: &mut SplitMix64) {
         let live: BTreeSet<NodeId> = self.nodes.keys().cloned().collect();
         let victim = pick(&live, rng);
-        match rng.below(4) {
+        match rng.up_to(3) {
             0 => {
                 for peer in live.iter().filter(|peer| **peer != victim) {
                     self.sim.block(&victim, peer);
@@ -591,7 +591,7 @@ impl Harness {
                 let other = pick(&live, rng);
                 if other != victim {
                     self.sim.block(&victim, &other);
-                    if rng.below(2) == 0 {
+                    if rng.up_to(1) == 0 {
                         self.sim.block(&other, &victim);
                     }
                 }
@@ -671,21 +671,21 @@ fn dst_divergence_never_serves_an_acknowledged_write_stale() {
 
 fn divergence_scenario(seed: u64) -> Stats {
     let mut rng = rng(seed ^ 0xd1fe);
-    let n = 2 + rng.below(4); // 2..=5 nodes
-    let lag = rng.below(3);
+    let n = 2 + rng.up_to(3); // 2..=5 nodes
+    let lag = rng.up_to(2);
     let mut h = Harness::new(seed, n, &mut rng, lag);
     let mut writes = SplitMix64::new(seed ^ 0x0517);
     let horizon = reap_horizon_ms();
 
     h.run_for(2 * CONVERGE_MS, 40, &mut writes);
     h.sim
-        .set_loss(u8::try_from(rng.below(11)).expect("below(11) is 0..11"));
-    h.sim.set_jitter(u64::from(rng.below(6)));
+        .set_loss(Percent::try_from(rng.up_to(10)).expect("at most 10%"));
+    h.sim.set_jitter(u64::from(rng.up_to(5)));
 
     for episode in 0..6 {
         h.partition(&mut rng);
-        let hold = u64::from(rng.below(u32::try_from(2 * horizon).expect("small")));
-        h.run_for(hold, u64::from(20 + rng.below(60)), &mut writes);
+        let hold = u64::from(rng.up_to(u32::try_from(2 * horizon - 1).expect("small")));
+        h.run_for(hold, u64::from(20 + rng.up_to(59)), &mut writes);
         h.sim.heal_all();
         h.run_for(LEASE_MS, 40, &mut writes);
         if episode % 3 == 2 && h.nodes.len() > 2 {
@@ -696,7 +696,7 @@ fn divergence_scenario(seed: u64) -> Stats {
     }
 
     h.sim.heal_all();
-    h.sim.set_loss(0);
+    h.sim.set_loss(Percent::ZERO);
     h.sim.set_jitter(0);
     h.run_for(2 * horizon, 40, &mut writes);
     h.stats

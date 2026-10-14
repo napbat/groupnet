@@ -29,9 +29,11 @@ fn node(name: &str, boot: u64) -> ClaimEngine {
     ClaimEngine::new(
         config(),
         scope(),
-        NodeId::from(name),
-        BootId(u128::from(boot)),
-        1,
+        PresenceIdentity {
+            node: NodeId::from(name),
+            boot: BootId(u128::from(boot)),
+            session: 1,
+        },
     )
     .unwrap()
 }
@@ -81,7 +83,16 @@ fn scope_encoding_and_constructor_bounds_are_unambiguous() {
         .placement_key()
     );
     assert_eq!(
-        ClaimEngine::new(config(), scope(), NodeId::from("me"), BootId(0), 1).err(),
+        ClaimEngine::new(
+            config(),
+            scope(),
+            PresenceIdentity {
+                node: NodeId::from("me"),
+                boot: BootId(0),
+                session: 1
+            }
+        )
+        .err(),
         Some(BootstrapError::InvalidIdentity)
     );
     let error = ClaimEngine::new(
@@ -90,9 +101,11 @@ fn scope_encoding_and_constructor_bounds_are_unambiguous() {
             ..config()
         },
         scope(),
-        NodeId::from("me"),
-        BootId(1),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(1),
+            session: 1,
+        },
     )
     .unwrap_err();
     assert_eq!(
@@ -104,6 +117,11 @@ fn scope_encoding_and_constructor_bounds_are_unambiguous() {
         std::error::Error::source(&error).map(ToString::to_string),
         Some("bootstrap max_members must be below usize::MAX".to_owned())
     );
+}
+
+#[test]
+fn default_config_is_valid() {
+    assert_eq!(BootstrapConfig::default().validate(), Ok(()));
 }
 
 #[test]
@@ -401,7 +419,16 @@ fn fresh_same_boot_session_rejects_old_claim_and_completion() {
     });
     let old_op = old.current_operation().unwrap();
 
-    let mut fresh = ClaimEngine::new(config(), scope(), NodeId::from("me"), BootId(7), 2).unwrap();
+    let mut fresh = ClaimEngine::new(
+        config(),
+        scope(),
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 2,
+        },
+    )
+    .unwrap();
     let fresh_claim = published(&fresh.step(BootstrapEvent::Start));
     assert_ne!(old_claim.identity, fresh_claim.identity);
     let fresh_tick = fresh.step(BootstrapEvent::Tick(crate::Time(3)));
@@ -481,8 +508,16 @@ fn follower_observes_ready_donor_before_wait_budget_expires() {
     let winner =
         placement::owner(&scope().placement_key(), &names.iter().cloned().collect()).unwrap();
     let follower_name = names.iter().find(|name| **name != winner).unwrap();
-    let mut follower =
-        ClaimEngine::new(config(), scope(), follower_name.clone(), BootId(7), 1).unwrap();
+    let mut follower = ClaimEngine::new(
+        config(),
+        scope(),
+        PresenceIdentity {
+            node: follower_name.clone(),
+            boot: BootId(7),
+            session: 1,
+        },
+    )
+    .unwrap();
     let self_claim = published(&follower.step(BootstrapEvent::Start));
     let donor_claim = BootstrapClaim {
         identity: ClaimIdentity {

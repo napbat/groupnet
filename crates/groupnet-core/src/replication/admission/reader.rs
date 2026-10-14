@@ -1,10 +1,12 @@
 //! A reader's finite admission window, independent of its ordinary serve lease.
 
 use crate::Time;
-use crate::replication::{BoundComparison, Comparison, Cursor, Scope, SourceProof};
+use crate::replication::{Comparison, Cursor, Scope};
 
 use super::types::{valid_receipt, valid_scope};
-use super::{AdmissionId, AdmissionPolicy, PolicyError, RecordBinding, SourceReceipt};
+use super::{
+    AdmissionId, AdmissionPolicy, PolicyError, ProjectionReceipt, RecordBinding, SourceReceipt,
+};
 
 /// Exact append request for one finite reader admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,10 +200,7 @@ impl ReaderCore {
         &mut self,
         now: Time,
         token: (u64, u64),
-        applied: &Cursor,
-        proof: &SourceProof,
-        admission_to_applied: &BoundComparison,
-        applied_to_head: &BoundComparison,
+        receipt: &ProjectionReceipt,
     ) -> Result<(), ReaderError> {
         self.tick(now)?;
         let pending = self.pending.as_ref().ok_or(ReaderError::Stale)?;
@@ -209,6 +208,12 @@ impl ReaderCore {
             return Err(ReaderError::Stale);
         }
         let admission = pending.cursor.as_ref().ok_or(ReaderError::Proof)?;
+        let ProjectionReceipt {
+            applied,
+            proof,
+            admission_to_applied,
+            applied_to_head,
+        } = receipt;
         if applied.history != self.policy.history
             || applied
                 .validate(&self.scope, self.policy.max_cursor_bytes.get())

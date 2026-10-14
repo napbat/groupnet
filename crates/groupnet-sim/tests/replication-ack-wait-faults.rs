@@ -225,7 +225,7 @@ fn expired_polls_and_old_sessions_cannot_steal_healed_acknowledgements() {
                         );
                         last_poll = Some(op);
                         if time < 15 {
-                            if time == 0 || rng.below(3) == 0 {
+                            if time == 0 || rng.up_to(2) == 0 {
                                 saw_drop = true;
                             } else {
                                 delayed.push((time + 6, Event::AckChecked { op }));

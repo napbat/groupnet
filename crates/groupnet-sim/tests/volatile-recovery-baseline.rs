@@ -80,7 +80,7 @@ fn retained_local_baseline_only_resumes_after_exact_affirmation() {
         assert!(lapse.effects.iter().any(|effect| matches!(effect,
             RecoveryEffect::SuspendLocalBaseline { op } if *op == baseline)));
         assert!(!engine.state().recovered);
-        if rng.below(2) == 0 {
+        if rng.up_to(1) == 0 {
             let interrupted_step = engine.step(RecoveryEvent::FeedGap { lapses: 1 });
             assert!(
                 interrupted_step

@@ -8,7 +8,7 @@ use groupnet_core::volatile_bootstrap::transfer::{TransferConfig, TransferEffect
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
     BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine,
-    ClaimIdentity,
+    ClaimIdentity, PresenceIdentity,
 };
 use groupnet_core::volatile_recovery::RecoveryOperation;
 use groupnet_core::{NodeId, Time};
@@ -167,8 +167,16 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         boot: BootId,
         session: u64,
     ) -> Result<(Self, DonorSender), BootstrapSessionError> {
-        let mut engine = ClaimEngine::new(config.claim, scope.clone(), me.clone(), boot, session)
-            .map_err(BootstrapSessionError::Claim)?;
+        let mut engine = ClaimEngine::new(
+            config.claim,
+            scope.clone(),
+            PresenceIdentity {
+                node: me.clone(),
+                boot,
+                session,
+            },
+        )
+        .map_err(BootstrapSessionError::Claim)?;
         engine
             .enable_transfer(config.transfer)
             .map_err(BootstrapSessionError::Transfer)?;
@@ -421,9 +429,11 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         let Ok(mut engine) = ClaimEngine::new(
             self.config.claim,
             self.scope.clone(),
-            self.me.clone(),
-            self.boot,
-            session,
+            PresenceIdentity {
+                node: self.me.clone(),
+                boot: self.boot,
+                session,
+            },
         ) else {
             return false;
         };

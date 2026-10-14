@@ -2,24 +2,24 @@
 //! must converge every node on one coordinator — reproducibly.
 
 use groupnet_core::{Command, Config, GroupEngine, GroupId, NodeId, Status, Time};
-use groupnet_sim::Simulation;
+use groupnet_sim::{Percent, Simulation};
 
 fn node_ids(names: &[&str]) -> Vec<NodeId> {
     names.iter().map(|s| NodeId::new(*s)).collect()
 }
 
-fn build(group: &GroupId, ids: &[NodeId], latency: u64, loss_percent: u8) -> Simulation {
-    build_with(group, ids, latency, loss_percent, &Config::default())
+fn build(group: &GroupId, ids: &[NodeId], latency: u64, loss: Percent) -> Simulation {
+    build_with(group, ids, latency, loss, &Config::default())
 }
 
 fn build_with(
     group: &GroupId,
     ids: &[NodeId],
     latency: u64,
-    loss_percent: u8,
+    loss: Percent,
     config: &Config,
 ) -> Simulation {
-    let mut sim = Simulation::new(latency).with_loss(loss_percent);
+    let mut sim = Simulation::new(latency).with_loss(loss);
     for id in ids {
         let seeds = ids.iter().filter(|x| *x != id).cloned();
         sim.add(
@@ -36,7 +36,7 @@ fn three_nodes_agree_on_coordinator() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c"]);
 
-    let mut sim = build(&group, &ids, 10, 0);
+    let mut sim = build(&group, &ids, 10, Percent::ZERO);
     sim.run_until(Time(5_000));
 
     assert!(sim.all_agree_on_coordinator(), "nodes did not converge");
@@ -59,7 +59,7 @@ fn converges_despite_deterministic_loss() {
         suspect_timeout_ms: 10_000_000,
         ..Config::default()
     };
-    let mut sim = build_with(&group, &ids, 10, 33, &cfg);
+    let mut sim = build_with(&group, &ids, 10, Percent::of(33), &cfg);
     sim.run_until(Time(10_000));
 
     assert!(sim.all_agree_on_coordinator());
@@ -74,7 +74,7 @@ fn run_is_bit_for_bit_reproducible() {
     let ids = node_ids(&["node-a", "node-b", "node-c"]);
 
     let coord_after_run = || {
-        let mut sim = build(&group, &ids, 7, 0);
+        let mut sim = build(&group, &ids, 7, Percent::ZERO);
         sim.run_until(Time(5_000));
         ids.iter()
             .map(|id| sim.coordinator_of(id))
@@ -93,7 +93,7 @@ fn metadata_propagates_and_converges() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c"]);
 
-    let mut sim = build(&group, &ids, 10, 0);
+    let mut sim = build(&group, &ids, 10, Percent::ZERO);
     // Let membership settle, then write metadata on one node.
     sim.run_until(Time(1_000));
     sim.command(
@@ -120,7 +120,7 @@ fn latest_write_wins_across_nodes() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c"]);
 
-    let mut sim = build(&group, &ids, 10, 0);
+    let mut sim = build(&group, &ids, 10, Percent::ZERO);
     sim.run_until(Time(1_000));
 
     // node-a writes v1; later node-b overwrites with v2. The later (higher
@@ -154,7 +154,7 @@ fn detects_and_removes_a_crashed_node() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c", "node-d"]);
 
-    let mut sim = build(&group, &ids, 10, 0);
+    let mut sim = build(&group, &ids, 10, Percent::ZERO);
     sim.run_until(Time(2_000));
     for id in &ids {
         assert_eq!(
@@ -189,7 +189,7 @@ fn indirect_probe_prevents_false_positive_under_partition() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c"]);
 
-    let mut sim = build(&group, &ids, 10, 0);
+    let mut sim = build(&group, &ids, 10, Percent::ZERO);
     sim.run_until(Time(2_000));
 
     // Sever the *direct* link between a and c in both directions. They can still
@@ -221,7 +221,7 @@ fn dead_tombstones_are_reaped() {
         dead_timeout_ms: 1_000,
         ..Config::default()
     };
-    let mut sim = build_with(&group, &ids, 10, 0, &cfg);
+    let mut sim = build_with(&group, &ids, 10, Percent::ZERO, &cfg);
     sim.run_until(Time(2_000));
 
     let dead = ids[3].clone();
@@ -244,7 +244,7 @@ fn voluntary_leave_removes_node_and_sticks() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c"]);
 
-    let mut sim = build(&group, &ids, 10, 0);
+    let mut sim = build(&group, &ids, 10, Percent::ZERO);
     sim.run_until(Time(2_000));
 
     // node-c leaves gracefully; the leave must disseminate and not be refuted
@@ -264,7 +264,7 @@ fn per_node_state_converges_cluster_wide() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c"]);
 
-    let mut sim = build(&group, &ids, 10, 0);
+    let mut sim = build(&group, &ids, 10, Percent::ZERO);
     sim.run_until(Time(1_000));
 
     // Each node advertises its own app-defined state (e.g. its capacity weight).
@@ -294,7 +294,7 @@ fn per_node_state_update_supersedes_cluster_wide() {
     let group = GroupId::new("shard-42");
     let ids = node_ids(&["node-a", "node-b", "node-c"]);
 
-    let mut sim = build(&group, &ids, 10, 0);
+    let mut sim = build(&group, &ids, 10, Percent::ZERO);
     sim.run_until(Time(1_000));
 
     sim.command(&ids[0], Command::SetLocalState(b"ready=false".to_vec()))

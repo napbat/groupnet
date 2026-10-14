@@ -122,8 +122,8 @@ pub enum Effect {
     ///
     /// The engine is *asking*, not doing: it holds no connection, no etag and
     /// no wall clock. The driver loads the anchor record, decides with
-    /// [`anchor::plan_claim`](crate::anchor::plan_claim) (or
-    /// [`anchor::renewal_record`](crate::anchor::renewal_record) if it is the
+    /// [`AnchorTerms::plan_claim`](crate::anchor::AnchorTerms::plan_claim) (or
+    /// [`AnchorTerms::renewal_record`](crate::anchor::AnchorTerms::renewal_record) if it is the
     /// holder and still has its etag), performs the conditional write, and
     /// reports back with
     /// [`Command::AnchorActivated`](crate::Command::AnchorActivated) or

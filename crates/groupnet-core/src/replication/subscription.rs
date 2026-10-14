@@ -9,7 +9,9 @@ use super::{
 
 mod delivery;
 mod terminal;
-pub use delivery::{CommitSubscriberAck, DurableDeliveryReceipt, SubscriberAckReceipt};
+pub use delivery::{
+    CommitSubscriberAck, DeliveryRequest, DurableDeliveryReceipt, SubscriberAckReceipt,
+};
 pub use terminal::{TerminalReason, TerminalReceipt, TerminalRequest};
 
 /// Stable subscriber name within an exact native source scope.
@@ -33,6 +35,11 @@ pub struct SubscriberKey {
 /// Byte and event budgets are nonzero by type; [`RetentionPolicy::validate`]
 /// checks the fingerprint and the age budget. A request additionally bounds
 /// every field by the session's [`SubscriptionLimits`].
+///
+/// The fingerprint identifies the source's configured policy, so there is no
+/// default policy: [`RetentionPolicy::new`] takes the fingerprint and fills
+/// the budgets with the largest promise [`SubscriptionLimits::default`]
+/// admits (64 MiB, a million events, a day, a million events of lag).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetentionPolicy {
     /// Stable canonical fingerprint of the source's configured policy; nonempty.
@@ -69,6 +76,21 @@ impl fmt::Display for RetentionPolicyError {
 impl std::error::Error for RetentionPolicyError {}
 
 impl RetentionPolicy {
+    /// A policy identified by `fingerprint`, with the default budgets; refine
+    /// them with struct-update syntax. An empty fingerprint is reported by
+    /// [`validate`](Self::validate), never replaced.
+    #[must_use]
+    pub fn new(fingerprint: impl Into<Vec<u8>>) -> Self {
+        let limits = SubscriptionLimits::default();
+        Self {
+            fingerprint: fingerprint.into(),
+            max_bytes: limits.max_retained_bytes,
+            max_events: limits.max_retained_events,
+            max_age_ms: limits.max_retained_age_ms,
+            max_lag_events: limits.max_lag_events,
+        }
+    }
+
     /// Checks the policy's own rules, independent of session limits.
     ///
     /// # Errors
@@ -742,6 +764,23 @@ mod tests {
         assert_eq!(
             std::error::Error::source(&error).map(ToString::to_string),
             Some("retention policy fingerprint must be nonempty".to_owned())
+        );
+    }
+
+    /// The fingerprint-only constructor yields a valid policy that the
+    /// default session limits admit, and never replaces an empty fingerprint.
+    #[test]
+    fn new_policy_is_valid_and_admitted_by_default_limits() {
+        let policy = RetentionPolicy::new(vec![9]);
+        assert_eq!(policy.validate(), Ok(()));
+        let mut request = request();
+        request.policy = policy;
+        request
+            .validate(256, SubscriptionLimits::default())
+            .expect("the default budgets fit the default limits");
+        assert_eq!(
+            RetentionPolicy::new(Vec::new()).validate(),
+            Err(RetentionPolicyError::EmptyFingerprint)
         );
     }
 }

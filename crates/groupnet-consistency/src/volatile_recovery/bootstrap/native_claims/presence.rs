@@ -3,8 +3,8 @@
 use std::mem::size_of;
 
 use groupnet_core::volatile_bootstrap::{
-    BootstrapPresence, PresenceIdentity, decode_presence_value, encode_presence_value,
-    encoded_presence_len,
+    BootstrapPresence, ObservedEntry, PresenceIdentity, decode_presence_value,
+    encode_presence_value, encoded_presence_len,
 };
 use groupnet_runtime::{
     EntryInspectionLimits, EntryMutationLimits, EntryRevision, InspectedPair, InspectedPairEntry,
@@ -114,8 +114,10 @@ impl NativeClaimSource {
                 let existing = decode_presence_value(
                     &self.scope,
                     self.policy,
-                    &local.node,
-                    existing,
+                    ObservedEntry {
+                        author: &local.node,
+                        value: existing,
+                    },
                     self.max_value_bytes,
                 )
                 .map_err(|_| MALFORMED)?;

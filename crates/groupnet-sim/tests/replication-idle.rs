@@ -99,7 +99,7 @@ fn idle_backoff_revokes_stale_serving_and_discovers_silent_commit() {
     let mut saw_backoff = false;
     for seed in 0..64 {
         let mut rng = SplitMix64::new(seed);
-        let committed_value = u8::try_from(10 + rng.below(100)).unwrap();
+        let committed_value = u8::try_from(10 + rng.up_to(99)).unwrap();
         let partitioned = seed % 5 == 0;
         let config = Config {
             idle: Some(IdlePolicy {

@@ -114,12 +114,12 @@ fn named_waits_keep_fixed_epochs_and_find_acks_without_hints() {
             [0, 0]
         } else {
             [
-                2 + rng.below(18),
-                if seed % 4 == 0 { 50 } else { 3 + rng.below(18) },
+                2 + rng.up_to(17),
+                if seed % 4 == 0 { 50 } else { 3 + rng.up_to(17) },
             ]
         };
-        let cancel_at = (seed % 11 == 0).then_some(5 + rng.below(13));
-        let lost_at = (seed % 13 == 0).then_some(6 + rng.below(12));
+        let cancel_at = (seed % 11 == 0).then_some(5 + rng.up_to(12));
+        let lost_at = (seed % 13 == 0).then_some(6 + rng.up_to(11));
         let mut queue = VecDeque::new();
         enqueue(
             &mut queue,

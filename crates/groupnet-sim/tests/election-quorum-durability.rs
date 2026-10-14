@@ -51,7 +51,7 @@ use groupnet_core::{
     Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId,
     RecoveredGrant, Time, VoterRoster,
 };
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 /// How long a host's authority survives its last successful renewal — and,
 /// under Quorum, the claim window, the boot guard and the grant blackout too.
@@ -90,7 +90,7 @@ fn rng(seed: u64) -> SplitMix64 {
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    let i = usize::try_from(rng.below(n)).expect("bounded by the set size");
+    let i = usize::try_from(rng.up_to(n - 1)).expect("bounded by the set size");
     v[i].clone()
 }
 
@@ -107,19 +107,19 @@ struct Topology {
 /// the cluster, sometimes a strict subset, and one seed in four a five-voter
 /// roster whose fifth member never boots at all.
 fn draw_topology(rng: &mut SplitMix64, name: &str) -> Topology {
-    let n = 3 + usize::try_from(rng.below(4)).expect("a 0..4 draw");
+    let n = 3 + usize::try_from(rng.up_to(3)).expect("a 0..4 draw");
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
     let booted: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
-    let absent = n >= 4 && rng.below(4) == 0;
+    let absent = n >= 4 && rng.up_to(3) == 0;
     let booted_voters = if absent {
         4
-    } else if n >= 5 && rng.below(2) == 0 {
+    } else if n >= 5 && rng.up_to(1) == 0 {
         5
     } else {
         3
     };
-    let off = usize::try_from(rng.below(u32::try_from(n).expect("a handful of nodes")))
+    let off = usize::try_from(rng.up_to(u32::try_from(n - 1).expect("a handful of nodes")))
         .expect("bounded by n");
     let mut voters: BTreeSet<NodeId> = (0..booted_voters)
         .map(|k| ids[(off + k) % n].clone())
@@ -183,9 +183,9 @@ fn durability_run(seed: u64, mode: Durability) -> Run {
         }
     );
 
-    let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
-    sim.set_loss(u8::try_from(rng.below(20)).expect("below(20) is 0..20"));
-    sim.set_jitter(u64::from(rng.below(9)));
+    let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
+    sim.set_loss(Percent::try_from(rng.up_to(19)).expect("at most 19%"));
+    sim.set_jitter(u64::from(rng.up_to(8)));
     let mut alive: BTreeSet<NodeId> = topo.booted.clone();
     for id in &topo.booted {
         let seeds = topo.booted.iter().filter(|x| *x != id).cloned();
@@ -200,11 +200,11 @@ fn durability_run(seed: u64, mode: Durability) -> Run {
     let mut restarts: BTreeMap<NodeId, Vec<Time>> = BTreeMap::new();
     let mut now = 0u64;
     for _round in 0..ROUNDS {
-        now += u64::from(30 + rng.below(120));
+        now += u64::from(30 + rng.up_to(119));
         sim.run_until(Time(now));
         assert_lease_disjoint(&sim, now, &label);
 
-        match rng.below(7) {
+        match rng.up_to(6) {
             0 | 1 if alive.len() > 1 => {
                 let victim = pick(&alive, &mut rng);
                 sim.crash(&victim).expect("live node");
@@ -254,7 +254,7 @@ fn durability_run(seed: u64, mode: Durability) -> Run {
     }
 
     sim.heal_all();
-    sim.set_loss(0);
+    sim.set_loss(Percent::ZERO);
     sim.set_jitter(0);
     now += SETTLE_MS;
     sim.run_until(Time(now));

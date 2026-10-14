@@ -26,6 +26,13 @@ pub struct CaptureId {
 /// Every count and byte cap is nonzero by type; [`JournalConfig::validate`]
 /// checks the millisecond lifetimes, the caps' relations to each other, and
 /// that [`DonorJournal::storage_bound`] is representable.
+///
+/// [`Default`] reserves a 64 MiB encoded and 64 MiB decoded image, retains
+/// 4096 delta events of at most 4 KiB (16 MiB in total, 256-byte identities),
+/// serves eight followers in 256-event, 1 MiB batches with 4 MiB in flight,
+/// captures up to 256 writer cuts (8 KiB of writer IDs) and 1024 members
+/// (256 KiB), and keeps a candidate for five minutes and a follower
+/// reservation for two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalConfig {
     /// Maximum encoded image bytes reserved before capture.
@@ -66,6 +73,31 @@ pub struct JournalConfig {
     /// Maximum lifetime of one follower reservation, in logical milliseconds;
     /// nonzero and at most `max_total_ms`.
     pub max_follower_ms: u64,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            max_encoded_bytes: const { NonZeroUsize::new(64 * 1024 * 1024).unwrap() },
+            max_decoded_bytes: const { NonZeroUsize::new(64 * 1024 * 1024).unwrap() },
+            max_events: const { NonZeroUsize::new(4096).unwrap() },
+            max_suffix_bytes: const { NonZeroUsize::new(16 * 1024 * 1024).unwrap() },
+            max_event_bytes: const { NonZeroUsize::new(4096).unwrap() },
+            max_identity_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_followers: const { NonZeroUsize::new(8).unwrap() },
+            max_follower_id_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_cuts: const { NonZeroUsize::new(256).unwrap() },
+            max_cut_bytes: const { NonZeroUsize::new(8 * 1024).unwrap() },
+            max_members: const { NonZeroUsize::new(1024).unwrap() },
+            max_membership_bytes: const { NonZeroUsize::new(256 * 1024).unwrap() },
+            max_scope_bytes: const { NonZeroUsize::new(512).unwrap() },
+            max_batch_events: const { NonZeroUsize::new(256).unwrap() },
+            max_batch_bytes: const { NonZeroUsize::new(1024 * 1024).unwrap() },
+            max_inflight_bytes: const { NonZeroUsize::new(4 * 1024 * 1024).unwrap() },
+            max_total_ms: 300_000,
+            max_follower_ms: 120_000,
+        }
+    }
 }
 
 /// Invalid [`JournalConfig`], naming the violated rule.

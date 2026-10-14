@@ -2,6 +2,8 @@
 //! healthy connection carries.
 //!
 //! * an echo round trips, empty payload included;
+//! * a timeout beyond the wire's maximum saturates and still answers, and a
+//!   zero timeout is refused unsent;
 //! * many concurrent calls from several clients to one server each get their
 //!   *own* answer, over exactly one connection per client;
 //! * a handler's error reaches the caller as `Remote`, a panicking handler
@@ -21,7 +23,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_rpc::{
-    FrameLimit, RpcClient, RpcConfig, RpcError, RpcServer, RpcServerConfig, RpcStatus,
+    FrameLimit, MAX_TIMEOUT, RpcClient, RpcConfig, RpcError, RpcServer, RpcServerConfig, RpcStatus,
 };
 use groupnet_testkit::cluster::eventually;
 use groupnet_transport::QueueCapacity;
@@ -58,6 +60,40 @@ async fn an_echo_round_trips() {
     assert_eq!(
         client.call(&server, Bytes::new(), CALL).await,
         Ok(Bytes::new())
+    );
+}
+
+/// A timeout longer than the wire's `u32` milliseconds saturates to
+/// `MAX_TIMEOUT` rather than overflowing the clock, and the call goes
+/// through; a zero timeout fails `Timeout` without being sent.
+#[tokio::test]
+async fn timeouts_saturate_at_the_wire_maximum_and_zero_is_refused() {
+    let net = MemBulkNet::new();
+    let _server = RpcServer::bind(
+        plane(&net, "s"),
+        |_from: NodeId, request: Bytes| async move { Ok::<_, RpcStatus>(request) },
+    );
+    let client = client(&net, "c");
+    let server = NodeId::new("s");
+
+    for timeout in [
+        Duration::MAX,
+        MAX_TIMEOUT + Duration::from_secs(1),
+        MAX_TIMEOUT,
+    ] {
+        assert_eq!(
+            client
+                .call(&server, Bytes::from_static(b"far"), timeout)
+                .await,
+            Ok(Bytes::from_static(b"far")),
+            "{timeout:?}"
+        );
+    }
+    assert_eq!(
+        client
+            .call(&server, Bytes::from_static(b"now"), Duration::ZERO)
+            .await,
+        Err(RpcError::Timeout)
     );
 }
 

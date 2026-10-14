@@ -144,6 +144,16 @@ pub fn encoded_claim_len(
     Ok(size)
 }
 
+/// One gossip entry value as an actor observed it: the member that authored
+/// it and its raw bytes. Decoding binds the value to exactly this author.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedEntry<'a> {
+    /// The member whose entry carried the value.
+    pub author: &'a NodeId,
+    /// The value's encoded bytes.
+    pub value: &'a [u8],
+}
+
 /// Decodes one actor-observed claim, requiring exact scope, policy and author.
 ///
 /// The caller sets `remaining_ms` only from the actor's native TTL sample.
@@ -154,10 +164,13 @@ pub fn encoded_claim_len(
 pub fn decode_claim_value(
     scope: &BootstrapScope,
     policy: BootstrapConfig,
-    observed_node: &NodeId,
-    bytes: &[u8],
+    observed: ObservedEntry<'_>,
     max_bytes: usize,
 ) -> Result<BootstrapClaim, ClaimCodecError> {
+    let ObservedEntry {
+        author: observed_node,
+        value: bytes,
+    } = observed;
     if bytes.len() > max_bytes {
         return Err(ClaimCodecError::Bound);
     }
@@ -323,10 +336,13 @@ pub fn encode_presence_value(
 pub fn decode_presence_value(
     scope: &BootstrapScope,
     policy: BootstrapConfig,
-    observed_node: &NodeId,
-    bytes: &[u8],
+    observed: ObservedEntry<'_>,
     max_bytes: usize,
 ) -> Result<BootstrapPresence, ClaimCodecError> {
+    let ObservedEntry {
+        author: observed_node,
+        value: bytes,
+    } = observed;
     if bytes.len() > max_bytes {
         return Err(ClaimCodecError::Bound);
     }
@@ -481,8 +497,16 @@ mod tests {
             encoded_claim_len(&scope(), policy(), &claim(), 256).unwrap(),
             bytes.len()
         );
-        let decoded =
-            decode_claim_value(&scope(), policy(), &claim().identity.node, &bytes, 256).unwrap();
+        let decoded = decode_claim_value(
+            &scope(),
+            policy(),
+            ObservedEntry {
+                author: &claim().identity.node,
+                value: &bytes,
+            },
+            256,
+        )
+        .unwrap();
         assert_eq!(decoded.remaining_ms, 0);
         assert_eq!(decoded.identity, claim().identity);
         assert_eq!(decoded.renewal, 4);
@@ -509,7 +533,15 @@ mod tests {
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert_eq!(
-            decode_claim_value(&scope(), policy(), &claim().identity.node, &trailing, 256),
+            decode_claim_value(
+                &scope(),
+                policy(),
+                ObservedEntry {
+                    author: &claim().identity.node,
+                    value: &trailing
+                },
+                256
+            ),
             Err(ClaimCodecError::Malformed)
         );
         let mut changed_policy = policy();
@@ -518,18 +550,36 @@ mod tests {
             decode_claim_value(
                 &scope(),
                 changed_policy,
-                &claim().identity.node,
-                &bytes,
+                ObservedEntry {
+                    author: &claim().identity.node,
+                    value: &bytes
+                },
                 256
             ),
             Err(ClaimCodecError::Mismatch)
         );
         assert_eq!(
-            decode_claim_value(&scope(), policy(), &NodeId::new("node-b"), &bytes, 256),
+            decode_claim_value(
+                &scope(),
+                policy(),
+                ObservedEntry {
+                    author: &NodeId::new("node-b"),
+                    value: &bytes
+                },
+                256
+            ),
             Err(ClaimCodecError::Mismatch)
         );
         assert_eq!(
-            decode_claim_value(&scope(), policy(), &claim().identity.node, &bytes, 8),
+            decode_claim_value(
+                &scope(),
+                policy(),
+                ObservedEntry {
+                    author: &claim().identity.node,
+                    value: &bytes
+                },
+                8
+            ),
             Err(ClaimCodecError::Bound)
         );
         let mut bad_version = bytes;
@@ -538,8 +588,10 @@ mod tests {
             decode_claim_value(
                 &scope(),
                 policy(),
-                &claim().identity.node,
-                &bad_version,
+                ObservedEntry {
+                    author: &claim().identity.node,
+                    value: &bad_version
+                },
                 256
             ),
             Err(ClaimCodecError::Mismatch)
@@ -562,9 +614,16 @@ mod tests {
             encoded_presence_len(&scope(), policy(), &presence, 256).unwrap(),
             bytes.len()
         );
-        let decoded =
-            decode_presence_value(&scope(), policy(), &presence.identity.node, &bytes, 256)
-                .unwrap();
+        let decoded = decode_presence_value(
+            &scope(),
+            policy(),
+            ObservedEntry {
+                author: &presence.identity.node,
+                value: &bytes,
+            },
+            256,
+        )
+        .unwrap();
         assert_eq!(decoded.identity, presence.identity);
         assert_eq!(decoded.renewal, 4);
         assert_eq!(decoded.remaining_ms, 0);
@@ -575,13 +634,29 @@ mod tests {
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert_eq!(
-            decode_presence_value(&scope(), policy(), &presence.identity.node, &trailing, 256),
+            decode_presence_value(
+                &scope(),
+                policy(),
+                ObservedEntry {
+                    author: &presence.identity.node,
+                    value: &trailing
+                },
+                256
+            ),
             Err(ClaimCodecError::Malformed)
         );
         let mut wrong_policy = policy();
         wrong_policy.claim_ttl_ms += 1;
         assert_eq!(
-            decode_presence_value(&scope(), wrong_policy, &presence.identity.node, &bytes, 256,),
+            decode_presence_value(
+                &scope(),
+                wrong_policy,
+                ObservedEntry {
+                    author: &presence.identity.node,
+                    value: &bytes
+                },
+                256
+            ),
             Err(ClaimCodecError::Mismatch)
         );
     }
