@@ -4,9 +4,9 @@ use std::io;
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet::core::NodeId;
-use groupnet::messaging::Bytes;
 use groupnet::runtime::{Endpoint, Messages, Node, Ordered, Unordered};
 use groupnet::streams::{UnorderedDelivery, UnorderedOptions, UnorderedSession};
+use groupnet::transport::Bytes;
 
 use super::WAIT;
 

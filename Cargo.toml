@@ -15,8 +15,8 @@ groupnet-core = { path = "crates/groupnet-core", version = "0.1.0" }
 groupnet-transport = { path = "crates/groupnet-transport", version = "0.1.0" }
 groupnet-transport-mem = { path = "crates/groupnet-transport-mem", version = "0.1.0" }
 groupnet-transport-udp = { path = "crates/groupnet-transport-udp", version = "0.1.0" }
-# default-features = false so the umbrella's `tcp` / `tcp-msg` features pick
-# exactly one plane; direct dependents get both planes by default anyway.
+# default-features = false so the facade's binding and capability features
+# (`tcp`, `bulk`, `runtime`) choose its planes; direct dependents get both.
 groupnet-transport-tcp = { path = "crates/groupnet-transport-tcp", version = "0.1.0", default-features = false }
 groupnet-network = { path = "crates/groupnet-network", version = "0.1.0" }
 groupnet-messaging = { path = "crates/groupnet-messaging", version = "0.1.0" }

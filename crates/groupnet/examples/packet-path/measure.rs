@@ -6,9 +6,9 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use groupnet::messaging::Bytes;
 use groupnet::runtime::Unordered;
 use groupnet::streams::{UnorderedDelivery, UnorderedOptions, UnorderedSession};
+use groupnet::transport::Bytes;
 
 use super::setup::{Pair, Path, SETUP_TIMEOUT};
 

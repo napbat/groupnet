@@ -5,7 +5,7 @@
 //! The protocol choice lives in the registered link; every deployment uses the
 //! same managed `Node` and membership API.
 
-#![cfg(all(feature = "runtime", feature = "tcp-msg"))]
+#![cfg(all(feature = "runtime", feature = "tcp"))]
 
 use std::time::Duration;
 

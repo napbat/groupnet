@@ -8,51 +8,50 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Every runtime node owns a routed network. Protocol bindings remain selectable;
-# memory supports the default examples without opening OS sockets.
-# Disable defaults for the dependency-free coordination core and transport trait.
+# Features come in two kinds, joined by weak `?/` edges so that every selected
+# binding carries every selected capability:
+#
+# * bindings choose transport crates: `mem`, `tcp`, `udp`, `ipc`;
+# * capabilities choose planes: `runtime` (managed nodes: routing, messages,
+#   ordered/unordered sessions, link registration), `bulk` (data-plane streams)
+#   and `connectivity` (native traversal under TCP/UDP links).
+#
+# The defaults run a managed node over memory links without opening OS sockets.
+# Disable them for the dependency-free core and transport traits.
 default = ["runtime", "mem"]
 runtime = [
-    "dep:groupnet-runtime", "bulk", "dep:groupnet-network", "dep:groupnet-messaging", "dep:groupnet-streams",
-    "groupnet-transport/link", "groupnet-transport-mem?/link",
-    "groupnet-transport-tcp?/link", "groupnet-transport-udp?/link",
+    "dep:groupnet-runtime", "dep:groupnet-network", "dep:groupnet-messaging", "dep:groupnet-streams",
+    "bulk", "groupnet-transport/link",
+    "groupnet-transport-mem?/link", "groupnet-transport-tcp?/link", "groupnet-transport-udp?/link",
 ]
-mem = ["dep:groupnet-transport-mem"]
-udp = ["dep:groupnet-transport-udp"]
-# Named seeds resolved through the operating system's resolver
-# (`runtime::SystemResolver`): a seed addressed as `host:port` and re-resolved
-# for the life of the node.
-dns = ["runtime", "groupnet-runtime/dns"]
-# Data plane: `bulk` is the stream trait + framing (in groupnet-transport);
-# `tcp` is the TCP binding.
-bulk = ["groupnet-transport/bulk"]
-tcp = ["bulk", "dep:groupnet-transport-tcp", "groupnet-transport-tcp/bulk"]
-# Control plane over persistent TCP: a bounded pool of lazily dialed,
-# idle-closed connections — the constant-connection *option* for deployments
-# that want frames delivered at network latency over reliable links. Gossip
-# deployments keep `udp`; nothing forces a socket per member.
-tcp-msg = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
-# Native link implementations are independent crates, not router built-ins.
-ipc = ["dep:groupnet-transport-ipc"]
-# Native adjacent-path establishment used internally by enabled TCP/UDP bindings.
+bulk = ["groupnet-transport/bulk", "groupnet-transport-mem?/bulk", "groupnet-transport-tcp?/bulk"]
 connectivity = [
     "dep:groupnet-transport-punch",
     "groupnet-transport-tcp?/connectivity",
     "groupnet-transport-udp?/connectivity",
 ]
+# Named seeds resolved through the operating system's resolver
+# (`runtime::SystemResolver`): a seed addressed as `host:port` and re-resolved
+# for the life of the node.
+dns = ["runtime", "groupnet-runtime/dns"]
+mem = ["dep:groupnet-transport-mem"]
+# Persistent-connection control plane (`TcpMsgTransport`); with `bulk`, also
+# reliable streams (`TcpBulkTransport`); with `runtime`, the managed `TcpLink`.
+tcp = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
+udp = ["dep:groupnet-transport-udp"]
+ipc = ["dep:groupnet-transport-ipc"]
 # Request/response RPC over the data plane: concurrent calls multiplexed onto
 # one stream per peer, with deadlines, bounded frames and per-connection
-# handler limits. Rides `bulk`, so bring a binding (`tcp`, or your own). The
-# weak `groupnet-transport-mem?/bulk` is the same edge `consistency-handoff`
-# carries: if `mem` is on, its `MemBulkNet` comes too, and nothing otherwise.
-rpc = ["bulk", "dep:groupnet-rpc", "groupnet-transport-mem?/bulk"]
+# handler limits. Rides `bulk`, so bring a binding (`tcp`, `mem`, a runtime
+# `Node`, or your own).
+rpc = ["bulk", "dep:groupnet-rpc"]
 # Session-consistency layer: per-writer sequenced write feeds with loss
 # detection, and applied-write frontiers for read-your-writes barriers.
 # Built on the runtime's Group handle.
 consistency = ["runtime", "dep:groupnet-consistency"]
-# The strong-coherence tier on top: applied-watermark acks (AckLedger /
-# applied_cluster_wide). Opt-in — writers wait on every alive member, and
-# one ledger republish flows per applied event; see the scaling envelope.
+# Applied-watermark acknowledgements (`AckLedger`, `applied_by_selected`,
+# `applied_by_roster`) reporting an `AckOutcome`: who was waited on, who
+# acknowledged, who is missing. One ledger republish flows per applied event.
 consistency-acks = ["consistency", "groupnet-consistency/acks"]
 # The coherence-lease tier above that: readers hold self-expiring leases to
 # *serve*, so a writer's invalidation ends at an acknowledgement or at a silent
@@ -67,23 +66,8 @@ consistency-leases = ["consistency-acks", "groupnet-consistency/leases"]
 consistency-hosted = ["consistency", "groupnet-consistency/hosted"]
 # Snapshot handoff on top of the Hosted write path: a recovering host pulls a
 # covering snapshot from a donor over the data plane instead of waiting for a
-# ring it has already overrun. The only consistency feature that reaches across
-# the two planes, so it turns `bulk` on — bring your own binding (`tcp`, or the
-# `BulkTransport` trait over your own).
-#
-# `groupnet-transport-mem?/bulk` is the one non-obvious edge, and the `?` is the
-# whole of it: this feature needs no in-memory transport, but *if* `mem` is also
-# on (it is, by default) then the binding it selects must carry its data plane
-# too. Without it `transport::mem` would expose the control plane alone and the
-# tier's own in-process fabric — `MemBulkNet` — would be missing from the one
-# build that most obviously wants it. Weak, so `--no-default-features` plus this
-# tier still pulls in nothing.
-consistency-handoff = [
-    "consistency-hosted",
-    "bulk",
-    "groupnet-consistency/handoff",
-    "groupnet-transport-mem?/bulk",
-]
+# ring it has already overrun.
+consistency-handoff = ["consistency-hosted", "bulk", "groupnet-consistency/handoff"]
 # Resumable source-backed replay and native-position read floors. Snapshot and
 # event-complete subscriptions are separate later capabilities.
 consistency-replication = ["consistency", "groupnet-consistency/replication"]
@@ -92,7 +76,6 @@ consistency-volatile-bootstrap-bulk = [
     "consistency-volatile-recovery",
     "bulk",
     "groupnet-consistency/volatile-bootstrap-bulk",
-    "groupnet-transport-mem?/bulk",
 ]
 sim = ["dep:groupnet-sim"]
 
@@ -116,11 +99,6 @@ groupnet-sim = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 tokio-util = { workspace = true, features = ["compat"] }
-# The handoff facade test implements `SnapshotSource`/`SnapshotSink`, whose chunk
-# type is `bytes::Bytes`. The facade re-exports no `bytes`, so a consumer that
-# implements those two traits declares its own bytes dependency. This test uses
-# the workspace version. Dev-only: nothing enters the published graph.
-bytes = { workspace = true }
 rcgen = { workspace = true }
 # TLS-over-TCP baseline of the tunnel-throughput example; dev-only.
 rustls = { workspace = true }
@@ -143,7 +121,7 @@ required-features = ["runtime", "mem"]
 
 [[example]]
 name = "dynamic-admission"
-required-features = ["runtime", "tcp-msg"]
+required-features = ["runtime", "tcp"]
 
 [[example]]
 name = "dynamic-relay"
@@ -151,28 +129,29 @@ required-features = ["runtime", "udp", "connectivity"]
 
 [[example]]
 name = "native-traversal"
-required-features = ["runtime", "udp", "tcp-msg", "connectivity"]
+required-features = ["runtime", "udp", "tcp", "connectivity"]
 
 [[example]]
 name = "connectivity-bridge"
-required-features = ["runtime", "mem", "tcp-msg", "connectivity"]
+required-features = ["runtime", "mem", "tcp", "connectivity"]
 
 [[example]]
 name = "application-messages"
-required-features = ["runtime", "mem", "tcp-msg", "connectivity"]
+required-features = ["runtime", "mem", "tcp", "connectivity"]
 
 [[example]]
 name = "packet-path"
-required-features = ["runtime", "mem", "udp", "tcp-msg", "connectivity"]
+required-features = ["runtime", "mem", "udp", "tcp", "connectivity"]
 
 [[example]]
 name = "tunnel-throughput"
-required-features = ["runtime", "tcp-msg"]
+required-features = ["runtime", "tcp"]
 
 [lints]
 workspace = true
 
 # The doc table and its links cover every layer, so render docs.rs with all
-# features on — otherwise the feature-gated modules (sim, tcp, …) go missing.
+# features on; `docsrs` turns on per-item feature badges.
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

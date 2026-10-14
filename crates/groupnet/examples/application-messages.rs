@@ -17,9 +17,10 @@ use std::{
 use groupnet::{
     connectivity::{PathPolicy, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig},
     core::NodeId,
-    messaging::{Bytes, Delivery, Frame, MessageContext, SendOptions},
+    messaging::{Delivery, Frame, MessageContext, SendOptions},
     runtime::Node,
     transport::{
+        Bytes,
         mem::{MemLink, Network},
         tcp::TcpMsgTransport,
     },

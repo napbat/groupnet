@@ -1,26 +1,65 @@
 //! # Groupnet
 //!
 //! A deterministic, leaderless coordination fabric for systems that partition
-//! state into shard groups. This umbrella crate re-exports the layered pieces as
-//! one namespaced hierarchy — each module mirrors an underlying crate:
+//! state into shard groups. This umbrella crate re-exports the layered crates as
+//! one namespaced hierarchy: every module mirrors exactly one underlying crate,
+//! and nothing is re-exported twice at the root.
 //!
-//! | Module | Role |
-//! |--------|------|
-//! | [`core`] | sans-IO state machine, identity, weighted [`placement`](core::placement) (HA-hash), and the [`wire`](core::wire) protocol — pure, deterministic, dep-free |
-//! | [`transport`] | the datagram [`Transport`](transport::Transport) trait, the data-plane [`bulk`](transport::bulk) streams, and the concrete bindings [`mem`](transport::mem) / [`udp`](transport::udp) / [`tcp`](transport::tcp) (persistent control-plane connections *and* bulk streams) |
-//! | `connectivity` | native adjacent-node connection establishment and live direct/relay path management, used internally by TCP/UDP adapters *(feature `connectivity`)* |
-//! | [`network`] | protocol-independent routing and pinned end-to-end TLS streams *(feature `runtime`, default)* |
-//! | [`runtime`] | async, group-per-task [`Node`](runtime::Node) / [`Group`](runtime::Group) driver + [`Routing`](runtime::Routing) *(feature `runtime`, default)* |
-//! | [`rpc`] | request/response calls over the data plane: an [`RpcClient`](rpc::RpcClient) multiplexing concurrent calls onto one stream per peer, and an [`RpcServer`](rpc::RpcServer) answering them under deadlines and per-connection limits *(feature `rpc`)* |
-//! | [`consistency`] | session-consistency layer: per-writer sequenced [`WriteFeed`](consistency::WriteFeed)s with loss detection, and [`Frontier`](consistency::Frontier) read-your-writes barriers *(feature `consistency`)* |
-//! | `consistency::hosted` | the Hosted write path: fenced, epoch-scoped writes through the group's elected host, priced by a commit level (`Local` / `QuorumApplied` / `AllApplied`) *(feature `consistency-hosted`)* |
-//! | `consistency::hosted::handoff` | snapshot handoff: a recovering host pulls a covering snapshot from a donor over the data plane, verified at three points, instead of waiting on a ring it has overrun *(feature `consistency-handoff`)* |
-//! | [`sim`] | deterministic single-threaded [`Simulation`](sim::Simulation) *(feature `sim`)* |
+//! | Module | Crate | Role | Feature |
+//! |--------|-------|------|---------|
+//! | [`core`] | `groupnet-core` | sans-IO state machine, identity, weighted [`placement`](core::placement), and the [`wire`](core::wire) protocol — pure, deterministic, dependency-free | always |
+//! | [`transport`] | `groupnet-transport` + bindings | the control-plane [`Transport`](transport::Transport) trait, shared [`Bytes`](transport::Bytes) and [`QueueCapacity`](transport::QueueCapacity), and the bindings `mem` / `tcp` / `udp` / `ipc` as submodules | always; bindings by name |
+//! | `connectivity` | `groupnet-transport-punch` | native traversal and rendezvous servers under TCP/UDP links | `connectivity` |
+//! | `network` | `groupnet-network` | protocol-independent routing and pinned end-to-end TLS tunnels | `runtime` |
+//! | `messaging` | `groupnet-messaging` | opaque application frames, delivery receipts, and the messaging engine | `runtime` |
+//! | `streams` | `groupnet-streams` | ordered streams and reliable/unreliable unordered sessions | `runtime` |
+//! | `runtime` | `groupnet-runtime` | the managed `Node` / `Group` driver, typed `Endpoint` / `Peer` handles, and receive callbacks (`runtime::messaging`) | `runtime` |
+//! | `rpc` | `groupnet-rpc` | request/response calls over any data plane | `rpc` |
+//! | `consistency` | `groupnet-consistency` | write feeds, frontiers, floors, acknowledgements, leases, hosted writes, handoff, replication | `consistency`, `consistency-*` |
+//! | `sim` | `groupnet-sim` | deterministic single-threaded engine harness | `sim` |
 //!
-//! Two planes: the **control plane** (small best-effort datagrams — gossip,
-//! membership, routing) and the opt-in **data plane** (reliable byte streams —
-//! replication, bulk transfer). Both are transport-agnostic; use a bundled
-//! binding or implement the trait yourself.
+//! Name each type through the module of the crate that owns it:
+//! `groupnet::core::NodeId`, `groupnet::runtime::{Node, Messages, Ordered}`,
+//! `groupnet::messaging::SendOptions`, `groupnet::network::RouterConfig`,
+//! `groupnet::streams::UnorderedDelivery`, and `groupnet::transport::Bytes` for
+//! payloads. (Lower-layer crates' signature types are also re-exported by the
+//! crates that use them, for direct dependents of those crates.)
+//!
+//! # Features
+//!
+//! Features come in two kinds. **Bindings** choose transport crates: `mem`,
+//! `tcp`, `udp`, `ipc`. **Capabilities** choose planes: `runtime` (managed
+//! nodes with routing, messages, ordered/unordered sessions and link
+//! registration; it always includes the stream and tunnel machinery), `bulk`
+//! (data-plane streams) and `connectivity` (native traversal under TCP/UDP
+//! links). Every selected binding carries every selected capability: `tcp` with
+//! `bulk` provides `TcpBulkTransport`, `mem` with `bulk` provides `MemBulkNet`,
+//! and any binding with `runtime` provides its managed link.
+//!
+//! | Feature | Adds | Implies |
+//! |---------|------|---------|
+//! | `runtime` *(default)* | `network`, `messaging`, `streams`, `runtime`; `transport::link` / `transport::admission` | `bulk` |
+//! | `mem` *(default)* | `transport::mem` | — |
+//! | `tcp` | `transport::tcp` (`TcpMsgTransport`; `TcpBulkTransport` with `bulk`; `TcpLink` with `runtime`) | — |
+//! | `udp`, `ipc` | `transport::udp`, `transport::ipc` | — |
+//! | `bulk` | `transport::bulk`, `transport::framing` | — |
+//! | `connectivity` | `connectivity`; native modes of `TcpLink` / `UdpLink` | — |
+//! | `dns` | `runtime::SystemResolver` | `runtime` |
+//! | `rpc` | `rpc` | `bulk` |
+//! | `consistency` | `consistency` (feeds, frontiers, floors) | `runtime` |
+//! | `consistency-acks`, `-leases`, `-hosted`, `-handoff`, `-replication`, `-volatile-recovery`, `-volatile-bootstrap-bulk` | the matching `consistency` tier | `consistency`; `-leases` → `-acks`; `-handoff` → `-hosted` + `bulk`; `-volatile-bootstrap-bulk` → `-volatile-recovery` + `bulk` |
+//! | `sim` | `sim` | — |
+//!
+//! Minimal builds keep one dependency on this facade:
+//!
+//! ```toml
+//! # Sans-IO core, placement, and the transport traits only.
+//! groupnet = { version = "0.1", default-features = false }
+//! # Reliable TCP streams and RPC without a managed node.
+//! groupnet = { version = "0.1", default-features = false, features = ["tcp", "rpc"] }
+//! ```
+//!
+//! # Example
 //!
 //! ```no_run
 //! # #[cfg(all(feature = "runtime", feature = "mem"))]
@@ -46,143 +85,61 @@
 //! # }
 //! # }
 //! ```
-//!
-//! Want fewer dependencies? Depend on the underlying crates directly
-//! (`groupnet-core`, `groupnet-transport`, …) rather than this facade — the split
-//! is what keeps the core dependency-free and the async runtime optional.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
-/// Sans-IO core: the deterministic [`GroupEngine`](core::GroupEngine), the
-/// identity types, weighted [`placement`](core::placement), and the
-/// [`wire`](core::wire) protocol. Pure, deterministic, dependency-free.
 pub use groupnet_core as core;
 
-/// Transport layer: the control-plane [`Transport`](transport::Transport) trait,
-/// the opt-in data-plane [`bulk`](transport::bulk) streams, and the concrete
-/// socket / in-memory bindings.
+/// The transport layer: the control-plane [`Transport`](transport::Transport)
+/// trait, shared [`Bytes`](transport::Bytes) payloads and
+/// [`QueueCapacity`](transport::QueueCapacity) bounds, the data-plane `bulk`
+/// streams and `framing` (feature `bulk`), link registration and admission
+/// (`link` / `admission`, feature `runtime` or any binding's managed link), and
+/// the concrete bindings as submodules.
 pub mod transport {
-    pub use groupnet_transport::{Inbound, MAX_NODE_ID_BYTES, QueueCapacity, Transport};
+    pub use groupnet_transport::*;
 
-    /// Data-plane stream transport: `BulkTransport`, `DataStream`, `DataPlane`
-    /// *(feature `bulk`)*.
-    #[cfg(feature = "bulk")]
-    pub use groupnet_transport::bulk;
-
-    /// Shared length-prefixed framing limits and primitives *(feature `bulk`)*.
-    #[cfg(feature = "bulk")]
-    pub use groupnet_transport::framing;
-
-    /// In-memory control-plane binding, for tests and single-process clusters
-    /// *(feature `mem`)*.
-    #[cfg(feature = "mem")]
-    pub use groupnet_transport_mem as mem;
-
-    /// UDP control-plane binding *(feature `udp`)*.
-    #[cfg(feature = "udp")]
-    pub use groupnet_transport_udp as udp;
-
-    /// TCP bindings: the persistent-connection control plane
-    /// (`TcpMsgTransport`, feature `tcp-msg`) and the data-plane streams
-    /// (`TcpBulkTransport`, feature `tcp`).
-    #[cfg(any(feature = "tcp", feature = "tcp-msg"))]
-    pub use groupnet_transport_tcp as tcp;
-
-    /// Object-safe link registration and owned worker lifecycle (feature `runtime`).
-    #[cfg(feature = "runtime")]
-    pub use groupnet_transport::link;
-
-    /// Application admission and live adjacent-peer sessions (feature `runtime`).
-    #[cfg(feature = "runtime")]
-    pub use groupnet_transport::admission;
-
-    /// Native local IPC links (feature `ipc`).
     #[cfg(feature = "ipc")]
     pub use groupnet_transport_ipc as ipc;
+    #[cfg(feature = "mem")]
+    pub use groupnet_transport_mem as mem;
+    #[cfg(feature = "tcp")]
+    pub use groupnet_transport_tcp as tcp;
+    #[cfg(feature = "udp")]
+    pub use groupnet_transport_udp as udp;
 }
 
-/// Native adjacent-node connection establishment and live path management
-/// *(feature `connectivity`)*. TCP/UDP adapters consume these resources; logical
-/// multi-hop forwarding remains in the protocol-independent router.
 #[cfg(feature = "connectivity")]
 pub use groupnet_transport_punch as connectivity;
 
-/// Managed networks: protocol-independent routing and encrypted streams
-/// *(feature `runtime`)*. Link implementations remain in [`transport`].
+#[cfg(feature = "runtime")]
+pub use groupnet_messaging as messaging;
 #[cfg(feature = "runtime")]
 pub use groupnet_network as network;
-
-/// Opaque node/group frames, delivery receipts, and receive callbacks
-/// *(feature `runtime`)*. Message types come from `groupnet-messaging`; callback
-/// ownership and group fanout reports remain runtime concerns.
-#[cfg(feature = "runtime")]
-pub mod messaging {
-    pub use groupnet_messaging::{
-        Bytes, DEFAULT_MAX_MESSAGE_BYTES, Delivery, Frame, MessageContext, MessageId,
-        MessageProtocol, Messaging, MessagingConfig, Receipt, SendOptions,
-    };
-    pub use groupnet_runtime::messaging::{GroupSendReport, ReceiveHandle, RecipientOutcome};
-}
-
-/// Async runtime: the group-per-task [`Node`](runtime::Node) /
-/// [`Group`](runtime::Group) driver and the cluster [`Routing`](runtime::Routing)
-/// table.
 #[cfg(feature = "runtime")]
 pub use groupnet_runtime as runtime;
-
-/// Ordered streams and explicitly reliable or unreliable unordered sessions.
 #[cfg(feature = "runtime")]
 pub use groupnet_streams as streams;
 
-#[cfg(feature = "runtime")]
-pub use groupnet_messaging::MessageProtocol;
-#[cfg(feature = "runtime")]
-pub use groupnet_runtime::{Endpoint, Messages, Ordered, Peer, PeerImplementation, Unordered};
-#[cfg(feature = "runtime")]
-pub use groupnet_streams::{
-    SessionProtocol, UnorderedConfig, UnorderedDelivery, UnorderedOptions, UnorderedSession,
-};
-
-/// Request/response RPC over the data plane: an
-/// [`RpcClient`](rpc::RpcClient) multiplexes concurrent calls onto one
-/// [`DataStream`](rpc::DataStream) per peer (lazily connected, replaced after
-/// a failure), and an [`RpcServer`](rpc::RpcServer) answers them with an
-/// async handler, bounded per connection and by each request's deadline.
-/// The server composes with other stream consumers: the application owns
-/// `accept` and hands each RPC stream to
-/// [`RpcServer::serve`](rpc::RpcServer::serve), or
-/// [`RpcServer::bind`](rpc::RpcServer::bind) runs the accept loop of a plane
-/// that carries only RPC. Peer addresses are registered on the transport by
-/// the caller *(feature `rpc`)*.
 #[cfg(feature = "rpc")]
 pub use groupnet_rpc as rpc;
 
-/// Session-consistency layer over groups: per-writer sequenced write feeds
-/// ([`WriteFeed`](consistency::WriteFeed) / [`PeerWrites`](consistency::PeerWrites),
-/// loss detected as explicit [`Gap`](consistency::PeerWrite::Gap)s) and
-/// applied-write frontiers for read-your-writes barriers
-/// ([`Frontier`](consistency::Frontier)). Honest scope: per-writer order and
-/// session guarantees — consensus and fencing are deliberately out.
-///
-/// Two stronger tiers sit on top, each priced separately and each off by
-/// default: `consistency-acks` adds applied-watermark acknowledgement
-/// (`AckLedger` / `applied_cluster_wide` — writers wait on every alive member),
-/// and `consistency-leases` adds the coherence-lease tier above it
-/// (`consistency::lease` — readers hold self-expiring leases to *serve*, so a
-/// writer's wait ends at an acknowledgement **or** at a silent peer's lease
-/// lapse). See the crate's own docs for the scaling envelope of each.
-///
-/// Answering the other question — *who may write* — is `consistency-hosted`
-/// (`consistency::hosted`): fenced, epoch-scoped writes through the group's
-/// elected host, with a commit level pricing the guarantee. Its strong profile
-/// (`Activation::Quorum` × `Commit::QuorumApplied`) is consensus, opt-in per
-/// group and deliberately confined to fixed single-digit rosters. Its recovery
-/// is ring-bound, and `consistency-handoff`
-/// (`consistency::hosted::handoff`) is the way past that bound: a covering
-/// snapshot pulled from a donor over the data plane. It is the one consistency
-/// feature that spans both planes, so it turns `bulk` on and expects a binding.
 #[cfg(feature = "consistency")]
 pub use groupnet_consistency as consistency;
 
-/// Deterministic simulation driver ([`Simulation`](sim::Simulation)) and its
-/// seedable PRNG.
 #[cfg(feature = "sim")]
 pub use groupnet_sim as sim;
+
+/// Every Rust snippet in the repository README, compiled as a doctest so the
+/// primary onboarding path cannot drift from the API.
+#[cfg(all(
+    doctest,
+    feature = "runtime",
+    feature = "mem",
+    feature = "tcp",
+    feature = "udp",
+    feature = "connectivity",
+    feature = "rpc",
+    feature = "consistency-acks",
+))]
+#[doc = include_str!("../../../README.md")]
+pub struct ReadmeDoctests;
