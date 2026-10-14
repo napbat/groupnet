@@ -97,6 +97,7 @@ use super::{
 use crate::feed::{PublishError, WriteFeed};
 use crate::peers::checked_head_at;
 use crate::token::WriteToken;
+use crate::wait::WaitDeadline;
 use crate::wire::hosted_entry_key;
 
 /// How often a committed write re-examines the gossiped ledgers — the same
@@ -624,7 +625,7 @@ impl<K: 'static> HostedWrites<K> {
         level: Commit,
         timeout: Duration,
     ) -> CommitOutcome {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = WaitDeadline::after(timeout);
         loop {
             let waiting_on = match CommitCore::evaluate(&self.view(level), &self.me, token, level) {
                 CommitVerdict::Committed => return CommitOutcome::Committed,
@@ -636,7 +637,7 @@ impl<K: 'static> HostedWrites<K> {
             if lead.epoch != token.epoch || lead.host.as_ref() != Some(&self.me) {
                 return CommitOutcome::Deposed { epoch: token.epoch };
             }
-            if tokio::time::Instant::now() >= deadline {
+            if deadline.passed() {
                 return CommitOutcome::TimedOut { waiting_on };
             }
             tokio::time::sleep(COMMIT_POLL).await;

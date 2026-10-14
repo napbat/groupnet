@@ -8,6 +8,8 @@ use super::{
     RecoveryMode, RecoveryRearm, SETTLE, Time, admission, bootstrap_config, eventually_within,
     journal_config, member_from_claim,
 };
+use groupnet_consistency::QueueCapacity;
+use groupnet_consistency::volatile_recovery::bootstrap::PresenceIdentity;
 
 fn captured_for_cleanup(
     serial: u64,
@@ -130,15 +132,16 @@ async fn one_worker_builds_origin_once_before_advertising_donor() {
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap();
     let reads = Arc::new(ReadAdapter::default());
-    let handle = RecoveryHandle::open_with_bootstrap_and_rearm(
-        Arc::clone(&reads),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::clone(&reads), NodeId::from("me"), 9)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -146,17 +149,15 @@ async fn one_worker_builds_origin_once_before_advertising_donor() {
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        9,
-        RecoveryRearm {
+        })
+        .mode(RecoveryMode::Unleased)
+        .rearm(RecoveryRearm {
             initial_ms: 50,
             max_ms: 200,
-        },
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     eventually_within(
         "one guarded builder reaches independent affirmation",
         SETTLE,
@@ -206,15 +207,16 @@ async fn completed_origin_without_donor_capture_serves_without_a_second_scan() {
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap();
     let reads = Arc::new(ReadAdapter::default());
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::clone(&reads),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::clone(&reads), NodeId::from("me"), 9)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -222,13 +224,11 @@ async fn completed_origin_without_donor_capture_serves_without_a_second_scan() {
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        9,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     eventually_within("local-only image is independently affirmed", SETTLE, || {
         handle.status().may_serve && donor.builds.load(Ordering::SeqCst) == 1
     })
@@ -245,7 +245,7 @@ async fn required_participation_keeps_local_origin_and_declines_claim_only_donor
     let donor = Arc::new(OriginDonor::default());
     let mut config = bootstrap_config();
     config.require_participation = true;
-    config.max_claim_metadata_bytes = 512;
+    config.max_claim_metadata_bytes = std::num::NonZeroUsize::new(512).unwrap();
     let (driver, sender) = BootstrapSession::new(
         BootstrapCapabilities {
             claims: Arc::clone(&claims),
@@ -257,15 +257,16 @@ async fn required_participation_keeps_local_origin_and_declines_claim_only_donor
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap();
     let reads = Arc::new(ReadAdapter::default());
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::clone(&reads),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::clone(&reads), NodeId::from("me"), 9)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -273,13 +274,11 @@ async fn required_participation_keeps_local_origin_and_declines_claim_only_donor
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        9,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     eventually_within(
         "local scan can affirm without a donor advertisement",
         SETTLE,
@@ -331,7 +330,7 @@ async fn one_coalesced_wake_serves_a_bounded_burst_without_waiting_for_renewal()
     let donor = Arc::new(OriginDonor::default());
     let mut config = bootstrap_config();
     config.claim.renew_ms = 400;
-    config.donor_inbox_capacity = 4;
+    config.donor_inbox_capacity = QueueCapacity::of(4);
     let (driver, sender) = BootstrapSession::new(
         BootstrapCapabilities {
             claims,
@@ -343,14 +342,15 @@ async fn one_coalesced_wake_serves_a_bounded_burst_without_waiting_for_renewal()
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(23),
-        11,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(23),
+            session: 11,
+        },
     )
     .unwrap();
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::new(ReadAdapter::default()),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::new(ReadAdapter::default()), NodeId::from("me"), 23)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -358,13 +358,11 @@ async fn one_coalesced_wake_serves_a_bounded_burst_without_waiting_for_renewal()
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        23,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     eventually_within("donor capture available", SETTLE, || {
         handle.status().may_serve && donor.ingress.lock().unwrap().is_some()
     })
@@ -415,14 +413,15 @@ async fn stalled_ready_renewal_cannot_serve_a_request_after_capture_expiry() {
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(32),
-        15,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(32),
+            session: 15,
+        },
     )
     .unwrap();
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::new(ReadAdapter::default()),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::new(ReadAdapter::default()), NodeId::from("me"), 32)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -430,13 +429,11 @@ async fn stalled_ready_renewal_cannot_serve_a_request_after_capture_expiry() {
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        32,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     eventually_within("local capture ready", SETTLE, || {
         handle.status().may_serve && donor.ingress.lock().unwrap().is_some()
     })
@@ -499,15 +496,16 @@ async fn cancel_while_capture_is_private_retires_charge_without_publication() {
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(8),
-        2,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(8),
+            session: 2,
+        },
     )
     .unwrap();
     let reads = Arc::new(ReadAdapter::default());
-    let handle = RecoveryHandle::open_with_bootstrap(
-        reads,
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(reads, NodeId::from("me"), 10)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -515,13 +513,11 @@ async fn cancel_while_capture_is_private_retires_charge_without_publication() {
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        10,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     tokio::time::timeout(SETTLE, donor.started.notified())
         .await
         .unwrap();
@@ -556,15 +552,16 @@ async fn expired_builder_permit_cannot_publish_after_child_timeout() {
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(24),
-        12,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(24),
+            session: 12,
+        },
     )
     .unwrap();
     let reads = Arc::new(ReadAdapter::default());
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::clone(&reads),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::clone(&reads), NodeId::from("me"), 24)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -572,13 +569,11 @@ async fn expired_builder_permit_cannot_publish_after_child_timeout() {
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        24,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     tokio::time::timeout(SETTLE, donor.started.notified())
         .await
         .expect("builder callback started");
@@ -613,14 +608,15 @@ async fn donor_only_invalidation_withdraws_ready_without_revoking_local_reads() 
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(9),
-        3,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(9),
+            session: 3,
+        },
     )
     .unwrap();
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::new(ReadAdapter::default()),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::new(ReadAdapter::default()), NodeId::from("me"), 11)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -628,13 +624,11 @@ async fn donor_only_invalidation_withdraws_ready_without_revoking_local_reads() 
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        11,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     eventually_within("capture ready", SETTLE, || {
         handle.status().may_serve && donor.ingress.lock().unwrap().is_some()
     })
@@ -768,24 +762,23 @@ pub(super) fn open_follower(
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(17),
-        7,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(17),
+            session: 7,
+        },
     )
     .unwrap();
     let reads = Arc::new(ReadAdapter {
         peer: Some(peer),
         ..ReadAdapter::default()
     });
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::clone(&reads),
-        recovery,
-        mode,
-        NodeId::from("me"),
-        15,
-        Box::new(driver),
-    )
-    .unwrap();
+    let handle = RecoveryHandle::builder(Arc::clone(&reads), NodeId::from("me"), 15)
+        .config(recovery)
+        .mode(mode)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     (donor, admission, handle, reads)
 }
 
@@ -793,7 +786,7 @@ pub(super) fn open_follower(
 async fn complete_presence_enables_canonical_peer_transfer() {
     let mut config = bootstrap_config();
     config.require_participation = true;
-    config.max_claim_metadata_bytes = 512;
+    config.max_claim_metadata_bytes = std::num::NonZeroUsize::new(512).unwrap();
     let (donor, admission, handle, reads) = follower_setup_with_config(false, config);
     eventually_within(
         "peer transfer and fresh head barrier use the same participant roster",
@@ -818,7 +811,7 @@ async fn complete_presence_enables_canonical_peer_transfer() {
 async fn renewal_due_at_donor_selection_does_not_decline_the_peer() {
     let mut config = bootstrap_config();
     config.require_participation = true;
-    config.max_claim_metadata_bytes = 512;
+    config.max_claim_metadata_bytes = std::num::NonZeroUsize::new(512).unwrap();
     config.claim.settle_ms = 50;
     config.claim.renew_ms = 1;
     let (claims, donor, admission, handle, reads) =
@@ -844,7 +837,7 @@ async fn renewal_due_at_donor_selection_does_not_decline_the_peer() {
 async fn completed_peer_keeps_presence_through_lapse_for_a_third_join() {
     let mut config = bootstrap_config();
     config.require_participation = true;
-    config.max_claim_metadata_bytes = 512;
+    config.max_claim_metadata_bytes = std::num::NonZeroUsize::new(512).unwrap();
     let (claims, donor, _admission, handle, reads) =
         follower_setup_with_mode(false, config, RecoveryMode::Leased);
     reads.lapse_sequences.store(1, Ordering::SeqCst);

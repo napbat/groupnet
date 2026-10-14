@@ -7,7 +7,7 @@ use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, ByteAdmission,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::native_claims::{
-    NativeClaimSource, NativeClaimSourceError,
+    NativeClaimOptions, NativeClaimSource, NativeClaimSourceError,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
     ClaimObservationLimits, ClaimSource,
@@ -42,13 +42,13 @@ fn policy() -> BootstrapConfig {
 
 fn admission() -> ByteAdmission {
     ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: 16_384,
+        max_total_bytes: std::num::NonZeroUsize::new(16_384).unwrap(),
         max_encoded_bytes: 0,
         max_decoded_bytes: 0,
         max_suffix_bytes: 0,
         max_native_overlap_bytes: 0,
         max_inflight_bytes: 16_384,
-        max_reservations: 8,
+        max_reservations: std::num::NonZeroUsize::new(8).unwrap(),
     })
     .unwrap()
 }
@@ -103,11 +103,13 @@ async fn construction_names_each_rejected_argument() {
     let open = |scope, policy, max_key_bytes, max_value_bytes| {
         NativeClaimSource::new(
             group.clone(),
-            scope,
-            policy,
-            max_key_bytes,
-            max_value_bytes,
             admission(),
+            NativeClaimOptions {
+                scope,
+                policy,
+                max_key_bytes,
+                max_value_bytes,
+            },
         )
         .unwrap_err()
     };
@@ -151,7 +153,17 @@ async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_prese
     groupnet_testkit::cluster::converged(&[&a_group, &b_group]).await;
     let budget = admission();
     let source = |group| {
-        NativeClaimSource::new(group, scope(), policy(), 128, VALUE_BYTES, budget.clone()).unwrap()
+        NativeClaimSource::new(
+            group,
+            budget.clone(),
+            NativeClaimOptions {
+                scope: scope(),
+                policy: policy(),
+                max_key_bytes: 128,
+                max_value_bytes: VALUE_BYTES,
+            },
+        )
+        .unwrap()
     };
     let old = source(b_group.clone());
     old.publish_presence(presence(b_id.clone(), 7, 8))
@@ -180,20 +192,24 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
     let budget = admission();
     let old = NativeClaimSource::new(
         cluster.groups[0].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     let new = NativeClaimSource::new(
         cluster.groups[0].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     let mut old_presence = presence(cluster.ids[0].clone(), 7, 8);
@@ -244,11 +260,13 @@ async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_a
     let budget = admission();
     let source = NativeClaimSource::new(
         cluster.groups[0].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     // Fewer racing writes than the bounded re-inspection allows. Each one
@@ -303,20 +321,24 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
     let budget = admission();
     let first = NativeClaimSource::new(
         cluster.groups[0].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     let second = NativeClaimSource::new(
         cluster.groups[1].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     let first_presence = presence(cluster.ids[0].clone(), 7, 8);
@@ -413,20 +435,24 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
     let budget = admission();
     let source_a = NativeClaimSource::new(
         cluster.groups[0].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     let source_b = NativeClaimSource::new(
         cluster.groups[1].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     source_a
@@ -498,20 +524,24 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
     let budget = admission();
     let old = NativeClaimSource::new(
         cluster.groups[0].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     let new = NativeClaimSource::new(
         cluster.groups[0].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     let old_claim = claim(cluster.ids[0].clone());
@@ -549,22 +579,24 @@ async fn failed_converted_admission_retires_raw_actor_response_first() {
     let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let raw_charge = 2_048 + claim_entry_key(&scope(), 128).unwrap().len();
     let budget = ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: raw_charge + 1,
+        max_total_bytes: std::num::NonZeroUsize::new(raw_charge + 1).unwrap(),
         max_encoded_bytes: 0,
         max_decoded_bytes: 0,
         max_suffix_bytes: 0,
         max_native_overlap_bytes: 0,
         max_inflight_bytes: raw_charge + 1,
-        max_reservations: 2,
+        max_reservations: std::num::NonZeroUsize::new(2).unwrap(),
     })
     .unwrap();
     let source = NativeClaimSource::new(
         cluster.groups[0].clone(),
-        scope(),
-        policy(),
-        128,
-        VALUE_BYTES,
         budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: 128,
+            max_value_bytes: VALUE_BYTES,
+        },
     )
     .unwrap();
     let op = BootstrapOperation {

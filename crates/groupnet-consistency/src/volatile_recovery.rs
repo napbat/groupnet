@@ -9,13 +9,14 @@
 //! the engine's events, effects, and steps stay in `groupnet_core`.
 
 pub mod bootstrap;
+mod defaults;
 mod error;
 mod shell;
 
 pub use error::{AdapterError, AdapterErrorKind};
 pub use shell::{
-    PeerObservation, PublicationPermit, ReadyCapturePermit, RecoveryAdapter, RecoveryHandle,
-    RecoveryOpenError, RecoveryStatus,
+    PeerObservation, PublicationPermit, ReadyCapturePermit, RecoveryAdapter, RecoveryBuilder,
+    RecoveryHandle, RecoveryOpenError, RecoveryStatus,
 };
 
 pub use groupnet_core::volatile_recovery::{

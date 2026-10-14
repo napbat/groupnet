@@ -6,14 +6,16 @@ use std::future::ready;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, Admitted, ByteAdmission,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_adapter::{
-    BootstrapStatePort, BulkDonorPort, BulkDonorPortError,
+    BootstrapStatePort, BulkDonorOptions, BulkDonorPort, BulkDonorPortError,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
-    BootstrapBulkListener, BulkLimits, BulkLimitsError, PhaseLimits, WireLimits,
+    BootstrapBulkClient, BootstrapBulkListener, BulkLimits, BulkLimitsError, PhaseLimits,
+    WireLimits, WireLimitsError,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::inbox::DonorInbox;
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
@@ -144,13 +146,13 @@ impl BootstrapStatePort for PrivateState {
 
 fn admission() -> ByteAdmission {
     ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: 100_000,
+        max_total_bytes: std::num::NonZeroUsize::new(100_000).unwrap(),
         max_encoded_bytes: 100_000,
         max_decoded_bytes: 100_000,
         max_suffix_bytes: 100_000,
         max_native_overlap_bytes: 100_000,
         max_inflight_bytes: 100_000,
-        max_reservations: 100,
+        max_reservations: std::num::NonZeroUsize::new(100).unwrap(),
     })
     .unwrap()
 }
@@ -158,21 +160,21 @@ fn admission() -> ByteAdmission {
 fn limits() -> BulkLimits {
     BulkLimits {
         wire: WireLimits {
-            max_frame_bytes: 4096,
-            max_scope_bytes: 64,
-            max_node_bytes: 32,
-            max_payload_bytes: 2048,
+            max_frame_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_payload_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
         },
         phase: PhaseLimits {
-            max_body_bytes: 2048,
-            max_scope_bytes: 64,
-            max_node_bytes: 32,
-            max_writer_bytes: 32,
-            max_cuts: 4,
-            max_members: 4,
-            max_events: 4,
-            max_identity_bytes: 32,
-            max_effect_bytes: 128,
+            max_body_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_writer_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_cuts: std::num::NonZeroUsize::new(4).unwrap(),
+            max_members: std::num::NonZeroUsize::new(4).unwrap(),
+            max_events: std::num::NonZeroUsize::new(4).unwrap(),
+            max_identity_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_effect_bytes: std::num::NonZeroUsize::new(128).unwrap(),
         },
         server_request: Duration::from_secs(1),
     }
@@ -267,9 +269,11 @@ async fn wrong_admission_pool_is_rejected_before_network_allocation() {
         Arc::new(PrivateState),
         plane,
         owned.clone(),
-        scope,
-        policy(),
-        limits(),
+        BulkDonorOptions {
+            scope,
+            policy: policy(),
+            limits: limits(),
+        },
     )
     .unwrap();
     let mut resources = TransferResources::default();
@@ -300,9 +304,11 @@ fn construction_names_each_rejected_rule() {
             Arc::new(PrivateState),
             DataPlane::new(net.endpoint(NodeId::from("follower"))),
             admission(),
-            scope,
-            policy,
-            limits,
+            BulkDonorOptions {
+                scope,
+                policy,
+                limits,
+            },
         )
         .err()
     };
@@ -337,14 +343,46 @@ fn construction_names_each_rejected_rule() {
         open(scope.clone(), wide, limits()),
         Some(BulkDonorPortError::MetadataExceedsBody)
     );
-    let mut zero_frame = limits();
-    zero_frame.wire.max_frame_bytes = 0;
-    let rejected = open(scope, policy(), zero_frame).unwrap();
+    let mut oversized_frame = limits();
+    oversized_frame.wire.max_frame_bytes =
+        std::num::NonZeroUsize::new(groupnet_transport::framing::MAX_FRAME_BYTES + 1).unwrap();
+    let rejected = open(scope, policy(), oversized_frame).unwrap();
     assert_eq!(
         rejected,
-        BulkDonorPortError::Limits(BulkLimitsError::FrameBytes)
+        BulkDonorPortError::Limits(BulkLimitsError::Wire(WireLimitsError::FrameAboveTransport))
     );
     assert!(std::error::Error::source(&rejected).is_some());
+}
+
+/// The responder's per-request deadline is checked when the listener or
+/// client is built, not discovered after the first accepted connection.
+#[test]
+fn an_unrepresentable_server_deadline_is_rejected_before_serving() {
+    let net = MemBulkNet::new();
+    let unbounded = BulkLimits {
+        server_request: Duration::MAX,
+        ..limits()
+    };
+    let (sender, _inbox) = DonorInbox::new(QueueCapacity::MIN);
+    assert_eq!(
+        BootstrapBulkListener::new(
+            DataPlane::new(net.endpoint(NodeId::from("donor"))),
+            sender,
+            admission(),
+            unbounded,
+        )
+        .err(),
+        Some(BulkLimitsError::ServerRequestRange)
+    );
+    assert_eq!(
+        BootstrapBulkClient::new(
+            DataPlane::new(net.endpoint(NodeId::from("follower"))),
+            admission(),
+            unbounded,
+        )
+        .err(),
+        Some(BulkLimitsError::ServerRequestRange)
+    );
 }
 
 #[tokio::test]
@@ -377,7 +415,7 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
         ],
         cuts: vec![],
     };
-    let (sender, mut inbox) = DonorInbox::new(5).unwrap();
+    let (sender, mut inbox) = DonorInbox::new(QueueCapacity::of(5));
     inbox.set_identity(Some(context.donor.clone()));
     let listener =
         BootstrapBulkListener::new(donor_plane, sender, donor_budget.clone(), limits()).unwrap();
@@ -423,9 +461,11 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
         Arc::new(PrivateState),
         follower_plane,
         worker_budget.clone(),
-        scope,
-        policy(),
-        limits(),
+        BulkDonorOptions {
+            scope,
+            policy: policy(),
+            limits: limits(),
+        },
     )
     .unwrap();
     let mut resources = TransferResources::default();
@@ -645,9 +685,11 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
         Arc::new(PrivateState),
         plane,
         budget.clone(),
-        scope,
-        policy(),
-        limits(),
+        BulkDonorOptions {
+            scope,
+            policy: policy(),
+            limits: limits(),
+        },
     )
     .unwrap();
     let capture = capture_for_test(&budget);

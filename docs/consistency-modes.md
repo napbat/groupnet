@@ -800,9 +800,10 @@ error; a client may be acknowledged only for `Committed`.
 ##### The commit ledger: epoch-stamped, and why literal ack reuse fails
 
 The commit-levels sketch reads "the acks-tier machinery scoped to voters". As
-built it is a **new, epoch-stamped ledger** — `~hosted:applied`
-(`~hosted:applied:<name>` for a named write path) — carrying one leadership
-epoch followed by the same watermark records the ack ledger uses:
+built it is a **new, epoch-stamped ledger** — `~hosted/applied/d`
+(`~hosted/applied/n<len>:<name>` for a named write path, the crate's shared
+injective entry layout) — carrying one leadership epoch followed by the same
+watermark records the ack ledger uses:
 
 ```text
 (lead_epoch: u64 LE) (records: u32 LE) (writer_len: u32, writer: utf-8, token_epoch: u64, token_seq: u64)*
@@ -1848,8 +1849,9 @@ mis-deployed node rather than letting it misparse frames.
 **Consumer API:** select the group mode with `GroupProfile::hosted(HostedConfig)`
 and `Node::join_group_with`; observe it with `Group::leadership()`. Construct a
 Local-only path with `HostedWrites::new(group, me, capacity, encode)`, or a
-quorum-committed path with `HostedWrites::committed(group, me, capacity, encode,
-ledger)`, which validates the Hosted/Quorum configuration and ledger binding.
+quorum-committed path with
+`HostedWrites::builder(group, me, capacity, encode).committed(ledger).build()?`,
+whose `build` validates the Hosted/Quorum configuration and ledger binding.
 `fence()` returns `Option<Fence>` only when service is admitted; `publish` returns
 a token or `HostedError`. Request a commit level and deadline through
 `publish_committed`, not by assuming that `publish` alone waited for a majority.

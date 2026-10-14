@@ -24,13 +24,13 @@ use tokio::sync::oneshot;
 
 fn budget() -> ByteAdmission {
     ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: 100_000,
+        max_total_bytes: std::num::NonZeroUsize::new(100_000).unwrap(),
         max_encoded_bytes: 100_000,
         max_decoded_bytes: 100_000,
         max_suffix_bytes: 100_000,
         max_native_overlap_bytes: 100_000,
         max_inflight_bytes: 100_000,
-        max_reservations: 100,
+        max_reservations: std::num::NonZeroUsize::new(100).unwrap(),
     })
     .unwrap()
 }
@@ -38,21 +38,21 @@ fn budget() -> ByteAdmission {
 fn limits() -> BulkLimits {
     BulkLimits {
         wire: WireLimits {
-            max_frame_bytes: 4096,
-            max_scope_bytes: 64,
-            max_node_bytes: 32,
-            max_payload_bytes: 2048,
+            max_frame_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_payload_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
         },
         phase: PhaseLimits {
-            max_body_bytes: 2048,
-            max_scope_bytes: 64,
-            max_node_bytes: 32,
-            max_writer_bytes: 32,
-            max_cuts: 4,
-            max_members: 4,
-            max_events: 4,
-            max_identity_bytes: 32,
-            max_effect_bytes: 128,
+            max_body_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_writer_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_cuts: std::num::NonZeroUsize::new(4).unwrap(),
+            max_members: std::num::NonZeroUsize::new(4).unwrap(),
+            max_events: std::num::NonZeroUsize::new(4).unwrap(),
+            max_identity_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_effect_bytes: std::num::NonZeroUsize::new(128).unwrap(),
         },
         server_request: Duration::from_secs(1),
     }

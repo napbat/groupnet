@@ -6,8 +6,9 @@ use std::time::Instant;
 use super::*;
 use groupnet_consistency::replication::{
     Operation, SnapshotApplicationAdapter, SnapshotAttachment, SnapshotConfig, SnapshotHold,
-    SnapshotImage, SnapshotOffer, SnapshotSourceAdapter, SnapshotStage, Time,
+    SnapshotImage, SnapshotOffer, SnapshotSourceAdapter, SnapshotStage,
 };
+use groupnet_core::Time;
 
 fn unused<T>() -> Result<T, AdapterFailure<io::Error>> {
     Err(AdapterFailure::Terminal(io::Error::other(

@@ -1,7 +1,9 @@
 //! Static mode bridge for worker-owned native snapshot handles.
 
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use groupnet_core::replication::{Operation, Scope, SnapshotConfig, SnapshotOffer, SourceProof};
@@ -12,10 +14,20 @@ use super::snapshot_api::{
     SnapshotImage, SnapshotSourceAdapter, SnapshotStage,
 };
 
-type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T, FailureClass>> + Send + 'a>>;
+/// A replay-only mode has no snapshot capability: every operation resolves at
+/// once to a terminal failure without touching an adapter.
+struct Unavailable<T>(PhantomData<fn() -> T>);
 
-fn unavailable<T>() -> Work<'static, T> {
-    Box::pin(async { Err(FailureClass::Terminal) })
+impl<T> Future for Unavailable<T> {
+    type Output = Result<T, FailureClass>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(Err(FailureClass::Terminal))
+    }
+}
+
+fn unavailable<T>() -> Unavailable<T> {
+    Unavailable(PhantomData)
 }
 
 pub(crate) trait SnapshotMode<S, A>: Send + Sync + 'static
@@ -36,7 +48,7 @@ where
         _: groupnet_core::Time,
         _: Instant,
         _: SnapshotConfig,
-    ) -> Work<'_, SnapshotHold<Self::Hold>> {
+    ) -> impl Future<Output = Result<SnapshotHold<Self::Hold>, FailureClass>> + Send + '_ {
         unavailable()
     }
 
@@ -45,11 +57,17 @@ where
         _: &'a mut Self::Hold,
         _: Scope,
         _: SnapshotConfig,
-    ) -> Work<'a, SnapshotImage<Self::ReadHandle>> {
+    ) -> impl Future<Output = Result<SnapshotImage<Self::ReadHandle>, FailureClass>> + Send + 'a
+    {
         unavailable()
     }
 
-    fn read<'a>(_: &'a S, _: &'a mut Self::ReadHandle, _: u64, _: usize) -> Work<'a, Vec<u8>> {
+    fn read<'a>(
+        _: &'a S,
+        _: &'a mut Self::ReadHandle,
+        _: u64,
+        _: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, FailureClass>> + Send + 'a {
         unavailable()
     }
 
@@ -58,7 +76,7 @@ where
         _: &'a mut Self::Hold,
         _: S::Position,
         _: SnapshotConfig,
-    ) -> Work<'a, SourceProof> {
+    ) -> impl Future<Output = Result<SourceProof, FailureClass>> + Send + 'a {
         unavailable()
     }
 
@@ -66,11 +84,12 @@ where
         _: &'a S,
         _: &'a mut Self::Hold,
         _: S::Position,
-    ) -> Work<'a, SnapshotAttachment<Self::Attachment>> {
+    ) -> impl Future<Output = Result<SnapshotAttachment<Self::Attachment>, FailureClass>> + Send + 'a
+    {
         unavailable()
     }
 
-    fn release(_: &S, _: Self::Hold) -> Work<'_, ()> {
+    fn release(_: &S, _: Self::Hold) -> impl Future<Output = Result<(), FailureClass>> + Send + '_ {
         unavailable()
     }
 
@@ -79,15 +98,24 @@ where
         _: Scope,
         _: &'a SnapshotOffer,
         _: CheckpointLimit,
-    ) -> Work<'a, SnapshotStage<Self::Stage>> {
+    ) -> impl Future<Output = Result<SnapshotStage<Self::Stage>, FailureClass>> + Send + 'a {
         unavailable()
     }
 
-    fn write<'a>(_: &'a A, _: &'a mut Self::Stage, _: u64, _: Vec<u8>) -> Work<'a, usize> {
+    fn write<'a>(
+        _: &'a A,
+        _: &'a mut Self::Stage,
+        _: u64,
+        _: Vec<u8>,
+    ) -> impl Future<Output = Result<usize, FailureClass>> + Send + 'a {
         unavailable()
     }
 
-    fn verify<'a>(_: &'a A, _: &'a mut Self::Stage, _: &'a [u8]) -> Work<'a, usize> {
+    fn verify<'a>(
+        _: &'a A,
+        _: &'a mut Self::Stage,
+        _: &'a [u8],
+    ) -> impl Future<Output = Result<usize, FailureClass>> + Send + 'a {
         unavailable()
     }
 
@@ -97,7 +125,7 @@ where
         _: S::Position,
         _: S::Position,
         _: S::Batch,
-    ) -> Work<'a, usize> {
+    ) -> impl Future<Output = Result<usize, FailureClass>> + Send + 'a {
         unavailable()
     }
 
@@ -105,7 +133,8 @@ where
         _: &A,
         _: Self::Stage,
         _: S::Position,
-    ) -> Work<'_, Checkpoint<S::Position, A::Recovery>> {
+    ) -> impl Future<Output = Result<Checkpoint<S::Position, A::Recovery>, FailureClass>> + Send + '_
+    {
         unavailable()
     }
 }
@@ -133,125 +162,115 @@ where
     type Stage = A::Stage;
     const ENABLED: bool = true;
 
-    fn acquire(
+    async fn acquire(
         source: &S,
         scope: Scope,
         request: Operation,
         due: groupnet_core::Time,
         wall_deadline: Instant,
         limit: SnapshotConfig,
-    ) -> Work<'_, SnapshotHold<Self::Hold>> {
-        Box::pin(async move {
-            source
-                .acquire_hold(scope, request, due, wall_deadline, limit)
-                .await
-                .map_err(|e| e.class())
-        })
+    ) -> Result<SnapshotHold<Self::Hold>, FailureClass> {
+        source
+            .acquire_hold(scope, request, due, wall_deadline, limit)
+            .await
+            .map_err(|e| e.class())
     }
 
-    fn offer<'a>(
+    async fn offer<'a>(
         source: &'a S,
         hold: &'a mut Self::Hold,
         scope: Scope,
         limit: SnapshotConfig,
-    ) -> Work<'a, SnapshotImage<Self::ReadHandle>> {
-        Box::pin(async move {
-            source
-                .offer(hold, scope, limit)
-                .await
-                .map_err(|e| e.class())
-        })
+    ) -> Result<SnapshotImage<Self::ReadHandle>, FailureClass> {
+        source
+            .offer(hold, scope, limit)
+            .await
+            .map_err(|e| e.class())
     }
 
-    fn read<'a>(
+    async fn read<'a>(
         source: &'a S,
         read: &'a mut Self::ReadHandle,
         offset: u64,
         max: usize,
-    ) -> Work<'a, Vec<u8>> {
-        Box::pin(async move {
-            source
-                .read_chunk(read, offset, max)
-                .await
-                .map_err(|e| e.class())
-        })
+    ) -> Result<Vec<u8>, FailureClass> {
+        source
+            .read_chunk(read, offset, max)
+            .await
+            .map_err(|e| e.class())
     }
 
-    fn barrier<'a>(
+    async fn barrier<'a>(
         source: &'a S,
         hold: &'a mut Self::Hold,
         from: S::Position,
         limit: SnapshotConfig,
-    ) -> Work<'a, SourceProof> {
-        Box::pin(async move {
-            source
-                .barrier(hold, from, limit)
-                .await
-                .map_err(|e| e.class())
-        })
+    ) -> Result<SourceProof, FailureClass> {
+        source
+            .barrier(hold, from, limit)
+            .await
+            .map_err(|e| e.class())
     }
 
-    fn attach<'a>(
+    async fn attach<'a>(
         source: &'a S,
         hold: &'a mut Self::Hold,
         after: S::Position,
-    ) -> Work<'a, SnapshotAttachment<Self::Attachment>> {
-        Box::pin(async move { source.attach(hold, after).await.map_err(|e| e.class()) })
+    ) -> Result<SnapshotAttachment<Self::Attachment>, FailureClass> {
+        source.attach(hold, after).await.map_err(|e| e.class())
     }
 
-    fn release(source: &S, hold: Self::Hold) -> Work<'_, ()> {
-        Box::pin(async move { source.release_hold(hold).await.map_err(|e| e.class()) })
+    async fn release(source: &S, hold: Self::Hold) -> Result<(), FailureClass> {
+        source.release_hold(hold).await.map_err(|e| e.class())
     }
 
-    fn open<'a>(
+    async fn open<'a>(
         app: &'a A,
         scope: Scope,
         offer: &'a SnapshotOffer,
         limit: CheckpointLimit,
-    ) -> Work<'a, SnapshotStage<Self::Stage>> {
-        Box::pin(async move {
-            app.begin_stage(scope, offer, limit)
-                .await
-                .map_err(|e| e.class())
-        })
+    ) -> Result<SnapshotStage<Self::Stage>, FailureClass> {
+        app.begin_stage(scope, offer, limit)
+            .await
+            .map_err(|e| e.class())
     }
 
-    fn write<'a>(
+    async fn write<'a>(
         app: &'a A,
         stage: &'a mut Self::Stage,
         offset: u64,
         bytes: Vec<u8>,
-    ) -> Work<'a, usize> {
-        Box::pin(async move {
-            app.write_chunk(stage, offset, bytes)
-                .await
-                .map_err(|e| e.class())
-        })
+    ) -> Result<usize, FailureClass> {
+        app.write_chunk(stage, offset, bytes)
+            .await
+            .map_err(|e| e.class())
     }
 
-    fn verify<'a>(app: &'a A, stage: &'a mut Self::Stage, digest: &'a [u8]) -> Work<'a, usize> {
-        Box::pin(async move { app.verify_image(stage, digest).await.map_err(|e| e.class()) })
+    async fn verify<'a>(
+        app: &'a A,
+        stage: &'a mut Self::Stage,
+        digest: &'a [u8],
+    ) -> Result<usize, FailureClass> {
+        app.verify_image(stage, digest).await.map_err(|e| e.class())
     }
 
-    fn apply<'a>(
+    async fn apply<'a>(
         app: &'a A,
         stage: &'a mut Self::Stage,
         from: S::Position,
         through: S::Position,
         batch: S::Batch,
-    ) -> Work<'a, usize> {
-        Box::pin(async move {
-            app.apply_private(stage, from, through, batch)
-                .await
-                .map_err(|e| e.class())
-        })
+    ) -> Result<usize, FailureClass> {
+        app.apply_private(stage, from, through, batch)
+            .await
+            .map_err(|e| e.class())
     }
 
-    fn seal(
+    async fn seal(
         app: &A,
         stage: Self::Stage,
         through: S::Position,
-    ) -> Work<'_, Checkpoint<S::Position, A::Recovery>> {
-        Box::pin(async move { app.seal_stage(stage, through).await.map_err(|e| e.class()) })
+    ) -> Result<Checkpoint<S::Position, A::Recovery>, FailureClass> {
+        app.seal_stage(stage, through).await.map_err(|e| e.class())
     }
 }

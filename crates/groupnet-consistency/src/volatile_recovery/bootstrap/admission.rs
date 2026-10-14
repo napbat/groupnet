@@ -1,5 +1,6 @@
 //! Shared byte admission for optional volatile peer bootstrap.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use crate::volatile_recovery::{AdapterError, AdapterErrorKind};
@@ -32,31 +33,49 @@ impl AdmissionClass {
 }
 
 /// Aggregate and per-class caps shared across all recovery scopes.
+///
+/// The aggregate and reservation bounds are nonzero by type; a zero class cap
+/// is valid and disables that class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionLimits {
     /// Maximum simultaneous bytes.
-    pub max_total_bytes: usize,
-    /// Maximum encoded image and chunk bytes.
+    pub max_total_bytes: NonZeroUsize,
+    /// Maximum encoded image and chunk bytes; zero disables the class.
     pub max_encoded_bytes: usize,
-    /// Maximum decoded private-index bytes.
+    /// Maximum decoded private-index bytes; zero disables the class.
     pub max_decoded_bytes: usize,
-    /// Maximum retained donor-suffix bytes.
+    /// Maximum retained donor-suffix bytes; zero disables the class.
     pub max_suffix_bytes: usize,
-    /// Maximum native-overlap bytes.
+    /// Maximum native-overlap bytes; zero disables the class.
     pub max_native_overlap_bytes: usize,
-    /// Maximum returned-batch and queued-frame bytes.
+    /// Maximum returned-batch and queued-frame bytes; zero disables the
+    /// class.
     pub max_inflight_bytes: usize,
     /// Maximum simultaneous resource reservations.
-    pub max_reservations: usize,
+    pub max_reservations: NonZeroUsize,
+}
+
+impl Default for AdmissionLimits {
+    /// A 256 MiB pool: two 64 MiB images (encoded and decoded), 16 MiB each
+    /// of donor suffix and native overlap, 64 MiB of in-flight frames and
+    /// metadata, and 1024 simultaneous reservations.
+    fn default() -> Self {
+        const MIB: usize = 1024 * 1024;
+        Self {
+            max_total_bytes: NonZeroUsize::new(256 * MIB).expect("nonzero"),
+            max_encoded_bytes: 64 * MIB,
+            max_decoded_bytes: 64 * MIB,
+            max_suffix_bytes: 16 * MIB,
+            max_native_overlap_bytes: 16 * MIB,
+            max_inflight_bytes: 64 * MIB,
+            max_reservations: NonZeroUsize::new(1024).expect("nonzero"),
+        }
+    }
 }
 
 /// An [`AdmissionLimits`] rule that [`AdmissionLimits::validate`] rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionLimitsError {
-    /// `max_total_bytes` is zero.
-    ZeroTotal,
-    /// `max_reservations` is zero.
-    ZeroReservations,
     /// The cap of this class exceeds `max_total_bytes`.
     ClassExceedsTotal(AdmissionClass),
 }
@@ -64,8 +83,6 @@ pub enum AdmissionLimitsError {
 impl std::fmt::Display for AdmissionLimitsError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ZeroTotal => formatter.write_str("max_total_bytes is zero"),
-            Self::ZeroReservations => formatter.write_str("max_reservations is zero"),
             Self::ClassExceedsTotal(class) => {
                 write!(formatter, "the {class:?} cap exceeds max_total_bytes")
             }
@@ -104,18 +121,11 @@ impl From<AdmissionError> for AdapterError {
 }
 
 impl AdmissionLimits {
-    /// Checks the aggregate and per-class caps. A zero class cap is valid: it
-    /// disables that class.
+    /// Checks every class cap against the aggregate.
     ///
     /// # Errors
-    /// Names the zero aggregate bound or the class cap above the total.
+    /// Names the class whose cap exceeds `max_total_bytes`.
     pub fn validate(&self) -> Result<(), AdmissionLimitsError> {
-        if self.max_total_bytes == 0 {
-            return Err(AdmissionLimitsError::ZeroTotal);
-        }
-        if self.max_reservations == 0 {
-            return Err(AdmissionLimitsError::ZeroReservations);
-        }
         let classes = [
             AdmissionClass::Encoded,
             AdmissionClass::Decoded,
@@ -125,7 +135,7 @@ impl AdmissionLimits {
         ];
         match classes
             .into_iter()
-            .find(|class| self.class_cap(*class) > self.max_total_bytes)
+            .find(|class| self.class_cap(*class) > self.max_total_bytes.get())
         {
             Some(class) => Err(AdmissionLimitsError::ClassExceedsTotal(class)),
             None => Ok(()),
@@ -206,9 +216,9 @@ impl ByteAdmission {
             .reservations
             .checked_add(1)
             .ok_or(AdmissionError::Full)?;
-        if total > self.0.limits.max_total_bytes
+        if total > self.0.limits.max_total_bytes.get()
             || class_total > cap
-            || reservations > self.0.limits.max_reservations
+            || reservations > self.0.limits.max_reservations.get()
         {
             return Err(AdmissionError::Full);
         }
@@ -349,13 +359,13 @@ mod tests {
 
     fn limits() -> AdmissionLimits {
         AdmissionLimits {
-            max_total_bytes: 10,
+            max_total_bytes: std::num::NonZeroUsize::new(10).unwrap(),
             max_encoded_bytes: 10,
             max_decoded_bytes: 10,
             max_suffix_bytes: 10,
             max_native_overlap_bytes: 10,
             max_inflight_bytes: 10,
-            max_reservations: 2,
+            max_reservations: std::num::NonZeroUsize::new(2).unwrap(),
         }
     }
 
@@ -395,13 +405,13 @@ mod tests {
     #[test]
     fn payload_drops_before_charge_is_released() {
         let budget = ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 1,
+            max_total_bytes: std::num::NonZeroUsize::new(1).unwrap(),
             max_encoded_bytes: 1,
             max_decoded_bytes: 1,
             max_suffix_bytes: 1,
             max_native_overlap_bytes: 1,
             max_inflight_bytes: 1,
-            max_reservations: 1,
+            max_reservations: std::num::NonZeroUsize::new(1).unwrap(),
         })
         .unwrap();
         let retired = Arc::new(AtomicUsize::new(0));
@@ -421,13 +431,13 @@ mod tests {
     #[test]
     fn scoped_consume_keeps_charge_through_core_processing() {
         let budget = ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 1,
+            max_total_bytes: std::num::NonZeroUsize::new(1).unwrap(),
             max_encoded_bytes: 0,
             max_decoded_bytes: 0,
             max_suffix_bytes: 0,
             max_native_overlap_bytes: 0,
             max_inflight_bytes: 1,
-            max_reservations: 1,
+            max_reservations: std::num::NonZeroUsize::new(1).unwrap(),
         })
         .unwrap();
         let retired = Arc::new(AtomicUsize::new(0));
@@ -443,13 +453,13 @@ mod tests {
     #[test]
     fn owned_conversion_and_failed_conversion_release_after_payload() {
         let budget = ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 1,
+            max_total_bytes: std::num::NonZeroUsize::new(1).unwrap(),
             max_encoded_bytes: 0,
             max_decoded_bytes: 0,
             max_suffix_bytes: 0,
             max_native_overlap_bytes: 0,
             max_inflight_bytes: 1,
-            max_reservations: 1,
+            max_reservations: std::num::NonZeroUsize::new(1).unwrap(),
         })
         .unwrap();
         let retired = Arc::new(AtomicUsize::new(0));
@@ -481,13 +491,13 @@ mod tests {
     #[test]
     fn per_class_limit_rejects_without_leaking_total_charge() {
         let budget = ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 10,
+            max_total_bytes: std::num::NonZeroUsize::new(10).unwrap(),
             max_encoded_bytes: 2,
             max_decoded_bytes: 10,
             max_suffix_bytes: 10,
             max_native_overlap_bytes: 10,
             max_inflight_bytes: 10,
-            max_reservations: 2,
+            max_reservations: std::num::NonZeroUsize::new(2).unwrap(),
         })
         .unwrap();
         assert_eq!(
@@ -525,22 +535,37 @@ mod tests {
     fn invalid_limits_name_their_rule() {
         assert_eq!(
             ByteAdmission::new(AdmissionLimits {
-                max_total_bytes: 0,
+                max_suffix_bytes: 11,
                 ..limits()
             })
             .unwrap_err(),
-            AdmissionLimitsError::ZeroTotal
+            AdmissionLimitsError::ClassExceedsTotal(AdmissionClass::Suffix)
         );
+        // A zero class cap disables that class; it is not an error.
         assert_eq!(
             AdmissionLimits {
-                max_suffix_bytes: 11,
+                max_encoded_bytes: 0,
                 ..limits()
             }
             .validate(),
-            Err(AdmissionLimitsError::ClassExceedsTotal(
-                AdmissionClass::Suffix
-            ))
+            Ok(())
         );
+    }
+
+    #[test]
+    fn the_default_pool_is_valid_and_admits_every_class() {
+        let defaults = AdmissionLimits::default();
+        assert_eq!(defaults.validate(), Ok(()));
+        let budget = ByteAdmission::new(defaults).unwrap();
+        for class in [
+            AdmissionClass::Encoded,
+            AdmissionClass::Decoded,
+            AdmissionClass::Suffix,
+            AdmissionClass::NativeOverlap,
+            AdmissionClass::Inflight,
+        ] {
+            assert!(budget.reserve(class, 1).is_ok(), "{class:?}");
+        }
     }
 
     #[test]

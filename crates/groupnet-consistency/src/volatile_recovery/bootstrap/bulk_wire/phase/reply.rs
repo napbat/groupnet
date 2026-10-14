@@ -42,7 +42,7 @@ fn write_cuts(
     cuts: &[NativeCut],
     limits: PhaseLimits,
 ) -> Result<(), WireError> {
-    if cuts.len() > limits.max_cuts
+    if cuts.len() > limits.max_cuts.get()
         || cuts
             .windows(2)
             .any(|pair| (&pair[0].writer, pair[0].epoch) >= (&pair[1].writer, pair[1].epoch))
@@ -55,7 +55,7 @@ fn write_cuts(
             .to_be_bytes(),
     )?;
     for cut in cuts {
-        writer.blob(&cut.writer, limits.max_writer_bytes)?;
+        writer.blob(&cut.writer, limits.max_writer_bytes.get())?;
         writer.put(&cut.epoch.to_be_bytes())?;
         writer.put(&cut.sequence.to_be_bytes())?;
     }
@@ -64,7 +64,7 @@ fn write_cuts(
 
 fn read_cuts(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<Vec<NativeCut>, WireError> {
     let count = usize::from(u16::from_be_bytes(reader.number()?));
-    if count > limits.max_cuts {
+    if count > limits.max_cuts.get() {
         return Err(WireError::Capacity);
     }
     let mut cuts = Vec::new();
@@ -72,7 +72,7 @@ fn read_cuts(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<Vec<NativeC
         .map_err(|_| WireError::Capacity)?;
     for _ in 0..count {
         let cut = NativeCut {
-            writer: read_blob(reader, limits.max_writer_bytes)?,
+            writer: read_blob(reader, limits.max_writer_bytes.get())?,
             epoch: u64::from_be_bytes(reader.number()?),
             sequence: u64::from_be_bytes(reader.number()?),
         };
@@ -92,7 +92,7 @@ fn write_members(
     members: &[groupnet_core::volatile_bootstrap::BootstrapMemberIdentity],
     limits: PhaseLimits,
 ) -> Result<(), WireError> {
-    if members.len() > limits.max_members
+    if members.len() > limits.max_members.get()
         || members.windows(2).any(|pair| pair[0].node >= pair[1].node)
     {
         return Err(WireError::Invalid);
@@ -113,7 +113,7 @@ fn read_members(
     limits: PhaseLimits,
 ) -> Result<Vec<groupnet_core::volatile_bootstrap::BootstrapMemberIdentity>, WireError> {
     let count = usize::from(u16::from_be_bytes(reader.number()?));
-    if count > limits.max_members {
+    if count > limits.max_members.get() {
         return Err(WireError::Capacity);
     }
     let mut members = Vec::new();
@@ -161,8 +161,8 @@ fn valid_batch(value: &JournalBatch, correlation: &Correlation, limits: PhaseLim
         || value.operation == 0
         || value.from.capture != value.reservation.capture
         || value.through.capture != value.reservation.capture
-        || value.deltas.len() > limits.max_events
-        || value.bytes > limits.max_body_bytes
+        || value.deltas.len() > limits.max_events.get()
+        || value.bytes > limits.max_body_bytes.get()
     {
         return false;
     }
@@ -172,12 +172,14 @@ fn valid_batch(value: &JournalBatch, correlation: &Correlation, limits: PhaseLim
             return false;
         };
         if delta.position != next
-            || delta.effect.len() > limits.max_effect_bytes
+            || delta.effect.len() > limits.max_effect_bytes.get()
             || match &delta.identity {
                 DeltaIdentity::Native(cut) => {
-                    cut.writer.is_empty() || cut.writer.len() > limits.max_writer_bytes
+                    cut.writer.is_empty() || cut.writer.len() > limits.max_writer_bytes.get()
                 }
-                DeltaIdentity::Local(id) => id.is_empty() || id.len() > limits.max_identity_bytes,
+                DeltaIdentity::Local(id) => {
+                    id.is_empty() || id.len() > limits.max_identity_bytes.get()
+                }
             }
         {
             return false;
@@ -236,16 +238,16 @@ fn write_batch(
         match &delta.identity {
             DeltaIdentity::Native(cut) => {
                 writer.put(&[1])?;
-                writer.blob(&cut.writer, limits.max_writer_bytes)?;
+                writer.blob(&cut.writer, limits.max_writer_bytes.get())?;
                 writer.put(&cut.epoch.to_be_bytes())?;
                 writer.put(&cut.sequence.to_be_bytes())?;
             }
             DeltaIdentity::Local(id) => {
                 writer.put(&[2])?;
-                writer.blob(id, limits.max_identity_bytes)?;
+                writer.blob(id, limits.max_identity_bytes.get())?;
             }
         }
-        if delta.effect.len() > limits.max_effect_bytes {
+        if delta.effect.len() > limits.max_effect_bytes.get() {
             return Err(WireError::Capacity);
         }
         writer.put(
@@ -264,7 +266,7 @@ fn read_batch(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<JournalBat
     let from = read_cursor(reader, limits)?;
     let through = read_cursor(reader, limits)?;
     let count = usize::from(u16::from_be_bytes(reader.number()?));
-    if count > limits.max_events {
+    if count > limits.max_events.get() {
         return Err(WireError::Capacity);
     }
     let mut deltas = Vec::new();
@@ -275,16 +277,16 @@ fn read_batch(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<JournalBat
         let position = u64::from_be_bytes(reader.number()?);
         let identity = match reader.number::<1>()?[0] {
             1 => DeltaIdentity::Native(NativeCut {
-                writer: read_blob(reader, limits.max_writer_bytes)?,
+                writer: read_blob(reader, limits.max_writer_bytes.get())?,
                 epoch: u64::from_be_bytes(reader.number()?),
                 sequence: u64::from_be_bytes(reader.number()?),
             }),
-            2 => DeltaIdentity::Local(read_blob(reader, limits.max_identity_bytes)?),
+            2 => DeltaIdentity::Local(read_blob(reader, limits.max_identity_bytes.get())?),
             _ => return Err(WireError::Invalid),
         };
         let effect_len = usize::try_from(u32::from_be_bytes(reader.number()?))
             .map_err(|_| WireError::Capacity)?;
-        if effect_len > limits.max_effect_bytes {
+        if effect_len > limits.max_effect_bytes.get() {
             return Err(WireError::Capacity);
         }
         let effect_slice = reader.take(effect_len)?;
@@ -319,10 +321,7 @@ pub fn encode_reply(
     exchange: ExchangeKind,
     limits: PhaseLimits,
 ) -> Result<Envelope, WireError> {
-    if !limits.valid() {
-        return Err(WireError::Capacity);
-    }
-    let mut writer = Writer::new(limits.max_body_bytes);
+    let mut writer = Writer::new(limits.max_body_bytes.get());
     match (exchange, reply) {
         (ExchangeKind::Offer, DonorReply::Offer(offer)) => {
             if !valid_offer(offer.get(), &correlation) {
@@ -382,7 +381,7 @@ pub fn decode_reply(frame: &Envelope, limits: PhaseLimits) -> Result<WireReply, 
     let Message::Reply(bytes) = &frame.message else {
         return Err(WireError::Invalid);
     };
-    if !limits.valid() || bytes.len() > limits.max_body_bytes {
+    if bytes.len() > limits.max_body_bytes.get() {
         return Err(WireError::Capacity);
     }
     let mut reader = Reader { bytes, position: 0 };
@@ -454,27 +453,27 @@ mod tests {
 
     fn limits() -> PhaseLimits {
         PhaseLimits {
-            max_body_bytes: 4096,
-            max_scope_bytes: 32,
-            max_node_bytes: 32,
-            max_writer_bytes: 16,
-            max_cuts: 4,
-            max_members: 4,
-            max_events: 4,
-            max_identity_bytes: 16,
-            max_effect_bytes: 64,
+            max_body_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_writer_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+            max_cuts: std::num::NonZeroUsize::new(4).unwrap(),
+            max_members: std::num::NonZeroUsize::new(4).unwrap(),
+            max_events: std::num::NonZeroUsize::new(4).unwrap(),
+            max_identity_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+            max_effect_bytes: std::num::NonZeroUsize::new(64).unwrap(),
         }
     }
 
     fn admitted<T>(value: T) -> Admitted<T> {
         ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 20_000,
+            max_total_bytes: std::num::NonZeroUsize::new(20_000).unwrap(),
             max_encoded_bytes: 20_000,
             max_decoded_bytes: 20_000,
             max_suffix_bytes: 20_000,
             max_native_overlap_bytes: 20_000,
             max_inflight_bytes: 20_000,
-            max_reservations: 4,
+            max_reservations: std::num::NonZeroUsize::new(4).unwrap(),
         })
         .unwrap()
         .reserve(AdmissionClass::Inflight, 4096)

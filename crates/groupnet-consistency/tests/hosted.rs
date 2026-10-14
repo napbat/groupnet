@@ -429,6 +429,20 @@ async fn a_voter_that_stops_applying_is_named_by_the_write_it_holds_up() {
             .expect("the host serves");
         assert_eq!(receipt.outcome, CommitOutcome::Committed, "{level:?}");
     }
+    // A timeout beyond the clock's range is a wait without a deadline, never
+    // an overflow: it resolves on the commit itself.
+    let receipt = tokio::time::timeout(
+        PATIENT,
+        voters[host].writes().publish_committed(
+            &"unbounded".to_owned(),
+            Commit::QuorumApplied,
+            Duration::MAX,
+        ),
+    )
+    .await
+    .expect("the commit resolves the unbounded wait")
+    .expect("the host serves");
+    assert_eq!(receipt.outcome, CommitOutcome::Committed);
 
     // One voter stops applying. Its node stays up, it keeps voting, and its
     // ledger keeps its (now stale) watermark on the wire — the fail-slow shape.

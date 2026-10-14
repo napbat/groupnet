@@ -10,8 +10,9 @@ use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
 use tokio::sync::watch;
 
 use super::{
-    Correlation, Envelope, ExchangeKind, Message, PhaseLimits, Refusal, ReplyTracker, WireLimits,
-    decode, decode_reply, decode_request, encode, encode_reply, encode_request,
+    Correlation, Envelope, ExchangeKind, Message, PhaseLimits, PhaseLimitsError, Refusal,
+    ReplyTracker, WireLimits, WireLimitsError, decode, decode_reply, decode_request, encode,
+    encode_reply, encode_request,
 };
 use crate::volatile_recovery::bootstrap::admission::{AdmissionClass, Admitted, ByteAdmission};
 use crate::volatile_recovery::bootstrap::inbox::{DonorInboxError, DonorSender};
@@ -19,14 +20,30 @@ use crate::volatile_recovery::bootstrap::ports::DonorRequest;
 use crate::volatile_recovery::{AdapterError, AdapterErrorKind};
 
 /// Finite network and decode limits for one transfer operation.
+///
+/// [`validate`](Self::validate) runs [`WireLimits::validate`] and
+/// [`PhaseLimits::validate`], then the rules relating the two, the
+/// responder's request deadline and the memory charges they derive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BulkLimits {
     /// Complete encoded frame and identity limits.
     pub wire: WireLimits,
     /// Typed request/reply collection limits.
     pub phase: PhaseLimits,
-    /// Independent server-side maximum for one accepted request.
+    /// Independent server-side maximum for one accepted request; nonzero and
+    /// representable from now on this platform's clock.
     pub server_request: Duration,
+}
+
+impl Default for BulkLimits {
+    /// The default wire and phase limits, with a 30 s responder deadline.
+    fn default() -> Self {
+        Self {
+            wire: WireLimits::default(),
+            phase: PhaseLimits::default(),
+            server_request: Duration::from_secs(30),
+        }
+    }
 }
 
 impl BulkLimits {
@@ -46,25 +63,34 @@ impl BulkLimits {
         let arc_count = self
             .phase
             .max_members
+            .get()
             .checked_add(12)
             .ok_or(BulkLimitsError::ChargeOverflow)?;
         self.phase
             .max_body_bytes
+            .get()
             .checked_add(header)
             .and_then(|value| {
                 value.checked_add(
                     self.phase
                         .max_members
+                        .get()
                         .checked_mul(size_of::<ClaimIdentity>())?,
                 )
             })
             .and_then(|value| {
-                value.checked_add(self.phase.max_cuts.checked_mul(size_of::<NativeCut>())?)
+                value.checked_add(
+                    self.phase
+                        .max_cuts
+                        .get()
+                        .checked_mul(size_of::<NativeCut>())?,
+                )
             })
             .and_then(|value| {
                 value.checked_add(
                     self.phase
                         .max_events
+                        .get()
                         .checked_mul(size_of::<JournalDelta>())?,
                 )
             })
@@ -78,6 +104,7 @@ impl BulkLimits {
         // NodeIds and any refcounted identity copy.
         self.wire
             .max_frame_bytes
+            .get()
             .checked_add(size_of::<Envelope>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
             .ok_or(BulkLimitsError::ChargeOverflow)
@@ -86,6 +113,7 @@ impl BulkLimits {
     fn tracker_charge(self) -> Result<usize, BulkLimitsError> {
         self.wire
             .max_frame_bytes
+            .get()
             .checked_add(size_of::<ReplyTracker>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
             .ok_or(BulkLimitsError::ChargeOverflow)
@@ -94,57 +122,43 @@ impl BulkLimits {
     pub(crate) fn correlation_charge(self) -> Result<usize, BulkLimitsError> {
         self.wire
             .max_frame_bytes
+            .get()
             .checked_add(size_of::<Correlation>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
             .ok_or(BulkLimitsError::ChargeOverflow)
     }
 
-    /// Rejects unusable or contradictory finite bounds.
+    /// Rejects unrepresentable or contradictory finite bounds.
     ///
     /// # Errors
-    /// Names the first zero, excessive, or inverted bound, or the derived
-    /// memory charge that overflows.
+    /// The wire or phase rule (as its own error, the
+    /// [`source`](std::error::Error::source)), the first phase bound above
+    /// its wire bound, a zero or clock-unrepresentable `server_request`, or
+    /// a derived memory charge that overflows.
     pub fn validate(&self) -> Result<(), BulkLimitsError> {
         let (wire, phase) = (self.wire, self.phase);
+        wire.validate().map_err(BulkLimitsError::Wire)?;
+        phase.validate().map_err(BulkLimitsError::Phase)?;
         let rules = [
             (
-                wire.max_frame_bytes == 0
-                    || wire.max_frame_bytes > groupnet_transport::framing::MAX_FRAME_BYTES,
-                BulkLimitsError::FrameBytes,
-            ),
-            (wire.max_scope_bytes == 0, BulkLimitsError::ZeroWireScope),
-            (wire.max_node_bytes == 0, BulkLimitsError::ZeroWireNode),
-            (wire.max_payload_bytes == 0, BulkLimitsError::ZeroPayload),
-            (
-                phase.max_body_bytes == 0 || phase.max_body_bytes > wire.max_payload_bytes,
-                BulkLimitsError::BodyBytes,
+                phase.max_body_bytes > wire.max_payload_bytes,
+                BulkLimitsError::BodyAbovePayload,
             ),
             (
-                phase.max_scope_bytes == 0 || phase.max_scope_bytes > wire.max_scope_bytes,
-                BulkLimitsError::PhaseScopeBytes,
+                phase.max_scope_bytes > wire.max_scope_bytes,
+                BulkLimitsError::PhaseScopeAboveWire,
             ),
             (
-                phase.max_node_bytes == 0 || phase.max_node_bytes > wire.max_node_bytes,
-                BulkLimitsError::PhaseNodeBytes,
-            ),
-            (phase.max_cuts == 0, BulkLimitsError::ZeroCuts),
-            (phase.max_members == 0, BulkLimitsError::ZeroMembers),
-            (phase.max_events == 0, BulkLimitsError::ZeroEvents),
-            (
-                phase.max_identity_bytes == 0,
-                BulkLimitsError::ZeroIdentityBytes,
-            ),
-            (
-                phase.max_effect_bytes == 0,
-                BulkLimitsError::ZeroEffectBytes,
-            ),
-            (
-                phase.max_writer_bytes == 0,
-                BulkLimitsError::ZeroWriterBytes,
+                phase.max_node_bytes > wire.max_node_bytes,
+                BulkLimitsError::PhaseNodeAboveWire,
             ),
             (
                 self.server_request.is_zero(),
                 BulkLimitsError::ZeroServerRequest,
+            ),
+            (
+                Instant::now().checked_add(self.server_request).is_none(),
+                BulkLimitsError::ServerRequestRange,
             ),
         ];
         if let Some((_, error)) = rules.into_iter().find(|(violated, _)| *violated) {
@@ -161,32 +175,18 @@ impl BulkLimits {
 /// A [`BulkLimits`] rule that [`BulkLimits::validate`] rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BulkLimitsError {
-    /// `wire.max_frame_bytes` is zero or exceeds the transport frame cap.
-    FrameBytes,
-    /// `wire.max_scope_bytes` is zero.
-    ZeroWireScope,
-    /// `wire.max_node_bytes` is zero.
-    ZeroWireNode,
-    /// `wire.max_payload_bytes` is zero.
-    ZeroPayload,
-    /// `phase.max_body_bytes` is zero or exceeds `wire.max_payload_bytes`.
-    BodyBytes,
-    /// `phase.max_scope_bytes` is zero or exceeds `wire.max_scope_bytes`.
-    PhaseScopeBytes,
-    /// `phase.max_node_bytes` is zero or exceeds `wire.max_node_bytes`.
-    PhaseNodeBytes,
-    /// `phase.max_cuts` is zero.
-    ZeroCuts,
-    /// `phase.max_members` is zero.
-    ZeroMembers,
-    /// `phase.max_events` is zero.
-    ZeroEvents,
-    /// `phase.max_identity_bytes` is zero.
-    ZeroIdentityBytes,
-    /// `phase.max_effect_bytes` is zero.
-    ZeroEffectBytes,
-    /// `phase.max_writer_bytes` is zero.
-    ZeroWriterBytes,
+    /// `wire` failed [`WireLimits::validate`]; the [`WireLimitsError`] is the
+    /// [`source`](std::error::Error::source).
+    Wire(WireLimitsError),
+    /// `phase` failed [`PhaseLimits::validate`]; the [`PhaseLimitsError`] is
+    /// the [`source`](std::error::Error::source).
+    Phase(PhaseLimitsError),
+    /// `phase.max_body_bytes` exceeds `wire.max_payload_bytes`.
+    BodyAbovePayload,
+    /// `phase.max_scope_bytes` exceeds `wire.max_scope_bytes`.
+    PhaseScopeAboveWire,
+    /// `phase.max_node_bytes` exceeds `wire.max_node_bytes`.
+    PhaseNodeAboveWire,
     /// `server_request` is zero.
     ZeroServerRequest,
     /// `server_request` from now is not representable by the clock.
@@ -198,21 +198,11 @@ pub enum BulkLimitsError {
 impl std::fmt::Display for BulkLimitsError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::FrameBytes => "wire.max_frame_bytes is zero or exceeds the transport frame cap",
-            Self::ZeroWireScope => "wire.max_scope_bytes is zero",
-            Self::ZeroWireNode => "wire.max_node_bytes is zero",
-            Self::ZeroPayload => "wire.max_payload_bytes is zero",
-            Self::BodyBytes => "phase.max_body_bytes is zero or exceeds wire.max_payload_bytes",
-            Self::PhaseScopeBytes => {
-                "phase.max_scope_bytes is zero or exceeds wire.max_scope_bytes"
-            }
-            Self::PhaseNodeBytes => "phase.max_node_bytes is zero or exceeds wire.max_node_bytes",
-            Self::ZeroCuts => "phase.max_cuts is zero",
-            Self::ZeroMembers => "phase.max_members is zero",
-            Self::ZeroEvents => "phase.max_events is zero",
-            Self::ZeroIdentityBytes => "phase.max_identity_bytes is zero",
-            Self::ZeroEffectBytes => "phase.max_effect_bytes is zero",
-            Self::ZeroWriterBytes => "phase.max_writer_bytes is zero",
+            Self::Wire(_) => "invalid wire limits",
+            Self::Phase(_) => "invalid phase limits",
+            Self::BodyAbovePayload => "phase.max_body_bytes exceeds wire.max_payload_bytes",
+            Self::PhaseScopeAboveWire => "phase.max_scope_bytes exceeds wire.max_scope_bytes",
+            Self::PhaseNodeAboveWire => "phase.max_node_bytes exceeds wire.max_node_bytes",
             Self::ZeroServerRequest => "server_request is zero",
             Self::ServerRequestRange => "server_request exceeds the clock range",
             Self::ChargeOverflow => "a memory charge derived from the bulk limits overflows",
@@ -220,7 +210,15 @@ impl std::fmt::Display for BulkLimitsError {
     }
 }
 
-impl std::error::Error for BulkLimitsError {}
+impl std::error::Error for BulkLimitsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wire(error) => Some(error),
+            Self::Phase(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<BulkLimitsError> for BulkError {
     fn from(error: BulkLimitsError) -> Self {
@@ -314,8 +312,9 @@ async fn recv_envelope<S: futures_util::io::AsyncRead + Unpin>(
     limits: BulkLimits,
     deadline: Instant,
 ) -> Result<Option<Admitted<Envelope>>, BulkError> {
-    let raw_budget = reserve(admission, limits.wire.max_frame_bytes)?;
-    let raw = before(deadline, stream.recv_bounded(limits.wire.max_frame_bytes))
+    let max_frame_bytes = limits.wire.max_frame_bytes.get();
+    let raw_budget = reserve(admission, max_frame_bytes)?;
+    let raw = before(deadline, stream.recv_bounded(max_frame_bytes))
         .await?
         .map_err(|_| BulkError::Transport)?;
     let Some(raw) = raw else {
@@ -335,12 +334,12 @@ async fn send_envelope<S: futures_util::io::AsyncWrite + Unpin>(
     limits: BulkLimits,
     deadline: Instant,
 ) -> Result<(), BulkError> {
-    let raw_budget = reserve(admission, limits.wire.max_frame_bytes)?;
+    let raw_budget = reserve(admission, limits.wire.max_frame_bytes.get())?;
     let raw = encode(envelope, limits.wire).map_err(|_| BulkError::Protocol)?;
     let raw = raw_budget.hold(raw);
     before(
         deadline,
-        stream.send_bounded_ref(raw.get(), limits.wire.max_frame_bytes),
+        stream.send_bounded_ref(raw.get(), limits.wire.max_frame_bytes.get()),
     )
     .await?
     .map_err(|_| BulkError::Transport)
@@ -371,11 +370,20 @@ impl<B: BulkTransport> BootstrapBulkClient<B> {
         limits: BulkLimits,
     ) -> Result<Self, BulkLimitsError> {
         limits.validate()?;
-        Ok(Self {
+        Ok(Self::validated(plane, admission, limits))
+    }
+
+    /// [`new`](Self::new) for limits the caller has already validated.
+    pub(in crate::volatile_recovery::bootstrap) fn validated(
+        plane: DataPlane<B>,
+        admission: ByteAdmission,
+        limits: BulkLimits,
+    ) -> Self {
+        Self {
             plane,
             admission,
             limits,
-        })
+        }
     }
 
     /// Sends one current core effect and accepts only its exact terminal reply.
@@ -396,14 +404,14 @@ impl<B: BulkTransport> BootstrapBulkClient<B> {
         let envelope = encode_request(request, correlation, self.limits.phase)
             .map_err(|_| BulkError::Protocol)?;
         let envelope = phase_budget.hold(envelope);
-        let raw_budget = reserve(&self.admission, self.limits.wire.max_frame_bytes)?;
+        let raw_budget = reserve(&self.admission, self.limits.wire.max_frame_bytes.get())?;
         let raw = encode(envelope.get(), self.limits.wire).map_err(|_| BulkError::Protocol)?;
         let raw = raw_budget.hold(raw);
         let tracker_budget = reserve(&self.admission, self.limits.tracker_charge()?)?;
         let mut tracker = ReplyTracker::new(
             envelope.get(),
             1,
-            u64::try_from(self.limits.phase.max_body_bytes)
+            u64::try_from(self.limits.phase.max_body_bytes.get())
                 .map_err(|_| BulkLimitsError::ChargeOverflow)?,
         )
         .map_err(|_| BulkError::Protocol)?;
@@ -415,7 +423,7 @@ impl<B: BulkTransport> BootstrapBulkClient<B> {
         .map_err(|_| BulkError::Transport)?;
         before(
             deadline,
-            stream.send_bounded_ref(raw.get(), self.limits.wire.max_frame_bytes),
+            stream.send_bounded_ref(raw.get(), self.limits.wire.max_frame_bytes.get()),
         )
         .await?
         .map_err(|_| BulkError::Transport)?;
@@ -554,7 +562,7 @@ impl<B: BulkTransport> BootstrapBulkListener<B> {
                 Err(BulkError::Expired) => Err(Refusal::Expired),
                 Ok(Ok(Err(_))) | Err(_) => Err(Refusal::Continuity),
             },
-            Err(DonorInboxError::Full | DonorInboxError::InvalidCapacity) => Err(Refusal::Capacity),
+            Err(DonorInboxError::Full) => Err(Refusal::Capacity),
             Err(DonorInboxError::Closed) => Err(Refusal::Stale),
         };
         self.send_result(&mut stream, correlation.get(), exchange, result, deadline)
@@ -618,26 +626,32 @@ impl<B: BulkTransport> BootstrapBulkListener<B> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
+
+    fn nz(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap()
+    }
 
     fn limits() -> BulkLimits {
         BulkLimits {
             wire: WireLimits {
-                max_frame_bytes: 4096,
-                max_scope_bytes: 64,
-                max_node_bytes: 32,
-                max_payload_bytes: 2048,
+                max_frame_bytes: nz(4096),
+                max_scope_bytes: nz(64),
+                max_node_bytes: nz(32),
+                max_payload_bytes: nz(2048),
             },
             phase: PhaseLimits {
-                max_body_bytes: 2048,
-                max_scope_bytes: 64,
-                max_node_bytes: 32,
-                max_writer_bytes: 32,
-                max_cuts: 4,
-                max_members: 4,
-                max_events: 4,
-                max_identity_bytes: 32,
-                max_effect_bytes: 128,
+                max_body_bytes: nz(2048),
+                max_scope_bytes: nz(64),
+                max_node_bytes: nz(32),
+                max_writer_bytes: nz(32),
+                max_cuts: nz(4),
+                max_members: nz(4),
+                max_events: nz(4),
+                max_identity_bytes: nz(32),
+                max_effect_bytes: nz(128),
             },
             server_request: Duration::from_secs(1),
         }
@@ -647,21 +661,59 @@ mod tests {
     fn decoded_collection_and_header_charges_are_finite_and_checked() {
         let limits = limits();
         limits.validate().unwrap();
-        assert!(limits.decoded_charge().unwrap() > limits.phase.max_body_bytes);
-        assert!(limits.envelope_charge().unwrap() > limits.wire.max_frame_bytes);
-        assert!(limits.tracker_charge().unwrap() > limits.wire.max_frame_bytes);
-        assert!(limits.correlation_charge().unwrap() > limits.wire.max_frame_bytes);
+        assert!(limits.decoded_charge().unwrap() > limits.phase.max_body_bytes.get());
+        assert!(limits.envelope_charge().unwrap() > limits.wire.max_frame_bytes.get());
+        assert!(limits.tracker_charge().unwrap() > limits.wire.max_frame_bytes.get());
+        assert!(limits.correlation_charge().unwrap() > limits.wire.max_frame_bytes.get());
+        assert_eq!(BulkLimits::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn validation_composes_the_wire_and_phase_rules_and_keeps_them_as_source() {
+        let limits = limits();
+        let wire = BulkLimits {
+            wire: WireLimits {
+                max_payload_bytes: nz(4097),
+                ..limits.wire
+            },
+            ..limits
+        };
+        let error = wire.validate().unwrap_err();
         assert_eq!(
-            BulkLimits {
-                phase: PhaseLimits {
-                    max_members: usize::MAX,
-                    ..limits.phase
-                },
-                ..limits
-            }
-            .validate(),
-            Err(BulkLimitsError::ChargeOverflow)
+            error,
+            BulkLimitsError::Wire(WireLimitsError::PayloadAboveFrame)
         );
+        assert!(std::error::Error::source(&error).is_some());
+
+        let phase = BulkLimits {
+            phase: PhaseLimits {
+                max_members: nz(usize::MAX),
+                ..limits.phase
+            },
+            ..limits
+        };
+        assert_eq!(
+            phase.validate(),
+            Err(BulkLimitsError::Phase(
+                PhaseLimitsError::MembersAboveCountField
+            ))
+        );
+
+        let inverted = BulkLimits {
+            phase: PhaseLimits {
+                max_body_bytes: nz(limits.wire.max_payload_bytes.get() + 1),
+                ..limits.phase
+            },
+            ..limits
+        };
+        let error = BulkError::from(inverted.validate().unwrap_err());
+        assert_eq!(error, BulkError::Limits(BulkLimitsError::BodyAbovePayload));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn the_responder_deadline_is_nonzero_and_on_the_clock() {
+        let limits = limits();
         assert_eq!(
             BulkLimits {
                 server_request: Duration::ZERO,
@@ -670,15 +722,13 @@ mod tests {
             .validate(),
             Err(BulkLimitsError::ZeroServerRequest)
         );
-        let inverted = BulkLimits {
-            phase: PhaseLimits {
-                max_body_bytes: limits.wire.max_payload_bytes + 1,
-                ..limits.phase
-            },
-            ..limits
-        };
-        let error = BulkError::from(inverted.validate().unwrap_err());
-        assert_eq!(error, BulkError::Limits(BulkLimitsError::BodyBytes));
-        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(
+            BulkLimits {
+                server_request: Duration::MAX,
+                ..limits
+            }
+            .validate(),
+            Err(BulkLimitsError::ServerRequestRange)
+        );
     }
 }

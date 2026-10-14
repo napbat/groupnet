@@ -40,14 +40,16 @@ async fn construction_reports_the_violated_limit_and_snapshot_mode() {
         .spawn()
         .await;
     let group = &cluster.groups[0];
-    let depth = Semaphore::MAX_PERMITS + 1;
+    let ops = Semaphore::MAX_PERMITS + 1;
     let bounds = Limits {
-        queue_depth: NonZeroUsize::new(depth).expect("nonzero"),
+        max_parallel_ops: NonZeroUsize::new(ops).expect("nonzero"),
         ..limits()
     };
     let error = Replication::new(group.clone(), MemSource::default(), StubApp, bounds)
-        .expect_err("queue depth above permits");
-    let expected = LimitsError::QueueDepthAbovePermits { queue_depth: depth };
+        .expect_err("parallel operations above permits");
+    let expected = LimitsError::ParallelOpsAbovePermits {
+        max_parallel_ops: ops,
+    };
     assert_eq!(error, OpenError::InvalidLimits(expected));
     assert_eq!(
         error

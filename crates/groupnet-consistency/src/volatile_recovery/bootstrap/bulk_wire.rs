@@ -3,15 +3,19 @@
 //! This public opt-in peer data-plane API carries only the nine typed donor
 //! phases. Its codec frames are transport data, never source authority.
 
+use std::num::NonZeroUsize;
+
 use groupnet_core::NodeId;
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapOperation, BootstrapScope, ClaimIdentity,
 };
+use groupnet_transport::framing::MAX_FRAME_BYTES;
 
 mod phase;
 mod transport;
 pub use phase::{
-    PhaseLimits, WireReply, decode_reply, decode_request, encode_reply, encode_request,
+    PhaseLimits, PhaseLimitsError, WireReply, decode_reply, decode_request, encode_reply,
+    encode_request,
 };
 pub use transport::{
     BootstrapBulkClient, BootstrapBulkListener, BulkError, BulkLimits, BulkLimitsError,
@@ -163,17 +167,78 @@ pub struct Envelope {
 }
 
 /// Caller-chosen finite pre-allocation wire limits.
+///
+/// Every bound is nonzero by type; [`validate`](Self::validate) checks them
+/// against the transport frame cap and the envelope's own length fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WireLimits {
-    /// Maximum complete encoded bootstrap body, excluding `DataStream` header.
-    pub max_frame_bytes: usize,
+    /// Maximum complete encoded bootstrap body, excluding `DataStream`
+    /// header; at most the transport's `MAX_FRAME_BYTES`.
+    pub max_frame_bytes: NonZeroUsize,
     /// Maximum combined scope name bytes.
-    pub max_scope_bytes: usize,
-    /// Maximum bytes in one node identity.
-    pub max_node_bytes: usize,
-    /// Maximum bytes in the frame's operation payload.
-    pub max_payload_bytes: usize,
+    pub max_scope_bytes: NonZeroUsize,
+    /// Maximum bytes in one node identity; at most `u16::MAX`, the width of
+    /// its length field.
+    pub max_node_bytes: NonZeroUsize,
+    /// Maximum bytes in the frame's operation payload; at most
+    /// `max_frame_bytes`.
+    pub max_payload_bytes: NonZeroUsize,
 }
+
+impl Default for WireLimits {
+    /// 4 MiB frames carrying up to 2 MiB of operation payload, for scopes and
+    /// node identities within the core's default claim limits.
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: nonzero(4 * 1024 * 1024),
+            max_scope_bytes: nonzero(512),
+            max_node_bytes: nonzero(256),
+            max_payload_bytes: nonzero(2 * 1024 * 1024),
+        }
+    }
+}
+
+impl WireLimits {
+    /// Checks every bound against what an envelope can carry.
+    ///
+    /// # Errors
+    /// The [`WireLimitsError`] naming the first violated rule.
+    pub fn validate(&self) -> Result<(), WireLimitsError> {
+        if self.max_frame_bytes.get() > MAX_FRAME_BYTES {
+            return Err(WireLimitsError::FrameAboveTransport);
+        }
+        if self.max_payload_bytes > self.max_frame_bytes {
+            return Err(WireLimitsError::PayloadAboveFrame);
+        }
+        if self.max_node_bytes.get() > usize::from(u16::MAX) {
+            return Err(WireLimitsError::NodeAboveLengthField);
+        }
+        Ok(())
+    }
+}
+
+/// A [`WireLimits`] rule that [`WireLimits::validate`] rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireLimitsError {
+    /// `max_frame_bytes` exceeds the transport's `MAX_FRAME_BYTES`.
+    FrameAboveTransport,
+    /// `max_payload_bytes` exceeds `max_frame_bytes`.
+    PayloadAboveFrame,
+    /// `max_node_bytes` exceeds `u16::MAX`, the width of its length field.
+    NodeAboveLengthField,
+}
+
+impl std::fmt::Display for WireLimitsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::FrameAboveTransport => "max_frame_bytes exceeds the transport frame cap",
+            Self::PayloadAboveFrame => "max_payload_bytes exceeds max_frame_bytes",
+            Self::NodeAboveLengthField => "max_node_bytes exceeds u16::MAX",
+        })
+    }
+}
+
+impl std::error::Error for WireLimitsError {}
 
 /// Invalid, unsupported, or excessive wire input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,18 +249,13 @@ pub enum WireError {
     Capacity,
 }
 
-impl WireLimits {
-    fn valid(self) -> bool {
-        self.max_frame_bytes > 0
-            && self.max_scope_bytes > 0
-            && self.max_node_bytes > 0
-            && self.max_payload_bytes > 0
-    }
+const fn nonzero(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).expect("nonzero default")
 }
 
 fn identity_size(identity: &ClaimIdentity, limits: WireLimits) -> Result<usize, WireError> {
     let node = identity.node.as_str().len();
-    if node == 0 || node > limits.max_node_bytes || node > usize::from(u16::MAX) {
+    if node == 0 || node > limits.max_node_bytes.get() || node > usize::from(u16::MAX) {
         return Err(WireError::Capacity);
     }
     Ok(node)
@@ -211,7 +271,7 @@ fn validate_correlation(value: &Correlation, limits: WireLimits) -> Result<usize
     if scope == 0
         || value.scope.domain.is_empty()
         || value.scope.partition.is_empty()
-        || scope > limits.max_scope_bytes
+        || scope > limits.max_scope_bytes.get()
         || value.scope.domain.len() > usize::from(u16::MAX)
         || value.scope.partition.len() > usize::from(u16::MAX)
         || value.donor.incarnation.0 == 0
@@ -252,16 +312,13 @@ fn validate_correlation(value: &Correlation, limits: WireLimits) -> Result<usize
 /// # Errors
 /// Rejects invalid identities, inconsistent operation binding, or a cap.
 pub fn encode(value: &Envelope, limits: WireLimits) -> Result<Vec<u8>, WireError> {
-    if !limits.valid() {
-        return Err(WireError::Capacity);
-    }
     let variable = validate_correlation(&value.correlation, limits)?;
     let payload_bytes = match &value.message {
         Message::Request(bytes) | Message::Reply(bytes) => bytes.len(),
         Message::Refused(_) => 1,
         Message::Terminator { .. } => 12,
     };
-    if payload_bytes > limits.max_payload_bytes {
+    if payload_bytes > limits.max_payload_bytes.get() {
         return Err(WireError::Capacity);
     }
     let payload_len = u32::try_from(payload_bytes).map_err(|_| WireError::Capacity)?;
@@ -269,7 +326,7 @@ pub fn encode(value: &Envelope, limits: WireLimits) -> Result<Vec<u8>, WireError
         .checked_add(variable)
         .and_then(|size| size.checked_add(payload_bytes))
         .ok_or(WireError::Capacity)?;
-    if length > limits.max_frame_bytes {
+    if length > limits.max_frame_bytes.get() {
         return Err(WireError::Capacity);
     }
     let mut out = Vec::new();
@@ -387,7 +444,7 @@ impl<'a> Reader<'a> {
 /// # Errors
 /// Rejects malformed, unsupported, excessive, or inconsistent input.
 pub fn decode(bytes: &[u8], limits: WireLimits) -> Result<Envelope, WireError> {
-    if !limits.valid() || bytes.len() > limits.max_frame_bytes || bytes.len() < FIXED_BYTES {
+    if bytes.len() > limits.max_frame_bytes.get() || bytes.len() < FIXED_BYTES {
         return Err(WireError::Capacity);
     }
     let mut reader = Reader { bytes, position: 0 };
@@ -399,10 +456,10 @@ pub fn decode(bytes: &[u8], limits: WireLimits) -> Result<Envelope, WireError> {
     if reader.number::<1>()?[0] != 0 {
         return Err(WireError::Invalid);
     }
-    let domain = reader.string(limits.max_scope_bytes)?;
-    let partition = reader.string(limits.max_scope_bytes)?;
-    let donor = reader.identity(limits.max_node_bytes)?;
-    let follower = reader.identity(limits.max_node_bytes)?;
+    let domain = reader.string(limits.max_scope_bytes.get())?;
+    let partition = reader.string(limits.max_scope_bytes.get())?;
+    let donor = reader.identity(limits.max_node_bytes.get())?;
+    let follower = reader.identity(limits.max_node_bytes.get())?;
     let parent = reader.operation()?;
     let child = reader.operation()?;
     let correlation = Correlation {
@@ -415,7 +472,7 @@ pub fn decode(bytes: &[u8], limits: WireLimits) -> Result<Envelope, WireError> {
     validate_correlation(&correlation, limits)?;
     let payload_bytes =
         usize::try_from(u32::from_be_bytes(reader.number()?)).map_err(|_| WireError::Capacity)?;
-    if payload_bytes > limits.max_payload_bytes {
+    if payload_bytes > limits.max_payload_bytes.get() {
         return Err(WireError::Capacity);
     }
     let payload = reader.take(payload_bytes)?;
@@ -543,11 +600,41 @@ mod tests {
 
     fn limits() -> WireLimits {
         WireLimits {
-            max_frame_bytes: 512,
-            max_scope_bytes: 64,
-            max_node_bytes: 32,
-            max_payload_bytes: 128,
+            max_frame_bytes: nonzero(512),
+            max_scope_bytes: nonzero(64),
+            max_node_bytes: nonzero(32),
+            max_payload_bytes: nonzero(128),
         }
+    }
+
+    #[test]
+    fn wire_limits_name_each_unrepresentable_bound() {
+        assert_eq!(limits().validate(), Ok(()));
+        assert_eq!(WireLimits::default().validate(), Ok(()));
+        assert_eq!(
+            WireLimits {
+                max_frame_bytes: nonzero(MAX_FRAME_BYTES + 1),
+                ..limits()
+            }
+            .validate(),
+            Err(WireLimitsError::FrameAboveTransport)
+        );
+        assert_eq!(
+            WireLimits {
+                max_payload_bytes: nonzero(513),
+                ..limits()
+            }
+            .validate(),
+            Err(WireLimitsError::PayloadAboveFrame)
+        );
+        assert_eq!(
+            WireLimits {
+                max_node_bytes: nonzero(usize::from(u16::MAX) + 1),
+                ..limits()
+            }
+            .validate(),
+            Err(WireLimitsError::NodeAboveLengthField)
+        );
     }
 
     fn fixture(message: Message) -> Envelope {
@@ -638,7 +725,7 @@ mod tests {
         assert_eq!(encode(&frame, limits()), Err(WireError::Invalid));
         frame.correlation.child.session -= 1;
         let tight = WireLimits {
-            max_frame_bytes: FIXED_BYTES,
+            max_frame_bytes: nonzero(FIXED_BYTES),
             ..limits()
         };
         assert_eq!(encode(&frame, tight), Err(WireError::Capacity));

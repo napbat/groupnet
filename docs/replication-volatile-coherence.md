@@ -139,7 +139,8 @@ fenced operation (gap, lapse, cancel, expiry, or a newer token) is discarded
 by the permit and refused by the core, so it can never revive old work.
 
 The opt-in runtime is `groupnet-consistency/volatile-recovery` (facade feature
-`groupnet/consistency-volatile-recovery`). `RecoveryHandle::open` starts closed
+`groupnet/consistency-volatile-recovery`). `RecoveryHandle::builder(adapter, me,
+session)…open()` starts closed
 and synchronously revokes the adapter's independent serve grant before
 returning. `feed_gap` and `lease_lapse` atomically close the read/publication
 gate and retain a bounded coalesced signal before returning; a gap dominates
@@ -262,9 +263,9 @@ bucket free of control objects, and ordinary read fallbacks intact.
 event and returns `RecoveryError::Rearm(_)` for an invalid one.
 A coalesced `StartWithLapses` event preserves an explicit restart and
 its highest observed lapse counter in one full recovery generation.
-`RecoveryHandle::open_with_rearm` performs the matching platform
-deadline check before spawning its worker. Existing constructors remain
-unchanged and opt out. The core owns the rearm deadline in `next_deadline`
+`RecoveryBuilder::rearm` makes `open()` perform the matching platform
+deadline check before spawning its worker; a builder without it opts out.
+The core owns the rearm deadline in `next_deadline`
 and emits `ArmTimer`; the runtime only maps that logical deadline to its
 monotonic clock. No Tokio timer map, app retry loop, or second token allocator
 is introduced. Source and application callbacks retain their exact

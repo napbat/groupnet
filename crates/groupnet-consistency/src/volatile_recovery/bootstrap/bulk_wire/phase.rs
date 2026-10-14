@@ -1,5 +1,7 @@
 //! Typed, bounded donor request bodies carried by the bulk envelope.
 
+use std::num::NonZeroUsize;
+
 use groupnet_core::volatile_bootstrap::journal::{
     AttachToken, BarrierReceipt, CaptureId, JournalCursor, NativeCut, ReservationId,
 };
@@ -8,48 +10,137 @@ use groupnet_core::volatile_bootstrap::{
 };
 use groupnet_core::{NodeId, Status};
 
-use super::{Correlation, Envelope, ExchangeKind, Message, Reader, WireError};
+use super::{Correlation, Envelope, ExchangeKind, Message, Reader, WireError, nonzero};
 use crate::volatile_recovery::bootstrap::ports::DonorRequest;
 
 mod reply;
 pub use reply::{WireReply, decode_reply, encode_reply};
 
 /// Finite phase metadata and collection limits applied before decoding.
+///
+/// Every bound is nonzero by type; [`validate`](Self::validate) checks each
+/// against the width of the length or count field that carries it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PhaseLimits {
     /// Maximum complete phase body bytes.
-    pub max_body_bytes: usize,
+    pub max_body_bytes: NonZeroUsize,
     /// Maximum bytes in one scope's two names.
-    pub max_scope_bytes: usize,
-    /// Maximum bytes in one node identity.
-    pub max_node_bytes: usize,
-    /// Maximum native writer identity bytes.
-    pub max_writer_bytes: usize,
-    /// Maximum native writer cuts in one barrier.
-    pub max_cuts: usize,
-    /// Maximum complete members in one barrier.
-    pub max_members: usize,
-    /// Maximum returned journal effects in one batch.
-    pub max_events: usize,
-    /// Maximum bytes in one native/local mutation identity.
-    pub max_identity_bytes: usize,
-    /// Maximum bytes in one final index effect.
-    pub max_effect_bytes: usize,
+    pub max_scope_bytes: NonZeroUsize,
+    /// Maximum bytes in one node identity; at most `u16::MAX`.
+    pub max_node_bytes: NonZeroUsize,
+    /// Maximum native writer identity bytes; at most `u16::MAX`.
+    pub max_writer_bytes: NonZeroUsize,
+    /// Maximum native writer cuts in one barrier; at most `u16::MAX`.
+    pub max_cuts: NonZeroUsize,
+    /// Maximum complete members in one barrier; at most `u16::MAX`.
+    pub max_members: NonZeroUsize,
+    /// Maximum returned journal effects in one batch; at most `u16::MAX`.
+    pub max_events: NonZeroUsize,
+    /// Maximum bytes in one native/local mutation identity; at most
+    /// `u16::MAX`.
+    pub max_identity_bytes: NonZeroUsize,
+    /// Maximum bytes in one final index effect; at most `u32::MAX`.
+    pub max_effect_bytes: NonZeroUsize,
+}
+
+impl Default for PhaseLimits {
+    /// 2 MiB bodies covering the core's default transfer policy: 1024
+    /// members, 256 cuts and 256 events per batch, 256-byte identities and
+    /// 64 KiB effects.
+    fn default() -> Self {
+        Self {
+            max_body_bytes: nonzero(2 * 1024 * 1024),
+            max_scope_bytes: nonzero(512),
+            max_node_bytes: nonzero(256),
+            max_writer_bytes: nonzero(256),
+            max_cuts: nonzero(256),
+            max_members: nonzero(1024),
+            max_events: nonzero(256),
+            max_identity_bytes: nonzero(256),
+            max_effect_bytes: nonzero(64 * 1024),
+        }
+    }
 }
 
 impl PhaseLimits {
-    fn valid(self) -> bool {
-        self.max_body_bytes > 0
-            && self.max_scope_bytes > 0
-            && self.max_node_bytes > 0
-            && self.max_writer_bytes > 0
-            && self.max_cuts > 0
-            && self.max_members > 0
-            && self.max_events > 0
-            && self.max_identity_bytes > 0
-            && self.max_effect_bytes > 0
+    /// Checks every bound against the field that encodes it.
+    ///
+    /// # Errors
+    /// The [`PhaseLimitsError`] naming the first unrepresentable bound.
+    pub fn validate(&self) -> Result<(), PhaseLimitsError> {
+        let u16_max = usize::from(u16::MAX);
+        let rules = [
+            (
+                self.max_node_bytes.get() > u16_max,
+                PhaseLimitsError::NodeAboveLengthField,
+            ),
+            (
+                self.max_writer_bytes.get() > u16_max,
+                PhaseLimitsError::WriterAboveLengthField,
+            ),
+            (
+                self.max_identity_bytes.get() > u16_max,
+                PhaseLimitsError::IdentityAboveLengthField,
+            ),
+            (
+                self.max_cuts.get() > u16_max,
+                PhaseLimitsError::CutsAboveCountField,
+            ),
+            (
+                self.max_members.get() > u16_max,
+                PhaseLimitsError::MembersAboveCountField,
+            ),
+            (
+                self.max_events.get() > u16_max,
+                PhaseLimitsError::EventsAboveCountField,
+            ),
+            (
+                u32::try_from(self.max_effect_bytes.get()).is_err(),
+                PhaseLimitsError::EffectAboveLengthField,
+            ),
+        ];
+        match rules.into_iter().find(|(violated, _)| *violated) {
+            Some((_, error)) => Err(error),
+            None => Ok(()),
+        }
     }
 }
+
+/// A [`PhaseLimits`] bound that [`PhaseLimits::validate`] rejected: larger
+/// than the length or count field that carries it can say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseLimitsError {
+    /// `max_node_bytes` exceeds `u16::MAX`.
+    NodeAboveLengthField,
+    /// `max_writer_bytes` exceeds `u16::MAX`.
+    WriterAboveLengthField,
+    /// `max_identity_bytes` exceeds `u16::MAX`.
+    IdentityAboveLengthField,
+    /// `max_cuts` exceeds `u16::MAX`.
+    CutsAboveCountField,
+    /// `max_members` exceeds `u16::MAX`.
+    MembersAboveCountField,
+    /// `max_events` exceeds `u16::MAX`.
+    EventsAboveCountField,
+    /// `max_effect_bytes` exceeds `u32::MAX`.
+    EffectAboveLengthField,
+}
+
+impl std::fmt::Display for PhaseLimitsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NodeAboveLengthField => "max_node_bytes exceeds u16::MAX",
+            Self::WriterAboveLengthField => "max_writer_bytes exceeds u16::MAX",
+            Self::IdentityAboveLengthField => "max_identity_bytes exceeds u16::MAX",
+            Self::CutsAboveCountField => "max_cuts exceeds u16::MAX",
+            Self::MembersAboveCountField => "max_members exceeds u16::MAX",
+            Self::EventsAboveCountField => "max_events exceeds u16::MAX",
+            Self::EffectAboveLengthField => "max_effect_bytes exceeds u32::MAX",
+        })
+    }
+}
+
+impl std::error::Error for PhaseLimitsError {}
 
 struct Writer {
     bytes: Vec<u8>,
@@ -107,7 +198,7 @@ impl Writer {
     }
 
     fn identity(&mut self, id: &ClaimIdentity, limits: PhaseLimits) -> Result<(), WireError> {
-        self.string(id.node.as_str(), limits.max_node_bytes)?;
+        self.string(id.node.as_str(), limits.max_node_bytes.get())?;
         self.put(&id.incarnation.0.to_be_bytes())?;
         self.put(&id.session.to_be_bytes())?;
         self.put(&id.attempt.to_be_bytes())
@@ -118,10 +209,10 @@ impl Writer {
         member: &BootstrapMemberIdentity,
         limits: PhaseLimits,
     ) -> Result<(), WireError> {
-        if !member.valid_bounded(limits.max_node_bytes) {
+        if !member.valid_bounded(limits.max_node_bytes.get()) {
             return Err(WireError::Invalid);
         }
-        self.string(member.node.as_str(), limits.max_node_bytes)?;
+        self.string(member.node.as_str(), limits.max_node_bytes.get())?;
         self.put(&member.member_incarnation.to_be_bytes())?;
         self.put(&[member.status.to_wire()])?;
         match &member.presence {
@@ -140,11 +231,11 @@ impl Writer {
             .len()
             .checked_add(scope.partition.len())
             .ok_or(WireError::Capacity)?;
-        if total > limits.max_scope_bytes {
+        if total > limits.max_scope_bytes.get() {
             return Err(WireError::Capacity);
         }
-        self.string(&scope.domain, limits.max_scope_bytes)?;
-        self.string(&scope.partition, limits.max_scope_bytes)
+        self.string(&scope.domain, limits.max_scope_bytes.get())?;
+        self.string(&scope.partition, limits.max_scope_bytes.get())
     }
 
     fn capture(&mut self, id: &CaptureId, limits: PhaseLimits) -> Result<(), WireError> {
@@ -171,8 +262,8 @@ impl Writer {
     }
 
     fn barrier(&mut self, receipt: &BarrierReceipt, limits: PhaseLimits) -> Result<(), WireError> {
-        if receipt.covered_cuts.len() > limits.max_cuts
-            || receipt.members.len() > limits.max_members
+        if receipt.covered_cuts.len() > limits.max_cuts.get()
+            || receipt.members.len() > limits.max_members.get()
         {
             return Err(WireError::Capacity);
         }
@@ -186,7 +277,7 @@ impl Writer {
                 .to_be_bytes(),
         )?;
         for cut in &receipt.covered_cuts {
-            self.blob(&cut.writer, limits.max_writer_bytes)?;
+            self.blob(&cut.writer, limits.max_writer_bytes.get())?;
             self.put(&cut.epoch.to_be_bytes())?;
             self.put(&cut.sequence.to_be_bytes())?;
         }
@@ -222,7 +313,7 @@ fn read_blob(reader: &mut Reader<'_>, cap: usize) -> Result<Vec<u8>, WireError> 
 
 fn read_identity(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<ClaimIdentity, WireError> {
     Ok(ClaimIdentity {
-        node: NodeId::new(reader.string(limits.max_node_bytes)?),
+        node: NodeId::new(reader.string(limits.max_node_bytes.get())?),
         incarnation: BootId(u128::from_be_bytes(reader.number()?)),
         session: u64::from_be_bytes(reader.number()?),
         attempt: u64::from_be_bytes(reader.number()?),
@@ -233,7 +324,7 @@ fn read_member(
     reader: &mut Reader<'_>,
     limits: PhaseLimits,
 ) -> Result<BootstrapMemberIdentity, WireError> {
-    let node = NodeId::new(reader.string(limits.max_node_bytes)?);
+    let node = NodeId::new(reader.string(limits.max_node_bytes.get())?);
     let member_incarnation = u64::from_be_bytes(reader.number()?);
     let status = Status::from_wire(reader.take(1)?[0]).ok_or(WireError::Invalid)?;
     let presence = match reader.take(1)?[0] {
@@ -252,19 +343,19 @@ fn read_member(
         status,
     };
     member
-        .valid_bounded(limits.max_node_bytes)
+        .valid_bounded(limits.max_node_bytes.get())
         .then_some(member)
         .ok_or(WireError::Invalid)
 }
 
 fn read_scope(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<BootstrapScope, WireError> {
-    let domain = reader.string(limits.max_scope_bytes)?;
-    let partition = reader.string(limits.max_scope_bytes)?;
+    let domain = reader.string(limits.max_scope_bytes.get())?;
+    let partition = reader.string(limits.max_scope_bytes.get())?;
     if domain
         .len()
         .checked_add(partition.len())
         .ok_or(WireError::Capacity)?
-        > limits.max_scope_bytes
+        > limits.max_scope_bytes.get()
     {
         return Err(WireError::Capacity);
     }
@@ -311,7 +402,7 @@ fn read_barrier(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<BarrierR
     let barrier_operation = u64::from_be_bytes(reader.number()?);
     let cursor = read_cursor(reader, limits)?;
     let cuts_len = usize::from(u16::from_be_bytes(reader.number()?));
-    if cuts_len > limits.max_cuts {
+    if cuts_len > limits.max_cuts.get() {
         return Err(WireError::Capacity);
     }
     let mut covered_cuts = Vec::new();
@@ -320,13 +411,13 @@ fn read_barrier(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<BarrierR
         .map_err(|_| WireError::Capacity)?;
     for _ in 0..cuts_len {
         covered_cuts.push(NativeCut {
-            writer: read_blob(reader, limits.max_writer_bytes)?,
+            writer: read_blob(reader, limits.max_writer_bytes.get())?,
             epoch: u64::from_be_bytes(reader.number()?),
             sequence: u64::from_be_bytes(reader.number()?),
         });
     }
     let members_len = usize::from(u16::from_be_bytes(reader.number()?));
-    if members_len > limits.max_members {
+    if members_len > limits.max_members.get() {
         return Err(WireError::Capacity);
     }
     let mut members = Vec::new();
@@ -467,11 +558,8 @@ pub fn encode_request(
     correlation: Correlation,
     limits: PhaseLimits,
 ) -> Result<Envelope, WireError> {
-    if !limits.valid() {
-        return Err(WireError::Capacity);
-    }
     validate_request(request, &correlation)?;
-    let mut body = Writer::new(limits.max_body_bytes);
+    let mut body = Writer::new(limits.max_body_bytes.get());
     match request {
         DonorRequest::Offer { max_metadata_bytes } => body.number(*max_metadata_bytes)?,
         DonorRequest::Reserve { follower, cut } => {
@@ -538,7 +626,7 @@ pub fn decode_request(frame: &Envelope, limits: PhaseLimits) -> Result<DonorRequ
     let Message::Request(bytes) = &frame.message else {
         return Err(WireError::Invalid);
     };
-    if !limits.valid() || bytes.len() > limits.max_body_bytes {
+    if bytes.len() > limits.max_body_bytes.get() {
         return Err(WireError::Capacity);
     }
     let mut reader = Reader { bytes, position: 0 };
@@ -594,15 +682,80 @@ mod tests {
 
     fn limits() -> PhaseLimits {
         PhaseLimits {
-            max_body_bytes: 4096,
-            max_scope_bytes: 32,
-            max_node_bytes: 32,
-            max_writer_bytes: 16,
-            max_cuts: 4,
-            max_members: 4,
-            max_events: 4,
-            max_identity_bytes: 16,
-            max_effect_bytes: 64,
+            max_body_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
+            max_scope_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
+            max_writer_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+            max_cuts: std::num::NonZeroUsize::new(4).unwrap(),
+            max_members: std::num::NonZeroUsize::new(4).unwrap(),
+            max_events: std::num::NonZeroUsize::new(4).unwrap(),
+            max_identity_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+            max_effect_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        }
+    }
+
+    #[test]
+    fn phase_limits_name_each_bound_its_field_cannot_carry() {
+        assert_eq!(limits().validate(), Ok(()));
+        assert_eq!(PhaseLimits::default().validate(), Ok(()));
+        let wide = nonzero(usize::from(u16::MAX) + 1);
+        let cases = [
+            (
+                PhaseLimits {
+                    max_node_bytes: wide,
+                    ..limits()
+                },
+                PhaseLimitsError::NodeAboveLengthField,
+            ),
+            (
+                PhaseLimits {
+                    max_writer_bytes: wide,
+                    ..limits()
+                },
+                PhaseLimitsError::WriterAboveLengthField,
+            ),
+            (
+                PhaseLimits {
+                    max_identity_bytes: wide,
+                    ..limits()
+                },
+                PhaseLimitsError::IdentityAboveLengthField,
+            ),
+            (
+                PhaseLimits {
+                    max_cuts: wide,
+                    ..limits()
+                },
+                PhaseLimitsError::CutsAboveCountField,
+            ),
+            (
+                PhaseLimits {
+                    max_members: wide,
+                    ..limits()
+                },
+                PhaseLimitsError::MembersAboveCountField,
+            ),
+            (
+                PhaseLimits {
+                    max_events: wide,
+                    ..limits()
+                },
+                PhaseLimitsError::EventsAboveCountField,
+            ),
+        ];
+        for (limits, expected) in cases {
+            assert_eq!(limits.validate(), Err(expected));
+        }
+        // The widest bound is a u32 length; it only binds on 64-bit targets.
+        if let Ok(beyond) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert_eq!(
+                PhaseLimits {
+                    max_effect_bytes: nonzero(beyond),
+                    ..limits()
+                }
+                .validate(),
+                Err(PhaseLimitsError::EffectAboveLengthField)
+            );
         }
     }
 

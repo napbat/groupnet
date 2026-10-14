@@ -1,22 +1,26 @@
 //! One concrete claim/transfer child driven inside the recovery worker.
 
 use std::collections::VecDeque;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_core::volatile_bootstrap::transfer::{TransferConfig, TransferEffect, TransferEvent};
+use groupnet_core::volatile_bootstrap::transfer::{
+    TransferConfig, TransferConfigError, TransferEffect, TransferEvent,
+};
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapConfig, BootstrapEffect, BootstrapError, BootstrapEvent,
+    BootId, BootstrapConfig, BootstrapConfigError, BootstrapEffect, BootstrapError, BootstrapEvent,
     BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine,
-    ClaimIdentity,
+    ClaimIdentity, PresenceIdentity,
 };
 use groupnet_core::volatile_recovery::RecoveryOperation;
 use groupnet_core::{NodeId, Time};
+use groupnet_transport::QueueCapacity;
 use tokio::sync::Notify;
 
 use super::admission::{AdmissionClass, AdmissionError, Reservation};
 use super::driver::{AcquisitionBinding, BootstrapDriver, BootstrapFuture, BootstrapOutcome};
-use super::inbox::{DonorInbox, DonorInboxError, DonorSender};
+use super::inbox::{DonorInbox, DonorSender};
 use super::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSource, DonorCapture, DonorPort,
     LogicalClock, TransferContext, TransferResources,
@@ -27,6 +31,12 @@ use crate::volatile_recovery::{AdapterErrorKind, PublicationPermit, ReadyCapture
 const MAX_DONOR_SERVICE_BATCH: usize = 32;
 
 /// Source and memory limits for one optional bootstrap child.
+///
+/// The application's image schema is the one mandatory input
+/// ([`new`](Self::new)); every other limit starts from an operational default
+/// and is refined with struct-update syntax. [`validate`](Self::validate)
+/// checks the whole value, and [`BootstrapSession::new`] runs it before any
+/// shared admission is reserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootstrapRuntimeConfig {
     /// Sans-IO advisory claim limits.
@@ -34,9 +44,9 @@ pub struct BootstrapRuntimeConfig {
     /// Sans-IO private transfer limits.
     pub transfer: TransferConfig,
     /// Complete native claim snapshot bytes, checked before source allocation.
-    pub max_claim_metadata_bytes: usize,
+    pub max_claim_metadata_bytes: NonZeroUsize,
     /// Bounded incoming donor requests served by the same worker.
-    pub donor_inbox_capacity: usize,
+    pub donor_inbox_capacity: QueueCapacity,
     /// Require a complete native participation cut. Donor capture and peer
     /// transfer then bind to that roster, which the bulk Offer and Barrier
     /// carry; a missing or changed roster declines peer transfer to guarded
@@ -46,56 +56,137 @@ pub struct BootstrapRuntimeConfig {
     pub require_participation: bool,
 }
 
+/// Default native claim snapshot budget: 1 MiB.
+const DEFAULT_CLAIM_METADATA_BYTES: NonZeroUsize = NonZeroUsize::new(1024 * 1024).unwrap();
+
+/// Default bounded donor inbox depth.
+const DEFAULT_DONOR_INBOX: QueueCapacity = QueueCapacity::of(16);
+
+impl BootstrapRuntimeConfig {
+    /// The default limits for a follower that installs images of
+    /// `expected_schema`: the core's claim and transfer defaults, 1 MiB of
+    /// claim metadata, a 16-request donor inbox, and claims-only selection.
+    #[must_use]
+    pub const fn new(expected_schema: NonZeroU32) -> Self {
+        Self {
+            claim: crate::volatile_recovery::defaults::claim(),
+            transfer: crate::volatile_recovery::defaults::transfer(expected_schema),
+            max_claim_metadata_bytes: DEFAULT_CLAIM_METADATA_BYTES,
+            donor_inbox_capacity: DEFAULT_DONOR_INBOX,
+            require_participation: false,
+        }
+    }
+
+    /// Checks the claim and transfer limits, the retained core-metadata
+    /// charge they imply, and the claim budget against this platform's clock.
+    ///
+    /// # Errors
+    /// The [`BootstrapRuntimeConfigError`] naming the first violated rule.
+    pub fn validate(&self) -> Result<(), BootstrapRuntimeConfigError> {
+        self.claim
+            .validate()
+            .map_err(BootstrapRuntimeConfigError::Claim)?;
+        self.transfer
+            .validate()
+            .map_err(BootstrapRuntimeConfigError::Transfer)?;
+        self.core_metadata_bytes()
+            .ok_or(BootstrapRuntimeConfigError::MetadataOverflow)?;
+        Instant::now()
+            .checked_add(Duration::from_millis(self.claim.total_ms))
+            .ok_or(BootstrapRuntimeConfigError::ClockRange)?;
+        Ok(())
+    }
+
+    /// The admission charge for the core's retained metadata.
+    ///
+    /// Core retains an observed claim map plus binding, offer, barrier,
+    /// coverage, an effect copy, and transient completion copies. Twelve
+    /// complete transfer-metadata sets is deliberately conservative for those
+    /// simultaneous owners. Vec/BTreeMap element headers have their own finite
+    /// count-bound charge. Real image, suffix, native and wire buffers are
+    /// charged separately to their actual owners. This is an admission bound,
+    /// not a claim of byte-exact allocator RSS.
+    fn core_metadata_bytes(&self) -> Option<usize> {
+        self.transfer
+            .max_metadata_bytes
+            .get()
+            .checked_mul(12)?
+            .checked_add(self.max_claim_metadata_bytes.get())?
+            .checked_add(self.claim.max_members.get().checked_mul(128)?)?
+            .checked_add(self.transfer.max_cuts.get().checked_mul(64)?)?
+            .checked_add(512)
+    }
+}
+
+/// The [`BootstrapRuntimeConfig`] rule [`BootstrapRuntimeConfig::validate`]
+/// rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootstrapRuntimeConfigError {
+    /// `claim` failed [`BootstrapConfig::validate`]; the
+    /// [`BootstrapConfigError`] is the [`source`](std::error::Error::source).
+    Claim(BootstrapConfigError),
+    /// `transfer` failed [`TransferConfig::validate`]; the
+    /// [`TransferConfigError`] is the [`source`](std::error::Error::source).
+    Transfer(TransferConfigError),
+    /// The retained core-metadata charge derived from `transfer`, `claim` and
+    /// `max_claim_metadata_bytes` overflows `usize`.
+    MetadataOverflow,
+    /// `claim.total_ms` from now is not representable by this platform's
+    /// clock.
+    ClockRange,
+}
+
+impl std::fmt::Display for BootstrapRuntimeConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Claim(_) => "invalid claim limits",
+            Self::Transfer(_) => "invalid transfer limits",
+            Self::MetadataOverflow => "retained core metadata charge overflows",
+            Self::ClockRange => "claim.total_ms exceeds the clock range",
+        })
+    }
+}
+
+impl std::error::Error for BootstrapRuntimeConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Claim(error) => Some(error),
+            Self::Transfer(error) => Some(error),
+            Self::MetadataOverflow | Self::ClockRange => None,
+        }
+    }
+}
+
 /// Opening the optional child failed before it could publish a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootstrapSessionError {
-    /// The claim core rejected `config.claim`, `scope`, or the local identity;
-    /// the [`BootstrapError`] is the [`source`](std::error::Error::source).
-    Claim(BootstrapError),
-    /// The claim core rejected `config.transfer`; the [`BootstrapError`] is
-    /// the [`source`](std::error::Error::source).
-    Transfer(BootstrapError),
-    /// The claim core refused `config.require_participation`; the
+    /// `config` failed [`BootstrapRuntimeConfig::validate`]; nothing was
+    /// reserved. The [`BootstrapRuntimeConfigError`] is the
+    /// [`source`](std::error::Error::source).
+    Config(BootstrapRuntimeConfigError),
+    /// The claim core rejected `scope` or the local `identity`; the
     /// [`BootstrapError`] is the [`source`](std::error::Error::source).
-    Participation(BootstrapError),
-    /// `config.max_claim_metadata_bytes` is zero.
-    ZeroClaimMetadata,
-    /// The retained core-metadata charge derived from `config` overflows.
-    MetadataOverflow,
+    Claim(BootstrapError),
     /// Aggregate memory admission could not reserve retained core metadata.
     Admission(AdmissionError),
-    /// Donor ingress capacity was invalid.
-    Inbox(DonorInboxError),
-    /// A required finite absolute deadline is not representable.
-    ClockRange,
 }
 
 impl std::fmt::Display for BootstrapSessionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Claim(_) => formatter.write_str("claim core rejected the session"),
-            Self::Transfer(_) => formatter.write_str("claim core rejected the transfer config"),
-            Self::Participation(_) => {
-                formatter.write_str("claim core refused required participation")
-            }
-            Self::ZeroClaimMetadata => formatter.write_str("max_claim_metadata_bytes is zero"),
-            Self::MetadataOverflow => {
-                formatter.write_str("retained core metadata charge overflows")
-            }
-            Self::Admission(_) => formatter.write_str("core metadata admission refused"),
-            Self::Inbox(_) => formatter.write_str("invalid donor inbox capacity"),
-            Self::ClockRange => formatter.write_str("bootstrap deadline exceeds the clock range"),
-        }
+        formatter.write_str(match self {
+            Self::Config(_) => "invalid bootstrap runtime config",
+            Self::Claim(_) => "claim core rejected the session",
+            Self::Admission(_) => "core metadata admission refused",
+        })
     }
 }
 
 impl std::error::Error for BootstrapSessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Claim(error) | Self::Transfer(error) | Self::Participation(error) => Some(error),
+            Self::Config(error) => Some(error),
+            Self::Claim(error) => Some(error),
             Self::Admission(error) => Some(error),
-            Self::Inbox(error) => Some(error),
-            Self::ZeroClaimMetadata | Self::MetadataOverflow | Self::ClockRange => None,
         }
     }
 }
@@ -154,60 +245,56 @@ impl<C: ClaimSource, D: DonorPort> Drop for BootstrapSession<C, D> {
 }
 
 impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
-    /// Creates one child and its bounded donor request sender.
+    /// Creates one child for `scope`, published under the long-lived
+    /// participation `identity` (node, process-fresh boot, worker session),
+    /// and its bounded donor request sender.
+    ///
+    /// `config` is validated first: an invalid one reserves nothing.
     ///
     /// # Errors
-    /// Names the rejected identity or limit, the refused admission, or the
-    /// unrepresentable clock range.
+    /// The violated config rule, the rejected scope or identity, or the
+    /// refused admission.
     pub fn new(
         capabilities: BootstrapCapabilities<C, D>,
         config: BootstrapRuntimeConfig,
         scope: BootstrapScope,
-        me: NodeId,
-        boot: BootId,
-        session: u64,
+        identity: PresenceIdentity,
     ) -> Result<(Self, DonorSender), BootstrapSessionError> {
+        config.validate().map_err(BootstrapSessionError::Config)?;
+        let PresenceIdentity {
+            node: me,
+            boot,
+            session,
+        } = identity;
+        // The validated config cannot fail the transfer and participation
+        // switches on a fresh engine; any refusal is still the core's own.
         let mut engine = ClaimEngine::new(config.claim, scope.clone(), me.clone(), boot, session)
             .map_err(BootstrapSessionError::Claim)?;
         engine
             .enable_transfer(config.transfer)
-            .map_err(BootstrapSessionError::Transfer)?;
+            .map_err(BootstrapSessionError::Claim)?;
         if config.require_participation {
             engine
                 .require_participation()
-                .map_err(BootstrapSessionError::Participation)?;
+                .map_err(BootstrapSessionError::Claim)?;
         }
-        if config.max_claim_metadata_bytes == 0 {
-            return Err(BootstrapSessionError::ZeroClaimMetadata);
-        }
-        // Core retains an observed claim map plus binding, offer, barrier,
-        // coverage, an effect copy, and transient completion copies. Twelve
-        // complete transfer-metadata sets is deliberately conservative for
-        // those simultaneous owners. Vec/BTreeMap element headers have their
-        // own finite count-bound charge. Real image, suffix, native and wire
-        // buffers are charged separately to their actual owners. This is an
-        // admission bound, not a claim of byte-exact allocator RSS.
         let core_bytes = config
-            .transfer
-            .max_metadata_bytes
-            .get()
-            .checked_mul(12)
-            .and_then(|value| value.checked_add(config.max_claim_metadata_bytes))
-            .and_then(|value| value.checked_add(config.claim.max_members.get().checked_mul(128)?))
-            .and_then(|value| value.checked_add(config.transfer.max_cuts.get().checked_mul(64)?))
-            .and_then(|value| value.checked_add(512))
-            .ok_or(BootstrapSessionError::MetadataOverflow)?;
+            .core_metadata_bytes()
+            .ok_or(BootstrapSessionError::Config(
+                BootstrapRuntimeConfigError::MetadataOverflow,
+            ))?;
+        let clock = LogicalClock::start();
+        if clock.absolute(Time(config.claim.total_ms)).is_none() {
+            return Err(BootstrapSessionError::Config(
+                BootstrapRuntimeConfigError::ClockRange,
+            ));
+        }
         let core_metadata = capabilities
             .admission
             .reserve(AdmissionClass::Inflight, core_bytes)
             .map_err(BootstrapSessionError::Admission)?;
-        let (sender, inbox) =
-            DonorInbox::new(config.donor_inbox_capacity).map_err(BootstrapSessionError::Inbox)?;
+        let (sender, inbox) = DonorInbox::new(config.donor_inbox_capacity);
         let wake = inbox.wake();
-        let clock = LogicalClock::start();
-        if clock.absolute(Time(config.claim.total_ms)).is_none() {
-            return Err(BootstrapSessionError::ClockRange);
-        }
         Ok((
             Self {
                 claims: capabilities.claims,
@@ -324,7 +411,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         ClaimObservationLimits {
             max_members,
             max_member_bytes,
-            max_metadata_bytes: self.config.max_claim_metadata_bytes,
+            max_metadata_bytes: self.config.max_claim_metadata_bytes.get(),
         }
     }
 
@@ -360,6 +447,7 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         let budget = self
             .config
             .donor_inbox_capacity
+            .get()
             .min(MAX_DONOR_SERVICE_BATCH);
         let mut served = 0;
         for _ in 0..budget {

@@ -7,6 +7,7 @@ use super::{
     RecoveryAdapter, RecoveryConfig, RecoveryFallback, RecoveryHandle, RecoveryMode,
     RecoveryOperation, RecoveryStage, SETTLE, bootstrap_config, eventually_within,
 };
+use groupnet_consistency::volatile_recovery::bootstrap::PresenceIdentity;
 use std::future::ready;
 
 const PAGES: usize = 25;
@@ -86,20 +87,20 @@ async fn own_origin_rebuild_keeps_presence_renewing_past_claim_ttls() {
     let donor = Arc::new(OriginDonor::default());
     let mut config = bootstrap_config();
     config.require_participation = true;
-    config.max_claim_metadata_bytes = 512;
+    config.max_claim_metadata_bytes = std::num::NonZeroUsize::new(512).unwrap();
     let ttl = Duration::from_millis(config.claim.claim_ttl_ms);
     let (driver, _sender) = BootstrapSession::new(
         BootstrapCapabilities {
             claims: Arc::clone(&claims),
             donor: Arc::clone(&donor),
             admission: ByteAdmission::new(AdmissionLimits {
-                max_total_bytes: 100_000,
+                max_total_bytes: std::num::NonZeroUsize::new(100_000).unwrap(),
                 max_encoded_bytes: 0,
                 max_decoded_bytes: 1_024,
                 max_suffix_bytes: 50_000,
                 max_native_overlap_bytes: 1_024,
                 max_inflight_bytes: 8_192,
-                max_reservations: 32,
+                max_reservations: std::num::NonZeroUsize::new(32).unwrap(),
             })
             .unwrap(),
         },
@@ -108,15 +109,16 @@ async fn own_origin_rebuild_keeps_presence_renewing_past_claim_ttls() {
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap();
     let origin = Arc::new(SlowOrigin::default());
-    let handle = RecoveryHandle::open_with_bootstrap(
-        Arc::clone(&origin),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::clone(&origin), NodeId::from("me"), 9)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -124,13 +126,11 @@ async fn own_origin_rebuild_keeps_presence_renewing_past_claim_ttls() {
             attempt_ms: 500,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        9,
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .mode(RecoveryMode::Unleased)
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     eventually_within("the declined child falls back to origin", SETTLE, || {
         origin.scanning.load(Ordering::SeqCst)
     })

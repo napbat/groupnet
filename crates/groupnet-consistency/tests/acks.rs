@@ -7,8 +7,9 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use groupnet_consistency::{
-    AckBasis, AckLedger, CAP_ACKS, Group, PeerWrite, PeerWrites, PublishError, Recorded, WriteFeed,
-    WriteToken, applied_by, applied_by_roster, applied_by_selected, applied_cluster_wide,
+    AckBasis, AckLedger, AckWait, CAP_ACKS, Group, PeerWrite, PeerWrites, PublishError, Recorded,
+    WriteFeed, WriteToken, applied_by, applied_by_roster, applied_by_selected,
+    applied_cluster_wide,
 };
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually, spawn_mem_node};
@@ -30,6 +31,15 @@ fn opts() -> NodeOpts {
 
 fn decode(bytes: &[u8]) -> Option<String> {
     String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// `writer`'s feed through `token`, waited on for at most `timeout`.
+fn wait(writer: &NodeId, token: WriteToken, timeout: Duration) -> AckWait<'_> {
+    AckWait {
+        writer,
+        token,
+        timeout,
+    }
 }
 
 fn feed(group: &Group, epoch: u64) -> WriteFeed<String> {
@@ -77,7 +87,7 @@ async fn applied_acknowledgements_round_trip() {
     let feed = feed(&a_group, 4);
     let token = feed.publish(&"w1".to_owned()).await.expect("advertised");
 
-    let outcome = applied_cluster_wide(&a_group, &a_id, token, Duration::from_secs(5)).await;
+    let outcome = applied_cluster_wide(&a_group, wait(&a_id, token, Duration::from_secs(5))).await;
     assert!(outcome.is_complete(), "{outcome:?}");
     assert!(!outcome.is_vacuous(), "B was waited on: {outcome:?}");
     assert_eq!(outcome.basis, AckBasis::AliveMembers);
@@ -91,13 +101,45 @@ async fn applied_acknowledgements_round_trip() {
     );
     // A token nobody has applied yet must time out, not lie — and name who.
     let future = WriteToken { epoch: 4, seq: 99 };
-    let outcome = applied_cluster_wide(&a_group, &a_id, future, Duration::from_millis(200)).await;
+    let outcome =
+        applied_cluster_wide(&a_group, wait(&a_id, future, Duration::from_millis(200))).await;
     assert!(
         !outcome.is_complete(),
         "an unapplied token must not be acknowledged"
     );
     assert_eq!(outcome.missing, vec![b_id]);
     assert_eq!(outcome.acknowledged, Vec::<NodeId>::new());
+}
+
+/// A timeout longer than the clock can represent is a wait without a
+/// deadline, never an overflow: every wait form accepts `Duration::MAX` and
+/// resolves on its outcome.
+#[tokio::test]
+async fn an_unrepresentable_timeout_waits_without_overflowing() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_mem_node(&net, "max-a", &["max-b"], &opts()).await;
+    let (b_id, _b_node, b_group) = spawn_mem_node(&net, "max-b", &["max-a"], &opts()).await;
+    converged_within(&[&a_group, &b_group], SETTLE).await;
+    apply_loop(&b_group, &b_id);
+
+    let token = feed(&a_group, 5)
+        .publish(&"w1".to_owned())
+        .await
+        .expect("advertised");
+    let forever = wait(&a_id, token, Duration::MAX);
+    let outcomes = tokio::time::timeout(SETTLE, async {
+        (
+            applied_cluster_wide(&a_group, forever).await,
+            applied_by_selected(&a_group, forever, |_| true).await,
+            applied_by_roster(&a_group, forever, [b_id.clone()]).await,
+        )
+    })
+    .await
+    .expect("each wait resolves on its outcome");
+    for outcome in [outcomes.0, outcomes.1, outcomes.2] {
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert_eq!(outcome.acknowledged, vec![b_id.clone()]);
+    }
 }
 
 /// A writer stopping on purpose waits for its peers to observe its seal
@@ -117,20 +159,20 @@ async fn a_seal_is_acknowledged_like_a_write() {
     let feed = feed(&a_group, 4);
     let last = feed.publish(&"w1".to_owned()).await.expect("advertised");
     assert!(
-        applied_cluster_wide(&a_group, &a_id, last, Duration::from_secs(5))
+        applied_cluster_wide(&a_group, wait(&a_id, last, Duration::from_secs(5)))
             .await
             .is_complete()
     );
     let seal = WriteToken { epoch: 4, seq: 2 };
     assert!(
-        !applied_cluster_wide(&a_group, &a_id, seal, Duration::from_millis(200))
+        !applied_cluster_wide(&a_group, wait(&a_id, seal, Duration::from_millis(200)))
             .await
             .is_complete(),
         "the last write's acknowledgement is not the seal's"
     );
     assert_eq!(feed.seal().await, Ok(seal));
     assert!(
-        applied_cluster_wide(&a_group, &a_id, seal, Duration::from_secs(5))
+        applied_cluster_wide(&a_group, wait(&a_id, seal, Duration::from_secs(5)))
             .await
             .is_complete(),
         "the subscriber acknowledged the seal"
@@ -175,10 +217,8 @@ async fn selected_waits_skip_members_that_do_not_participate() {
 
     let outcome = applied_by_selected(
         &a_group,
-        &a_id,
-        token,
+        wait(&a_id, token, Duration::from_secs(5)),
         |peer| a_group.node_has_capability(peer, CAP_ACKS),
-        Duration::from_secs(5),
     )
     .await;
     assert!(outcome.is_complete(), "{outcome:?}");
@@ -191,7 +231,8 @@ async fn selected_waits_skip_members_that_do_not_participate() {
     );
 
     // Pinned: the unscoped wait still hangs on C, which never acknowledges.
-    let outcome = applied_cluster_wide(&a_group, &a_id, token, Duration::from_millis(300)).await;
+    let outcome =
+        applied_cluster_wide(&a_group, wait(&a_id, token, Duration::from_millis(300))).await;
     assert!(
         !outcome.is_complete(),
         "cluster-wide still waits on the non-participating member"
@@ -200,10 +241,8 @@ async fn selected_waits_skip_members_that_do_not_participate() {
     // Selecting a peer that never acknowledges times out exactly as it should.
     let outcome = applied_by_selected(
         &a_group,
-        &a_id,
-        token,
+        wait(&a_id, token, Duration::from_millis(300)),
         |peer| *peer == c_id,
-        Duration::from_millis(300),
     )
     .await;
     assert!(
@@ -231,10 +270,8 @@ async fn empty_and_lagged_selections_are_visible_and_a_roster_does_not_lag() {
 
     let lagged = applied_by_selected(
         &a_group,
-        &a_id,
-        token,
+        wait(&a_id, token, Duration::from_secs(5)),
         |peer| a_group.node_has_capability(peer, CAP_ACKS),
-        Duration::from_secs(5),
     )
     .await;
     assert!(lagged.is_complete(), "nobody selected, nobody missing");
@@ -251,10 +288,8 @@ async fn empty_and_lagged_selections_are_visible_and_a_roster_does_not_lag() {
     let roster = [a_id.clone(), b_id.clone(), b_id.clone()];
     let pending = applied_by_roster(
         &a_group,
-        &a_id,
-        token,
+        wait(&a_id, token, Duration::from_millis(200)),
         roster.clone(),
-        Duration::from_millis(200),
     )
     .await;
     assert_eq!(pending.basis, AckBasis::FixedRoster);
@@ -271,7 +306,12 @@ async fn empty_and_lagged_selections_are_visible_and_a_roster_does_not_lag() {
     apply_loop(&b_group, &b_id);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let second = feed.publish(&"w2".to_owned()).await.expect("advertised");
-    let done = applied_by_roster(&a_group, &a_id, second, roster, Duration::from_secs(5)).await;
+    let done = applied_by_roster(
+        &a_group,
+        wait(&a_id, second, Duration::from_secs(5)),
+        roster,
+    )
+    .await;
     assert!(done.is_complete(), "{done:?}");
     assert_eq!(done.acknowledged, vec![b_id]);
     assert_eq!(done.skipped, Vec::<NodeId>::new());

@@ -11,17 +11,26 @@ origin rebuild and performs no extra coordination writes to S3.
 
 ## One recovery episode and one worker
 
-`RecoveryHandle::open_with_bootstrap` opens the same public safety gate and
-cancellation semantics as `open_with_rearm`, accepting a
-`Box<dyn BootstrapDriver>`. The combined constructor is
-`open_with_bootstrap_and_rearm`. `BootstrapSession::new` constructs the
-concrete driver from `BootstrapCapabilities<C: ClaimSource, D: DonorPort>`,
-`BootstrapRuntimeConfig`, scope, node, a 128-bit `BootId`, and session, and
-returns its bounded `DonorSender`. The capabilities share a `ByteAdmission`;
-configuration pins finite claim/transfer, observation, and inbox limits,
-including `require_participation`. Journal/capture and bulk limits are pinned
-by their respective bindings. Existing `RecoveryAdapter` implementations
-and callers of `open` need not implement transfer methods.
+`RecoveryHandle::builder(adapter, me, session)` configures the recovery
+worker; its `.bootstrap(Box<dyn BootstrapDriver>)` setter adds a peer
+bootstrap child behind the same public safety gate and cancellation
+semantics, and composes with `.rearm(..)`; `.open()` validates and spawns.
+`BootstrapSession::new` constructs the concrete driver from
+`BootstrapCapabilities<C: ClaimSource, D: DonorPort>`, a
+`BootstrapRuntimeConfig`, the scope, and the worker's `PresenceIdentity`
+(node, a 128-bit `BootId`, and session), and returns its bounded
+`DonorSender`. The capabilities share a `ByteAdmission`; configuration pins
+finite claim/transfer, observation, and inbox limits, including
+`require_participation`. `BootstrapRuntimeConfig::new(expected_schema)`
+starts from the core's claim and transfer defaults; the metadata budget is a
+`NonZeroUsize` and the donor inbox a `QueueCapacity`, and
+`BootstrapRuntimeConfig::validate` (also run by `BootstrapSession::new`
+before any shared admission is reserved) names a rejected claim or transfer
+rule, an overflowing core-metadata charge, or an unrepresentable claim budget
+as a typed `BootstrapRuntimeConfigError`. Journal/capture and bulk limits
+are pinned by their respective bindings. Existing `RecoveryAdapter`
+implementations and builders without a bootstrap child need not implement
+transfer methods.
 An application may inject a boot identity for tests. Production s3cache fleet
 integration must obtain one token per process start from the operating system CSPRNG;
 failure disables peer bootstrap and leaves guarded origin recovery available.

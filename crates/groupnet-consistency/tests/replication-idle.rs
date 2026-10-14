@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::replication::{
     AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
     Comparison, Cursor, IdlePolicy, InstallPermit, Limits, Materialized, ProofId, ReadVerdict,
@@ -425,7 +426,7 @@ async fn restored_authority_rechecks_even_when_false_command_was_backpressured()
         .await;
     let source = Source::default();
     let mut config = limits();
-    config.queue_depth = NonZeroUsize::MIN;
+    config.queue_depth = QueueCapacity::MIN;
     let manager = Replication::new(
         cluster.groups[0].clone(),
         source.clone(),

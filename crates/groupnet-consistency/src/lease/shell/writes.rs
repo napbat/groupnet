@@ -11,6 +11,7 @@ use crate::lease::coherence::{CoherenceCore, CoherenceStep, WaitMember};
 use crate::lease::core::ClockMs;
 use crate::lease::{CAP_LEASE, CoherenceOutcome};
 use crate::token::WriteToken;
+use crate::wait::WaitDeadline;
 
 use super::{Leases, Shared, decode_renewal, lock};
 
@@ -201,7 +202,7 @@ impl Leases {
         token: WriteToken,
         timeout: Duration,
     ) -> CoherenceOutcome {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = WaitDeadline::after(timeout);
         let _registration = self.shared.register(writer, token);
         let mut core = CoherenceCore::new(writer.clone());
         loop {
@@ -217,7 +218,7 @@ impl Leases {
                     CoherenceStep::Waiting { .. } => {}
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if deadline.passed() {
                 let mut waiting_on = core.abandon(token).unwrap_or_default();
                 waiting_on.extend(held.unwrap_or_default());
                 waiting_on.sort_unstable();

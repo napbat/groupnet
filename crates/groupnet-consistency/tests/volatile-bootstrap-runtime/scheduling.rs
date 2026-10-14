@@ -5,6 +5,7 @@ use super::{
     Instant, NodeId, Ordering, OriginDonor, ReadAdapter, RecoveryConfig, RecoveryHandle,
     RecoveryMode, RecoveryRearm, SETTLE, admission, bootstrap_config, eventually_within,
 };
+use groupnet_consistency::volatile_recovery::bootstrap::PresenceIdentity;
 use groupnet_core::volatile_bootstrap::ClaimPhase;
 
 /// Consumers run the worker beside their gossip and peer tasks, often on a
@@ -34,15 +35,16 @@ async fn settling_acquisition_yields_until_its_deadline() {
             domain: "o".into(),
             partition: "b".into(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap();
     let started = Instant::now();
-    let handle = RecoveryHandle::open_with_bootstrap_and_rearm(
-        Arc::new(ReadAdapter::default()),
-        RecoveryConfig {
+    let handle = RecoveryHandle::builder(Arc::new(ReadAdapter::default()), NodeId::from("me"), 9)
+        .config(RecoveryConfig {
             max_members: std::num::NonZeroUsize::new(2).unwrap(),
             max_member_bytes: std::num::NonZeroUsize::new(8).unwrap(),
             max_barrier_rounds: std::num::NonZeroU32::new(2).unwrap(),
@@ -50,17 +52,15 @@ async fn settling_acquisition_yields_until_its_deadline() {
             attempt_ms: 4_000,
             settle_ms: 5,
             poll_ms: 5,
-        },
-        RecoveryMode::Unleased,
-        NodeId::from("me"),
-        9,
-        RecoveryRearm {
+        })
+        .mode(RecoveryMode::Unleased)
+        .rearm(RecoveryRearm {
             initial_ms: 50,
             max_ms: 200,
-        },
-        Box::new(driver),
-    )
-    .unwrap();
+        })
+        .bootstrap(Box::new(driver))
+        .open()
+        .unwrap();
     // A worker that never yields while Settling advances straight to the
     // origin build before this task is polled again, so the Willing claim is
     // never observable.
