@@ -99,6 +99,6 @@ pub use routing::Routing;
 pub use seeds::SystemResolver;
 pub use seeds::{
     DEFAULT_REFRESH_INTERVAL, DEFAULT_RETRY_INTERVAL, DEFAULT_STARTUP_ATTEMPTS, NamedSeeds,
-    ResolveFuture, SeedEvent, SeedResolver,
+    NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
 };
 pub use store::{FileGrantStore, GrantStore};

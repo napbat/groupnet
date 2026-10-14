@@ -4,17 +4,21 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
 
-use super::{NamedSeeds, ResolveFuture, SeedEvent, SeedResolver, resolve_named_seeds};
+use super::{
+    MIN_INTERVAL, NamedSeeds, NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
+    resolve_named_seeds,
+};
 
 const RETRY: Duration = Duration::from_secs(1);
 const REFRESH: Duration = Duration::from_secs(5);
-const ATTEMPTS: u32 = 3;
+const ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 
 /// A transport that only records `learn_peer` calls.
 #[derive(Default)]
@@ -263,14 +267,14 @@ async fn a_late_seed_is_retried_at_the_retry_cadence_until_it_resolves() {
 async fn a_seed_outliving_its_window_is_reported_once_and_kept_at_the_refresh_cadence() {
     let h = Harness::spawn(&[("b", "b.svc:7000")], Scripted::default());
     advance(Duration::ZERO).await;
-    advance(RETRY * (ATTEMPTS - 1)).await;
-    assert_eq!(h.resolver.lookups("b.svc:7000"), ATTEMPTS);
+    advance(RETRY * (ATTEMPTS.get() - 1)).await;
+    assert_eq!(h.resolver.lookups("b.svc:7000"), ATTEMPTS.get());
     assert_eq!(h.seen(), vec![Seen::Unresolved("b".into())]);
 
     advance(RETRY).await;
     assert_eq!(
         h.resolver.lookups("b.svc:7000"),
-        ATTEMPTS,
+        ATTEMPTS.get(),
         "past its window a seed waits a refresh"
     );
     advance(REFRESH * 2).await;
@@ -317,4 +321,40 @@ async fn the_task_ends_with_its_transport() {
     drop(transport);
     advance(REFRESH).await;
     assert!(task.is_finished());
+}
+
+#[test]
+fn validate_rejects_intervals_below_the_minimum_by_field_without_flooring() {
+    let seeds = || NamedSeeds::new(Scripted::default());
+    assert_eq!(seeds().validate(), Ok(()));
+    assert_eq!(
+        seeds()
+            .retry_interval(MIN_INTERVAL)
+            .refresh_interval(MIN_INTERVAL)
+            .validate(),
+        Ok(()),
+        "the minimum itself is accepted"
+    );
+    assert_eq!(
+        seeds().retry_interval(Duration::ZERO).validate(),
+        Err(NamedSeedsError::RetryIntervalTooShort {
+            interval: Duration::ZERO,
+            min: MIN_INTERVAL,
+        })
+    );
+    let short = Duration::from_micros(999);
+    assert_eq!(
+        seeds().refresh_interval(short).validate(),
+        Err(NamedSeedsError::RefreshIntervalTooShort {
+            interval: short,
+            min: MIN_INTERVAL,
+        })
+    );
+    let error = io::Error::from(
+        seeds()
+            .retry_interval(Duration::ZERO)
+            .validate()
+            .unwrap_err(),
+    );
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }

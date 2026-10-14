@@ -5,15 +5,15 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
 use groupnet_network::RouterConfig;
-use groupnet_runtime::{NamedSeeds, Node, ResolveFuture, SeedEvent, SeedResolver};
+use groupnet_runtime::{NamedSeeds, NamedSeedsError, Node, ResolveFuture, SeedEvent, SeedResolver};
 use groupnet_testkit::cluster::eventually_within;
-use groupnet_transport::link::{BoundLink, LinkConfig};
+use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture};
 use groupnet_transport_mem::{MemLink, Network};
 use groupnet_transport_udp::UdpTransport;
 
@@ -183,6 +183,59 @@ async fn pending_lookup_stops(explicit_close: bool) {
     tokio::time::timeout(SETTLE, router.cancelled())
         .await
         .expect("router cancellation accompanies resolver shutdown");
+}
+
+/// Records whether start ever tried to bind it.
+#[derive(Debug)]
+struct BindProbe {
+    peers: Vec<NodeId>,
+    bound: Arc<AtomicBool>,
+}
+
+impl groupnet_runtime::LinkProvider for BindProbe {
+    fn peers(&self) -> &[NodeId] {
+        &self.peers
+    }
+
+    fn bind(self: Box<Self>, _local: NodeId) -> LinkFuture<'static, io::Result<BoundLink>> {
+        self.bound.store(true, Ordering::SeqCst);
+        Box::pin(async { Err(io::Error::other("probe never binds")) })
+    }
+}
+
+#[tokio::test]
+async fn start_rejects_a_too_short_seed_interval_by_field_before_binding() {
+    let bound = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    let peer = NodeId::new("peer");
+    let error = Node::builder(NodeId::new("invalid-seeds"))
+        .link(BindProbe {
+            peers: vec![peer.clone()],
+            bound: bound.clone(),
+        })
+        .named_seeds(
+            NamedSeeds::new(PendingResolver {
+                started: Arc::clone(&started),
+                cancelled: Arc::new(AtomicUsize::new(0)),
+            })
+            .seed(peer, SEED_NAME)
+            .retry_interval(Duration::ZERO),
+        )
+        .start()
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<NamedSeedsError>()),
+        Some(&NamedSeedsError::RetryIntervalTooShort {
+            interval: Duration::ZERO,
+            min: Duration::from_millis(1),
+        })
+    );
+    assert!(!bound.load(Ordering::SeqCst), "validation precedes binding");
+    assert_eq!(started.load(Ordering::SeqCst), 0, "no lookup ran");
 }
 
 /// The operating system resolver resolves a literal `host:port` and a

@@ -117,7 +117,8 @@ impl NodeBuilder {
     /// the node itself (see [`NamedSeeds`]): every seed joins the seed set
     /// now, its address reaches admitted links once it resolves, and it is
     /// re-resolved for the life of the node. A later call replaces an earlier one.
-    /// This does not grant link admission.
+    /// This does not grant link admission. Stored as given;
+    /// [`start`](Self::start) validates it ([`NamedSeeds::validate`]).
     #[must_use]
     pub fn named_seeds(mut self, seeds: NamedSeeds) -> Self {
         self.named_seeds = Some(seeds);
@@ -204,9 +205,11 @@ impl NodeBuilder {
     /// Returns `InvalidInput` before binding anything when a policy fails
     /// validation, wrapping the typed error that names the field: the group
     /// [`ConfigError`](groupnet_core::ConfigError) from [`Config::validate`], a
-    /// [`MessagingConfigError`](crate::messaging::MessagingConfigError), or an
-    /// [`UnorderedConfigError`](crate::UnorderedConfigError). Propagates invalid
-    /// routing configuration, binding, registration, or security setup failures.
+    /// [`MessagingConfigError`](crate::messaging::MessagingConfigError), an
+    /// [`UnorderedConfigError`](crate::UnorderedConfigError), or a
+    /// [`NamedSeedsError`](crate::NamedSeedsError) from
+    /// [`NamedSeeds::validate`]. Propagates invalid routing configuration,
+    /// binding, registration, or security setup failures.
     ///
     /// # Panics
     /// Requires a Tokio runtime; propagates poisoned internal locks.
@@ -214,6 +217,9 @@ impl NodeBuilder {
         self.config.validate()?;
         self.messaging.validate()?;
         self.unordered.validate()?;
+        if let Some(named) = &self.named_seeds {
+            named.validate()?;
+        }
         let mut seeds = self.seeds;
         seeds.extend(self.network.peers());
         if let Some(named) = &self.named_seeds {

@@ -34,6 +34,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -47,12 +48,13 @@ pub const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How many failed attempts a never-resolved seed gets by default before it is
 /// reported [`SeedEvent::Unresolved`] and moves to the refresh cadence.
-pub const DEFAULT_STARTUP_ATTEMPTS: u32 = 30;
+pub const DEFAULT_STARTUP_ATTEMPTS: NonZeroU32 = NonZeroU32::new(30).unwrap();
 
 /// How often a resolved seed is re-resolved by default.
 pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The smallest accepted interval: a zero would busy-spin the resolver task.
+/// The shortest interval [`NamedSeeds::validate`] accepts: a zero would
+/// busy-spin the resolver task.
 const MIN_INTERVAL: Duration = Duration::from_millis(1);
 
 /// A future returned by [`SeedResolver::resolve`].
@@ -145,7 +147,7 @@ pub struct NamedSeeds {
     seeds: Vec<(NodeId, String)>,
     resolver: Arc<dyn SeedResolver>,
     retry_interval: Duration,
-    startup_attempts: u32,
+    startup_attempts: NonZeroU32,
     refresh_interval: Duration,
     observer: Option<Observer>,
 }
@@ -186,27 +188,28 @@ impl NamedSeeds {
         self
     }
 
-    /// The wait between attempts while a seed has never resolved (floored at
-    /// 1 ms).
+    /// The wait between attempts while a seed has never resolved. Stored as
+    /// given; [`validate`](Self::validate) rejects anything under 1 ms.
     #[must_use]
     pub fn retry_interval(mut self, interval: Duration) -> Self {
-        self.retry_interval = interval.max(MIN_INTERVAL);
+        self.retry_interval = interval;
         self
     }
 
     /// How many failed attempts a never-resolved seed gets before it is
-    /// reported [`SeedEvent::Unresolved`] (floored at 1).
+    /// reported [`SeedEvent::Unresolved`].
     #[must_use]
-    pub fn startup_attempts(mut self, attempts: u32) -> Self {
-        self.startup_attempts = attempts.max(1);
+    pub fn startup_attempts(mut self, attempts: NonZeroU32) -> Self {
+        self.startup_attempts = attempts;
         self
     }
 
     /// The re-resolution cadence once a seed has resolved, and the retry
-    /// cadence after its startup window (floored at 1 ms).
+    /// cadence after its startup window. Stored as given;
+    /// [`validate`](Self::validate) rejects anything under 1 ms.
     #[must_use]
     pub fn refresh_interval(mut self, interval: Duration) -> Self {
-        self.refresh_interval = interval.max(MIN_INTERVAL);
+        self.refresh_interval = interval;
         self
     }
 
@@ -223,10 +226,73 @@ impl NamedSeeds {
         self.seeds.iter().map(|(node, _)| node)
     }
 
+    /// Checks the resolution policy;
+    /// [`NodeBuilder::start`](crate::NodeBuilder::start) calls this before
+    /// binding anything.
+    ///
+    /// # Errors
+    /// Returns the first violated rule, naming the field: an interval shorter
+    /// than 1 ms would busy-spin the resolver task.
+    pub fn validate(&self) -> Result<(), NamedSeedsError> {
+        if self.retry_interval < MIN_INTERVAL {
+            return Err(NamedSeedsError::RetryIntervalTooShort {
+                interval: self.retry_interval,
+                min: MIN_INTERVAL,
+            });
+        }
+        if self.refresh_interval < MIN_INTERVAL {
+            return Err(NamedSeedsError::RefreshIntervalTooShort {
+                interval: self.refresh_interval,
+                min: MIN_INTERVAL,
+            });
+        }
+        Ok(())
+    }
+
     fn emit(&self, event: &SeedEvent) {
         if let Some(observer) = &self.observer {
             observer(event);
         }
+    }
+}
+
+/// A violated [`NamedSeeds`] rule, naming the offending field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedSeedsError {
+    /// `retry_interval` is shorter than `min`.
+    RetryIntervalTooShort {
+        /// The configured interval.
+        interval: Duration,
+        /// The shortest accepted interval.
+        min: Duration,
+    },
+    /// `refresh_interval` is shorter than `min`.
+    RefreshIntervalTooShort {
+        /// The configured interval.
+        interval: Duration,
+        /// The shortest accepted interval.
+        min: Duration,
+    },
+}
+
+impl fmt::Display for NamedSeedsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (field, interval, min) = match self {
+            Self::RetryIntervalTooShort { interval, min } => ("retry_interval", interval, min),
+            Self::RefreshIntervalTooShort { interval, min } => ("refresh_interval", interval, min),
+        };
+        write!(
+            f,
+            "named seeds {field} {interval:?} is shorter than the minimum {min:?}"
+        )
+    }
+}
+
+impl std::error::Error for NamedSeedsError {}
+
+impl From<NamedSeedsError> for io::Error {
+    fn from(error: NamedSeedsError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
     }
 }
 
@@ -307,10 +373,10 @@ fn attempt<T: Transport>(
         Err(_) if slot.current.is_some() => seeds.refresh_interval,
         Err(error) => {
             slot.failures = slot.failures.saturating_add(1);
-            if slot.failures < seeds.startup_attempts {
+            if slot.failures < seeds.startup_attempts.get() {
                 return seeds.retry_interval;
             }
-            if slot.failures == seeds.startup_attempts {
+            if slot.failures == seeds.startup_attempts.get() {
                 seeds.emit(&SeedEvent::Unresolved {
                     node: slot.node.clone(),
                     name: slot.name.clone(),
