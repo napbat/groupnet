@@ -15,10 +15,7 @@ use groupnet_transport_mem::MemLink;
 const WAIT: Duration = Duration::from_secs(5);
 
 fn delivered() -> SendOptions {
-    SendOptions {
-        delivery: Delivery::Delivered,
-        timeout: WAIT,
-    }
+    SendOptions::Delivered { timeout: WAIT }
 }
 
 async fn receive(group: &Group) -> groupnet_runtime::messaging::Frame {
@@ -130,10 +127,7 @@ async fn applied_fanout_freezes_recipients_across_departure_and_late_join() {
         sender
             .send_frame(
                 Bytes::from_static(b"frozen"),
-                SendOptions {
-                    delivery: Delivery::Applied,
-                    timeout: WAIT,
-                },
+                SendOptions::Applied { timeout: WAIT },
             )
             .await
     });
@@ -297,10 +291,7 @@ async fn payload_boundaries_and_empty_fanout_validate_before_dispatch() {
         io::ErrorKind::InvalidInput
     );
     for timeout in [Duration::ZERO, Duration::from_secs(31)] {
-        let options = SendOptions {
-            delivery: Delivery::Delivered,
-            timeout,
-        };
+        let options = SendOptions::Delivered { timeout };
         assert_eq!(
             empty
                 .send_frame(Bytes::new(), options)
@@ -420,8 +411,7 @@ async fn group_report_keeps_success_and_unknown_timeout_outcomes() {
         sender
             .send_frame(
                 Bytes::from_static(b"work"),
-                SendOptions {
-                    delivery: Delivery::Applied,
+                SendOptions::Applied {
                     timeout: Duration::from_millis(500),
                 },
             )
@@ -459,10 +449,7 @@ async fn manual_buffer_contexts_survive_payload_moves_and_complete_application()
         .spawn()
         .await;
     converge(&cluster.groups.iter().collect::<Vec<_>>(), 2).await;
-    let options = SendOptions {
-        delivery: Delivery::Applied,
-        timeout: WAIT,
-    };
+    let options = SendOptions::Applied { timeout: WAIT };
     let sender = cluster.nodes[0].clone();
     let recipient = cluster.ids[1].clone();
     let mut node_sending = tokio::spawn(async move {
@@ -539,10 +526,7 @@ async fn manual_buffer_contexts_reject_after_payload_drop() {
         .spawn()
         .await;
     converge(&cluster.groups.iter().collect::<Vec<_>>(), 2).await;
-    let options = SendOptions {
-        delivery: Delivery::Applied,
-        timeout: WAIT,
-    };
+    let options = SendOptions::Applied { timeout: WAIT };
     let sender = cluster.nodes[0].clone();
     let recipient = cluster.ids[1].clone();
     let node_sending = tokio::spawn(async move {
@@ -611,8 +595,7 @@ async fn dropping_manual_buffer_contexts_does_not_acknowledge_application() {
         .spawn()
         .await;
     converge(&cluster.groups.iter().collect::<Vec<_>>(), 2).await;
-    let options = SendOptions {
-        delivery: Delivery::Applied,
+    let options = SendOptions::Applied {
         timeout: Duration::from_millis(250),
     };
     let (node_result, group_result, ()) = tokio::join!(
@@ -705,10 +688,7 @@ async fn buffer_callback_retains_receipt_and_excludes_all_other_receive_variants
     );
     let mut sending = Box::pin(cluster.groups[0].send_frame(
         Bytes::from_static(b"process buffer"),
-        SendOptions {
-            delivery: Delivery::Applied,
-            timeout: WAIT,
-        },
+        SendOptions::Applied { timeout: WAIT },
     ));
     tokio::select! {
         result = &mut sending => panic!("send completed before application: {result:?}"),

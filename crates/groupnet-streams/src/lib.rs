@@ -15,7 +15,7 @@ use std::{future::Future, io};
 use groupnet_core::NodeId;
 
 mod ordered;
-pub mod unordered;
+mod unordered;
 
 pub use bytes::Bytes;
 pub use groupnet_network::Router;
@@ -23,8 +23,8 @@ pub use groupnet_network::tunnel::{TunnelTransport, TunneledStream};
 pub use groupnet_transport::QueueCapacity;
 pub use ordered::OrderedProtocol;
 pub use unordered::{
-    UnorderedConfig, UnorderedConfigError, UnorderedDelivery, UnorderedOptions, UnorderedProtocol,
-    UnorderedSession,
+    UnorderedConfig, UnorderedConfigError, UnorderedDelivery, UnorderedOptions,
+    UnorderedOptionsError, UnorderedProtocol, UnorderedSession, ValidUnorderedConfig,
 };
 
 /// A statically dispatched protocol establishing sessions with logical peers.

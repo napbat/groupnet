@@ -290,7 +290,7 @@ struct Inner {
     messaging: crate::messaging::Hub,
     ordered: Mutex<Option<groupnet_streams::OrderedProtocol>>,
     /// Node-wide unordered policy, validated at start and fixed for the node's life.
-    unordered_config: groupnet_streams::UnorderedConfig,
+    unordered_config: groupnet_streams::ValidUnorderedConfig,
     unordered: Mutex<Option<groupnet_streams::UnorderedProtocol>>,
     /// Joined groups (handle + inbox). Holding the `Group` makes `join_group`
     /// idempotent: a repeat join returns the existing handle instead of

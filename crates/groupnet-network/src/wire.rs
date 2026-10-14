@@ -13,7 +13,7 @@ use zerocopy::{
 use crate::router::ReassemblyConfig;
 
 pub(crate) const MAX_FRAME: usize = 65_000;
-pub(crate) const MAX_HOPS: usize = 16;
+pub(crate) const MAX_HOPS: u8 = 16;
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -134,7 +134,7 @@ pub(crate) enum Frame<'a> {
 
 #[cfg(test)]
 pub(crate) fn decode(bytes: &[u8]) -> io::Result<Frame<'_>> {
-    decode_bounded(bytes, MAX_FRAME, MAX_HOPS)
+    decode_bounded(bytes, MAX_FRAME, usize::from(MAX_HOPS))
 }
 
 pub(crate) fn decode_bounded(

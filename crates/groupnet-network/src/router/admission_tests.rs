@@ -47,7 +47,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
     let bootstrap = NodeId::new("bootstrap-only");
     let peer = NodeId::new("previously-unknown");
     let beyond = NodeId::new("beyond");
-    let router = Router::new(local, RouterConfig::default())?;
+    let router = Router::new(local)?;
     let registry = SessionRegistry::new(std::num::NonZeroUsize::new(2).expect("nonzero"));
     let (incoming, receive) = mpsc::channel(16);
     let (sent, mut recipients) = mpsc::channel(32);

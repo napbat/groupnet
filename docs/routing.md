@@ -123,10 +123,13 @@ The router neither decodes protocol bodies nor interprets their ACKs.
 reassembly bounds, protocol/inbox/link capacities and physical-send deadlines.
 Configuration is validated against wire representation before workers start;
 `RouterConfig::validate` names each violated rule as a `RouterConfigError`
-variant (wrapped as an `InvalidInput` `io::Error` by `Router::new` and
-`NetworkBuilder::bind`). Every queue capacity is a `QueueCapacity`, and route,
-transport, protocol, replay and reassembly counts are `NonZero*` types, so
-they are nonzero by construction. Increasing a bound does not enlarge a
+variant, composing `ReassemblyConfig::validate` as
+`RouterConfigError::Reassembly` (wrapped as an `InvalidInput` `io::Error` by
+`Router::with_config` and `NetworkBuilder::bind`; `Router::new` uses the
+defaults). Every queue capacity is a `QueueCapacity`; route, transport,
+protocol, replay and reassembly counts, the `max_frame` envelope and the
+`max_hops` budget (a `NonZeroU8`, at least 2) are `NonZero*` types, so they are
+nonzero by construction. Increasing a bound does not enlarge a
 physical link's MTU: fragmentation still applies, and every receiving router
 enforces its own limits.
 

@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use groupnet_core::{Config, GroupId, NodeId};
+use groupnet_messaging::ValidMessagingConfig;
 use groupnet_network::{LinkProvider, NetworkBuilder, RouterConfig, TunnelConfig};
-use groupnet_streams::UnorderedConfig;
+use groupnet_streams::{UnorderedConfig, ValidUnorderedConfig};
 
 use super::{GroupProfile, Inner, Node, ROUTING_GROUP, recv_loop, sync_peer_addrs};
 use crate::seeds::{NamedSeeds, resolve_named_seeds};
@@ -215,8 +216,8 @@ impl NodeBuilder {
     /// Requires a Tokio runtime; propagates poisoned internal locks.
     pub async fn start(self) -> io::Result<Node> {
         self.config.validate()?;
-        self.messaging.validate()?;
-        self.unordered.validate()?;
+        let messaging = ValidMessagingConfig::try_from(self.messaging)?;
+        let unordered = ValidUnorderedConfig::try_from(self.unordered)?;
         if let Some(named) = &self.named_seeds {
             named.validate()?;
         }
@@ -226,7 +227,7 @@ impl NodeBuilder {
             seeds.extend(named.nodes().cloned());
         }
         let network = self.network.bind(self.id.clone()).await?;
-        let messaging = crate::messaging::Hub::new(network.router(), self.messaging)?;
+        let messaging = crate::messaging::Hub::new(network.router(), messaging)?;
         let inner = Arc::new(Inner {
             id: self.id,
             transport: Arc::new(network.router().clone()),
@@ -234,7 +235,7 @@ impl NodeBuilder {
             config: self.config,
             messaging,
             ordered: Mutex::new(None),
-            unordered_config: self.unordered,
+            unordered_config: unordered,
             unordered: Mutex::new(None),
             routes: Mutex::new(HashMap::new()),
             start: Instant::now(),

@@ -164,10 +164,7 @@ async fn demonstrate(a: &Node, b: &Node, c: &Node) -> io::Result<()> {
             }
         })?);
     }
-    let options = SendOptions {
-        delivery: Delivery::Applied,
-        timeout: WAIT,
-    };
+    let options = SendOptions::Applied { timeout: WAIT };
     let report = groups[0]
         .send_frame(Bytes::from_static(b"invalidate:object-42"), options)
         .await?;
@@ -223,10 +220,7 @@ async fn demonstrate(a: &Node, b: &Node, c: &Node) -> io::Result<()> {
 }
 
 async fn node_frames(a: &Node, c: &Node) -> io::Result<()> {
-    let options = SendOptions {
-        delivery: Delivery::Delivered,
-        timeout: WAIT,
-    };
+    let options = SendOptions::Delivered { timeout: WAIT };
     a.send_frame(
         c.id(),
         Bytes::from_static(b"node frame\0with boundary"),
@@ -249,10 +243,7 @@ async fn node_frames(a: &Node, c: &Node) -> io::Result<()> {
     a.send_frame(
         c.id(),
         Bytes::from_static(b"node callback"),
-        SendOptions {
-            delivery: Delivery::Applied,
-            timeout: WAIT,
-        },
+        SendOptions::Applied { timeout: WAIT },
     )
     .await?;
     handler.close().await?;
@@ -283,10 +274,7 @@ async fn node_frames(a: &Node, c: &Node) -> io::Result<()> {
         a.send_frame(
             c.id(),
             Bytes::from_static(b"manual applied buffer"),
-            SendOptions {
-                delivery: Delivery::Applied,
-                timeout: WAIT,
-            },
+            SendOptions::Applied { timeout: WAIT },
         ),
         receive,
     )?;
@@ -305,10 +293,7 @@ async fn node_frames(a: &Node, c: &Node) -> io::Result<()> {
     a.send_frame(
         c.id(),
         Bytes::from_static(b"buffer callback"),
-        SendOptions {
-            delivery: Delivery::Applied,
-            timeout: WAIT,
-        },
+        SendOptions::Applied { timeout: WAIT },
     )
     .await?;
     handler.close().await?;
@@ -340,10 +325,7 @@ async fn endpoints_only(a: &Node, c: &Node) -> io::Result<()> {
     let report = left
         .send_frame(
             Bytes::from_static(b"bridge is not a group member"),
-            SendOptions {
-                delivery: Delivery::Applied,
-                timeout: WAIT,
-            },
+            SendOptions::Applied { timeout: WAIT },
         )
         .await?;
     if report.outcomes.len() != 1 || report.outcomes[0].node != *c.id() {

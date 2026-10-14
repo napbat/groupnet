@@ -8,7 +8,7 @@ use groupnet_transport_mem::Network;
 const WAIT: Duration = Duration::from_secs(5);
 
 fn router(name: &str) -> io::Result<Router> {
-    Router::new(
+    Router::with_config(
         NodeId::new(name),
         RouterConfig {
             announce_interval: Duration::from_millis(20),
@@ -66,9 +66,11 @@ async fn configured_pair(
 }
 
 fn options(delivery: Delivery) -> SendOptions {
-    SendOptions {
-        delivery,
-        timeout: Duration::from_secs(2),
+    let timeout = Duration::from_secs(2);
+    match delivery {
+        Delivery::BestEffort => SendOptions::BestEffort,
+        Delivery::Delivered => SendOptions::Delivered { timeout },
+        Delivery::Applied => SendOptions::Applied { timeout },
     }
 }
 
@@ -251,13 +253,13 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
     for n in 0..messages.config().received_records.get() {
         let mut id = [0; 16];
         id[8..].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
-        let packet = codec::data(
-            MessageId(id),
-            Delivery::Applied,
-            DEFAULT_MAX_TIMEOUT_MS,
-            None,
-            b"original",
-        )
+        let packet = codec::data(&DataPacket {
+            id: MessageId(id),
+            delivery: Delivery::Applied,
+            retry_horizon_ms: DEFAULT_MAX_TIMEOUT_MS,
+            group: None,
+            payload: b"original",
+        })
         .unwrap();
         worker::process(
             &messages.inner,
@@ -312,7 +314,14 @@ async fn received_record_exhaustion_never_evicts_live_identity_and_body_collisio
             ApplicationPacket {
                 from: source.clone(),
                 payload: Bytes::from(
-                    codec::data(id, Delivery::Applied, DEFAULT_MAX_TIMEOUT_MS, None, body).unwrap(),
+                    codec::data(&DataPacket {
+                        id,
+                        delivery: Delivery::Applied,
+                        retry_horizon_ms: DEFAULT_MAX_TIMEOUT_MS,
+                        group: None,
+                        payload: body,
+                    })
+                    .unwrap(),
                 ),
             },
         );
@@ -422,10 +431,7 @@ async fn invalid_bounds_no_route_and_outstanding_limit_fail_before_dispatch() ->
                     router.local_id(),
                     None,
                     Bytes::new(),
-                    SendOptions {
-                        delivery: Delivery::Applied,
-                        timeout
-                    }
+                    SendOptions::Applied { timeout }
                 )
                 .await
                 .unwrap_err()
@@ -487,7 +493,14 @@ async fn receipt_records_success_when_ack_route_is_missing_and_shutdown_wakes_re
         ApplicationPacket {
             from: source.clone(),
             payload: Bytes::from(
-                codec::data(id, Delivery::Applied, DEFAULT_MAX_TIMEOUT_MS, None, b"work").unwrap(),
+                codec::data(&DataPacket {
+                    id,
+                    delivery: Delivery::Applied,
+                    retry_horizon_ms: DEFAULT_MAX_TIMEOUT_MS,
+                    group: None,
+                    payload: b"work",
+                })
+                .unwrap(),
             ),
         },
     );
@@ -600,8 +613,7 @@ async fn asymmetric_retry_bounds_fail_closed_without_execution_and_admit_safe_ho
     };
     let (a, b, sender, receiver) =
         configured_pair("a", "b", sender_config, receiver_config).await?;
-    let unsupported = SendOptions {
-        delivery: Delivery::Delivered,
+    let unsupported = SendOptions::Delivered {
         timeout: Duration::from_millis(150),
     };
     let result = tokio::time::timeout(
@@ -626,8 +638,7 @@ async fn asymmetric_retry_bounds_fail_closed_without_execution_and_admit_safe_ho
             .len(),
         0
     );
-    let supported = SendOptions {
-        delivery: Delivery::Delivered,
+    let supported = SendOptions::Delivered {
         timeout: Duration::from_millis(40),
     };
     let (sent, incoming) = tokio::join!(
@@ -666,19 +677,25 @@ async fn message_payload_slices_share_storage_without_mutating_unique_or_shared_
     let messages = Messaging::new(&router)?;
     for shared in [false, true] {
         let encoded = Bytes::from(
-            codec::data(
-                MessageId([u8::from(shared); 16]),
-                Delivery::BestEffort,
-                0,
-                None,
-                b"payload",
-            )
+            codec::data(&DataPacket {
+                id: MessageId([u8::from(shared); 16]),
+                delivery: Delivery::BestEffort,
+                retry_horizon_ms: 0,
+                group: None,
+                payload: b"payload",
+            })
             .unwrap(),
         );
         let expected_pointer = encoded.as_ptr().wrapping_add(
-            codec::DataFrame::new(MessageId([0; 16]), Delivery::BestEffort, 0, None, &[])
-                .unwrap()
-                .len(),
+            codec::DataFrame::new(DataPacket {
+                id: MessageId([0; 16]),
+                delivery: Delivery::BestEffort,
+                retry_horizon_ms: 0,
+                group: None,
+                payload: &[],
+            })
+            .unwrap()
+            .len(),
         );
         let alias = shared.then(|| encoded.clone());
         worker::process(
@@ -711,6 +728,30 @@ async fn message_payload_slices_share_storage_without_mutating_unique_or_shared_
             );
         }
     }
+    messages.close().await;
+    router.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_bounds_bind_nothing_and_proven_bounds_bind_unchecked() -> io::Result<()> {
+    let router = router("validated")?;
+    let invalid = MessagingConfig {
+        retry_interval: Duration::ZERO,
+        ..MessagingConfig::default()
+    };
+    let error = Messaging::with_config(&router, invalid).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<MessagingConfigError>()),
+        Some(&MessagingConfigError::ZeroRetryInterval)
+    );
+    // The rejected configuration never claimed the namespace.
+    let proven = ValidMessagingConfig::try_from(MessagingConfig::default()).unwrap();
+    let messages = Messaging::with_validated(&router, proven)?;
+    assert_eq!(messages.config(), &MessagingConfig::default());
     messages.close().await;
     router.close().await;
     Ok(())

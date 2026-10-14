@@ -12,10 +12,7 @@ use tokio::{sync::Notify, time::timeout};
 const WAIT: Duration = Duration::from_secs(5);
 
 fn applied() -> SendOptions {
-    SendOptions {
-        delivery: Delivery::Applied,
-        timeout: WAIT,
-    }
+    SendOptions::Applied { timeout: WAIT }
 }
 
 #[tokio::test]
@@ -114,7 +111,7 @@ async fn callback_failure_rejects_application_and_releases_receive_ownership() {
     assert_eq!(payload.as_ref(), b"after rejection");
     assert_eq!(context.from, NodeId::new("failure"));
     assert_eq!(context.group, None);
-    assert_eq!(context.delivery(), SendOptions::default().delivery);
+    assert_eq!(context.delivery(), SendOptions::default().delivery());
     node.close().await;
 }
 
@@ -144,8 +141,7 @@ async fn cancelled_callback_does_not_ack_unfinished_work_and_manual_wait_is_excl
             std::future::pending::<io::Result<()>>()
         })
         .unwrap();
-    let options = SendOptions {
-        delivery: Delivery::Applied,
+    let options = SendOptions::Applied {
         timeout: Duration::from_millis(250),
     };
     let mut sent = Box::pin(node.send_frame(node.id(), Bytes::from_static(b"unfinished"), options));
@@ -209,10 +205,7 @@ async fn full_application_inbox_rejects_delivery_without_blocking_metadata_or_lo
 {
     let node = Node::builder(NodeId::new("bounded")).start().await.unwrap();
     let group = node.join_group("coordination");
-    let options = SendOptions {
-        delivery: Delivery::Delivered,
-        timeout: WAIT,
-    };
+    let options = SendOptions::Delivered { timeout: WAIT };
     for value in 0_u8..64 {
         node.send_frame(node.id(), Bytes::copy_from_slice(&[value]), options)
             .await

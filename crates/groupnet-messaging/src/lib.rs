@@ -10,8 +10,9 @@
 //! after an inactive retention horizon and retained for another horizon.
 //! No ordering is promised.
 //!
-//! The [`codec`] module is pure sans-IO; this crate owns all acknowledgement,
-//! retry and duplicate state. The network router carries its packets opaquely.
+//! The packet codec ([`decode`], [`data`], [`ack`]) is pure sans-IO; this crate
+//! owns all acknowledgement, retry and duplicate state. The network router
+//! carries its packets opaquely.
 //!
 //! [`MessageProtocol`] is the send-side contract a handle may share. Receiving
 //! and shutdown belong to the engine owner ([`Messaging::recv`],
@@ -19,11 +20,11 @@
 //! The network and transport types this crate's signatures take ([`Router`],
 //! [`ProtocolIo`], [`ProtocolId`], [`QueueCapacity`]) are re-exported here.
 
-/// Sans-IO application message identities, receipt transitions and bounded codec.
-pub mod codec;
-
+mod codec;
 mod config;
-pub use config::{MessagingConfig, MessagingConfigError};
+pub use config::{
+    MessagingConfig, MessagingConfigError, SendValidationError, ValidMessagingConfig,
+};
 mod received;
 mod worker;
 
@@ -48,9 +49,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub use bytes::Bytes;
 pub use codec::{
-    DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, DecodeError,
-    Delivery, MessageId, Outcome, Packet, ReceiptState, Rejection, ack, completes, data, decode,
-    destination_valid,
+    DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, DataPacket,
+    DecodeError, Delivery, EncodeError, MessageId, Outcome, Packet, ReceiptState, Rejection, ack,
+    completes, data, decode, destination_valid,
 };
 
 /// Static-dispatch application message sends with protocol-specific receipts.
@@ -80,20 +81,44 @@ pub trait MessageProtocol: Send + Sync {
     ) -> impl Future<Output = io::Result<MessageId>> + Send;
 }
 
-/// Delivery boundary and finite acknowledgement deadline.
-#[derive(Clone, Copy, Debug)]
-pub struct SendOptions {
-    /// Receiver acknowledgement boundary; defaults to local best effort.
-    pub delivery: Delivery,
-    /// Acknowledged sends require a nonzero deadline within the endpoint's configuration.
-    pub timeout: Duration,
+/// A send's delivery boundary, carrying the acknowledgement deadline only for
+/// the boundaries that wait for one. Defaults to local best effort.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SendOptions {
+    /// Local dispatch only; no receiver acknowledgement, retry or deadline.
+    #[default]
+    BestEffort,
+    /// Waits until the receiver reserves its application queue.
+    Delivered {
+        /// Nonzero acknowledgement deadline, at most the endpoint's
+        /// [`MessagingConfig::max_timeout`].
+        timeout: Duration,
+    },
+    /// Waits until the receiving application explicitly applies the frame.
+    Applied {
+        /// Nonzero acknowledgement deadline, at most the endpoint's
+        /// [`MessagingConfig::max_timeout`].
+        timeout: Duration,
+    },
 }
 
-impl Default for SendOptions {
-    fn default() -> Self {
-        Self {
-            delivery: Delivery::BestEffort,
-            timeout: Duration::from_secs(5),
+impl SendOptions {
+    /// The receiver acknowledgement boundary these options request.
+    #[must_use]
+    pub const fn delivery(&self) -> Delivery {
+        match self {
+            Self::BestEffort => Delivery::BestEffort,
+            Self::Delivered { .. } => Delivery::Delivered,
+            Self::Applied { .. } => Delivery::Applied,
+        }
+    }
+
+    /// The acknowledgement deadline, or `None` for best effort.
+    #[must_use]
+    pub const fn timeout(&self) -> Option<Duration> {
+        match self {
+            Self::BestEffort => None,
+            Self::Delivered { timeout } | Self::Applied { timeout } => Some(*timeout),
         }
     }
 }
@@ -389,9 +414,19 @@ impl Messaging {
     /// Binds messaging with node-wide queue, retry and retention bounds.
     ///
     /// # Errors
-    /// Rejects invalid configuration, unavailable executor/randomness or claimed namespace.
+    /// Returns `InvalidInput` wrapping a [`MessagingConfigError`] before binding;
+    /// rejects an unavailable executor/randomness or claimed namespace.
     pub fn with_config(router: &Router, config: MessagingConfig) -> io::Result<Self> {
-        config.validate()?;
+        Self::with_validated(router, ValidMessagingConfig::try_from(config)?)
+    }
+
+    /// Binds messaging with bounds already proven valid, without checking them
+    /// again.
+    ///
+    /// # Errors
+    /// Rejects an unavailable executor/randomness or claimed namespace.
+    pub fn with_validated(router: &Router, config: ValidMessagingConfig) -> io::Result<Self> {
+        let config = config.into_inner();
         tokio::runtime::Handle::try_current().map_err(|_| closed())?;
         if router.is_closed() {
             return Err(closed());
@@ -464,8 +499,13 @@ impl Messaging {
     /// Validates an operation against this shared endpoint's settings.
     ///
     /// # Errors
-    /// Returns `InvalidInput` when the payload/deadline exceeds configured bounds.
-    pub fn validate_send(&self, options: SendOptions, payload_len: usize) -> io::Result<()> {
+    /// Returns the [`SendValidationError`] naming an oversized payload or an
+    /// out-of-range acknowledgement deadline.
+    pub fn validate_send(
+        &self,
+        options: SendOptions,
+        payload_len: usize,
+    ) -> Result<(), SendValidationError> {
         self.inner.config.validate_send(options, payload_len)
     }
 
@@ -473,7 +513,8 @@ impl Messaging {
     /// Retries retain application identity but allocate fresh router packet IDs.
     /// Cancelling this future removes its bounded outstanding-send reservation.
     /// # Errors
-    /// Reports invalid input, local backpressure/no route, explicit rejection,
+    /// Reports invalid input (`InvalidInput` wrapping a [`SendValidationError`]
+    /// or an [`EncodeError`]), local backpressure/no route, explicit rejection,
     /// shutdown, or `TimedOut` (remote outcome unknown).
     pub async fn send(
         &self,
@@ -494,19 +535,19 @@ impl Messaging {
         }
         let id = self.inner.next_id()?;
         // Validated once; every retry re-encodes the same packet unchecked.
-        let frame = codec::DataFrame::new(id, options.delivery, retry_horizon_ms, group, &payload)
-            .map_err(|_| {
-                error(
-                    io::ErrorKind::InvalidInput,
-                    "invalid application group or payload",
-                )
-            })?;
-        if options.delivery == Delivery::BestEffort {
+        let frame = codec::DataFrame::new(DataPacket {
+            id,
+            delivery: options.delivery(),
+            retry_horizon_ms,
+            group,
+            payload: &payload,
+        })?;
+        let Some(timeout) = options.timeout() else {
             self.inner.dispatch(to, &frame)?;
             return Ok(id);
-        }
+        };
         let start = tokio::time::Instant::now();
-        let deadline = start.checked_add(options.timeout).ok_or_else(|| {
+        let deadline = start.checked_add(timeout).ok_or_else(|| {
             error(
                 io::ErrorKind::InvalidInput,
                 "acknowledgement deadline exceeds the monotonic clock",
@@ -528,7 +569,7 @@ impl Messaging {
                 id,
                 Pending {
                     to: to.clone(),
-                    delivery: options.delivery,
+                    delivery: options.delivery(),
                     result,
                 },
             );

@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
 use groupnet_network::{
-    Router, RouterConfig,
+    Router, RouterConfig, TunnelConfig,
     tunnel::{PeerIdentity, TunnelLimits, TunnelTransport, TunneledStream},
 };
 use groupnet_transport::{Inbound, Transport, bulk::BulkTransport, link::LinkConfig};
@@ -176,8 +176,8 @@ async fn bulk_transfer(
         announce_interval: Duration::from_millis(100),
         ..RouterConfig::default()
     };
-    let ar = Router::new(a.clone(), config.clone()).unwrap();
-    let cr = Router::new(c.clone(), config).unwrap();
+    let ar = Router::with_config(a.clone(), config.clone()).unwrap();
+    let cr = Router::with_config(c.clone(), config).unwrap();
     let backlog = Arc::new(AtomicU64::new(0));
     ar.add_transport(
         Delayed::new(network.endpoint(a.clone()), link, backlog.clone()),
@@ -199,18 +199,26 @@ async fn bulk_transfer(
         .unwrap();
     }
     let (ac, cc, _) = credentials();
-    let initiator = TunnelTransport::with_limits(
+    let initiator = TunnelTransport::with_config(
         ar.clone(),
-        ac.identity,
-        vec![PeerIdentity::new(c.clone(), &cc.leaf).unwrap()],
-        limits.clone(),
+        TunnelConfig {
+            limits: limits.clone(),
+            ..TunnelConfig::new(
+                ac.identity,
+                vec![PeerIdentity::new(c.clone(), &cc.leaf).unwrap()],
+            )
+        },
     )
     .unwrap();
-    let acceptor = TunnelTransport::with_limits(
+    let acceptor = TunnelTransport::with_config(
         cr.clone(),
-        cc.identity,
-        vec![PeerIdentity::new(a.clone(), &ac.leaf).unwrap()],
-        limits,
+        TunnelConfig {
+            limits,
+            ..TunnelConfig::new(
+                cc.identity,
+                vec![PeerIdentity::new(a.clone(), &ac.leaf).unwrap()],
+            )
+        },
     )
     .unwrap();
     let (client, server) = tokio::join!(initiator.connect(&c), acceptor.accept());

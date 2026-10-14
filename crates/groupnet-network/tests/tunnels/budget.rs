@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+use groupnet_network::TunnelConfig;
 use groupnet_network::tunnel::{PeerIdentity, TunnelLimits, TunnelTransport, TunneledStream};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::bulk::BulkTransport;
@@ -55,10 +56,22 @@ impl Pair {
         let (a, c, _) = credentials();
         let ap = PeerIdentity::new(fabric.c.local_id().clone(), &c.leaf).unwrap();
         let cp = PeerIdentity::new(fabric.a.local_id().clone(), &a.leaf).unwrap();
-        let sender =
-            TunnelTransport::with_limits(fabric.a.clone(), a.identity, vec![ap], limits()).unwrap();
-        let receiver =
-            TunnelTransport::with_limits(fabric.c.clone(), c.identity, vec![cp], limits()).unwrap();
+        let sender = TunnelTransport::with_config(
+            fabric.a.clone(),
+            TunnelConfig {
+                limits: limits(),
+                ..TunnelConfig::new(a.identity, vec![ap])
+            },
+        )
+        .unwrap();
+        let receiver = TunnelTransport::with_config(
+            fabric.c.clone(),
+            TunnelConfig {
+                limits: limits(),
+                ..TunnelConfig::new(c.identity, vec![cp])
+            },
+        )
+        .unwrap();
         Self {
             fabric,
             sender,

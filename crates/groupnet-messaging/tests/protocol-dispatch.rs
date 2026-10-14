@@ -3,10 +3,9 @@
 use groupnet_core::{GroupId, NodeId};
 // The router types this crate's signatures take come from its own re-exports.
 use groupnet_messaging::{
-    Bytes, Delivery, Frame, MessageId, MessageProtocol, Messaging, ProtocolId, ProtocolIo, Router,
-    SendOptions, codec,
+    Bytes, DataPacket, Delivery, Frame, MessageId, MessageProtocol, Messaging, Packet, ProtocolId,
+    ProtocolIo, Router, SendOptions, data, decode,
 };
-use groupnet_network::RouterConfig;
 use std::io;
 
 #[derive(Debug)]
@@ -29,10 +28,16 @@ impl MessageProtocol for CustomProtocol {
     ) -> impl Future<Output = io::Result<MessageId>> + Send {
         let id = MessageId([options; 16]);
         std::future::ready(
-            codec::data(id, Delivery::BestEffort, 0, group, &payload)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "custom payload bound"))
-                .and_then(|packet| self.0.send(to, &packet))
-                .map(|()| id),
+            data(&DataPacket {
+                id,
+                delivery: Delivery::BestEffort,
+                retry_horizon_ms: 0,
+                group,
+                payload: &payload,
+            })
+            .map_err(io::Error::from)
+            .and_then(|packet| self.0.send(to, &packet))
+            .map(|()| id),
         )
     }
 }
@@ -41,10 +46,9 @@ impl MessageProtocol for CustomProtocol {
 impl CustomProtocol {
     async fn recv(&self) -> io::Result<Frame<CustomReceipt>> {
         let packet = self.0.recv().await?;
-        let codec::Packet::Data {
+        let Packet::Data {
             id, group, payload, ..
-        } = codec::decode(&packet.payload)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "custom packet"))?
+        } = decode(&packet.payload)?
         else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected ack"));
         };
@@ -81,7 +85,7 @@ async fn typed_send<P: MessageProtocol>(
 async fn custom_and_default_protocols_share_routes_without_inbox_stealing() -> io::Result<()> {
     let local = NodeId::new("custom-local");
     let group = GroupId::new("custom-group");
-    let router = Router::new(local.clone(), RouterConfig::default())?;
+    let router = Router::new(local.clone())?;
     let messages = Messaging::new(&router)?;
     let custom = CustomProtocol(router.bind_protocol(CustomProtocol::ID)?);
     let ordinary = typed_send(

@@ -84,11 +84,13 @@ pub use group::{
     EntryMutationError, EntryMutationLimits, EntryRevision, Group, InspectedEntries,
     InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
-pub use groupnet_network::tunnel::{PeerIdentity, TlsIdentity, TunnelTransport, TunneledStream};
-pub use groupnet_network::{LinkProvider, Router, RouterConfig, TunnelConfig};
+pub use groupnet_network::tunnel::{
+    PeerIdentity, PeerIdentityError, TlsIdentity, TlsIdentityError, TunnelTransport, TunneledStream,
+};
+pub use groupnet_network::{LinkProvider, Router, RouterConfig, TunnelConfig, TunnelConfigError};
 pub use groupnet_streams::{
     OrderedProtocol, SessionProtocol, UnorderedConfig, UnorderedConfigError, UnorderedDelivery,
-    UnorderedOptions, UnorderedProtocol, UnorderedSession,
+    UnorderedOptions, UnorderedOptionsError, UnorderedProtocol, UnorderedSession,
 };
 pub use node::{
     Endpoint, GroupProfile, ManagedProtocol, Messages, Node, NodeBuilder, Ordered, Peer,

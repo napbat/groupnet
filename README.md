@@ -239,7 +239,7 @@ Applications address a node or group, never an intermediate bridge:
 
 ```rust
 use groupnet::core::NodeId;
-use groupnet::messaging::{Delivery, SendOptions};
+use groupnet::messaging::SendOptions;
 use groupnet::runtime::Node;
 use groupnet::transport::Bytes;
 use std::{io, time::Duration};
@@ -263,8 +263,7 @@ async fn invalidate(sender: &Node, receiver: &Node) -> io::Result<()> {
     let report = outgoing
         .send_frame(
             Bytes::from_static(b"opaque application bytes"),
-            SendOptions {
-                delivery: Delivery::Applied,
+            SendOptions::Applied {
                 timeout: Duration::from_secs(5),
             },
         )

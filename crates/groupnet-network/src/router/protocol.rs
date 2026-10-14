@@ -110,6 +110,7 @@ impl ProtocolIo {
         shared
             .config
             .max_frame
+            .get()
             .saturating_sub(PayloadKind::Application(self.inner.id).header_len(&shared.local, to))
     }
 

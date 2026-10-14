@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::network::{
-    Router, RouterConfig,
+    Router, RouterConfig, TunnelConfig,
     tunnel::{PeerIdentity, TlsIdentity, TunnelTransport},
 };
 use groupnet_core::NodeId;
@@ -130,9 +130,9 @@ impl Fabric {
             announce_interval: Duration::from_millis(100),
             ..RouterConfig::default()
         };
-        let ar = Router::new(a.clone(), config.clone()).unwrap();
-        let br = Router::new(b.clone(), config.clone()).unwrap();
-        let cr = Router::new(c.clone(), config).unwrap();
+        let ar = Router::with_config(a.clone(), config.clone()).unwrap();
+        let br = Router::with_config(b.clone(), config.clone()).unwrap();
+        let cr = Router::with_config(c.clone(), config).unwrap();
         let first = Network::new();
         let faults = Arc::new(Faults::default());
         if lossy {
@@ -203,8 +203,10 @@ impl Fabric {
         let ap = PeerIdentity::new(self.c.local_id().clone(), &c.leaf).unwrap();
         let cp = PeerIdentity::new(self.a.local_id().clone(), &a.leaf).unwrap();
         (
-            TunnelTransport::new(self.a.clone(), a.identity, vec![ap]).unwrap(),
-            TunnelTransport::new(self.c.clone(), c.identity, vec![cp]).unwrap(),
+            TunnelTransport::with_config(self.a.clone(), TunnelConfig::new(a.identity, vec![ap]))
+                .unwrap(),
+            TunnelTransport::with_config(self.c.clone(), TunnelConfig::new(c.identity, vec![cp]))
+                .unwrap(),
         )
     }
 

@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_network::{Router, RouterConfig};
+use groupnet_network::Router;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::link::LinkProvider;
@@ -316,8 +316,8 @@ async fn unused_address() -> SocketAddr {
 #[tokio::test]
 async fn provider_binds_identity_cost_and_native_mtu_and_router_closes_socket() {
     let relay = keyed_relay().await;
-    let a = Router::new("a".into(), RouterConfig::default()).unwrap();
-    let b = Router::new("b".into(), RouterConfig::default()).unwrap();
+    let a = Router::new("a".into()).unwrap();
+    let b = Router::new("b".into()).unwrap();
     let a_address = unused_address().await;
     let b_address = unused_address().await;
     for (router, peer, bind, cost) in [
@@ -387,7 +387,7 @@ async fn provider_rejects_a_different_local_identity_before_binding() {
 #[tokio::test]
 async fn failed_router_registration_drains_provider_endpoint() {
     let bind = unused_address().await;
-    let router = Router::new("local".into(), RouterConfig::default()).unwrap();
+    let router = Router::new("local".into()).unwrap();
     let mut config = UdpPunchConfig::new(
         router.local_id().clone(),
         SocketAddr::from(([127, 0, 0, 1], 12345)),

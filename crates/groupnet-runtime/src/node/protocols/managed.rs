@@ -102,8 +102,12 @@ impl ManagedProtocol<UnorderedProtocol> {
     /// [`UnorderedConfig`](groupnet_streams::UnorderedConfig).
     ///
     /// # Errors
-    /// Returns `InvalidInput` for a disallowed policy or zero setup deadline.
-    pub fn validate_options(&self, options: &UnorderedOptions) -> io::Result<()> {
+    /// Returns the violated [`UnorderedOptionsError`](groupnet_streams::UnorderedOptionsError)
+    /// rule: a disallowed policy, or a zero or over-long setup deadline.
+    pub fn validate_options(
+        &self,
+        options: &UnorderedOptions,
+    ) -> Result<(), groupnet_streams::UnorderedOptionsError> {
         self.engine.validate_options(options)
     }
 

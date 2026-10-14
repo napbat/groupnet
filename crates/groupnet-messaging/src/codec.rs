@@ -2,6 +2,8 @@
 //!
 //! These acknowledgements are queue/application outcomes, not durable commits.
 
+use std::{fmt, str::Utf8Error};
+
 use groupnet_core::{GroupId, NodeId};
 use zerocopy::byteorder::network_endian::U64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -188,12 +190,80 @@ pub enum Packet<'a> {
     },
 }
 
-/// A malformed or out-of-bounds packet.
+/// Why bytes are not a well-formed application packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DecodeError;
+pub enum DecodeError {
+    /// The packet ends before a complete header, field or group name.
+    Truncated,
+    /// The packet does not start with this codec's magic and version.
+    UnknownVersion,
+    /// The packet kind is neither data nor acknowledgement.
+    UnknownKind(u8),
+    /// The data packet's delivery boundary is unknown.
+    UnknownDelivery(u8),
+    /// The retry horizon is zero for an acknowledged delivery or nonzero for
+    /// best effort.
+    RetryHorizonMismatch,
+    /// The group-presence flag is neither 0 nor 1.
+    UnknownGroupFlag(u8),
+    /// A present group name is empty.
+    EmptyGroup,
+    /// A present group name is not UTF-8.
+    GroupNotUtf8(Utf8Error),
+    /// The payload exceeds the `u32` wire length.
+    PayloadTooLarge,
+    /// The acknowledgement outcome is unknown.
+    UnknownOutcome(u8),
+    /// The rejection reason is unknown.
+    UnknownRejection(u8),
+    /// An acknowledgement carries bytes after its outcome.
+    TrailingBytes,
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("application packet is truncated"),
+            Self::UnknownVersion => f.write_str("application packet has an unknown version"),
+            Self::UnknownKind(kind) => write!(f, "application packet kind {kind} is unknown"),
+            Self::UnknownDelivery(delivery) => {
+                write!(f, "application delivery {delivery} is unknown")
+            }
+            Self::RetryHorizonMismatch => {
+                f.write_str("application retry horizon does not match its delivery")
+            }
+            Self::UnknownGroupFlag(flag) => write!(f, "application group flag {flag} is unknown"),
+            Self::EmptyGroup => f.write_str("application group name is empty"),
+            Self::GroupNotUtf8(_) => f.write_str("application group name is not UTF-8"),
+            Self::PayloadTooLarge => f.write_str("application payload exceeds the u32 wire length"),
+            Self::UnknownOutcome(outcome) => {
+                write!(f, "application outcome {outcome} is unknown")
+            }
+            Self::UnknownRejection(reason) => {
+                write!(f, "application rejection {reason} is unknown")
+            }
+            Self::TrailingBytes => f.write_str("application acknowledgement has trailing bytes"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::GroupNotUtf8(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<DecodeError> for std::io::Error {
+    fn from(error: DecodeError) -> Self {
+        Self::new(std::io::ErrorKind::InvalidData, error)
+    }
+}
 
 fn take<'a>(body: &mut &'a [u8], count: usize) -> Result<&'a [u8], DecodeError> {
-    let (part, rest) = body.split_at_checked(count).ok_or(DecodeError)?;
+    let (part, rest) = body.split_at_checked(count).ok_or(DecodeError::Truncated)?;
     *body = rest;
     Ok(part)
 }
@@ -204,42 +274,43 @@ fn byte(body: &mut &[u8]) -> Result<u8, DecodeError> {
 
 /// Rejects unknown versions, kinds, statuses, truncated IDs and trailing ACK bytes.
 /// # Errors
-/// Returns `DecodeError` for any malformed application packet.
+/// Returns the [`DecodeError`] naming the first malformed field.
 pub fn decode(bytes: &[u8]) -> Result<Packet<'_>, DecodeError> {
-    let (header, mut body) = Header::ref_from_prefix(bytes).map_err(|_| DecodeError)?;
+    let (header, mut body) = Header::ref_from_prefix(bytes).map_err(|_| DecodeError::Truncated)?;
     if header.magic != MAGIC {
-        return Err(DecodeError);
+        return Err(DecodeError::UnknownVersion);
     }
     let id = MessageId(header.id);
     match header.kind {
         0 => {
-            let (metadata, rest) = DataMetadata::ref_from_prefix(body).map_err(|_| DecodeError)?;
+            let (metadata, rest) =
+                DataMetadata::ref_from_prefix(body).map_err(|_| DecodeError::Truncated)?;
             body = rest;
             let delivery = match metadata.delivery {
                 0 => Delivery::BestEffort,
                 1 => Delivery::Delivered,
                 2 => Delivery::Applied,
-                _ => return Err(DecodeError),
+                other => return Err(DecodeError::UnknownDelivery(other)),
             };
             let retry_horizon_ms = metadata.retry_horizon_ms.get();
             if (delivery == Delivery::BestEffort) != (retry_horizon_ms == 0) {
-                return Err(DecodeError);
+                return Err(DecodeError::RetryHorizonMismatch);
             }
             let group = match metadata.grouped {
                 0 => None,
                 1 => {
                     let length = usize::from(byte(&mut body)?);
                     if length == 0 {
-                        return Err(DecodeError);
+                        return Err(DecodeError::EmptyGroup);
                     }
-                    let name =
-                        std::str::from_utf8(take(&mut body, length)?).map_err(|_| DecodeError)?;
+                    let name = std::str::from_utf8(take(&mut body, length)?)
+                        .map_err(DecodeError::GroupNotUtf8)?;
                     Some(GroupId::new(name))
                 }
-                _ => return Err(DecodeError),
+                other => return Err(DecodeError::UnknownGroupFlag(other)),
             };
             if u32::try_from(body.len()).is_err() {
-                return Err(DecodeError);
+                return Err(DecodeError::PayloadTooLarge);
             }
             Ok(Packet::Data {
                 id,
@@ -250,7 +321,8 @@ pub fn decode(bytes: &[u8]) -> Result<Packet<'_>, DecodeError> {
             })
         }
         1 => {
-            let (status, rest) = AckStatus::ref_from_prefix(body).map_err(|_| DecodeError)?;
+            let (status, rest) =
+                AckStatus::ref_from_prefix(body).map_err(|_| DecodeError::Truncated)?;
             body = rest;
             let outcome = match status.outcome {
                 0 => Outcome::Accepted,
@@ -262,33 +334,73 @@ pub fn decode(bytes: &[u8]) -> Result<Packet<'_>, DecodeError> {
                     3 => Rejection::Invalid,
                     4 => Rejection::Interrupted,
                     5 => Rejection::Other,
-                    _ => return Err(DecodeError),
+                    other => return Err(DecodeError::UnknownRejection(other)),
                 }),
-                _ => return Err(DecodeError),
+                other => return Err(DecodeError::UnknownOutcome(other)),
             };
             if !body.is_empty() {
-                return Err(DecodeError);
+                return Err(DecodeError::TrailingBytes);
             }
             Ok(Packet::Ack { id, outcome })
         }
-        _ => Err(DecodeError),
+        other => Err(DecodeError::UnknownKind(other)),
+    }
+}
+
+/// The fields of one application data packet, encoded by [`data`].
+#[derive(Clone, Copy, Debug)]
+pub struct DataPacket<'a> {
+    /// Application identity, shared by every retry.
+    pub id: MessageId,
+    /// Receiver acknowledgement boundary.
+    pub delivery: Delivery,
+    /// The sender's complete retry deadline rounded up to milliseconds, or zero
+    /// for best effort. Every retry must preserve it.
+    pub retry_horizon_ms: u64,
+    /// Optional group destination; its name is 1 to 255 bytes.
+    pub group: Option<&'a GroupId>,
+    /// Opaque data, at most `u32::MAX` bytes.
+    pub payload: &'a [u8],
+}
+
+/// Why a [`DataPacket`] cannot be encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeError {
+    /// `payload` exceeds the `u32` wire length.
+    PayloadTooLarge,
+    /// `group` names an empty or longer-than-255-byte group.
+    GroupNameLength,
+    /// `retry_horizon_ms` is zero for an acknowledged delivery or nonzero for
+    /// best effort.
+    RetryHorizonMismatch,
+}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::PayloadTooLarge => "application payload exceeds the u32 wire length",
+            Self::GroupNameLength => "application group name must be 1 to 255 bytes",
+            Self::RetryHorizonMismatch => {
+                "application retry horizon must be zero exactly for best effort"
+            }
+        })
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+impl From<EncodeError> for std::io::Error {
+    fn from(error: EncodeError) -> Self {
+        Self::new(std::io::ErrorKind::InvalidInput, error)
     }
 }
 
 /// Encodes application data after validating group, buffer and retry-horizon bounds.
-/// `retry_horizon_ms` is the sender's complete retry deadline rounded up to
-/// milliseconds, or zero for best effort. Every retry must preserve it.
 ///
 /// # Errors
-/// Returns `DecodeError` for unrepresentable buffers/groups or an invalid horizon.
-pub fn data(
-    id: MessageId,
-    delivery: Delivery,
-    retry_horizon_ms: u64,
-    group: Option<&GroupId>,
-    payload: &[u8],
-) -> Result<Vec<u8>, DecodeError> {
-    let frame = DataFrame::new(id, delivery, retry_horizon_ms, group, payload)?;
+/// Returns the [`EncodeError`] naming an unrepresentable payload, group or horizon.
+pub fn data(packet: &DataPacket<'_>) -> Result<Vec<u8>, EncodeError> {
+    let frame = DataFrame::new(*packet)?;
     let mut bytes = Vec::with_capacity(frame.len());
     frame.encode(|part| bytes.extend_from_slice(part));
     Ok(bytes)
@@ -308,31 +420,33 @@ pub(crate) struct DataFrame<'a> {
 
 impl<'a> DataFrame<'a> {
     /// Validates group, buffer and retry-horizon representability.
-    pub(crate) fn new(
-        id: MessageId,
-        delivery: Delivery,
-        retry_horizon_ms: u64,
-        group: Option<&'a GroupId>,
-        payload: &'a [u8],
-    ) -> Result<Self, DecodeError> {
-        if u32::try_from(payload.len()).is_err()
-            || (delivery == Delivery::BestEffort) != (retry_horizon_ms == 0)
-        {
-            return Err(DecodeError);
+    pub(crate) fn new(packet: DataPacket<'a>) -> Result<Self, EncodeError> {
+        let DataPacket {
+            id,
+            delivery,
+            retry_horizon_ms,
+            group,
+            payload,
+        } = packet;
+        if u32::try_from(payload.len()).is_err() {
+            return Err(EncodeError::PayloadTooLarge);
+        }
+        if (delivery == Delivery::BestEffort) != (retry_horizon_ms == 0) {
+            return Err(EncodeError::RetryHorizonMismatch);
         }
         let group = group
             .map(|group| {
                 let name = group.as_str();
                 match u8::try_from(name.len()) {
                     Ok(length) if length != 0 => Ok((length, name)),
-                    _ => Err(DecodeError),
+                    _ => Err(EncodeError::GroupNameLength),
                 }
             })
             .transpose()?;
         let len = (size_of::<Header>() + size_of::<DataMetadata>())
             .checked_add(group.map_or(0, |(length, _)| 1 + usize::from(length)))
             .and_then(|length| length.checked_add(payload.len()))
-            .ok_or(DecodeError)?;
+            .ok_or(EncodeError::PayloadTooLarge)?;
         Ok(Self {
             header: Header {
                 magic: MAGIC,
@@ -473,18 +587,32 @@ mod tests {
         assert!(receipt.expired(179_999));
     }
 
+    fn packet<'a>(
+        delivery: Delivery,
+        retry_horizon_ms: u64,
+        group: Option<&'a GroupId>,
+        payload: &'a [u8],
+    ) -> DataPacket<'a> {
+        DataPacket {
+            id: MessageId([9; 16]),
+            delivery,
+            retry_horizon_ms,
+            group,
+            payload,
+        }
+    }
+
     #[test]
     fn codec_preserves_binary_data_and_rejects_malformed_packets() {
         let id = MessageId([9; 16]);
         let group = GroupId::new("unicode-λ");
         let payload = [0, 255, 0, 42];
-        let bytes = data(
-            id,
+        let bytes = data(&packet(
             Delivery::Applied,
             DEFAULT_MAX_TIMEOUT_MS,
             Some(&group),
             &payload,
-        )
+        ))
         .unwrap();
         assert_eq!(
             decode(&bytes),
@@ -497,14 +625,22 @@ mod tests {
             })
         );
         for end in 0..size_of::<Header>() + size_of::<DataMetadata>() + 1 + "unicode-λ".len() {
-            assert!(decode(&bytes[..end]).is_err());
+            assert_eq!(decode(&bytes[..end]), Err(DecodeError::Truncated));
         }
         let mut bad = bytes.clone();
         bad[21] = 99;
-        assert!(decode(&bad).is_err());
-        bad = bytes;
+        assert_eq!(decode(&bad), Err(DecodeError::UnknownDelivery(99)));
+        bad.clone_from(&bytes);
         bad[4] = 99;
-        assert!(decode(&bad).is_err());
+        assert_eq!(decode(&bad), Err(DecodeError::UnknownKind(99)));
+        bad.clone_from(&bytes);
+        bad[size_of::<Header>() + 1] = 7;
+        assert_eq!(decode(&bad), Err(DecodeError::UnknownGroupFlag(7)));
+        bad.clone_from(&bytes);
+        bad[size_of::<Header>() + size_of::<DataMetadata>() + 1] = 0xff;
+        let not_utf8 = decode(&bad).unwrap_err();
+        assert!(matches!(not_utf8, DecodeError::GroupNotUtf8(_)));
+        assert!(std::error::Error::source(&not_utf8).is_some());
         for outcome in [
             Outcome::Accepted,
             Outcome::Applied,
@@ -513,50 +649,71 @@ mod tests {
             let mut bytes = ack(id, outcome);
             assert_eq!(decode(&bytes), Ok(Packet::Ack { id, outcome }));
             bytes.push(0);
-            assert!(decode(&bytes).is_err());
+            assert_eq!(decode(&bytes), Err(DecodeError::TrailingBytes));
         }
+        let mut unknown = ack(id, Outcome::Rejected(Rejection::Other));
+        *unknown.last_mut().unwrap() = 6;
+        assert_eq!(decode(&unknown), Err(DecodeError::UnknownRejection(6)));
+        unknown.pop();
+        *unknown.last_mut().unwrap() = 3;
+        assert_eq!(decode(&unknown), Err(DecodeError::UnknownOutcome(3)));
         let extended = vec![0; DEFAULT_MAX_MESSAGE_BYTES + 1];
-        let encoded = data(
-            id,
+        let encoded = data(&packet(
             Delivery::Delivered,
             DEFAULT_MAX_TIMEOUT_MS,
             None,
             &extended,
-        )
+        ))
         .unwrap();
         assert!(
             matches!(decode(&encoded), Ok(Packet::Data { payload, .. }) if payload == extended)
         );
-        assert!(
-            data(
-                id,
+        assert_eq!(
+            data(&packet(
                 Delivery::Delivered,
                 DEFAULT_MAX_TIMEOUT_MS,
                 Some(&GroupId::new("")),
                 &[]
-            )
-            .is_err()
+            )),
+            Err(EncodeError::GroupNameLength)
         );
     }
 
     #[test]
     fn wire_bounds_and_retry_horizon_are_explicit_and_fail_closed() {
-        let id = MessageId([1; 16]);
         let boundary = GroupId::new("g".repeat(usize::from(u8::MAX)));
-        let bytes = data(id, Delivery::Applied, 1, Some(&boundary), b"body").unwrap();
+        let bytes = data(&packet(Delivery::Applied, 1, Some(&boundary), b"body")).unwrap();
         assert!(
             matches!(decode(&bytes), Ok(Packet::Data { group: Some(group), retry_horizon_ms: 1, .. }) if group == boundary)
         );
         let oversized = GroupId::new("g".repeat(usize::from(u8::MAX) + 1));
-        assert!(data(id, Delivery::Applied, 1, Some(&oversized), b"").is_err());
-        assert!(data(id, Delivery::Applied, 0, None, b"").is_err());
-        assert!(data(id, Delivery::BestEffort, 1, None, b"").is_err());
-        let mut old_version = data(id, Delivery::BestEffort, 0, None, b"").unwrap();
+        assert_eq!(
+            data(&packet(Delivery::Applied, 1, Some(&oversized), b"")),
+            Err(EncodeError::GroupNameLength)
+        );
+        assert_eq!(
+            data(&packet(Delivery::Applied, 0, None, b"")),
+            Err(EncodeError::RetryHorizonMismatch)
+        );
+        assert_eq!(
+            data(&packet(Delivery::BestEffort, 1, None, b"")),
+            Err(EncodeError::RetryHorizonMismatch)
+        );
+        let mut old_version = data(&packet(Delivery::BestEffort, 0, None, b"")).unwrap();
         old_version[..4].copy_from_slice(b"GNA1");
-        assert!(decode(&old_version).is_err());
-        let mut malformed = data(id, Delivery::Applied, 1, None, b"").unwrap();
+        assert_eq!(decode(&old_version), Err(DecodeError::UnknownVersion));
+        let mut malformed = data(&packet(Delivery::Applied, 1, None, b"")).unwrap();
         let offset = size_of::<Header>() + 2;
         malformed[offset..offset + size_of::<U64>()].fill(0);
-        assert!(decode(&malformed).is_err());
+        assert_eq!(decode(&malformed), Err(DecodeError::RetryHorizonMismatch));
+        let mut empty_group = data(&packet(Delivery::Applied, 1, Some(&boundary), b"")).unwrap();
+        empty_group[size_of::<Header>() + size_of::<DataMetadata>()] = 0;
+        assert_eq!(decode(&empty_group), Err(DecodeError::EmptyGroup));
+        for error in [DecodeError::Truncated, DecodeError::UnknownKind(9)] {
+            assert_eq!(
+                std::io::Error::from(error).kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
     }
 }

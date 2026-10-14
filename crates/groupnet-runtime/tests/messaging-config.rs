@@ -4,7 +4,7 @@ use std::{io, num::NonZeroUsize, time::Duration};
 
 use groupnet_core::NodeId;
 use groupnet_runtime::messaging::{
-    Bytes, Delivery, MessagingConfig, MessagingConfigError, SendOptions,
+    Bytes, MessagingConfig, MessagingConfigError, SendOptions, SendValidationError,
 };
 use groupnet_runtime::{Messages, Node, RouterConfig};
 use groupnet_transport::QueueCapacity;
@@ -22,7 +22,7 @@ async fn managed_configuration_controls_payload_deadlines_and_node_inbox() -> io
     };
     let node = Node::builder(id.clone())
         .routing(RouterConfig {
-            max_frame: 100_000,
+            max_frame: NonZeroUsize::new(100_000).unwrap(),
             ..RouterConfig::default()
         })
         .messaging(config)
@@ -31,8 +31,7 @@ async fn managed_configuration_controls_payload_deadlines_and_node_inbox() -> io
     // Binding and empty fanout must not retain the former thirty-second cap.
     let _endpoint = node.endpoint(Messages::delivered(Duration::from_secs(90)))?;
     let empty = node.join_group("empty");
-    let options = SendOptions {
-        delivery: Delivery::Delivered,
+    let options = SendOptions::Delivered {
         timeout: Duration::from_secs(90),
     };
     let payload = Bytes::from(vec![7; 70_000]);
@@ -64,19 +63,32 @@ async fn managed_configuration_controls_payload_deadlines_and_node_inbox() -> io
         .map_err(io::Error::other)??;
     assert_eq!(frame.id, message);
     assert_eq!(frame.payload, payload);
+    let oversized = empty
+        .send_frame(Bytes::from(vec![0; 70_001]), options)
+        .await
+        .unwrap_err();
+    assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        empty
-            .send_frame(Bytes::from(vec![0; 70_001]), options)
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        oversized
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<SendValidationError>()),
+        Some(&SendValidationError::PayloadTooLarge {
+            len: 70_001,
+            max: NonZeroUsize::new(70_000).unwrap(),
+        })
     );
+    let too_long = node
+        .endpoint(Messages::delivered(Duration::from_secs(91)))
+        .unwrap_err();
+    assert_eq!(too_long.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        node.endpoint(Messages::delivered(Duration::from_secs(91)))
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        too_long
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<SendValidationError>()),
+        Some(&SendValidationError::TimeoutAboveMax {
+            timeout: Duration::from_secs(91),
+            max: Duration::from_secs(90),
+        })
     );
     node.router().close().await;
     Ok(())

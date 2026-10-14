@@ -106,7 +106,7 @@ impl Node {
         if let Some(protocol) = protocol.as_ref() {
             return Ok(protocol.clone());
         }
-        let unordered = UnorderedProtocol::new(
+        let unordered = UnorderedProtocol::with_validated(
             self.router(),
             self.tunnels()?.clone(),
             self.inner.unordered_config.clone(),
