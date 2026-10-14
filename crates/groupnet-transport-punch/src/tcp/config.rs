@@ -10,71 +10,69 @@ use groupnet_transport::{NodeIdError, QueueCapacity, validate_node_id};
 
 use super::{MAX_CANDIDATE_BINDS, MAX_CANDIDATES, MAX_PEERS, sockets};
 use crate::common::{MAX_IDENTITY_BYTES, PeerListFault, check_peers, wildcard_for};
-use crate::{NetworkKey, PathPolicy};
+use crate::{NetworkKey, PathPolicy, PeerPolicy};
 
 const DEFAULT_MAX_PEERS: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 
 /// Configuration for one TCP-only traversal endpoint.
+///
+/// [`new`](Self::new) takes exactly the identity and security inputs — the
+/// local identity, the rendezvous, the optional fabric key and the peer
+/// policy; every other field is operational policy with a documented default
+/// that callers refine with struct-update syntax.
 #[derive(Clone)]
 pub struct TcpPunchConfig {
     /// Application-chosen routing identity (1–64 UTF-8 bytes).
     pub local: NodeId,
     /// Registration and primary reusable listening/source socket bind.
+    /// Default: the ephemeral wildcard of the rendezvous address family.
     pub bind: SocketAddr,
     /// Explicit TCP rendezvous address.
     pub rendezvous: SocketAddr,
     /// Optional trusted-fabric key. Keyed endpoints never downgrade.
     pub key: Option<NetworkKey>,
-    /// Static peer allowlist (at most 255 entries); empty when discovering dynamically.
-    pub peers: Vec<NodeId>,
-    /// Whether rendezvous-admitted identities may be discovered dynamically.
-    pub dynamic: bool,
+    /// A static allowlist (at most 255 entries), or dynamic discovery of
+    /// rendezvous-admitted identities.
+    pub peers: PeerPolicy,
     /// Opaque application admission credential, limited to
-    /// [`MAX_CREDENTIAL_BYTES`] bytes.
+    /// [`MAX_CREDENTIAL_BYTES`] bytes. Default: empty.
     pub credential: Vec<u8>,
-    /// Direct preference or privacy-preserving relay-only operation.
+    /// Direct preference or privacy-preserving relay-only operation. Default:
+    /// [`PathPolicy::DirectPreferred`] when keyed, [`PathPolicy::RelayOnly`]
+    /// when keyless.
     pub policy: PathPolicy,
     /// Additional listener/source binds, at most three, including other families.
-    /// Each socket is retained for the lifetime of the endpoint.
+    /// Each socket is retained for the lifetime of the endpoint. Default: none.
     pub candidate_binds: Vec<SocketAddr>,
     /// Explicit externally mapped TCP candidates, at most eight total candidates.
     /// These are hints, never authorization. Invalid addresses are rejected.
     /// Each local/remote pair permits one outstanding check, with three-attempt
     /// bursts separated by a ten-second cooldown. A rotating peer scheduler caps
     /// the endpoint at sixteen outstanding dials and sixteen new checks/second.
+    /// Default: none.
     pub advertised_candidates: Vec<SocketAddr>,
     /// Expand wildcard listeners to local interface addresses when gathering.
     /// IPv6 link-local addresses without a scope are not advertised.
+    /// Default: `true`.
     pub gather_interfaces: bool,
     /// Maximum concurrently admitted neighbors (an operational memory bound).
+    /// Default: 128.
     pub max_peers: NonZeroUsize,
     /// Capacity of the endpoint's bounded packet, event and writer queues.
+    /// Default: 128.
     pub queue_capacity: QueueCapacity,
 }
 
 impl TcpPunchConfig {
-    /// Creates a keyed, static, direct-preferred endpoint.
+    /// Configures an endpoint from its identity and security inputs, with an
+    /// ephemeral wildcard bind, no candidates beyond gathered interfaces, an
+    /// empty credential and the key-dependent default [`PathPolicy`].
     #[must_use]
-    pub fn new(local: NodeId, rendezvous: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> Self {
-        let mut config = Self::dynamic(local, rendezvous, Some(key), Vec::new());
-        config.peers = peers;
-        config.dynamic = false;
-        config
-    }
-
-    /// Creates explicit keyless dynamic discovery, defaulting to relay-only.
-    #[must_use]
-    pub fn open(local: NodeId, rendezvous: SocketAddr) -> Self {
-        Self::dynamic(local, rendezvous, None, Vec::new())
-    }
-
-    /// Creates dynamic discovery with application credentials and an optional key.
-    #[must_use]
-    pub fn dynamic(
+    pub fn new(
         local: NodeId,
         rendezvous: SocketAddr,
         key: Option<NetworkKey>,
-        credential: Vec<u8>,
+        peers: PeerPolicy,
     ) -> Self {
         Self {
             local,
@@ -86,9 +84,8 @@ impl TcpPunchConfig {
                 PathPolicy::RelayOnly
             },
             key,
-            peers: Vec::new(),
-            dynamic: true,
-            credential,
+            peers,
+            credential: Vec::new(),
             candidate_binds: Vec::new(),
             advertised_candidates: Vec::new(),
             gather_interfaces: true,
@@ -104,22 +101,21 @@ impl TcpPunchConfig {
     /// Returns the first violated rule, naming its field.
     pub fn validate(&self) -> Result<(), TcpPunchConfigError> {
         validate_node_id(&self.local, MAX_IDENTITY_BYTES).map_err(TcpPunchConfigError::Local)?;
-        if self.peers.len() > MAX_PEERS {
-            return Err(TcpPunchConfigError::PeersExceedWireLimit {
-                peers: self.peers.len(),
-            });
+        let peers = self.peers.static_peers();
+        if peers.len() > MAX_PEERS {
+            return Err(TcpPunchConfigError::PeersExceedWireLimit { peers: peers.len() });
         }
-        if self.peers.len() > self.max_peers.get() {
+        if peers.len() > self.max_peers.get() {
             return Err(TcpPunchConfigError::PeersExceedMaxPeers {
-                peers: self.peers.len(),
+                peers: peers.len(),
                 max_peers: self.max_peers,
             });
         }
-        check_peers(&self.peers).map_err(|fault| match fault {
+        check_peers(peers).map_err(|fault| match fault {
             PeerListFault::Invalid { index, error } => TcpPunchConfigError::Peer { index, error },
             PeerListFault::Duplicate { index } => TcpPunchConfigError::DuplicatePeer { index },
         })?;
-        if self.peers.contains(&self.local) {
+        if peers.contains(&self.local) {
             return Err(TcpPunchConfigError::LocalListedAsPeer);
         }
         if self.credential.len() > MAX_CREDENTIAL_BYTES {
@@ -172,7 +168,6 @@ impl fmt::Debug for TcpPunchConfig {
             .field("rendezvous", &self.rendezvous)
             .field("key", &self.key)
             .field("peers", &self.peers)
-            .field("dynamic", &self.dynamic)
             .field("policy", &self.policy)
             .field("candidate_binds", &self.candidate_binds)
             .field("advertised_candidates", &self.advertised_candidates)
@@ -188,31 +183,32 @@ impl fmt::Debug for TcpPunchConfig {
 pub enum TcpPunchConfigError {
     /// `local` is not a valid native identity.
     Local(NodeIdError),
-    /// `peers` lists more than the 255 identities a registration can carry.
+    /// The static `peers` list holds more than the 255 identities a
+    /// registration can carry.
     PeersExceedWireLimit {
         /// Number of configured peers.
         peers: usize,
     },
-    /// `peers` lists more identities than `max_peers` admits.
+    /// The static `peers` list holds more identities than `max_peers` admits.
     PeersExceedMaxPeers {
         /// Number of configured peers.
         peers: usize,
         /// The configured peer capacity.
         max_peers: NonZeroUsize,
     },
-    /// `peers[index]` is not a valid native identity.
+    /// Static `peers[index]` is not a valid native identity.
     Peer {
         /// Position of the rejected entry.
         index: usize,
         /// Why the identity was rejected.
         error: NodeIdError,
     },
-    /// `peers[index]` repeats an earlier entry.
+    /// Static `peers[index]` repeats an earlier entry.
     DuplicatePeer {
         /// Position of the repeated entry.
         index: usize,
     },
-    /// `peers` lists the endpoint's own `local` identity.
+    /// The static `peers` list holds the endpoint's own `local` identity.
     LocalListedAsPeer,
     /// `credential` exceeds [`MAX_CREDENTIAL_BYTES`].
     CredentialTooLarge {
@@ -297,7 +293,14 @@ impl fmt::Display for TcpPunchConfigError {
     }
 }
 
-impl error::Error for TcpPunchConfigError {}
+impl error::Error for TcpPunchConfigError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Local(error) | Self::Peer { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<TcpPunchConfigError> for io::Error {
     fn from(error: TcpPunchConfigError) -> Self {

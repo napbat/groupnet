@@ -7,7 +7,10 @@
 //! [`LinkProvider`], so custom transports use the same
 //! initialization path as protocol providers.
 
+mod config;
 mod worker;
+
+pub use config::{LinkConfig, LinkConfigError};
 
 #[cfg(test)]
 mod tests;
@@ -45,31 +48,10 @@ impl<A> PeerEndpoint<A> {
     }
 }
 
-/// Admission, cost, and frame bounds for one adjacent-peer link.
-#[derive(Clone, Debug)]
-pub struct LinkConfig {
-    /// Admitted adjacent peers; routing rejects other sources.
-    pub peers: Vec<NodeId>,
-    /// Positive path cost.
-    pub cost: u32,
-    /// Maximum physical frame size supported by the link.
-    pub mtu: usize,
-}
-
-impl LinkConfig {
-    /// Creates an equal-cost link supporting frames up to 65,000 bytes.
-    #[must_use]
-    pub fn new(peers: Vec<NodeId>) -> Self {
-        Self {
-            peers,
-            cost: 1,
-            mtu: 65_000,
-        }
-    }
-}
-
 /// A configured link implementation, consumed when the network starts.
-/// Binding must release partial resources on failure or cancellation.
+/// Binding validates the whole configuration, including its [`LinkConfig`]
+/// through [`LinkConfig::validate_for`], before opening any socket or
+/// listener, and releases partial resources on later failure or cancellation.
 pub trait LinkProvider: Send + fmt::Debug + 'static {
     /// Explicit adjacent peers, used as initial membership seeds.
     fn peers(&self) -> &[NodeId];

@@ -7,6 +7,8 @@ use tokio::time::timeout;
 
 use super::wire::{Body, MAX_PACKET, Packet, Session};
 use super::*;
+use crate::PeerPolicy;
+use groupnet_transport::admission::OpenAdmission;
 
 const SETTLE: Duration = Duration::from_secs(5);
 const SILENCE: Duration = Duration::from_millis(150);
@@ -21,9 +23,14 @@ fn key() -> NetworkKey {
 
 async fn rendezvous(peers: &[&str]) -> UdpRendezvous {
     let peers = peers.iter().map(|peer| NodeId::from(*peer)).collect();
-    UdpRendezvous::bind(UdpRendezvousConfig::new(loopback(), key(), peers))
-        .await
-        .unwrap()
+    UdpRendezvous::bind(UdpRendezvousConfig::new(
+        loopback(),
+        Some(key()),
+        PeerPolicy::Static(peers),
+        Arc::new(OpenAdmission),
+    ))
+    .await
+    .unwrap()
 }
 
 struct RawPeer {
@@ -365,7 +372,12 @@ async fn unknown_names_and_bad_authentication_cannot_obtain_reflections() {
 async fn direct_packet_replays_bad_keys_and_unknown_sources_do_not_enter_receive_queue() {
     let relay = rendezvous(&["a", "b", "unknown"]).await;
     let address = relay.local_addr();
-    let mut config = UdpPunchConfig::new("a".into(), address, key(), vec!["b".into()]);
+    let mut config = UdpPunchConfig::new(
+        "a".into(),
+        address,
+        Some(key()),
+        PeerPolicy::Static(vec!["b".into()]),
+    );
     config.bind = loopback();
     let a = UdpConnection::bind(config).await.unwrap();
     let mut b = RawPeer::new("b", [2; 16]).await;

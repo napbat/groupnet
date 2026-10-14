@@ -153,19 +153,68 @@ fn length_header_is_four_big_endian_bytes() {
 fn length_header_bounds_encode_and_decode() {
     assert!(LengthHeader::new(MAX_FRAME_BYTES).is_ok());
     assert_eq!(
-        LengthHeader::new(MAX_FRAME_BYTES + 1).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
+        LengthHeader::new(MAX_FRAME_BYTES + 1),
+        Err(FrameLengthError::AboveCeiling {
+            length: MAX_FRAME_BYTES + 1
+        })
     );
     let header = LengthHeader::new(100).unwrap();
-    assert_eq!(header.length_within(100).unwrap(), 100);
+    assert_eq!(header.length_within(100), Ok(100));
     assert_eq!(
-        header.length_within(99).unwrap_err().kind(),
-        io::ErrorKind::InvalidData
+        header.length_within(99),
+        Err(FrameLengthError::ReceivedAboveLimit {
+            length: 100,
+            max_bytes: 99
+        })
     );
-    // A hostile prefix is capped by the ceiling even under a larger limit.
+    assert_eq!(header.length_within(MAX_FRAME_BYTES), Ok(100));
+    // A limit above the ceiling is refused, not silently capped.
     let hostile = LengthHeader::read_from_bytes(&u32::MAX.to_be_bytes()).unwrap();
     assert_eq!(
-        hostile.length_within(usize::MAX).unwrap_err().kind(),
-        io::ErrorKind::InvalidData
+        hostile.length_within(usize::MAX),
+        Err(FrameLengthError::LimitAboveCeiling {
+            max_bytes: usize::MAX
+        })
     );
+    assert_eq!(
+        header.length_within(MAX_FRAME_BYTES + 1),
+        Err(FrameLengthError::LimitAboveCeiling {
+            max_bytes: MAX_FRAME_BYTES + 1
+        })
+    );
+    assert!(matches!(
+        hostile.length_within(MAX_FRAME_BYTES),
+        Err(FrameLengthError::ReceivedAboveLimit { .. })
+    ));
+}
+
+#[test]
+fn frame_length_errors_convert_at_the_stream_boundary() {
+    let received = io::Error::from(FrameLengthError::ReceivedAboveLimit {
+        length: 9,
+        max_bytes: 8,
+    });
+    assert_eq!(received.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        received
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<FrameLengthError>()),
+        Some(&FrameLengthError::ReceivedAboveLimit {
+            length: 9,
+            max_bytes: 8
+        })
+    );
+    for caller in [
+        FrameLengthError::AboveCeiling { length: 1 },
+        FrameLengthError::Overflow,
+        FrameLengthError::ZeroLimit,
+        FrameLengthError::LimitAboveCeiling { max_bytes: 1 },
+        FrameLengthError::SendAboveLimit {
+            length: 2,
+            max_bytes: 1,
+        },
+    ] {
+        assert_ne!(caller.to_string(), "");
+        assert_eq!(io::Error::from(caller).kind(), io::ErrorKind::InvalidInput);
+    }
 }

@@ -307,17 +307,16 @@ impl Router {
     fn attach_link(&self, link: BoundLink) -> Result<TransportId, (io::Error, BoundLink)> {
         let shared = &self.inner.shared;
         let config = &link.config;
-        if config.cost == 0
-            || config.peers.len() > shared.config.max_routes.get()
-            || config
-                .peers
-                .iter()
-                .any(|peer| !wire::id_valid(peer) || peer == &shared.local)
-            || !(wire::FRAGMENT + 1..=shared.config.max_frame).contains(&config.mtu)
+        if let Err(error) = config.validate_for(&shared.local) {
+            return Err((error.into(), link));
+        }
+        let mtu = config.mtu.get();
+        if config.peers.len() > shared.config.max_routes.get()
+            || !(wire::FRAGMENT + 1..=shared.config.max_frame).contains(&mtu)
             || shared
                 .config
                 .max_frame
-                .div_ceil(config.mtu.saturating_sub(wire::FRAGMENT).max(1))
+                .div_ceil(mtu.saturating_sub(wire::FRAGMENT).max(1))
                 > usize::from(shared.config.reassembly.max_fragments.get())
         {
             return Err((wire::invalid("invalid link configuration"), link));
@@ -347,7 +346,7 @@ impl Router {
             id,
             config.peers.clone(),
             sessions.as_ref(),
-            config.mtu,
+            config.mtu.get(),
             outgoing,
             cancel.clone(),
         );

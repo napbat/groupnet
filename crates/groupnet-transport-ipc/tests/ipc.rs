@@ -1,16 +1,18 @@
 //! Real local-IPC integration tests; no mocked streams or fixed names.
 
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
 use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
-use groupnet_transport::link::{LinkLifecycle, LinkProvider, PeerEndpoint};
-use groupnet_transport::{QueueCapacity, Transport};
+use groupnet_transport::Transport;
+use groupnet_transport::link::{LinkConfigError, LinkLifecycle, LinkProvider};
+// The adapter re-exports the shared types its own signatures name.
 use groupnet_transport_ipc::{
-    IpcAddress, IpcConfig, IpcConfigError, IpcLink, IpcTransport, MAX_FRAME,
+    IpcAddress, IpcConfig, IpcConfigError, IpcLink, IpcPeerError, IpcTransport, MAX_FRAME,
+    NodeIdError, PeerEndpoint, QueueCapacity,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -146,28 +148,49 @@ async fn bounded_peer_book_and_node_ids() {
             .register_peer(NodeId::new(format!("peer-{index}")), address.ipc.clone())
             .unwrap();
     }
-    assert!(
-        transport
-            .register_peer(NodeId::new("overflow"), address.ipc.clone())
-            .is_err()
+    let peer_error = |error: io::Error| {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        *error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcPeerError>())
+            .expect("typed peer error")
+    };
+    assert_eq!(
+        peer_error(
+            transport
+                .register_peer(NodeId::new("overflow"), address.ipc.clone())
+                .unwrap_err()
+        ),
+        IpcPeerError::PeerLimit {
+            max_peers: NonZeroUsize::new(128).unwrap()
+        }
     );
     transport
         .register_peer(NodeId::new("peer-0"), address.ipc.clone())
         .unwrap();
-    assert!(
-        transport
-            .register_peer(NodeId::new("local"), address.ipc.clone())
-            .is_err()
+    assert_eq!(
+        peer_error(
+            transport
+                .register_peer(NodeId::new("local"), address.ipc.clone())
+                .unwrap_err()
+        ),
+        IpcPeerError::Local
     );
-    assert!(
-        transport
-            .register_peer(NodeId::new("x".repeat(65)), address.ipc.clone())
-            .is_err()
+    assert_eq!(
+        peer_error(
+            transport
+                .register_peer(NodeId::new("x".repeat(65)), address.ipc.clone())
+                .unwrap_err()
+        ),
+        IpcPeerError::Identity(NodeIdError::TooLong { len: 65, max: 64 })
     );
-    assert!(
-        transport
-            .register_peer(NodeId::new(""), address.ipc.clone())
-            .is_err()
+    assert_eq!(
+        peer_error(
+            transport
+                .register_peer(NodeId::new(""), address.ipc.clone())
+                .unwrap_err()
+        ),
+        IpcPeerError::Identity(NodeIdError::Empty)
     );
     transport
         .send(&NodeId::new("unknown"), b"drop")
@@ -411,7 +434,7 @@ async fn provider_routes_bounded_frames_and_router_drains_listener() {
             right_address.ipc.clone(),
         )],
     )
-    .with_cost(7);
+    .with_cost(NonZeroU32::new(7).unwrap());
     let right_provider = IpcLink::new(
         right_address.ipc.clone(),
         vec![PeerEndpoint::new(
@@ -462,17 +485,74 @@ async fn provider_routes_bounded_frames_and_router_drains_listener() {
 }
 
 #[tokio::test]
-async fn provider_peer_registration_failure_drains_bound_listener() {
+async fn provider_preflights_every_peer_before_opening_a_listener() {
     let address = Address::new();
+    let peer_address = Address::new();
     let local = NodeId::new("local");
-    let provider = IpcLink::new(
-        address.ipc.clone(),
-        vec![PeerEndpoint::new(local.clone(), address.ipc.clone())],
-    );
-    assert_eq!(
-        Box::new(provider).bind(local).await.unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
+    // An occupied listener address proves no bind was attempted: a provider
+    // reaching the listener would fail with the platform's address error.
+    let occupant = IpcTransport::bind(NodeId::new("occupant"), &address.ipc).unwrap();
+    let peer = |node: &str| PeerEndpoint::new(NodeId::new(node), peer_address.ipc.clone());
+    let link_cases = [
+        (
+            vec![
+                peer("a"),
+                PeerEndpoint::new(local.clone(), peer_address.ipc.clone()),
+            ],
+            LinkConfigError::LocalPeer { index: 1 },
+        ),
+        (
+            vec![peer("a"), peer("a")],
+            LinkConfigError::DuplicatePeer { index: 1 },
+        ),
+        (
+            vec![peer("")],
+            LinkConfigError::Peer {
+                index: 0,
+                error: NodeIdError::Empty,
+            },
+        ),
+    ];
+    for (peers, expected) in link_cases {
+        let error = Box::new(IpcLink::new(address.ipc.clone(), peers))
+            .bind(local.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<LinkConfigError>()),
+            Some(&expected)
+        );
+    }
+    let one_peer = IpcConfig {
+        max_peers: NonZeroUsize::MIN,
+        ..IpcConfig::default()
+    };
+    let ipc_cases = [
+        (
+            IpcLink::new(address.ipc.clone(), vec![peer(&"x".repeat(65))]),
+            IpcPeerError::Identity(NodeIdError::TooLong { len: 65, max: 64 }),
+        ),
+        (
+            IpcLink::new(address.ipc.clone(), vec![peer("a"), peer("b")]).with_config(one_peer),
+            IpcPeerError::PeerLimit {
+                max_peers: NonZeroUsize::MIN,
+            },
+        ),
+    ];
+    for (provider, expected) in ipc_cases {
+        let error = Box::new(provider).bind(local.clone()).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<IpcPeerError>()),
+            Some(&expected)
+        );
+    }
+    occupant.close().await;
     let replacement = IpcTransport::bind(NodeId::new("replacement"), &address.ipc).unwrap();
     replacement.close().await;
 }

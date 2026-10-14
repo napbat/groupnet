@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_transport::admission::{AcceptedPeer, Admission, JoinRequest};
+use groupnet_transport::admission::{AcceptedPeer, Admission, AdmissionError, JoinRequest};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 use super::candidates::Candidates;
 use super::wire::{self, Body, MAX_PACKET, Packet, Session};
 use super::{LEASE, NetworkKey, random, transient};
-use crate::RelayPacing;
 use crate::pacing::Budget;
+use crate::{PeerPolicy, RelayPacing};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(3);
 const RATE_INTERVAL: Duration = Duration::from_secs(1);
@@ -281,12 +281,15 @@ impl UdpRendezvous {
     /// [`UdpRendezvousConfigError`], and propagates socket errors.
     pub async fn bind(config: UdpRendezvousConfig) -> io::Result<Self> {
         config.validate()?;
-        let allowed = config.peers.map(|peers| {
-            peers
-                .into_iter()
-                .map(|peer| peer.as_str().to_owned())
-                .collect()
-        });
+        let allowed = match config.peers {
+            PeerPolicy::Static(peers) => Some(
+                peers
+                    .into_iter()
+                    .map(|peer| peer.as_str().to_owned())
+                    .collect(),
+            ),
+            PeerPolicy::Dynamic => None,
+        };
         let socket = UdpSocket::bind(config.bind).await?;
         let address = socket.local_addr()?;
         let cancel = CancellationToken::new();
@@ -324,7 +327,7 @@ impl UdpRendezvous {
 struct Decision {
     node: NodeId,
     registration: Registration,
-    accepted: io::Result<AcceptedPeer>,
+    accepted: Result<AcceptedPeer, AdmissionError>,
 }
 
 struct ServerState {
@@ -722,10 +725,10 @@ fn spawn_admission(
         )
         .await
         .unwrap_or_else(|_| {
-            Err(io::Error::new(
+            Err(AdmissionError::from(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "admission timed out",
-            ))
+            )))
         });
         Decision {
             node,

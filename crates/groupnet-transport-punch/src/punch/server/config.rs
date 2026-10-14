@@ -5,13 +5,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::{error, fmt, io};
 
-use groupnet_core::NodeId;
 use groupnet_transport::NodeIdError;
-use groupnet_transport::admission::{Admission, OpenAdmission};
+use groupnet_transport::admission::Admission;
 
 use super::super::{DEFAULT_MAX_PEERS, MAX_UDP_MESSAGE, NetworkKey};
-use crate::RelayPacing;
 use crate::common::{PeerListFault, check_peers};
+use crate::{PeerPolicy, RelayPacing};
 
 const DEFAULT_PENDING_ADMISSIONS: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
@@ -38,21 +37,27 @@ impl Default for UdpRendezvousLimits {
 }
 
 /// Socket, fabric authentication, application admission, and rendezvous capacities.
+///
+/// [`new`](Self::new) takes exactly the security inputs — the optional fabric
+/// key, the peer policy and the application admission policy — with the bind
+/// address; capacities and relay pacing are defaultable policy.
 #[derive(Clone)]
 pub struct UdpRendezvousConfig {
     /// UDP socket bind address (multicast is rejected).
     pub bind: SocketAddr,
     /// Optional trusted-fabric key; keyed traffic never downgrades.
     pub key: Option<NetworkKey>,
-    /// Fixed identity allowlist, or `None` for dynamic application admission.
-    pub peers: Option<Vec<NodeId>>,
+    /// A fixed identity allowlist, or dynamic application admission.
+    pub peers: PeerPolicy,
     /// Application admission policy, evaluated only after return-routability.
     pub admission: Arc<dyn Admission>,
-    /// Operational capacities; control-rate limits and challenge/session deadlines stay fixed.
+    /// Operational capacities; control-rate limits and challenge/session
+    /// deadlines stay fixed. Default: [`UdpRendezvousLimits::default`].
     pub limits: UdpRendezvousLimits,
     /// Optional per-identity byte budget for admitted relay data, which never
     /// spends the control-rate budget. Datagrams over budget are dropped, so a
     /// byte burst must hold at least one [`MAX_UDP_MESSAGE`] payload.
+    /// Default: [`RelayPacing::Backpressure`].
     pub relay_pacing: RelayPacing,
 }
 
@@ -71,36 +76,22 @@ impl fmt::Debug for UdpRendezvousConfig {
 }
 
 impl UdpRendezvousConfig {
-    /// Creates keyed rendezvous configuration with a fixed identity allowlist
-    /// and open application admission.
+    /// Configures a rendezvous from its security inputs with default limits
+    /// and relay pacing. Keyed datagrams never fall back to keyless parsing.
+    /// `admission` runs only after address return-routability, with bounded
+    /// time and concurrency; `OpenAdmission` is the explicit choice to accept
+    /// every claimed identity, which proves no identity ownership.
     #[must_use]
-    pub fn new(bind: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> Self {
-        Self {
-            peers: Some(peers),
-            ..Self::with_admission(bind, Some(key), Arc::new(OpenAdmission))
-        }
-    }
-
-    /// Creates explicitly keyless dynamic discovery with open application admission.
-    /// Open admission provides no cryptographic identity assurance.
-    #[must_use]
-    pub fn open(bind: SocketAddr) -> Self {
-        Self::with_admission(bind, None, Arc::new(OpenAdmission))
-    }
-
-    /// Creates dynamic discovery with application admission and optional fabric HMAC.
-    /// Keyed datagrams never fall back to keyless parsing. Policies run only
-    /// after address return-routability, with bounded time and concurrency.
-    #[must_use]
-    pub fn with_admission(
+    pub fn new(
         bind: SocketAddr,
         key: Option<NetworkKey>,
+        peers: PeerPolicy,
         admission: Arc<dyn Admission>,
     ) -> Self {
         Self {
             bind,
             key,
-            peers: None,
+            peers,
             admission,
             limits: UdpRendezvousLimits::default(),
             relay_pacing: RelayPacing::Backpressure,
@@ -121,22 +112,19 @@ impl UdpRendezvousConfig {
         if self.bind.ip().is_multicast() {
             return Err(UdpRendezvousConfigError::MulticastBind);
         }
-        if let Some(peers) = &self.peers {
-            if peers.len() > self.limits.max_peers.get() {
-                return Err(UdpRendezvousConfigError::PeersExceedMaxPeers {
-                    peers: peers.len(),
-                    max_peers: self.limits.max_peers,
-                });
-            }
-            check_peers(peers).map_err(|fault| match fault {
-                PeerListFault::Invalid { index, error } => {
-                    UdpRendezvousConfigError::Peer { index, error }
-                }
-                PeerListFault::Duplicate { index } => {
-                    UdpRendezvousConfigError::DuplicatePeer { index }
-                }
-            })?;
+        let peers = self.peers.static_peers();
+        if peers.len() > self.limits.max_peers.get() {
+            return Err(UdpRendezvousConfigError::PeersExceedMaxPeers {
+                peers: peers.len(),
+                max_peers: self.limits.max_peers,
+            });
         }
+        check_peers(peers).map_err(|fault| match fault {
+            PeerListFault::Invalid { index, error } => {
+                UdpRendezvousConfigError::Peer { index, error }
+            }
+            PeerListFault::Duplicate { index } => UdpRendezvousConfigError::DuplicatePeer { index },
+        })?;
         Ok(())
     }
 }
@@ -148,21 +136,22 @@ pub enum UdpRendezvousConfigError {
     PacingBurstBelowMessage,
     /// `bind` is a multicast address.
     MulticastBind,
-    /// `peers` lists more identities than `limits.max_peers` retains.
+    /// The static `peers` list holds more identities than `limits.max_peers`
+    /// retains.
     PeersExceedMaxPeers {
         /// Number of allowlisted identities.
         peers: usize,
         /// The configured peer capacity.
         max_peers: NonZeroUsize,
     },
-    /// `peers[index]` is not a valid native identity.
+    /// Static `peers[index]` is not a valid native identity.
     Peer {
         /// Position of the rejected entry.
         index: usize,
         /// Why the identity was rejected.
         error: NodeIdError,
     },
-    /// `peers[index]` repeats an earlier entry.
+    /// Static `peers[index]` repeats an earlier entry.
     DuplicatePeer {
         /// Position of the repeated entry.
         index: usize,
@@ -189,7 +178,14 @@ impl fmt::Display for UdpRendezvousConfigError {
     }
 }
 
-impl error::Error for UdpRendezvousConfigError {}
+impl error::Error for UdpRendezvousConfigError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Peer { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<UdpRendezvousConfigError> for io::Error {
     fn from(error: UdpRendezvousConfigError) -> Self {

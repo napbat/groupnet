@@ -1,13 +1,17 @@
 //! Native UDP and TCP multi-candidate traversal with session-bound relay fallback.
 //!
-//! [`UdpPunchConfig::new`] preserves explicitly keyed, allowlisted fabrics.
-//! [`UdpPunchConfig::open`] defaults to [`PathPolicy::RelayOnly`]. Explicitly setting
-//! [`UdpPunchConfig::policy`] to [`PathPolicy::DirectPreferred`] enables keyless
-//! punching: no pre-shared transport key or identity keypair is required.
+//! [`UdpPunchConfig::new`] takes the local identity, the rendezvous, an
+//! optional [`NetworkKey`] and a [`PeerPolicy`]: a static allowlist or dynamic
+//! discovery, each carrying only its own data. Keyed fabrics default to
+//! [`PathPolicy::DirectPreferred`]; keyless ones conservatively default to
+//! [`PathPolicy::RelayOnly`], and explicitly setting [`UdpPunchConfig::policy`]
+//! to `DirectPreferred` enables keyless punching: no pre-shared transport key or
+//! identity keypair is required.
 //! Internal fresh random challenges and capabilities prove return-routability,
 //! not cryptographic identity. Application admission may independently require
-//! credentials through [`UdpRendezvousConfig::with_admission`]; keyed configurations
-//! retain strict HMAC authentication and never downgrade.
+//! credentials through the [`Admission`] policy a rendezvous configuration
+//! takes; keyed configurations retain strict HMAC authentication and never
+//! downgrade.
 //! UDP registration proves address return-routability before discovery or relay.
 //! Direct data requires current session-bound path proofs and message authentication.
 //! Relay-only pair discovery omits physical endpoint addresses and never probes.
@@ -16,10 +20,18 @@
 //!
 //! Each protocol has one endpoint configuration ([`UdpPunchConfig`],
 //! [`TcpPunchConfig`]) and one rendezvous configuration ([`UdpRendezvousConfig`],
-//! [`TcpRendezvousConfig`]) with nested protocol-specific limits. Every
-//! configuration exposes `validate`, returning a typed error that names the
-//! violated field; each binder calls it first and surfaces a failure as
-//! `InvalidInput` wrapping that typed error.
+//! [`TcpRendezvousConfig`]); each takes its identity and security inputs in
+//! `new` and keeps its operational policy in public fields with documented
+//! defaults. The endpoint and rendezvous configurations expose `validate`,
+//! returning a typed error that names the violated field (keeping a rejected
+//! identity's [`NodeIdError`] as its `source`); each binder calls it first and
+//! surfaces a failure as `InvalidInput` wrapping that typed error. Their nested
+//! limits are valid by type, except [`TcpRendezvousLimits`], whose one
+//! cross-field rule has its own `validate`; [`UdpRendezvousLimits`] needs none.
+//!
+//! The shared transport types these signatures name — [`QueueCapacity`],
+//! [`NodeIdError`], [`Admission`], [`SessionRegistry`], [`SessionId`],
+//! [`Bytes`], [`Inbound`] and [`AdmittedInbound`] — are re-exported here.
 //!
 //! [`UdpConnection`] and [`TcpConnection`] establish and maintain adjacent packet
 //! paths, with bounded best-effort I/O, admission generations, and explicit
@@ -42,10 +54,15 @@
 
 mod common;
 mod pacing;
+mod peers;
 mod punch;
 mod tcp;
 
+pub use groupnet_transport::admission::{Admission, SessionId, SessionRegistry};
+pub use groupnet_transport::link::AdmittedInbound;
+pub use groupnet_transport::{Bytes, Inbound, NodeIdError, QueueCapacity};
 pub use pacing::RelayPacing;
+pub use peers::PeerPolicy;
 pub use punch::{
     MAX_UDP_MESSAGE, NetworkKey, PathPolicy, PeerPath, UdpConnection, UdpPunchConfig,
     UdpPunchConfigError, UdpRendezvous, UdpRendezvousConfig, UdpRendezvousConfigError,

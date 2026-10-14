@@ -1,15 +1,26 @@
 //! Adapter regressions for native session ownership and raw-mode isolation.
 
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet_core::NodeId;
 use groupnet_transport::Transport;
-use groupnet_transport::admission::{SessionId, SessionRegistry};
-use groupnet_transport_punch::{UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig};
+use groupnet_transport::admission::{OpenAdmission, SessionId, SessionRegistry};
+use groupnet_transport_punch::{PeerPolicy, UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig};
 
-use super::UdpTransport;
 use super::framing::SendBuffer;
+use super::{UdpRegisterPeerError, UdpTransport};
+
+fn open_rendezvous() -> UdpRendezvousConfig {
+    UdpRendezvousConfig::new(
+        "127.0.0.1:0".parse().expect("server address"),
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    )
+}
 
 async fn admitted(registry: &SessionRegistry, peer: &NodeId) -> SessionId {
     let mut neighbors = registry.subscribe();
@@ -26,7 +37,7 @@ async fn admitted(registry: &SessionRegistry, peer: &NodeId) -> SessionId {
 }
 
 async fn connect(id: &NodeId, rendezvous: SocketAddr) -> UdpTransport {
-    let mut config = UdpPunchConfig::open(id.clone(), rendezvous);
+    let mut config = UdpPunchConfig::new(id.clone(), rendezvous, None, PeerPolicy::Dynamic);
     config.bind = "127.0.0.1:0".parse().expect("bind address");
     config.gather_interfaces = false;
     UdpTransport::bind_connectivity(config)
@@ -36,18 +47,16 @@ async fn connect(id: &NodeId, rendezvous: SocketAddr) -> UdpTransport {
 
 #[tokio::test]
 async fn managed_connection_preserves_socket_sessions_and_tagged_io() {
-    let server = UdpRendezvous::bind(UdpRendezvousConfig::open(
-        "127.0.0.1:0".parse().expect("server address"),
-    ))
-    .await
-    .expect("rendezvous");
+    let server = UdpRendezvous::bind(open_rendezvous())
+        .await
+        .expect("rendezvous");
     let receiver_id = NodeId::new("connected-receiver");
     let sender_id = NodeId::new("connected-sender");
     let receiver = connect(&receiver_id, server.local_addr()).await;
     let receiver_addr = receiver.local_addr();
     let observer = receiver.clone();
     let receiver_sessions = observer.sessions().expect("native sessions");
-    let bound = receiver.into_bound_link(7);
+    let bound = receiver.into_bound_link(NonZeroU32::new(7).unwrap());
     assert!(std::net::UdpSocket::bind(receiver_addr).is_err());
 
     let sender = connect(&sender_id, server.local_addr()).await;
@@ -98,17 +107,15 @@ async fn managed_connection_preserves_socket_sessions_and_tagged_io() {
     assert_eq!(observer.local_addrs(), [receiver_addr]);
     assert_eq!(observer.observed_addr(), None);
     let _replacement = std::net::UdpSocket::bind(receiver_addr).expect("actual socket released");
-    sender.into_bound_link(1).driver.close().await;
+    sender.into_bound_link(NonZeroU32::MIN).driver.close().await;
     server.close().await;
 }
 
 #[tokio::test]
 async fn connected_mode_ignores_address_hints_and_raw_self_attribution() {
-    let server = UdpRendezvous::bind(UdpRendezvousConfig::open(
-        "127.0.0.1:0".parse().expect("server address"),
-    ))
-    .await
-    .expect("rendezvous");
+    let server = UdpRendezvous::bind(open_rendezvous())
+        .await
+        .expect("rendezvous");
     let receiver_id = NodeId::new("fenced-receiver");
     let attacker_id = NodeId::new("unadmitted");
     let receiver = connect(&receiver_id, server.local_addr()).await;
@@ -116,7 +123,10 @@ async fn connected_mode_ignores_address_hints_and_raw_self_attribution() {
         .await
         .expect("raw socket");
     let hint = raw.local_addr().expect("hint address");
-    receiver.register_peer(attacker_id.clone(), hint);
+    assert_eq!(
+        receiver.register_peer(attacker_id.clone(), hint),
+        Err(UdpRegisterPeerError::Connectivity)
+    );
     receiver.learn_peer(&attacker_id, &hint.to_string());
     assert!(!receiver.known_peers().contains(&attacker_id));
     assert!(receiver.direct_addr_to(&attacker_id).is_none());
@@ -141,6 +151,10 @@ async fn connected_mode_ignores_address_hints_and_raw_self_attribution() {
             .borrow()
             .is_empty()
     );
-    receiver.into_bound_link(1).driver.close().await;
+    receiver
+        .into_bound_link(NonZeroU32::MIN)
+        .driver
+        .close()
+        .await;
     server.close().await;
 }

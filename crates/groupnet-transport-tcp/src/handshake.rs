@@ -28,12 +28,14 @@ pub(crate) fn check_id(id: &NodeId) -> io::Result<()> {
 
 /// The typed length prefix of one field.
 pub(crate) fn field_header(bytes: &[u8]) -> io::Result<LengthHeader> {
-    LengthHeader::new(bytes.len())
+    Ok(LengthHeader::new(bytes.len())?)
 }
 
 /// Sends our node id as one length-prefixed field so the peer can attribute
-/// the connection. Bulk streams and managed sessions acknowledge identities;
-/// the raw message plane never does.
+/// the connection. A managed session acknowledges it by echoing the accepted
+/// identity back; a bulk stream's dialer writes it and starts streaming
+/// without reading any acknowledgement, and the raw message plane never
+/// acknowledges either.
 #[cfg(any(feature = "bulk", feature = "link"))]
 pub(crate) async fn write_id(sock: &mut (impl AsyncWrite + Unpin), id: &NodeId) -> io::Result<()> {
     check_id(id)?;

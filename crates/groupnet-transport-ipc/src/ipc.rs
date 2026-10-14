@@ -12,13 +12,15 @@ mod platform;
 mod runtime;
 
 use std::collections::HashMap;
-use std::io;
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::{error, fmt, io};
 
 use bytes::Bytes;
 use groupnet_core::NodeId;
+use groupnet_transport::NodeIdError;
 use groupnet_transport::admission::SessionId;
 use groupnet_transport::link::{LinkFuture, LinkLifecycle};
 use groupnet_transport::{Inbound, Transport};
@@ -161,6 +163,36 @@ impl IpcTransport {
         })
     }
 
+    /// Checks every configured peer exactly as [`register_peer`] would on a
+    /// fresh transport bound for `local` under `config` — identity bound,
+    /// not the local node, at most `max_peers`, a valid platform address —
+    /// without binding anything. `peers` must already be distinct.
+    ///
+    /// [`register_peer`]: Self::register_peer
+    pub(crate) fn preflight_peers(
+        local: &NodeId,
+        config: &IpcConfig,
+        peers: &[NodeId],
+        addresses: &[IpcAddress],
+    ) -> io::Result<()> {
+        config.validate()?;
+        frame::validate_id(local)?;
+        if peers.len() > config.max_peers.get() {
+            return Err(IpcPeerError::PeerLimit {
+                max_peers: config.max_peers,
+            }
+            .into());
+        }
+        for (peer, address) in peers.iter().zip(addresses) {
+            frame::validate_id(peer).map_err(IpcPeerError::Identity)?;
+            if peer == local {
+                return Err(IpcPeerError::Local.into());
+            }
+            platform::validate_address(address)?;
+        }
+        Ok(())
+    }
+
     /// Registers or replaces the local address of a peer.
     ///
     /// Replacing an address invalidates the existing outbound queue; the next
@@ -168,27 +200,28 @@ impl IpcTransport {
     /// automatically trusted or added to this local-only address book.
     ///
     /// # Errors
-    /// Rejects invalid IDs/addresses, the local node, a full peer book, or a
-    /// closed transport.
+    /// Returns `InvalidInput` carrying the [`IpcPeerError`] for an invalid
+    /// identity, the local node or a full peer book, rejects an invalid
+    /// platform address, and fails once the transport is closed.
     pub fn register_peer(&self, node: NodeId, address: IpcAddress) -> io::Result<()> {
-        frame::validate_id(&node)?;
+        frame::validate_id(&node).map_err(IpcPeerError::Identity)?;
         platform::validate_address(&address)?;
         let state = &self.handle.state;
         if state.cancel.is_cancelled() {
             return Err(closed());
         }
         if node == state.local {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot register self",
-            ));
+            return Err(IpcPeerError::Local.into());
         }
         let mut book = state
             .book
             .lock()
             .map_err(|_| io::Error::other("IPC book poisoned"))?;
         if !book.peers.contains_key(&node) && book.peers.len() >= state.config.max_peers.get() {
-            return Err(io::Error::other("IPC peer limit reached"));
+            return Err(IpcPeerError::PeerLimit {
+                max_peers: state.config.max_peers,
+            }
+            .into());
         }
         if book.peers.get(&node) != Some(&address) {
             book.sessions.remove(&node);
@@ -307,6 +340,48 @@ impl Transport for IpcTransport {
 
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "IPC transport closed")
+}
+
+/// Why a peer cannot enter an [`IpcTransport`]'s address book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcPeerError {
+    /// The peer's identity is empty or longer than the 64-byte IPC bound.
+    Identity(NodeIdError),
+    /// The peer is the transport's own identity.
+    Local,
+    /// The address book already holds `max_peers` other peers, or a link
+    /// configures more peers than that.
+    PeerLimit {
+        /// The configured [`IpcConfig::max_peers`].
+        max_peers: NonZeroUsize,
+    },
+}
+
+impl fmt::Display for IpcPeerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity(error) => write!(f, "peer identity rejected: {error}"),
+            Self::Local => f.write_str("an IPC transport cannot register itself as a peer"),
+            Self::PeerLimit { max_peers } => {
+                write!(f, "IPC peers exceed the max_peers bound of {max_peers}")
+            }
+        }
+    }
+}
+
+impl error::Error for IpcPeerError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Identity(error) => Some(error),
+            Self::Local | Self::PeerLimit { .. } => None,
+        }
+    }
+}
+
+impl From<IpcPeerError> for io::Error {
+    fn from(error: IpcPeerError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
 }
 
 #[cfg(test)]

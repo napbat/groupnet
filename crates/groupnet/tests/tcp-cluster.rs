@@ -30,8 +30,8 @@ async fn nodes_gossip_and_sync_entries_over_persistent_tcp() {
     let tb = TcpMsgTransport::bind(b_id.clone(), "127.0.0.1:0")
         .await
         .expect("bind b");
-    ta.register_peer(b_id.clone(), tb.local_addr());
-    tb.register_peer(a_id.clone(), ta.local_addr());
+    ta.register_peer(b_id.clone(), tb.local_addr()).unwrap();
+    tb.register_peer(a_id.clone(), ta.local_addr()).unwrap();
 
     // Clones share the pool, so we can watch it from outside the nodes.
     let a_pool = ta.clone();
@@ -90,8 +90,8 @@ async fn seed_only_bootstrap_resolves_every_address_dynamically() {
     let tc = TcpMsgTransport::bind(c_id.clone(), "127.0.0.1:0")
         .await
         .expect("bind c");
-    ta.register_peer(b_id.clone(), tb.local_addr());
-    tc.register_peer(b_id.clone(), tb.local_addr());
+    ta.register_peer(b_id.clone(), tb.local_addr()).unwrap();
+    tc.register_peer(b_id.clone(), tb.local_addr()).unwrap();
 
     let a_book = ta.clone();
     let c_book = tc.clone();

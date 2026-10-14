@@ -7,16 +7,17 @@
 //! Application streams use disposable, pinned TLS identities; group messages
 //! remain on the managed node's separate coordination inbox.
 
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io, net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet::connectivity::{
-    PathPolicy, PeerPath, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig,
+    PathPolicy, PeerPath, PeerPolicy, TcpPunchConfig, TcpRendezvous, TcpRendezvousConfig,
 };
 use groupnet::core::NodeId;
 use groupnet::network::TunnelConfig;
 use groupnet::network::tunnel::{PeerIdentity, TlsIdentity};
 use groupnet::runtime::{Node, Ordered};
+use groupnet::transport::admission::OpenAdmission;
 use groupnet::transport::mem::{MemLink, Network};
 use groupnet::transport::tcp::TcpMsgTransport;
 use rcgen::{
@@ -45,8 +46,11 @@ async fn main() -> io::Result<()> {
     } else {
         PathPolicy::DirectPreferred
     };
-    let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::new(
         "127.0.0.1:0".parse().map_err(io::Error::other)?,
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
     ))
     .await?;
     let address = relay.local_addr();
@@ -80,13 +84,13 @@ async fn main() -> io::Result<()> {
             memory.endpoint(NodeId::new("edge-b")),
             vec![NodeId::new("memory-a")],
         ))
-        .link(b_tcp.into_bound_link(1))
+        .link(b_tcp.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(50)
         .tunnels(b_tls)
         .start()
         .await?;
     let c = Node::builder(NodeId::new("remote-c"))
-        .link(c_tcp.into_bound_link(1))
+        .link(c_tcp.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(50)
         .tunnels(c_tls)
         .start()
@@ -104,7 +108,7 @@ async fn main() -> io::Result<()> {
 }
 
 fn config(local: &str, address: SocketAddr, policy: PathPolicy) -> TcpPunchConfig {
-    let mut config = TcpPunchConfig::open(NodeId::new(local), address);
+    let mut config = TcpPunchConfig::new(NodeId::new(local), address, None, PeerPolicy::Dynamic);
     config.policy = policy;
     config
         .candidate_binds
@@ -221,7 +225,9 @@ async fn promote(a: &Node, c: &Node, address: SocketAddr, policy: PathPolicy) ->
         PeerPath::Relay
     };
     settle(|| tcp.path_to(c.router().local_id()) == Some(expected)).await?;
-    a.router().add_link(tcp.clone().into_bound_link(1)).await?;
+    a.router()
+        .add_link(tcp.clone().into_bound_link(NonZeroU32::MIN))
+        .await?;
     let direct = [NodeId::new("memory-a"), NodeId::new("remote-c")];
     settle(|| {
         a.router()

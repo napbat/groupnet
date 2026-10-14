@@ -7,12 +7,15 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet::core::NodeId;
 use groupnet::runtime::{Group, Node};
-use groupnet::transport::admission::{AcceptedPeer, Admission, JoinRequest, OpenAdmission};
+use groupnet::transport::admission::{
+    AcceptedPeer, Admission, AdmissionError, JoinRequest, OpenAdmission,
+};
 use groupnet::transport::link::{LinkFuture, PeerEndpoint};
 use groupnet::transport::tcp::{TcpAdmission, TcpLink, TcpMsgConfig, TcpMsgTransport};
 
@@ -20,13 +23,15 @@ use groupnet::transport::tcp::{TcpAdmission, TcpLink, TcpMsgConfig, TcpMsgTransp
 struct Invitation;
 
 impl Admission for Invitation {
-    fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
         Box::pin(async move {
             if request.credential != b"example-invite" {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "invalid invitation",
-                ));
+                return Err(AdmissionError::CredentialRejected {
+                    claimed: request.claimed.clone(),
+                });
             }
             Ok(AcceptedPeer::new(request.claimed.clone()))
         })
@@ -93,7 +98,7 @@ async fn main() -> io::Result<()> {
     .await?;
     let address = transport.local_addr();
     let server = Node::builder(server_id.clone())
-        .link(transport.into_bound_link(1))
+        .link(transport.into_bound_link(NonZeroU32::MIN))
         .gossip_interval_ms(50)
         .start()
         .await?;

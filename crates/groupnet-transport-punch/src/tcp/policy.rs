@@ -1,12 +1,8 @@
 //! TCP rendezvous configuration, operational limits and the independent control budget.
 
 use crate::common::{PeerListFault, check_peers};
-use crate::{NetworkKey, RelayPacing};
-use groupnet_core::NodeId;
-use groupnet_transport::{
-    NodeIdError, QueueCapacity,
-    admission::{Admission, OpenAdmission},
-};
+use crate::{NetworkKey, PeerPolicy, RelayPacing};
+use groupnet_transport::{NodeIdError, QueueCapacity, admission::Admission};
 use std::{error, fmt, io, net::SocketAddr, num::NonZeroU32, sync::Arc};
 
 /// Rate and finite burst allowance for one admitted control connection.
@@ -74,20 +70,25 @@ impl TcpRendezvousLimits {
 }
 
 /// Listener, fabric authentication, application admission, and TCP rendezvous limits.
+///
+/// [`new`](Self::new) takes exactly the security inputs — the optional fabric
+/// key, the peer policy and the application admission policy — with the bind
+/// address; limits and relay pacing are defaultable policy.
 #[derive(Clone)]
 pub struct TcpRendezvousConfig {
     /// TCP listener bind address (multicast is rejected).
     pub bind: SocketAddr,
     /// Optional trusted-fabric key; keyed traffic never downgrades.
     pub key: Option<NetworkKey>,
-    /// Fixed identity allowlist, or `None` for dynamic application admission.
-    pub peers: Option<Vec<NodeId>>,
+    /// A fixed identity allowlist, or dynamic application admission.
+    pub peers: PeerPolicy,
     /// Application admission policy for every registration.
     pub admission: Arc<dyn Admission>,
     /// Operational capacities and the independent control budget.
+    /// Default: [`TcpRendezvousLimits::default`].
     pub limits: TcpRendezvousLimits,
     /// Optional byte-based policy for valid, admitted relay data. A paced TCP
-    /// source is delayed, never dropped.
+    /// source is delayed, never dropped. Default: [`RelayPacing::Backpressure`].
     pub relay_pacing: RelayPacing,
 }
 
@@ -106,34 +107,21 @@ impl fmt::Debug for TcpRendezvousConfig {
 }
 
 impl TcpRendezvousConfig {
-    /// Creates keyed rendezvous configuration with a fixed identity allowlist
-    /// and open application admission.
+    /// Configures a rendezvous from its security inputs with default limits
+    /// and relay pacing. Keyed traffic never downgrades; `OpenAdmission` is
+    /// the explicit choice to accept every claimed identity, which proves no
+    /// identity ownership.
     #[must_use]
-    pub fn new(bind: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> Self {
-        Self {
-            peers: Some(peers),
-            ..Self::with_admission(bind, Some(key), Arc::new(OpenAdmission))
-        }
-    }
-
-    /// Creates explicitly keyless dynamic discovery with open application admission.
-    /// Open admission proves no identity ownership.
-    #[must_use]
-    pub fn open(bind: SocketAddr) -> Self {
-        Self::with_admission(bind, None, Arc::new(OpenAdmission))
-    }
-
-    /// Creates application-controlled admission with optional strict fabric authentication.
-    #[must_use]
-    pub fn with_admission(
+    pub fn new(
         bind: SocketAddr,
         key: Option<NetworkKey>,
+        peers: PeerPolicy,
         admission: Arc<dyn Admission>,
     ) -> Self {
         Self {
             bind,
             key,
-            peers: None,
+            peers,
             admission,
             limits: TcpRendezvousLimits::default(),
             relay_pacing: RelayPacing::Backpressure,
@@ -150,16 +138,12 @@ impl TcpRendezvousConfig {
         if self.bind.ip().is_multicast() {
             return Err(TcpRendezvousConfigError::MulticastBind);
         }
-        if let Some(peers) = &self.peers {
-            check_peers(peers).map_err(|fault| match fault {
-                PeerListFault::Invalid { index, error } => {
-                    TcpRendezvousConfigError::Peer { index, error }
-                }
-                PeerListFault::Duplicate { index } => {
-                    TcpRendezvousConfigError::DuplicatePeer { index }
-                }
-            })?;
-        }
+        check_peers(self.peers.static_peers()).map_err(|fault| match fault {
+            PeerListFault::Invalid { index, error } => {
+                TcpRendezvousConfigError::Peer { index, error }
+            }
+            PeerListFault::Duplicate { index } => TcpRendezvousConfigError::DuplicatePeer { index },
+        })?;
         Ok(())
     }
 }
@@ -172,14 +156,14 @@ pub enum TcpRendezvousConfigError {
     ControlQueueBelowMaxSessions,
     /// `bind` is a multicast address.
     MulticastBind,
-    /// `peers[index]` is not a valid native identity.
+    /// Static `peers[index]` is not a valid native identity.
     Peer {
         /// Position of the rejected entry.
         index: usize,
         /// Why the identity was rejected.
         error: NodeIdError,
     },
-    /// `peers[index]` repeats an earlier entry.
+    /// Static `peers[index]` repeats an earlier entry.
     DuplicatePeer {
         /// Position of the repeated entry.
         index: usize,
@@ -201,7 +185,14 @@ impl fmt::Display for TcpRendezvousConfigError {
     }
 }
 
-impl error::Error for TcpRendezvousConfigError {}
+impl error::Error for TcpRendezvousConfigError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Peer { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<TcpRendezvousConfigError> for io::Error {
     fn from(error: TcpRendezvousConfigError) -> Self {
@@ -213,8 +204,24 @@ impl From<TcpRendezvousConfigError> for io::Error {
 mod tests {
     use super::*;
     use crate::pacing::Budget;
+    use groupnet_core::NodeId;
+    use groupnet_transport::admission::OpenAdmission;
+    use std::error::Error as _;
     use std::time::Duration;
     use tokio::time::Instant;
+
+    fn open(bind: SocketAddr) -> TcpRendezvousConfig {
+        TcpRendezvousConfig::new(bind, None, PeerPolicy::Dynamic, Arc::new(OpenAdmission))
+    }
+
+    fn keyed(bind: SocketAddr, peers: Vec<NodeId>) -> TcpRendezvousConfig {
+        TcpRendezvousConfig::new(
+            bind,
+            Some(NetworkKey::from_bytes([1; 32])),
+            PeerPolicy::Static(peers),
+            Arc::new(OpenAdmission),
+        )
+    }
 
     #[test]
     fn independent_control_budget_does_not_throttle_relay_packets() {
@@ -227,7 +234,7 @@ mod tests {
             start + Duration::from_millis(500)
         );
         assert!(matches!(
-            TcpRendezvousConfig::open(([127, 0, 0, 1], 0).into()).relay_pacing,
+            open(([127, 0, 0, 1], 0).into()).relay_pacing,
             RelayPacing::Backpressure
         ));
     }
@@ -248,7 +255,7 @@ mod tests {
             limits.validate(),
             Err(TcpRendezvousConfigError::ControlQueueBelowMaxSessions)
         );
-        let mut config = TcpRendezvousConfig::open(([127, 0, 0, 1], 0).into());
+        let mut config = open(([127, 0, 0, 1], 0).into());
         config.limits = limits;
         assert_eq!(
             config.validate(),
@@ -264,30 +271,56 @@ mod tests {
     #[test]
     fn bind_and_allowlist_rules_name_their_field() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
-        let key = NetworkKey::from_bytes([1; 32]);
         assert_eq!(
-            TcpRendezvousConfig::open(([224, 0, 0, 1], 0).into()).validate(),
+            open(([224, 0, 0, 1], 0).into()).validate(),
             Err(TcpRendezvousConfigError::MulticastBind)
         );
         assert_eq!(
-            TcpRendezvousConfig::new(bind, key.clone(), vec!["a".into(), "a".into()]).validate(),
+            keyed(bind, vec!["a".into(), "a".into()]).validate(),
             Err(TcpRendezvousConfigError::DuplicatePeer { index: 1 })
         );
         assert_eq!(
-            TcpRendezvousConfig::new(bind, key.clone(), vec!["x".repeat(65).into()]).validate(),
+            keyed(bind, vec!["x".repeat(65).into()]).validate(),
             Err(TcpRendezvousConfigError::Peer {
                 index: 0,
                 error: NodeIdError::TooLong { len: 65, max: 64 }
             })
         );
-        TcpRendezvousConfig::new(bind, key, vec!["a".into(), "b".into()])
+        keyed(bind, vec!["a".into(), "b".into()])
             .validate()
             .unwrap();
     }
 
+    #[test]
+    fn dynamic_policy_skips_the_static_list_checks() {
+        let mut config = keyed(([127, 0, 0, 1], 0).into(), vec!["a".into(), "a".into()]);
+        assert_eq!(
+            config.validate(),
+            Err(TcpRendezvousConfigError::DuplicatePeer { index: 1 })
+        );
+        config.peers = PeerPolicy::Dynamic;
+        assert_eq!(config.peers.static_peers(), &[] as &[NodeId]);
+        config.validate().unwrap();
+        open(([127, 0, 0, 1], 0).into()).validate().unwrap();
+    }
+
+    #[test]
+    fn source_is_the_wrapped_identity_error() {
+        let peer = TcpRendezvousConfigError::Peer {
+            index: 0,
+            error: NodeIdError::Empty,
+        };
+        assert_eq!(
+            peer.source()
+                .and_then(|source| source.downcast_ref::<NodeIdError>()),
+            Some(&NodeIdError::Empty)
+        );
+        assert!(TcpRendezvousConfigError::MulticastBind.source().is_none());
+    }
+
     #[tokio::test]
     async fn bind_surfaces_the_typed_error_as_invalid_input() {
-        let mut config = TcpRendezvousConfig::open(([127, 0, 0, 1], 0).into());
+        let mut config = open(([127, 0, 0, 1], 0).into());
         config.limits.control_queue = QueueCapacity::of(1);
         let error = crate::TcpRendezvous::bind(config).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use groupnet_transport::Transport;
-use groupnet_transport::admission::{AcceptedPeer, OpenAdmission};
+use groupnet_transport::admission::{AcceptedPeer, AdmissionError, OpenAdmission};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
@@ -51,7 +51,9 @@ pub(super) async fn receive(endpoint: &TcpMsgTransport) -> groupnet_transport::I
 }
 
 pub(super) fn connect(client: &TcpMsgTransport, server: &TcpMsgTransport) {
-    client.register_peer(server.local_id().clone(), server.local_addr());
+    client
+        .register_peer(server.local_id().clone(), server.local_addr())
+        .unwrap();
     client
         .connect_peer(server.local_id())
         .expect("connect bootstrap");
@@ -120,14 +122,20 @@ struct Accounts {
 }
 
 impl Admission for Accounts {
-    fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
         Box::pin(async move {
             self.called.fetch_add(1, Ordering::SeqCst);
             assert!(request.remote.is_some());
-            if request.claimed.as_str() == "account:alice" && request.credential == b"alice-token" {
-                Ok(AcceptedPeer::new(request.claimed.clone()))
+            let claimed = request.claimed.clone();
+            if request.claimed.as_str() != "account:alice" {
+                Err(AdmissionError::UnknownPeer { claimed })
+            } else if request.credential == b"alice-token" {
+                Ok(AcceptedPeer::new(claimed))
             } else {
-                Err(denied())
+                Err(AdmissionError::CredentialRejected { claimed })
             }
         })
     }
@@ -212,8 +220,10 @@ async fn duplicate_identity_cannot_evict_incumbent_and_clean_reconnect_works() {
 async fn simultaneous_dials_converge_to_one_full_duplex_session() {
     let a = endpoint("a", Arc::new(OpenAdmission), &[]).await;
     let b = endpoint("b", Arc::new(OpenAdmission), &[]).await;
-    a.register_peer(b.local_id().clone(), b.local_addr());
-    b.register_peer(a.local_id().clone(), a.local_addr());
+    a.register_peer(b.local_id().clone(), b.local_addr())
+        .unwrap();
+    b.register_peer(a.local_id().clone(), a.local_addr())
+        .unwrap();
     // Both provisional queues exist before any task can execute the handshake.
     a.connect_peer(b.local_id()).expect("a dial");
     b.connect_peer(a.local_id()).expect("b dial");
@@ -266,7 +276,10 @@ struct Stall {
 }
 
 impl Admission for Stall {
-    fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if request.claimed.as_str() == "stall" {
@@ -386,7 +399,10 @@ async fn oversized_wire_credentials_are_rejected_before_policy_and_capacity_hold
 struct Rename;
 
 impl Admission for Rename {
-    fn admit<'a>(&'a self, _request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+    fn admit<'a>(
+        &'a self,
+        _request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
         Box::pin(async { Ok(AcceptedPeer::new(NodeId::new("renamed"))) })
     }
 }
@@ -510,10 +526,12 @@ async fn client_rejects_server_reassigning_its_local_identity() {
         .await
         .expect("listener");
     let client = endpoint("client", Arc::new(OpenAdmission), &[]).await;
-    client.register_peer(
-        NodeId::new("server"),
-        listener.local_addr().expect("address"),
-    );
+    client
+        .register_peer(
+            NodeId::new("server"),
+            listener.local_addr().expect("address"),
+        )
+        .unwrap();
     let malicious = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept");
         let hello = read_hello(&mut socket).await.expect("claim");
@@ -689,7 +707,7 @@ async fn admitted_reader_applies_configured_frame_cap() {
         NodeId::new("capped-server"),
         "127.0.0.1:0",
         TcpMsgConfig {
-            max_frame_bytes: 4,
+            max_frame_bytes: std::num::NonZeroUsize::new(4).unwrap(),
             ..TcpMsgConfig::default()
         },
         TcpAdmission::new(Arc::new(OpenAdmission)),

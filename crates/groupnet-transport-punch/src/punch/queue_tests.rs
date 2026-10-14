@@ -1,6 +1,7 @@
 //! Owned payload, queue backpressure, and operational configuration regressions.
 
 use super::*;
+use crate::PeerPolicy;
 use groupnet_transport::admission::AcceptedPeer;
 
 fn connection() -> (UdpConnection, mpsc::Receiver<Outbound>) {
@@ -149,14 +150,14 @@ async fn owned_admitted_send_drops_replaced_generation() {
 #[tokio::test]
 async fn bind_addresses_stay_cached_after_shutdown() {
     let address = SocketAddr::from(([127, 0, 0, 1], 1234));
-    let defaults = UdpPunchConfig::open("local".into(), address);
+    let defaults = UdpPunchConfig::new("local".into(), address, None, PeerPolicy::Dynamic);
     assert_eq!(defaults.max_peers, DEFAULT_MAX_PEERS);
     assert_eq!(defaults.queue_capacity, DEFAULT_QUEUE_CAPACITY);
     let mut config = UdpPunchConfig::new(
         "local".into(),
         address,
-        NetworkKey::from_bytes([1; 32]),
-        Vec::new(),
+        Some(NetworkKey::from_bytes([1; 32])),
+        PeerPolicy::Static(Vec::new()),
     );
     config.bind = SocketAddr::from(([127, 0, 0, 1], 0));
     config.candidate_binds = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
@@ -184,8 +185,8 @@ async fn configured_capacities_apply_to_both_queues_and_admission_registry() {
     let mut config = UdpPunchConfig::new(
         "local".into(),
         address,
-        NetworkKey::from_bytes([1; 32]),
-        Vec::new(),
+        Some(NetworkKey::from_bytes([1; 32])),
+        PeerPolicy::Static(Vec::new()),
     );
     config.bind = SocketAddr::from(([127, 0, 0, 1], 0));
     config.gather_interfaces = false;

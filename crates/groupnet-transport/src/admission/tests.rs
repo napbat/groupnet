@@ -23,24 +23,66 @@ fn open_is_explicit_and_checks_identity_and_credential_bounds() {
     let error =
         futures::executor::block_on(policy.admit(JoinRequest::new(&node, &credential, None)))
             .unwrap_err();
+    assert!(matches!(
+        error,
+        AdmissionError::Request(JoinRequestError::CredentialTooLong { len })
+            if len == MAX_CREDENTIAL_BYTES + 1
+    ));
+    let error = io::Error::from(error);
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    assert_eq!(
-        typed::<JoinRequestError>(&error),
-        &JoinRequestError::CredentialTooLong {
-            len: MAX_CREDENTIAL_BYTES + 1
-        }
-    );
+    assert!(matches!(
+        typed::<AdmissionError>(&error),
+        AdmissionError::Request(JoinRequestError::CredentialTooLong { .. })
+    ));
     let error =
         futures::executor::block_on(policy.admit(JoinRequest::new(&NodeId::new(""), &[], None)))
             .unwrap_err();
-    assert_eq!(
-        typed::<JoinRequestError>(&error),
-        &JoinRequestError::Claimed(NodeIdError::Empty)
-    );
+    assert!(matches!(
+        error,
+        AdmissionError::Request(JoinRequestError::Claimed(NodeIdError::Empty))
+    ));
     assert!(
         !format!("{:?}", JoinRequest::new(&node, b"private-credential", None))
             .contains("private-credential")
     );
+}
+
+#[test]
+fn admission_errors_keep_their_cause_and_map_to_socket_kinds() {
+    let claimed = NodeId::new("claimed");
+    let request = AdmissionError::from(JoinRequestError::Claimed(NodeIdError::Empty));
+    assert!(
+        error::Error::source(&request)
+            .and_then(|source| source.downcast_ref::<JoinRequestError>())
+            .is_some()
+    );
+    assert_eq!(io::Error::from(request).kind(), io::ErrorKind::InvalidInput);
+    for denial in [
+        AdmissionError::UnknownPeer {
+            claimed: claimed.clone(),
+        },
+        AdmissionError::CredentialRejected {
+            claimed: claimed.clone(),
+        },
+    ] {
+        assert!(denial.to_string().contains("claimed"));
+        assert!(error::Error::source(&denial).is_none());
+        let denial = io::Error::from(denial);
+        assert_eq!(denial.kind(), io::ErrorKind::PermissionDenied);
+        typed::<AdmissionError>(&denial);
+    }
+    let unavailable = AdmissionError::from(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "account store timed out",
+    ));
+    assert!(
+        error::Error::source(&unavailable)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .is_some_and(|cause| cause.kind() == io::ErrorKind::TimedOut)
+    );
+    assert_eq!(io::Error::from(unavailable).kind(), io::ErrorKind::TimedOut);
+    let other = AdmissionError::Unavailable("lookup failed".into());
+    assert_eq!(io::Error::from(other).kind(), io::ErrorKind::Other);
 }
 
 #[test]

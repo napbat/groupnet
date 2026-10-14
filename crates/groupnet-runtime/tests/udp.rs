@@ -35,7 +35,7 @@ async fn three_nodes_converge_over_udp() {
     for (i, t) in transports.iter().enumerate() {
         for (j, id) in ids.iter().enumerate() {
             if i != j {
-                t.register_peer(id.clone(), addrs[j]);
+                t.register_peer(id.clone(), addrs[j]).unwrap();
             }
         }
     }

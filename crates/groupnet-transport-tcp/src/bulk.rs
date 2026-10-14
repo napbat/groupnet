@@ -24,8 +24,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_transport::QueueCapacity;
 use groupnet_transport::bulk::BulkTransport;
+use groupnet_transport::{MAX_NODE_ID_BYTES, NodeIdError, QueueCapacity, validate_node_id};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs, lookup_host};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
@@ -180,13 +180,18 @@ impl TcpBulkTransport {
     /// [`accept`](BulkTransport::accept) never completes. A client process
     /// uses it to call servers (for example a `groupnet-rpc` server, which
     /// answers on the stream the client opened) without a listening port.
-    #[must_use]
-    pub fn dial_only(local: NodeId) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// Returns the [`NodeIdError`] for a `local` id that is empty or longer
+    /// than [`MAX_NODE_ID_BYTES`], before any endpoint exists, so a dial
+    /// never opens a socket for an identity its handshake would refuse.
+    pub fn dial_only(local: NodeId) -> Result<Self, NodeIdError> {
+        validate_node_id(&local, MAX_NODE_ID_BYTES)?;
+        Ok(Self {
             local,
             listener: None,
             peers: RwLock::new(HashMap::new()),
-        }
+        })
     }
 
     /// This endpoint's local node id.

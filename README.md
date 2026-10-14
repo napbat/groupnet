@@ -729,35 +729,43 @@ access-control policy for peers or groups.
 Plain TCP/UDP does not provide endpoint authentication or encryption. Static
 links assume trusted peers; explicitly open admission accepts untrusted identity
 claims and does not make their routing advertisements trustworthy.
-Keyed `UdpPunchConfig::new(local, rendezvous, key, peers)` supplies a self-hosted
+Keyed `UdpPunchConfig::new(local, rendezvous, Some(key), PeerPolicy::Static(peers))` supplies a self-hosted
 rendezvous address, provisioned `NetworkKey`, explicit peers, and `PathPolicy`.
 Direct-preferred mode probes peers simultaneously; relay-only mode never sends
 direct probes. Not every NAT supports direct connectivity.
 
 For dynamic keyless discovery, host
-`UdpRendezvous::bind(UdpRendezvousConfig::open(address))` and give each node
-`UdpLink::connectivity(UdpPunchConfig::open(local_id, rendezvous_address))`.
+`UdpRendezvous::bind(UdpRendezvousConfig::new(address, None, PeerPolicy::Dynamic, Arc::new(OpenAdmission)))`
+and give each node
+`UdpLink::connectivity(UdpPunchConfig::new(local_id, rendezvous_address, None, PeerPolicy::Dynamic))`.
 No participant list, public/private key pair, or pre-shared transport key is
 required. Here **keyless** means `UdpPunchConfig.key == None`, not an absence of
-application admission or all cryptography. `UdpPunchConfig::open` conservatively
+application admission or all cryptography. A keyless `UdpPunchConfig` conservatively
 defaults to `RelayOnly`; select direct punching explicitly:
 
 ```rust
 use groupnet::connectivity::{
-    PathPolicy, UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
+    PathPolicy, PeerPolicy, UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
 };
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
+use groupnet::transport::admission::OpenAdmission;
 use groupnet::transport::udp::UdpLink;
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, sync::Arc};
 
 /// The self-hosted rendezvous: open admission, no fabric key.
 async fn host_rendezvous(bind: SocketAddr) -> io::Result<UdpRendezvous> {
-    UdpRendezvous::bind(UdpRendezvousConfig::open(bind)).await
+    UdpRendezvous::bind(UdpRendezvousConfig::new(
+        bind,
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    ))
+    .await
 }
 
 async fn join_through(rendezvous: SocketAddr, local_id: NodeId) -> io::Result<Node> {
-    let mut config = UdpPunchConfig::open(local_id.clone(), rendezvous);
+    let mut config = UdpPunchConfig::new(local_id.clone(), rendezvous, None, PeerPolicy::Dynamic);
     config.policy = PathPolicy::DirectPreferred;
     Node::builder(local_id)
         .link(UdpLink::connectivity(config))
@@ -770,8 +778,8 @@ Admission, transport authentication, and path policy are independent choices:
 
 | Choice | Configuration |
 |---|---|
-| Accept a claimed `NodeId` without ownership proof | Explicit `OpenAdmission` / `UdpRendezvousConfig::open` (or `TcpRendezvousConfig::open`) |
-| Apply application-defined admission rules | `UdpRendezvousConfig::with_admission(bind, key, policy)` (likewise for TCP); supply credentials through `UdpPunchConfig::dynamic` / `TcpPunchConfig::dynamic` |
+| Accept a claimed `NodeId` without ownership proof | Explicit `OpenAdmission` as the rendezvous `admission` (`UdpRendezvousConfig::new(bind, None, PeerPolicy::Dynamic, Arc::new(OpenAdmission))`, likewise `TcpRendezvousConfig`) |
+| Apply application-defined admission rules | `UdpRendezvousConfig::new(bind, key, PeerPolicy::Dynamic, policy)` (likewise for TCP); supply credentials through the `credential` field of a `PeerPolicy::Dynamic` `UdpPunchConfig` / `TcpPunchConfig` |
 | Authenticate datagrams as members of a trusted fabric | Configure the same `NetworkKey`; keyed endpoints never downgrade |
 | Prefer verified direct UDP, falling back to relay | `PathPolicy::DirectPreferred`, with or without a configured key |
 | Use relay only; do not exchange peer socket addresses or send direct probes | `PathPolicy::RelayOnly`; applies to a pair if either endpoint selects it |
@@ -805,9 +813,9 @@ bindings. It is not a transport or a separately registered router link.
 | TCP | `TcpPunchConfig` / `TcpLink::connectivity(config)` | `TcpRendezvous::bind(TcpRendezvousConfig)` |
 
 Each rendezvous has one binder taking its full endpoint configuration — `bind`,
-an optional fabric `key`, an optional fixed `peers` allowlist, the `admission`
-policy, `limits` and `relay_pacing` — built with `new(bind, key, peers)`,
-`open(bind)` or `with_admission(bind, key, policy)`. Every punch and rendezvous
+an optional fabric `key`, a `PeerPolicy` (`Static` allowlist or `Dynamic`), the
+`admission` policy, `limits` and `relay_pacing` — built with
+`new(bind, key, peers, admission)`. Every punch and rendezvous
 configuration has a `validate()` returning a typed error (`UdpPunchConfigError`,
 `TcpRendezvousConfigError`, …), checked again by `bind`; `max_peers` is a
 `NonZeroUsize`. The TCP and UDP adapter crates re-export the configuration and
@@ -855,7 +863,7 @@ retains TCP relay operation. This is native TCP, not HTTPS proxy traversal or a
 TLS-wrapped control protocol.
 
 ```rust
-use groupnet::connectivity::{PathPolicy, TcpPunchConfig};
+use groupnet::connectivity::{PathPolicy, PeerPolicy, TcpPunchConfig};
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
 use groupnet::transport::tcp::TcpLink;
@@ -865,7 +873,8 @@ async fn join_over_tcp(
     local_id: NodeId,
     tcp_rendezvous: SocketAddr,
 ) -> Result<Node, Box<dyn std::error::Error>> {
-    let mut config = TcpPunchConfig::open(local_id.clone(), tcp_rendezvous);
+    let mut config =
+        TcpPunchConfig::new(local_id.clone(), tcp_rendezvous, None, PeerPolicy::Dynamic);
     config.policy = PathPolicy::DirectPreferred;
     config.candidate_binds.push("[::]:0".parse()?);
     let node = Node::builder(local_id)

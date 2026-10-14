@@ -1,14 +1,15 @@
 //! Connectivity feeds protocol links; routing preserves heterogeneous transit and failover.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use groupnet_core::NodeId;
 use groupnet_network::{Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
+use groupnet_transport::admission::OpenAdmission;
 use groupnet_transport::link::LinkProvider;
 use groupnet_transport_mem::Network;
-use groupnet_transport_punch::{TcpRendezvous, TcpRendezvousConfig};
+use groupnet_transport_punch::{PeerPolicy, TcpRendezvous, TcpRendezvousConfig};
 use groupnet_transport_tcp::{PathPolicy, PeerPath, TcpLink, TcpMsgTransport, TcpPunchConfig};
 
 const WAIT: Duration = Duration::from_secs(15);
@@ -26,7 +27,7 @@ fn router(id: &str) -> Router {
 }
 
 fn config(id: &str, address: SocketAddr, policy: PathPolicy) -> TcpPunchConfig {
-    let mut config = TcpPunchConfig::open(NodeId::new(id), address);
+    let mut config = TcpPunchConfig::new(NodeId::new(id), address, None, PeerPolicy::Dynamic);
     config.bind = "127.0.0.1:0".parse().unwrap();
     config.policy = policy;
     config.candidate_binds.push(config.bind);
@@ -46,9 +47,14 @@ async fn exchange(a: &Router, c: &Router, payload: &[u8]) {
 }
 
 async fn topology(policy: PathPolicy) -> (TcpRendezvous, Router, Router, Router) {
-    let relay = TcpRendezvous::bind(TcpRendezvousConfig::open("127.0.0.1:0".parse().unwrap()))
-        .await
-        .unwrap();
+    let relay = TcpRendezvous::bind(TcpRendezvousConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    ))
+    .await
+    .unwrap();
     let address = relay.local_addr();
     let (a, b, c) = (router("a"), router("b"), router("c"));
     let memory = Network::new();
@@ -138,7 +144,9 @@ async fn compatible_connectivity_promotes_direct_route_and_loss_restores_bridge(
         || a_tcp.path_to(c.local_id()) == Some(PeerPath::Direct),
     )
     .await;
-    a.add_link(a_tcp.clone().into_bound_link(1)).await.unwrap();
+    a.add_link(a_tcp.clone().into_bound_link(NonZeroU32::MIN))
+        .await
+        .unwrap();
     eventually_within("router prefers compatible one-hop route", WAIT, || {
         a.route_to(c.local_id())
             .is_some_and(|route| route.path == [a.local_id().clone(), c.local_id().clone()])

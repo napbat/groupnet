@@ -10,15 +10,22 @@ use groupnet_transport::{NodeIdError, QueueCapacity, validate_node_id};
 
 use super::candidates::{self, MAX_CANDIDATES, MAX_SOCKETS};
 use super::{DEFAULT_MAX_PEERS, DEFAULT_QUEUE_CAPACITY, NetworkKey, PathPolicy};
+use crate::PeerPolicy;
 use crate::common::{MAX_IDENTITY_BYTES, PeerListFault, check_peers, wildcard_for};
 
 /// Socket, trusted identities and rendezvous policy for one UDP endpoint.
+///
+/// [`new`](Self::new) takes exactly the identity and security inputs — the
+/// local identity, the rendezvous, the optional fabric key and the peer
+/// policy; every other field is operational policy with a documented default
+/// that callers refine with struct-update syntax.
 #[derive(Clone)]
 pub struct UdpPunchConfig {
     /// Stable routing identity (1–64 UTF-8 bytes).
     pub local: NodeId,
     /// Primary UDP bind address; its family must match the rendezvous.
     /// This socket owns the observed mapping and remains the relay/control path.
+    /// Default: the ephemeral wildcard of the rendezvous address family.
     pub bind: SocketAddr,
     /// Explicit rendezvous address; no third-party discovery service is used.
     pub rendezvous: SocketAddr,
@@ -26,56 +33,46 @@ pub struct UdpPunchConfig {
     /// `None` requires no provisioned transport key or identity keypair, but does
     /// not disable internal random challenges or application admission credentials.
     pub key: Option<NetworkKey>,
-    /// Initial static allowlist, or no fixed identities in dynamic mode.
-    pub peers: Vec<NodeId>,
-    /// Whether admitted rendezvous peers are discovered dynamically.
-    pub dynamic: bool,
+    /// A static allowlist, or dynamic discovery of rendezvous-admitted peers.
+    pub peers: PeerPolicy,
     /// Opaque application admission credential (at most
-    /// [`MAX_CREDENTIAL_BYTES`] bytes).
+    /// [`MAX_CREDENTIAL_BYTES`] bytes). Default: empty.
     pub credential: Vec<u8>,
-    /// Direct-path preference or relay-only operation.
+    /// Direct-path preference or relay-only operation. Default:
+    /// [`PathPolicy::DirectPreferred`] when keyed, conservatively
+    /// [`PathPolicy::RelayOnly`] when keyless; a keyless endpoint may enable
+    /// direct paths explicitly.
     pub policy: PathPolicy,
     /// Additional direct-path sockets (at most three), including another IP family.
     /// Their lifetimes are owned by this endpoint; the primary `bind` owns relay registration.
+    /// Default: none.
     pub candidate_binds: Vec<SocketAddr>,
     /// Operator-supplied direct addresses (at most eight), checked independently.
-    /// Addresses are untrusted hints, never proof of a usable path.
+    /// Addresses are untrusted hints, never proof of a usable path. Default: none.
     pub advertised_candidates: Vec<SocketAddr>,
     /// Gather usable local interface addresses for wildcard-bound sockets.
     /// Link-local addresses are excluded because remote scope identifiers are not portable.
+    /// Default: `true`.
     pub gather_interfaces: bool,
     /// Maximum live admitted peers retained by this endpoint.
     /// This operational limit does not change candidate or wire-format bounds.
+    /// Default: 128.
     pub max_peers: NonZeroUsize,
     /// Packet capacity of each incoming and outgoing queue.
-    /// Full queues drop best-effort packets without blocking.
+    /// Full queues drop best-effort packets without blocking. Default: 128.
     pub queue_capacity: QueueCapacity,
 }
 
 impl UdpPunchConfig {
-    /// Creates a direct-preferred configuration with an ephemeral wildcard bind.
+    /// Configures an endpoint from its identity and security inputs, with an
+    /// ephemeral wildcard bind, no candidates beyond gathered interfaces, an
+    /// empty credential and the key-dependent default [`PathPolicy`].
     #[must_use]
-    pub fn new(local: NodeId, rendezvous: SocketAddr, key: NetworkKey, peers: Vec<NodeId>) -> Self {
-        let mut config = Self::dynamic(local, rendezvous, Some(key), Vec::new());
-        config.peers = peers;
-        config.dynamic = false;
-        config
-    }
-
-    /// Creates explicit keyless dynamic discovery, conservatively defaulting to relay-only.
-    #[must_use]
-    pub fn open(local: NodeId, rendezvous: SocketAddr) -> Self {
-        Self::dynamic(local, rendezvous, None, Vec::new())
-    }
-
-    /// Creates dynamic discovery with an optional fabric key and opaque credential.
-    /// Keyless configurations default to relay-only; policy may explicitly enable direct paths.
-    #[must_use]
-    pub fn dynamic(
+    pub fn new(
         local: NodeId,
         rendezvous: SocketAddr,
         key: Option<NetworkKey>,
-        credential: Vec<u8>,
+        peers: PeerPolicy,
     ) -> Self {
         Self {
             local,
@@ -87,9 +84,8 @@ impl UdpPunchConfig {
                 PathPolicy::RelayOnly
             },
             key,
-            peers: Vec::new(),
-            dynamic: true,
-            credential,
+            peers,
+            credential: Vec::new(),
             candidate_binds: Vec::new(),
             advertised_candidates: Vec::new(),
             gather_interfaces: true,
@@ -105,17 +101,18 @@ impl UdpPunchConfig {
     /// Returns the first violated rule, naming its field.
     pub fn validate(&self) -> Result<(), UdpPunchConfigError> {
         validate_node_id(&self.local, MAX_IDENTITY_BYTES).map_err(UdpPunchConfigError::Local)?;
-        if self.peers.len() > self.max_peers.get() {
+        let peers = self.peers.static_peers();
+        if peers.len() > self.max_peers.get() {
             return Err(UdpPunchConfigError::PeersExceedMaxPeers {
-                peers: self.peers.len(),
+                peers: peers.len(),
                 max_peers: self.max_peers,
             });
         }
-        check_peers(&self.peers).map_err(|fault| match fault {
+        check_peers(peers).map_err(|fault| match fault {
             PeerListFault::Invalid { index, error } => UdpPunchConfigError::Peer { index, error },
             PeerListFault::Duplicate { index } => UdpPunchConfigError::DuplicatePeer { index },
         })?;
-        if self.peers.contains(&self.local) {
+        if peers.contains(&self.local) {
             return Err(UdpPunchConfigError::LocalListedAsPeer);
         }
         if self.credential.len() > MAX_CREDENTIAL_BYTES {
@@ -169,7 +166,6 @@ impl fmt::Debug for UdpPunchConfig {
             .field("rendezvous", &self.rendezvous)
             .field("key", &self.key)
             .field("peers", &self.peers)
-            .field("dynamic", &self.dynamic)
             .field("credential", &"[REDACTED]")
             .field("policy", &self.policy)
             .field("candidate_binds", &self.candidate_binds)
@@ -194,26 +190,26 @@ fn bindable(address: SocketAddr) -> bool {
 pub enum UdpPunchConfigError {
     /// `local` is not a valid native identity.
     Local(NodeIdError),
-    /// `peers` lists more identities than `max_peers` admits.
+    /// The static `peers` list holds more identities than `max_peers` admits.
     PeersExceedMaxPeers {
         /// Number of configured peers.
         peers: usize,
         /// The configured peer capacity.
         max_peers: NonZeroUsize,
     },
-    /// `peers[index]` is not a valid native identity.
+    /// Static `peers[index]` is not a valid native identity.
     Peer {
         /// Position of the rejected entry.
         index: usize,
         /// Why the identity was rejected.
         error: NodeIdError,
     },
-    /// `peers[index]` repeats an earlier entry.
+    /// Static `peers[index]` repeats an earlier entry.
     DuplicatePeer {
         /// Position of the repeated entry.
         index: usize,
     },
-    /// `peers` lists the endpoint's own `local` identity.
+    /// The static `peers` list holds the endpoint's own `local` identity.
     LocalListedAsPeer,
     /// `credential` exceeds [`MAX_CREDENTIAL_BYTES`].
     CredentialTooLarge {
@@ -295,7 +291,14 @@ impl fmt::Display for UdpPunchConfigError {
     }
 }
 
-impl error::Error for UdpPunchConfigError {}
+impl error::Error for UdpPunchConfigError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Local(error) | Self::Peer { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<UdpPunchConfigError> for io::Error {
     fn from(error: UdpPunchConfigError) -> Self {

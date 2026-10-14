@@ -296,7 +296,7 @@ Fresh random protocol capabilities remain mandatory internal session mechanics,
 not application-managed identity keys.
 
 Path selection is independent of admission and configured-key authentication.
-`UdpPunchConfig::open` defaults to `RelayOnly`; setting its public `policy` field to
+`UdpPunchConfig::new(local, rendezvous, None, PeerPolicy::Dynamic)` defaults keyless configs to `RelayOnly`; setting its public `policy` field to
 `DirectPreferred` enables punching with relay fallback. A pair stays relay-only
 if either endpoint requests it: neither endpoint is offered the other's socket
 address, and neither sends or accepts direct probes/data for that pair. The
@@ -392,10 +392,10 @@ and burst bytes. Waiting for data capacity or pacing is cancellation-aware.
 Both rendezvous services take one full endpoint configuration through one
 binder: `UdpRendezvous::bind(UdpRendezvousConfig)` and
 `TcpRendezvous::bind(TcpRendezvousConfig)`. Each configuration holds the bind
-address, optional `NetworkKey`, optional fixed allowlist, `Admission` policy,
-protocol-specific limits (`UdpRendezvousLimits`, `TcpRendezvousLimits`) and
-`relay_pacing`, and is built with `new(bind, key, peers)` (keyed allowlist,
-open admission), `open(bind)` or `with_admission(bind, key, admission)`.
+address, optional `NetworkKey`, a `PeerPolicy` (`Static` allowlist or
+`Dynamic`), `Admission` policy, protocol-specific limits (`UdpRendezvousLimits`,
+`TcpRendezvousLimits`) and `relay_pacing`, and is built with
+`new(bind, key, peers, admission)`.
 Endpoint (`UdpPunchConfig`, `TcpPunchConfig`) and rendezvous configurations
 expose `validate()`, returning a typed error enum with one field-named variant
 per rule; every binder runs it first and fails with `InvalidInput` wrapping

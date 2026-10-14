@@ -6,15 +6,16 @@ use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::{
     Transport,
-    admission::{AcceptedPeer, Admission, JoinRequest, OpenAdmission},
+    admission::{AcceptedPeer, Admission, AdmissionError, JoinRequest, OpenAdmission},
     link::{LinkFuture, LinkProvider},
 };
 use groupnet_transport_punch::{MAX_TCP_MESSAGE, TcpRendezvous, TcpRendezvousConfig};
 // Endpoint configuration and path types come only from the adapter's re-exports.
 use groupnet_transport_tcp::{
-    NetworkKey, PathPolicy, PeerPath, TcpLink, TcpMsgTransport, TcpPunchConfig, TcpPunchConfigError,
+    NetworkKey, PathPolicy, PeerPath, PeerPolicy, TcpLink, TcpMsgTransport, TcpPunchConfig,
+    TcpPunchConfigError,
 };
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 
 const SETTLE: Duration = Duration::from_secs(10);
@@ -28,8 +29,12 @@ fn key() -> NetworkKey {
 }
 
 fn config(local: &str, rendezvous: SocketAddr, policy: PathPolicy) -> TcpPunchConfig {
-    let mut config =
-        TcpPunchConfig::dynamic(NodeId::from(local), rendezvous, Some(key()), Vec::new());
+    let mut config = TcpPunchConfig::new(
+        NodeId::from(local),
+        rendezvous,
+        Some(key()),
+        PeerPolicy::Dynamic,
+    );
     config.bind = SocketAddr::new(rendezvous.ip(), 0);
     config.candidate_binds = vec![config.bind];
     config.policy = policy;
@@ -37,18 +42,24 @@ fn config(local: &str, rendezvous: SocketAddr, policy: PathPolicy) -> TcpPunchCo
 }
 
 async fn keyed_relay(bind: SocketAddr, admission: Arc<dyn Admission>) -> io::Result<TcpRendezvous> {
-    TcpRendezvous::bind(TcpRendezvousConfig::with_admission(
+    TcpRendezvous::bind(TcpRendezvousConfig::new(
         bind,
         Some(key()),
+        PeerPolicy::Dynamic,
         admission,
     ))
     .await
 }
 
 async fn open_relay() -> TcpRendezvous {
-    TcpRendezvous::bind(TcpRendezvousConfig::open(loopback()))
-        .await
-        .unwrap()
+    TcpRendezvous::bind(TcpRendezvousConfig::new(
+        loopback(),
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    ))
+    .await
+    .unwrap()
 }
 
 async fn pair(policy: PathPolicy) -> (TcpRendezvous, TcpMsgTransport, TcpMsgTransport) {
@@ -91,12 +102,12 @@ fn adapter_reexports_build_and_validate_a_configuration() {
     let mut config = TcpPunchConfig::new(
         NodeId::from("a"),
         "127.0.0.1:7000".parse().unwrap(),
-        NetworkKey::from_bytes([1; 32]),
-        vec![NodeId::from("b")],
+        Some(NetworkKey::from_bytes([1; 32])),
+        PeerPolicy::Static(vec![NodeId::from("b")]),
     );
     config.policy = PathPolicy::RelayOnly;
     config.validate().unwrap();
-    config.peers.push(NodeId::from("a"));
+    config.peers = PeerPolicy::Static(vec![NodeId::from("b"), NodeId::from("a")]);
     assert_eq!(
         config.validate(),
         Err(TcpPunchConfigError::LocalListedAsPeer)
@@ -151,10 +162,10 @@ async fn direct_candidates_reuse_registration_port_and_preserve_message_boundari
 async fn one_relay_only_peer_forces_relay_without_exposing_candidates() {
     let relay = open_relay().await;
     let address = relay.local_addr();
-    let mut ac = TcpPunchConfig::open("a".into(), address);
+    let mut ac = TcpPunchConfig::new("a".into(), address, None, PeerPolicy::Dynamic);
     ac.bind = loopback();
     ac.policy = PathPolicy::DirectPreferred;
-    let mut bc = TcpPunchConfig::open("b".into(), address);
+    let mut bc = TcpPunchConfig::new("b".into(), address, None, PeerPolicy::Dynamic);
     bc.bind = loopback();
     let a = TcpMsgTransport::bind_connectivity(ac).await.unwrap();
     let b = TcpMsgTransport::bind_connectivity(bc).await.unwrap();
@@ -203,7 +214,7 @@ async fn duplicate_identity_cannot_evict_incumbent_and_shutdown_withdraws_sessio
 #[tokio::test]
 async fn replacement_sessions_fence_queued_frames_and_generation_tagged_sends() {
     let (relay, a, b) = pair(PathPolicy::RelayOnly).await;
-    let bound = b.clone().into_bound_link(1);
+    let bound = b.clone().into_bound_link(NonZeroU32::MIN);
     let registry = bound.sessions.as_ref().unwrap();
     let old = registry
         .subscribe()
@@ -267,13 +278,15 @@ async fn unauthenticated_direct_data_and_idle_accepts_do_not_authorize_messages(
 struct CredentialAdmission;
 
 impl Admission for CredentialAdmission {
-    fn admit<'a>(&'a self, request: JoinRequest<'a>) -> LinkFuture<'a, io::Result<AcceptedPeer>> {
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
         Box::pin(async move {
             if request.credential != b"approved" {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "credential denied",
-                ));
+                return Err(AdmissionError::CredentialRejected {
+                    claimed: request.claimed.clone(),
+                });
             }
             Ok(AcceptedPeer::new(request.claimed.clone()))
         })
@@ -292,9 +305,14 @@ async fn application_admission_and_keyed_mode_fail_closed() {
             .is_err()
     );
     assert!(
-        TcpMsgTransport::bind_connectivity(TcpPunchConfig::open("keyless".into(), address))
-            .await
-            .is_err()
+        TcpMsgTransport::bind_connectivity(TcpPunchConfig::new(
+            "keyless".into(),
+            address,
+            None,
+            PeerPolicy::Dynamic
+        ))
+        .await
+        .is_err()
     );
     let mut ac = config("a", address, PathPolicy::RelayOnly);
     ac.credential = b"approved".to_vec();
@@ -309,9 +327,11 @@ async fn tcp_connectivity_link_rejects_identity_mismatch_before_binding() {
     let relay = open_relay().await;
     let address = relay.local_addr();
     assert!(
-        Box::new(TcpLink::connectivity(TcpPunchConfig::open(
+        Box::new(TcpLink::connectivity(TcpPunchConfig::new(
             "a".into(),
-            address
+            address,
+            None,
+            PeerPolicy::Dynamic
         )))
         .bind("other".into())
         .await
@@ -412,8 +432,12 @@ async fn candidate_scheduling_is_fair_across_more_than_four_peers() {
     let mut peers = Vec::new();
     for index in 0..7 {
         let node = NodeId::from(format!("peer-{index}"));
-        let mut config =
-            TcpPunchConfig::new(node.clone(), address, key(), vec![NodeId::from("hub")]);
+        let mut config = TcpPunchConfig::new(
+            node.clone(),
+            address,
+            Some(key()),
+            PeerPolicy::Static(vec![NodeId::from("hub")]),
+        );
         config.bind = loopback();
         config.candidate_binds = vec![loopback()];
         config.advertised_candidates = vec!["192.0.2.1:59999".parse().unwrap()];
@@ -456,7 +480,7 @@ async fn candidate_scheduling_is_fair_across_more_than_four_peers() {
 async fn unauthenticated_accept_flood_does_not_starve_established_relay_or_heartbeats() {
     let (relay, a, b) = pair(PathPolicy::RelayOnly).await;
     let address = relay.local_addr();
-    let bound = a.clone().into_bound_link(1);
+    let bound = a.clone().into_bound_link(NonZeroU32::MIN);
     let registry = bound.sessions.as_ref().unwrap();
     let generation = registry
         .subscribe()

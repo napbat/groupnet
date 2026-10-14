@@ -1,6 +1,7 @@
 //! Consumer-visible bridging, fragmentation, route failover, and ownership.
 
 use std::io;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -34,20 +35,22 @@ fn connect(
     mtu: usize,
 ) -> io::Result<(TransportId, TransportId)> {
     let net = Network::new();
+    let cost = NonZeroU32::new(cost).expect("nonzero cost");
+    let mtu = NonZeroUsize::new(mtu).expect("nonzero mtu");
     let aid = a.add_transport(
         net.endpoint(a.local_id().clone()),
         LinkConfig {
-            peers: vec![b.local_id().clone()],
             cost,
             mtu,
+            ..LinkConfig::new(vec![b.local_id().clone()])
         },
     )?;
     let bid = b.add_transport(
         net.endpoint(b.local_id().clone()),
         LinkConfig {
-            peers: vec![a.local_id().clone()],
             cost,
             mtu,
+            ..LinkConfig::new(vec![a.local_id().clone()])
         },
     )?;
     Ok((aid, bid))
@@ -208,8 +211,8 @@ async fn ipc_only_peer_reaches_tcp_only_peer_through_a_two_adapter_bridge() -> i
     b.add_transport(ipc_b.clone(), LinkConfig::new(vec![a.local_id().clone()]))?;
     let tcp_b = TcpMsgTransport::bind(b.local_id().clone(), "127.0.0.1:0").await?;
     let tcp_c = TcpMsgTransport::bind(c.local_id().clone(), "127.0.0.1:0").await?;
-    tcp_b.register_peer(c.local_id().clone(), tcp_c.local_addr());
-    tcp_c.register_peer(b.local_id().clone(), tcp_b.local_addr());
+    tcp_b.register_peer(c.local_id().clone(), tcp_c.local_addr())?;
+    tcp_c.register_peer(b.local_id().clone(), tcp_b.local_addr())?;
     b.add_transport(tcp_b, LinkConfig::new(vec![c.local_id().clone()]))?;
     c.add_transport(tcp_c, LinkConfig::new(vec![b.local_id().clone()]))?;
     eventually_within("heterogeneous bidirectional paths", WAIT, || {

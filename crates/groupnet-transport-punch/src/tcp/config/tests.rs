@@ -7,9 +7,16 @@ fn config() -> TcpPunchConfig {
     TcpPunchConfig::new(
         "local".into(),
         SocketAddr::from(([127, 0, 0, 1], 9000)),
-        NetworkKey::from_bytes([1; 32]),
-        vec!["peer".into()],
+        Some(NetworkKey::from_bytes([1; 32])),
+        PeerPolicy::Static(vec!["peer".into()]),
     )
+}
+
+fn push_peer(config: &mut TcpPunchConfig, peer: &str) {
+    let PeerPolicy::Static(peers) = &mut config.peers else {
+        panic!("the fixture uses a static peer list");
+    };
+    peers.push(peer.into());
 }
 
 fn rejected(change: impl FnOnce(&mut TcpPunchConfig)) -> TcpPunchConfigError {
@@ -21,9 +28,23 @@ fn rejected(change: impl FnOnce(&mut TcpPunchConfig)) -> TcpPunchConfigError {
 #[test]
 fn defaults_validate() {
     config().validate().unwrap();
-    TcpPunchConfig::open("local".into(), SocketAddr::from(([127, 0, 0, 1], 9000)))
-        .validate()
-        .unwrap();
+}
+
+#[test]
+fn dynamic_policy_carries_no_static_peers_and_validates() {
+    let config = TcpPunchConfig::new(
+        "local".into(),
+        SocketAddr::from(([127, 0, 0, 1], 9000)),
+        None,
+        PeerPolicy::Dynamic,
+    );
+    assert_eq!(config.peers.static_peers(), &[] as &[NodeId]);
+    config.validate().unwrap();
+    let narrow = TcpPunchConfig {
+        max_peers: NonZeroUsize::MIN,
+        ..config
+    };
+    narrow.validate().unwrap();
 }
 
 #[test]
@@ -37,23 +58,25 @@ fn identity_rules_name_their_field() {
         TcpPunchConfigError::Local(NodeIdError::TooLong { len: 65, max: 64 })
     );
     assert_eq!(
-        rejected(|config| config.peers = vec!["a".into(), "".into()]),
+        rejected(|config| config.peers = PeerPolicy::Static(vec!["a".into(), "".into()])),
         TcpPunchConfigError::Peer {
             index: 1,
             error: NodeIdError::Empty
         }
     );
     assert_eq!(
-        rejected(|config| config.peers = vec!["a".into(), "b".into(), "a".into()]),
+        rejected(
+            |config| config.peers = PeerPolicy::Static(vec!["a".into(), "b".into(), "a".into()])
+        ),
         TcpPunchConfigError::DuplicatePeer { index: 2 }
     );
     assert_eq!(
-        rejected(|config| config.peers.push("local".into())),
+        rejected(|config| push_peer(config, "local")),
         TcpPunchConfigError::LocalListedAsPeer
     );
     assert_eq!(
         rejected(|config| {
-            config.peers.push("other".into());
+            push_peer(config, "other");
             config.max_peers = NonZeroUsize::MIN;
         }),
         TcpPunchConfigError::PeersExceedMaxPeers {
@@ -63,9 +86,11 @@ fn identity_rules_name_their_field() {
     );
     assert_eq!(
         rejected(|config| {
-            config.peers = (0..=MAX_PEERS)
-                .map(|index| NodeId::from(format!("peer-{index}")))
-                .collect();
+            config.peers = PeerPolicy::Static(
+                (0..=MAX_PEERS)
+                    .map(|index| NodeId::from(format!("peer-{index}")))
+                    .collect(),
+            );
             config.max_peers = NonZeroUsize::new(1024).unwrap();
         }),
         TcpPunchConfigError::PeersExceedWireLimit {
@@ -138,10 +163,28 @@ fn display_names_the_field() {
     );
 }
 
+#[test]
+fn source_is_the_wrapped_identity_error() {
+    let local = TcpPunchConfigError::Local(NodeIdError::Empty);
+    assert_eq!(
+        error::Error::source(&local).and_then(|source| source.downcast_ref::<NodeIdError>()),
+        Some(&NodeIdError::Empty)
+    );
+    let peer = TcpPunchConfigError::Peer {
+        index: 0,
+        error: NodeIdError::TooLong { len: 65, max: 64 },
+    };
+    assert_eq!(
+        error::Error::source(&peer).and_then(|source| source.downcast_ref::<NodeIdError>()),
+        Some(&NodeIdError::TooLong { len: 65, max: 64 })
+    );
+    assert!(error::Error::source(&TcpPunchConfigError::InvalidRendezvous).is_none());
+}
+
 #[tokio::test]
 async fn bind_surfaces_the_typed_error_as_invalid_input() {
     let mut config = config();
-    config.peers.push("local".into());
+    push_peer(&mut config, "local");
     let error = TcpConnection::bind(config).await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(

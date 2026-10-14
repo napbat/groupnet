@@ -225,9 +225,12 @@ impl TcpMsgTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TcpRegisterPeerError;
     use groupnet_testkit::cluster::eventually_within;
     use groupnet_transport::Transport;
-    use groupnet_transport_punch::{TcpRendezvous, TcpRendezvousConfig};
+    use groupnet_transport::admission::OpenAdmission;
+    use groupnet_transport_punch::{PeerPolicy, TcpRendezvous, TcpRendezvousConfig};
+    use std::num::NonZeroU32;
     use std::time::Duration;
 
     const SETTLE: Duration = Duration::from_secs(5);
@@ -235,15 +238,20 @@ mod tests {
     #[tokio::test]
     async fn native_hints_cannot_change_paths_and_bound_lifecycle_owns_shared_sessions() {
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let relay = TcpRendezvous::bind(TcpRendezvousConfig::open(loopback))
-            .await
-            .expect("rendezvous");
+        let relay = TcpRendezvous::bind(TcpRendezvousConfig::new(
+            loopback,
+            None,
+            PeerPolicy::Dynamic,
+            Arc::new(OpenAdmission),
+        ))
+        .await
+        .expect("rendezvous");
         let rendezvous = relay.local_addr();
         let a_id = NodeId::new("adapter-a");
         let b_id = NodeId::new("adapter-b");
-        let mut a_config = TcpPunchConfig::open(a_id.clone(), rendezvous);
+        let mut a_config = TcpPunchConfig::new(a_id.clone(), rendezvous, None, PeerPolicy::Dynamic);
         a_config.bind = loopback;
-        let mut b_config = TcpPunchConfig::open(b_id.clone(), rendezvous);
+        let mut b_config = TcpPunchConfig::new(b_id.clone(), rendezvous, None, PeerPolicy::Dynamic);
         b_config.bind = loopback;
         let a = TcpMsgTransport::bind_connectivity(a_config)
             .await
@@ -269,9 +277,16 @@ mod tests {
             .id;
         let fake = NodeId::new("not-admitted");
         let fake_address = "127.0.0.1:9".parse().expect("fake address");
-        a.register_peer(fake.clone(), fake_address);
+        assert_eq!(
+            a.register_peer(fake.clone(), fake_address),
+            Err(TcpRegisterPeerError::Connectivity),
+            "a native endpoint records no direct address"
+        );
         a.learn_peer(&fake, &fake_address.to_string());
-        a.register_peer(b_id.clone(), fake_address);
+        assert_eq!(
+            a.register_peer(b_id.clone(), fake_address),
+            Err(TcpRegisterPeerError::Connectivity)
+        );
         assert_eq!(a.peer_addr(&fake), None);
         assert_eq!(a.path_to(&fake), None);
         assert_eq!(a.path_to(&b_id), Some(PeerPath::Relay));
@@ -284,7 +299,7 @@ mod tests {
             .expect("endpoint running");
         assert_eq!(changes.paths(), vec![(b_id.clone(), PeerPath::Relay)]);
 
-        let bound = a.clone().into_bound_link(7);
+        let bound = a.clone().into_bound_link(NonZeroU32::new(7).unwrap());
         assert!(
             bound
                 .sessions
@@ -328,7 +343,6 @@ mod tests {
     #[tokio::test]
     async fn direct_path_changes_follow_admitted_sessions_until_shutdown() {
         use crate::{TcpAdmission, TcpMsgConfig};
-        use groupnet_transport::admission::OpenAdmission;
 
         let raw = TcpMsgTransport::bind(NodeId::new("raw"), "127.0.0.1:0")
             .await
@@ -346,7 +360,8 @@ mod tests {
         let b = admitted("paths-b").await.expect("b");
         let mut changes = a.path_changes().expect("admitted path watch");
         assert_eq!(changes.paths(), Vec::new());
-        b.register_peer(a.local_id().clone(), a.local_addr());
+        b.register_peer(a.local_id().clone(), a.local_addr())
+            .unwrap();
         b.connect_peer(a.local_id()).expect("connect");
         tokio::time::timeout(SETTLE, async {
             while changes.paths() != vec![(b.local_id().clone(), PeerPath::Direct)] {

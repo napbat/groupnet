@@ -23,7 +23,7 @@ use groupnet_core::NodeId;
 use groupnet_rpc::{RpcClient, RpcError, RpcServer, RpcServerHandle, RpcStatus};
 use groupnet_testkit::cluster::eventually;
 use groupnet_transport::bulk::{BulkTransport, DataPlane};
-use groupnet_transport_mem::bulk::{MemBulkNet, MemBulkTransport};
+use groupnet_transport_mem::{MemBulkNet, MemBulkTransport};
 use tokio::sync::mpsc;
 
 /// A call budget no healthy in-process call comes near.

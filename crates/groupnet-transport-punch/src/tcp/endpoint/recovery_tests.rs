@@ -3,9 +3,10 @@ use super::{
     ProofPeer, Proofs, TcpConnection, TcpPunchConfig, direct, lock, register,
     wire::{self, Message, Token},
 };
-use crate::{PathPolicy, PeerPath, TcpRendezvous, TcpRendezvousConfig};
+use crate::{PathPolicy, PeerPath, PeerPolicy, TcpRendezvous, TcpRendezvousConfig};
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::eventually_within;
+use groupnet_transport::admission::OpenAdmission;
 use std::{
     collections::HashMap,
     io,
@@ -16,6 +17,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 const RECOVER: Duration = Duration::from_secs(20);
+
+fn open(local: NodeId, rendezvous: std::net::SocketAddr) -> TcpPunchConfig {
+    TcpPunchConfig::new(local, rendezvous, None, PeerPolicy::Dynamic)
+}
 
 async fn control_read(
     reader: &mut tokio::net::tcp::OwnedReadHalf,
@@ -90,14 +95,19 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    let rendezvous = TcpRendezvous::bind(TcpRendezvousConfig::open("127.0.0.1:0".parse().unwrap()))
-        .await
-        .unwrap();
+    let rendezvous = TcpRendezvous::bind(TcpRendezvousConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    ))
+    .await
+    .unwrap();
     let address = rendezvous.local_addr();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let candidate = listener.local_addr().unwrap();
     let peer_session = [19; 32];
-    let mut config = TcpPunchConfig::open(NodeId::from("peer"), address);
+    let mut config = open(NodeId::from("peer"), address);
     config.policy = PathPolicy::DirectPreferred;
     let mut registration = TcpStream::connect(address).await.unwrap();
     register(
@@ -117,7 +127,7 @@ async fn fixture() -> Fixture {
         let (mut reader, mut writer) = registration.into_split();
         tokio::select! { () = cancel.cancelled() => {}, _ = control_read(&mut reader, &introductions) => {}, _ = control_write(&mut writer) => {} }
     });
-    let mut config = TcpPunchConfig::open(NodeId::from("client"), address);
+    let mut config = open(NodeId::from("client"), address);
     config.bind = "127.0.0.1:0".parse().unwrap();
     config.policy = PathPolicy::DirectPreferred;
     let client = TcpConnection::bind(config).await.unwrap();
@@ -309,10 +319,9 @@ async fn disconnected_peer(replace_before_close: bool) {
         )
         .await;
     }
-    let replacement =
-        TcpConnection::bind(TcpPunchConfig::open(peer.clone(), rendezvous.local_addr()))
-            .await
-            .unwrap();
+    let replacement = TcpConnection::bind(open(peer.clone(), rendezvous.local_addr()))
+        .await
+        .unwrap();
     eventually_within(
         "live rendezvous admits a replacement generation",
         RECOVER,

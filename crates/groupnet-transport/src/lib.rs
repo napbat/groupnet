@@ -35,7 +35,11 @@
 //! worker. TCP and UDP resolve [`ToSocketAddrs`] targets, which is
 //! asynchronous. Every custom configuration is validated by the constructor,
 //! which returns the configuration's typed error (or an `io::Error` wrapping
-//! it at socket boundaries) instead of correcting a value.
+//! it at socket boundaries) instead of correcting a value. Managed links
+//! (feature `link`) preflight completely before binding: each provider checks
+//! its own configuration, its `link::LinkConfig` (nonzero cost and MTU by type;
+//! valid, distinct, non-local peers through `LinkConfig::validate_for`) and
+//! every configured peer endpoint before it opens any socket or listener.
 //!
 //! [`ToSocketAddrs`]: https://docs.rs/tokio/latest/tokio/net/trait.ToSocketAddrs.html
 //!
@@ -69,7 +73,7 @@ mod transport;
 pub use identity::{MAX_NODE_ID_BYTES, NodeIdError, validate_node_id};
 pub use transport::{Inbound, Transport};
 
-pub mod capacity;
+mod capacity;
 
 pub use capacity::{QueueCapacity, QueueCapacityError};
 

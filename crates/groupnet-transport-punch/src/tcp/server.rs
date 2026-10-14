@@ -4,9 +4,9 @@ use super::{
     lock, random, sockets,
     wire::{self, Auth, Duplex, Message, Token},
 };
-use crate::RelayPacing;
 use crate::common::check_peers;
 use crate::pacing::Budget;
+use crate::{PeerPolicy, RelayPacing};
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{Admission, JoinRequest};
 use std::{
@@ -55,9 +55,10 @@ impl TcpRendezvous {
     /// propagates socket errors.
     pub async fn bind(config: TcpRendezvousConfig) -> io::Result<Self> {
         config.validate()?;
-        let allowed = config
-            .peers
-            .map(|peers| Arc::new(peers.into_iter().collect::<HashSet<_>>()));
+        let allowed = match config.peers {
+            PeerPolicy::Static(peers) => Some(Arc::new(peers.into_iter().collect::<HashSet<_>>())),
+            PeerPolicy::Dynamic => None,
+        };
         let listener = TcpListener::bind(config.bind).await?;
         let address = listener.local_addr()?;
         let cancel = CancellationToken::new();

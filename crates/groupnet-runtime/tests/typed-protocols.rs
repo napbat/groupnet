@@ -23,6 +23,7 @@ use rcgen::{
 };
 use std::{
     io,
+    num::{NonZeroU32, NonZeroUsize},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -164,9 +165,9 @@ async fn temporary_peer_drop_does_not_cancel_returned_ordered_stream() -> io::Re
         local.router().add_transport(
             memory.endpoint(local.id().clone()),
             LinkConfig {
-                peers: vec![remote.id().clone()],
-                cost: 1,
-                mtu: 1200,
+                cost: NonZeroU32::MIN,
+                mtu: NonZeroUsize::new(1200).unwrap(),
+                ..LinkConfig::new(vec![remote.id().clone()])
             },
         )?;
     }

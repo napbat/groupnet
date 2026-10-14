@@ -6,13 +6,16 @@
 //! confidentiality. The rendezvous is not itself a coordination-group member.
 
 use std::io;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet::connectivity::{
-    PathPolicy, PeerPath, UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
+    PathPolicy, PeerPath, PeerPolicy, UdpPunchConfig, UdpRendezvous, UdpRendezvousConfig,
 };
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
+use groupnet::transport::admission::OpenAdmission;
 use groupnet::transport::udp::UdpTransport;
 
 #[tokio::main]
@@ -28,8 +31,11 @@ async fn main() -> io::Result<()> {
     } else {
         PeerPath::Relay
     };
-    let relay = UdpRendezvous::bind(UdpRendezvousConfig::open(
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::new(
         "127.0.0.1:0".parse().expect("literal loopback address"),
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
     ))
     .await?;
     let address = relay.local_addr();
@@ -41,12 +47,12 @@ async fn main() -> io::Result<()> {
     let mut nodes = Vec::with_capacity(ids.len());
     let mut transports = Vec::with_capacity(ids.len());
     for id in &ids {
-        let mut config = UdpPunchConfig::open(id.clone(), address);
+        let mut config = UdpPunchConfig::new(id.clone(), address, None, PeerPolicy::Dynamic);
         config.policy = policy;
         let transport = UdpTransport::bind_connectivity(config).await?;
         nodes.push(
             Node::builder(id.clone())
-                .link(transport.clone().into_bound_link(1))
+                .link(transport.clone().into_bound_link(NonZeroU32::MIN))
                 .gossip_interval_ms(50)
                 .start()
                 .await?,

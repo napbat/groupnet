@@ -22,6 +22,7 @@ use super::{
     Capability, HEARTBEAT, MAX_CHECKS, Outbound, PathPolicy, Peer, UdpPunchConfig, lock, random,
     transient,
 };
+use crate::PeerPolicy;
 
 struct Endpoint {
     config: UdpPunchConfig,
@@ -89,6 +90,7 @@ async fn drive(
     let socket = sockets.remove(0);
     let queries = config
         .peers
+        .static_peers()
         .iter()
         .map(|node| (node.as_str().to_owned(), 0))
         .collect();
@@ -183,13 +185,14 @@ impl Endpoint {
         lock(&self.peers).retain(|_, peer| {
             peer.path(now).is_some()
                 && peer.lease.is_active()
-                && (!self.config.dynamic || now.duration_since(peer.offered) < super::LEASE)
+                && (!self.config.peers.is_dynamic()
+                    || now.duration_since(peer.offered) < super::LEASE)
         });
         if self
             .registered
             .is_none_or(|seen| now.duration_since(seen) >= super::LEASE)
         {
-            if self.config.dynamic || self.config.key.is_none() {
+            if self.config.peers.is_dynamic() || self.config.key.is_none() {
                 lock(&self.peers).clear();
             }
             *lock(&self.observed) = None;
@@ -199,7 +202,7 @@ impl Endpoint {
                 self.config.rendezvous,
                 Body::Heartbeat { proof: self.nonce },
             );
-            if self.config.dynamic {
+            if self.config.peers.is_dynamic() {
                 self.discovery =
                     self.transmit(self.config.rendezvous, Body::Discover { proof: self.nonce });
             }
@@ -217,8 +220,8 @@ impl Endpoint {
             }
         }
         // NodeId clones are Arc clones. Do not hold a path-state lock over I/O.
-        for index in 0..self.config.peers.len() {
-            let node = self.config.peers[index].clone();
+        for index in 0..self.config.peers.static_peers().len() {
+            let node = self.config.peers.static_peers()[index].clone();
             let sequence = self.transmit(
                 self.config.rendezvous,
                 Body::Query {
@@ -231,7 +234,7 @@ impl Endpoint {
             }
             self.probe(&node);
         }
-        if self.config.dynamic && self.config.policy != PathPolicy::RelayOnly {
+        if self.config.peers.is_dynamic() && self.config.policy != PathPolicy::RelayOnly {
             let nodes: Vec<_> = lock(&self.peers)
                 .values()
                 .map(|peer| peer.node.clone())
@@ -370,7 +373,7 @@ impl Endpoint {
             || self
                 .registered
                 .is_none_or(|seen| seen.elapsed() >= super::LEASE)
-            || if self.config.dynamic {
+            || if self.config.peers.is_dynamic() {
                 packet.sequence != self.discovery || self.discovery == 0
             } else {
                 self.queries.get(peer).copied() != Some(packet.sequence)
@@ -390,7 +393,7 @@ impl Endpoint {
         if relay_only && !addresses.is_empty() {
             return;
         }
-        if !self.config.dynamic
+        if !self.config.peers.is_dynamic()
             && let Some(query) = self.queries.get_mut(peer)
         {
             *query = 0;
@@ -414,12 +417,14 @@ impl Endpoint {
             }
             previous.lease.revoke();
         }
-        let node = if self.config.dynamic {
-            NodeId::from(peer)
-        } else if let Some(node) = self.config.peers.iter().find(|node| node.as_str() == peer) {
-            node.clone()
-        } else {
-            return;
+        let node = match &self.config.peers {
+            PeerPolicy::Dynamic => NodeId::from(peer),
+            PeerPolicy::Static(peers) => {
+                let Some(node) = peers.iter().find(|node| node.as_str() == peer) else {
+                    return;
+                };
+                node.clone()
+            }
         };
         let Ok(lease) = self.sessions.try_admit(AcceptedPeer { node: node.clone() }) else {
             return;

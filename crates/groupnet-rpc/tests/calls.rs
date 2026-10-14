@@ -28,7 +28,7 @@ use groupnet_rpc::{
 use groupnet_testkit::cluster::eventually;
 use groupnet_transport::QueueCapacity;
 use groupnet_transport::bulk::DataPlane;
-use groupnet_transport_mem::bulk::{MemBulkNet, MemBulkTransport};
+use groupnet_transport_mem::{MemBulkNet, MemBulkTransport};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 

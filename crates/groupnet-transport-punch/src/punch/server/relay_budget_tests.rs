@@ -4,6 +4,8 @@ use std::num::NonZeroU64;
 
 use tokio::time::timeout;
 
+use groupnet_transport::admission::OpenAdmission;
+
 use super::*;
 
 const SETTLE: Duration = Duration::from_secs(1);
@@ -200,7 +202,12 @@ fn byte_pacing_drops_over_budget_relay_without_spending_control() {
 
 #[test]
 fn relay_pacing_burst_must_hold_one_maximum_relay_message() {
-    let mut config = UdpRendezvousConfig::open(loopback());
+    let mut config = UdpRendezvousConfig::new(
+        loopback(),
+        None,
+        PeerPolicy::Dynamic,
+        Arc::new(OpenAdmission),
+    );
     config.validate().unwrap();
     let paced = |burst| RelayPacing::Bytes {
         bytes_per_second: NonZeroU64::new(1).unwrap(),

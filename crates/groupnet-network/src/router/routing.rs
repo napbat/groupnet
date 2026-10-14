@@ -255,7 +255,7 @@ impl Shared {
         let adapter = table.links.get(&link)?;
         adapter
             .admits(&admitted.packet.from, admitted.session)
-            .then_some(adapter.config.cost)
+            .then_some(adapter.config.cost.get())
     }
 
     /// Processes one admitted physical frame on the link worker that read it:

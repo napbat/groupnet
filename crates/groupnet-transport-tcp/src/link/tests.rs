@@ -1,5 +1,8 @@
 use super::*;
 use crate::{TcpAdmissionError, TcpMsgConfigError};
+use groupnet_transport::framing::MAX_FRAME_BYTES;
+use groupnet_transport::link::LinkConfigError;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 fn typed<E: std::error::Error + 'static>(error: &io::Error) -> &E {
@@ -22,7 +25,7 @@ async fn provider_drains_listener_on_close() {
             "127.0.0.1:12345".parse().expect("peer address"),
         )],
     )
-    .with_cost(7);
+    .with_cost(NonZeroU32::new(7).unwrap());
     let provider: Box<dyn LinkProvider> = Box::new(link);
     let bound = provider.bind(NodeId::new("tcp-local")).await.expect("bind");
     assert!(std::net::TcpListener::bind(address).is_err());
@@ -36,7 +39,7 @@ async fn provider_drains_listener_on_close() {
 async fn binding_is_the_validation_point_and_names_the_field() {
     let address: SocketAddr = "127.0.0.1:0".parse().expect("address");
     let invalid_msg = TcpLink::new(address, Vec::new()).with_msg_config(TcpMsgConfig {
-        max_frame_bytes: 0,
+        max_frame_bytes: NonZeroUsize::new(MAX_FRAME_BYTES + 1).unwrap(),
         ..TcpMsgConfig::default()
     });
     let error = Box::new(invalid_msg)
@@ -46,7 +49,9 @@ async fn binding_is_the_validation_point_and_names_the_field() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
         typed::<TcpMsgConfigError>(&error),
-        &TcpMsgConfigError::ZeroMaxFrameBytes
+        &TcpMsgConfigError::MaxFrameBytesAboveCeiling {
+            max_frame_bytes: NonZeroUsize::new(MAX_FRAME_BYTES + 1).unwrap()
+        }
     );
 
     let oversized = TcpLink::new(address, Vec::new()).with_credentials(vec![
@@ -80,7 +85,7 @@ async fn binding_is_the_validation_point_and_names_the_field() {
     );
 
     let link = TcpLink::new(address, Vec::new()).with_msg_config(TcpMsgConfig {
-        max_frame_bytes: 512,
+        max_frame_bytes: NonZeroUsize::new(512).unwrap(),
         ..TcpMsgConfig::default()
     });
     let bound = Box::new(link)
@@ -88,7 +93,8 @@ async fn binding_is_the_validation_point_and_names_the_field() {
         .await
         .expect("bind");
     assert_eq!(
-        bound.config.mtu, 512,
+        bound.config.mtu.get(),
+        512,
         "the stored config reached the transport"
     );
     tokio::time::timeout(Duration::from_secs(5), bound.driver.close())
@@ -103,6 +109,41 @@ async fn provider_propagates_listener_bind_errors() {
         .expect("listener");
     let link = TcpLink::new(listener.local_addr().expect("address"), Vec::new());
     assert!(Box::new(link).bind(NodeId::new("tcp-local")).await.is_err());
+}
+
+#[tokio::test]
+async fn invalid_peer_list_is_rejected_before_the_listener_opens() {
+    // An occupied address would fail with `AddrInUse` if the listener opened first.
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let address = occupied.local_addr().expect("address");
+    let endpoint: SocketAddr = "127.0.0.1:9".parse().expect("peer address");
+    let local = NodeId::new("tcp-local");
+    let cases = [
+        (
+            vec![
+                PeerEndpoint::new(NodeId::new("tcp-peer"), endpoint),
+                PeerEndpoint::new(local.clone(), endpoint),
+            ],
+            LinkConfigError::LocalPeer { index: 1 },
+        ),
+        (
+            vec![
+                PeerEndpoint::new(NodeId::new("tcp-peer"), endpoint),
+                PeerEndpoint::new(NodeId::new("tcp-peer"), endpoint),
+            ],
+            LinkConfigError::DuplicatePeer { index: 1 },
+        ),
+    ];
+    for (peers, expected) in cases {
+        let error = Box::new(TcpLink::new(address, peers))
+            .bind(local.clone())
+            .await
+            .expect_err("invalid peer list rejected at bind");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(typed::<LinkConfigError>(&error), &expected);
+    }
 }
 
 #[tokio::test]
@@ -138,7 +179,10 @@ async fn configured_admission_denial_names_the_claim() {
         .admit(JoinRequest::new(&stranger, &[], None))
         .await
         .expect_err("unconfigured peer denied");
-    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        matches!(&error, AdmissionError::UnknownPeer { claimed } if *claimed == stranger),
+        "{error:?}"
+    );
     assert!(error.to_string().contains("stranger"), "{error}");
 }
 
@@ -170,7 +214,7 @@ async fn static_admission_rejects_unknown_and_bootstrap_recovers_late_listener()
     )
     .await
     .expect("a");
-    a.register_peer(b_id.clone(), b_addr);
+    a.register_peer(b_id.clone(), b_addr).unwrap();
     a.connect_peer(&b_id)
         .expect("best-effort unavailable bootstrap");
     // Observe the refused attempt before bringing up the configured peer.
@@ -222,7 +266,9 @@ async fn static_admission_rejects_unknown_and_bootstrap_recovers_late_listener()
     )
     .await
     .expect("unknown");
-    unknown.register_peer(a.local_id().clone(), a.local_addr());
+    unknown
+        .register_peer(a.local_id().clone(), a.local_addr())
+        .unwrap();
     unknown.connect_peer(a.local_id()).expect("attempt");
     dial_finished(&unknown).await;
     assert!(
@@ -245,15 +291,15 @@ async fn static_admission_rejects_unknown_and_bootstrap_recovers_late_listener()
 #[cfg(feature = "connectivity")]
 #[tokio::test]
 async fn native_link_rejects_a_mismatched_identity_before_binding() {
-    use crate::{NetworkKey, TcpPunchConfig};
+    use crate::{NetworkKey, PeerPolicy, TcpPunchConfig};
 
     let config = TcpPunchConfig::new(
         NodeId::new("configured-local"),
         "127.0.0.1:9".parse().expect("rendezvous"),
-        NetworkKey::from_bytes([3; 32]),
-        Vec::new(),
+        Some(NetworkKey::from_bytes([3; 32])),
+        PeerPolicy::Static(Vec::new()),
     );
-    let link = TcpLink::connectivity(config).with_cost(4);
+    let link = TcpLink::connectivity(config).with_cost(NonZeroU32::new(4).unwrap());
     let error = Box::new(link)
         .bind(NodeId::new("different-local"))
         .await
