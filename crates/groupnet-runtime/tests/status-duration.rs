@@ -21,6 +21,7 @@
 //! All waiting is a bounded poll on a predicate (`eventually*`), never a bare
 //! sleep.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -176,8 +177,9 @@ async fn bounded_roster_refuses_overflow_without_truncating_a_coherent_view() {
         .await;
     converged_within(&cluster.groups.iter().collect::<Vec<_>>(), SETTLE).await;
     let observer = &cluster.groups[0];
+    let nz = |n| NonZeroUsize::new(n).expect("nonzero bound");
     let bounded = observer
-        .statuses_held_bounded(3, 64)
+        .statuses_held_bounded(nz(3), nz(64))
         .expect("three members fit one bounded snapshot");
     assert_eq!(bounded.len(), 3);
     assert!(bounded.iter().any(|(id, _, _)| id == &cluster.ids[0]));
@@ -186,18 +188,26 @@ async fn bounded_roster_refuses_overflow_without_truncating_a_coherent_view() {
             .iter()
             .all(|(id, status, _)| { observer.member_status(id) == Some(*status) })
     );
+    let too_many = observer.statuses_held_bounded(nz(2), nz(64)).unwrap_err();
     assert_eq!(
-        observer.statuses_held_bounded(2, 64),
-        Err(BoundedRosterError::TooManyMembers)
+        too_many,
+        BoundedRosterError::TooManyMembers { members: 3, max: 2 }
     );
     assert_eq!(
-        observer.statuses_held_bounded(3, 5),
-        Err(BoundedRosterError::IdentityTooLong)
+        too_many.to_string(),
+        "roster has 3 members, above the bound of 2"
     );
+    let too_long = observer.statuses_held_bounded(nz(3), nz(5)).unwrap_err();
     assert_eq!(
-        observer.statuses_held_bounded(0, 64),
-        Err(BoundedRosterError::InvalidLimit)
+        too_long,
+        BoundedRosterError::IdentityTooLong { bytes: 6, max: 5 }
     );
+    let as_error: &dyn std::error::Error = &too_long;
+    assert_eq!(
+        as_error.to_string(),
+        "member identity has 6 bytes, above the bound of 5"
+    );
+    assert!(as_error.source().is_none());
 }
 
 /// A crashed node — detected by the failure detector, not announced — is held

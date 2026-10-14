@@ -140,6 +140,23 @@ its exclusive receive ownership; they never compete for the messaging worker's
 raw receive queue. Ordered application accepts and unordered TLS setup have
 separate authenticated namespaces; unordered accepts respect the selected
 delivery policy. Application datagrams use their own routed protocol ID.
+
+Ordered streams are scoped by an application `StreamProtocolId`:
+`Ordered::new()` is the default protocol and `Ordered::protocol(id)` any other.
+Every ordered stream opens with a versioned setup exchange inside the pinned TLS
+tunnel (`GNOS` magic, version byte, big-endian `u32` protocol id; the acceptor
+answers accepted, unknown protocol or queue full). The node's one ordered
+dispatcher reads each setup on a bounded number of concurrent tasks under
+`OrderedConfig::setup_timeout` and queues the stream on that protocol's own
+accept queue (`OrderedConfig::accept_queue`, fixed by `NodeBuilder::ordered`).
+Binding the first endpoint for an id opens its queue; a connector naming an id
+the peer never bound gets `ConnectionRefused`, and a full queue answers
+`WouldBlock` without touching any other protocol's queue. Independent consumers
+therefore run independent accept loops on one node and never receive each
+other's streams: `Endpoint<Ordered>` implements `BulkTransport`, so a
+`DataPlane`, `RpcClient` or `RpcServer` runs over its own protocol beside any
+other stream consumer. `Node`'s own `BulkTransport` adapter is the default
+protocol's endpoint.
 Unordered keys derive from the pinned TLS exporter and payloads bypass the
 ordered control stream. Revocation and shutdown invalidate both the retained
 control session and its datagram keys. See

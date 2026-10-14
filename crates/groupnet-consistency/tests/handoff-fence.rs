@@ -66,7 +66,7 @@ use groupnet_consistency::{
     ChunkLimit, CommitLedger, Handoff, HandoffError, Snapshot, SnapshotChunks, SnapshotSink,
     SnapshotSource, WriteToken,
 };
-use groupnet_core::{Activation, HostedConfig, NodeId, Role, VoterRoster};
+use groupnet_core::{NodeId, Role, VoterRoster};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::{MemBulkNet, Network};
@@ -263,12 +263,11 @@ async fn linked(
 /// A Quorum profile over `voters`, storage-free — so every first election is
 /// charged the boot blackout.
 fn quorum_profile(voters: &[&str]) -> GroupProfile {
-    GroupProfile::hosted(HostedConfig {
-        activation: Activation::Quorum {
-            voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
-        },
+    GroupProfile::Quorum {
         lease_ms: LEASE_MS,
-    })
+        voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
+        storage: None,
+    }
 }
 
 /// A `Settle` profile for a node that is **alone** on its own fabric: the
@@ -283,12 +282,10 @@ fn quorum_profile(voters: &[&str]) -> GroupProfile {
 /// gets between spawning this node and taking its offer, and that offer must be
 /// stamped from the hostless view it starts in.
 fn lone_settle_profile() -> GroupProfile {
-    GroupProfile::hosted(HostedConfig {
-        activation: Activation::Settle {
-            claim_settle_ms: CLAIM_SETTLE_MS,
-        },
+    GroupProfile::Settle {
         lease_ms: LEASE_MS,
-    })
+        claim_settle_ms: CLAIM_SETTLE_MS,
+    }
 }
 
 /// One node of a Quorum-activated hosted group: as much of

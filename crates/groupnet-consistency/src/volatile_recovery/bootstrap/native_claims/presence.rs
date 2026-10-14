@@ -6,13 +6,16 @@ use groupnet_core::volatile_bootstrap::{
     BootstrapPresence, ObservedEntry, PresenceIdentity, decode_presence_value,
     encode_presence_value, encoded_presence_len,
 };
+use std::time::Duration;
+
 use groupnet_runtime::{
-    EntryInspectionLimits, EntryMutationLimits, EntryRevision, InspectedPair, InspectedPairEntry,
+    EntryInspectionLimits, EntryRemoval, EntryRevision, EntryWrite, InspectedPair,
+    InspectedPairEntry,
 };
 
 use super::{
     AdapterError, AdapterErrorKind, AdmissionClass, Admitted, CAPACITY, MALFORMED,
-    NativeClaimSource, UNAVAILABLE,
+    NativeClaimSource, UNAVAILABLE, nonzero,
 };
 
 /// A newer or concurrent presence for this member holds the entry.
@@ -38,11 +41,11 @@ impl NativeClaimSource {
             )
             .ok_or(CAPACITY)?;
         Ok(EntryInspectionLimits {
-            max_key_bytes: self.key.len().max(self.presence_key.len()),
-            max_members: self.policy.max_members.get(),
-            max_member_bytes: self.policy.max_member_bytes.get(),
-            max_value_bytes: self.max_value_bytes,
-            max_response_bytes,
+            max_key_bytes: nonzero(self.key.len().max(self.presence_key.len()))?,
+            max_members: self.policy.max_members,
+            max_member_bytes: self.policy.max_member_bytes,
+            max_value_bytes: nonzero(self.max_value_bytes)?,
+            max_response_bytes: nonzero(max_response_bytes)?,
         })
     }
 
@@ -50,6 +53,7 @@ impl NativeClaimSource {
         let limits = self.pair_limits()?;
         let charge = limits
             .max_response_bytes
+            .get()
             .checked_add(self.presence_key.len())
             .and_then(|bytes| bytes.checked_add(self.key.len()))
             .ok_or(CAPACITY)?;
@@ -134,7 +138,7 @@ impl NativeClaimSource {
                 } else if existing.renewal > presence.renewal {
                     return Err(FENCED);
                 } else if existing.renewal == presence.renewal {
-                    if local.first_remaining_ttl_ms.is_none_or(|ttl| ttl == 0) {
+                    if local.first_remaining_ttl.is_none_or(|ttl| ttl.is_zero()) {
                         return Err(FENCED);
                     }
                     *published = Some((presence.identity, value));
@@ -153,14 +157,10 @@ impl NativeClaimSource {
             let result = self
                 .group
                 .set_entry_if_revision(
-                    self.presence_key.clone(),
-                    value.get().clone(),
-                    Some(self.policy.claim_ttl_ms),
+                    EntryWrite::new(self.presence_key.clone(), value.get().clone())
+                        .with_ttl(Duration::from_millis(self.policy.claim_ttl_ms))
+                        .with_limits(self.mutation_limits(&self.presence_key)?),
                     expected,
-                    EntryMutationLimits {
-                        max_key_bytes: self.presence_key.len(),
-                        max_value_bytes: self.max_value_bytes,
-                    },
                     queued,
                 )
                 .await;
@@ -187,7 +187,7 @@ impl NativeClaimSource {
                     let matches = readback.get().entries.iter().any(|entry| {
                         &entry.node == self.group.local_node()
                             && entry.first.as_deref() == Some(value.get().as_slice())
-                            && entry.first_remaining_ttl_ms.is_some_and(|ttl| ttl > 0)
+                            && entry.first_remaining_ttl.is_some_and(|ttl| !ttl.is_zero())
                     });
                     if !matches {
                         return Err(UNAVAILABLE);
@@ -222,10 +222,8 @@ impl NativeClaimSource {
         let result = self
             .group
             .delete_entry_if_value(
-                self.presence_key.clone(),
-                value.get().clone(),
-                self.presence_key.len(),
-                self.max_value_bytes,
+                EntryRemoval::new(self.presence_key.clone(), value.get().clone())
+                    .with_limits(self.mutation_limits(&self.presence_key)?),
                 queued,
             )
             .await;

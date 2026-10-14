@@ -8,6 +8,7 @@
 
 use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::time::Duration;
 
 use groupnet_core::{Config, ConfigError, NodeId};
 use groupnet_runtime::{Node, NodeBuilder};
@@ -34,7 +35,7 @@ async fn rejection(builder: NodeBuilder) -> ConfigError {
 #[tokio::test]
 async fn start_rejects_a_zero_gossip_interval() {
     let net = Network::new();
-    let cause = rejection(builder(&net, "zero-gossip").gossip_interval_ms(0)).await;
+    let cause = rejection(builder(&net, "zero-gossip").gossip_interval(Duration::ZERO)).await;
     assert_eq!(cause, ConfigError::ZeroGossipInterval);
 }
 
@@ -62,7 +63,7 @@ async fn configured_values_reach_the_group_as_given() {
             indirect_probes: indirect,
             ..Config::default()
         })
-        .gossip_interval_ms(7)
+        .gossip_interval(Duration::from_millis(7))
         .gossip_fanout(gossip_fanout)
         .max_delta_frame_bytes(frame)
         .full_digest_every(NonZeroU64::MIN)
@@ -82,4 +83,22 @@ async fn configured_values_reach_the_group_as_given() {
         config.suspect_timeout_ms,
         Config::default().suspect_timeout_ms
     );
+}
+
+#[tokio::test]
+async fn the_gossip_interval_reaches_the_core_in_whole_milliseconds() {
+    let net = Network::new();
+    for (interval, ms) in [
+        (Duration::from_millis(7), 7),
+        (Duration::from_micros(7_001), 8),
+        (Duration::MAX, u64::MAX),
+    ] {
+        let node = builder(&net, &format!("interval-{ms}"))
+            .gossip_interval(interval)
+            .start()
+            .await
+            .expect("a nonzero interval starts");
+        assert_eq!(node.join_group("g").config().gossip_interval_ms, ms);
+        node.close().await;
+    }
 }

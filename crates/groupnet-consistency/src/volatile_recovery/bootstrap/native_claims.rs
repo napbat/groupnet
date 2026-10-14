@@ -8,8 +8,12 @@ use groupnet_core::volatile_bootstrap::{
     BootstrapScope, ClaimCodecError, ClaimIdentity, ObservedEntry, PresenceIdentity,
     claim_entry_key, decode_claim_value, encode_claim_value, encoded_claim_len, presence_entry_key,
 };
-use groupnet_runtime::{EntryBudget, EntryInspectionLimits, Group, InspectedEntries};
+use groupnet_runtime::{
+    EntryBudget, EntryInspectionLimits, EntryMutationLimits, EntryRemoval, EntryWrite, Group,
+    InspectedEntries,
+};
 use std::mem::size_of;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use super::admission::{AdmissionClass, Admitted, ByteAdmission, Reservation};
@@ -30,6 +34,17 @@ const CAPACITY: AdapterError = AdapterError::new(AdapterErrorKind::Capacity);
 /// A bounded snapshot vector could not be allocated.
 fn allocation(error: std::collections::TryReserveError) -> AdapterError {
     AdapterError::with_source(AdapterErrorKind::Capacity, error)
+}
+
+/// A caller bound the runtime requires nonzero.
+fn nonzero(bytes: usize) -> Result<NonZeroUsize, AdapterError> {
+    NonZeroUsize::new(bytes).ok_or_else(|| AdapterErrorKind::InvalidInput.into())
+}
+
+/// A native remaining TTL in the policy's whole milliseconds, if present and
+/// representable.
+fn remaining_ms(ttl: Option<Duration>) -> Option<u64> {
+    ttl.and_then(|ttl| u64::try_from(ttl.as_millis()).ok())
 }
 
 /// A [`NativeClaimSource::new`] argument rule that was violated.
@@ -154,11 +169,19 @@ impl NativeClaimSource {
             return Err(AdapterErrorKind::InvalidInput.into());
         }
         Ok(EntryInspectionLimits {
-            max_key_bytes: self.key.len(),
-            max_members: limits.max_members,
-            max_member_bytes: limits.max_member_bytes,
-            max_value_bytes: self.max_value_bytes,
-            max_response_bytes: limits.max_metadata_bytes,
+            max_key_bytes: nonzero(self.key.len())?,
+            max_members: nonzero(limits.max_members)?,
+            max_member_bytes: nonzero(limits.max_member_bytes)?,
+            max_value_bytes: nonzero(self.max_value_bytes)?,
+            max_response_bytes: nonzero(limits.max_metadata_bytes)?,
+        })
+    }
+
+    /// Mutation bounds for `key` and this source's values.
+    fn mutation_limits(&self, key: &str) -> Result<EntryMutationLimits, AdapterError> {
+        Ok(EntryMutationLimits {
+            max_key_bytes: nonzero(key.len())?,
+            max_value_bytes: nonzero(self.max_value_bytes)?,
         })
     }
 
@@ -178,7 +201,7 @@ impl NativeClaimSource {
         let raw_budget = admission.reserve(AdmissionClass::Inflight, raw_charge)?;
         let (raw, raw_budget) = self
             .group
-            .inspect_scoped_entry(self.key.clone(), inspection_limits, raw_budget)
+            .inspect_scoped_entry(&self.key, inspection_limits, raw_budget)
             .await
             .map_err(|_| UNAVAILABLE)?;
         let raw = raw_budget.hold(raw);
@@ -200,7 +223,7 @@ impl NativeClaimSource {
         for entry in raw.entries {
             let eligible = entry.status == Status::Alive;
             if let Some(value) = entry.value {
-                let remaining_ms = entry.remaining_ttl_ms.ok_or(MALFORMED)?;
+                let remaining_ms = remaining_ms(entry.remaining_ttl).ok_or(MALFORMED)?;
                 if remaining_ms == 0 || remaining_ms > self.policy.claim_ttl_ms {
                     return Err(MALFORMED);
                 }
@@ -259,13 +282,13 @@ impl NativeClaimSource {
             .reserve(AdmissionClass::Inflight, raw_charge)?;
         let (observed, budget) = self
             .group
-            .inspect_scoped_entry(self.key.clone(), inspection_limits, budget)
+            .inspect_scoped_entry(&self.key, inspection_limits, budget)
             .await
             .map_err(|_| UNAVAILABLE)?;
         let matching = observed.entries.iter().any(|entry| {
             &entry.node == self.group.local_node()
                 && entry.value.as_deref() == Some(expected)
-                && entry.remaining_ttl_ms.is_some_and(|ttl| ttl > 0)
+                && entry.remaining_ttl.is_some_and(|ttl| !ttl.is_zero())
         });
         drop(observed);
         drop(budget);
@@ -314,11 +337,9 @@ impl ClaimSource for NativeClaimSource {
         let confirmed = self
             .group
             .set_entry_confirmed(
-                self.key.clone(),
-                value.get().clone(),
-                Some(self.policy.claim_ttl_ms),
-                self.key.len(),
-                self.max_value_bytes,
+                EntryWrite::new(self.key.clone(), value.get().clone())
+                    .with_ttl(Duration::from_millis(self.policy.claim_ttl_ms))
+                    .with_limits(self.mutation_limits(&self.key)?),
                 queued,
             )
             .await;
@@ -349,10 +370,8 @@ impl ClaimSource for NativeClaimSource {
         let result = self
             .group
             .delete_entry_if_value(
-                self.key.clone(),
-                expected,
-                self.key.len(),
-                self.max_value_bytes,
+                EntryRemoval::new(self.key.clone(), expected)
+                    .with_limits(self.mutation_limits(&self.key)?),
                 queued,
             )
             .await;

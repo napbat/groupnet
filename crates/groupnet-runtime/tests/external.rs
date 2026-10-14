@@ -14,8 +14,8 @@
 //!   stream, and the record holds exactly that `(epoch, host)`;
 //! * killing the host leaves a record nobody renews, and a survivor **steals**
 //!   it once it is `TTL + steal_margin` stale, at a strictly higher epoch;
-//! * the inert postures: an anchor on an `Eventual` group is never called even
-//!   once, and an `External` group with no anchor sits at `(0, None)` quietly;
+//! * the inert posture: an `External` group with no anchor sits at `(0, None)`
+//!   quietly (no other mode can carry an anchor at all);
 //! * [`Group::leave`] **releases** the record — stamped already-expired — so a
 //!   successor claims well inside the TTL it would otherwise have waited out.
 //!
@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use groupnet_core::anchor::AnchorRecord;
-use groupnet_core::{Activation, HostedConfig, NodeId, Role, placement};
+use groupnet_core::{NodeId, Role, placement};
 use groupnet_runtime::{
     Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf, Group, GroupEvent, GroupProfile,
     Leadership, Node,
@@ -57,7 +57,7 @@ const SETTLE: Duration = Duration::from_secs(12);
 /// A brisk gossip cadence, so anchor rounds and renewals happen in wall-clock
 /// milliseconds. It also sets the driver's tick period (half the tightest
 /// deadline, i.e. ~7ms here), which [`LEASE_MS`] is two orders of magnitude
-/// above — the sizing rule [`HostedConfig`] states.
+/// above — the sizing rule `HostedConfig` states.
 const GOSSIP_MS: u64 = 15;
 
 /// The record's TTL **and** the engine lease — one knob by design, because the
@@ -69,13 +69,12 @@ const LEASE_MS: u64 = 600;
 const STEAL_MARGIN_MS: u64 = 200;
 
 /// The `External` profile every fixture here runs, at `lease_ms`.
-fn external_profile(lease_ms: u64) -> GroupProfile {
-    GroupProfile::hosted(HostedConfig {
-        activation: Activation::External {
-            steal_margin_ms: STEAL_MARGIN_MS,
-        },
+fn external_profile(lease_ms: u64, anchor: Option<Arc<dyn Anchor>>) -> GroupProfile {
+    GroupProfile::External {
         lease_ms,
-    })
+        steal_margin_ms: STEAL_MARGIN_MS,
+        anchor,
+    }
 }
 
 /// Rendezvous ranking of `ids` for `group`, best first — the order row X1's
@@ -397,7 +396,7 @@ async fn three_external_nodes_elect_through_the_anchor() {
     let anchors: Vec<Arc<FakeAnchor>> = IDS.iter().map(|_| FakeAnchor::healthy(&object)).collect();
     let net = Network::new();
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
-        external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
+        external_profile(LEASE_MS, Some(anchor.as_anchor()))
     })
     .await;
     let logs: Vec<LeadershipLog> = fleet.groups.iter().map(watch_leadership).collect();
@@ -467,7 +466,7 @@ async fn killing_the_host_lets_a_survivor_steal_the_record() {
     let anchors: Vec<Arc<FakeAnchor>> = IDS.iter().map(|_| FakeAnchor::healthy(&object)).collect();
     let net = Network::new();
     let mut fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
-        external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
+        external_profile(LEASE_MS, Some(anchor.as_anchor()))
     })
     .await;
 
@@ -510,64 +509,12 @@ async fn killing_the_host_lets_a_survivor_steal_the_record() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. The inert postures.
+// 3. The inert posture.
 // ---------------------------------------------------------------------------
 
 /// Several gossip rounds' worth of digests — a run long enough that a Hosted
 /// group would have elected (and renewed) several times over.
 const A_REAL_RUN: u64 = 8;
-
-/// An anchor configured on an `Eventual` group is **never called** — not once,
-/// on any node, for the group's whole life. That is what makes it safe to hand
-/// every node in a fleet the same profile builder and let each group's own
-/// activation decide whether it means anything.
-#[tokio::test]
-async fn an_anchor_on_an_eventual_group_is_never_called() {
-    const GROUP: &str = "external-inert-eventual";
-    const IDS: [&str; 3] = ["xi-a", "xi-b", "xi-c"];
-
-    let object = AnchorObject::new();
-    let anchors: Vec<Arc<FakeAnchor>> = IDS.iter().map(|_| FakeAnchor::healthy(&object)).collect();
-    let net = Network::new();
-    // Eventual — the default posture — carrying an anchor anyway.
-    let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
-        GroupProfile::eventual().with_anchor(anchor.as_anchor())
-    })
-    .await;
-
-    let refs = fleet.refs();
-    converged_within(&refs, SETTLE).await;
-    eventually_within("the cluster to run for a while", SETTLE, || {
-        fleet
-            .groups
-            .iter()
-            .all(|g| g.net_stats().digests_built >= A_REAL_RUN)
-    })
-    .await;
-
-    for (id, anchor) in IDS.iter().zip(&anchors) {
-        assert!(
-            anchor.calls().is_empty(),
-            "{id}'s Eventual group touched its anchor: {:?}",
-            anchor.calls()
-        );
-    }
-    assert!(
-        object.record().is_none(),
-        "an Eventual group wrote a record"
-    );
-    for (id, group) in fleet.ids.iter().zip(&fleet.groups) {
-        assert_eq!(
-            group.leadership(),
-            Leadership {
-                epoch: 0,
-                host: None,
-                role: Role::Follower,
-            },
-            "{id} elected something in a group with no election"
-        );
-    }
-}
 
 /// An `External` group with **no anchor** is the fail-safe posture: the
 /// engine's prompts are dropped, nobody claims, and every node sits at
@@ -579,7 +526,7 @@ async fn an_external_group_without_an_anchor_never_hosts() {
     let cluster = MemCluster::builder(&["xn-a", "xn-b", "xn-c"])
         .group(GROUP)
         .gossip_interval_ms(GOSSIP_MS)
-        .group_profile(external_profile(LEASE_MS))
+        .group_profile(external_profile(LEASE_MS, None))
         .spawn()
         .await;
     let logs: Vec<LeadershipLog> = cluster.groups.iter().map(watch_leadership).collect();
@@ -645,7 +592,7 @@ async fn leaving_releases_the_record_so_a_successor_claims_early() {
     let anchors: Vec<Arc<FakeAnchor>> = IDS.iter().map(|_| FakeAnchor::healthy(&object)).collect();
     let net = Network::new();
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
-        external_profile(RELEASE_LEASE_MS).with_anchor(anchor.as_anchor())
+        external_profile(RELEASE_LEASE_MS, Some(anchor.as_anchor()))
     })
     .await;
 

@@ -59,7 +59,7 @@ async fn main() -> io::Result<()> {
             memory.endpoint(NodeId::new("a")),
             vec![NodeId::new("b")],
         ))
-        .gossip_interval_ms(30)
+        .gossip_interval(Duration::from_millis(30))
         .start()
         .await?;
     let b = Node::builder(NodeId::new("b"))
@@ -68,12 +68,12 @@ async fn main() -> io::Result<()> {
             vec![NodeId::new("a")],
         ))
         .link(b_tcp.into_bound_link(NonZeroU32::MIN))
-        .gossip_interval_ms(30)
+        .gossip_interval(Duration::from_millis(30))
         .start()
         .await?;
     let c = Node::builder(NodeId::new("c"))
         .link(c_tcp.into_bound_link(NonZeroU32::MIN))
-        .gossip_interval_ms(30)
+        .gossip_interval(Duration::from_millis(30))
         .start()
         .await?;
     let result = tokio::time::timeout(WAIT * 4, demonstrate(&a, &b, &c))

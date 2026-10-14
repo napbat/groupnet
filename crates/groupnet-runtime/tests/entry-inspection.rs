@@ -1,13 +1,14 @@
 //! Bounded, cancellation-safe actor cuts of membership and one scoped entry.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use groupnet_runtime::{
-    EntryBudget, EntryInspectionError, EntryInspectionLimits, EntryMutationLimits, EntryRevision,
-    Group,
+    EntryBudget, EntryInspectionError, EntryInspectionLimits, EntryMutationError,
+    EntryMutationLimits, EntryRemoval, EntryRevision, EntryWrite, Group,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually, eventually_within};
 
@@ -29,14 +30,33 @@ impl Drop for Budget {
     }
 }
 
+const fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap()
+}
+
+/// The smallest response bound `limits` validates with: no single identity or
+/// value bound above it, yet far below any real roster's response charge.
+const TINY_RESPONSE: NonZeroUsize = nz(32);
+
 fn limits() -> EntryInspectionLimits {
     EntryInspectionLimits {
-        max_key_bytes: 32,
-        max_members: 2,
-        max_member_bytes: 16,
-        max_value_bytes: 32,
-        max_response_bytes: 900,
+        max_key_bytes: nz(32),
+        max_members: nz(2),
+        max_member_bytes: nz(16),
+        max_value_bytes: nz(32),
+        max_response_bytes: nz(900),
     }
+}
+
+fn mutation_limits() -> EntryMutationLimits {
+    EntryMutationLimits {
+        max_key_bytes: nz(32),
+        max_value_bytes: nz(32),
+    }
+}
+
+const fn ttl(ms: u64) -> Duration {
+    Duration::from_millis(ms)
 }
 
 fn budget(bytes: usize) -> (Budget, Arc<AtomicUsize>) {
@@ -59,7 +79,8 @@ async fn actor_cut_has_bounded_complete_roster_and_aging_native_ttl() {
         .await;
     let a = &cluster.groups[0];
     let b = &cluster.groups[1];
-    a.set_entry("~claim:test", b"owner-1", Some(3_000)).unwrap();
+    a.set_entry("~claim:test", b"owner-1", Some(ttl(3_000)))
+        .unwrap();
     a.set_entry("~claim:permanent", b"not-ttl", None).unwrap();
     eventually("peer receives scoped entry", || {
         b.node_entry(&cluster.ids[0], "~claim:test").is_some()
@@ -82,8 +103,8 @@ async fn actor_cut_has_bounded_complete_roster_and_aging_native_ttl() {
         .find(|entry| entry.node == cluster.ids[0])
         .unwrap();
     assert_eq!(owner.value.as_deref(), Some(&b"owner-1"[..]));
-    let remaining = owner.remaining_ttl_ms.unwrap();
-    assert!(remaining > 0 && remaining <= 3_000);
+    let remaining = owner.remaining_ttl.unwrap();
+    assert!(remaining > Duration::ZERO && remaining <= ttl(3_000));
     assert!(first.sampled_at <= Instant::now());
     drop(first_budget);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -103,7 +124,7 @@ async fn actor_cut_has_bounded_complete_roster_and_aging_native_ttl() {
         .iter()
         .find(|entry| entry.node == cluster.ids[0])
         .unwrap()
-        .remaining_ttl_ms
+        .remaining_ttl
         .unwrap();
     assert!(second_remaining < remaining);
 
@@ -118,7 +139,7 @@ async fn actor_cut_has_bounded_complete_roster_and_aging_native_ttl() {
         .find(|entry| entry.node == cluster.ids[0])
         .unwrap();
     assert_eq!(permanent_owner.value.as_deref(), Some(&b"not-ttl"[..]));
-    assert_eq!(permanent_owner.remaining_ttl_ms, None);
+    assert_eq!(permanent_owner.remaining_ttl, None);
 }
 
 #[tokio::test]
@@ -130,9 +151,10 @@ async fn pair_cut_keeps_membership_and_both_native_ttls_together() {
         .await;
     let a = &cluster.groups[0];
     let b = &cluster.groups[1];
-    a.set_entry("~presence:test", b"boot-a", Some(3_000))
+    a.set_entry("~presence:test", b"boot-a", Some(ttl(3_000)))
         .unwrap();
-    a.set_entry("~claim:test", b"build-a", Some(2_000)).unwrap();
+    a.set_entry("~claim:test", b"build-a", Some(ttl(2_000)))
+        .unwrap();
     eventually("peer sees both scoped values", || {
         b.node_entry(&cluster.ids[0], "~presence:test").is_some()
             && b.node_entry(&cluster.ids[0], "~claim:test").is_some()
@@ -153,13 +175,13 @@ async fn pair_cut_keeps_membership_and_both_native_ttls_together() {
     assert_eq!(member.second.as_deref(), Some(&b"build-a"[..]));
     assert!(
         member
-            .first_remaining_ttl_ms
-            .is_some_and(|ttl| ttl > 0 && ttl <= 3_000)
+            .first_remaining_ttl
+            .is_some_and(|left| left > Duration::ZERO && left <= ttl(3_000))
     );
     assert!(
         member
-            .second_remaining_ttl_ms
-            .is_some_and(|ttl| ttl > 0 && ttl <= 2_000)
+            .second_remaining_ttl
+            .is_some_and(|left| left > Duration::ZERO && left <= ttl(2_000))
     );
     assert!(cut.sampled_at <= Instant::now());
     drop(cut);
@@ -172,7 +194,7 @@ async fn pair_cut_keeps_membership_and_both_native_ttls_together() {
             "~presence:test",
             "~claim:test",
             EntryInspectionLimits {
-                max_response_bytes: 1,
+                max_response_bytes: TINY_RESPONSE,
                 ..limits()
             },
             small,
@@ -210,14 +232,10 @@ async fn revision_write(group: &Group, key: &str, value: &[u8], expected: EntryR
     let (owner, _) = budget(1_024);
     group
         .set_entry_if_revision(
-            key,
-            value.to_vec(),
-            Some(3_000),
+            EntryWrite::new(key, value)
+                .with_ttl(ttl(3_000))
+                .with_limits(mutation_limits()),
             expected,
-            EntryMutationLimits {
-                max_key_bytes: 32,
-                max_value_bytes: 32,
-            },
             owner,
         )
         .await
@@ -259,7 +277,10 @@ async fn scoped_revision_fences_old_create_after_new_withdraw_and_ignores_unrela
     for update in 0..32_u8 {
         let (unrelated, _) = budget(1_024);
         group
-            .set_entry_confirmed("unrelated", vec![update], None, 32, 32, unrelated)
+            .set_entry_confirmed(
+                EntryWrite::new("unrelated", vec![update]).with_limits(mutation_limits()),
+                unrelated,
+            )
             .await
             .unwrap();
     }
@@ -272,7 +293,10 @@ async fn scoped_revision_fences_old_create_after_new_withdraw_and_ignores_unrela
     let (withdraw, _) = budget(1_024);
     assert!(
         group
-            .delete_entry_if_value(key, b"boot-new:2", 32, 32, withdraw)
+            .delete_entry_if_value(
+                EntryRemoval::new(key, b"boot-new:2").with_limits(mutation_limits()),
+                withdraw,
+            )
             .await
             .unwrap()
             .0
@@ -301,7 +325,7 @@ async fn overflow_refuses_whole_actor_cut_and_releases_its_budget() {
         .await;
     let group = &cluster.groups[0];
     group
-        .set_entry("~claim:test", b"claim-value", Some(800))
+        .set_entry("~claim:test", b"claim-value", Some(ttl(800)))
         .unwrap();
     eventually("local entry applied", || {
         group.node_entry(&cluster.ids[0], "~claim:test").is_some()
@@ -309,7 +333,7 @@ async fn overflow_refuses_whole_actor_cut_and_releases_its_budget() {
     .await;
     eventually("membership roster converges", || {
         group
-            .statuses_held_bounded(2, 32)
+            .statuses_held_bounded(nz(2), nz(32))
             .is_ok_and(|members| members.len() == 2)
     })
     .await;
@@ -319,7 +343,7 @@ async fn overflow_refuses_whole_actor_cut_and_releases_its_budget() {
         .inspect_scoped_entry(
             "~claim:test",
             EntryInspectionLimits {
-                max_response_bytes: 1,
+                max_response_bytes: TINY_RESPONSE,
                 ..limits()
             },
             small_budget,
@@ -334,7 +358,7 @@ async fn overflow_refuses_whole_actor_cut_and_releases_its_budget() {
         .inspect_scoped_entry(
             "~claim:test",
             EntryInspectionLimits {
-                max_members: 1,
+                max_members: nz(1),
                 ..limits()
             },
             member_budget,
@@ -348,7 +372,7 @@ async fn overflow_refuses_whole_actor_cut_and_releases_its_budget() {
         .inspect_scoped_entry(
             "~claim:test",
             EntryInspectionLimits {
-                max_value_bytes: 1,
+                max_value_bytes: nz(1),
                 ..limits()
             },
             value_budget,
@@ -365,7 +389,12 @@ async fn confirmed_local_claim_and_exact_withdrawal_fence_a_newer_renewal() {
     let key = "~claim:test";
     let (write_budget, _) = budget(1_024);
     group
-        .set_entry_confirmed(key, b"boot1:renew1", Some(3_000), 32, 32, write_budget)
+        .set_entry_confirmed(
+            EntryWrite::new(key, b"boot1:renew1")
+                .with_ttl(ttl(3_000))
+                .with_limits(mutation_limits()),
+            write_budget,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -374,13 +403,21 @@ async fn confirmed_local_claim_and_exact_withdrawal_fence_a_newer_renewal() {
     );
     let (write_budget, _) = budget(1_024);
     group
-        .set_entry_confirmed(key, b"boot1:renew2", Some(3_000), 32, 32, write_budget)
+        .set_entry_confirmed(
+            EntryWrite::new(key, b"boot1:renew2")
+                .with_ttl(ttl(3_000))
+                .with_limits(mutation_limits()),
+            write_budget,
+        )
         .await
         .unwrap();
     let (withdraw_budget, _) = budget(1_024);
     assert!(
         !group
-            .delete_entry_if_value(key, b"boot1:renew1", 32, 32, withdraw_budget)
+            .delete_entry_if_value(
+                EntryRemoval::new(key, b"boot1:renew1").with_limits(mutation_limits()),
+                withdraw_budget,
+            )
             .await
             .unwrap()
             .0
@@ -392,7 +429,10 @@ async fn confirmed_local_claim_and_exact_withdrawal_fence_a_newer_renewal() {
     let (withdraw_budget, _) = budget(1_024);
     assert!(
         group
-            .delete_entry_if_value(key, b"boot1:renew2", 32, 32, withdraw_budget)
+            .delete_entry_if_value(
+                EntryRemoval::new(key, b"boot1:renew2").with_limits(mutation_limits()),
+                withdraw_budget,
+            )
             .await
             .unwrap()
             .0
@@ -430,14 +470,14 @@ async fn cancelled_confirmed_write_keeps_queue_charge_until_actor_publication() 
     let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
     let group = &cluster.groups[0];
     let (owner, dropped) = budget(1_024);
-    let mut write = Box::pin(group.set_entry_confirmed(
-        "~claim:test",
-        b"boot1:renew1",
-        Some(3_000),
-        32,
-        32,
-        owner,
-    ));
+    let mut write = Box::pin(
+        group.set_entry_confirmed(
+            EntryWrite::new("~claim:test", b"boot1:renew1")
+                .with_ttl(ttl(3_000))
+                .with_limits(mutation_limits()),
+            owner,
+        ),
+    );
     std::future::poll_fn(|cx| {
         assert!(matches!(write.as_mut().poll(cx), Poll::Pending));
         Poll::Ready(())
@@ -461,16 +501,32 @@ async fn mutation_rejects_unreserved_bytes_before_enqueue() {
     let group = &cluster.groups[0];
     let (small, dropped) = budget(1);
     let error = group
-        .set_entry_confirmed("~claim:test", b"value", Some(3_000), 32, 32, small)
+        .set_entry_confirmed(
+            EntryWrite::new("~claim:test", b"value")
+                .with_ttl(ttl(3_000))
+                .with_limits(mutation_limits()),
+            small,
+        )
         .await
         .unwrap_err();
-    assert_eq!(error, groupnet_runtime::EntryMutationError::InvalidLimit);
+    assert_eq!(
+        error,
+        EntryMutationError::BudgetTooSmall {
+            required: Some("~claim:test".len() + b"value".len()),
+            available: 1,
+        }
+    );
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     assert!(group.node_entry(&cluster.ids[0], "~claim:test").is_none());
 }
 
 #[tokio::test]
 async fn short_owned_values_with_large_capacity_never_enter_the_actor_queue() {
+    const TOO_LONG: EntryMutationError = EntryMutationError::ValueTooLong {
+        bytes: 512,
+        max: 32,
+    };
+
     fn oversized_value() -> Vec<u8> {
         let mut value = Vec::with_capacity(512);
         value.push(b'x');
@@ -482,46 +538,40 @@ async fn short_owned_values_with_large_capacity_never_enter_the_actor_queue() {
     assert_eq!(
         group
             .set_entry_confirmed(
-                "~presence:test",
-                oversized_value(),
-                None,
-                32,
-                32,
+                EntryWrite::new("~presence:test", oversized_value()).with_limits(mutation_limits()),
                 first_budget
             )
             .await
             .unwrap_err(),
-        groupnet_runtime::EntryMutationError::InvalidLimit
+        TOO_LONG
     );
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     let (second_budget, _) = budget(1_024);
     assert_eq!(
         group
             .set_entry_if_revision(
-                "~presence:test",
-                oversized_value(),
-                None,
+                EntryWrite::new("~presence:test", oversized_value()).with_limits(mutation_limits()),
                 EntryRevision {
                     key: None,
                     member: 0,
-                },
-                EntryMutationLimits {
-                    max_key_bytes: 32,
-                    max_value_bytes: 32,
                 },
                 second_budget,
             )
             .await
             .unwrap_err(),
-        groupnet_runtime::EntryMutationError::InvalidLimit
+        TOO_LONG
     );
     let (budget, _) = budget(1_024);
     assert_eq!(
         group
-            .delete_entry_if_value("~presence:test", oversized_value(), 32, 32, budget)
+            .delete_entry_if_value(
+                EntryRemoval::new("~presence:test", oversized_value())
+                    .with_limits(mutation_limits()),
+                budget
+            )
             .await
             .unwrap_err(),
-        groupnet_runtime::EntryMutationError::InvalidLimit
+        TOO_LONG
     );
     assert!(
         group

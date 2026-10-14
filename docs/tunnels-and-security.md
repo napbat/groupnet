@@ -10,11 +10,16 @@ to open a protected resource.
 
 Both endpoints configure a `TlsIdentity` and explicit `PeerIdentity` certificate
 pins. Applications open ordered streams with `node.endpoint(Ordered::new())`
-(or `node.peer(id, Ordered::new())`); `Node` also implements `BulkTransport` as
-an adapter over that same endpoint for code generic over bulk transports, and a
-standalone `Network` implements it directly over this tunnel endpoint. Without
-tunnel configuration, `connect` and `accept` return `Unsupported`; there is no
-plaintext fallback.
+(or `node.peer(id, Ordered::new())`), or with `Ordered::protocol(id)` for an
+application stream protocol with its own accept queue (see
+[typed sessions](architecture.md#typed-sessions-and-logical-peers)). Each
+ordered stream's authenticated setup names its `StreamProtocolId`, and the
+acceptor refuses a protocol it has no endpoint for. `Endpoint<Ordered>`
+implements `BulkTransport` for code generic over bulk transports, and so does
+`Node`, as an adapter over its default-protocol endpoint; a standalone `Network`
+implements it directly over this tunnel endpoint, without the setup exchange.
+Without tunnel configuration, `connect` and `accept` return `Unsupported`; there
+is no plaintext fallback.
 
 ```mermaid
 sequenceDiagram

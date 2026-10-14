@@ -11,7 +11,7 @@ use groupnet_runtime::InspectedPair;
 use super::{
     AdapterError, AdapterErrorKind, AdmissionClass, Admitted, BootstrapClaim, BootstrapMember,
     ByteAdmission, CAPACITY, ClaimObservationLimits, MALFORMED, NativeClaimSource, UNAVAILABLE,
-    allocation,
+    allocation, nonzero, remaining_ms,
 };
 use crate::volatile_recovery::bootstrap::ports::{ParticipationSnapshot, TimedParticipant};
 
@@ -25,7 +25,7 @@ impl NativeClaimSource {
             return Err(AdapterErrorKind::InvalidInput.into());
         }
         let mut inspection = self.inspection_limits(limits)?;
-        inspection.max_key_bytes = self.key.len().max(self.presence_key.len());
+        inspection.max_key_bytes = nonzero(self.key.len().max(self.presence_key.len()))?;
         let raw_charge = limits
             .max_metadata_bytes
             .checked_add(self.key.len())
@@ -74,7 +74,7 @@ impl NativeClaimSource {
                 status: entry.status,
             };
             if let Some(value) = entry.first {
-                let remaining_ms = entry.first_remaining_ttl_ms.ok_or(MALFORMED)?;
+                let remaining_ms = remaining_ms(entry.first_remaining_ttl).ok_or(MALFORMED)?;
                 if remaining_ms == 0 || remaining_ms > self.policy.claim_ttl_ms {
                     return Err(MALFORMED);
                 }
@@ -98,7 +98,7 @@ impl NativeClaimSource {
                 return Err(MALFORMED);
             }
             if let Some(value) = entry.second {
-                let remaining_ms = entry.second_remaining_ttl_ms.ok_or(MALFORMED)?;
+                let remaining_ms = remaining_ms(entry.second_remaining_ttl).ok_or(MALFORMED)?;
                 if remaining_ms == 0 || remaining_ms > self.policy.claim_ttl_ms {
                     return Err(MALFORMED);
                 }

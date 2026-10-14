@@ -37,7 +37,7 @@ use groupnet_consistency::{
     ChunkLimit, Commit, CommitLedger, Frontier, Group, Handoff, HostedRead, HostedReads,
     HostedWrites, Snapshot, SnapshotChunks, SnapshotSink, SnapshotSource, WriteToken,
 };
-use groupnet_core::{Activation, HostedConfig, NodeId, VoterRoster, placement};
+use groupnet_core::{NodeId, VoterRoster, placement};
 use groupnet_runtime::{GroupProfile, Node};
 use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, MemLink, Network};
 
@@ -179,19 +179,18 @@ impl Member {
             .collect();
         let mut builder = Node::builder(me.clone())
             .link(MemLink::new(net.endpoint(me.clone()), peers.clone()))
-            .gossip_interval_ms(15);
+            .gossip_interval(Duration::from_millis(15));
         for peer in peers {
             builder = builder.seed(peer);
         }
         let node = builder.start().await.expect("the memory link binds");
         let group = node.join_group_with(
             GROUP,
-            GroupProfile::hosted(HostedConfig {
-                activation: Activation::Quorum {
-                    voters: VoterRoster::new(voters.iter().cloned()),
-                },
+            GroupProfile::Quorum {
                 lease_ms: 600,
-            }),
+                voters: VoterRoster::new(voters.iter().cloned()),
+                storage: None,
+            },
         );
         let ledger = Arc::new(CommitLedger::new(group.clone()));
         let writes = HostedWrites::builder(

@@ -53,7 +53,7 @@ async fn client(
             .with_admission(Arc::new(OpenAdmission))
             .with_credentials(credential.to_vec()),
         )
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .start()
         .await
 }
@@ -99,7 +99,7 @@ async fn main() -> io::Result<()> {
     let address = transport.local_addr();
     let server = Node::builder(server_id.clone())
         .link(transport.into_bound_link(NonZeroU32::MIN))
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .start()
         .await?;
     let first = client("player-a", &server_id, address, credential).await?;

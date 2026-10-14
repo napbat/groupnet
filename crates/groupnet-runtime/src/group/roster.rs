@@ -1,5 +1,6 @@
 //! Membership and status reads over the group actor's published snapshots.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -152,25 +153,28 @@ impl Group {
     /// `max_members`; callers can remove it after receiving the snapshot.
     ///
     /// # Errors
-    /// Returns [`BoundedRosterError`] if a limit is zero or the observed view
-    /// exceeds either limit. An error is not a truncated roster.
+    /// Returns [`BoundedRosterError`] if the observed view exceeds either
+    /// limit. An error is not a truncated roster.
     pub fn statuses_held_bounded(
         &self,
-        max_members: usize,
-        max_member_bytes: usize,
+        max_members: NonZeroUsize,
+        max_member_bytes: NonZeroUsize,
     ) -> Result<Vec<(NodeId, Status, Duration)>, BoundedRosterError> {
-        if max_members == 0 || max_member_bytes == 0 {
-            return Err(BoundedRosterError::InvalidLimit);
-        }
         let view = self.statuses_rx.borrow();
-        if view.len() > max_members {
-            return Err(BoundedRosterError::TooManyMembers);
+        if view.len() > max_members.get() {
+            return Err(BoundedRosterError::TooManyMembers {
+                members: view.len(),
+                max: max_members.get(),
+            });
         }
-        if view
+        if let Some(node) = view
             .keys()
-            .any(|node| node.as_str().len() > max_member_bytes)
+            .find(|node| node.as_str().len() > max_member_bytes.get())
         {
-            return Err(BoundedRosterError::IdentityTooLong);
+            return Err(BoundedRosterError::IdentityTooLong {
+                bytes: node.as_str().len(),
+                max: max_member_bytes.get(),
+            });
         }
         let now = now_since(self.start);
         Ok(view

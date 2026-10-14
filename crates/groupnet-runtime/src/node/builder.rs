@@ -2,23 +2,24 @@ use std::collections::HashMap;
 use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use groupnet_core::{Config, GroupId, NodeId};
 use groupnet_messaging::ValidMessagingConfig;
 use groupnet_network::{LinkProvider, NetworkBuilder, RouterConfig, TunnelConfig};
-use groupnet_streams::{UnorderedConfig, ValidUnorderedConfig};
+use groupnet_streams::{OrderedConfig, UnorderedConfig, ValidOrderedConfig, ValidUnorderedConfig};
 
-use super::{GroupProfile, Inner, Node, ROUTING_GROUP, recv_loop, sync_peer_addrs};
+use super::{Inner, Node, Posture, ROUTING_GROUP, recv_loop, sync_peer_addrs};
+use crate::clock::core_millis;
 use crate::seeds::{NamedSeeds, resolve_named_seeds};
 
 /// Configures a managed [`Node`]'s protocol links, group memberships and
 /// node-wide protocol policies.
 ///
 /// Link providers bind their endpoints at [`start`](Self::start); adjacent
-/// admitted peers also become initial membership seeds. Node-wide messaging
-/// and unordered-session policies are validated by `start` and fixed for the
-/// node's life; per-operation delivery options stay on the protocol
+/// admitted peers also become initial membership seeds. Node-wide messaging,
+/// ordered-stream and unordered-session policies are validated once by `start`
+/// and fixed for the node's life; per-operation delivery options stay on the protocol
 /// descriptors.
 pub struct NodeBuilder {
     id: NodeId,
@@ -28,6 +29,7 @@ pub struct NodeBuilder {
     advertise_addr: Option<String>,
     named_seeds: Option<NamedSeeds>,
     messaging: crate::messaging::MessagingConfig,
+    ordered: OrderedConfig,
     unordered: UnorderedConfig,
 }
 
@@ -39,6 +41,7 @@ impl std::fmt::Debug for NodeBuilder {
             .field("seeds", &self.seeds)
             .field("named_seeds", &self.named_seeds)
             .field("messaging", &self.messaging)
+            .field("ordered", &self.ordered)
             .field("unordered", &self.unordered)
             .finish_non_exhaustive()
     }
@@ -54,6 +57,7 @@ impl NodeBuilder {
             advertise_addr: None,
             named_seeds: None,
             messaging: crate::messaging::MessagingConfig::default(),
+            ordered: OrderedConfig::default(),
             unordered: UnorderedConfig::default(),
         }
     }
@@ -91,6 +95,17 @@ impl NodeBuilder {
     #[must_use]
     pub fn messaging(mut self, config: crate::messaging::MessagingConfig) -> Self {
         self.messaging = config;
+        self
+    }
+
+    /// Configures node-wide ordered-stream accept queues (one per
+    /// [`StreamProtocolId`](crate::StreamProtocolId)) and the setup deadline for
+    /// every [`Ordered`](crate::Ordered) endpoint and peer of this node.
+    /// [`start`](Self::start) rejects an invalid configuration; the policy
+    /// cannot change once the node runs.
+    #[must_use]
+    pub fn ordered(mut self, config: OrderedConfig) -> Self {
+        self.ordered = config;
         self
     }
 
@@ -134,14 +149,16 @@ impl NodeBuilder {
         self
     }
 
-    /// Overrides the gossip round's cadence (milliseconds) — see
+    /// Overrides the gossip round's cadence — see
     /// [`Config::gossip_interval_ms`]. Every round sends a digest/delta
     /// anti-entropy exchange to [`gossip_fanout`](Self::gossip_fanout) peers.
-    /// Lower is faster to converge but chattier. Stored as given;
+    /// Lower is faster to converge but chattier. The core counts whole
+    /// milliseconds: a sub-millisecond remainder rounds up to the next one and
+    /// an interval beyond `u64::MAX` milliseconds saturates. Stored as given;
     /// [`start`](Self::start) rejects zero.
     #[must_use]
-    pub fn gossip_interval_ms(mut self, ms: u64) -> Self {
-        self.config.gossip_interval_ms = ms;
+    pub fn gossip_interval(mut self, interval: Duration) -> Self {
+        self.config.gossip_interval_ms = core_millis(interval);
         self
     }
 
@@ -207,6 +224,7 @@ impl NodeBuilder {
     /// validation, wrapping the typed error that names the field: the group
     /// [`ConfigError`](groupnet_core::ConfigError) from [`Config::validate`], a
     /// [`MessagingConfigError`](crate::messaging::MessagingConfigError), an
+    /// [`OrderedConfigError`](crate::OrderedConfigError), an
     /// [`UnorderedConfigError`](crate::UnorderedConfigError), or a
     /// [`NamedSeedsError`](crate::NamedSeedsError) from
     /// [`NamedSeeds::validate`]. Propagates invalid routing configuration,
@@ -217,6 +235,7 @@ impl NodeBuilder {
     pub async fn start(self) -> io::Result<Node> {
         self.config.validate()?;
         let messaging = ValidMessagingConfig::try_from(self.messaging)?;
+        let ordered = ValidOrderedConfig::try_from(self.ordered)?;
         let unordered = ValidUnorderedConfig::try_from(self.unordered)?;
         if let Some(named) = &self.named_seeds {
             named.validate()?;
@@ -234,6 +253,7 @@ impl NodeBuilder {
             seeds,
             config: self.config,
             messaging,
+            ordered_config: ordered,
             ordered: Mutex::new(None),
             unordered_config: unordered,
             unordered: Mutex::new(None),
@@ -260,7 +280,7 @@ impl NodeBuilder {
         let routing_group = node.get_or_spawn(
             GroupId::new(ROUTING_GROUP),
             None,
-            GroupProfile::from_mode(node.inner.config.mode.clone()),
+            Posture::from_mode(node.inner.config.mode.clone()),
         );
         if let Some(addr) = self.advertise_addr {
             let _ = routing_group.set_entry("~addr", addr.into_bytes(), None);

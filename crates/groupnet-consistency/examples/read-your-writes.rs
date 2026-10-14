@@ -147,7 +147,7 @@ async fn spawn(net: &Network, id: &str, peer: &str) -> (NodeId, Node, Group) {
             vec![NodeId::new(peer)],
         ))
         .seed(NodeId::new(peer))
-        .gossip_interval_ms(10)
+        .gossip_interval(Duration::from_millis(10))
         .start()
         .await
         .expect("the memory link binds");

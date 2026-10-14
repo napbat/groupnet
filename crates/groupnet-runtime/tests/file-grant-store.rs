@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Activation, HostedConfig, NodeId, RecoveredGrant, Role, VoterRoster};
-use groupnet_runtime::{FileGrantStore, Group, GroupProfile, Leadership, Node};
+use groupnet_core::{NodeId, RecoveredGrant, Role, VoterRoster};
+use groupnet_runtime::{FileGrantStore, Group, GroupProfile, Leadership, Node, VoterStorage};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
 
@@ -66,13 +66,11 @@ async fn boot_voter(
 ) -> (RecoveredGrant, Node, Group) {
     let store = FileGrantStore::open(path).expect("open ledger");
     let recovered = store.load().expect("an intact ledger loads");
-    let profile = GroupProfile::hosted(HostedConfig {
-        activation: Activation::Quorum {
-            voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
-        },
+    let profile = GroupProfile::Quorum {
         lease_ms: LEASE_MS,
-    })
-    .with_voter_storage(recovered.clone(), Arc::new(store));
+        voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
+        storage: Some(VoterStorage::new(recovered.clone(), Arc::new(store))),
+    };
     let opts = NodeOpts::new(group)
         .gossip_interval_ms(GOSSIP_MS)
         .group_profile(profile);

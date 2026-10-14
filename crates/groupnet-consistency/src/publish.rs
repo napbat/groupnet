@@ -55,10 +55,10 @@ mod tests {
         let attempts = Cell::new(0);
         let outcome = enqueue(|| {
             attempts.set(attempts.get() + 1);
-            Err(CommandRejected)
+            Err(CommandRejected::InboxFull)
         })
         .await;
-        assert_eq!(outcome, Err(CommandRejected));
+        assert_eq!(outcome, Err(CommandRejected::InboxFull));
         assert_eq!(attempts.get(), PUBLISH_RETRIES);
     }
 
@@ -68,7 +68,7 @@ mod tests {
         let outcome = enqueue(|| {
             attempts.set(attempts.get() + 1);
             if attempts.get() < 3 {
-                Err(CommandRejected)
+                Err(CommandRejected::InboxFull)
             } else {
                 Ok(())
             }

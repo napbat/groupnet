@@ -558,8 +558,8 @@ Status: **delivered (pending review)** — `Activation::Quorum { voters }` +
 `engine/election/quorum.rs`, `Effect::PersistGrant`, `RecoveredGrant` +
 `GroupEngine::with_recovered` in `groupnet-core`; the `GrantStore` trait,
 its bundled durable implementation `FileGrantStore` (one checksummed record,
-replaced by temp-file + `fsync` + rename) and
-`GroupProfile::with_voter_storage` in `groupnet-runtime`. The as-built rules
+replaced by temp-file + `fsync` + rename) and the `VoterStorage` that only
+`GroupProfile::Quorum` carries, in `groupnet-runtime`. The as-built rules
 refine the sketch above and are now contract:
 
 * **What carries global single-lease safety is the grant *promise*, not the
@@ -1107,7 +1107,7 @@ Status: **Delivered (pending review).** What shipped, by layer:
   `Effect::AnchorClaimDue`, `Command::AnchorActivated` /
   `Command::AnchorObserved`; the `X`-rows in `engine/election/external.rs`.
 * **runtime** — the `Anchor` trait (`load` + conditional `store`), `AnchorToken`
-  / `AnchorWriteIf` / `AnchorCas`, `GroupProfile::with_anchor`, and the per-group
+  / `AnchorWriteIf` / `AnchorCas`, `GroupProfile::External { anchor, .. }`, and the per-group
   `anchor_task` in `groupnet-runtime/src/anchor.rs`.
 * **sim** — a deterministic CAS register plus the driver state around it
   (`groupnet-sim/src/anchor.rs`), with fault knobs for anchor reachability,
@@ -1847,8 +1847,8 @@ Peers upgrade together, so there is no mixed-version cluster to plan for: an
 unknown kind is malformed and decodes to `None`, and `FRAME_VERSION` rejects a
 mis-deployed node rather than letting it misparse frames.
 
-**Consumer API:** select the group mode with `GroupProfile::hosted(HostedConfig)`
-and `Node::join_group_with`; observe it with `Group::leadership()`. Construct a
+**Consumer API:** select the group mode with a `GroupProfile` variant (`Settle`,
+`Quorum` or `External`, each carrying only its own options) and `Node::join_group_with`; observe it with `Group::leadership()`. Construct a
 Local-only path with `HostedWrites::new(group, me, capacity, encode)`, or a
 quorum-committed path with `HostedWrites::committed(group, me, capacity, encode,
 ledger)`, which validates the Hosted/Quorum configuration and ledger binding.

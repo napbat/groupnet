@@ -3,7 +3,7 @@
 //! with the fence that write bought it.
 //!
 //! This is `fenced-ownership` with the election replaced: the epoch is closed by
-//! [`Activation::External`] — an `If-None-Match` / `If-Match` `PUT` against a
+//! `Activation::External` — an `If-None-Match` / `If-Match` `PUT` against a
 //! single anchor object — instead of by a voter majority. Everything downstream
 //! of the epoch is unchanged, because a fence is a fence whoever allocated it.
 //! What the run shows:
@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use groupnet_consistency::{Group, HostedWrites};
 use groupnet_core::anchor::AnchorRecord;
-use groupnet_core::{Activation, HostedConfig, NodeId, Role};
+use groupnet_core::{NodeId, Role};
 use groupnet_runtime::{
     Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf, GroupProfile, Node,
 };
@@ -148,7 +148,7 @@ impl Member {
             .collect();
         let mut builder = Node::builder(me.clone())
             .link(MemLink::new(net.endpoint(me.clone()), peers.clone()))
-            .gossip_interval_ms(15);
+            .gossip_interval(Duration::from_millis(15));
         for peer in peers {
             builder = builder.seed(peer);
         }
@@ -156,13 +156,11 @@ impl Member {
         let anchor: Arc<dyn Anchor> = anchor.clone();
         let group = node.join_group_with(
             "docs",
-            GroupProfile::hosted(HostedConfig {
-                activation: Activation::External {
-                    steal_margin_ms: STEAL_MARGIN_MS,
-                },
+            GroupProfile::External {
                 lease_ms: LEASE_MS,
-            })
-            .with_anchor(anchor),
+                steal_margin_ms: STEAL_MARGIN_MS,
+                anchor: Some(anchor),
+            },
         );
         // The Local regime: no `CommitLedger`, no roster, no recovery gate.
         let writes = HostedWrites::new(

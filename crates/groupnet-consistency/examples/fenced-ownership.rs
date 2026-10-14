@@ -33,7 +33,7 @@ use std::time::Duration;
 use groupnet_consistency::{
     Commit, CommitLedger, Group, HostedError, HostedRead, HostedReads, HostedWrites,
 };
-use groupnet_core::{Activation, HostedConfig, NodeId, Role, VoterRoster};
+use groupnet_core::{NodeId, Role, VoterRoster};
 use groupnet_runtime::{GroupProfile, Node};
 use groupnet_transport_mem::{MemLink, Network};
 use tokio::task::JoinHandle;
@@ -102,7 +102,7 @@ impl Member {
             .collect();
         let mut builder = Node::builder(me.clone())
             .link(MemLink::new(net.endpoint(me.clone()), peers.clone()))
-            .gossip_interval_ms(15);
+            .gossip_interval(Duration::from_millis(15));
         for peer in peers {
             builder = builder.seed(peer);
         }
@@ -110,10 +110,11 @@ impl Member {
         let voters = VoterRoster::new(IDS.iter().map(|id| NodeId::new(*id)));
         let group = node.join_group_with(
             "docs",
-            GroupProfile::hosted(HostedConfig {
-                activation: Activation::Quorum { voters },
+            GroupProfile::Quorum {
                 lease_ms: LEASE_MS,
-            }),
+                voters,
+                storage: None,
+            },
         );
         // The committed regime builds only on a Quorum group: `QuorumApplied`
         // counts that activation's static voter roster.

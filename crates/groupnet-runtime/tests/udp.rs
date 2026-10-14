@@ -50,7 +50,7 @@ async fn three_nodes_converge_over_udp() {
                 announce_interval: Duration::from_millis(30),
                 ..RouterConfig::default()
             })
-            .gossip_interval_ms(30);
+            .gossip_interval(Duration::from_millis(30));
         for (j, id) in ids.iter().enumerate() {
             if i != j {
                 builder = builder.seed(id.clone());

@@ -51,19 +51,23 @@ const MAX_RECORD_LEN: usize = HEADER_LEN + u16::MAX as usize + CHECKSUM_LEN;
 /// A durable [`GrantStore`] backed by one file.
 ///
 /// Give each Quorum group its own path. On boot, call [`load`](Self::load) and
-/// pass the result to
-/// [`GroupProfile::with_voter_storage`](crate::GroupProfile::with_voter_storage)
+/// pass the result to [`VoterStorage::new`](crate::VoterStorage::new)
 /// together with this store, **before** joining the group: the join path is
 /// synchronous and holds a lock, so it performs no I/O of its own and cannot
 /// read the ledger for you.
 ///
 /// ```no_run
 /// # use std::sync::Arc;
-/// # use groupnet_runtime::{FileGrantStore, GroupProfile};
-/// # fn demo(profile: GroupProfile) -> std::io::Result<GroupProfile> {
+/// # use groupnet_core::VoterRoster;
+/// # use groupnet_runtime::{FileGrantStore, GroupProfile, VoterStorage};
+/// # fn demo(voters: VoterRoster) -> std::io::Result<GroupProfile> {
 /// let store = FileGrantStore::open("/var/lib/node/shard-42.grant")?;
 /// let recovered = store.load()?; // fail closed: a corrupt ledger is an error
-/// Ok(profile.with_voter_storage(recovered, Arc::new(store)))
+/// Ok(GroupProfile::Quorum {
+///     lease_ms: 2_000,
+///     voters,
+///     storage: Some(VoterStorage::new(recovered, Arc::new(store))),
+/// })
 /// # }
 /// ```
 ///

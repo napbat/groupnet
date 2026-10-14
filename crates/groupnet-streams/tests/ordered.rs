@@ -1,4 +1,5 @@
-//! Ordered endpoint lifetime is independent of the shared node tunnel transport.
+//! Ordered endpoint lifetime is independent of the shared node tunnel transport,
+//! and each stream protocol has its own isolated accept queue.
 
 use std::{io, time::Duration};
 
@@ -9,7 +10,10 @@ use groupnet_network::{
     tunnel::{PeerIdentity, TlsIdentity},
 };
 // The network types this crate's signatures take come from its own re-exports.
-use groupnet_streams::{OrderedProtocol, Router, SessionProtocol, TunnelTransport, TunneledStream};
+use groupnet_streams::{
+    OrderedConfig, OrderedConfigError, OrderedProtocol, QueueCapacity, Router, SessionProtocol,
+    StreamProtocolId, TunnelTransport, TunneledStream,
+};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::{bulk::BulkTransport, link::LinkConfig};
 use groupnet_transport_mem::Network;
@@ -119,8 +123,8 @@ async fn connect<P: SessionProtocol<Session = TunneledStream, ConnectOptions = (
 #[tokio::test]
 async fn ordered_shutdown_cancels_only_its_streams_and_blocked_calls() {
     let fabric = Fabric::new().await;
-    let sender = OrderedProtocol::new(fabric.sender.clone());
-    let receiver = OrderedProtocol::new(fabric.receiver.clone());
+    let sender = OrderedProtocol::new(fabric.sender.clone()).unwrap();
+    let receiver = OrderedProtocol::new(fabric.receiver.clone()).unwrap();
     let (client, server) = timeout(DEADLINE, async {
         tokio::join!(connect(&sender, fabric.right.local_id()), receiver.accept())
     })
@@ -139,11 +143,14 @@ async fn ordered_shutdown_cancels_only_its_streams_and_blocked_calls() {
     assert!(sender.connect(fabric.right.local_id(), ()).await.is_err());
     assert!(sender.accept().await.is_err());
 
-    // The original node bulk plane and unordered setup plane remain usable.
+    // The node's tunnel plane and unordered setup plane remain usable: a new
+    // endpoint on the same tunnels reaches the receiver, and setup channels
+    // still flow.
+    let sender_again = OrderedProtocol::new(fabric.sender.clone()).unwrap();
     timeout(DEADLINE, async {
         let (new, accepted, control, control_accepted) = tokio::join!(
-            fabric.sender.connect(fabric.right.local_id()),
-            fabric.receiver.accept(),
+            connect(&sender_again, fabric.right.local_id()),
+            receiver.accept(),
             fabric.sender.connect_control(fabric.right.local_id()),
             fabric.receiver.accept_control(),
         );
@@ -176,12 +183,13 @@ async fn ordered_shutdown_cancels_only_its_streams_and_blocked_calls() {
 #[tokio::test]
 async fn clones_share_lifetime_but_last_endpoint_drop_does_not_close_transport() {
     let fabric = Fabric::new().await;
-    let endpoint = OrderedProtocol::new(fabric.sender.clone());
+    let endpoint = OrderedProtocol::new(fabric.sender.clone()).unwrap();
     let clone = endpoint.clone();
+    let receiver = OrderedProtocol::new(fabric.receiver.clone()).unwrap();
     let (client, server) = timeout(DEADLINE, async {
         tokio::join!(
             endpoint.connect(fabric.right.local_id(), ()),
-            fabric.receiver.accept()
+            receiver.accept()
         )
     })
     .await
@@ -196,10 +204,11 @@ async fn clones_share_lifetime_but_last_endpoint_drop_does_not_close_transport()
     drop(clone);
     assert!(client.cancellation().is_cancelled());
     assert!(client.read(&mut [0]).await.is_err());
+    let fresh = OrderedProtocol::new(fabric.sender.clone()).unwrap();
     let (connected, accepted) = timeout(DEADLINE, async {
         tokio::join!(
-            fabric.sender.connect(fabric.right.local_id()),
-            fabric.receiver.accept()
+            fresh.connect(fabric.right.local_id(), ()),
+            receiver.accept()
         )
     })
     .await
@@ -212,7 +221,7 @@ async fn clones_share_lifetime_but_last_endpoint_drop_does_not_close_transport()
 #[tokio::test]
 async fn node_shutdown_notifies_endpoint_and_interrupts_accept() {
     let fabric = Fabric::new().await;
-    let endpoint = OrderedProtocol::new(fabric.receiver.clone());
+    let endpoint = OrderedProtocol::new(fabric.receiver.clone()).unwrap();
     timeout(DEADLINE, async {
         let (accepted, ()) = tokio::join!(endpoint.accept(), fabric.receiver.close());
         assert!(accepted.is_err());
@@ -236,7 +245,7 @@ async fn cancelled_connect_releases_endpoint_sessions_without_cancelling_shared_
         ),
     )
     .unwrap();
-    let endpoint = OrderedProtocol::new(tunnels.clone());
+    let endpoint = OrderedProtocol::new(tunnels.clone()).unwrap();
     for _ in 0..16 {
         assert!(
             timeout(Duration::from_millis(25), endpoint.connect(&peer, ()))
@@ -253,4 +262,145 @@ async fn cancelled_connect_releases_endpoint_sessions_without_cancelling_shared_
     assert!(!tunnels.cancellation().is_cancelled());
     tunnels.close().await;
     router.close().await;
+}
+
+/// Writes `tag` on a fresh stream of `endpoint`'s protocol.
+async fn tagged(endpoint: &OrderedProtocol, peer: &NodeId, tag: u8) -> TunneledStream {
+    let mut stream = endpoint.connect(peer, ()).await.unwrap();
+    stream.write_all(&[tag]).await.unwrap();
+    stream.flush().await.unwrap();
+    stream
+}
+
+/// Accepts one stream from `endpoint` and returns its first byte.
+async fn first_byte(endpoint: &OrderedProtocol) -> u8 {
+    let (_, mut stream) = endpoint.accept().await.unwrap();
+    let mut tag = [0];
+    stream.read_exact(&mut tag).await.unwrap();
+    tag[0]
+}
+
+#[tokio::test]
+async fn protocol_scoped_consumers_never_receive_each_others_streams() {
+    const RPC: StreamProtocolId = StreamProtocolId::new(1);
+    const BLOBS: StreamProtocolId = StreamProtocolId::new(2);
+    const STREAMS: u8 = 4;
+
+    let fabric = Fabric::new().await;
+    let receiver = OrderedProtocol::new(fabric.receiver.clone()).unwrap();
+    let (rpc_in, blobs_in) = (receiver.scoped(RPC), receiver.scoped(BLOBS));
+    assert_eq!(rpc_in.protocol(), RPC);
+    assert_eq!(receiver.protocol(), StreamProtocolId::DEFAULT);
+    let sender = OrderedProtocol::new(fabric.sender.clone()).unwrap();
+    let (rpc_out, blobs_out) = (sender.scoped(RPC), sender.scoped(BLOBS));
+    let peer = fabric.right.local_id().clone();
+
+    // Interleaved connects of both protocols, all queued before any accept.
+    let mut held = Vec::new();
+    timeout(DEADLINE, async {
+        for _ in 0..STREAMS {
+            held.push(tagged(&rpc_out, &peer, b'r').await);
+            held.push(tagged(&blobs_out, &peer, b'b').await);
+        }
+    })
+    .await
+    .unwrap();
+
+    // Each independent accept loop sees exactly its own protocol's streams.
+    timeout(DEADLINE, async {
+        for _ in 0..STREAMS {
+            assert_eq!(first_byte(&blobs_in).await, b'b');
+        }
+        for _ in 0..STREAMS {
+            assert_eq!(first_byte(&rpc_in).await, b'r');
+        }
+    })
+    .await
+    .unwrap();
+    for (name, endpoint) in [
+        ("rpc", &rpc_in),
+        ("blobs", &blobs_in),
+        ("default", &receiver),
+    ] {
+        assert!(
+            timeout(Duration::from_millis(100), endpoint.accept())
+                .await
+                .is_err(),
+            "{name} accepted a stream that was never connected to it"
+        );
+    }
+
+    // A protocol the receiver never bound is refused at setup.
+    let unbound = sender.scoped(StreamProtocolId::new(3));
+    let refused = timeout(DEADLINE, unbound.connect(&peer, ()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+    fabric.close().await;
+}
+
+#[tokio::test]
+async fn a_full_protocol_queue_refuses_without_touching_its_neighbour() {
+    const FULL: StreamProtocolId = StreamProtocolId::new(9);
+    let fabric = Fabric::new().await;
+    let config = OrderedConfig {
+        accept_queue: QueueCapacity::MIN,
+        ..OrderedConfig::default()
+    };
+    let receiver = OrderedProtocol::with_config(fabric.receiver.clone(), config).unwrap();
+    let full = receiver.scoped(FULL);
+    let sender = OrderedProtocol::new(fabric.sender.clone()).unwrap();
+    let peer = fabric.right.local_id().clone();
+    let queued = timeout(DEADLINE, tagged(&sender.scoped(FULL), &peer, 1))
+        .await
+        .unwrap();
+    let refused = timeout(DEADLINE, sender.scoped(FULL).connect(&peer, ()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+
+    // The default protocol's queue is its own.
+    let (default_out, default_in) = timeout(DEADLINE, async {
+        tokio::join!(tagged(&sender, &peer, 2), first_byte(&receiver))
+    })
+    .await
+    .unwrap();
+    assert_eq!(default_in, 2);
+    assert_eq!(timeout(DEADLINE, first_byte(&full)).await.unwrap(), 1);
+    drop((queued, default_out));
+    fabric.close().await;
+}
+
+#[tokio::test]
+async fn invalid_config_is_rejected_before_any_dispatcher_starts() {
+    let fabric = Fabric::new().await;
+    let error = OrderedProtocol::with_config(
+        fabric.receiver.clone(),
+        OrderedConfig {
+            setup_timeout: Duration::ZERO,
+            ..OrderedConfig::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<OrderedConfigError>()),
+        Some(&OrderedConfigError::ZeroSetupTimeout)
+    );
+    // Nothing claimed the receiver's ordered queue: a raw tunnel accept still
+    // receives the stream.
+    let (connected, accepted) = timeout(DEADLINE, async {
+        tokio::join!(
+            fabric.sender.connect(fabric.right.local_id()),
+            fabric.receiver.accept()
+        )
+    })
+    .await
+    .unwrap();
+    assert!(connected.is_ok() && accepted.is_ok());
+    fabric.close().await;
 }

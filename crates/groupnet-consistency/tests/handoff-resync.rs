@@ -57,7 +57,7 @@ use groupnet_consistency::{
     HandoffReceipt, HostedRead, HostedReads, HostedWrites, Snapshot, SnapshotChunks, SnapshotSink,
     SnapshotSource, WriteToken,
 };
-use groupnet_core::{Activation, HostedConfig, NodeId, Role, VoterRoster, placement};
+use groupnet_core::{NodeId, Role, VoterRoster, placement};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, Network};
@@ -101,12 +101,11 @@ fn ranked(group: &str, ids: &[&str]) -> Vec<NodeId> {
 
 /// A Quorum profile over `voters`, storage-free (see the module docs).
 fn quorum_profile(voters: &[&str]) -> GroupProfile {
-    GroupProfile::hosted(HostedConfig {
-        activation: Activation::Quorum {
-            voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
-        },
+    GroupProfile::Quorum {
         lease_ms: LEASE_MS,
-    })
+        voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
+        storage: None,
+    }
 }
 
 /// A single-writer target, in the map shape both ends of a handoff speak.

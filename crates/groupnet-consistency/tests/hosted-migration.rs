@@ -39,7 +39,7 @@ use groupnet_consistency::{
     CAP_HOSTED, Commit, CommitLedger, CommitOutcome, Completeness, HostedError, HostedRead,
     HostedReads, HostedWrites, WriteToken,
 };
-use groupnet_core::{Activation, HostedConfig, NodeId, Role, VoterRoster, placement};
+use groupnet_core::{NodeId, Role, VoterRoster, placement};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
@@ -92,12 +92,11 @@ fn ranked(group: &str, ids: &[&str]) -> Vec<NodeId> {
 
 /// A Quorum profile over `voters`, storage-free (see the module docs).
 fn quorum_profile(voters: &[&str]) -> GroupProfile {
-    GroupProfile::hosted(HostedConfig {
-        activation: Activation::Quorum {
-            voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
-        },
+    GroupProfile::Quorum {
         lease_ms: LEASE_MS,
-    })
+        voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
+        storage: None,
+    }
 }
 
 /// The leadership every live node agrees on, or `None` while it is still

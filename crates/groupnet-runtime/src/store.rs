@@ -2,10 +2,9 @@
 //! [`Effect::PersistGrant`] contract into a real one.
 //!
 //! Only a [`Quorum`](groupnet_core::Activation::Quorum) group has anything to
-//! persist, and only a node inside its voter roster. Everything here is inert
-//! for every other group — configuring a store on an
-//! [`Eventual`](groupnet_core::GroupMode::Eventual) group is legal and simply
-//! never called.
+//! persist, and only a node inside its voter roster, so voter storage exists
+//! only on [`GroupProfile::Quorum`](crate::GroupProfile::Quorum): no other
+//! profile can carry a store.
 //!
 //! [`Effect::PersistGrant`]: groupnet_core::Effect::PersistGrant
 
@@ -84,10 +83,11 @@ pub use file::FileGrantStore;
 /// * **A panic counts as a failure.** The driver treats a panicking store
 ///   exactly like an error return — neither proves the pair reached disk.
 ///
-/// On boot, the deployment reads its store back and hands the result to
-/// [`GroupProfile::with_voter_storage`](crate::GroupProfile::with_voter_storage)
-/// as a [`RecoveredGrant`]. Read it *before* joining: the join path is
-/// synchronous and holds a lock, so it can perform no I/O of its own.
+/// On boot, the deployment reads its store back and hands the result, with
+/// the store, to [`VoterStorage::new`] for a
+/// [`GroupProfile::Quorum`](crate::GroupProfile::Quorum) as a
+/// [`RecoveredGrant`]. Read it *before* joining: the join path is synchronous
+/// and holds a lock, so it can perform no I/O of its own.
 ///
 /// [`FileGrantStore`] is the bundled implementation: one checksummed record
 /// per group, replaced atomically, read back with
@@ -109,19 +109,29 @@ pub trait GrantStore: Send + Sync + 'static {
     fn persist(&self, epoch: u64, claimant: &NodeId) -> std::io::Result<()>;
 }
 
-/// The voter-durability wiring one group is joined with: what storage said on
-/// boot, and where to write what happens next.
+/// The voter-durability wiring one Quorum group is joined with: what storage
+/// said on boot, and where to write what happens next. Carried only by
+/// [`GroupProfile::Quorum`](crate::GroupProfile::Quorum), the one mode with a
+/// voter ledger.
 ///
-/// Built by [`GroupProfile::with_voter_storage`](crate::GroupProfile::with_voter_storage);
-/// the two halves travel together because either alone is a half-measure — a
+/// The two halves travel together because either alone is a half-measure — a
 /// store with no recovery re-arms the boot blackout it was meant to replace,
 /// and a recovery with no store recovers a pair that will never be updated.
 #[derive(Clone)]
-pub(crate) struct VoterStorage {
+pub struct VoterStorage {
     /// What this voter's storage says it had granted before the restart.
-    pub recovered: RecoveredGrant,
+    pub(crate) recovered: RecoveredGrant,
     /// Where grants are written before they reach the wire.
-    pub store: Arc<dyn GrantStore>,
+    pub(crate) store: Arc<dyn GrantStore>,
+}
+
+impl VoterStorage {
+    /// Pairs what `store` said on boot (`recovered`, read **before** joining)
+    /// with the store that persists every later grant.
+    #[must_use]
+    pub fn new(recovered: RecoveredGrant, store: Arc<dyn GrantStore>) -> Self {
+        Self { recovered, store }
+    }
 }
 
 impl fmt::Debug for VoterStorage {

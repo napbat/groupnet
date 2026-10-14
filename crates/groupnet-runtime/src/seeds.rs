@@ -10,15 +10,19 @@
 //! resolution, off the startup path, for the life of the node:
 //!
 //! * **First resolution** is attempted at once, then every
-//!   [`retry_interval`](NamedSeeds::retry_interval) until it succeeds. After
-//!   [`startup_attempts`](NamedSeeds::startup_attempts) failures the seed is
+//!   [`retry_interval`](NamedSeeds::with_retry_interval) until it succeeds. After
+//!   [`startup_attempts`](NamedSeeds::with_startup_attempts) failures the seed is
 //!   reported [`SeedEvent::Unresolved`] once and from then on retried at the
 //!   refresh cadence — a seed is never abandoned.
-//! * **Re-resolution** runs every [`refresh_interval`](NamedSeeds::refresh_interval)
+//! * **Re-resolution** runs every [`refresh_interval`](NamedSeeds::with_refresh_interval)
 //!   once a seed has resolved. A changed address is taught to the transport and
 //!   reported [`SeedEvent::Resolved`] with the address it replaced; an unchanged
 //!   one is not re-taught. A failed lookup keeps the last address — a DNS blip
 //!   must not churn the book.
+//!
+//! An interval longer than the clock can schedule (up to [`Duration::MAX`])
+//! saturates to the furthest representable wait: the seed is simply not
+//! retried within the node's life, and the resolver never overflows.
 //!
 //! Every named seed joins the node's seed set at [`start`](crate::NodeBuilder::start),
 //! so every group contacts it the moment its address is known; until then a
@@ -57,6 +61,10 @@ pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// busy-spin the resolver task.
 const MIN_INTERVAL: Duration = Duration::from_millis(1);
 
+/// The longest wait the resolver schedules (about thirty years, Tokio's own
+/// "far future"): a longer interval saturates here, an unobservable difference.
+const MAX_WAIT: Duration = Duration::from_hours(24 * 365 * 30);
+
 /// A future returned by [`SeedResolver::resolve`].
 ///
 /// Boxed so the trait stays **dyn-compatible**: [`NamedSeeds`] holds an
@@ -91,7 +99,7 @@ impl SeedResolver for SystemResolver {
     }
 }
 
-/// What the resolver task reports through [`NamedSeeds::on_event`].
+/// What the resolver task reports through [`NamedSeeds::with_observer`].
 #[derive(Debug)]
 pub enum SeedEvent {
     /// A seed resolved to an address it did not hold before, and the transport
@@ -135,7 +143,7 @@ type Observer = Arc<dyn Fn(&SeedEvent) + Send + Sync>;
 ///     .link(link)
 ///     .named_seeds(
 ///         NamedSeeds::new(SystemResolver)
-///             .seed(NodeId::new("cache-0"), "cache-0.cache.svc:7000"),
+///             .with_seed(NodeId::new("cache-0"), "cache-0.cache.svc:7000"),
 ///     )
 ///     .start().await?;
 /// # let _ = node;
@@ -183,15 +191,16 @@ impl NamedSeeds {
     /// local node is ignored at start, so one shared all-replicas list can
     /// configure every replica.
     #[must_use]
-    pub fn seed(mut self, node: NodeId, name: impl Into<String>) -> Self {
+    pub fn with_seed(mut self, node: NodeId, name: impl Into<String>) -> Self {
         self.seeds.push((node, name.into()));
         self
     }
 
     /// The wait between attempts while a seed has never resolved. Stored as
-    /// given; [`validate`](Self::validate) rejects anything under 1 ms.
+    /// given; [`validate`](Self::validate) rejects anything under 1 ms, and a
+    /// wait beyond what the clock can schedule saturates.
     #[must_use]
-    pub fn retry_interval(mut self, interval: Duration) -> Self {
+    pub fn with_retry_interval(mut self, interval: Duration) -> Self {
         self.retry_interval = interval;
         self
     }
@@ -199,16 +208,17 @@ impl NamedSeeds {
     /// How many failed attempts a never-resolved seed gets before it is
     /// reported [`SeedEvent::Unresolved`].
     #[must_use]
-    pub fn startup_attempts(mut self, attempts: NonZeroU32) -> Self {
+    pub fn with_startup_attempts(mut self, attempts: NonZeroU32) -> Self {
         self.startup_attempts = attempts;
         self
     }
 
     /// The re-resolution cadence once a seed has resolved, and the retry
     /// cadence after its startup window. Stored as given;
-    /// [`validate`](Self::validate) rejects anything under 1 ms.
+    /// [`validate`](Self::validate) rejects anything under 1 ms, and a wait
+    /// beyond what the clock can schedule saturates.
     #[must_use]
-    pub fn refresh_interval(mut self, interval: Duration) -> Self {
+    pub fn with_refresh_interval(mut self, interval: Duration) -> Self {
         self.refresh_interval = interval;
         self
     }
@@ -216,7 +226,7 @@ impl NamedSeeds {
     /// Reports every [`SeedEvent`] to `observer` (logging, readiness). Called
     /// on the resolver task; keep it cheap and non-blocking.
     #[must_use]
-    pub fn on_event(mut self, observer: impl Fn(&SeedEvent) + Send + Sync + 'static) -> Self {
+    pub fn with_observer(mut self, observer: impl Fn(&SeedEvent) + Send + Sync + 'static) -> Self {
         self.observer = Some(Arc::new(observer));
         self
     }
@@ -343,8 +353,22 @@ pub(crate) async fn resolve_named_seeds<T: Transport>(
             let Some(transport) = transport.upgrade() else {
                 return;
             };
-            slot.due = Instant::now() + attempt(&*transport, slot, outcome, &seeds);
+            let now = Instant::now();
+            slot.due = schedule(now, attempt(&*transport, slot, outcome, &seeds));
         }
+    }
+}
+
+/// The instant `wait` after `now`, saturating at [`MAX_WAIT`] instead of
+/// overflowing the clock. Halving finds the furthest representable instant on
+/// a platform whose clock cannot reach `now + MAX_WAIT`.
+fn schedule(now: Instant, wait: Duration) -> Instant {
+    let mut wait = wait.min(MAX_WAIT);
+    loop {
+        if let Some(due) = now.checked_add(wait) {
+            return due;
+        }
+        wait /= 2;
     }
 }
 

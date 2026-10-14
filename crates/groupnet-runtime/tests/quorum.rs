@@ -22,8 +22,10 @@
 //!   bids and no epoch is ever closed;
 //! * a voter that restarts with its persisted ledger re-grants the **sitting
 //!   claimant immediately**, so the incumbent is host again well inside the
-//!   `lease_ms` a blackout would have cost;
-//! * an `Eventual` group configured with voter storage never touches it.
+//!   `lease_ms` a blackout would have cost.
+//!
+//! Voter storage exists only on `GroupProfile::Quorum`; no other profile can
+//! carry a store (a compile-time property, proven by the `GroupProfile` docs).
 //!
 //! All waiting is a bounded poll on a predicate (`eventually_within`), never a
 //! bare sleep.
@@ -32,14 +34,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use groupnet_core::{
-    Activation, HostedConfig, NodeId, RecoveredGrant, Role, VoterRoster, placement, wire,
-};
+use groupnet_core::{NodeId, RecoveredGrant, Role, VoterRoster, placement, wire};
 use groupnet_network::{RouterConfig, testing::message_payload};
-use groupnet_runtime::{GrantStore, Group, GroupProfile, Leadership, Node};
-use groupnet_testkit::cluster::{
-    MemCluster, NodeOpts, converged_within, eventually_within, spawn_mem_node,
-};
+use groupnet_runtime::{GrantStore, Group, GroupProfile, Leadership, Node, VoterStorage};
+use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport::link::{BoundLink, LinkConfig};
 use groupnet_transport::{Inbound, Transport};
 use groupnet_transport_mem::{MemTransport, Network};
@@ -81,13 +79,11 @@ fn quorum_profile(
     store: Arc<RecordingStore>,
     recovered: RecoveredGrant,
 ) -> GroupProfile {
-    GroupProfile::hosted(HostedConfig {
-        activation: Activation::Quorum {
-            voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
-        },
+    GroupProfile::Quorum {
         lease_ms: LEASE_MS,
-    })
-    .with_voter_storage(recovered, store)
+        voters: VoterRoster::new(voters.iter().map(|v| NodeId::new(*v))),
+        storage: Some(VoterStorage::new(recovered, store)),
+    }
 }
 
 /// A [`GrantStore`] that remembers every persist the driver asked of it and —
@@ -624,57 +620,6 @@ async fn a_recovered_voter_re_grants_the_incumbent_without_a_blackout() {
     .await;
 }
 
-/// An `Eventual` group configured with voter storage never touches it: there is
-/// no ledger to write, so the store stays empty for the life of a demonstrably
-/// live group.
-///
-/// One store, shared by all three nodes, so a single stray persist anywhere
-/// shows up here. (That it *can* show up is what the tests above establish.)
-#[tokio::test]
-async fn an_eventual_group_never_touches_its_voter_store() {
-    const GROUP: &str = "eventual-with-storage";
-
-    let store = RecordingStore::healthy();
-    let cluster = MemCluster::builder(&["es-a", "es-b", "es-c"])
-        .group(GROUP)
-        .gossip_interval_ms(GOSSIP_MS)
-        .group_profile(
-            GroupProfile::eventual().with_voter_storage(RecoveredGrant::none(), store.clone()),
-        )
-        .spawn()
-        .await;
-
-    let refs: Vec<&Group> = cluster.groups.iter().collect();
-    converged_within(&refs, SETTLE).await;
-    // Demonstrably live, not merely quiet: a write crosses the group.
-    cluster.groups[0]
-        .set_entry("crossed", b"ok".to_vec(), None)
-        .expect("the group actor is live");
-    eventually_within("the write to reach the other nodes", SETTLE, || {
-        cluster.groups[1..]
-            .iter()
-            .all(|g| g.node_entry(&cluster.ids[0], "crossed").is_some())
-    })
-    .await;
-
-    for (id, group) in cluster.ids.iter().zip(&cluster.groups) {
-        assert_eq!(
-            group.leadership(),
-            Leadership {
-                epoch: 0,
-                host: None,
-                role: Role::Follower,
-            },
-            "{id}'s eventual group must never leave the initial belief"
-        );
-    }
-    assert!(
-        store.attempts().is_empty(),
-        "an Eventual group has no voter ledger, so nothing may be written to one: {:?}",
-        store.attempts()
-    );
-}
-
 /// What one node actually put on the wire, by frame kind.
 ///
 /// A frame the driver dropped is invisible from every other vantage point — the
@@ -760,7 +705,7 @@ async fn build_wired(net: &Network, id: &str, all: &[&str]) -> (Node, Arc<WireCo
             announce_interval: Duration::from_millis(GOSSIP_MS),
             ..RouterConfig::default()
         })
-        .gossip_interval_ms(GOSSIP_MS);
+        .gossip_interval(Duration::from_millis(GOSSIP_MS));
     for seed in all.iter().filter(|other| **other != id) {
         builder = builder.seed(NodeId::new(*seed));
     }

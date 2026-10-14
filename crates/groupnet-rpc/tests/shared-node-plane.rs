@@ -1,23 +1,25 @@
 //! Integration test: **RPC next to another stream consumer on one runtime
-//! `Node`** — two nodes on a routed in-memory network with pinned TLS
-//! tunnels, whose bulk plane every stream consumer of a node shares.
+//! `Node`**, each with its own independent accept loop — two nodes on a
+//! routed in-memory network with pinned TLS tunnels.
 //!
-//! The serving node runs the only accept loop on its plane and dispatches
-//! each inbound stream by the tag byte its dialer wrote first: RPC streams go
-//! to an `RpcServer` through the connection-level `serve`, blob streams to a
-//! framed echo. Calls and blob echoes interleave on the same node pair, the
-//! handler sees the tunnel-authenticated caller, and the RPC server counts
-//! only the RPC connection.
+//! Every consumer binds its own ordered stream protocol: the RPC server owns
+//! the accept loop of its protocol through `RpcServer::bind`, and a blob echo
+//! runs a separate accept loop on another protocol of the same node. The node
+//! routes each inbound stream by the protocol its connector named in the
+//! authenticated setup, so no shared dispatcher or tag byte exists. Calls and
+//! blob echoes interleave on the same node pair, the handler sees the
+//! tunnel-authenticated caller, the RPC server counts only the RPC connection,
+//! and the node's default ordered protocol never sees either consumer's
+//! streams.
 
 use std::io;
 use std::time::Duration;
 
-use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use groupnet_core::NodeId;
 use groupnet_network::TunnelConfig;
 use groupnet_network::tunnel::{PeerIdentity, TlsIdentity};
 use groupnet_rpc::{BulkTransport, Bytes, DataPlane, DataStream, RpcClient, RpcServer, RpcStatus};
-use groupnet_runtime::Node;
+use groupnet_runtime::{Node, Ordered, StreamProtocolId};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport_mem::{MemLink, Network};
 use rcgen::{
@@ -29,9 +31,9 @@ use tokio::task::JoinSet;
 /// Bounds route discovery and every call.
 const WAIT: Duration = Duration::from_secs(10);
 
-/// The first byte of every stream on the shared plane names its consumer.
-const RPC: u8 = b'r';
-const BLOB: u8 = b'b';
+/// The stream protocols every node in the cluster agrees on.
+const RPC: StreamProtocolId = StreamProtocolId::new(1);
+const BLOB: StreamProtocolId = StreamProtocolId::new(2);
 
 /// One CA and `count` leaf identities it signed, each with its leaf DER.
 fn identities(count: usize) -> Vec<(TlsIdentity, Vec<u8>)> {
@@ -99,29 +101,6 @@ async fn linked_nodes(a_id: &NodeId, b_id: &NodeId) -> io::Result<(Node, Node)> 
     Ok((a, b))
 }
 
-/// The node's own streams, tagged for the remote dispatcher: `connect` writes
-/// `tag` before handing the stream to its consumer.
-struct Tagged {
-    node: Node,
-    tag: u8,
-}
-
-impl BulkTransport for Tagged {
-    type Error = io::Error;
-    type Stream = <Node as BulkTransport>::Stream;
-
-    async fn connect(&self, to: &NodeId) -> io::Result<Self::Stream> {
-        let mut stream = BulkTransport::connect(&self.node, to).await?;
-        stream.write_all(&[self.tag]).await?;
-        stream.flush().await?;
-        Ok(stream)
-    }
-
-    async fn accept(&self) -> io::Result<(NodeId, Self::Stream)> {
-        BulkTransport::accept(&self.node).await
-    }
-}
-
 /// The second consumer: echoes every frame back on its stream.
 async fn blob_echo<S>(mut stream: DataStream<S>)
 where
@@ -135,7 +114,7 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rpc_and_a_blob_consumer_share_one_node_plane() -> io::Result<()> {
+async fn rpc_and_a_blob_consumer_run_independent_accept_loops_on_one_node() -> io::Result<()> {
     const CALLS: usize = 16;
     const BLOBS: usize = 3;
 
@@ -143,45 +122,37 @@ async fn rpc_and_a_blob_consumer_share_one_node_plane() -> io::Result<()> {
     let caller_id = NodeId::new("shared-caller");
     let (server_node, caller_node) = linked_nodes(&server_id, &caller_id).await?;
 
-    // Serving node: one accept loop on the node's plane, RPC one consumer.
-    let rpc = RpcServer::new(|from: NodeId, request: Bytes| async move {
-        Ok::<_, RpcStatus>(Bytes::from(format!(
-            "{from}:{}",
-            String::from_utf8_lossy(&request)
-        )))
-    });
-    let dispatcher = tokio::spawn({
-        let (plane, rpc) = (DataPlane::new(server_node.clone()), rpc.clone());
+    // Serving node: RPC owns its own protocol's accept loop...
+    let rpc = RpcServer::bind(
+        DataPlane::new(server_node.endpoint(Ordered::protocol(RPC))?),
+        |from: NodeId, request: Bytes| async move {
+            Ok::<_, RpcStatus>(Bytes::from(format!(
+                "{from}:{}",
+                String::from_utf8_lossy(&request)
+            )))
+        },
+    );
+    // ...and the blob consumer runs an independent one beside it.
+    let blob_loop = tokio::spawn({
+        let plane = DataPlane::new(server_node.endpoint(Ordered::protocol(BLOB))?);
         async move {
-            while let Ok((from, stream)) = plane.accept().await {
-                let rpc = rpc.clone();
-                tokio::spawn(async move {
-                    let mut raw = stream.into_inner();
-                    let mut tag = [0];
-                    if raw.read_exact(&mut tag).await.is_err() {
-                        return;
-                    }
-                    match tag[0] {
-                        RPC => rpc
-                            .serve(from, DataStream::new(raw))
-                            .expect("the RPC server admits the stream"),
-                        BLOB => blob_echo(DataStream::new(raw)).await,
-                        other => panic!("untagged stream {other}"),
-                    }
-                });
+            let mut served = 0;
+            while let Ok((_, stream)) = plane.accept().await {
+                served += 1;
+                tokio::spawn(blob_echo(stream));
+                if served == BLOBS {
+                    break;
+                }
             }
+            served
         }
     });
 
-    // Calling node: an RPC client and blob streams over the same node.
-    let client = RpcClient::new(DataPlane::new(Tagged {
-        node: caller_node.clone(),
-        tag: RPC,
-    }));
-    let blobs = DataPlane::new(Tagged {
-        node: caller_node.clone(),
-        tag: BLOB,
-    });
+    // Calling node: an RPC client and blob streams, each on its protocol.
+    let client = RpcClient::new(DataPlane::new(
+        caller_node.endpoint(Ordered::protocol(RPC))?,
+    ));
+    let blobs = DataPlane::new(caller_node.endpoint(Ordered::protocol(BLOB))?);
 
     let mut work = JoinSet::new();
     for n in 0..BLOBS {
@@ -212,13 +183,30 @@ async fn rpc_and_a_blob_consumer_share_one_node_plane() -> io::Result<()> {
         done.expect("work task")?;
     }
     assert_eq!(
+        tokio::time::timeout(WAIT, blob_loop)
+            .await
+            .expect("the blob loop accepted every blob stream")
+            .expect("blob loop task"),
+        BLOBS,
+        "the blob loop accepted exactly the blob streams"
+    );
+    assert_eq!(
         rpc.connections(),
         1,
         "every call shared one RPC connection; blob streams never reached RPC"
     );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            BulkTransport::accept(&server_node)
+        )
+        .await
+        .is_err(),
+        "the node's default ordered protocol received a scoped stream"
+    );
 
     client.shutdown();
-    dispatcher.abort();
+    rpc.shutdown();
     caller_node.close().await;
     server_node.close().await;
     Ok(())

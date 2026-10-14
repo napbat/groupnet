@@ -8,6 +8,8 @@
 
 #![cfg(all(feature = "runtime", feature = "mem"))]
 
+use std::time::Duration;
+
 use groupnet::core::NodeId;
 use groupnet::network::RouterConfig;
 use groupnet::runtime::{Group, Node};
@@ -32,7 +34,7 @@ async fn cluster_built_from_facade_paths_converges_and_replicates() {
         let node = Node::builder(id.clone())
             .link(MemLink::new(net.endpoint(id.clone()), peers))
             .routing(RouterConfig::default())
-            .gossip_interval_ms(20)
+            .gossip_interval(Duration::from_millis(20))
             .start()
             .await
             .expect("start node");
