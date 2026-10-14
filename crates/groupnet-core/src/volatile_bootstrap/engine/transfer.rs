@@ -461,7 +461,9 @@ impl ClaimEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::types::{BootId, BootstrapConfig, BootstrapEvent, BootstrapScope};
+    use super::super::super::types::{
+        BootId, BootstrapConfig, BootstrapEvent, BootstrapScope, PresenceIdentity,
+    };
     use super::super::ObservedRenewal;
     use super::*;
     use crate::NodeId;
@@ -485,9 +487,11 @@ mod tests {
                 domain: "o".into(),
                 partition: "b".into(),
             },
-            NodeId::from("me"),
-            BootId(1),
-            1,
+            PresenceIdentity {
+                node: NodeId::from("me"),
+                boot: BootId(1),
+                session: 1,
+            },
         )
         .unwrap();
         engine

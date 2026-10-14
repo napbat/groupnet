@@ -82,7 +82,7 @@ const BOUNDARIES: [Boundary; 6] = [
 ];
 
 fn within(rng: &mut SplitMix64, (low, high): (u64, u64)) -> u64 {
-    low + u64::from(rng.below(u32::try_from(high - low + 1).unwrap()))
+    low + u64::from(rng.up_to(u32::try_from(high - low).unwrap()))
 }
 
 /// `a`'s departure, every instant drawn from its stop.
@@ -116,7 +116,7 @@ impl Departure {
         let reaped = nonlive + SUSPECT_MS + REAP_MS + within(rng, (0, 200));
         let next_life = exit + within(rng, POD_START_MS);
         let moved = exit + within(rng, (1_000, 2_000)) + within(rng, (0, SEED_REFRESH_MS));
-        let relearned = (rng.below(4) != 0 && moved > reaped && moved < next_life).then(|| {
+        let relearned = (rng.up_to(3) != 0 && moved > reaped && moved < next_life).then(|| {
             let nonlive = moved + within(rng, (100, 400));
             (moved, nonlive, nonlive + SUSPECT_MS + REAP_MS)
         });

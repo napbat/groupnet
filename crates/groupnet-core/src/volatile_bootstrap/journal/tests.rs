@@ -34,6 +34,16 @@ fn config() -> JournalConfig {
     }
 }
 
+/// The default config validates, and its conservative storage reservation
+/// stays a modest fraction of a host's memory.
+#[test]
+fn default_config_is_valid_and_its_storage_bound_is_modest() {
+    let config = JournalConfig::default();
+    assert_eq!(config.validate(), Ok(()));
+    let bound = DonorJournal::storage_bound(config).expect("representable");
+    assert!(bound <= 128 * 1024 * 1024, "storage bound {bound}");
+}
+
 #[test]
 fn config_validate_names_each_rule() {
     assert_eq!(config().validate(), Ok(()));

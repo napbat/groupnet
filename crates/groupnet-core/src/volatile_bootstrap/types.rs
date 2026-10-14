@@ -27,6 +27,10 @@ impl BootstrapScope {
 ///
 /// Roster and byte caps are nonzero by type; [`BootstrapConfig::validate`]
 /// checks the millisecond timers and their relations to `total_ms`.
+/// [`Default`] admits 1024 members with 256-byte identities and 512 bytes of
+/// scope names; claims settle for 2 s, renew every second under a 5 s TTL,
+/// observations take at most 5 s, a stalled build is abandoned after 30 s and
+/// an episode gets two minutes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootstrapConfig {
     /// Maximum complete member/claim roster entries; below `usize::MAX`.
@@ -51,6 +55,22 @@ pub struct BootstrapConfig {
     /// Liveness budget for this bootstrap selection episode, restarted each
     /// time the selected build advances; nonzero.
     pub total_ms: u64,
+}
+
+impl Default for BootstrapConfig {
+    fn default() -> Self {
+        Self {
+            max_members: const { NonZeroUsize::new(1024).unwrap() },
+            max_member_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_scope_bytes: const { NonZeroUsize::new(512).unwrap() },
+            settle_ms: 2_000,
+            renew_ms: 1_000,
+            claim_ttl_ms: 5_000,
+            observe_ms: 5_000,
+            donor_wait_ms: 30_000,
+            total_ms: 120_000,
+        }
+    }
 }
 
 /// Invalid [`BootstrapConfig`], naming the violated rule.
@@ -299,6 +319,21 @@ pub struct BootstrapMember {
     pub node: NodeId,
     /// Whether this member is currently eligible to build or donate.
     pub eligible: bool,
+}
+
+/// One complete source participation cut, read in a single actor sample:
+/// member eligibility, the exact roster, the live participation entries and
+/// the claims, all at the same native cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParticipationCut<'a> {
+    /// Every member's build/donate eligibility.
+    pub members: &'a [BootstrapMember],
+    /// The exact native member identities at the cut.
+    pub roster: &'a [BootstrapMemberIdentity],
+    /// The live participation entries at the cut.
+    pub participants: &'a [BootstrapParticipant],
+    /// The claims observed at the cut.
+    pub claims: &'a [BootstrapClaim],
 }
 
 /// Correlation for one core operation, from a single checked allocator.

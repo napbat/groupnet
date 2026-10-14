@@ -28,7 +28,7 @@ use std::num::NonZeroUsize;
 
 use groupnet_core::Time;
 use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Status, placement};
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 /// The per-frame byte cap the DST holds the engines to. Small enough that the
 /// large-state seeds genuinely split deltas across rounds, and every emitted
@@ -63,7 +63,7 @@ fn engine(group: &GroupId, id: &NodeId, alive: &BTreeSet<NodeId>) -> GroupEngine
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are tens of nodes");
-    v[rng.below(n) as usize].clone()
+    v[rng.up_to(n - 1) as usize].clone()
 }
 
 #[test]
@@ -76,14 +76,14 @@ fn dst_safety_and_liveness_across_seeds() {
 fn run_scenario(seed: u64) {
     let mut rng = rng(seed);
     let group = GroupId::new("shard");
-    let n = 3 + rng.below(4); // 3..=6 nodes
+    let n = 3 + rng.up_to(3); // 3..=6 nodes
     let all: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
 
-    let latency = u64::from(3 + rng.below(8));
+    let latency = u64::from(3 + rng.up_to(7));
     let mut sim = Simulation::new(latency);
     // up to 24% loss during chaos
-    sim.set_loss(u8::try_from(rng.below(25)).expect("below(25) is 0..25"));
-    sim.set_jitter(u64::from(rng.below(9))); // up to 8ms reorder
+    sim.set_loss(Percent::try_from(rng.up_to(24)).expect("at most 24%"));
+    sim.set_jitter(u64::from(rng.up_to(8))); // up to 8ms reorder
 
     let mut alive: BTreeSet<NodeId> = all.iter().cloned().collect();
     for id in &all {
@@ -92,7 +92,7 @@ fn run_scenario(seed: u64) {
 
     let mut now = 0u64;
     for _round in 0..30 {
-        now += u64::from(30 + rng.below(120));
+        now += u64::from(30 + rng.up_to(119));
         sim.run_until(Time(now));
 
         // Safety: must hold at every step, even mid-chaos.
@@ -125,7 +125,7 @@ fn run_scenario(seed: u64) {
 
     // Converge under fair conditions, then assert liveness.
     sim.heal_all();
-    sim.set_loss(0);
+    sim.set_loss(Percent::ZERO);
     sim.set_jitter(0);
     now += 20_000;
     sim.run_until(Time(now));
@@ -167,7 +167,7 @@ fn inject_fault(
     alive: &mut BTreeSet<NodeId>,
     now: u64,
 ) {
-    match rng.below(8) {
+    match rng.up_to(7) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
             sim.crash(&victim).expect("live node");
@@ -306,12 +306,12 @@ fn dst_no_resurrection_after_reap() {
     for seed in 0..128u64 {
         let mut rng = rng(seed ^ 0x51e3);
         let group = GroupId::new("reap");
-        let n = 3 + rng.below(4);
+        let n = 3 + rng.up_to(3);
         let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
         let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
-        let mut sim = Simulation::new(u64::from(2 + rng.below(6)));
-        sim.set_jitter(u64::from(rng.below(6)));
+        let mut sim = Simulation::new(u64::from(2 + rng.up_to(5)));
+        sim.set_jitter(u64::from(rng.up_to(5)));
         for id in &ids {
             sim.add(engine(&group, id, &all)).expect("distinct node");
         }

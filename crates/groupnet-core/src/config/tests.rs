@@ -339,3 +339,30 @@ fn absurd_inputs_saturate_instead_of_wrapping() {
         Config::default().suspect_timeout_ms
     );
 }
+
+/// The default Hosted config settles, validates inside a default `Config`,
+/// and honours its own sizing rule against the default detector: the lease
+/// expires before any group of two or more members can elect a successor.
+#[test]
+fn default_hosted_config_is_valid_and_split_brain_bounded() {
+    let hosted = HostedConfig::default();
+    let Activation::Settle { claim_settle_ms } = hosted.activation else {
+        panic!(
+            "the default activation is Settle, got {:?}",
+            hosted.activation
+        );
+    };
+    let cfg = Config {
+        mode: GroupMode::Hosted(hosted.clone()),
+        ..Config::default()
+    };
+    assert_eq!(cfg.validate(), Ok(()));
+    assert!(hosted.lease_ms > 2 * cfg.gossip_interval_ms);
+    for members in 2..=256 {
+        assert!(
+            hosted.lease_ms < cfg.detection_window_ms(members) + claim_settle_ms,
+            "lease {} must stay below detection + settle at {members} members",
+            hosted.lease_ms
+        );
+    }
+}

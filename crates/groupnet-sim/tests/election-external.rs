@@ -4,8 +4,8 @@
 //!
 //! The simulator owns one register per run: an `Option<AnchorRecord>` plus an
 //! etag counter, written only by rounds that are scheduled like every other
-//! event. Every *verdict* in those rounds is core's — `plan_claim`,
-//! `renewal_record`, `ambiguous_applied` — so a counterexample here is a
+//! event. Every *verdict* in those rounds is core's — `AnchorTerms::plan_claim`,
+//! `AnchorTerms::renewal_record`, `ambiguous_applied` — so a counterexample here is a
 //! counterexample against the shipped decision rules, not against a paraphrase
 //! of them.
 //!
@@ -55,7 +55,7 @@ use groupnet_core::{
     Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
     placement,
 };
-use groupnet_sim::{AnchorEvent, Simulation, SplitMix64};
+use groupnet_sim::{AnchorEvent, Percent, Simulation, SplitMix64};
 
 /// How long a host's authority survives its last successful anchor round —
 /// which is also the anchor record's TTL and the boot guard. One number, as
@@ -433,7 +433,7 @@ fn rng(seed: u64) -> SplitMix64 {
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    let i = usize::try_from(rng.below(n)).expect("bounded by the set size");
+    let i = usize::try_from(rng.up_to(n - 1)).expect("bounded by the set size");
     v[i].clone()
 }
 
@@ -461,7 +461,7 @@ impl Topology {
 
 /// Draws a cluster of 3..=6 nodes.
 fn draw_topology(rng: &mut SplitMix64, name: &str) -> Topology {
-    let n = 3 + usize::try_from(rng.below(4)).expect("a 0..4 draw");
+    let n = 3 + usize::try_from(rng.up_to(3)).expect("a 0..4 draw");
     let booted: BTreeSet<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
     Topology {
         group: GroupId::new(name),
@@ -498,7 +498,7 @@ fn inject_fault(
     alive: &mut BTreeSet<NodeId>,
     now: u64,
 ) -> Option<NodeId> {
-    match rng.below(11) {
+    match rng.up_to(10) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
             sim.crash(&victim).expect("live node");
@@ -622,14 +622,14 @@ fn dst_external_epoch_is_globally_unique_without_storage() {
 fn external_chaos(seed: u64) -> (BTreeMap<AnchorEvent, u64>, u64) {
     let mut rng = rng(seed ^ 0x7c31);
     let topo = draw_topology(&mut rng, &format!("x-chaos-{seed}"));
-    let mut sim = Simulation::new(u64::from(3 + rng.below(8))); // 3..=10ms links
+    let mut sim = Simulation::new(u64::from(3 + rng.up_to(7))); // 3..=10ms links
     sim.enable_anchor(LEASE_MS, STEAL_MARGIN_MS);
-    sim.set_anchor_latency(u64::from(5 + rng.below(26))); // 5..=30ms store trips
-    sim.set_loss(u8::try_from(rng.below(25)).expect("below(25) is 0..25"));
-    sim.set_jitter(u64::from(rng.below(9))); // up to 8ms reorder
+    sim.set_anchor_latency(u64::from(5 + rng.up_to(25))); // 5..=30ms store trips
+    sim.set_loss(Percent::try_from(rng.up_to(24)).expect("at most 24%"));
+    sim.set_jitter(u64::from(rng.up_to(8))); // up to 8ms reorder
     for node in &topo.booted {
         let margin = i64::try_from(STEAL_MARGIN_MS).expect("a small margin");
-        let skew = i64::from(rng.below(u32::try_from(2 * margin + 1).expect("small"))) - margin;
+        let skew = i64::from(rng.up_to(u32::try_from(2 * margin).expect("small"))) - margin;
         sim.set_anchor_skew(node, skew);
     }
 
@@ -640,7 +640,7 @@ fn external_chaos(seed: u64) -> (BTreeMap<AnchorEvent, u64>, u64) {
     let mut beliefs = Beliefs::default();
     let mut now = 0u64;
     for _round in 0..40 {
-        now += u64::from(30 + rng.below(120));
+        now += u64::from(30 + rng.up_to(119));
         sim.run_until(Time(now));
         sample(&sim, &alive, &mut beliefs, (now, &label));
         if let Some(node) = inject_fault(&mut sim, &mut rng, &topo, &mut alive, now) {
@@ -650,7 +650,7 @@ fn external_chaos(seed: u64) -> (BTreeMap<AnchorEvent, u64>, u64) {
 
     sim.heal_all();
     sim.heal_anchor_all();
-    sim.set_loss(0);
+    sim.set_loss(Percent::ZERO);
     sim.set_jitter(0);
     now += 30_000;
     sim.run_until(Time(now));

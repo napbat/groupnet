@@ -20,7 +20,9 @@ pub enum RecoveryMode {
 ///
 /// Roster caps are nonzero by type; [`RecoveryConfig::validate`] checks the
 /// millisecond timers, their relation to `total_ms`, and the roster byte
-/// product.
+/// product. [`Default`] admits 1024 peers with 256-byte identities and eight
+/// barrier rounds, and gives an episode 60 s, one operation 10 s, the settle
+/// delay 1 s and the observation poll 200 ms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryConfig {
     /// Maximum peer identities in any observation or retained recovery roster.
@@ -44,6 +46,20 @@ pub struct RecoveryConfig {
     /// Delay between unsuccessful grant or affirmation observations; nonzero
     /// and at most `total_ms`.
     pub poll_ms: u64,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            max_members: const { NonZeroUsize::new(1024).unwrap() },
+            max_member_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_barrier_rounds: const { NonZeroU32::new(8).unwrap() },
+            total_ms: 60_000,
+            attempt_ms: 10_000,
+            settle_ms: 1_000,
+            poll_ms: 200,
+        }
+    }
 }
 
 /// Invalid [`RecoveryConfig`], naming the violated rule.
@@ -125,12 +141,24 @@ impl RecoveryConfig {
 
 /// Optional spacing between exhausted full recovery episodes.
 /// Individual operations inside an episode still retry on `RecoveryConfig::poll_ms`.
+///
+/// [`Default`] waits 1 s after the first exhausted episode and doubles up to
+/// a minute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryRearm {
     /// Delay after the first exhausted episode, in logical milliseconds; nonzero.
     pub initial_ms: u64,
     /// Inclusive cap on later doubled delays; at least `initial_ms`.
     pub max_ms: u64,
+}
+
+impl Default for RecoveryRearm {
+    fn default() -> Self {
+        Self {
+            initial_ms: 1_000,
+            max_ms: 60_000,
+        }
+    }
 }
 
 /// Invalid [`RecoveryRearm`], naming the violated rule.
@@ -577,6 +605,12 @@ mod tests {
             settle_ms: 5,
             poll_ms: 2,
         }
+    }
+
+    #[test]
+    fn defaults_are_valid() {
+        assert_eq!(RecoveryConfig::default().validate(), Ok(()));
+        assert_eq!(RecoveryRearm::default().validate(), Ok(()));
     }
 
     #[test]

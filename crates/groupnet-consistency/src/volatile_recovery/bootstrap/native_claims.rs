@@ -5,8 +5,8 @@ use std::num::NonZeroUsize;
 use groupnet_core::Status;
 use groupnet_core::volatile_bootstrap::{
     BootstrapClaim, BootstrapConfig, BootstrapConfigError, BootstrapMember, BootstrapOperation,
-    BootstrapScope, ClaimCodecError, ClaimIdentity, PresenceIdentity, claim_entry_key,
-    decode_claim_value, encode_claim_value, encoded_claim_len, presence_entry_key,
+    BootstrapScope, ClaimCodecError, ClaimIdentity, ObservedEntry, PresenceIdentity,
+    claim_entry_key, decode_claim_value, encode_claim_value, encoded_claim_len, presence_entry_key,
 };
 use groupnet_runtime::{EntryBudget, EntryInspectionLimits, Group, InspectedEntries};
 use std::mem::size_of;
@@ -207,8 +207,10 @@ impl NativeClaimSource {
                 let mut claim = decode_claim_value(
                     &self.scope,
                     self.policy,
-                    &entry.node,
-                    &value,
+                    ObservedEntry {
+                        author: &entry.node,
+                        value: &value,
+                    },
                     self.max_value_bytes,
                 )
                 .map_err(|_| MALFORMED)?;

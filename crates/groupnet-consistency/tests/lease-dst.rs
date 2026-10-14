@@ -85,7 +85,7 @@ use groupnet_consistency::lease::{
     encode_renewal, grant_entry_key, renewal_entry_key,
 };
 use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Time};
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 /// The lease duration `D` every suite here runs on. Short enough that a
 /// handful of seconds of virtual time covers many lease lifetimes, long enough
@@ -158,7 +158,7 @@ fn engine(group: &GroupId, id: &NodeId, peers: &[NodeId]) -> GroupEngine {
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    v[rng.below(n) as usize].clone()
+    v[rng.up_to(n - 1) as usize].clone()
 }
 
 /// `(u64 epoch, u64 seq)` little-endian — the same 16-byte shape the tier's own
@@ -356,13 +356,13 @@ impl Harness {
     fn new(tag: Tag, n: u32, rng: &mut SplitMix64, resync_lag: u32) -> Self {
         let group = GroupId::new(format!("lease-{}", tag.seed));
         let all: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
-        let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
+        let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
         let mut nodes = BTreeMap::new();
         let mut boots = BTreeMap::new();
         for id in &all {
             sim.add(engine(&group, id, &all)).expect("distinct node");
             boots.insert(id.clone(), 1);
-            let phase = u64::from(rng.below(u32::try_from(RENEW_MS).unwrap_or(u32::MAX)));
+            let phase = u64::from(rng.up_to(u32::try_from(RENEW_MS - 1).unwrap_or(u32::MAX)));
             nodes.insert(id.clone(), Node::new(id, 1, 0, phase, resync_lag));
         }
         Self {
@@ -754,7 +754,7 @@ impl Harness {
     /// the isolated node keeps *hearing* the group that can no longer hear it.
     fn inject_fault(&mut self, rng: &mut SplitMix64, slots: u32) {
         let live: BTreeSet<NodeId> = self.nodes.keys().cloned().collect();
-        match rng.below(slots) {
+        match rng.up_to(slots - 1) {
             0 | 2 if live.len() > 2 => {
                 let victim = pick(&live, rng);
                 self.sim.crash(&victim).expect("live node");
@@ -953,19 +953,19 @@ fn dst_lease_restart_chaos_never_serves_a_previous_life() {
 /// soon as a lease is live again).
 fn chaos_scenario(seed: u64, salt: u64, suite: &'static str, slots: u32, max_lag: u32) -> Stats {
     let mut rng = rng(seed ^ salt);
-    let n = 3 + rng.below(5); // 3..=7 nodes
-    let lag = rng.below(max_lag);
+    let n = 3 + rng.up_to(4); // 3..=7 nodes
+    let lag = rng.up_to(max_lag - 1);
     let mut h = Harness::new(Tag { suite, seed }, n, &mut rng, lag);
 
     // Converge first, on a fair fabric: the properties below are about a
     // running protocol, not about bootstrap.
     h.run_rounds(16, 60);
     h.sim
-        .set_loss(u8::try_from(rng.below(25)).expect("below(25) is 0..25"));
-    h.sim.set_jitter(u64::from(rng.below(9)));
+        .set_loss(Percent::try_from(rng.up_to(24)).expect("at most 24%"));
+    h.sim.set_jitter(u64::from(rng.up_to(8)));
 
     for _ in 0..40 {
-        let step = u64::from(30 + rng.below(120));
+        let step = u64::from(30 + rng.up_to(119));
         h.step_to(h.now + step);
         h.inject_fault(&mut rng, slots);
     }
@@ -973,7 +973,7 @@ fn chaos_scenario(seed: u64, salt: u64, suite: &'static str, slots: u32, max_lag
     // A fair fabric again, long enough for every in-flight write to end at an
     // ack or a lapse rather than at the harness's own deadline.
     h.sim.heal_all();
-    h.sim.set_loss(0);
+    h.sim.set_loss(Percent::ZERO);
     h.sim.set_jitter(0);
     h.run_rounds(40, 60);
     h.stats

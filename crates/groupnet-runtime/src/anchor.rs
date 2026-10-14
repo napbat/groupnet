@@ -33,9 +33,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use groupnet_core::anchor::{
-    AnchorRecord, ClaimPlan, ambiguous_applied, plan_claim, renewal_record,
-};
+use groupnet_core::anchor::{AnchorRecord, AnchorTerms, ClaimPlan, ambiguous_applied};
 use groupnet_core::{Command, NodeId, Role, Time};
 use tokio::sync::{mpsc, watch};
 
@@ -81,7 +79,7 @@ impl AnchorToken {
 /// writes every object store already offers, and the only two this tier needs.
 ///
 /// Which one to use is never the driver's guess: it is what
-/// [`plan_claim`](groupnet_core::anchor::plan_claim) decided, carried across
+/// [`AnchorTerms::plan_claim`](groupnet_core::anchor::AnchorTerms::plan_claim) decided, carried across
 /// unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnchorWriteIf {
@@ -360,7 +358,7 @@ pub(crate) async fn anchor_task(task: AnchorTask) {
 ///
 /// The token is what makes a renewal a renewal — a holder with its etag extends
 /// the epoch it has; a holder that has lost it must re-plan through
-/// [`plan_claim`], which bids strictly higher.
+/// [`AnchorTerms::plan_claim`], which bids strictly higher.
 #[derive(Clone)]
 struct Held {
     /// The epoch the anchor awarded.
@@ -506,7 +504,11 @@ impl Claimant {
         if held.expires_at_wall_ms.saturating_sub(w0) > self.lease_ms / 2 {
             return;
         }
-        let record = renewal_record(&self.local, held.epoch, w0, self.lease_ms);
+        let terms = AnchorTerms {
+            ttl_ms: self.lease_ms,
+            steal_margin_ms: self.steal_margin_ms,
+        };
+        let record = terms.renewal_record(&self.local, held.epoch, w0);
         self.write(
             AnchorWriteIf::Matches(held.token),
             record,
@@ -516,7 +518,7 @@ impl Claimant {
         .await;
     }
 
-    /// Read the anchor and act on [`plan_claim`]'s verdict.
+    /// Read the anchor and act on [`AnchorTerms::plan_claim`]'s verdict.
     async fn claim(&mut self, epoch_hint: u64, t0: Time, w0: u64) {
         let Ok(loaded) = self.anchor.load().await else {
             // An unreachable anchor decides nothing: no claim, no observation,
@@ -528,14 +530,11 @@ impl Claimant {
             Some((record, token)) => (Some(record), Some(token)),
             None => (None, None),
         };
-        match plan_claim(
-            &self.local,
-            epoch_hint,
-            record.as_ref(),
-            w0,
-            self.lease_ms,
-            self.steal_margin_ms,
-        ) {
+        let terms = AnchorTerms {
+            ttl_ms: self.lease_ms,
+            steal_margin_ms: self.steal_margin_ms,
+        };
+        match terms.plan_claim(&self.local, epoch_hint, record.as_ref(), w0) {
             ClaimPlan::Yield { retry_at_wall_ms } => {
                 self.retry_at_wall_ms = Some(retry_at_wall_ms);
                 // Teach the engine who does hold it. Fence-ordered, not

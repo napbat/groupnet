@@ -24,12 +24,16 @@ impl Simulation {
     pub(super) fn send(&mut self, from: &NodeId, to: NodeId, wire: Vec<u8>) {
         self.max_frame_bytes = self.max_frame_bytes.max(wire.len());
         self.note_lead_frame(from, &wire);
-        // Deterministic per-message jitter keyed on the sequence number this
-        // delivery is about to take, so links can reorder.
+        // Deterministic per-message jitter in `0..=jitter_ms`, keyed on the
+        // sequence number this delivery is about to take, so links can
+        // reorder. `u64::MAX` spans the whole word rather than overflowing.
         let extra = if self.jitter_ms == 0 {
             0
         } else {
-            SplitMix64::hash(self.seq.wrapping_add(1)) % (self.jitter_ms + 1)
+            let draw = SplitMix64::hash(self.seq.wrapping_add(1));
+            self.jitter_ms
+                .checked_add(1)
+                .map_or(draw, |span| draw % span)
         };
         let at = self
             .now
@@ -47,7 +51,8 @@ impl Simulation {
 
     /// One frame arriving, subject to the loss schedule and the partition set.
     pub(super) fn deliver(&mut self, to: &NodeId, from: NodeId, wire: &[u8], seq: u64) {
-        if self.loss_percent != 0 && SplitMix64::hash(seq) % 100 < u64::from(self.loss_percent) {
+        let loss = u64::from(self.loss.get());
+        if loss != 0 && SplitMix64::hash(seq) % 100 < loss {
             return; // deterministic per-message drop
         }
         if self.blocked.contains(&(from.clone(), to.clone())) {

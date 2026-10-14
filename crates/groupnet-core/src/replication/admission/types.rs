@@ -15,6 +15,11 @@ const MAX_POLICY_CURSOR_BYTES: usize = 4096;
 ///
 /// Counts and byte caps are nonzero by type; [`AdmissionPolicy::validate`]
 /// checks identities, upper caps, and the [`ExpiryTiming`] arithmetic.
+///
+/// The source history and the policy fingerprint identify the fleet's source
+/// and policy, so there is no default policy: [`AdmissionPolicy::new`] takes
+/// exactly those and fills the timing from [`ExpiryTiming::default`], 1024
+/// waiters and 4 KiB cursors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionPolicy {
     /// Source history that orders admissions and intents.
@@ -87,6 +92,25 @@ impl fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {}
 
 impl AdmissionPolicy {
+    /// A policy ordering admissions on `history` and identified by
+    /// `fingerprint`, with the default timing and bounds; refine them with
+    /// struct-update syntax. Empty or oversized identities are reported by
+    /// [`validate`](Self::validate), never replaced.
+    #[must_use]
+    pub fn new(history: SourceHistory, fingerprint: impl Into<Vec<u8>>) -> Self {
+        let timing = ExpiryTiming::default();
+        Self {
+            history,
+            fingerprint: fingerprint.into(),
+            max_duration_ms: timing.max_duration_ms,
+            rate_numerator: timing.rate_numerator,
+            rate_denominator: timing.rate_denominator,
+            clock_margin_ms: timing.clock_margin_ms,
+            max_waiters: const { NonZeroUsize::new(1024).unwrap() },
+            max_cursor_bytes: const { NonZeroUsize::new(MAX_POLICY_CURSOR_BYTES).unwrap() },
+        }
+    }
+
     /// Validate all finite bounds and integer clock-rate arithmetic.
     ///
     /// # Errors
@@ -170,6 +194,23 @@ pub struct SourceReceipt {
     pub proof: SourceProof,
     /// Exact-bound comparison of record position to that head.
     pub record_to_head: BoundComparison,
+}
+
+/// Source adapter's certification that a reader materialized contiguously
+/// through its admission record, in the same source history.
+///
+/// Both comparisons are exact bounds under `proof`: the admission record is
+/// at or before `applied`, and `applied` is at or before the proven head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionReceipt {
+    /// Native cursor the reader has applied through.
+    pub applied: Cursor,
+    /// Source head and history statement the comparisons are bound to.
+    pub proof: SourceProof,
+    /// Exact-bound comparison of the admission record to `applied`.
+    pub admission_to_applied: BoundComparison,
+    /// Exact-bound comparison of `applied` to the proven head.
+    pub applied_to_head: BoundComparison,
 }
 
 /// Native record identity certified by a source append readback.

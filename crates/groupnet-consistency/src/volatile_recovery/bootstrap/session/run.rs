@@ -9,7 +9,7 @@ use crate::volatile_recovery::bootstrap::ports::{
     LocalCaptureOutcome, LocalCaptureRequest, ReadyCaptureRequest,
 };
 use groupnet_core::volatile_bootstrap::{
-    BootstrapMemberIdentity, BootstrapParticipant, ClaimIdentity,
+    BootstrapMemberIdentity, BootstrapParticipant, ClaimIdentity, ParticipationCut,
 };
 
 /// Where one participation cut is sampled and how it is verified.
@@ -101,10 +101,12 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     self.engine
                         .verify_participant_roster(
                             op,
-                            &snapshot.members,
-                            &snapshot.roster,
-                            &participants,
-                            &snapshot.claims,
+                            ParticipationCut {
+                                members: &snapshot.members,
+                                roster: &snapshot.roster,
+                                participants: &participants,
+                                claims: &snapshot.claims,
+                            },
                         )
                         .ok()?;
                     self.engine
@@ -115,10 +117,12 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     .engine
                     .verify_peer_roster(
                         op,
-                        &snapshot.members,
-                        &snapshot.roster,
-                        &participants,
-                        &snapshot.claims,
+                        ParticipationCut {
+                            members: &snapshot.members,
+                            roster: &snapshot.roster,
+                            participants: &participants,
+                            claims: &snapshot.claims,
+                        },
                     )
                     .ok(),
             }

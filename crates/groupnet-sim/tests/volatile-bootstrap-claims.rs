@@ -3,7 +3,7 @@
 use groupnet_core::placement;
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
-    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine,
+    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine, PresenceIdentity,
 };
 use groupnet_core::{NodeId, Time};
 use groupnet_sim::SplitMix64;
@@ -75,6 +75,27 @@ fn expected_builder(names: &[NodeId]) -> NodeId {
     placement::owner(&scope().placement_key(), &names.iter().cloned().collect()).unwrap()
 }
 
+/// One unstarted engine per name, booted `first_boot..` in order, all under
+/// `session`.
+fn engines_for(names: &[NodeId], first_boot: u128, session: u64) -> Vec<ClaimEngine> {
+    names
+        .iter()
+        .zip(first_boot..)
+        .map(|(name, boot)| {
+            ClaimEngine::new(
+                config(),
+                scope(),
+                PresenceIdentity {
+                    node: name.clone(),
+                    boot: BootId(boot),
+                    session,
+                },
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
 #[test]
 fn converged_claims_take_over_and_partitions_have_safe_duplicate_builders() {
     let mut connected = 0;
@@ -82,24 +103,11 @@ fn converged_claims_take_over_and_partitions_have_safe_duplicate_builders() {
     let mut partitions = 0;
     for seed in 0..64 {
         let mut rng = SplitMix64::new(seed);
-        let count = usize::try_from(3 + rng.below(4)).unwrap();
+        let count = usize::try_from(3 + rng.up_to(3)).unwrap();
         let names: Vec<_> = (0..count)
             .map(|index| NodeId::from(format!("n{index}")))
             .collect();
-        let mut engines: Vec<_> = names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                ClaimEngine::new(
-                    config(),
-                    scope(),
-                    name.clone(),
-                    BootId(u128::try_from(index + 1).unwrap()),
-                    seed + 1,
-                )
-                .unwrap()
-            })
-            .collect();
+        let mut engines = engines_for(&names, 1, seed + 1);
         let claims: Vec<_> = engines
             .iter_mut()
             .map(|engine| claim(&engine.step(BootstrapEvent::Start)))
@@ -152,22 +160,9 @@ fn converged_claims_take_over_and_partitions_have_safe_duplicate_builders() {
         assert_eq!(replacements, 1, "seed {seed}");
         takeovers += 1;
 
-        let split = 1 + usize::try_from(rng.below(u32::try_from(count - 1).unwrap())).unwrap();
+        let split = 1 + usize::try_from(rng.up_to(u32::try_from(count - 2).unwrap())).unwrap();
         for part in [&names[..split], &names[split..]] {
-            let mut local: Vec<_> = part
-                .iter()
-                .enumerate()
-                .map(|(index, name)| {
-                    ClaimEngine::new(
-                        config(),
-                        scope(),
-                        name.clone(),
-                        BootId(u128::try_from(index + 101).unwrap()),
-                        seed + 100,
-                    )
-                    .unwrap()
-                })
-                .collect();
+            let mut local = engines_for(part, 101, seed + 100);
             let local_claims: Vec<_> = local
                 .iter_mut()
                 .map(|engine| claim(&engine.step(BootstrapEvent::Start)))

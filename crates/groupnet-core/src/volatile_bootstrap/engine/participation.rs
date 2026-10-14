@@ -7,7 +7,7 @@ use crate::{NodeId, Time};
 use super::{ClaimEngine, ObservedPresence};
 use crate::volatile_bootstrap::{
     BootstrapClaim, BootstrapError, BootstrapMember, BootstrapMemberIdentity, BootstrapParticipant,
-    BootstrapStep, PresenceIdentity, same_membership,
+    BootstrapStep, ParticipationCut, PresenceIdentity, same_membership,
 };
 
 impl ClaimEngine {
@@ -57,10 +57,7 @@ impl ClaimEngine {
     pub fn verify_participant_roster(
         &mut self,
         op: crate::volatile_bootstrap::BootstrapOperation,
-        members: &[BootstrapMember],
-        roster: &[BootstrapMemberIdentity],
-        participants: &[BootstrapParticipant],
-        claims: &[BootstrapClaim],
+        cut: ParticipationCut<'_>,
     ) -> Result<(), BootstrapError> {
         if self.roster_poll != Some(op)
             || self.roster_poll_due.is_none_or(|due| self.now >= due)
@@ -75,7 +72,7 @@ impl ClaimEngine {
             return Err(BootstrapError::Stage);
         }
         let (roster, observed) =
-            self.validate_participants(members, roster, participants, claims)?;
+            self.validate_participants(cut.members, cut.roster, cut.participants, cut.claims)?;
         self.matches_pinned_roster(&roster)?;
         if self.participant_roster.is_none() {
             self.participant_roster = Some(roster);
@@ -115,10 +112,7 @@ impl ClaimEngine {
     pub fn verify_peer_roster(
         &mut self,
         op: crate::volatile_bootstrap::BootstrapOperation,
-        members: &[BootstrapMember],
-        roster: &[BootstrapMemberIdentity],
-        participants: &[BootstrapParticipant],
-        claims: &[BootstrapClaim],
+        cut: ParticipationCut<'_>,
     ) -> Result<Vec<BootstrapMemberIdentity>, BootstrapError> {
         if self.roster_poll != Some(op)
             || self.roster_poll_due.is_none_or(|due| self.now >= due)
@@ -130,7 +124,8 @@ impl ClaimEngine {
         {
             return Err(BootstrapError::Stage);
         }
-        let (roster, _) = self.validate_participants(members, roster, participants, claims)?;
+        let (roster, _) =
+            self.validate_participants(cut.members, cut.roster, cut.participants, cut.claims)?;
         self.roster_poll = None;
         self.roster_poll_due = None;
         Ok(roster)
@@ -293,9 +288,11 @@ mod tests {
                 domain: "o".to_owned(),
                 partition: "b".to_owned(),
             },
-            NodeId::from("me"),
-            BootId(7),
-            1,
+            PresenceIdentity {
+                node: NodeId::from("me"),
+                boot: BootId(7),
+                session: 1,
+            },
         )
         .unwrap();
         engine.require_participation().unwrap();
@@ -429,10 +426,12 @@ mod tests {
         engine
             .verify_participant_roster(
                 cut,
-                &members,
-                &roster(&participants),
-                &participants,
-                &claims,
+                ParticipationCut {
+                    members: &members,
+                    roster: &roster(&participants),
+                    participants: &participants,
+                    claims: &claims,
+                },
             )
             .unwrap();
         let recapture = engine.step(BootstrapEvent::StartReadyRecapture);
@@ -532,7 +531,15 @@ mod tests {
         exact.push(peer.member.clone());
         let incomplete = engine.begin_roster_observation().unwrap();
         assert_eq!(
-            engine.verify_participant_roster(incomplete, &members, &exact, &participants, &[],),
+            engine.verify_participant_roster(
+                incomplete,
+                ParticipationCut {
+                    members: &members,
+                    roster: &exact,
+                    participants: &participants,
+                    claims: &[]
+                }
+            ),
             Err(BootstrapError::InvalidObservation)
         );
         assert!(engine.ready_recapture_pending());
@@ -540,7 +547,15 @@ mod tests {
         let mut present = participants;
         present.push(peer);
         assert_eq!(
-            engine.verify_participant_roster(complete, &members, &exact, &present, &[]),
+            engine.verify_participant_roster(
+                complete,
+                ParticipationCut {
+                    members: &members,
+                    roster: &exact,
+                    participants: &present,
+                    claims: &[]
+                }
+            ),
             Ok(())
         );
         let recapture = engine.step(BootstrapEvent::StartReadyRecapture);
@@ -723,10 +738,12 @@ mod tests {
         assert_eq!(
             engine.verify_participant_roster(
                 old,
-                &members,
-                &roster(&participants),
-                &participants,
-                &claims
+                ParticipationCut {
+                    members: &members,
+                    roster: &roster(&participants),
+                    participants: &participants,
+                    claims: &claims
+                }
             ),
             Err(BootstrapError::Stage)
         );
@@ -734,20 +751,24 @@ mod tests {
         engine
             .verify_participant_roster(
                 current,
-                &members,
-                &roster(&participants),
-                &participants,
-                &claims,
+                ParticipationCut {
+                    members: &members,
+                    roster: &roster(&participants),
+                    participants: &participants,
+                    claims: &claims,
+                },
             )
             .unwrap();
         assert_eq!(engine.participant_roster().unwrap().len(), 1);
         assert_eq!(
             engine.verify_participant_roster(
                 old,
-                &members,
-                &roster(&participants),
-                &participants,
-                &claims
+                ParticipationCut {
+                    members: &members,
+                    roster: &roster(&participants),
+                    participants: &participants,
+                    claims: &claims
+                }
             ),
             Err(BootstrapError::Stage)
         );

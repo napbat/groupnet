@@ -36,6 +36,14 @@ pub(crate) fn native_cuts_cover(actual: &[NativeCut], expected: &[NativeCut]) ->
 ///
 /// Budgets and the schema are nonzero by type; [`TransferConfig::validate`]
 /// checks the coverage cadence and the chunk budgets against the image cap.
+///
+/// The expected schema identifies the application's image format, so there
+/// is no default config: [`TransferConfig::new`] takes exactly the schema and
+/// fills the budgets to match [`JournalConfig::default`](super::super::journal::JournalConfig)
+/// — a 64 MiB encoded and decoded image in up to 1024 chunks of 1 MiB, 1 MiB
+/// of offer metadata, 256-event 1 MiB batches, 4096 replayed events, 16 MiB of
+/// buffered native effects, 1024 members, 256 writer cuts and a 100 ms
+/// coverage poll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferConfig {
     /// Application schema this follower can decode and install.
@@ -95,6 +103,27 @@ impl fmt::Display for TransferConfigError {
 impl std::error::Error for TransferConfigError {}
 
 impl TransferConfig {
+    /// A follower config installing images of `expected_schema`, with the
+    /// default budgets; refine them with struct-update syntax.
+    #[must_use]
+    pub const fn new(expected_schema: NonZeroU32) -> Self {
+        Self {
+            expected_schema,
+            max_metadata_bytes: const { NonZeroUsize::new(1024 * 1024).unwrap() },
+            max_encoded_bytes: const { NonZeroUsize::new(64 * 1024 * 1024).unwrap() },
+            max_decoded_bytes: const { NonZeroUsize::new(64 * 1024 * 1024).unwrap() },
+            max_chunk_bytes: const { NonZeroUsize::new(1024 * 1024).unwrap() },
+            max_chunks: const { NonZeroUsize::new(1024).unwrap() },
+            max_batch_bytes: const { NonZeroUsize::new(1024 * 1024).unwrap() },
+            max_batch_events: const { NonZeroUsize::new(256).unwrap() },
+            max_replay_events: const { NonZeroUsize::new(4096).unwrap() },
+            max_native_buffer_bytes: const { NonZeroUsize::new(16 * 1024 * 1024).unwrap() },
+            max_members: const { NonZeroUsize::new(1024).unwrap() },
+            max_cuts: const { NonZeroUsize::new(256).unwrap() },
+            coverage_poll_ms: 100,
+        }
+    }
+
     /// Rejects inverted or unprogressing finite budgets.
     ///
     /// # Errors
@@ -536,6 +565,22 @@ mod tests {
             max_cuts: nz(1),
             coverage_poll_ms: 2,
         }
+    }
+
+    #[test]
+    fn new_config_is_valid_and_matches_the_default_journal() {
+        let schema = NonZeroU32::new(7).unwrap();
+        let config = TransferConfig::new(schema);
+        assert_eq!(config.expected_schema, schema);
+        assert_eq!(config.validate(), Ok(()));
+        let journal = super::super::super::journal::JournalConfig::default();
+        assert_eq!(config.max_encoded_bytes, journal.max_encoded_bytes);
+        assert_eq!(config.max_decoded_bytes, journal.max_decoded_bytes);
+        assert_eq!(config.max_batch_bytes, journal.max_batch_bytes);
+        assert_eq!(config.max_batch_events, journal.max_batch_events);
+        assert_eq!(config.max_replay_events, journal.max_events);
+        assert_eq!(config.max_members, journal.max_members);
+        assert_eq!(config.max_cuts, journal.max_cuts);
     }
 
     #[test]

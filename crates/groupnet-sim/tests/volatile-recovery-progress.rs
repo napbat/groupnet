@@ -38,9 +38,9 @@ fn progressing_scan_outlives_every_fixed_bound_and_only_a_stall_retries() {
     let (mut one_pass, mut retried) = (0, 0);
     for seed in 0..96 {
         let mut rng = SplitMix64::new(seed);
-        let pages = 50 + rng.below(40);
-        let stall_at = (seed % 3 == 0).then(|| rng.below(pages));
-        let stall_ms = CONFIG.attempt_ms + u64::from(rng.below(5));
+        let pages = 50 + rng.up_to(39);
+        let stall_at = (seed % 3 == 0).then(|| rng.up_to(pages - 1));
+        let stall_ms = CONFIG.attempt_ms + u64::from(rng.up_to(4));
         let mut stalled = false;
         let mut engine =
             RecoveryEngine::new(CONFIG, RecoveryMode::Unleased, NodeId::from("me"), seed + 1)
@@ -68,7 +68,7 @@ fn progressing_scan_outlives_every_fixed_bound_and_only_a_stall_retries() {
                         scan = Some(Scan {
                             op,
                             done: 0,
-                            next_page: now + 1 + u64::from(rng.below(7)),
+                            next_page: now + 1 + u64::from(rng.up_to(6)),
                         });
                     }
                     RecoveryEffect::Affirm { op } => {
@@ -124,7 +124,7 @@ fn progressing_scan_outlives_every_fixed_bound_and_only_a_stall_retries() {
                 stalled = true;
                 stall_ms
             } else {
-                1 + u64::from(rng.below(u32::try_from(CONFIG.attempt_ms - 1).unwrap()))
+                1 + u64::from(rng.up_to(u32::try_from(CONFIG.attempt_ms - 2).unwrap()))
             };
             current.next_page = now + gap;
         }

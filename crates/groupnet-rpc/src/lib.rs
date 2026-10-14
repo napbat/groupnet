@@ -31,6 +31,12 @@
 //! [`RpcServer`], so on a shared plane its transport writes whatever the
 //! remote dispatcher expects (the tag below) before the first frame.
 //!
+//! This crate supplies no managed protocol binding: on a shared plane the
+//! application's dispatcher is the **only** accept loop, and every inbound
+//! consumer — RPC included — is served through it. Independent accept loops
+//! (an RPC [`bind`](RpcServer::bind) beside a runtime `Ordered` endpoint, say)
+//! would race for the same inbound streams and are not supported.
+//!
 //! ```no_run
 //! use std::io;
 //! use std::time::Duration;
@@ -131,7 +137,8 @@
 //! | `2` Error | `id: u64`, `code: u16`, UTF-8 message |
 //!
 //! A request's `deadline_ms` is the caller's remaining budget when it was
-//! sent; the server measures it from receipt, so no clocks are compared.
+//! sent, rounded up to whole milliseconds; the server measures it from
+//! receipt, so no clocks are compared.
 //! Malformed bytes, an unknown version or kind, or a frame over the receiver's
 //! `max_frame_bytes` drop the connection that carried them — and with it, on
 //! the client, every call in flight on it ([`RpcError::ConnectionLost`]).
@@ -170,8 +177,9 @@
 //!   with no call waiting, by the server after its `idle_timeout` with no
 //!   request and no handler running. Keep the server's longer than the
 //!   clients', so the side that knows nothing is in flight closes first.
-//!   Call timeouts and timers are bounded by [`MAX_TIMEOUT`], the
-//!   wire deadline's `u32` milliseconds.
+//!   Configured timers are bounded by [`MAX_TIMEOUT`], the wire deadline's
+//!   `u32` milliseconds; a call's timeout saturates to it — the one
+//!   permitted correction, unobservable at ~49.7 days.
 
 mod client;
 mod codec;

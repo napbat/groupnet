@@ -530,17 +530,17 @@ fn dst_external_failover_lands_inside_its_budget() {
 /// of the budget was left unspent.
 fn failover_budget(seed: u64) -> (bool, u64) {
     let mut rng = SplitMix64::new(seed ^ 0xe2b0_9e37_79b9_7f4a);
-    let n = 3 + usize::try_from(rng.below(4)).expect("a 0..4 draw"); // 3..=6 nodes
+    let n = 3 + usize::try_from(rng.up_to(3)).expect("a 0..4 draw"); // 3..=6 nodes
     let members: BTreeSet<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
     let group = format!("x-budget-{seed}");
     let label = format!("X-budget seed {seed}");
 
-    let latency = 2 + u64::from(rng.below(u32::try_from(MAX_LATENCY_MS).expect("small") - 1));
+    let latency = 2 + u64::from(rng.up_to(u32::try_from(MAX_LATENCY_MS).expect("small") - 2));
     let mut sim = Simulation::new(latency);
     sim.enable_anchor(LEASE_MS, STEAL_MARGIN_MS);
     sim.set_anchor_latency(ANCHOR_LATENCY_MS);
     sim.set_jitter(u64::from(
-        rng.below(u32::try_from(MAX_JITTER_MS).expect("small") + 1),
+        rng.up_to(u32::try_from(MAX_JITTER_MS).expect("small")),
     ));
     for id in &members {
         sim.add(engine(&group, id, &members, &cfg()))
@@ -550,7 +550,7 @@ fn failover_budget(seed: u64) -> (bool, u64) {
     // Converge first: the budget bounds *failover*, not bootstrap. The crash
     // instant is drawn so the schedule samples its phase against each
     // survivor's probe cursor and the incumbent's renewal round.
-    let crash_at = 3_000 + u64::from(rng.below(500));
+    let crash_at = 3_000 + u64::from(rng.up_to(499));
     sim.run_until(Time(crash_at));
     let incumbent = sole_host(&sim, &format!("{label} (before the crash)"));
     let record = sim.anchor_record().expect("an elected group has a record");

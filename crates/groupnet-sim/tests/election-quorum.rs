@@ -51,7 +51,7 @@ use groupnet_core::{
     Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
     VoterRoster, placement,
 };
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 /// How long a host's authority survives its last successful renewal — and,
 /// under Quorum, the claim window, the boot guard and the grant blackout too.
@@ -359,23 +359,23 @@ impl Topology {
 /// strict subset of it (so a non-voter can be top-ranked), or five voters only
 /// four of which ever boot.
 fn draw_topology(rng: &mut SplitMix64, name: &str) -> Topology {
-    let n = 3 + usize::try_from(rng.below(4)).expect("a 0..4 draw"); // 3..=6 nodes
+    let n = 3 + usize::try_from(rng.up_to(3)).expect("a 0..4 draw"); // 3..=6 nodes
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
     let booted: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
     // One seed in four (where four voters can be found) puts a fifth voter in
     // the roster that is never booted at all.
-    let absent = n >= 4 && rng.below(4) == 0;
+    let absent = n >= 4 && rng.up_to(3) == 0;
     let booted_voters = if absent {
         4
-    } else if n >= 5 && rng.below(2) == 0 {
+    } else if n >= 5 && rng.up_to(1) == 0 {
         5
     } else {
         3
     };
     // Rotate which nodes vote, so the roster is not always the low ids and the
     // rendezvous top of a run is sometimes outside it.
-    let off = usize::try_from(rng.below(u32::try_from(n).expect("a handful of nodes")))
+    let off = usize::try_from(rng.up_to(u32::try_from(n - 1).expect("a handful of nodes")))
         .expect("bounded by n");
     let mut voters: BTreeSet<NodeId> = (0..booted_voters)
         .map(|k| ids[(off + k) % n].clone())
@@ -395,7 +395,7 @@ fn draw_topology(rng: &mut SplitMix64, name: &str) -> Topology {
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    let i = usize::try_from(rng.below(n)).expect("bounded by the set size");
+    let i = usize::try_from(rng.up_to(n - 1)).expect("bounded by the set size");
     v[i].clone()
 }
 
@@ -491,7 +491,7 @@ fn inject_fault(
     clock: (u64, Restarts),
 ) -> Option<NodeId> {
     let (now, policy) = clock;
-    match rng.below(8) {
+    match rng.up_to(7) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
             sim.crash(&victim).expect("live node");
@@ -606,9 +606,9 @@ impl Beliefs {
 fn quorum_chaos(seed: u64) {
     let mut rng = rng(seed ^ 0x90c7);
     let topo = draw_topology(&mut rng, &format!("chaos-{seed}"));
-    let mut sim = Simulation::new(u64::from(3 + rng.below(8))); // 3..=10ms links
-    sim.set_loss(u8::try_from(rng.below(25)).expect("below(25) is 0..25"));
-    sim.set_jitter(u64::from(rng.below(9))); // up to 8ms reorder
+    let mut sim = Simulation::new(u64::from(3 + rng.up_to(7))); // 3..=10ms links
+    sim.set_loss(Percent::try_from(rng.up_to(24)).expect("at most 24%"));
+    sim.set_jitter(u64::from(rng.up_to(8))); // up to 8ms reorder
 
     let mut alive: BTreeSet<NodeId> = topo.booted.clone();
     topo.boot(&mut sim);
@@ -627,7 +627,7 @@ fn quorum_chaos(seed: u64) {
     // walks a handover in 10ms steps. A two-host instant would therefore have to
     // fit inside 5ms of a shaped run *and* dodge every sample of the seeded ones.
     for _round in 0..30 {
-        now += u64::from(30 + rng.below(120));
+        now += u64::from(30 + rng.up_to(119));
         sim.run_until(Time(now));
         assert_lease_disjoint(&sim, now, &label);
         sample(&sim, &topo, &alive, &mut beliefs, (now, &label));
@@ -645,7 +645,7 @@ fn quorum_chaos(seed: u64) {
     }
 
     sim.heal_all();
-    sim.set_loss(0);
+    sim.set_loss(Percent::ZERO);
     sim.set_jitter(0);
     now += 30_000;
     sim.run_until(Time(now));
@@ -839,9 +839,9 @@ fn dst_quorum_epoch_is_globally_unique() {
 fn epoch_uniqueness(seed: u64) {
     let mut rng = rng(seed ^ 0x51c1);
     let topo = draw_topology(&mut rng, &format!("unique-{seed}"));
-    let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
-    sim.set_loss(u8::try_from(rng.below(25)).expect("below(25) is 0..25"));
-    sim.set_jitter(u64::from(rng.below(9)));
+    let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
+    sim.set_loss(Percent::try_from(rng.up_to(24)).expect("at most 24%"));
+    sim.set_jitter(u64::from(rng.up_to(8)));
 
     let mut alive: BTreeSet<NodeId> = topo.booted.clone();
     topo.boot(&mut sim);
@@ -849,7 +849,7 @@ fn epoch_uniqueness(seed: u64) {
     let label = format!("Q-S1 seed {seed}");
     let mut now = 0u64;
     for _round in 0..30 {
-        now += u64::from(30 + rng.below(120));
+        now += u64::from(30 + rng.up_to(119));
         sim.run_until(Time(now));
         assert_lease_disjoint(&sim, now, &label);
         inject_fault(
@@ -861,7 +861,7 @@ fn epoch_uniqueness(seed: u64) {
         );
     }
     sim.heal_all();
-    sim.set_loss(0);
+    sim.set_loss(Percent::ZERO);
     sim.set_jitter(0);
     now += 20_000;
     sim.run_until(Time(now));

@@ -10,6 +10,7 @@ mod liveness;
 
 use crate::anchor::{AnchorEvent, AnchorModel};
 use crate::error::SimError;
+use crate::percent::Percent;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
@@ -114,8 +115,8 @@ pub struct Simulation {
     engines: BTreeMap<NodeId, GroupEngine>,
     queue: BinaryHeap<Event>,
     seq: u64,
-    /// Deterministic per-message loss probability, 0..=100 percent.
-    loss_percent: u8,
+    /// Deterministic per-message loss probability.
+    loss: Percent,
     /// Deterministic per-message extra latency, 0..=`jitter_ms`, so messages on a
     /// link can arrive out of send order (models reorder). 0 disables it.
     jitter_ms: u64,
@@ -185,7 +186,7 @@ impl Simulation {
             engines: BTreeMap::new(),
             queue: BinaryHeap::new(),
             seq: 0,
-            loss_percent: 0,
+            loss: Percent::ZERO,
             jitter_ms: 0,
             blocked: BTreeSet::new(),
             max_frame_bytes: 0,
@@ -222,9 +223,9 @@ impl Simulation {
         self.blocked.clear();
     }
 
-    /// Changes the per-message loss probability mid-run (0..=100).
-    pub fn set_loss(&mut self, percent: u8) {
-        self.loss_percent = percent.min(100);
+    /// Changes the per-message loss probability mid-run.
+    pub fn set_loss(&mut self, loss: Percent) {
+        self.loss = loss;
     }
 
     /// Sets the maximum deterministic per-message extra latency. With a non-zero
@@ -234,12 +235,12 @@ impl Simulation {
         self.jitter_ms = ms;
     }
 
-    /// Sets deterministic per-message packet loss (`percent` of 0..=100).
+    /// Sets deterministic per-message packet loss.
     /// Reproducible run-to-run; no randomness is used anywhere. Each message is
     /// dropped independently based on a hash of its scheduling sequence.
     #[must_use]
-    pub fn with_loss(mut self, percent: u8) -> Self {
-        self.loss_percent = percent.min(100);
+    pub fn with_loss(mut self, loss: Percent) -> Self {
+        self.loss = loss;
         self
     }
 
@@ -412,7 +413,7 @@ impl Simulation {
     /// The node's **anchor driver dies with it**: the etag it was carrying is
     /// forgotten, exactly as a real process's would be. That is what makes a
     /// restart re-win the group through
-    /// [`plan_claim`](groupnet_core::anchor::plan_claim) at a strictly higher
+    /// [`AnchorTerms::plan_claim`](groupnet_core::anchor::AnchorTerms::plan_claim) at a strictly higher
     /// epoch instead of resuming the epoch the record still names it at — the
     /// tier keeps no node-local storage, and neither does this simulation.
     ///

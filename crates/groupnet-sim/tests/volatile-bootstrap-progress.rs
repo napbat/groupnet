@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
-    BootstrapOperation, BootstrapScope, ClaimEngine, ClaimIdentity,
+    BootstrapOperation, BootstrapScope, ClaimEngine, ClaimIdentity, PresenceIdentity,
 };
 use groupnet_core::{NodeId, Time};
 use groupnet_sim::SplitMix64;
@@ -93,8 +93,8 @@ fn follower_waits_for_a_progressing_builder_and_only_a_stall_releases_it() {
     for seed in 0..64_u64 {
         let mut rng = SplitMix64::new(seed);
         let stalls = seed % 2 == 1;
-        let pages = 40 + rng.below(40);
-        let stall_after = 1 + rng.below(pages - 1);
+        let pages = 40 + rng.up_to(39);
+        let stall_after = 1 + rng.up_to(pages - 2);
         let mut nodes: Vec<Node> = names
             .iter()
             .zip(1_u128..)
@@ -103,9 +103,11 @@ fn follower_waits_for_a_progressing_builder_and_only_a_stall_releases_it() {
                 engine: ClaimEngine::new(
                     CONFIG,
                     scope(),
-                    name.clone(),
-                    BootId(u128::from(seed) * 4 + boot),
-                    1,
+                    PresenceIdentity {
+                        node: name.clone(),
+                        boot: BootId(u128::from(seed) * 4 + boot),
+                        session: 1,
+                    },
                 )
                 .unwrap(),
                 view: BTreeMap::new(),
@@ -167,7 +169,7 @@ fn follower_waits_for_a_progressing_builder_and_only_a_stall_releases_it() {
                         let gap = if stalls && pages_done >= stall_after {
                             u64::MAX
                         } else {
-                            3 + u64::from(rng.below(7))
+                            3 + u64::from(rng.up_to(6))
                         };
                         nodes[index].build = Some((op, selected.clone(), now.saturating_add(gap)));
                         BootstrapEvent::BuildProgressed { op, selected }
@@ -187,7 +189,7 @@ fn follower_waits_for_a_progressing_builder_and_only_a_stall_releases_it() {
                                 .insert(claim.identity.node.clone(), (claim.clone(), now));
                             let other = 1 - index;
                             queue.push((
-                                now + 1 + u64::from(rng.below(2)),
+                                now + 1 + u64::from(rng.up_to(1)),
                                 other,
                                 Delivery::Publish(claim),
                             ));
@@ -207,7 +209,7 @@ fn follower_waits_for_a_progressing_builder_and_only_a_stall_releases_it() {
                             if builder.is_none() {
                                 builder = Some(index);
                                 node.build =
-                                    Some((op, selected, now + 3 + u64::from(rng.below(7))));
+                                    Some((op, selected, now + 3 + u64::from(rng.up_to(6))));
                             }
                         }
                         BootstrapEffect::BuilderProgressed => nodes[index].progress_reports += 1,

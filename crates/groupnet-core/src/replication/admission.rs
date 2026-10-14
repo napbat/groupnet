@@ -8,7 +8,8 @@ mod writer;
 pub use reader::{AdmissionAppend, ReaderCore, ReaderError};
 pub use timing::ExpiryTiming;
 pub use types::{
-    AdmissionId, AdmissionPolicy, AdmissionRef, PolicyError, RecordBinding, SourceReceipt,
+    AdmissionId, AdmissionPolicy, AdmissionRef, PolicyError, ProjectionReceipt, RecordBinding,
+    SourceReceipt,
 };
 pub use writer::{AckReceipt, AppendIntent, RosterEntry, RosterReceipt, WriterCore, WriterError};
 

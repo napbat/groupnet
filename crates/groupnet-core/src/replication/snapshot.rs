@@ -9,7 +9,10 @@ use crate::Time;
 /// Finite resource and time limits for one state-sync snapshot attempt.
 ///
 /// Byte and chunk budgets are nonzero by type; [`SnapshotConfig::validate`]
-/// checks the logical-time budget.
+/// checks the logical-time budget. [`Default`] bounds an attempt to a 64 MiB
+/// image in up to 1024 chunks of at most 1 MiB, 64 MiB of decoded candidate,
+/// 64 KiB of offer metadata and five minutes — sized to fit beside the default
+/// replication batch in the consistency tier's default shell reserves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotConfig {
     /// Maximum combined variable-length offer metadata and certificate bytes.
@@ -26,6 +29,19 @@ pub struct SnapshotConfig {
     /// Total logical time from before hold acquisition through ready
     /// admission, in milliseconds; nonzero.
     pub max_total_ms: u64,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            max_metadata_bytes: const { NonZeroUsize::new(64 * 1024).unwrap() },
+            max_snapshot_bytes: const { NonZeroU64::new(64 * 1024 * 1024).unwrap() },
+            max_chunks: const { NonZeroU32::new(1024).unwrap() },
+            max_chunk_bytes: const { NonZeroUsize::new(1024 * 1024).unwrap() },
+            max_candidate_bytes: const { NonZeroU64::new(64 * 1024 * 1024).unwrap() },
+            max_total_ms: 300_000,
+        }
+    }
 }
 
 /// Invalid [`SnapshotConfig`], naming the violated rule.

@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use groupnet_core::{Command, Config, GroupEngine, GroupId, GroupMode, NodeId, Status, Time};
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 /// Seeds the shared deterministic PRNG so each schedule is reproducible.
 fn rng(seed: u64) -> SplitMix64 {
@@ -67,7 +67,7 @@ fn engine(group: &GroupId, id: &NodeId, peers: &BTreeSet<NodeId>, config: Config
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    v[rng.below(n) as usize].clone()
+    v[rng.up_to(n - 1) as usize].clone()
 }
 
 /// Per-seed link characteristics, all in milliseconds: latency is drawn from
@@ -181,14 +181,14 @@ fn detection_within_window(config: &Config, link: &Link, salt: u64, victims: u32
         let mut rng = rng(seed ^ salt);
         let group = GroupId::new("detect");
         let smallest = victims + 2; // survivors >= 2
-        let n = smallest + rng.below(7 - smallest); // smallest..=6 nodes
+        let n = smallest + rng.up_to(6 - smallest); // smallest..=6 nodes
         let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
         let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
         // A healthy fabric: no loss, but jittered — so links reorder and a
         // probe/ack pair can arrive out of the order it was sent.
-        let mut sim = Simulation::new(link.base + u64::from(rng.below(link.spread)));
-        sim.set_jitter(u64::from(rng.below(link.jitter + 1)));
+        let mut sim = Simulation::new(link.base + u64::from(rng.up_to(link.spread - 1)));
+        sim.set_jitter(u64::from(rng.up_to(link.jitter)));
         for id in &ids {
             sim.add(engine(&group, id, &all, config.clone()))
                 .expect("distinct node");
@@ -200,7 +200,7 @@ fn detection_within_window(config: &Config, link: &Link, salt: u64, victims: u32
         // difference between a victim that falls silent just before its slot
         // and one that falls silent just after being acked, which is the whole
         // spread the window has to cover.
-        let crash_at = 3_000 + u64::from(rng.below(500));
+        let crash_at = 3_000 + u64::from(rng.up_to(499));
         sim.run_until(Time(crash_at));
         for id in &ids {
             assert_eq!(
@@ -279,13 +279,13 @@ type Observed = BTreeMap<(NodeId, NodeId), (Status, Time)>;
 fn run_since_scenario(seed: u64) {
     let mut rng = rng(seed ^ 0x51ce);
     let group = GroupId::new("since");
-    let n = 3 + rng.below(4);
+    let n = 3 + rng.up_to(3);
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
     let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
-    let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
-    sim.set_loss(u8::try_from(rng.below(25)).expect("below(25) is 0..25"));
-    sim.set_jitter(u64::from(rng.below(9)));
+    let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
+    sim.set_loss(Percent::try_from(rng.up_to(24)).expect("at most 24%"));
+    sim.set_jitter(u64::from(rng.up_to(8)));
 
     let mut alive: BTreeSet<NodeId> = all.clone();
     for id in &ids {
@@ -297,7 +297,7 @@ fn run_since_scenario(seed: u64) {
     let mut prev_obs = 0u64;
     let mut now = 0u64;
     for _round in 0..30 {
-        now += u64::from(20 + rng.below(120));
+        now += u64::from(20 + rng.up_to(119));
         sim.run_until(Time(now));
         check_stamps(&sim, &ids, &mut history, prev_obs, now, seed);
         prev_obs = now;
@@ -379,7 +379,7 @@ fn inject_fault(
     alive: &mut BTreeSet<NodeId>,
     now: u64,
 ) -> Option<NodeId> {
-    match rng.below(8) {
+    match rng.up_to(7) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
             sim.crash(&victim).expect("live node");

@@ -35,7 +35,8 @@
 //!   the one a *renewal* makes dangerous — an attempted renewal's
 //!   `(epoch, host)` is identical to the record it replaces, so only the
 //!   expiry distinguishes "it landed" from "my old record is still there".
-//! * **Every verdict is core's.** [`plan_claim`], [`renewal_record`] and
+//! * **Every verdict is core's.** [`AnchorTerms::plan_claim`],
+//!   [`AnchorTerms::renewal_record`] and
 //!   [`ambiguous_applied`] are called here unmodified. This module supplies
 //!   bytes, etags and a clock — the same division of labour a real object-store
 //!   driver has, which is what makes a DST failure here a failure of the
@@ -68,11 +69,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use groupnet_core::anchor::{
-    AnchorRecord, ClaimPlan, ambiguous_applied, plan_claim, renewal_record,
-};
+use groupnet_core::anchor::{AnchorRecord, AnchorTerms, ClaimPlan, ambiguous_applied};
 use groupnet_core::{NodeId, Time};
 
+use crate::percent::Percent;
 use crate::rng::SplitMix64;
 
 /// What one anchor round did to the register — the alphabet of
@@ -163,18 +163,19 @@ pub(crate) struct AnchorModel {
     /// is: one number, deliberately, so a record and the engine lease earned
     /// from it cannot drift apart.
     ttl_ms: u64,
-    /// The activation's `steal_margin_ms`, fed to [`plan_claim`] unmodified.
+    /// The activation's `steal_margin_ms`, fed to
+    /// [`AnchorTerms::plan_claim`] unmodified.
     steal_margin_ms: u64,
     /// A store round trip, in virtual milliseconds: prompt to write, and write
     /// to read-back.
     latency_ms: u64,
-    /// What share of writes apply but report `Unknown` (0..=100).
-    unknown_percent: u8,
-    /// What share of writes **do not apply** and still report `Unknown`
-    /// (0..=100) — the write-throttled or read-only store. Drawn before
-    /// [`unknown_percent`](Self::unknown_percent), so a round decided here
-    /// never touches the register at all.
-    unknown_lost_percent: u8,
+    /// What share of writes apply but report `Unknown`.
+    unknown: Percent,
+    /// What share of writes **do not apply** and still report `Unknown` —
+    /// the write-throttled or read-only store. Drawn before
+    /// [`unknown`](Self::unknown), so a round decided here never touches the
+    /// register at all.
+    unknown_lost: Percent,
     /// The register itself.
     record: Option<AnchorRecord>,
     /// The etag: a counter bumped on every applied write, so a held etag goes
@@ -227,8 +228,16 @@ impl AnchorModel {
         self.ttl_ms
     }
 
-    pub(crate) const fn set_unknown_percent(&mut self, percent: u8) {
-        self.unknown_percent = if percent > 100 { 100 } else { percent };
+    /// The two numbers every round runs on, as core takes them.
+    const fn terms(&self) -> AnchorTerms {
+        AnchorTerms {
+            ttl_ms: self.ttl_ms,
+            steal_margin_ms: self.steal_margin_ms,
+        }
+    }
+
+    pub(crate) const fn set_unknown_percent(&mut self, share: Percent) {
+        self.unknown = share;
     }
 
     /// The other reading of a timed-out `PUT`: the write **never applied**, and
@@ -241,8 +250,8 @@ impl AnchorModel {
     /// the round, because it is the driver's-eye view of what was *attempted*;
     /// [`record`](Self::record) is the ground truth for what landed, and under
     /// this knob the two deliberately disagree.
-    pub(crate) const fn set_unknown_lost_percent(&mut self, percent: u8) {
-        self.unknown_lost_percent = if percent > 100 { 100 } else { percent };
+    pub(crate) const fn set_unknown_lost_percent(&mut self, share: Percent) {
+        self.unknown_lost = share;
     }
 
     pub(crate) fn set_skew(&mut self, node: &NodeId, ms: i64) {
@@ -287,7 +296,7 @@ impl AnchorModel {
 
     /// A crash takes the driver with the process: the etag it was carrying is
     /// gone, and so is any round it had in flight. This is what makes a restart
-    /// **re-win** through [`plan_claim`] rather than resume — there is no
+    /// **re-win** through [`AnchorTerms::plan_claim`] rather than resume — there is no
     /// node-local storage in this tier, and the model has none either.
     pub(crate) fn forget(&mut self, node: &NodeId) {
         self.held.remove(node);
@@ -347,25 +356,21 @@ impl AnchorModel {
             self.held.remove(node);
             return (AnchorEvent::Yield, self.observe());
         }
-        let record = renewal_record(node, held.epoch, now_wall, self.ttl_ms);
+        let record = self.terms().renewal_record(node, held.epoch, now_wall);
         (AnchorEvent::Renew, self.apply_write(node, record))
     }
 
-    /// The claimant's path: load, [`plan_claim`], and write what it says.
+    /// The claimant's path: load, [`AnchorTerms::plan_claim`], and write what
+    /// it says.
     fn claim(
         &mut self,
         node: &NodeId,
         epoch_hint: u64,
         now_wall: u64,
     ) -> (AnchorEvent, RoundReport) {
-        let plan = plan_claim(
-            node,
-            epoch_hint,
-            self.record.as_ref(),
-            now_wall,
-            self.ttl_ms,
-            self.steal_margin_ms,
-        );
+        let plan = self
+            .terms()
+            .plan_claim(node, epoch_hint, self.record.as_ref(), now_wall);
         match plan {
             // A live record naming somebody else. The driver reports the pair
             // it read, which is how a node that has heard no gossip at all
@@ -401,9 +406,9 @@ impl AnchorModel {
         // Drawn first, and on its own constant: a write the store never applied
         // must not touch the register, and the two faults must be independently
         // schedulable.
-        let lost = self.unknown_lost_percent != 0
+        let lost = self.unknown_lost != Percent::ZERO
             && SplitMix64::hash(self.rounds ^ 0x51ed_270b_2c9e_4d13) % 100
-                < u64::from(self.unknown_lost_percent);
+                < u64::from(self.unknown_lost.get());
         if lost {
             self.unknown_rounds += 1;
             self.unknown_lost_rounds += 1;
@@ -412,9 +417,9 @@ impl AnchorModel {
         }
         self.record = Some(record.clone());
         self.token += 1;
-        let unknown = self.unknown_percent != 0
+        let unknown = self.unknown != Percent::ZERO
             && SplitMix64::hash(self.rounds ^ 0xa9c4_07d0_1f5e_2b63) % 100
-                < u64::from(self.unknown_percent);
+                < u64::from(self.unknown.get());
         if unknown {
             self.unknown_rounds += 1;
             self.held.remove(node);
@@ -473,6 +478,7 @@ impl AnchorModel {
 #[cfg(test)]
 mod tests {
     use super::{AnchorEvent, AnchorModel, RoundReport};
+    use crate::percent::Percent;
     use groupnet_core::anchor::AnchorRecord;
     use groupnet_core::{NodeId, Time};
 
@@ -574,7 +580,7 @@ mod tests {
     #[test]
     fn an_unknown_write_that_still_stands_resolves_as_won() {
         let mut model = model();
-        model.set_unknown_percent(100);
+        model.set_unknown_percent(Percent::HUNDRED);
         let (event, report) = model.round(&n("a"), 1, Time(0), None);
         assert_eq!(event, AnchorEvent::Create);
         let RoundReport::Ambiguous { attempted } = report else {
@@ -582,7 +588,7 @@ mod tests {
         };
         assert_eq!(model.unknown_rounds(), 1);
 
-        model.set_unknown_percent(0);
+        model.set_unknown_percent(Percent::ZERO);
         assert!(matches!(
             model.read_back(&n("a"), &attempted),
             RoundReport::Won { epoch: 1 }
@@ -600,11 +606,11 @@ mod tests {
     #[test]
     fn an_unknown_write_superseded_before_the_read_back_resolves_as_observed() {
         let mut model = model();
-        model.set_unknown_percent(100);
+        model.set_unknown_percent(Percent::HUNDRED);
         let RoundReport::Ambiguous { attempted } = model.round(&n("a"), 1, Time(0), None).1 else {
             panic!("a 100% unknown schedule is ambiguous");
         };
-        model.set_unknown_percent(0);
+        model.set_unknown_percent(Percent::ZERO);
         // Somebody stole it in the interval the driver spent not knowing.
         assert_eq!(claim(&mut model, "b", 2, 1_200), AnchorEvent::Steal);
 
@@ -627,7 +633,7 @@ mod tests {
         claim(&mut model, "a", 1, 0); // expires at wall 1_000
         let standing = model.record().expect("a record");
 
-        model.set_unknown_lost_percent(100);
+        model.set_unknown_lost_percent(Percent::HUNDRED);
         let (event, report) = model.round(&n("a"), 1, Time(600), Some(1));
         assert_eq!(event, AnchorEvent::Renew, "the round was a renewal attempt");
         let RoundReport::Ambiguous { attempted } = report else {
@@ -640,7 +646,7 @@ mod tests {
             "a write the store never applied must not touch the register"
         );
 
-        model.set_unknown_lost_percent(0);
+        model.set_unknown_lost_percent(Percent::ZERO);
         match model.read_back(&n("a"), &attempted) {
             RoundReport::Observed { epoch, host } => assert_eq!((epoch, host), (1, n("a"))),
             other => panic!("a renewal that never landed must not read as won: {other:?}"),

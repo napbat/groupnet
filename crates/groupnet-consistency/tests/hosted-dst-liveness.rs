@@ -327,9 +327,9 @@ impl Harness {
     fn new(tag: Tag, n: u32, rng: &mut SplitMix64) -> Self {
         let group = GroupId::new(format!("hosted-{}-{}", tag.0, tag.1));
         let all: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
-        let off = usize::try_from(rng.below(n)).expect("bounded by n");
+        let off = usize::try_from(rng.up_to(n - 1)).expect("bounded by n");
         let voters: BTreeSet<NodeId> = (0..3).map(|k| all[(off + k) % all.len()].clone()).collect();
-        let mut sim = Simulation::new(u64::from(3 + rng.below(8)));
+        let mut sim = Simulation::new(u64::from(3 + rng.up_to(7)));
         let mut nodes = BTreeMap::new();
         for id in &all {
             let seeds: Vec<NodeId> = all.iter().filter(|x| *x != id).cloned().collect();
@@ -689,7 +689,7 @@ impl Harness {
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    let i = usize::try_from(rng.below(n)).expect("bounded by the set size");
+    let i = usize::try_from(rng.up_to(n - 1)).expect("bounded by the set size");
     v[i].clone()
 }
 
@@ -811,7 +811,7 @@ fn dst_hosted_healthy_runs_serve_and_reestablish_after_a_heal() {
 
 fn healthy_scenario(seed: u64) -> Stats {
     let mut rng = rng(seed ^ 0x11ee);
-    let n = if rng.below(2) == 0 { 3 } else { 5 };
+    let n = if rng.up_to(1) == 0 { 3 } else { 5 };
     let tag = ("H-L1", seed);
     let mut h = Harness::new(tag, n, &mut rng);
 

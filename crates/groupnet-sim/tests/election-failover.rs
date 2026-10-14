@@ -79,7 +79,7 @@ fn engine(group: &GroupId, id: &NodeId, peers: &BTreeSet<NodeId>) -> GroupEngine
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    v[rng.below(n) as usize].clone()
+    v[rng.up_to(n - 1) as usize].clone()
 }
 
 /// [`pick`], removing the drawn node — a draw without replacement.
@@ -149,13 +149,13 @@ fn dst_new_host_activates_inside_the_advertised_budget() {
 fn new_host_budget(seed: u64) {
     let mut rng = rng(seed ^ 0xe2b0);
     let group = GroupId::new(format!("budget-{seed}"));
-    let n = 3 + rng.below(4); // 3..=6 nodes
+    let n = 3 + rng.up_to(3); // 3..=6 nodes
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
     let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
     // A healthy fabric: no loss, but jittered, so links reorder.
-    let mut sim = Simulation::new(2 + u64::from(rng.below(5)));
-    sim.set_jitter(u64::from(rng.below(6)));
+    let mut sim = Simulation::new(2 + u64::from(rng.up_to(4)));
+    sim.set_jitter(u64::from(rng.up_to(5)));
     for id in &ids {
         sim.add(engine(&group, id, &all)).expect("distinct node");
     }
@@ -163,7 +163,7 @@ fn new_host_budget(seed: u64) {
     // Converge first: the budget bounds *failover*, not bootstrap. The crash
     // instant is drawn too, so the schedule samples the phase of the crash
     // against each survivor's probe cursor and the incumbent's renewal tick.
-    let crash_at = 3_000 + u64::from(rng.below(500));
+    let crash_at = 3_000 + u64::from(rng.up_to(499));
     sim.run_until(Time(crash_at));
 
     let incumbent = sole_host(&sim, "E2", seed);
@@ -260,13 +260,13 @@ fn split_brain(seed: u64) {
     let ids: Vec<NodeId> = (0..5).map(|i| NodeId::new(format!("n{i}"))).collect();
     let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
-    let mut sim = Simulation::new(2 + u64::from(rng.below(5)));
-    sim.set_jitter(u64::from(rng.below(6)));
+    let mut sim = Simulation::new(2 + u64::from(rng.up_to(4)));
+    sim.set_jitter(u64::from(rng.up_to(5)));
     for id in &ids {
         sim.add(engine(&group, id, &all)).expect("distinct node");
     }
 
-    let split_at = 3_000 + u64::from(rng.below(500));
+    let split_at = 3_000 + u64::from(rng.up_to(499));
     sim.run_until(Time(split_at));
     let incumbent = sole_host(&sim, "E3", seed);
     let top = placement::owner(group.as_str(), &all).expect("a non-empty group");
@@ -336,11 +336,11 @@ fn split_brain(seed: u64) {
 /// incumbent drawn onto one side or the other so both shapes — "the incumbent
 /// keeps a majority" and "the incumbent is marooned" — appear across the seeds.
 fn draw_side(rng: &mut SplitMix64, all: &BTreeSet<NodeId>, incumbent: &NodeId) -> BTreeSet<NodeId> {
-    let wanted = 1 + usize::try_from(rng.below(2)).expect("a 0/1 draw");
+    let wanted = 1 + usize::try_from(rng.up_to(1)).expect("a 0/1 draw");
     let mut pool: BTreeSet<NodeId> = all.clone();
     pool.remove(incumbent);
     let mut side = BTreeSet::new();
-    if rng.below(2) == 0 {
+    if rng.up_to(1) == 0 {
         side.insert(incumbent.clone());
     }
     while side.len() < wanted {
@@ -425,17 +425,17 @@ fn dst_same_epoch_collision_is_fenced_deterministically() {
 fn same_epoch_collision(seed: u64) {
     let mut rng = rng(seed ^ 0xe4c0);
     let group = GroupId::new(format!("collide-{seed}"));
-    let n = 4 + rng.below(3); // 4..=6 nodes
+    let n = 4 + rng.up_to(2); // 4..=6 nodes
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
     let all: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
-    let mut sim = Simulation::new(2 + u64::from(rng.below(5)));
-    sim.set_jitter(u64::from(rng.below(6)));
+    let mut sim = Simulation::new(2 + u64::from(rng.up_to(4)));
+    sim.set_jitter(u64::from(rng.up_to(5)));
     for id in &ids {
         sim.add(engine(&group, id, &all)).expect("distinct node");
     }
 
-    let crash_at = 3_000 + u64::from(rng.below(500));
+    let crash_at = 3_000 + u64::from(rng.up_to(499));
     sim.run_until(Time(crash_at));
     let incumbent = sole_host(&sim, "E4", seed);
     let (epoch, _) = pair_of(&sim, &incumbent);
@@ -530,7 +530,7 @@ fn same_epoch_collision(seed: u64) {
 /// One side of a two-way cut of the survivors: at least one node on each side.
 fn draw_half(rng: &mut SplitMix64, survivors: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
     let most = u32::try_from(survivors.len() - 1).expect("a handful of survivors");
-    let wanted = 1 + usize::try_from(rng.below(most)).expect("bounded by the survivor count");
+    let wanted = 1 + usize::try_from(rng.up_to(most - 1)).expect("bounded by the survivor count");
     let mut pool = survivors.clone();
     let mut side = BTreeSet::new();
     while side.len() < wanted {

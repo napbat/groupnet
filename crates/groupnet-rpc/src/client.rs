@@ -123,10 +123,14 @@ impl<B: BulkTransport> RpcClient<B> {
 
     /// Calls `to` with `payload` and waits up to `timeout` for its answer.
     ///
-    /// The server receives the remaining budget as the request's deadline
-    /// and drops the work once it passes. A timeout above
-    /// [`MAX_TIMEOUT`](crate::MAX_TIMEOUT) is clamped to it. Dropping the
-    /// returned future abandons the call (a late answer is discarded).
+    /// The server receives the remaining budget, in whole milliseconds rounded
+    /// up, as the request's deadline and drops the work once it passes. A
+    /// zero `timeout` fails [`Timeout`](RpcError::Timeout) without sending. A
+    /// timeout above [`MAX_TIMEOUT`](crate::MAX_TIMEOUT) — the longest the
+    /// wire's `u32` milliseconds carry, about 49.7 days — saturates to it; the
+    /// difference is unobservable, and no timeout overflows the clock.
+    /// Dropping the returned future abandons the call (a late answer is
+    /// discarded).
     ///
     /// # Errors
     /// See [`RpcError`]: [`TooLarge`](RpcError::TooLarge),
@@ -148,6 +152,8 @@ impl<B: BulkTransport> RpcClient<B> {
         if payload.len() > inner.config.max_frame_bytes.body(REQUEST_HEAD) {
             return Err(RpcError::TooLarge);
         }
+        // Saturating to the wire's maximum is the permitted exception: the
+        // deadline below then always fits the monotonic clock and the wire.
         let timeout = timeout.min(MAX_TIMEOUT);
         if timeout.is_zero() {
             return Err(RpcError::Timeout);
@@ -172,9 +178,10 @@ impl<B: BulkTransport> RpcClient<B> {
                 id,
             };
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let deadline_ms = u32::try_from(remaining.as_millis())
-                .unwrap_or(u32::MAX)
-                .max(1);
+            // An expired budget is not sent: the wire carries no zero deadline.
+            let Some(deadline_ms) = wire_deadline_ms(remaining) else {
+                return Err(RpcError::Timeout);
+            };
             let frame = Frame::Request {
                 id,
                 deadline_ms,
@@ -216,6 +223,18 @@ impl<B: BulkTransport> RpcClient<B> {
     pub fn peers(&self) -> usize {
         lock(&self.inner.peers).len()
     }
+}
+
+/// `remaining` as a request's wire deadline: whole milliseconds rounded up, so
+/// a sub-millisecond budget still reaches the server as `1`, saturating at
+/// `u32::MAX` (only reachable from a budget of [`MAX_TIMEOUT`], which is that
+/// maximum). `None` once the budget is spent.
+fn wire_deadline_ms(remaining: Duration) -> Option<u32> {
+    if remaining.is_zero() {
+        return None;
+    }
+    let millis = remaining.as_nanos().div_ceil(1_000_000);
+    Some(u32::try_from(millis).unwrap_or(u32::MAX))
 }
 
 impl<B: BulkTransport> Inner<B> {
@@ -503,5 +522,30 @@ async fn drive<S>(
         () = read => {}
         () = write_frames(&mut writer, &mut queue, max_frame_bytes) => {}
         () = idle_out(&calls, idle) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::wire_deadline_ms;
+    use crate::MAX_TIMEOUT;
+
+    /// The wire carries the remaining budget rounded up to whole
+    /// milliseconds, never zero, and the longest budget a call can hold
+    /// fits exactly: nothing above it is ever converted, so nothing wraps.
+    #[test]
+    fn wire_deadline_rounds_up_and_fits_the_maximum_budget() {
+        assert_eq!(wire_deadline_ms(Duration::ZERO), None);
+        assert_eq!(wire_deadline_ms(Duration::from_nanos(1)), Some(1));
+        assert_eq!(wire_deadline_ms(Duration::from_micros(999)), Some(1));
+        assert_eq!(wire_deadline_ms(Duration::from_millis(1)), Some(1));
+        assert_eq!(wire_deadline_ms(Duration::from_micros(1_500)), Some(2));
+        assert_eq!(wire_deadline_ms(MAX_TIMEOUT), Some(u32::MAX));
+        assert_eq!(
+            wire_deadline_ms(MAX_TIMEOUT.saturating_sub(Duration::from_nanos(1))),
+            Some(u32::MAX)
+        );
     }
 }

@@ -290,6 +290,18 @@ fn same_or_backward_batch_cannot_advance_and_retry_is_bounded() {
 }
 
 #[test]
+fn default_snapshot_config_is_valid_alone_and_nested() {
+    assert_eq!(SnapshotConfig::default().validate(), Ok(()));
+    let config = Config {
+        snapshot: Some(SnapshotConfig::default()),
+        idle: Some(IdlePolicy::default()),
+        ..Config::default()
+    };
+    assert_eq!(config.validate(), Ok(()));
+    assert!(SessionEngine::new(scope(), Mode::StateSync, config, 1).is_ok());
+}
+
+#[test]
 fn nested_config_errors_name_their_rule_and_expose_source() {
     let snapshot = SnapshotConfig {
         max_metadata_bytes: NonZeroUsize::new(128).unwrap(),

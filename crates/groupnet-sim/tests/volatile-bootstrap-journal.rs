@@ -123,7 +123,7 @@ fn encoding_schedule_keeps_c_fixed_while_live_suffix_advances() {
                 }],
             )
             .unwrap();
-        let encode_due = 3 + u64::from(rng.below(3));
+        let encode_due = 3 + u64::from(rng.up_to(2));
         let fail = seed % 3 == 0;
         for at in 1..encode_due {
             assert!(journal.current_cursor().is_none());
@@ -206,7 +206,7 @@ fn queued_transfer_reconstructs_every_exact_barrier() {
             vec![(1, Delivery::Reserve), (2, Delivery::BeginAttach)];
         let mut at = 1u64;
         for index in 1..=5 {
-            at += 1 + u64::from(rng.below(2));
+            at += 1 + u64::from(rng.up_to(1));
             queue.push((at, Delivery::Append(index, mutation(&mut rng, index))));
         }
         for now in 3..=24 {
@@ -225,7 +225,7 @@ fn queued_transfer_reconstructs_every_exact_barrier() {
                 .enumerate()
                 .filter_map(|(index, (time, _))| (*time == due).then_some(index))
                 .collect::<Vec<_>>();
-            let choice = choices[rng.below(u32::try_from(choices.len()).unwrap()) as usize];
+            let choice = choices[rng.up_to(u32::try_from(choices.len() - 1).unwrap()) as usize];
             let (_, event) = queue.swap_remove(choice);
             match event {
                 Delivery::Append(index, effect) => {
@@ -252,7 +252,7 @@ fn queued_transfer_reconstructs_every_exact_barrier() {
                         .begin_attach(Time(due), reservation.as_ref().unwrap())
                         .unwrap();
                     queue.push((
-                        due + 1 + u64::from(rng.below(2)),
+                        due + 1 + u64::from(rng.up_to(1)),
                         Delivery::ConfirmAttach(token),
                     ));
                 }
@@ -284,7 +284,7 @@ fn queued_transfer_reconstructs_every_exact_barrier() {
                     {
                         pending = true;
                         queue.push((
-                            due + 1 + u64::from(rng.below(2)),
+                            due + 1 + u64::from(rng.up_to(1)),
                             Delivery::Ack(Box::new(batch)),
                         ));
                     }
@@ -371,10 +371,10 @@ fn queued_disposal_fences_delayed_batch_callbacks() {
         drop(batch);
         let mut image = Some(7);
         let fault_due = if seed % 3 == 2 { 5u64 } else { 6u64 };
-        let ack_due = if rng.below(2) == 0 {
-            3 + u64::from(rng.below(2))
+        let ack_due = if rng.up_to(1) == 0 {
+            3 + u64::from(rng.up_to(1))
         } else {
-            7 + u64::from(rng.below(2))
+            7 + u64::from(rng.up_to(1))
         };
         let mut queue = vec![(ack_due, true), (fault_due, false)];
         let mut disposed = false;
@@ -385,7 +385,7 @@ fn queued_disposal_fences_delayed_batch_callbacks() {
                 .enumerate()
                 .filter_map(|(index, (time, _))| (*time == due).then_some(index))
                 .collect::<Vec<_>>();
-            let choice = choices[rng.below(u32::try_from(choices.len()).unwrap()) as usize];
+            let choice = choices[rng.up_to(u32::try_from(choices.len() - 1).unwrap()) as usize];
             let (_, ack) = queue.swap_remove(choice);
             if ack {
                 let result = journal.ack_batch(Time(due), &reservation, operation, &through);
@@ -437,7 +437,7 @@ fn apply(state: &mut Option<u8>, effect: &[u8]) {
 }
 
 fn mutation(rng: &mut SplitMix64, index: u8) -> Vec<u8> {
-    match rng.below(4) {
+    match rng.up_to(3) {
         0 => vec![0],
         1 => vec![2],
         _ => vec![1, index],

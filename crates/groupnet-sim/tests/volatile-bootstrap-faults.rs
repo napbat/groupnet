@@ -3,7 +3,7 @@
 use groupnet_core::placement;
 use groupnet_core::volatile_bootstrap::{
     BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
-    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine, ClaimPhase,
+    BootstrapOperation, BootstrapScope, BootstrapStage, ClaimEngine, ClaimPhase, PresenceIdentity,
 };
 use groupnet_core::{NodeId, Time};
 use groupnet_sim::SplitMix64;
@@ -76,9 +76,13 @@ fn initialized(
             ClaimEngine::new(
                 config(),
                 scope(),
-                node.clone(),
-                groupnet_core::volatile_bootstrap::BootId(u128::try_from(index + 1).unwrap()),
-                seed + 1,
+                PresenceIdentity {
+                    node: node.clone(),
+                    boot: groupnet_core::volatile_bootstrap::BootId(
+                        u128::try_from(index + 1).unwrap(),
+                    ),
+                    session: seed + 1,
+                },
             )
             .unwrap()
         })
@@ -125,7 +129,7 @@ fn scripted_lost_and_reordered_claim_replies_preserve_selection_and_heal() {
         let mut rng = SplitMix64::new(seed);
         let (names, mut engines, mut claims, builder, follower) = initialized(seed);
         let donor_identity = engines[builder].selected().unwrap().clone();
-        if rng.below(4) == 0 {
+        if rng.up_to(3) == 0 {
             let build_op = engines[builder].current_operation().unwrap();
             engines[builder].step(BootstrapEvent::BuildFailed {
                 op: build_op,
@@ -159,7 +163,7 @@ fn scripted_lost_and_reordered_claim_replies_preserve_selection_and_heal() {
         let first_poll = engines[follower].step(BootstrapEvent::Tick(Time(5)));
         let first_op = observe(&first_poll.effects);
         claims[follower] = claim(&first_poll.effects);
-        let dropped = rng.below(2) == 0;
+        let dropped = rng.up_to(1) == 0;
         if dropped {
             // The first source reply is lost; a finite core timer reissues it.
             lost_polls += 1;

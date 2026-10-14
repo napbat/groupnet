@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use groupnet_core::volatile_bootstrap::{
     BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
-    BootstrapOperation, BootstrapScope, ClaimEngine, ClaimIdentity,
+    BootstrapOperation, BootstrapScope, ClaimEngine, ClaimIdentity, PresenceIdentity,
 };
 use groupnet_core::{NodeId, Time};
 use groupnet_sim::SplitMix64;
@@ -105,9 +105,9 @@ fn enqueue_effects(
                     let delay = if healthy || claim.renewal == 1 {
                         1
                     } else {
-                        rng.below(3)
+                        rng.up_to(2)
                     };
-                    if !healthy && recipient != from && claim.renewal > 1 && rng.below(7) == 0 {
+                    if !healthy && recipient != from && claim.renewal > 1 && rng.up_to(6) == 0 {
                         coverage.lost_deliveries += 1;
                         continue;
                     }
@@ -116,7 +116,7 @@ fn enqueue_effects(
                         recipient,
                         delivery: Delivery::Publish(claim.clone()),
                     });
-                    if !healthy && recipient != from && claim.renewal > 1 && rng.below(5) == 0 {
+                    if !healthy && recipient != from && claim.renewal > 1 && rng.up_to(4) == 0 {
                         queue.push(Queued {
                             at: now + u64::from(delay) + 1,
                             recipient,
@@ -145,7 +145,7 @@ fn enqueue_effects(
                 let delay = if healthy || op.token == 1 {
                     1
                 } else {
-                    1 + u64::from(rng.below(2))
+                    1 + u64::from(rng.up_to(1))
                 };
                 queue.push(Queued {
                     at: now + delay,
@@ -157,7 +157,7 @@ fn enqueue_effects(
                 coverage.builders_ever.insert(from);
                 // Some builders crash. The core's finite build timeout then
                 // fences that work and permits ordinary origin fallback.
-                if healthy || rng.below(6) != 0 {
+                if healthy || rng.up_to(5) != 0 {
                     queue.push(Queued {
                         at: now + 2,
                         recipient: from,
@@ -265,9 +265,13 @@ fn queued_native_ttl_claims_converge_and_survive_faults() {
                 ClaimEngine::new(
                     config(),
                     scope(),
-                    name.clone(),
-                    groupnet_core::volatile_bootstrap::BootId(u128::try_from(index + 1).unwrap()),
-                    seed + 1,
+                    PresenceIdentity {
+                        node: name.clone(),
+                        boot: groupnet_core::volatile_bootstrap::BootId(
+                            u128::try_from(index + 1).unwrap(),
+                        ),
+                        session: seed + 1,
+                    },
                 )
                 .unwrap()
             })

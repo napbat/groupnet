@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
     BootstrapMemberIdentity, BootstrapOperation, BootstrapParticipant, BootstrapPresence,
-    BootstrapScope, ClaimEngine, ClaimIdentity, PresenceIdentity,
+    BootstrapScope, ClaimEngine, ClaimIdentity, ParticipationCut, PresenceIdentity,
 };
 use groupnet_core::{NodeId, Status, Time};
 use groupnet_sim::SplitMix64;
@@ -78,24 +78,24 @@ impl Schedule {
     }
 
     fn seeded(rng: &mut SplitMix64, crash: bool) -> Self {
-        let leave = 50 + rng.below(40);
-        let reap = leave + 16 + rng.below(24);
-        let write = (rng.below(2) == 0).then(|| 40 + rng.below(leave - 40));
+        let leave = 50 + rng.up_to(39);
+        let reap = leave + 16 + rng.up_to(23);
+        let write = (rng.up_to(1) == 0).then(|| 40 + rng.up_to(leave - 41));
         let (leave, reap) = (u64::from(leave), u64::from(reap));
         Self {
-            build_len: 20 + u64::from(rng.below(10)),
-            affirm: u64::from(rng.below(3)),
-            encode: 1 + u64::from(rng.below(3)),
-            lag: u64::from(rng.below(3)),
+            build_len: 20 + u64::from(rng.up_to(9)),
+            affirm: u64::from(rng.up_to(2)),
+            encode: 1 + u64::from(rng.up_to(2)),
+            lag: u64::from(rng.up_to(2)),
             write: write.map(u64::from),
             leave,
-            lapse_leave: 6 + u64::from(rng.below(16)),
+            lapse_leave: 6 + u64::from(rng.up_to(15)),
             reap,
-            readd: reap + u64::from(rng.below(4)),
+            readd: reap + u64::from(rng.up_to(3)),
             // A crashed peer's re-registered name stays suspected: the
             // donor's own rebuild needs a complete cut.
-            readd_alive: !crash && rng.below(2) == 0,
-            lapse_join: 6 + u64::from(rng.below(8)),
+            readd_alive: !crash && rng.up_to(1) == 0,
+            lapse_join: 6 + u64::from(rng.up_to(7)),
             crash,
         }
     }
@@ -186,9 +186,11 @@ fn engine(seed: u64, node: usize) -> ClaimEngine {
             domain: "origin".to_owned(),
             partition: "bucket".to_owned(),
         },
-        name(node),
-        BootId(u128::from(seed) * 4 + u128::from(node == JOINER) * 2 + 1),
-        1,
+        PresenceIdentity {
+            node: name(node),
+            boot: BootId(u128::from(seed) * 4 + u128::from(node == JOINER) * 2 + 1),
+            session: 1,
+        },
     )
     .unwrap();
     engine.require_participation().unwrap();
@@ -458,10 +460,12 @@ impl World {
         self.donor
             .verify_participant_roster(
                 op,
-                &cut.members,
-                &cut.roster,
-                &cut.participants,
-                &cut.claims,
+                ParticipationCut {
+                    members: &cut.members,
+                    roster: &cut.roster,
+                    participants: &cut.participants,
+                    claims: &cut.claims,
+                },
             )
             .is_ok()
     }

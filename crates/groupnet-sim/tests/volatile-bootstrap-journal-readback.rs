@@ -143,12 +143,12 @@ fn seeded_lost_duplicate_reordered_replies_recover_or_expire_without_wrong_ack()
         ];
         let mut queued = Vec::new();
         for reply in originals {
-            if rng.below(3) == 0 {
+            if rng.up_to(2) == 0 {
                 lost += 1;
             } else {
-                queued.push((rng.below(4), reply.clone()));
-                if rng.below(3) == 0 {
-                    queued.push((rng.below(4), reply));
+                queued.push((rng.up_to(3), reply.clone()));
+                if rng.up_to(2) == 0 {
+                    queued.push((rng.up_to(3), reply));
                     duplicates += 1;
                 }
             }

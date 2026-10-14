@@ -13,9 +13,10 @@ use crate::codec::REQUEST_HEAD;
 pub use error::{FrameLimitError, RpcConfigError, RpcServerConfigError};
 
 /// The longest timer the RPC layer represents. A request's deadline travels
-/// as `u32` milliseconds (~49.7 days): a call's timeout is clamped to it, and
-/// every configured timer must lie within it, so deadlines computed from
-/// them never overflow the monotonic clock.
+/// as `u32` milliseconds (~49.7 days): a call's timeout saturates to it (the
+/// one permitted correction — the difference is unobservable), and every
+/// configured timer must lie within it, so deadlines computed from them never
+/// overflow the monotonic clock.
 pub const MAX_TIMEOUT: Duration = Duration::from_millis(u32::MAX as u64);
 
 /// A validated bound on one whole RPC frame, head included: at least the

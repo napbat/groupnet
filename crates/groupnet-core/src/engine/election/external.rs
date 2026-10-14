@@ -71,7 +71,7 @@
 //!   candidate** emits `AnchorClaimDue` on the same anti-entropy cadence,
 //!   hinting the epoch it already holds. The driver renews at that epoch while
 //!   it still has its etag, and re-plans through
-//!   [`plan_claim`](crate::anchor::plan_claim) — which bids strictly higher —
+//!   [`AnchorTerms::plan_claim`](crate::anchor::AnchorTerms::plan_claim) — which bids strictly higher —
 //!   if it does not. Reached only after row 6's lapse check, so a host that
 //!   has already run out of lease steps down instead of asking for more.
 //!
@@ -166,7 +166,7 @@ impl GroupEngine {
     /// The hint is deliberately *not* `highest_seen + 1`: a renewal keeps the
     /// epoch, because it decides nothing and so allocates nothing. It is still
     /// only a floor — a driver that has lost its etag re-plans through
-    /// [`plan_claim`](crate::anchor::plan_claim), which bids strictly above
+    /// [`AnchorTerms::plan_claim`](crate::anchor::AnchorTerms::plan_claim), which bids strictly above
     /// whatever the anchor actually shows, so a hint equal to a spent epoch
     /// can never re-litigate it.
     ///

@@ -80,7 +80,7 @@ fn volatile_recovery_reaches_applied_heads_or_fences_full_fallback() {
     let mut vanished = 0;
     for seed in 0..64 {
         let mut rng = SplitMix64::new(seed);
-        let heal_at = 2 + u64::from(rng.below(6));
+        let heal_at = 2 + u64::from(rng.up_to(5));
         let fail_observation = seed % 5 == 0;
         let disappear = seed % 7 == 0;
         let advance_once = seed % 3 == 0;

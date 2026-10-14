@@ -31,14 +31,20 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    /// A pseudo-random value in `0..n`; `n` is treated as at least `1`.
+    /// A pseudo-random value in `0..=max`.
+    ///
+    /// The bound is inclusive so that every `u32` is a valid one: there is no
+    /// empty range to reject or correct, and `up_to(u32::MAX)` spans the whole
+    /// word. A draw from `n` equally likely outcomes is `up_to(n - 1)`, exactly
+    /// `next_u64() % n`.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "`% n` bounds the draw below `n`, itself a u32, so the narrowing is \
-                  exact — and the whole point here is a branch-free fixed stream"
+        reason = "`% (max + 1)` bounds the draw by `max`, itself a u32, so the \
+                  narrowing is exact — and the whole point here is a branch-free \
+                  fixed stream"
     )]
-    pub fn below(&mut self, n: u32) -> u32 {
-        (self.next_u64() % u64::from(n.max(1))) as u32
+    pub fn up_to(&mut self, max: u32) -> u32 {
+        (self.next_u64() % (u64::from(max) + 1)) as u32
     }
 
     /// A stateless single-word draw, equal to `SplitMix64::new(x).next_u64()`.
@@ -133,19 +139,29 @@ mod tests {
         assert_ne!(draws(1, 8), draws(2, 8));
     }
 
-    /// `below` stays in range, treats `0` as `1` (no divide-by-zero), and maps
+    /// `up_to` stays in its inclusive range at both ends of `u32`, and maps
     /// the stream to bounded draws in a pinned way.
     #[test]
-    fn below_is_bounded_and_pinned() {
+    fn up_to_is_inclusive_bounded_and_pinned() {
         let mut rng = SplitMix64::new(7);
-        let got: Vec<u32> = (0..10).map(|_| rng.below(10)).collect();
+        let got: Vec<u32> = (0..10).map(|_| rng.up_to(9)).collect();
         assert_eq!(got, [7, 4, 6, 3, 4, 5, 8, 2, 5, 5]);
 
         let mut rng = SplitMix64::new(99);
+        let mut seen = [false; 3];
         for _ in 0..256 {
-            assert!(rng.below(3) < 3);
-            assert_eq!(rng.below(0), 0, "n is treated as at least 1");
-            assert_eq!(rng.below(1), 0);
+            let draw = rng.up_to(2);
+            assert!(draw <= 2);
+            seen[usize::try_from(draw).expect("at most 2")] = true;
+            assert_eq!(rng.up_to(0), 0, "the only value in 0..=0");
+        }
+        assert_eq!(seen, [true; 3], "the upper bound is reachable");
+
+        let mut rng = SplitMix64::new(5);
+        let mut words = rng.clone();
+        for _ in 0..64 {
+            let word = words.next_u64();
+            assert_eq!(u64::from(rng.up_to(u32::MAX)), word % (1 << 32));
         }
     }
 }

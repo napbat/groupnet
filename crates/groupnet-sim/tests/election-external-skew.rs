@@ -73,7 +73,7 @@ use groupnet_core::{
     Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
     placement,
 };
-use groupnet_sim::{AnchorEvent, Simulation, SplitMix64};
+use groupnet_sim::{AnchorEvent, Percent, Simulation, SplitMix64};
 
 /// A long lease, on purpose. The overlap this file is about lives *inside* the
 /// deposed holder's remaining lease, so the lease has to be comfortably longer
@@ -101,7 +101,7 @@ fn half_margin() -> i64 {
 fn draw_skew(rng: &mut SplitMix64) -> i64 {
     let half = half_margin();
     let span = u32::try_from(2 * half + 1).expect("a small margin");
-    i64::from(rng.below(span)) - half
+    i64::from(rng.up_to(span - 1)) - half
 }
 
 fn cfg() -> Config {
@@ -258,12 +258,12 @@ fn dst_within_margin_never_overlaps() {
 /// Returns `(steals, handovers)` for one seed.
 fn within_margin(seed: u64) -> (u64, u64) {
     let mut rng = SplitMix64::new(seed ^ 0x5c0f_9e37_79b9_7f4a);
-    let n = 3 + usize::try_from(rng.below(3)).expect("a 0..3 draw"); // 3..=5
+    let n = 3 + usize::try_from(rng.up_to(2)).expect("a 0..3 draw"); // 3..=5
     let members = ids(n);
     let group = format!("x-skew-{seed}");
     let label = format!("X-skew-a seed {seed}");
     let mut sim = cluster(&group, &members);
-    sim.set_jitter(u64::from(rng.below(6)));
+    sim.set_jitter(u64::from(rng.up_to(5)));
 
     // Per-node offsets inside ±margin/2, so every *pair* is within the margin —
     // the assumption in the form the rule actually uses.
@@ -277,7 +277,7 @@ fn within_margin(seed: u64) -> (u64, u64) {
     let mut now = 3_000u64;
     for _round in 0..8 {
         // One drawn fault per round, all of them handover pressure.
-        match rng.below(6) {
+        match rng.up_to(5) {
             0 => {
                 if let Some(host) = sim.hosts().first() {
                     sim.block_anchor(host);
@@ -313,7 +313,7 @@ fn within_margin(seed: u64) -> (u64, u64) {
             }
         }
 
-        now += 1_000 + u64::from(rng.below(2_000));
+        now += 1_000 + u64::from(rng.up_to(1999));
         while let Some(Time(at)) = sim.step_until(Time(now)) {
             let hosting = hosting_pairs(&sim);
             assert!(
@@ -441,7 +441,7 @@ fn beyond_margin(seed: u64) -> Overlap {
     // overlap wide enough to survive the prompt cadence and the round trip that
     // the successor's steal costs — so the family cannot degenerate into "the
     // overlap was theoretically possible but never observed".
-    let excess = u64::from(rng.below(800)) + GOSSIP_INTERVAL_MS + ANCHOR_LATENCY_MS + 50;
+    let excess = u64::from(rng.up_to(799)) + GOSSIP_INTERVAL_MS + ANCHOR_LATENCY_MS + 50;
     let delta = STEAL_MARGIN_MS + ANCHOR_LATENCY_MS + excess;
     sim.set_anchor_skew(
         &successor,
@@ -456,7 +456,7 @@ fn beyond_margin(seed: u64) -> Overlap {
     }
     // Half the seeds give the incumbent its store back the moment it is deposed,
     // which is what lets its own renewal tell it so.
-    let heal_on_overlap = rng.below(2) == 0;
+    let heal_on_overlap = rng.up_to(1) == 0;
 
     let deadline = 3_000 + 3 * LEASE_MS + 4_000;
     let (from, until) = watch_for_overlap(
@@ -630,19 +630,19 @@ fn dst_unknown_writes_never_double_activate() {
 
 fn unknown_writes(seed: u64) -> u64 {
     let mut rng = SplitMix64::new(seed ^ 0x0a3b_9e37_79b9_7f4a);
-    let members = ids(3 + usize::try_from(rng.below(2)).expect("a 0..2 draw"));
+    let members = ids(3 + usize::try_from(rng.up_to(1)).expect("a 0..2 draw"));
     let group = format!("x-unknown-{seed}");
     let label = format!("X-ambiguity seed {seed}");
     let mut sim = cluster(&group, &members);
-    sim.set_jitter(u64::from(rng.below(6)));
-    sim.set_anchor_unknown_percent(u8::try_from(20 + rng.below(31)).expect("20..=50"));
+    sim.set_jitter(u64::from(rng.up_to(5)));
+    sim.set_anchor_unknown_percent(Percent::try_from(20 + rng.up_to(30)).expect("20..=50"));
     for node in &members {
         sim.set_anchor_skew(node, draw_skew(&mut rng));
     }
 
     let mut now = 0u64;
     for _round in 0..6 {
-        now += 1_500 + u64::from(rng.below(1_500));
+        now += 1_500 + u64::from(rng.up_to(1499));
         while let Some(Time(at)) = sim.step_until(Time(now)) {
             let hosting = hosting_pairs(&sim);
             assert!(
@@ -653,7 +653,7 @@ fn unknown_writes(seed: u64) -> u64 {
         }
         // Keep the group changing hands, so ambiguity lands on creates, steals
         // and renewals alike rather than only on a quiet renewal loop.
-        match rng.below(3) {
+        match rng.up_to(2) {
             // Never below two live nodes: a cluster that crashed its way to
             // empty would end the run hostless for a reason that has nothing to
             // do with ambiguity.
@@ -685,7 +685,7 @@ fn unknown_writes(seed: u64) -> u64 {
 
     sim.heal_anchor_all();
     sim.heal_all();
-    sim.set_anchor_unknown_percent(0);
+    sim.set_anchor_unknown_percent(Percent::ZERO);
     now += 15_000;
     sim.run_until(Time(now));
 
@@ -773,14 +773,14 @@ fn dst_unknown_writes_that_never_applied_lapse_the_lease_on_schedule() {
 /// Returns `(lost rounds, the hostless stretch this seed produced)`.
 fn unknown_lost_writes(seed: u64) -> (u64, u64) {
     let mut rng = SplitMix64::new(seed ^ 0x7d41_9e37_79b9_7f4a);
-    let members = ids(3 + usize::try_from(rng.below(2)).expect("a 0..2 draw"));
+    let members = ids(3 + usize::try_from(rng.up_to(1)).expect("a 0..2 draw"));
     let group = format!("x-lost-{seed}");
     let label = format!("X-ambiguity-b seed {seed}");
     let mut sim = cluster(&group, &members);
-    sim.set_jitter(u64::from(rng.below(6)));
+    sim.set_jitter(u64::from(rng.up_to(5)));
     // Every clock is exact, on purpose: nothing this family produces may be
     // attributable to skew. It is X-skew-a's premise, held exactly.
-    let fault_at = 4_000 + u64::from(rng.below(400));
+    let fault_at = 4_000 + u64::from(rng.up_to(399));
     sim.run_until(Time(fault_at));
 
     let incumbent = sole_host(&sim, &format!("{label} (bootstrap)"));
@@ -797,7 +797,7 @@ fn unknown_lost_writes(seed: u64) -> (u64, u64) {
 
     // The fault. From here every write reports `Unknown` and applies nothing,
     // so the last round that landed is the last authority anybody earned...
-    sim.set_anchor_unknown_lost_percent(100);
+    sim.set_anchor_unknown_lost_percent(Percent::HUNDRED);
     // ...and the fabric is cut around the incumbent, so the other side buries
     // it and becomes entitled to steal the record it is no longer refreshing.
     for other in members.iter().filter(|n| **n != incumbent) {
@@ -832,7 +832,7 @@ fn unknown_lost_writes(seed: u64) -> (u64, u64) {
 
     // Heal both faults. Writes land again, and the group comes back — on one
     // host, at a strictly higher epoch, because hostship is re-won not resumed.
-    sim.set_anchor_unknown_lost_percent(0);
+    sim.set_anchor_unknown_lost_percent(Percent::ZERO);
     sim.heal_all();
     while let Some(Time(at)) = sim.step_until(Time(heal_at + 12_000)) {
         let hosting = hosting_pairs(&sim);

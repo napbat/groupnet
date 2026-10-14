@@ -31,8 +31,8 @@ pub use proof::{BoundComparison, Comparison, Coverage, ProofId, SourceProof};
 pub use session::SessionEngine;
 pub use snapshot::{ChunkReceipt, HoldReceipt, SnapshotConfig, SnapshotConfigError, SnapshotOffer};
 pub use subscription::{
-    CommitSubscriberAck, DurableDeliveryReceipt, FencedCheckpoint, RegisterReceipt,
-    RegisterSubscriber, ResumeSubscriber, RetentionPolicy, RetentionPolicyError,
+    CommitSubscriberAck, DeliveryRequest, DurableDeliveryReceipt, FencedCheckpoint,
+    RegisterReceipt, RegisterSubscriber, ResumeSubscriber, RetentionPolicy, RetentionPolicyError,
     SourceSubscriberState, SubscriberAckReceipt, SubscriberId, SubscriberKey, SubscriptionEpoch,
     SubscriptionError, SubscriptionLimits, SubscriptionLimitsError, TerminalReason,
     TerminalReceipt, TerminalRequest,

@@ -139,9 +139,11 @@ fn start(renews: bool) -> (ClaimEngine, Fixture, Vec<BootstrapEffect>) {
     let mut engine = ClaimEngine::new(
         claim_config(),
         scope(),
-        NodeId::from(follower_node),
-        BootId(1_u128 << 100),
-        9,
+        PresenceIdentity {
+            node: NodeId::from(follower_node),
+            boot: BootId(1_u128 << 100),
+            session: 9,
+        },
     )
     .unwrap();
     engine.enable_transfer(transfer_config()).unwrap();
@@ -607,17 +609,17 @@ fn enqueue(
         let Some(event) = event else { continue };
         let is_ack = matches!(&event, BootstrapEvent::Transfer(inner)
             if matches!(inner.as_ref(), TransferEvent::BatchAcknowledged { .. }));
-        if !healthy && ((is_ack && seed.is_multiple_of(5)) || rng.below(9) == 0) {
+        if !healthy && ((is_ack && seed.is_multiple_of(5)) || rng.up_to(8) == 0) {
             coverage.dropped += 1;
             coverage.ack_drops += usize::from(is_ack);
             continue;
         }
-        let delay = if healthy { 0 } else { u64::from(rng.below(4)) };
+        let delay = if healthy { 0 } else { u64::from(rng.up_to(3)) };
         queue.push(Scheduled {
             at: now + delay,
             event: event.clone(),
         });
-        if rng.below(4) == 0 {
+        if rng.up_to(3) == 0 {
             queue.push(Scheduled {
                 at: now + delay + 1,
                 event,

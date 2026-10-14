@@ -128,7 +128,7 @@ fn peer_handoff_shaped_barrier_faults_keep_reads_closed_until_independent_affirm
     for seed in 1..=48 {
         let mut rng = SplitMix64::new(seed);
         let fault = seed % 3;
-        let move_head = fault == 0 && rng.below(2) == 0;
+        let move_head = fault == 0 && rng.up_to(1) == 0;
         let mut engine = RecoveryEngine::new(
             RecoveryConfig {
                 max_members: std::num::NonZeroUsize::new(2).unwrap(),
@@ -300,7 +300,7 @@ fn delayed_duplicate_and_lost_peer_callbacks_cannot_reopen_a_superseded_image() 
                     true
                 }
             });
-            if rng.below(2) == 0 {
+            if rng.up_to(1) == 0 {
                 due.reverse();
             }
             for event in due {
@@ -388,13 +388,13 @@ fn delayed_duplicate_and_lost_peer_callbacks_cannot_reopen_a_superseded_image() 
                     {
                         4
                     } else {
-                        1 + u64::from(rng.below(2))
+                        1 + u64::from(rng.up_to(1))
                     };
                     scheduled.push(Scheduled {
                         at: now + delay,
                         event: event.clone(),
                     });
-                    if rng.below(5) == 0 {
+                    if rng.up_to(4) == 0 {
                         scheduled.push(Scheduled {
                             at: now + delay + 1,
                             event,

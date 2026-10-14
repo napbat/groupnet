@@ -17,7 +17,7 @@ mod engine;
 mod types;
 
 pub use claim_codec::{
-    ClaimCodecError, claim_entry_key, decode_claim_value, decode_presence_value,
+    ClaimCodecError, ObservedEntry, claim_entry_key, decode_claim_value, decode_presence_value,
     encode_claim_value, encode_presence_value, encoded_claim_len, encoded_presence_len,
     presence_entry_key,
 };
@@ -26,7 +26,7 @@ pub use types::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapConfigError, BootstrapEffect, BootstrapError,
     BootstrapEvent, BootstrapMember, BootstrapMemberIdentity, BootstrapOperation,
     BootstrapParticipant, BootstrapPresence, BootstrapScope, BootstrapStage, BootstrapStep,
-    ClaimIdentity, ClaimPhase, PresenceIdentity, ReleaseReason, same_membership,
+    ClaimIdentity, ClaimPhase, ParticipationCut, PresenceIdentity, ReleaseReason, same_membership,
 };
 
 #[cfg(test)]

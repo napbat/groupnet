@@ -3,7 +3,7 @@
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapEffect, BootstrapEvent, BootstrapMember,
     BootstrapMemberIdentity, BootstrapOperation, BootstrapParticipant, BootstrapScope,
-    BootstrapStage, ClaimEngine, ClaimIdentity, ClaimPhase, PresenceIdentity,
+    BootstrapStage, ClaimEngine, ClaimIdentity, ClaimPhase, ParticipationCut, PresenceIdentity,
 };
 use groupnet_core::{NodeId, Status, Time};
 use groupnet_sim::SplitMix64;
@@ -25,9 +25,11 @@ fn engine() -> ClaimEngine {
             domain: "o".to_owned(),
             partition: "b".to_owned(),
         },
-        NodeId::from("me"),
-        BootId(7),
-        1,
+        PresenceIdentity {
+            node: NodeId::from("me"),
+            boot: BootId(7),
+            session: 1,
+        },
     )
     .unwrap();
     engine.require_participation().unwrap();
@@ -154,7 +156,7 @@ fn complete_source_cut_or_finite_origin_fallback_under_faults() {
                 refused += 1;
             }
             // A duplicate delayed answer cannot advance a replaced operation.
-            if rng.below(2) == 0 {
+            if rng.up_to(1) == 0 {
                 let duplicate = engine.step(observation(op, variant));
                 if duplicate.rejection.is_some() {
                     duplicate_rejections += 1;
@@ -254,26 +256,36 @@ fn retired_ready_waits_for_complete_join_then_recaptures_once() {
             },
         ];
         let roster = vec![me.member.clone(), peer.member.clone()];
-        for _ in 0..=rng.below(2) {
+        for _ in 0..=rng.up_to(1) {
             let op = engine.begin_roster_observation().unwrap();
             assert!(
                 engine
                     .verify_participant_roster(
                         op,
-                        &members,
-                        &roster,
-                        std::slice::from_ref(&me),
-                        &[]
+                        ParticipationCut {
+                            members: &members,
+                            roster: &roster,
+                            participants: std::slice::from_ref(&me),
+                            claims: &[]
+                        }
                     )
                     .is_err()
             );
             assert!(engine.ready_recapture_pending());
             incomplete_cuts += 1;
         }
-        let _ = engine.step(BootstrapEvent::Tick(Time(8 + u64::from(rng.below(2)))));
+        let _ = engine.step(BootstrapEvent::Tick(Time(8 + u64::from(rng.up_to(1)))));
         let op = engine.begin_roster_observation().unwrap();
         assert_eq!(
-            engine.verify_participant_roster(op, &members, &roster, &[me, peer], &[]),
+            engine.verify_participant_roster(
+                op,
+                ParticipationCut {
+                    members: &members,
+                    roster: &roster,
+                    participants: &[me, peer],
+                    claims: &[]
+                }
+            ),
             Ok(())
         );
         let recapture = engine.step(BootstrapEvent::StartReadyRecapture);

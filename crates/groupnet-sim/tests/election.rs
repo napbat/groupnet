@@ -18,7 +18,7 @@ use groupnet_core::{
     Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Role, Time,
     placement,
 };
-use groupnet_sim::{Simulation, SplitMix64};
+use groupnet_sim::{Percent, Simulation, SplitMix64};
 
 /// How long a claim must stand unchallenged before its claimant activates.
 const CLAIM_SETTLE_MS: u64 = 200;
@@ -71,7 +71,7 @@ fn engine(group: &GroupId, id: &NodeId, peers: &BTreeSet<NodeId>) -> GroupEngine
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    v[rng.below(n) as usize].clone()
+    v[rng.up_to(n - 1) as usize].clone()
 }
 
 /// An `(epoch, host)` pair: the unit that names a serializer.
@@ -200,12 +200,12 @@ impl Beliefs {
 fn settle_chaos(seed: u64) {
     let mut rng = rng(seed ^ 0xe1c7);
     let group = GroupId::new(format!("hosted-{seed}"));
-    let n = 3 + rng.below(4); // 3..=6 nodes
+    let n = 3 + rng.up_to(3); // 3..=6 nodes
     let all: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
 
-    let mut sim = Simulation::new(u64::from(3 + rng.below(8))); // 3..=10ms links
-    sim.set_loss(u8::try_from(rng.below(25)).expect("below(25) is 0..25"));
-    sim.set_jitter(u64::from(rng.below(9))); // up to 8ms reorder
+    let mut sim = Simulation::new(u64::from(3 + rng.up_to(7))); // 3..=10ms links
+    sim.set_loss(Percent::try_from(rng.up_to(24)).expect("at most 24%"));
+    sim.set_jitter(u64::from(rng.up_to(8))); // up to 8ms reorder
 
     let mut alive: BTreeSet<NodeId> = all.iter().cloned().collect();
     for id in &all {
@@ -216,7 +216,7 @@ fn settle_chaos(seed: u64) {
     let mut activations = Activations::default();
     let mut now = 0u64;
     for _round in 0..30 {
-        now += u64::from(30 + rng.below(120));
+        now += u64::from(30 + rng.up_to(119));
         sim.run_until(Time(now));
         sample(&sim, &group, &alive, &mut beliefs, (now, seed));
         activations.absorb(&sim.leadership_log, seed);
@@ -229,7 +229,7 @@ fn settle_chaos(seed: u64) {
 
     // Converge under fair conditions, then assert liveness.
     sim.heal_all();
-    sim.set_loss(0);
+    sim.set_loss(Percent::ZERO);
     sim.set_jitter(0);
     now += 25_000;
     sim.run_until(Time(now));
@@ -402,7 +402,7 @@ fn inject_fault(
     alive: &mut BTreeSet<NodeId>,
     now: u64,
 ) -> Option<NodeId> {
-    match rng.below(8) {
+    match rng.up_to(7) {
         0 if alive.len() > 2 => {
             let victim = pick(alive, rng);
             sim.crash(&victim).expect("live node");

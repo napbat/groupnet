@@ -119,6 +119,10 @@ pub struct AckEvidence {
 ///
 /// Counts and byte caps are nonzero by type; [`AckWaitLimits::validate`]
 /// checks the timers and the caps' relation to `max_metadata_bytes`.
+/// [`Default`] admits 64 subscribers with identities and cursors up to the
+/// replication [`Config`](super::Config) default cursor size (4 KiB), 4 KiB
+/// certificates and 64 KiB of metadata, waiting up to 30 s and polling every
+/// 100 ms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AckWaitLimits {
     /// Maximum number of pinned named subscribers.
@@ -135,6 +139,19 @@ pub struct AckWaitLimits {
     /// Minimum delay between empty source checks, including missed hints;
     /// nonzero and at most `max_wait_ms`.
     pub poll_ms: u64,
+}
+
+impl Default for AckWaitLimits {
+    fn default() -> Self {
+        Self {
+            max_required: const { NonZeroUsize::new(64).unwrap() },
+            max_identity_bytes: const { NonZeroUsize::new(4096).unwrap() },
+            max_certificate_bytes: const { NonZeroUsize::new(4096).unwrap() },
+            max_metadata_bytes: const { NonZeroUsize::new(64 * 1024).unwrap() },
+            max_wait_ms: 30_000,
+            poll_ms: 100,
+        }
+    }
 }
 
 /// Invalid [`AckWaitLimits`], naming the violated rule.
@@ -271,6 +288,11 @@ mod tests {
             max_wait_ms: 20,
             poll_ms: 3,
         }
+    }
+
+    #[test]
+    fn default_limits_are_valid() {
+        assert_eq!(AckWaitLimits::default().validate(), Ok(()));
     }
 
     #[test]

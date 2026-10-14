@@ -52,7 +52,7 @@
 //! [`Activation::External`]: crate::Activation::External
 //! [`Activation::Quorum`]: crate::Activation::Quorum
 
-use crate::NodeId;
+use crate::{Activation, HostedConfig, NodeId};
 
 /// The anchor's whole contents: who holds the group, under which epoch, and
 /// until when by the holder's own wall clock.
@@ -86,15 +86,16 @@ impl AnchorRecord {
     /// rather than wrapping into immediately stealable.
     ///
     /// Note that this asks nothing about *who* is asking: entitlement is
-    /// [`plan_claim`]'s business, and the holder itself is entitled whether or
-    /// not the record has expired.
+    /// [`AnchorTerms::plan_claim`]'s business, and the holder itself is
+    /// entitled whether or not the record has expired.
     #[must_use]
     pub const fn stealable(&self, now_wall_ms: u64, steal_margin_ms: u64) -> bool {
         now_wall_ms >= self.expires_at_wall_ms.saturating_add(steal_margin_ms)
     }
 }
 
-/// What [`plan_claim`] decided a claimant should do with the anchor.
+/// What [`AnchorTerms::plan_claim`] decided a claimant should do with the
+/// anchor.
 ///
 /// The two write arms map onto the two conditional writes every object store
 /// offers — `Create` is an if-none-match `PUT`, `Supersede` is an if-match
@@ -120,70 +121,107 @@ pub enum ClaimPlan {
     },
 }
 
-/// The claim rule: given the record that was just loaded, decide what to
-/// write.
+/// The two numbers an [`Activation::External`] group's anchor rounds run on,
+/// kept by a driver as one value so they cannot drift apart.
 ///
-/// * **Nothing loaded** ⇒ [`ClaimPlan::Create`] at `max(epoch_hint, 1)`. Epoch
-///   0 is the engine's "nothing adopted" sentinel and must never name a
-///   hostship, so genesis floors at 1.
-/// * **A record this node is entitled to take** ⇒ [`ClaimPlan::Supersede`] at
-///   `max(loaded.epoch + 1, epoch_hint)`. Entitlement is *names this node* or
-///   *stealable* — nothing else. The `+ 1` is what makes the anchor an
-///   allocator; the hint is a **floor**, not an override, so a claimant that
-///   has gossiped a higher epoch than the anchor shows (a record rolled back,
-///   a stale read) still bids strictly above everything it has seen.
-/// * **Anything else** ⇒ [`ClaimPlan::Yield`].
-///
-/// A node that already holds the record is entitled, so a *restart* plans a
-/// `Supersede` at a strictly higher epoch rather than resuming the old one.
-/// That is the tier's rule, not an accident: hostship is never resumed, only
-/// re-won, and the record naming this node is evidence of an epoch rather than
-/// a grant of authority (row X5 / row 12b consume it that way).
-///
-/// A holder that still has its etag renews with [`renewal_record`] instead;
-/// this path is for winning an epoch, and it always costs one.
-#[must_use]
-pub fn plan_claim(
-    local: &NodeId,
-    epoch_hint: u64,
-    loaded: Option<&AnchorRecord>,
-    now_wall_ms: u64,
-    ttl_ms: u64,
-    steal_margin_ms: u64,
-) -> ClaimPlan {
-    let expires_at_wall_ms = now_wall_ms.saturating_add(ttl_ms);
-    let Some(current) = loaded else {
-        return ClaimPlan::Create(AnchorRecord {
-            epoch: epoch_hint.max(1),
-            host: local.clone(),
-            expires_at_wall_ms,
-        });
-    };
-    let entitled = current.host == *local || current.stealable(now_wall_ms, steal_margin_ms);
-    if !entitled {
-        return ClaimPlan::Yield {
-            retry_at_wall_ms: current.expires_at_wall_ms.saturating_add(steal_margin_ms),
-        };
-    }
-    ClaimPlan::Supersede(AnchorRecord {
-        epoch: current.epoch.saturating_add(1).max(epoch_hint),
-        host: local.clone(),
-        expires_at_wall_ms,
-    })
+/// `ttl_ms` is the group's [`HostedConfig::lease_ms`](crate::HostedConfig::lease_ms)
+/// — the record's TTL and the engine lease are deliberately one knob — and
+/// `steal_margin_ms` is the activation's own field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchorTerms {
+    /// How long a written record lasts past the writer's wall clock, in
+    /// milliseconds: the group's `lease_ms`.
+    pub ttl_ms: u64,
+    /// How far past a record's expiry a claimant waits before it may steal;
+    /// see [`AnchorRecord::stealable`].
+    pub steal_margin_ms: u64,
 }
 
-/// The record a holder writes to extend the epoch it already has.
-///
-/// Same epoch, same host, a fresh expiry — a renewal decides nothing, so it
-/// allocates nothing. A driver writes this against the etag it holds; a
-/// mismatch means it has been superseded and must abdicate, which is a hard
-/// signal rather than a retry.
-#[must_use]
-pub fn renewal_record(local: &NodeId, epoch: u64, now_wall_ms: u64, ttl_ms: u64) -> AnchorRecord {
-    AnchorRecord {
-        epoch,
-        host: local.clone(),
-        expires_at_wall_ms: now_wall_ms.saturating_add(ttl_ms),
+impl AnchorTerms {
+    /// The terms of `hosted`, when it is an [`Activation::External`] group;
+    /// `None` for every other activation, which has no anchor.
+    #[must_use]
+    pub const fn of(hosted: &HostedConfig) -> Option<Self> {
+        match hosted.activation {
+            Activation::External { steal_margin_ms } => Some(Self {
+                ttl_ms: hosted.lease_ms,
+                steal_margin_ms,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The claim rule: given the record `local` just loaded at `now_wall_ms`,
+    /// decide what to write.
+    ///
+    /// * **Nothing loaded** ⇒ [`ClaimPlan::Create`] at `max(epoch_hint, 1)`.
+    ///   Epoch 0 is the engine's "nothing adopted" sentinel and must never
+    ///   name a hostship, so genesis floors at 1.
+    /// * **A record this node is entitled to take** ⇒ [`ClaimPlan::Supersede`]
+    ///   at `max(loaded.epoch + 1, epoch_hint)`. Entitlement is *names this
+    ///   node* or *stealable* — nothing else. The `+ 1` is what makes the
+    ///   anchor an allocator; the hint is a **floor**, not an override, so a
+    ///   claimant that has gossiped a higher epoch than the anchor shows (a
+    ///   record rolled back, a stale read) still bids strictly above
+    ///   everything it has seen.
+    /// * **Anything else** ⇒ [`ClaimPlan::Yield`].
+    ///
+    /// A node that already holds the record is entitled, so a *restart* plans
+    /// a `Supersede` at a strictly higher epoch rather than resuming the old
+    /// one. That is the tier's rule, not an accident: hostship is never
+    /// resumed, only re-won, and the record naming this node is evidence of an
+    /// epoch rather than a grant of authority (row X5 / row 12b consume it
+    /// that way).
+    ///
+    /// A holder that still has its etag renews with
+    /// [`renewal_record`](Self::renewal_record) instead; this path is for
+    /// winning an epoch, and it always costs one.
+    #[must_use]
+    pub fn plan_claim(
+        self,
+        local: &NodeId,
+        epoch_hint: u64,
+        loaded: Option<&AnchorRecord>,
+        now_wall_ms: u64,
+    ) -> ClaimPlan {
+        let expires_at_wall_ms = now_wall_ms.saturating_add(self.ttl_ms);
+        let Some(current) = loaded else {
+            return ClaimPlan::Create(AnchorRecord {
+                epoch: epoch_hint.max(1),
+                host: local.clone(),
+                expires_at_wall_ms,
+            });
+        };
+        let entitled =
+            current.host == *local || current.stealable(now_wall_ms, self.steal_margin_ms);
+        if !entitled {
+            return ClaimPlan::Yield {
+                retry_at_wall_ms: current
+                    .expires_at_wall_ms
+                    .saturating_add(self.steal_margin_ms),
+            };
+        }
+        ClaimPlan::Supersede(AnchorRecord {
+            epoch: current.epoch.saturating_add(1).max(epoch_hint),
+            host: local.clone(),
+            expires_at_wall_ms,
+        })
+    }
+
+    /// The record a holder writes at `now_wall_ms` to extend the `epoch` it
+    /// already has.
+    ///
+    /// Same epoch, same host, a fresh expiry — a renewal decides nothing, so
+    /// it allocates nothing. A driver writes this against the etag it holds; a
+    /// mismatch means it has been superseded and must abdicate, which is a
+    /// hard signal rather than a retry.
+    #[must_use]
+    pub fn renewal_record(self, local: &NodeId, epoch: u64, now_wall_ms: u64) -> AnchorRecord {
+        AnchorRecord {
+            epoch,
+            host: local.clone(),
+            expires_at_wall_ms: now_wall_ms.saturating_add(self.ttl_ms),
+        }
     }
 }
 
@@ -239,11 +277,16 @@ pub fn ambiguous_applied(
 
 #[cfg(test)]
 mod tests {
-    use super::{AnchorRecord, ClaimPlan, ambiguous_applied, plan_claim, renewal_record};
+    use super::{AnchorRecord, AnchorTerms, ClaimPlan, ambiguous_applied};
     use crate::NodeId;
+    use crate::{Activation, HostedConfig, VoterRoster};
 
     const TTL: u64 = 1_000;
     const MARGIN: u64 = 200;
+    const TERMS: AnchorTerms = AnchorTerms {
+        ttl_ms: TTL,
+        steal_margin_ms: MARGIN,
+    };
 
     fn n(id: &str) -> NodeId {
         NodeId::new(id)
@@ -261,7 +304,28 @@ mod tests {
     /// `plan_claim` for `me` against `loaded` at `now`, at the fixture TTL and
     /// margin.
     fn plan(me: &str, hint: u64, loaded: Option<&AnchorRecord>, now: u64) -> ClaimPlan {
-        plan_claim(&n(me), hint, loaded, now, TTL, MARGIN)
+        TERMS.plan_claim(&n(me), hint, loaded, now)
+    }
+
+    /// Only an External group has anchor terms, and they are its lease and
+    /// its margin, unmodified.
+    #[test]
+    fn terms_are_read_off_an_external_config_only() {
+        let external = HostedConfig {
+            activation: Activation::External {
+                steal_margin_ms: MARGIN,
+            },
+            lease_ms: TTL,
+        };
+        assert_eq!(AnchorTerms::of(&external), Some(TERMS));
+        assert_eq!(AnchorTerms::of(&HostedConfig::default()), None);
+        let quorum = HostedConfig {
+            activation: Activation::Quorum {
+                voters: VoterRoster::new([n("a")]),
+            },
+            ..HostedConfig::default()
+        };
+        assert_eq!(AnchorTerms::of(&quorum), None);
     }
 
     /// An empty anchor is genesis: create, and never at epoch 0 — that number
@@ -344,7 +408,11 @@ mod tests {
         assert!(!held.stealable(9_999, 0));
         assert!(held.stealable(10_000, 0));
         assert_eq!(
-            plan_claim(&n("a"), 0, Some(&held), 10_000, TTL, 0),
+            AnchorTerms {
+                steal_margin_ms: 0,
+                ..TERMS
+            }
+            .plan_claim(&n("a"), 0, Some(&held), 10_000),
             ClaimPlan::Supersede(rec(8, "a", 11_000))
         );
     }
@@ -385,7 +453,7 @@ mod tests {
         );
         // A TTL that would overflow the expiry parks it at "never" instead of
         // at zero.
-        let ClaimPlan::Create(record) = plan_claim(&n("a"), 1, None, u64::MAX, TTL, MARGIN) else {
+        let ClaimPlan::Create(record) = TERMS.plan_claim(&n("a"), 1, None, u64::MAX) else {
             panic!("an absent record creates");
         };
         assert_eq!(record.expires_at_wall_ms, u64::MAX);
@@ -401,14 +469,16 @@ mod tests {
     /// host, a fresh expiry.
     #[test]
     fn a_renewal_keeps_the_epoch_and_only_moves_the_expiry() {
-        let renewed = renewal_record(&n("a"), 7, 10_000, TTL);
+        let renewed = TERMS.renewal_record(&n("a"), 7, 10_000);
         assert_eq!(renewed, rec(7, "a", 11_000));
         assert_eq!(
-            renewal_record(&n("a"), 7, 20_000, TTL).expires_at_wall_ms,
+            TERMS.renewal_record(&n("a"), 7, 20_000).expires_at_wall_ms,
             21_000
         );
         assert_eq!(
-            renewal_record(&n("a"), 7, u64::MAX, TTL).expires_at_wall_ms,
+            TERMS
+                .renewal_record(&n("a"), 7, u64::MAX)
+                .expires_at_wall_ms,
             u64::MAX,
             "saturating"
         );
@@ -453,7 +523,7 @@ mod tests {
     fn a_renewal_that_did_not_apply_is_not_mistaken_for_the_record_it_replaces() {
         let me = n("a");
         let standing = rec(8, "a", 11_000);
-        let renewal = renewal_record(&me, 8, 10_500, TTL); // expires at 11_500
+        let renewal = TERMS.renewal_record(&me, 8, 10_500); // expires at 11_500
 
         assert!(
             !ambiguous_applied(&me, &renewal, Some(&standing)),

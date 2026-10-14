@@ -112,21 +112,21 @@ impl Topology {
 /// strict subset of it (so a non-voter can be top-ranked), or five voters only
 /// four of which ever boot.
 fn draw_topology(rng: &mut SplitMix64, name: &str) -> Topology {
-    let n = 3 + usize::try_from(rng.below(4)).expect("a 0..4 draw"); // 3..=6 nodes
+    let n = 3 + usize::try_from(rng.up_to(3)).expect("a 0..4 draw"); // 3..=6 nodes
     let ids: Vec<NodeId> = (0..n).map(|i| NodeId::new(format!("n{i}"))).collect();
     let booted: BTreeSet<NodeId> = ids.iter().cloned().collect();
 
     // One seed in four (where four voters can be found) puts a fifth voter in
     // the roster that is never booted at all.
-    let absent = n >= 4 && rng.below(4) == 0;
+    let absent = n >= 4 && rng.up_to(3) == 0;
     let booted_voters = if absent {
         4
-    } else if n >= 5 && rng.below(2) == 0 {
+    } else if n >= 5 && rng.up_to(1) == 0 {
         5
     } else {
         3
     };
-    let off = usize::try_from(rng.below(u32::try_from(n).expect("a handful of nodes")))
+    let off = usize::try_from(rng.up_to(u32::try_from(n - 1).expect("a handful of nodes")))
         .expect("bounded by n");
     let mut voters: BTreeSet<NodeId> = (0..booted_voters)
         .map(|k| ids[(off + k) % n].clone())
@@ -146,7 +146,7 @@ fn draw_topology(rng: &mut SplitMix64, name: &str) -> Topology {
 fn pick(set: &BTreeSet<NodeId>, rng: &mut SplitMix64) -> NodeId {
     let v: Vec<&NodeId> = set.iter().collect();
     let n = u32::try_from(v.len()).expect("these clusters are a handful of nodes");
-    let i = usize::try_from(rng.below(n)).expect("bounded by the set size");
+    let i = usize::try_from(rng.up_to(n - 1)).expect("bounded by the set size");
     v[i].clone()
 }
 
@@ -273,11 +273,11 @@ fn dst_quorum_minority_never_activates() {
 fn minority_split(seed: u64) {
     let mut rng = rng(seed ^ 0x53a0);
     let topo = draw_topology(&mut rng, &format!("minority-{seed}"));
-    let mut sim = Simulation::new(2 + u64::from(rng.below(5)));
-    sim.set_jitter(u64::from(rng.below(6)));
+    let mut sim = Simulation::new(2 + u64::from(rng.up_to(4)));
+    sim.set_jitter(u64::from(rng.up_to(5)));
     topo.boot(&mut sim);
 
-    let split_at = 3_000 + u64::from(rng.below(500));
+    let split_at = 3_000 + u64::from(rng.up_to(499));
     sim.run_until(Time(split_at));
     let label = format!("Q-S3 seed {seed}");
     let incumbent = sole_host(&sim, &format!("{label} (before the split)"));
@@ -377,7 +377,7 @@ fn draw_starved_side(
     // "minority" means at all.
     let spare = (booted_voters - topo.majority).min(topo.majority - 1);
     let mut starved = BTreeSet::new();
-    if rng.below(2) == 0 {
+    if rng.up_to(1) == 0 {
         starved.insert(incumbent.clone());
     }
     let mut voter_pool: BTreeSet<NodeId> = topo
@@ -387,7 +387,7 @@ fn draw_starved_side(
         .cloned()
         .collect();
     let room = spare - topo.voters_in(&starved);
-    let wanted = rng.below(u32::try_from(room).expect("a handful of voters") + 1);
+    let wanted = rng.up_to(u32::try_from(room).expect("a handful of voters"));
     for _ in 0..wanted {
         let node = take(&mut voter_pool, rng);
         starved.insert(node);
@@ -398,7 +398,7 @@ fn draw_starved_side(
         .filter(|v| !starved.contains(*v))
         .cloned()
         .collect();
-    while !other_pool.is_empty() && rng.below(2) == 0 {
+    while !other_pool.is_empty() && rng.up_to(1) == 0 {
         let node = take(&mut other_pool, rng);
         starved.insert(node);
     }
@@ -498,17 +498,17 @@ fn failover_budget(seed: u64) {
     let mut rng = rng(seed ^ 0xe2b0);
     let topo = draw_topology(&mut rng, &format!("budget-{seed}"));
     // A healthy fabric: no loss, but jittered, so links reorder.
-    let latency = 2 + u64::from(rng.below(u32::try_from(MAX_LATENCY_MS).expect("small") - 1));
+    let latency = 2 + u64::from(rng.up_to(u32::try_from(MAX_LATENCY_MS).expect("small") - 2));
     let mut sim = Simulation::new(latency);
     sim.set_jitter(u64::from(
-        rng.below(u32::try_from(MAX_JITTER_MS).expect("small") + 1),
+        rng.up_to(u32::try_from(MAX_JITTER_MS).expect("small")),
     ));
     topo.boot(&mut sim);
 
     // Converge first: the budget bounds *failover*, not bootstrap. The crash
     // instant is drawn too, so the schedule samples its phase against each
     // survivor's probe cursor and the incumbent's renewal round.
-    let crash_at = 3_000 + u64::from(rng.below(500));
+    let crash_at = 3_000 + u64::from(rng.up_to(499));
     sim.run_until(Time(crash_at));
     let label = format!("Q-budget seed {seed}");
     let incumbent = sole_host(&sim, &format!("{label} (before the crash)"));

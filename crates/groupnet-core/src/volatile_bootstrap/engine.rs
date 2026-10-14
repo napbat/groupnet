@@ -103,8 +103,9 @@ pub struct ClaimEngine {
 }
 
 impl ClaimEngine {
-    /// Construct an unstarted selection session. `boot_incarnation` must be
-    /// fresh across process restarts for the same node and nonzero.
+    /// Construct an unstarted selection session for the local participant
+    /// `identity`. Its boot must be fresh across process restarts for the
+    /// same node and nonzero; its session nonzero.
     ///
     /// # Errors
     /// Returns [`BootstrapError::Config`] for invalid limits or
@@ -113,10 +114,13 @@ impl ClaimEngine {
     pub fn new(
         config: BootstrapConfig,
         scope: BootstrapScope,
-        me: NodeId,
-        boot_incarnation: BootId,
-        session: u64,
+        identity: PresenceIdentity,
     ) -> Result<Self, BootstrapError> {
+        let PresenceIdentity {
+            node: me,
+            boot: boot_incarnation,
+            session,
+        } = identity;
         config.validate().map_err(BootstrapError::Config)?;
         let names = scope
             .domain

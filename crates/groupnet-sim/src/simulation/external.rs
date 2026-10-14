@@ -17,6 +17,7 @@
 
 use super::{Kind, Simulation};
 use crate::anchor::RoundReport;
+use crate::percent::Percent;
 
 use groupnet_core::anchor::AnchorRecord;
 use groupnet_core::{Command, NodeId, Role, Time};
@@ -84,21 +85,20 @@ impl Simulation {
         self.anchor.heal_all();
     }
 
-    /// What share of conditional writes **apply and report `Unknown`**
-    /// (0..=100) — the timed-out `PUT` every object store can produce. The
-    /// driver resolves each one by reading the record back an anchor latency
-    /// later and judging it with
-    /// [`ambiguous_applied`](groupnet_core::anchor::ambiguous_applied).
+    /// What share of conditional writes **apply and report `Unknown`** — the
+    /// timed-out `PUT` every object store can produce. The driver resolves each
+    /// one by reading the record back an anchor latency later and judging it
+    /// with [`ambiguous_applied`](groupnet_core::anchor::ambiguous_applied).
     ///
     /// Deterministic: the schedule is keyed on the round counter through the
     /// same [`SplitMix64`](crate::SplitMix64) the loss schedule uses, so a
     /// failing seed replays exactly.
-    pub fn set_anchor_unknown_percent(&mut self, percent: u8) {
-        self.anchor.set_unknown_percent(percent);
+    pub fn set_anchor_unknown_percent(&mut self, share: Percent) {
+        self.anchor.set_unknown_percent(share);
     }
 
     /// What share of conditional writes report `Unknown` **without applying**
-    /// (0..=100) — the other half of the same timeout, and the shape a
+    /// — the other half of the same timeout, and the shape a
     /// write-throttled, read-only or expired-credential store produces
     /// indefinitely rather than transiently.
     ///
@@ -112,8 +112,8 @@ impl Simulation {
     /// Independent of [`set_anchor_unknown_percent`](Self::set_anchor_unknown_percent)
     /// — a separate deterministic draw on the same round counter — and decided
     /// first, so a write it takes never reaches the register.
-    pub fn set_anchor_unknown_lost_percent(&mut self, percent: u8) {
-        self.anchor.set_unknown_lost_percent(percent);
+    pub fn set_anchor_unknown_lost_percent(&mut self, share: Percent) {
+        self.anchor.set_unknown_lost_percent(share);
     }
 
     /// Writes a record into the anchor directly, as if some earlier incarnation
