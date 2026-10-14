@@ -12,8 +12,8 @@ use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
 
 use super::{
-    MAX_WAIT, MIN_INTERVAL, NamedSeeds, NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
-    resolve_named_seeds, schedule,
+    MIN_INTERVAL, NamedSeeds, NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
+    resolve_named_seeds,
 };
 
 const RETRY: Duration = Duration::from_secs(1);
@@ -332,8 +332,11 @@ async fn the_task_ends_with_its_transport() {
     assert!(task.is_finished());
 }
 
+/// Longer than the thirty-year horizon the resolver once capped every wait at.
+const CENTURY: Duration = Duration::from_hours(24 * 365 * 100);
+
 #[tokio::test(start_paused = true)]
-async fn unrepresentable_intervals_saturate_instead_of_panicking_the_resolver() {
+async fn unrepresentable_intervals_leave_the_seed_unscheduled_instead_of_panicking() {
     let resolver = Scripted::default();
     resolver.set("b.svc:7000", "10.0.0.2:7000");
     let h = Harness::spawn_with(
@@ -348,26 +351,68 @@ async fn unrepresentable_intervals_saturate_instead_of_panicking_the_resolver() 
         vec![(NodeId::new("b"), "10.0.0.2:7000".to_owned())],
         "the first attempt runs at once"
     );
-    advance(Duration::from_hours(24 * 365)).await;
+    advance(CENTURY).await;
     assert!(!h.task.is_finished(), "the resolver task panicked or ended");
     assert_eq!(
         h.resolver.lookups("b.svc:7000"),
         1,
-        "a saturated refresh fired"
+        "an unrepresentable refresh fired"
     );
     assert_eq!(
         h.resolver.lookups("c.svc:7000"),
         1,
-        "a saturated retry fired"
+        "an unrepresentable retry fired"
+    );
+    h.task.abort();
+    advance(Duration::ZERO).await;
+    assert!(
+        h.task.is_finished(),
+        "an unscheduled resolver still cancels"
     );
 }
 
-#[test]
-fn schedule_saturates_at_the_far_future() {
-    let now = tokio::time::Instant::now();
-    assert_eq!(schedule(now, RETRY), now + RETRY);
-    assert_eq!(schedule(now, Duration::MAX), now + MAX_WAIT);
-    assert_eq!(schedule(now, MAX_WAIT), now + MAX_WAIT);
+#[tokio::test(start_paused = true)]
+async fn a_long_representable_interval_is_waited_exactly() {
+    let resolver = Scripted::default();
+    resolver.set("b.svc:7000", "10.0.0.2:7000");
+    let h = Harness::spawn_with(
+        &[("b", "b.svc:7000"), ("c", "c.svc:7000")],
+        resolver,
+        CENTURY,
+        CENTURY,
+    );
+    advance(Duration::ZERO).await;
+    assert_eq!(h.resolver.lookups("b.svc:7000"), 1);
+    assert_eq!(h.resolver.lookups("c.svc:7000"), 1);
+
+    // One SETTLE has already elapsed: stop one SETTLE short of the deadline.
+    advance(
+        CENTURY
+            .checked_sub(SETTLE * 3)
+            .expect("a century exceeds 3 ms"),
+    )
+    .await;
+    assert_eq!(
+        h.resolver.lookups("b.svc:7000"),
+        1,
+        "a refresh fired before its interval"
+    );
+    assert_eq!(
+        h.resolver.lookups("c.svc:7000"),
+        1,
+        "a retry fired before its interval"
+    );
+    advance(SETTLE).await;
+    assert_eq!(
+        h.resolver.lookups("b.svc:7000"),
+        2,
+        "a refresh past the old horizon was shortened or lost"
+    );
+    assert_eq!(
+        h.resolver.lookups("c.svc:7000"),
+        2,
+        "a retry past the old horizon was shortened or lost"
+    );
 }
 
 #[test]
@@ -388,7 +433,7 @@ fn validate_rejects_intervals_below_the_minimum_by_field_without_flooring() {
             .with_refresh_interval(Duration::MAX)
             .validate(),
         Ok(()),
-        "an unrepresentable interval is accepted and saturates when scheduled"
+        "an unrepresentable interval is accepted and leaves the seed unscheduled"
     );
     assert_eq!(
         seeds().with_retry_interval(Duration::ZERO).validate(),

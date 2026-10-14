@@ -500,7 +500,7 @@ impl Messaging {
     ///
     /// # Errors
     /// Returns the [`SendValidationError`] naming an oversized payload or an
-    /// out-of-range acknowledgement deadline.
+    /// out-of-range or unrepresentable acknowledgement deadline.
     pub fn validate_send(
         &self,
         options: SendOptions,
@@ -547,12 +547,9 @@ impl Messaging {
             return Ok(id);
         };
         let start = tokio::time::Instant::now();
-        let deadline = start.checked_add(timeout).ok_or_else(|| {
-            error(
-                io::ErrorKind::InvalidInput,
-                "acknowledgement deadline exceeds the monotonic clock",
-            )
-        })?;
+        let deadline = start
+            .checked_add(timeout)
+            .ok_or(SendValidationError::UnrepresentableTimeout { timeout })?;
         let (result, mut receive) = oneshot::channel();
         {
             let mut state = self.inner.state.lock().map_err(|_| poisoned())?;

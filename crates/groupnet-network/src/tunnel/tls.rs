@@ -39,8 +39,10 @@ impl TlsIdentity {
     ///
     /// # Errors
     /// Returns the [`TlsIdentityError`] naming an empty or oversized root set or
-    /// chain, a malformed root or key, or a key the chain does not match; rustls
-    /// and parser failures stay available as the error's `source()`.
+    /// chain, a malformed root or key, or a key the chain does not match. Rustls
+    /// failures stay available as the error's `source()`; the key parser reports
+    /// only a static description, carried in [`TlsIdentityError::Key`] and its
+    /// `Display`.
     pub fn from_der(
         roots: Vec<Vec<u8>>,
         chain: Vec<Vec<u8>>,
@@ -101,19 +103,24 @@ pub enum TlsIdentityError {
     RootCount,
     /// `chain` is empty or holds more than [`TlsIdentity::MAX_CHAIN`] certificates.
     ChainCount,
-    /// A trust root is not a parseable certificate.
+    /// A trust root is not a parseable certificate; the rustls cause is the
+    /// `source()`.
     Root(rustls::Error),
-    /// `key` is not a recognized DER private key.
+    /// `key` is not a recognized DER private key. The parser offers no error
+    /// value, so this variant has no `source()`.
     Key {
-        /// The parser's reason.
+        /// The parser's static description of the failure.
         reason: &'static str,
     },
-    /// The client-certificate verifier rejected the trust roots.
+    /// The client-certificate verifier rejected the trust roots; the rustls
+    /// cause is the `source()`.
     Verifier(rustls::server::VerifierBuilderError),
-    /// The crypto provider does not support TLS 1.3.
+    /// The crypto provider does not support TLS 1.3; the rustls cause is the
+    /// `source()`.
     Protocol(rustls::Error),
     /// The chain and key do not form a usable credential (for example, a key
-    /// that does not match the leaf certificate).
+    /// that does not match the leaf certificate); the rustls cause is the
+    /// `source()`.
     Credentials(rustls::Error),
 }
 

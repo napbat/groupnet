@@ -112,7 +112,8 @@ pub use group::{
     InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
 pub use groupnet_network::tunnel::{
-    PeerIdentity, PeerIdentityError, TlsIdentity, TlsIdentityError, TunnelTransport, TunneledStream,
+    PeerIdentity, PeerIdentityError, TlsIdentity, TlsIdentityError, TunnelTransport,
+    TunneledStream, rustls,
 };
 pub use groupnet_network::{LinkProvider, Router, RouterConfig, TunnelConfig, TunnelConfigError};
 pub use groupnet_streams::{

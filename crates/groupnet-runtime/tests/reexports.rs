@@ -17,8 +17,20 @@ fn routing_and_tunnel_types_are_reachable_from_the_runtime() {
     named::<groupnet_runtime::TunnelConfig>();
     named::<groupnet_runtime::TunnelTransport>();
     named::<groupnet_runtime::TlsIdentity>();
+    named::<groupnet_runtime::TlsIdentityError>();
     named::<groupnet_runtime::PeerIdentity>();
     named::<dyn groupnet_runtime::LinkProvider>();
+}
+
+#[test]
+fn tls_identity_error_causes_are_reachable_from_the_runtime() {
+    named::<groupnet_runtime::rustls::Error>();
+    named::<groupnet_runtime::rustls::server::VerifierBuilderError>();
+    let _: fn(groupnet_runtime::rustls::Error) -> groupnet_runtime::TlsIdentityError =
+        groupnet_runtime::TlsIdentityError::Credentials;
+    let _: fn(
+        groupnet_runtime::rustls::server::VerifierBuilderError,
+    ) -> groupnet_runtime::TlsIdentityError = groupnet_runtime::TlsIdentityError::Verifier;
 }
 
 #[test]

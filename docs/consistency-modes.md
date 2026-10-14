@@ -271,8 +271,11 @@ skipped), with `is_complete()` and `is_vacuous()`:
 
 `AckLedger::record` reports only the local operation: `Ok(Recorded::Advanced)`
 (advanced and enqueued), `Ok(Recorded::Covered)` (nothing changed), or
-`Err(CommandRejected)` (advanced locally, enqueue refused — retry with
-`AckLedger::republish`). Nothing claims gossip delivery.
+`Err(rejected)` with the advance kept locally and the enqueue refused, where
+`rejected` is a `CommandRejected`: `InboxFull` is retryable overload (retry
+with `AckLedger::republish`, or let the next advancing record carry it), while
+`GroupClosed` means the group actor has shut down and no retry can succeed.
+Nothing claims gossip delivery.
 
 The live-membership waits are bounded-time (not absolute) under asymmetric
 partition inside the probe window — the crate's honesty box stays verbatim.
@@ -915,9 +918,11 @@ never publishes is invisible to both, so the contract is explicit:
 > (`HostedReads`), apply each event, and call `CommitLedger::record(&host,
 > token)` **after** the apply — and on a `Migrated` event call
 > `CommitLedger::refresh()`, so the stamp tracks the epoch the voter has
-> adopted even while no new writes are arriving. Both report a refused enqueue
-> as `Err(CommandRejected)` with the advance kept locally; retry with
-> `refresh()`, which re-carries the whole ledger. **Bind the subscriber to the
+> adopted even while no new writes are arriving. Both keep the advance locally
+> when the enqueue is refused and return `Err(rejected)`: on
+> `CommandRejected::InboxFull` (retryable overload) retry with `refresh()`,
+> which re-carries the whole ledger; `CommandRejected::GroupClosed` means the
+> group is gone and no retry can succeed. **Bind the subscriber to the
 > node's own write path** (`HostedWrites::bind`, one line before the loop takes
 > the handle), so that a voter which becomes host cuts its predecessor's lineage
 > at the instant it starts serving — see deviation 2b.
