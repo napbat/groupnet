@@ -46,6 +46,10 @@
 //! a full-duplex socket for each live identity. Managed sockets are not subject
 //! to raw idle/oldest-first eviction: dropping an idle writer must not withdraw
 //! an admitted neighbor or prevent a server from reaching a joiner behind NAT.
+//! Its handshake and gossip-learned addresses share a bounded book capped by
+//! `TcpAdmissionConfig::max_peers`; learning refreshes contact age and evicts the
+//! least recently learned contact. Explicitly registered bootstrap contacts are
+//! retained separately and cannot be overwritten by learned addresses.
 //!
 //! With `connectivity`, `TcpMsgTransport::bind_connectivity` owns a native
 //! TCP connection with admitted candidate traversal and relay fallback instead
@@ -69,21 +73,19 @@ use tokio::time::timeout;
 use crate::handshake::{check_id, read_intro, write_intro};
 use crate::tasks::Tasks;
 
+mod addresses;
 #[cfg(feature = "link")]
-#[path = "admitted.rs"]
 mod admitted;
+#[cfg(feature = "connectivity")]
+mod connectivity;
+mod endpoint;
+mod framing;
+
+use addresses::AddressBook;
 #[cfg(feature = "link")]
 pub use admitted::TcpAdmissionConfig;
-
-#[cfg(feature = "connectivity")]
-#[path = "connectivity.rs"]
-mod connectivity;
 #[cfg(feature = "connectivity")]
 pub use connectivity::TcpPathChanges;
-#[path = "msg_endpoint.rs"]
-mod endpoint;
-#[path = "msg_framing.rs"]
-mod framing;
 use framing::{FrameReader, extend_ready, next_batch, write_frames};
 
 #[derive(Debug)]
@@ -250,9 +252,9 @@ struct Inner {
     /// dialable — bound to an unspecified address with no `advertise`).
     intro: String,
     config: TcpMsgConfig,
-    /// `NodeId` -> where to dial. Interior mutability so peers can be
-    /// registered after binding (e.g. once ephemeral ports are known).
-    peers: RwLock<HashMap<NodeId, SocketAddr>>,
+    /// Explicit contacts and, for managed endpoints, a bounded learned book.
+    /// One lock covers registration, learning and lookup without lock inversion.
+    peers: RwLock<AddressBook>,
     pool: Mutex<Pool>,
     inbox: AsyncMutex<mpsc::Receiver<QueuedInbound>>,
     /// The network's synchronous sink, attached once by a link worker.
@@ -347,12 +349,16 @@ impl TcpMsgTransport {
             .or_else(|| (!local_addr.ip().is_unspecified()).then_some(local_addr))
             .map(|a| a.to_string())
             .unwrap_or_default();
+        #[cfg(feature = "link")]
+        let learned_capacity = admission.as_ref().map(|managed| managed.config.max_peers);
+        #[cfg(not(feature = "link"))]
+        let learned_capacity = None;
         let inner = Arc::new(Inner {
             local,
             local_addr,
             intro,
             config,
-            peers: RwLock::new(HashMap::new()),
+            peers: RwLock::new(AddressBook::new(learned_capacity)),
             pool: Mutex::new(Pool::default()),
             inbox: AsyncMutex::new(inbound_rx),
             tasks: Arc::new(Tasks::default()),
@@ -497,11 +503,7 @@ async fn read_loop(
         && let Ok(addr) = intro.parse::<SocketAddr>()
         && let Some(inner) = inner.upgrade()
     {
-        inner
-            .peers
-            .write()
-            .expect("peers lock poisoned")
-            .insert(from.clone(), addr);
+        inner.learn_peer_addr(&from, addr);
     }
     let Some(endpoint) = inner.upgrade() else {
         return;

@@ -43,6 +43,7 @@ const DEFAULT_QUEUE_CAPACITY: QueueCapacity = QueueCapacity::of(128);
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const LEASE: Duration = Duration::from_secs(6);
 const DIRECT_LEASE: Duration = Duration::from_secs(3);
+const MAX_CHECKS: usize = 32;
 
 /// Explicitly provisioned trusted-fabric HMAC key; Debug never reveals key bytes.
 #[derive(Clone)]
@@ -332,6 +333,18 @@ impl PathCheck {
             attempts: 0,
             next_probe: Instant::now(),
         }
+    }
+
+    fn tuple(&self) -> (SocketAddr, usize) {
+        (self.address, self.socket)
+    }
+
+    /// Holds a live transmit or receive capability.
+    fn validated(&self, now: Instant) -> bool {
+        self.direct.is_some_and(|capability| capability.live(now))
+            || self
+                .confirmed
+                .is_some_and(|capability| capability.live(now))
     }
 }
 

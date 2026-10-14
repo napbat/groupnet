@@ -126,5 +126,4 @@ impl FrameReader {
 }
 
 #[cfg(test)]
-#[path = "msg_framing_tests.rs"]
 mod tests;

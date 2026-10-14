@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 
-use super::super::{PathCheck, Peer, PendingCapability, candidates::valid};
+use super::super::{MAX_CHECKS, PathCheck, Peer, PendingCapability, candidates::valid};
 use super::{
     AdmittedInbound, Body, Capability, Endpoint, Inbound, Instant, Packet, PathPolicy, Session,
     SocketAddr, lock, random,
@@ -162,7 +162,7 @@ fn check_index(
     if let Some(index) = peer
         .checks
         .iter()
-        .position(|check| check.address == address && check.socket == socket)
+        .position(|check| check.tuple() == (address, socket))
     {
         return Some(index);
     }
@@ -171,13 +171,12 @@ fn check_index(
         return None;
     }
     let check = PathCheck::new(address, socket);
-    if peer.checks.len() < 32 {
+    if peer.checks.len() < MAX_CHECKS {
         peer.checks.push(check);
         return Some(peer.checks.len() - 1);
     }
     let index = peer.checks.iter().position(|old| {
-        old.direct.is_none_or(|cap| !cap.live(now))
-            && old.confirmed.is_none_or(|cap| !cap.live(now))
+        !old.validated(now)
             && old
                 .pending
                 .is_none_or(|pending| !pending.capability.live(now))

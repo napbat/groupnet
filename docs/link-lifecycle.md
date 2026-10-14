@@ -23,10 +23,24 @@ Old-session cleanup must not remove a replacement session. Resource capacity,
 credential bounds, handshake deadlines, and bounded pending admission remain
 library responsibilities even when the application accepts everyone.
 
+Managed direct TCP reserves `TcpAdmissionConfig::max_pending` handshake slots
+**per direction**: inbound and outbound work each have that bound, including
+application policy work. Outbound saturation therefore cannot consume the slots
+needed to resolve simultaneous inbound dials, even at a one-slot setting. Both
+directions retain the configured handshake deadline and shutdown cancellation.
+
 Bootstrap addresses identify initial contacts; they do not enumerate all future
 members. Only admitted adjacent peers enter routing. Discovery and forwarded
 membership records never independently authorize a new adjacent connection.
 Unauthenticated identifiers do not prove continuity after a session ends.
+
+Managed direct TCP retains explicitly registered bootstrap addresses separately
+from its learned contacts. Inbound handshake introductions and `learn_peer`
+hints share a learned-address cache capped by `TcpAdmissionConfig::max_peers`;
+learning refreshes an entry's age and evicts the least recently learned contact
+at capacity. Configured addresses take precedence and are neither overwritten
+nor evicted by learning. Eviction only removes a future dial hint, not a live
+session. Raw trusted TCP endpoints keep an unbounded, last-write-wins address book.
 
 Route discovery supplies a bounded, replaceable set of bootstrap contacts, not
 membership assertions. Each group contacts those peers through its own protocol;

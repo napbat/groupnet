@@ -32,7 +32,7 @@ impl<const N: usize> Default for CandidateSet<N> {
 
 impl<const N: usize> CandidateSet<N> {
     pub(super) fn insert(&mut self, address: SocketAddr) -> bool {
-        if !valid(address) || self.iter().any(|existing| existing == address) {
+        if !valid(address) || self.contains(address) {
             return false;
         }
         let index = usize::from(self.count);
@@ -49,6 +49,10 @@ impl<const N: usize> CandidateSet<N> {
         self.ports[index] = address.port();
         self.count += 1;
         true
+    }
+
+    pub(super) fn contains(&self, address: SocketAddr) -> bool {
+        self.iter().any(|existing| existing == address)
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = SocketAddr> + '_ {

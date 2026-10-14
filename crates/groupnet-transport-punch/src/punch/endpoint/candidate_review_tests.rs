@@ -3,8 +3,8 @@
 use std::time::Duration;
 use tokio::time::timeout;
 
-use super::super::{Capability, PeerPath, candidates::Candidates};
-use super::tests::{control, endpoint, loopback, packet};
+use super::super::{Capability, PeerPath};
+use super::tests::{control, endpoint, fill_sockets, loopback, offer, packet};
 use super::*;
 
 async fn receive_one(endpoint: &mut Endpoint) {
@@ -147,33 +147,22 @@ async fn forwarding_a_genuine_probe_cannot_authorize_third_party_confirm_data_or
     );
 }
 
-async fn fill_sockets(endpoint: &mut Endpoint) {
-    endpoint.config.candidate_binds = vec![loopback(); 3];
-    for _ in 0..3 {
-        endpoint
-            .extra_sockets
-            .push(UdpSocket::bind(loopback()).await.unwrap());
-    }
-}
-
 #[tokio::test]
 async fn eighth_advertisement_plus_distinct_observed_mapping_is_checked_with_full_cartesian_table()
 {
     let (mut endpoint, observed, _, _) = endpoint(PathPolicy::DirectPreferred).await;
     fill_sockets(&mut endpoint).await;
     let reachable = UdpSocket::bind(loopback()).await.unwrap();
-    let mut candidates = Candidates::default();
-    for port in 45000..45007 {
-        assert!(candidates.insert(([127, 0, 0, 1], port).into()));
-    }
-    assert!(candidates.insert(reachable.local_addr().unwrap()));
-    endpoint.accept_offer(
-        control(7, Body::Discover { proof: [2; 16] }),
-        "remote",
+    let advertised: Vec<SocketAddr> = (45000..45007)
+        .map(|port| ([127, 0, 0, 1], port).into())
+        .chain([reachable.local_addr().unwrap()])
+        .collect();
+    offer(
+        &mut endpoint,
         [3; 16],
-        Some(observed.local_addr().unwrap()),
-        false,
-        ((&candidates).into(), [7; 16]),
+        observed.local_addr().unwrap(),
+        &advertised,
+        [7; 16],
     );
     {
         let peers = lock(&endpoint.peers);
@@ -222,17 +211,15 @@ async fn eighth_advertisement_plus_distinct_observed_mapping_is_checked_with_ful
 async fn full_table_adopts_authenticated_new_nat_tuple_without_evicting_healthy_selected_path() {
     let (mut endpoint, observed, _, mut incoming) = endpoint(PathPolicy::DirectPreferred).await;
     fill_sockets(&mut endpoint).await;
-    let mut candidates = Candidates::default();
-    for port in 46000..46007 {
-        candidates.insert(([127, 0, 0, 1], port).into());
-    }
-    endpoint.accept_offer(
-        control(7, Body::Discover { proof: [2; 16] }),
-        "remote",
+    let advertised: Vec<SocketAddr> = (46000..46007)
+        .map(|port| ([127, 0, 0, 1], port).into())
+        .collect();
+    offer(
+        &mut endpoint,
         [3; 16],
-        Some(observed.local_addr().unwrap()),
-        false,
-        ((&candidates).into(), [7; 16]),
+        observed.local_addr().unwrap(),
+        &advertised,
+        [7; 16],
     );
     {
         let mut peers = lock(&endpoint.peers);

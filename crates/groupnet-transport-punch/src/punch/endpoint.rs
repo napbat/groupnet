@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::wire::{self, Body, MAX_PACKET, Packet, Session};
 use super::{
-    Capability, HEARTBEAT, Outbound, PathPolicy, Peer, PunchConfig, lock, random, transient,
+    Capability, HEARTBEAT, MAX_CHECKS, Outbound, PathPolicy, Peer, PunchConfig, lock, random,
+    transient,
 };
 
 struct Endpoint {
@@ -268,7 +269,7 @@ impl Endpoint {
         }
         let target = peer.session;
         let secret = peer.secret;
-        let mut probes = [None; 32];
+        let mut probes = [None; MAX_CHECKS];
         for (slot, check) in probes.iter_mut().zip(&mut peer.checks) {
             if now < check.next_probe || check.probe.is_some_and(|probe| probe.live(now)) {
                 continue;
@@ -404,28 +405,11 @@ impl Endpoint {
                 && previous.secret == secret
                 && previous.relay_only == relay_only
             {
+                let now = Instant::now();
                 if previous.addresses != addresses {
-                    let mut checks = self.make_checks(addresses);
-                    for check in &mut checks {
-                        if let Some(index) = previous.checks.iter().position(|old| {
-                            old.address == check.address && old.socket == check.socket
-                        }) {
-                            std::mem::swap(check, &mut previous.checks[index]);
-                        }
-                    }
-                    let selected = previous
-                        .selected
-                        .and_then(|index| previous.checks.get(index))
-                        .map(|check| (check.address, check.socket));
-                    previous.selected = selected.and_then(|(address, socket)| {
-                        checks
-                            .iter()
-                            .position(|check| check.address == address && check.socket == socket)
-                    });
-                    previous.checks = checks;
-                    previous.addresses = addresses;
+                    self.refresh_checks(previous, addresses, now);
                 }
-                previous.offered = Instant::now();
+                previous.offered = now;
                 return;
             }
             previous.lease.revoke();
@@ -446,7 +430,7 @@ impl Endpoint {
                 node,
                 session,
                 addresses,
-                candidate_cursor: 32,
+                candidate_cursor: MAX_CHECKS,
                 secret,
                 relay_only,
                 offered: Instant::now(),

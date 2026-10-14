@@ -97,8 +97,10 @@ impl TcpMsgTransport {
         Arc::new(self.clone())
     }
 
-    /// Teaches a direct endpoint that `node` listens at `addr`.
-    /// An existing connection is left alone until it next closes.
+    /// Registers a direct endpoint's explicit dial address for `node`.
+    /// Managed endpoints retain it independently of the bounded learned book;
+    /// handshake and gossip learning cannot overwrite it. Registering again
+    /// replaces the configured address, without changing an existing connection.
     /// This has no effect in connectivity mode: rendezvous admission owns paths.
     ///
     /// # Panics
@@ -109,11 +111,14 @@ impl TcpMsgTransport {
                 .peers
                 .write()
                 .expect("peers lock poisoned")
-                .insert(node, addr);
+                .register(node, addr);
         }
     }
 
-    /// Returns a direct endpoint's dial address, or a validated native direct path.
+    /// Returns a direct endpoint's configured or learned dial address, or a
+    /// validated native direct path. Managed learning is bounded by
+    /// `TcpAdmissionConfig::max_peers` when admission is enabled;
+    /// configured contacts take precedence and survive learned-address eviction.
     /// A relayed or unknown connectivity peer has no direct address.
     ///
     /// # Panics
@@ -121,12 +126,7 @@ impl TcpMsgTransport {
     #[must_use]
     pub fn peer_addr(&self, node: &NodeId) -> Option<SocketAddr> {
         match &self.backend {
-            Backend::Direct(inner) => inner
-                .peers
-                .read()
-                .expect("peers lock poisoned")
-                .get(node)
-                .copied(),
+            Backend::Direct(inner) => inner.peer_addr(node),
             #[cfg(feature = "connectivity")]
             Backend::Connectivity { connection, .. } => connection.direct_addr_to(node),
         }
@@ -169,10 +169,10 @@ impl Transport for TcpMsgTransport {
 
     fn learn_peer(&self, node: &NodeId, addr: &str) {
         // Native admission owns its own candidates: hints must not bypass it.
-        if self.direct().is_some()
+        if let Some(inner) = self.direct()
             && let Ok(addr) = addr.parse::<SocketAddr>()
         {
-            self.register_peer(node.clone(), addr);
+            inner.learn_peer_addr(node, addr);
         }
     }
 
@@ -288,6 +288,19 @@ impl Transport for TcpMsgTransport {
 }
 
 impl Inner {
+    /// Dial address for `node`: registered first, then learned.
+    pub(super) fn peer_addr(&self, node: &NodeId) -> Option<SocketAddr> {
+        self.peers.read().expect("peers lock poisoned").get(node)
+    }
+
+    /// Records a handshake-introduced or hinted dial address for `node`.
+    pub(super) fn learn_peer_addr(&self, node: &NodeId, addr: SocketAddr) {
+        self.peers
+            .write()
+            .expect("peers lock poisoned")
+            .learn(node, addr);
+    }
+
     async fn recv_raw(&self) -> io::Result<super::QueuedInbound> {
         if self.tasks.stopped() {
             return Err(shut_down());
@@ -315,13 +328,7 @@ impl Inner {
                 }
             }
         }
-        let addr = self
-            .peers
-            .read()
-            .expect("peers lock poisoned")
-            .get(to)
-            .copied();
-        if let Some(addr) = addr {
+        if let Some(addr) = self.peer_addr(to) {
             self.dial_raw(to, addr, msg);
         }
         Ok(())

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
+use super::super::candidates::{Candidates, MAX_SOCKETS};
 use super::super::{DIRECT_LEASE, PeerPath};
 use super::*;
 
@@ -30,7 +31,7 @@ pub(super) async fn endpoint(
         config,
         socket: UdpSocket::bind(loopback()).await.unwrap(),
         extra_sockets: Vec::new(),
-        local_candidates: super::super::candidates::Candidates::default(),
+        local_candidates: Candidates::default(),
         observed: Arc::new(Mutex::new(None)),
         announcement: 0,
         session: [1; 16],
@@ -76,7 +77,39 @@ pub(super) fn control(sequence: u64, body: Body<'_>) -> Packet<'_> {
     }
 }
 
-fn data(capability: Session) -> Body<'static> {
+/// Re-offers `remote` with `address` as its observed mapping plus `candidates`.
+pub(super) fn offer(
+    endpoint: &mut Endpoint,
+    session: Session,
+    address: SocketAddr,
+    candidates: &[SocketAddr],
+    secret: Session,
+) {
+    let mut advertised = Candidates::default();
+    for &candidate in candidates {
+        assert!(advertised.insert(candidate));
+    }
+    endpoint.accept_offer(
+        control(7, Body::Discover { proof: [2; 16] }),
+        "remote",
+        session,
+        Some(address),
+        false,
+        ((&advertised).into(), secret),
+    );
+}
+
+/// Leases every additional candidate socket on loopback.
+pub(super) async fn fill_sockets(endpoint: &mut Endpoint) {
+    endpoint.config.candidate_binds = vec![loopback(); MAX_SOCKETS - 1];
+    for _ in 1..MAX_SOCKETS {
+        endpoint
+            .extra_sockets
+            .push(UdpSocket::bind(loopback()).await.unwrap());
+    }
+}
+
+pub(super) fn data(capability: Session) -> Body<'static> {
     Body::Direct {
         peer: "local",
         target: [1; 16],
@@ -86,7 +119,7 @@ fn data(capability: Session) -> Body<'static> {
     }
 }
 
-fn confirmation(capability: Session) -> Body<'static> {
+pub(super) fn confirmation(capability: Session) -> Body<'static> {
     Body::Confirm {
         target: [1; 16],
         capability,
@@ -103,7 +136,8 @@ fn delivered(proof: Session, message: &[u8]) -> Body<'_> {
     }
 }
 
-fn challenge(endpoint: &mut Endpoint, address: SocketAddr, sequence: u64) -> Session {
+/// Receives an authenticated probe from `address`; returns its pending capability.
+pub(super) fn challenge(endpoint: &mut Endpoint, address: SocketAddr, sequence: u64) -> Session {
     endpoint.receive(
         packet(
             sequence,
@@ -115,7 +149,11 @@ fn challenge(endpoint: &mut Endpoint, address: SocketAddr, sequence: u64) -> Ses
         ),
         address,
     );
-    lock(&endpoint.peers)["remote"].checks[0]
+    lock(&endpoint.peers)["remote"]
+        .checks
+        .iter()
+        .find(|check| check.tuple() == (address, 0))
+        .unwrap()
         .pending
         .unwrap()
         .capability
@@ -490,14 +528,7 @@ async fn expired_pending_and_confirmed_tokens_and_replaced_sessions_fail_closed(
     endpoint.receive(packet(6, data(fresh)), address);
     assert!(incoming.try_recv().is_err());
     let old = lock(&endpoint.peers)["remote"].lease.clone();
-    endpoint.accept_offer(
-        control(7, Body::Discover { proof: [2; 16] }),
-        "remote",
-        [8; 16],
-        Some(address),
-        false,
-        (wire::CandidateList::empty(), [7; 16]),
-    );
+    offer(&mut endpoint, [8; 16], address, &[], [7; 16]);
     assert!(!old.is_active());
     assert!(
         lock(&endpoint.peers)["remote"].checks[0]

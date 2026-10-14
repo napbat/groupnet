@@ -1,7 +1,10 @@
 //! Candidate selection, failover, rate bounds, and admission lease regressions.
 
+use super::super::candidates::Candidates;
 use super::super::{DIRECT_LEASE, PeerPath};
-use super::tests::{control, endpoint, loopback, packet};
+use super::tests::{
+    challenge, confirmation, data, endpoint, fill_sockets, loopback, offer, packet,
+};
 use super::*;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -13,7 +16,7 @@ async fn candidate_checks_use_independent_nonces_and_additional_socket_then_fail
     let extra = UdpSocket::bind(loopback()).await.unwrap();
     let extra_address = extra.local_addr().unwrap();
     endpoint.extra_sockets.push(extra);
-    let mut candidates = super::super::candidates::Candidates::default();
+    let mut candidates = Candidates::default();
     candidates.insert(silent.local_addr().unwrap());
     candidates.insert(reachable.local_addr().unwrap());
     let checks = endpoint.make_checks(candidates);
@@ -182,13 +185,12 @@ async fn authenticated_peer_reflexive_candidates_are_bounded_and_fenced_on_repla
             secret: [7; 16],
         },
     );
-    endpoint.accept_offer(
-        control(7, Body::Discover { proof: [2; 16] }),
-        "remote",
+    offer(
+        &mut endpoint,
         [8; 16],
-        Some(remote.local_addr().unwrap()),
-        false,
-        (wire::CandidateList::empty(), [9; 16]),
+        remote.local_addr().unwrap(),
+        &[],
+        [9; 16],
     );
     endpoint.receive(old, ([127, 0, 0, 1], 40001).into());
     let forged = wire::sign_check(Packet {
@@ -227,15 +229,12 @@ async fn late_local_candidate_announcement_preserves_live_selection_and_admissio
     );
     let lease = lock(&endpoint.peers)["remote"].lease.clone();
     let extra = UdpSocket::bind(loopback()).await.unwrap();
-    let mut candidates = super::super::candidates::Candidates::default();
-    candidates.insert(extra.local_addr().unwrap());
-    endpoint.accept_offer(
-        control(7, Body::Discover { proof: [2; 16] }),
-        "remote",
+    offer(
+        &mut endpoint,
         [3; 16],
-        Some(address),
-        false,
-        ((&candidates).into(), [7; 16]),
+        address,
+        &[extra.local_addr().unwrap()],
+        [7; 16],
     );
     let peers = lock(&endpoint.peers);
     let peer = &peers["remote"];
@@ -251,6 +250,228 @@ async fn late_local_candidate_announcement_preserves_live_selection_and_admissio
             .token,
         [6; 16]
     );
+}
+
+fn confirm_receive_path(endpoint: &mut Endpoint, address: SocketAddr, sequence: u64) -> Session {
+    let capability = challenge(endpoint, address, sequence);
+    endpoint.receive(packet(sequence + 1, confirmation(capability)), address);
+    capability
+}
+
+fn select_transmit_path(endpoint: &mut Endpoint, address: SocketAddr, sequence: u64) {
+    endpoint.probe(&"remote".into());
+    let nonce = lock(&endpoint.peers)["remote"]
+        .checks
+        .iter()
+        .find(|check| check.tuple() == (address, 0))
+        .unwrap()
+        .probe
+        .unwrap()
+        .token;
+    endpoint.receive(
+        packet(
+            sequence,
+            Body::ProbeAck {
+                target: [1; 16],
+                nonce,
+                capability: [6; 16],
+                secret: [7; 16],
+            },
+        ),
+        address,
+    );
+}
+
+#[tokio::test]
+async fn same_session_candidate_refresh_preserves_validated_peer_reflexive_path() {
+    let (mut endpoint, remote, _, mut incoming) = endpoint(PathPolicy::DirectPreferred).await;
+    let primary = remote.local_addr().unwrap();
+    let learned = UdpSocket::bind(loopback()).await.unwrap();
+    let address = learned.local_addr().unwrap();
+    let capability = confirm_receive_path(&mut endpoint, address, 8);
+    select_transmit_path(&mut endpoint, address, 10);
+    endpoint.receive(packet(11, data(capability)), address);
+    assert_eq!(incoming.try_recv().unwrap().packet.msg, b"payload"[..]);
+    let (lease, direct_issued, confirmed_issued) = {
+        let peers = lock(&endpoint.peers);
+        let peer = &peers["remote"];
+        assert!(!peer.addresses.contains(address));
+        let check = &peer.checks[peer.selected.unwrap()];
+        assert_eq!(check.address, address);
+        (
+            peer.lease.clone(),
+            check.direct.unwrap().issued,
+            check.confirmed.unwrap().issued,
+        )
+    };
+    let first = UdpSocket::bind(loopback()).await.unwrap();
+    let second = UdpSocket::bind(loopback()).await.unwrap();
+    for pair in [
+        [first.local_addr().unwrap(), second.local_addr().unwrap()],
+        [second.local_addr().unwrap(), first.local_addr().unwrap()],
+    ] {
+        offer(&mut endpoint, [3; 16], primary, &pair, [7; 16]);
+        let peers = lock(&endpoint.peers);
+        let peer = &peers["remote"];
+        let check = &peer.checks[peer.selected.unwrap()];
+        assert_eq!(check.tuple(), (address, 0));
+        assert_eq!(check.direct.unwrap().issued, direct_issued);
+        assert_eq!(check.confirmed.unwrap().issued, confirmed_issued);
+        assert_eq!(peer.session, [3; 16]);
+        assert_eq!(peer.secret, [7; 16]);
+        assert_eq!(peer.sequence, 11);
+        assert_eq!(peer.lease.id(), lease.id());
+        assert!(lease.is_active());
+    }
+    endpoint.receive(packet(11, data(capability)), address);
+    assert!(incoming.try_recv().is_err());
+    endpoint.receive(packet(12, data(capability)), address);
+    let delivered = incoming.try_recv().unwrap();
+    assert_eq!(delivered.session, Some(lease.id()));
+    assert_eq!(delivered.packet.msg, b"payload"[..]);
+    endpoint.send_message(&Outbound {
+        to: "remote".into(),
+        session: lease.id(),
+        target: [3; 16],
+        message: Bytes::from_static(b"selected learned path"),
+    });
+    let mut bytes = [0; MAX_PACKET + 1];
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let (length, source) = learned.recv_from(&mut bytes).await.unwrap();
+            if matches!(wire::decode_mode(&bytes[..length], None).unwrap().body, Body::Direct { capability, message, .. } if capability == [6; 16] && message == b"selected learned path") {
+                assert_eq!(source, endpoint.socket.local_addr().unwrap());
+                break;
+            }
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn full_candidate_refresh_retains_validated_learned_paths_but_replacement_fences_them() {
+    let (mut endpoint, remote, _, mut incoming) = endpoint(PathPolicy::DirectPreferred).await;
+    fill_sockets(&mut endpoint).await;
+    let primary = remote.local_addr().unwrap();
+    let learned = UdpSocket::bind(loopback()).await.unwrap();
+    let address = learned.local_addr().unwrap();
+    let capability = confirm_receive_path(&mut endpoint, address, 8);
+    select_transmit_path(&mut endpoint, address, 10);
+    let receive_only = UdpSocket::bind(loopback()).await.unwrap();
+    let receive_address = receive_only.local_addr().unwrap();
+    let receive_capability = confirm_receive_path(&mut endpoint, receive_address, 11);
+    let lease = lock(&endpoint.peers)["remote"].lease.clone();
+    let advertised: Vec<SocketAddr> = (41000..41008)
+        .map(|port| ([127, 0, 0, 1], port).into())
+        .collect();
+    offer(&mut endpoint, [3; 16], primary, &advertised, [7; 16]);
+    {
+        let peers = lock(&endpoint.peers);
+        let peer = &peers["remote"];
+        assert_eq!(peer.checks.len(), 32);
+        assert_eq!(peer.addresses.len(), 9);
+        assert_eq!(peer.checks[peer.selected.unwrap()].address, address);
+        let check = peer
+            .checks
+            .iter()
+            .find(|check| check.address == receive_address)
+            .unwrap();
+        assert!(check.direct.is_none());
+        assert_eq!(check.confirmed.unwrap().token, receive_capability);
+        assert_eq!(peer.lease.id(), lease.id());
+    }
+    endpoint.receive(packet(13, data(capability)), address);
+    assert_eq!(incoming.try_recv().unwrap().session, Some(lease.id()));
+    endpoint.receive(packet(14, data(receive_capability)), receive_address);
+    assert_eq!(incoming.try_recv().unwrap().session, Some(lease.id()));
+    offer(&mut endpoint, [8; 16], primary, &advertised, [9; 16]);
+    assert!(!lease.is_active());
+    endpoint.receive(packet(15, data(capability)), address);
+    let forged = wire::sign_check(Packet {
+        session: [8; 16],
+        ..packet(16, data(capability))
+    });
+    endpoint.receive(forged, address);
+    assert!(incoming.try_recv().is_err());
+    let peers = lock(&endpoint.peers);
+    let peer = &peers["remote"];
+    assert_eq!(peer.checks.len(), 32);
+    assert!(peer.selected.is_none());
+    assert_eq!(peer.sequence, 0);
+    assert!(
+        peer.checks
+            .iter()
+            .all(|check| check.direct.is_none() && check.confirmed.is_none())
+    );
+    assert!(
+        !peer
+            .checks
+            .iter()
+            .any(|check| check.address == address || check.address == receive_address)
+    );
+}
+
+#[tokio::test]
+async fn candidate_refresh_preserves_matching_pending_and_probe_state() {
+    let (mut endpoint, remote, _, mut incoming) = endpoint(PathPolicy::DirectPreferred).await;
+    let address = remote.local_addr().unwrap();
+    endpoint.probe(&"remote".into());
+    challenge(&mut endpoint, address, 8);
+    let (probe, pending) = {
+        let peers = lock(&endpoint.peers);
+        let check = &peers["remote"].checks[0];
+        (check.probe.unwrap(), check.pending.unwrap())
+    };
+    let new_primary = UdpSocket::bind(loopback()).await.unwrap();
+    offer(
+        &mut endpoint,
+        [3; 16],
+        new_primary.local_addr().unwrap(),
+        &[address],
+        [7; 16],
+    );
+    {
+        let peers = lock(&endpoint.peers);
+        let check = peers["remote"]
+            .checks
+            .iter()
+            .find(|check| check.address == address)
+            .unwrap();
+        let (kept_probe, kept_pending) = (check.probe.unwrap(), check.pending.unwrap());
+        assert_eq!(
+            (kept_probe.token, kept_probe.issued),
+            (probe.token, probe.issued)
+        );
+        assert_eq!(
+            (
+                kept_pending.capability.token,
+                kept_pending.capability.issued,
+                kept_pending.sequence
+            ),
+            (
+                pending.capability.token,
+                pending.capability.issued,
+                pending.sequence
+            )
+        );
+    }
+    endpoint.receive(
+        packet(
+            9,
+            Body::ProbeAck {
+                target: [1; 16],
+                nonce: probe.token,
+                capability: [6; 16],
+                secret: [7; 16],
+            },
+        ),
+        address,
+    );
+    endpoint.receive(packet(10, confirmation(pending.capability.token)), address);
+    endpoint.receive(packet(11, data(pending.capability.token)), address);
+    assert_eq!(incoming.try_recv().unwrap().packet.msg, b"payload"[..]);
+    let peers = lock(&endpoint.peers);
+    let peer = &peers["remote"];
+    assert_eq!(peer.checks[peer.selected.unwrap()].address, address);
 }
 
 #[tokio::test]

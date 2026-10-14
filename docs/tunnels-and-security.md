@@ -352,6 +352,13 @@ healthy selected path. UDP final data and confirmations require pair-secret MACs
 forwarding a captured authentic probe and learning its returned capability is
 not sufficient to inject data or advance replay state.
 
+Same-session candidate refreshes preserve live validated UDP checks, including
+peer-reflexive tuples absent from the advertised list, their receive capabilities,
+and the selected direct path. Matching advertised checks retain in-flight proofs;
+new advertised tuples fill only the remaining slots within the 32-check bound.
+Refreshing an offer does not extend capability deadlines or reset replay state.
+A replacement peer generation still discards the old checks and admission lease.
+
 TCP direct and keyed control streams derive separate transmit/receive MAC keys
 and authenticate monotonic frame sequences. Reflection and replay cannot convert
 locally emitted traffic into traffic attributed to the remote peer. Direct

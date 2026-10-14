@@ -6,7 +6,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 
-async fn endpoint(id: &str, policy: Arc<dyn Admission>, credential: &[u8]) -> TcpMsgTransport {
+pub(super) async fn endpoint(
+    id: &str,
+    policy: Arc<dyn Admission>,
+    credential: &[u8],
+) -> TcpMsgTransport {
     TcpMsgTransport::bind_admitted(
         NodeId::new(id),
         "127.0.0.1:0",
@@ -19,7 +23,7 @@ async fn endpoint(id: &str, policy: Arc<dyn Admission>, credential: &[u8]) -> Tc
     .expect("admitted bind")
 }
 
-async fn eventually(mut condition: impl FnMut() -> bool) {
+pub(super) async fn eventually(mut condition: impl FnMut() -> bool) {
     timeout(Duration::from_secs(5), async {
         while !condition() {
             tokio::task::yield_now().await;
@@ -29,7 +33,7 @@ async fn eventually(mut condition: impl FnMut() -> bool) {
     .expect("condition converges");
 }
 
-fn peers(endpoint: &TcpMsgTransport) -> usize {
+pub(super) fn peers(endpoint: &TcpMsgTransport) -> usize {
     endpoint
         .sessions()
         .expect("sessions")
@@ -38,18 +42,45 @@ fn peers(endpoint: &TcpMsgTransport) -> usize {
         .len()
 }
 
-async fn receive(endpoint: &TcpMsgTransport) -> groupnet_transport::Inbound {
+pub(super) async fn receive(endpoint: &TcpMsgTransport) -> groupnet_transport::Inbound {
     timeout(Duration::from_secs(5), endpoint.recv())
         .await
         .expect("receive deadline")
         .expect("receive")
 }
 
-fn connect(client: &TcpMsgTransport, server: &TcpMsgTransport) {
+pub(super) fn connect(client: &TcpMsgTransport, server: &TcpMsgTransport) {
     client.register_peer(server.local_id().clone(), server.local_addr());
     client
         .connect_peer(server.local_id())
         .expect("connect bootstrap");
+}
+
+pub(super) fn managed(endpoint: &TcpMsgTransport) -> &Arc<Managed> {
+    endpoint
+        .direct()
+        .expect("direct endpoint")
+        .admission
+        .as_ref()
+        .expect("managed endpoint")
+}
+
+pub(super) fn no_connections(endpoint: &TcpMsgTransport) -> bool {
+    managed(endpoint)
+        .connections
+        .lock()
+        .expect("connections")
+        .peers
+        .is_empty()
+}
+
+/// Free `(inbound, outbound)` handshake permits.
+pub(super) fn available(endpoint: &TcpMsgTransport) -> (usize, usize) {
+    let managed = managed(endpoint);
+    (
+        managed.pending_inbound.available_permits(),
+        managed.pending_outbound.available_permits(),
+    )
 }
 
 #[tokio::test]
@@ -117,20 +148,7 @@ async fn custom_policy_rejects_wrong_credentials_and_claims_without_leaking_secr
         connect(&client, &server);
         let expected = policy.called.load(Ordering::SeqCst) + 1;
         eventually(|| policy.called.load(Ordering::SeqCst) >= expected).await;
-        eventually(|| {
-            client
-                .direct()
-                .expect("direct endpoint")
-                .admission
-                .as_ref()
-                .expect("managed")
-                .connections
-                .lock()
-                .expect("connections")
-                .peers
-                .is_empty()
-        })
-        .await;
+        eventually(|| no_connections(&client)).await;
         assert_eq!(peers(&server), 0);
         assert_eq!(peers(&client), 0);
         client.close().await;
@@ -157,20 +175,7 @@ async fn duplicate_identity_cannot_evict_incumbent_and_clean_reconnect_works() {
     let old = server.sessions().expect("sessions").subscribe().borrow()[0].id;
     let duplicate = endpoint("same-id", Arc::new(OpenAdmission), &[]).await;
     connect(&duplicate, &server);
-    eventually(|| {
-        duplicate
-            .direct()
-            .expect("direct endpoint")
-            .admission
-            .as_ref()
-            .expect("managed")
-            .connections
-            .lock()
-            .expect("connections")
-            .peers
-            .is_empty()
-    })
-    .await;
+    eventually(|| no_connections(&duplicate)).await;
     assert_eq!(peers(&duplicate), 0);
     assert!(
         server
@@ -246,20 +251,7 @@ async fn revoke_disconnects_and_fences_queued_frames_before_reconnect() {
     .await;
     sessions.revoke(client.local_id());
     eventually(|| peers(&client) == 0).await;
-    eventually(|| {
-        client
-            .direct()
-            .expect("direct endpoint")
-            .admission
-            .as_ref()
-            .expect("managed")
-            .connections
-            .lock()
-            .expect("connections")
-            .peers
-            .is_empty()
-    })
-    .await;
+    eventually(|| no_connections(&client)).await;
     connect(&client, &server);
     eventually(|| peers(&server) == 1 && peers(&client) == 1).await;
     let queued = server.recv_admitted().await.expect("queued frame");
@@ -310,33 +302,9 @@ async fn pending_policy_capacity_and_deadline_are_bounded_and_shutdown_drains() 
     eventually(|| policy.calls.load(Ordering::SeqCst) == 1).await;
     let denied = endpoint("denied-during-pending", Arc::new(OpenAdmission), &[]).await;
     connect(&denied, &server);
-    eventually(|| {
-        denied
-            .direct()
-            .expect("direct endpoint")
-            .admission
-            .as_ref()
-            .expect("managed")
-            .connections
-            .lock()
-            .expect("connections")
-            .peers
-            .is_empty()
-    })
-    .await;
+    eventually(|| no_connections(&denied)).await;
     assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
-    eventually(|| {
-        server
-            .direct()
-            .expect("direct endpoint")
-            .admission
-            .as_ref()
-            .expect("managed")
-            .pending
-            .available_permits()
-            == 1
-    })
-    .await;
+    eventually(|| available(&server).0 == 1).await;
     let allowed = endpoint("allowed-after-timeout", Arc::new(OpenAdmission), &[]).await;
     connect(&allowed, &server);
     eventually(|| peers(&server) == 1 && peers(&allowed) == 1).await;
@@ -405,20 +373,7 @@ async fn oversized_wire_credentials_are_rejected_before_policy_and_capacity_hold
     eventually(|| peers(&server) == 1 && peers(&first) == 1).await;
     let excess = endpoint("excess", Arc::new(OpenAdmission), &[]).await;
     connect(&excess, &server);
-    eventually(|| {
-        excess
-            .direct()
-            .expect("direct endpoint")
-            .admission
-            .as_ref()
-            .expect("managed")
-            .connections
-            .lock()
-            .expect("connections")
-            .peers
-            .is_empty()
-    })
-    .await;
+    eventually(|| no_connections(&excess)).await;
     assert_eq!(peers(&server), 1);
     assert_eq!(peers(&excess), 0);
     first.close().await;
@@ -440,20 +395,7 @@ async fn policy_cannot_silently_rename_local_identity() {
     let server = endpoint("server", Arc::new(Rename), &[]).await;
     let client = endpoint("client", Arc::new(OpenAdmission), &[]).await;
     connect(&client, &server);
-    eventually(|| {
-        client
-            .direct()
-            .expect("direct endpoint")
-            .admission
-            .as_ref()
-            .expect("managed")
-            .connections
-            .lock()
-            .expect("connections")
-            .peers
-            .is_empty()
-    })
-    .await;
+    eventually(|| no_connections(&client)).await;
     assert_eq!(peers(&server), 0);
     assert_eq!(peers(&client), 0);
     client.close().await;
@@ -614,17 +556,9 @@ async fn shutdown_cancels_policy_work_without_waiting_for_handshake_deadline() {
     timeout(Duration::from_secs(5), server.close())
         .await
         .expect("policy drained immediately");
-    assert_eq!(
-        server
-            .direct()
-            .expect("direct endpoint")
-            .admission
-            .as_ref()
-            .expect("managed")
-            .pending
-            .available_permits(),
-        64
-    );
+    assert_eq!(available(&server), (64, 64));
+    assert!(managed(&server).pending_inbound.is_closed());
+    assert!(managed(&server).pending_outbound.is_closed());
     assert_eq!(peers(&server), 0);
     eventually(|| client.outbound_connections() == 0).await;
     client.close().await;
@@ -693,8 +627,7 @@ async fn owned_queue_retains_payload_storage_and_drops_at_capacity() {
     let client = endpoint("owned-client", Arc::new(OpenAdmission), &[]).await;
     connect(&client, &server);
     eventually(|| peers(&server) == 1 && peers(&client) == 1).await;
-    let inner = server.direct().expect("direct");
-    let managed = inner.admission.as_ref().expect("managed");
+    let managed = managed(&server);
     let session = managed.sessions.subscribe().borrow()[0].id;
     let (frames, mut queued) = mpsc::channel(1);
     // Keep the original sender alive so the real socket writer remains parked.

@@ -40,10 +40,12 @@ struct HelloPrefix {
 /// Bounds for policy work and established managed TCP sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpAdmissionConfig {
-    /// Maximum handshakes executing concurrently, including custom policy work.
-    /// Default: 64.
+    /// Maximum handshakes executing concurrently per direction, including custom
+    /// policy work. Inbound and outbound each have this capacity. Default: 64.
     pub max_pending: QueueCapacity,
-    /// Maximum live admitted identities. Duplicate live identities are rejected.
+    /// Maximum live admitted identities and dynamically learned dial addresses.
+    /// Duplicate live identities are rejected. Registered bootstrap addresses
+    /// are retained separately and cannot be overwritten by learning.
     /// Must be nonzero. Default: 1024.
     pub max_peers: usize,
     /// Deadline covering connection establishment, wire exchange, and policy
@@ -81,8 +83,9 @@ pub(super) struct Managed {
     pub(super) sessions: SessionRegistry,
     policy: Arc<dyn Admission>,
     credential: Vec<u8>,
-    config: TcpAdmissionConfig,
-    pending: Arc<Semaphore>,
+    pub(super) config: TcpAdmissionConfig,
+    pending_inbound: Arc<Semaphore>,
+    pending_outbound: Arc<Semaphore>,
     connections: Mutex<Connections>,
     inbound: Mutex<Option<InboundPath>>,
 }
@@ -124,7 +127,8 @@ impl TcpMsgTransport {
         }
         let managed = Arc::new(Managed {
             sessions: SessionRegistry::new(admission.max_peers)?,
-            pending: Arc::new(Semaphore::new(admission.max_pending.get())),
+            pending_inbound: Arc::new(Semaphore::new(admission.max_pending.get())),
+            pending_outbound: Arc::new(Semaphore::new(admission.max_pending.get())),
             policy,
             credential,
             config: admission,
@@ -247,7 +251,8 @@ impl Managed {
     }
 
     pub(super) fn shutdown(&self) {
-        self.pending.close();
+        self.pending_inbound.close();
+        self.pending_outbound.close();
         self.sessions.close();
         self.inbound.lock().expect("inbound lock poisoned").take();
         self.connections
@@ -321,16 +326,10 @@ impl Managed {
             }
             return Ok(());
         }
-        let Some(addr) = inner
-            .peers
-            .read()
-            .expect("peers lock poisoned")
-            .get(peer)
-            .copied()
-        else {
+        let Some(addr) = inner.peer_addr(peer) else {
             return Ok(());
         };
-        let Ok(permit) = self.pending.clone().try_acquire_owned() else {
+        let Ok(permit) = self.pending_outbound.clone().try_acquire_owned() else {
             return Ok(());
         };
         let (frames, receiver) = mpsc::channel(inner.config.outbound_queue.get());
@@ -389,7 +388,7 @@ impl Managed {
     }
 
     pub(super) fn accept(self: &Arc<Self>, inner: &Arc<Inner>, socket: TcpStream) {
-        let Ok(permit) = self.pending.clone().try_acquire_owned() else {
+        let Ok(permit) = self.pending_inbound.clone().try_acquire_owned() else {
             return;
         };
         let managed = self.clone();
@@ -753,11 +752,7 @@ fn learn_intro(inner: &Weak<Inner>, node: &NodeId, intro: &str) {
     if let Ok(address) = intro.parse::<std::net::SocketAddr>()
         && let Some(inner) = inner.upgrade()
     {
-        inner
-            .peers
-            .write()
-            .expect("peers lock poisoned")
-            .insert(node.clone(), address);
+        inner.learn_peer_addr(node, address);
     }
 }
 
@@ -766,5 +761,7 @@ fn denied() -> io::Error {
 }
 
 #[cfg(test)]
-#[path = "admission_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod bounds_tests;

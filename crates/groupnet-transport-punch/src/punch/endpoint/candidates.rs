@@ -6,10 +6,11 @@ use std::task::Poll;
 
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
-
-use super::super::{PathCheck, Peer};
-use super::Endpoint;
 use tokio::time::Instant;
+
+use super::super::candidates::{CandidateSet, PeerCandidates};
+use super::super::{MAX_CHECKS, PathCheck, Peer};
+use super::Endpoint;
 
 pub(super) async fn receive(
     primary: &UdpSocket,
@@ -40,26 +41,50 @@ pub(super) async fn receive(
 }
 
 impl Endpoint {
-    pub(super) fn make_checks<const N: usize>(
-        &self,
-        addresses: super::super::candidates::CandidateSet<N>,
-    ) -> Vec<PathCheck> {
-        let mut checks = Vec::with_capacity(32);
+    pub(super) fn make_checks<const N: usize>(&self, addresses: CandidateSet<N>) -> Vec<PathCheck> {
+        let mut checks = Vec::with_capacity(MAX_CHECKS);
+        self.fill_checks(&mut checks, addresses);
+        checks
+    }
+
+    /// Appends each new compatible address/socket tuple until the table is full.
+    fn fill_checks<const N: usize>(&self, checks: &mut Vec<PathCheck>, addresses: CandidateSet<N>) {
         for address in addresses.iter() {
             for (index, socket) in std::iter::once(&self.socket)
                 .chain(&self.extra_sockets)
                 .enumerate()
             {
-                if checks.len() < 32
-                    && socket
-                        .local_addr()
-                        .is_ok_and(|bound| bound.is_ipv4() == address.is_ipv4())
+                if checks.len() >= MAX_CHECKS {
+                    return;
+                }
+                if socket
+                    .local_addr()
+                    .is_ok_and(|bound| bound.is_ipv4() == address.is_ipv4())
+                    && !checks.iter().any(|check| check.tuple() == (address, index))
                 {
                     checks.push(PathCheck::new(address, index));
                 }
             }
         }
-        checks
+    }
+
+    /// Re-targets a same-session peer at `addresses` without losing proof state.
+    pub(super) fn refresh_checks(&self, peer: &mut Peer, addresses: PeerCandidates, now: Instant) {
+        let selected = peer
+            .selected
+            .and_then(|index| peer.checks.get(index))
+            .map(PathCheck::tuple);
+        // Advertisements add probe targets; they cannot revoke a validated NAT
+        // tuple. Keep matching checks intact, including their in-flight proofs.
+        peer.checks
+            .retain(|check| check.validated(now) || addresses.contains(check.address));
+        self.fill_checks(&mut peer.checks, addresses);
+        peer.selected = selected.and_then(|selected| {
+            peer.checks
+                .iter()
+                .position(|check| check.tuple() == selected)
+        });
+        peer.addresses = addresses;
     }
 
     pub(super) fn rotate_check(&self, peer: &mut Peer, now: Instant) {
@@ -87,17 +112,16 @@ impl Endpoint {
                 || peer
                     .checks
                     .iter()
-                    .any(|check| check.address == address && check.socket == socket)
+                    .any(|check| check.tuple() == (address, socket))
             {
                 continue;
             }
             let mut check = PathCheck::new(address, socket);
             check.next_probe = now;
-            if peer.checks.len() < 32 {
+            if peer.checks.len() < MAX_CHECKS {
                 peer.checks.push(check);
             } else if let Some(index) = peer.checks.iter().position(|old| {
-                old.direct.is_none_or(|cap| !cap.live(now))
-                    && old.confirmed.is_none_or(|cap| !cap.live(now))
+                !old.validated(now)
                     && old
                         .pending
                         .is_none_or(|pending| !pending.capability.live(now))
