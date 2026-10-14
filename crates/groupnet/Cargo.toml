@@ -9,7 +9,8 @@ repository.workspace = true
 
 [features]
 # Features come in two kinds, joined by weak `?/` edges so that every selected
-# binding carries every selected capability:
+# binding carries each selected capability it supports (bulk: mem, tcp;
+# connectivity: tcp, udp; runtime: every binding):
 #
 # * bindings choose transport crates: `mem`, `tcp`, `udp`, `ipc`;
 # * capabilities choose planes: `runtime` (managed nodes: routing, messages,
@@ -68,8 +69,8 @@ consistency-hosted = ["consistency", "groupnet-consistency/hosted"]
 # covering snapshot from a donor over the data plane instead of waiting for a
 # ring it has already overrun.
 consistency-handoff = ["consistency-hosted", "bulk", "groupnet-consistency/handoff"]
-# Resumable source-backed replay and native-position read floors. Snapshot and
-# event-complete subscriptions are separate later capabilities.
+# Resumable source-backed replay and native-position read floors, including the
+# adapter-selected snapshot and event-complete subscription modes.
 consistency-replication = ["consistency", "groupnet-consistency/replication"]
 consistency-volatile-recovery = ["consistency", "groupnet-consistency/volatile-recovery"]
 consistency-volatile-bootstrap-bulk = [

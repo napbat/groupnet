@@ -32,9 +32,10 @@
 //! nodes with routing, messages, ordered/unordered sessions and link
 //! registration; it always includes the stream and tunnel machinery), `bulk`
 //! (data-plane streams) and `connectivity` (native traversal under TCP/UDP
-//! links). Every selected binding carries every selected capability: `tcp` with
-//! `bulk` provides `TcpBulkTransport`, `mem` with `bulk` provides `MemBulkNet`,
-//! and any binding with `runtime` provides its managed link.
+//! links). Every selected binding carries each selected capability it supports:
+//! `bulk` is provided by `mem` and `tcp`, `connectivity` by `tcp` and `udp`, and
+//! `runtime` by every binding (its managed link). So `tcp` with `bulk` provides
+//! `TcpBulkTransport` and `mem` with `bulk` provides `MemBulkNet`.
 //!
 //! | Feature | Adds | Implies |
 //! |---------|------|---------|

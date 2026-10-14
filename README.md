@@ -67,15 +67,19 @@ touch, so a driver cannot accidentally make it non-deterministic.
   with no lock on the hot path — the shard-per-core model.
 * **Best-effort, message-oriented transport.** Gossip tolerates loss, reorder,
   and duplication, which is what makes UDP / IPC / shared-memory bindable.
-* **Thin.** The core and the transport trait have **zero** dependencies; only
-  the async runtime layer pulls in `tokio` (a narrow feature slice).
+* **Thin.** The core has **zero** dependencies and the transport traits need
+  only `bytes` and the core; only the async runtime layer pulls in `tokio` (a
+  narrow feature slice).
 
 ## Workspace layout
 
 Groupnet separates two traffic classes — a **control plane** (small best-effort
-datagrams: gossip, membership, coordinator, routing) and an opt-in **data plane**
+datagrams: gossip, membership, coordinator, routing) and a **data plane**
 (reliable byte streams: replication, bulk state transfer). They have opposite
 requirements, so they're separate traits bound to separate physical connections.
+The data-plane crates are opt-in for transport-only builds; a managed `runtime`
+node always compiles its stream and tunnel machinery, and opens data-plane
+streams only when the application asks for them.
 
 | Crate | Plane | Deps | Role |
 |-------|-------|------|------|
@@ -134,8 +138,8 @@ of the crate that owns it — `groupnet::core::NodeId`,
 `groupnet::streams::UnorderedDelivery`, and `groupnet::transport::Bytes` for
 payloads — never the underlying crate name.
 
-Features come in two kinds, joined so that every selected binding carries every
-selected capability. **Bindings** choose transport crates: `mem` (default), `tcp`,
+Features come in two kinds, joined so that every selected binding carries each
+selected capability it supports. **Bindings** choose transport crates: `mem` (default), `tcp`,
 `udp`, `ipc`. **Capabilities** choose planes: `runtime` (default; managed nodes,
 routing, sessions and link registration), `bulk` (data-plane streams) and
 `connectivity` (native traversal under TCP/UDP links). So `tcp` alone is the TCP

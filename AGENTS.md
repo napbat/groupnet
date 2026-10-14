@@ -201,7 +201,7 @@ These hold in every published crate; a change that breaks one is a defect.
 - **Facade** (`groupnet`): one module per crate and nothing re-exported twice at
   the root. Features are bindings (`mem`, `tcp`, `udp`, `ipc`) and capabilities
   (`runtime`, `bulk`, `connectivity`) joined by weak `?/` edges, so every
-  selected binding carries every selected plane; layered features (`rpc`,
+  selected binding carries each selected plane it supports; layered features (`rpc`,
   `consistency-*`) imply only the capabilities they need. Documentation names
   each type through its owning crate's module and payloads as
   `groupnet::transport::Bytes`. Every README Rust snippet is complete, visible
