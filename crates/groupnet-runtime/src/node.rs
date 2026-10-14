@@ -2,14 +2,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use groupnet_core::{
-    Activation, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, RecoveredGrant,
-};
+use groupnet_core::{Config, GroupEngine, GroupId, GroupMode, NodeId};
 use groupnet_network::{Network, Router};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 
-use crate::anchor::{Anchor, AnchorTask, anchor_task};
+use crate::anchor::{AnchorTask, anchor_task};
 use crate::driver::{
     EVENTS_CAPACITY, Event, GroupTask, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers,
     group_task, statuses_snapshot,
@@ -22,8 +20,11 @@ use tokio::sync::broadcast;
 mod builder;
 mod discovery;
 mod messaging;
+mod profile;
 mod protocols;
 pub use builder::NodeBuilder;
+pub use profile::GroupProfile;
+use profile::Posture;
 pub use protocols::{
     Endpoint, ManagedProtocol, Messages, Ordered, Peer, PeerImplementation, ReceiveBinding,
     Unordered,
@@ -33,261 +34,14 @@ pub use protocols::{
 /// table. Its metadata holds `owner:<resource>` and `coord:<group>` entries.
 pub(crate) const ROUTING_GROUP: &str = "__groupnet_routing__";
 
-/// The consistency posture one group is joined under — what
-/// [`Node::join_group_with`] takes.
-///
-/// The posture is **per group, not per node**: a node freely mixes hosted
-/// shard groups with eventual fabric groups, and opting one group in cannot
-/// make another run an election. Everything else about the group (gossip
-/// cadence and fanout, detector timings) still comes from the node's builder
-/// config — a profile only decides the mode.
-///
-/// ```no_run
-/// use groupnet_core::{Activation, HostedConfig};
-/// use groupnet_runtime::GroupProfile;
-///
-/// # fn demo(node: &groupnet_runtime::Node) {
-/// let shard = node.join_group_with(
-///     "shard-7",
-///     GroupProfile::hosted(HostedConfig {
-///         activation: Activation::Settle {
-///             claim_settle_ms: 600,
-///         },
-///         lease_ms: 2_000,
-///     }),
-/// );
-/// # let _ = shard;
-/// # }
-/// ```
-///
-/// A `Quorum` group additionally carries the **voter storage** the driver
-/// honours [`Effect::PersistGrant`](groupnet_core::Effect::PersistGrant)
-/// through — see [`with_voter_storage`](Self::with_voter_storage) — and an
-/// `External` group the **anchor** it allocates epochs at, see
-/// [`with_anchor`](Self::with_anchor). Neither is part of a profile's identity
-/// (two profiles differing only in which file their store writes to, or which
-/// bucket their anchor lives in, describe the same group), which is why this
-/// type carries no `PartialEq`.
-#[derive(Clone)]
-pub struct GroupProfile {
-    mode: GroupMode,
-    /// Voter durability, `None` for the blackout posture.
-    storage: Option<VoterStorage>,
-    /// The external CAS register, `None` for the never-claims posture.
-    anchor: Option<Arc<dyn Anchor>>,
-}
-
-impl std::fmt::Debug for GroupProfile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Neither the store nor the anchor carries a `Debug` bound —
-        // deliberately, so an implementation is free to hold a client handle
-        // and nothing else.
-        f.debug_struct("GroupProfile")
-            .field("mode", &self.mode)
-            .field("storage", &self.storage)
-            .field("anchor", &self.anchor.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl GroupProfile {
-    /// Metadata and membership only, converging eventually — no election, no
-    /// host, and no election frames on the wire. What every group was before
-    /// Hosted mode existed, and what [`Node::join_group`] uses unless the
-    /// node's [`Config::mode`] says otherwise.
-    #[must_use]
-    pub const fn eventual() -> Self {
-        Self {
-            mode: GroupMode::Eventual,
-            storage: None,
-            anchor: None,
-        }
-    }
-
-    /// The group elects one epoch-fenced host per `config`, surfaced through
-    /// [`Group::leadership`](crate::Group::leadership) and
-    /// [`GroupEvent::LeadershipChanged`](crate::GroupEvent::LeadershipChanged).
-    ///
-    /// Size `config`'s durations against the node's detector timings — the
-    /// sizing rules (and the fact that both must be far larger than the
-    /// driver's tick period) are on [`HostedConfig`].
-    #[must_use]
-    pub const fn hosted(config: HostedConfig) -> Self {
-        Self {
-            mode: GroupMode::Hosted(config),
-            storage: None,
-            anchor: None,
-        }
-    }
-
-    /// Gives this group's **voter ledger** durability: what storage says was
-    /// granted before this process started, and where to write what it grants
-    /// next.
-    ///
-    /// Only a [`Quorum`](groupnet_core::Activation::Quorum) group has a ledger,
-    /// and only a node named in its roster ever writes to one. Setting this on
-    /// any other profile is legal and inert — the store is simply never called,
-    /// and `recovered` is ignored rather than half-applied (which is what makes
-    /// it safe to configure uniformly across a fleet whose groups differ).
-    ///
-    /// # What it buys, and what it does not
-    ///
-    /// Without it, a Quorum voter falls back on the engine's **boot blackout**:
-    /// it refuses every new claimant for one `lease_ms` after start, on the
-    /// argument that any grant it made before the crash has expired by then.
-    /// That is a timing rule standing in for a durability one. With it, the
-    /// granted pair is a floor that survives the restart outright — this voter
-    /// can never grant that epoch to a second claimant however long it was
-    /// down — and the claimant named in it may be re-granted **immediately**,
-    /// so a restarted voter stops starving the sitting host for a lease.
-    ///
-    /// What it does not buy is a shorter blackout for anyone *else*: recovery
-    /// restores the pair, never the instant it was granted at, so a recovered
-    /// voter still applies the boot-anchored window to every new claimant. See
-    /// [`RecoveredGrant`] for that argument in full, and in particular for why
-    /// [`RecoveredGrant::none`] is the one statement that lifts the blackout —
-    /// and may only be made by a driver that really did persist every grant.
-    ///
-    /// # Load recovery *before* joining
-    ///
-    /// `recovered` is a value, not a callback, because the join path is
-    /// synchronous and spawns the group actor under the node's group-table
-    /// lock: it can await nothing and must touch no disk. Read the store, then
-    /// join.
-    ///
-    /// ```no_run
-    /// # use std::sync::Arc;
-    /// # use groupnet_core::{Activation, HostedConfig, RecoveredGrant, VoterRoster};
-    /// # use groupnet_runtime::{GrantStore, GroupProfile};
-    /// # fn demo(
-    /// #     node: &groupnet_runtime::Node,
-    /// #     store: Arc<dyn GrantStore>,
-    /// #     recovered: RecoveredGrant,
-    /// #     voters: VoterRoster,
-    /// # ) {
-    /// // `recovered` was read off `store` before this call — no I/O happens
-    /// // inside the join.
-    /// let shard = node.join_group_with(
-    ///     "shard-7",
-    ///     GroupProfile::hosted(HostedConfig {
-    ///         activation: Activation::Quorum { voters },
-    ///         lease_ms: 2_000,
-    ///     })
-    ///     .with_voter_storage(recovered, store),
-    /// );
-    /// # let _ = shard;
-    /// # }
-    /// ```
-    #[must_use]
-    pub fn with_voter_storage(
-        mut self,
-        recovered: RecoveredGrant,
-        store: Arc<dyn GrantStore>,
-    ) -> Self {
-        self.storage = Some(VoterStorage { recovered, store });
-        self
-    }
-
-    /// Gives this group the **external CAS anchor** its epochs are allocated
-    /// at: the linearizable register a claimant must win a conditional write on
-    /// to become host.
-    ///
-    /// Only an [`External`](groupnet_core::Activation::External) group has an
-    /// anchor. Setting this on any other profile is legal and inert — the
-    /// anchor is simply never called, not even once — which is what makes it
-    /// safe to configure **uniformly across a fleet** whose groups differ, in
-    /// exactly the way [`with_voter_storage`](Self::with_voter_storage) is.
-    /// (The reserved routing group is pinned `Eventual`, so an anchor set on it
-    /// is inert for the same reason.)
-    ///
-    /// # No anchor, no host
-    ///
-    /// An `External` group configured **without** one is a supported,
-    /// deliberately fail-safe posture, not a misconfiguration the runtime
-    /// rescues: the engine's [`AnchorClaimDue`] prompts are dropped, this node
-    /// never claims, and the group stays at `(0, None)` unless it *adopts* a
-    /// pair some other node's driver won and beaconed. So a read-only member of
-    /// an `External` group — one that must never host, but must follow whoever
-    /// does — is configured by leaving the anchor off, and it costs nothing on
-    /// the wire.
-    ///
-    /// # One anchor, one object, one group
-    ///
-    /// A process hosting several `External` groups gives each its own [`Anchor`]
-    /// over its own object: the trait names no group, because the profile a
-    /// group is joined under is what pairs them. Two groups sharing one object
-    /// would share one epoch sequence and fight, and no rule in the tier can
-    /// detect it.
-    ///
-    /// ```no_run
-    /// # use std::sync::Arc;
-    /// # use groupnet_core::{Activation, HostedConfig};
-    /// # use groupnet_runtime::{Anchor, GroupProfile};
-    /// # fn demo(
-    /// #     node: &groupnet_runtime::Node,
-    /// #     anchor: Arc<dyn Anchor>,
-    /// # ) {
-    /// let shard = node.join_group_with(
-    ///     "shard-7",
-    ///     GroupProfile::hosted(HostedConfig {
-    ///         activation: Activation::External {
-    ///             steal_margin_ms: 500,
-    ///         },
-    ///         lease_ms: 2_000,
-    ///     })
-    ///     .with_anchor(anchor),
-    /// );
-    /// # let _ = shard;
-    /// # }
-    /// ```
-    ///
-    /// [`AnchorClaimDue`]: groupnet_core::Effect::AnchorClaimDue
-    #[must_use]
-    pub fn with_anchor(mut self, anchor: Arc<dyn Anchor>) -> Self {
-        self.anchor = Some(anchor);
-        self
-    }
-
-    /// The profile a bare [`Node::join_group`] joins under: whatever the
-    /// node's own [`Config::mode`] says.
-    const fn from_mode(mode: GroupMode) -> Self {
-        Self {
-            mode,
-            storage: None,
-            anchor: None,
-        }
-    }
-}
-
-/// The anchor wiring a group actually runs, or `None` for every group that
-/// claims nothing.
-///
-/// Both halves must line up: an anchor configured on a group whose activation
-/// is not `External` is inert (the uniform-fleet posture
-/// [`GroupProfile::with_anchor`] documents), and an `External` group with no
-/// anchor never claims (the fail-safe posture). `config` is the group's
-/// **effective** config, so the routing group — force-pinned `Eventual` —
-/// lands here as `None` whatever profile it was joined under.
-fn external_anchor(
-    config: &Config,
-    anchor: Option<Arc<dyn Anchor>>,
-) -> Option<(Arc<dyn Anchor>, u64, u64)> {
-    let anchor = anchor?;
-    let GroupMode::Hosted(hosted) = &config.mode else {
-        return None;
-    };
-    let Activation::External { steal_margin_ms } = &hosted.activation else {
-        return None;
-    };
-    Some((anchor, hosted.lease_ms, *steal_margin_ms))
-}
-
 struct Inner {
     id: NodeId,
     transport: Arc<Router>,
     seeds: Vec<NodeId>,
     config: Config,
     messaging: crate::messaging::Hub,
+    /// Node-wide ordered-stream policy, validated at start and fixed for the node's life.
+    ordered_config: groupnet_streams::ValidOrderedConfig,
     ordered: Mutex<Option<groupnet_streams::OrderedProtocol>>,
     /// Node-wide unordered policy, validated at start and fixed for the node's life.
     unordered_config: groupnet_streams::UnorderedConfig,
@@ -351,9 +105,11 @@ impl Node {
     /// # Panics
     /// If the internal group table was poisoned by a panic in another thread.
     pub fn join_group(&self, group: impl Into<GroupId>) -> Group {
-        self.join_group_with(
-            group,
-            GroupProfile::from_mode(self.inner.config.mode.clone()),
+        let routing = self.inner.routing.get().map(Group::command_sender);
+        self.get_or_spawn(
+            group.into(),
+            routing,
+            Posture::from_mode(self.inner.config.mode.clone()),
         )
     }
 
@@ -391,7 +147,7 @@ impl Node {
         // outside the lock: the routing group is joined once, during
         // `NodeBuilder::start`, before any `Node` handle exists to race with.
         let routing = self.inner.routing.get().map(Group::command_sender);
-        self.get_or_spawn(group.into(), routing, profile)
+        self.get_or_spawn(group.into(), routing, profile.into())
     }
 
     /// Returns the handle for `group`, spawning its actor if this node has not
@@ -411,13 +167,13 @@ impl Node {
         &self,
         group: GroupId,
         routing: Option<mpsc::Sender<Event>>,
-        profile: GroupProfile,
+        posture: Posture,
     ) -> Group {
         let mut routes = self.inner.routes.lock().expect("routes mutex poisoned");
         if let Some(existing) = routes.get(&group) {
             return existing.clone();
         }
-        let handle = self.spawn_group(group.clone(), routing, profile);
+        let handle = self.spawn_group(group.clone(), routing, posture);
         routes.insert(group, handle.clone());
         handle
     }
@@ -493,7 +249,7 @@ impl Node {
     ///
     /// `routing` is the routing group's command channel (so this group can
     /// publish its coordinator), or `None` for the routing group itself.
-    /// `profile` decides this group's mode, **its voter storage and its
+    /// `posture` decides this group's mode, **its voter storage and its
     /// anchor**; every other tunable comes from the node's config.
     ///
     /// An `External` group carrying an anchor gets a **second** task beside the
@@ -502,14 +258,13 @@ impl Node {
     /// one.
     ///
     /// The voter ledger is *recovered*, never *read*, here: the caller loaded
-    /// it before joining (see
-    /// [`GroupProfile::with_voter_storage`]), so this stays a pure,
+    /// it before joining (see [`GroupProfile::Quorum`]), so this stays a pure,
     /// non-awaiting function that the routes lock may safely be held across.
     fn spawn_group(
         &self,
         group: GroupId,
         routing: Option<mpsc::Sender<Event>>,
-        profile: GroupProfile,
+        posture: Posture,
     ) -> Group {
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
 
@@ -521,15 +276,18 @@ impl Node {
         // electing a host for it would put an epoch-fenced authority in front
         // of the table every other group publishes into, for no gain. No
         // profile (and no node-wide `Config::mode`) can opt it in.
-        let mut config = self.inner.config.clone();
-        config.mode = if group.as_str() == ROUTING_GROUP {
-            GroupMode::Eventual
+        // Pinning it also drops whatever voter storage or anchor the profile
+        // carried: an Eventual group has neither a ledger nor an anchor.
+        let posture = if group.as_str() == ROUTING_GROUP {
+            Posture::from_mode(GroupMode::Eventual)
         } else {
-            profile.mode
+            posture
         };
+        let mut config = self.inner.config.clone();
+        config.mode = posture.mode;
 
         let reachable = self.inner.transport.reachable().borrow().clone();
-        let (mut engine, store) = self.build_engine(&group, &config, profile.storage);
+        let (mut engine, store) = self.build_engine(&group, &config, posture.storage);
         // Discovery contacts receive bounded periodic digest attempts but are
         // not members until an actual participant exchanges group protocol.
         engine.apply(groupnet_core::Command::SetBootstrapContacts(
@@ -561,21 +319,20 @@ impl Node {
         // than the anti-entropy interval is stopped from stacking claims. The
         // task holds a *weak* command sender, so it can never keep a dead
         // group's actor (and its gossip, and its anchor renewals) alive.
-        let anchor_prompts =
-            external_anchor(&config, profile.anchor).map(|(anchor, lease_ms, steal_margin_ms)| {
-                let (prompt_tx, prompt_rx) = mpsc::channel(1);
-                tokio::spawn(anchor_task(AnchorTask {
-                    anchor,
-                    local: self.inner.id.clone(),
-                    commands: tx.downgrade(),
-                    prompts: prompt_rx,
-                    leadership: lead_rx.clone(),
-                    lease_ms,
-                    steal_margin_ms,
-                    start: self.inner.start,
-                }));
-                prompt_tx
-            });
+        let anchor_prompts = posture.anchor.map(|(anchor, lease_ms, steal_margin_ms)| {
+            let (prompt_tx, prompt_rx) = mpsc::channel(1);
+            tokio::spawn(anchor_task(AnchorTask {
+                anchor,
+                local: self.inner.id.clone(),
+                commands: tx.downgrade(),
+                prompts: prompt_rx,
+                leadership: lead_rx.clone(),
+                lease_ms,
+                steal_margin_ms,
+                start: self.inner.start,
+            }));
+            prompt_tx
+        });
 
         let tick_period = group_tick_period(&config);
         tokio::spawn(group_task(GroupTask {

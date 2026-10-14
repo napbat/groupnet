@@ -2,6 +2,7 @@
 #![cfg(feature = "volatile-recovery")]
 
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, ByteAdmission,
@@ -18,12 +19,20 @@ use groupnet_consistency::volatile_recovery::bootstrap::{
 };
 use groupnet_core::Status;
 use groupnet_core::volatile_bootstrap::{claim_entry_key, presence_entry_key};
+use groupnet_runtime::{EntryMutationLimits, EntryWrite};
 use groupnet_testkit::cluster::{MemCluster, eventually};
 
 const VALUE_BYTES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
 fn nz(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("nonzero")
+}
+
+fn limits_of(key: usize, value: usize) -> EntryMutationLimits {
+    EntryMutationLimits {
+        max_key_bytes: nz(key),
+        max_value_bytes: nz(value),
+    }
 }
 
 fn policy() -> BootstrapConfig {
@@ -201,7 +210,10 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
     for _ in 0..24 {
         let queued = budget.reserve(AdmissionClass::Inflight, 32).unwrap();
         cluster.groups[0]
-            .set_entry_confirmed("hot", b"x".to_vec(), None, 32, 32, queued)
+            .set_entry_confirmed(
+                EntryWrite::new("hot", b"x").with_limits(limits_of(32, 32)),
+                queued,
+            )
             .await
             .unwrap();
     }
@@ -260,7 +272,10 @@ async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_a
             for _ in 0..2 {
                 let queued = budget.reserve(AdmissionClass::Inflight, 32).unwrap();
                 group
-                    .set_entry_confirmed("hot", b"x".to_vec(), None, 32, 32, queued)
+                    .set_entry_confirmed(
+                        EntryWrite::new("hot", b"x").with_limits(limits_of(32, 32)),
+                        queued,
+                    )
                     .await
                     .unwrap();
             }
@@ -377,11 +392,9 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
     let queued = budget.reserve(AdmissionClass::Inflight, 128).unwrap();
     cluster.groups[0]
         .set_entry_confirmed(
-            &presence_key,
-            b"malformed",
-            Some(policy().claim_ttl_ms),
-            128,
-            256,
+            EntryWrite::new(&presence_key, b"malformed")
+                .with_ttl(Duration::from_millis(policy().claim_ttl_ms))
+                .with_limits(limits_of(128, 256)),
             queued,
         )
         .await
@@ -439,7 +452,7 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
             .node_entry(&cluster.ids[0], &key)
             .is_some()
             && cluster.groups[1]
-                .statuses_held_bounded(2, 16)
+                .statuses_held_bounded(nz(2), nz(16))
                 .is_ok_and(|members| {
                     members.len() == 2
                         && members
@@ -472,7 +485,12 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
 
     let queued = budget.reserve(AdmissionClass::Inflight, 128).unwrap();
     cluster.groups[1]
-        .set_entry_confirmed(&key, b"malformed", Some(3_000), 128, 256, queued)
+        .set_entry_confirmed(
+            EntryWrite::new(&key, b"malformed")
+                .with_ttl(Duration::from_secs(3))
+                .with_limits(limits_of(128, 256)),
+            queued,
+        )
         .await
         .unwrap();
     eventually("malformed peer claim propagates", || {
@@ -535,7 +553,10 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
     let key = claim_entry_key(&scope(), 128).unwrap();
     let queued = budget.reserve(AdmissionClass::Inflight, 128).unwrap();
     cluster.groups[0]
-        .set_entry_confirmed(&key, b"present-without-ttl", None, 128, 256, queued)
+        .set_entry_confirmed(
+            EntryWrite::new(&key, b"present-without-ttl").with_limits(limits_of(128, 256)),
+            queued,
+        )
         .await
         .unwrap();
     assert!(new.observe_claims(op, limits(), &budget).await.is_err());

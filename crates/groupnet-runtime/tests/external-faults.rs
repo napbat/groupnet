@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_core::anchor::AnchorRecord;
-use groupnet_core::{Activation, HostedConfig, NodeId, Role, placement};
+use groupnet_core::{NodeId, Role, placement};
 use groupnet_runtime::{
     Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf, Group, GroupEvent, GroupProfile,
     Leadership, Node,
@@ -51,7 +51,7 @@ const SETTLE: Duration = Duration::from_secs(12);
 /// A brisk gossip cadence, so anchor rounds and renewals happen in wall-clock
 /// milliseconds. It also sets the driver's tick period (half the tightest
 /// deadline, i.e. ~7ms here), which [`LEASE_MS`] is two orders of magnitude
-/// above — the sizing rule [`HostedConfig`] states.
+/// above — the sizing rule `HostedConfig` states.
 const GOSSIP_MS: u64 = 15;
 
 /// The record's TTL **and** the engine lease — one knob by design, because the
@@ -63,13 +63,12 @@ const LEASE_MS: u64 = 600;
 const STEAL_MARGIN_MS: u64 = 200;
 
 /// The `External` profile every fixture here runs, at `lease_ms`.
-fn external_profile(lease_ms: u64) -> GroupProfile {
-    GroupProfile::hosted(HostedConfig {
-        activation: Activation::External {
-            steal_margin_ms: STEAL_MARGIN_MS,
-        },
+fn external_profile(lease_ms: u64, anchor: Option<Arc<dyn Anchor>>) -> GroupProfile {
+    GroupProfile::External {
         lease_ms,
-    })
+        steal_margin_ms: STEAL_MARGIN_MS,
+        anchor,
+    }
 }
 
 /// Rendezvous ranking of `ids` for `group`, best first — the order row X1's
@@ -420,7 +419,7 @@ async fn an_unreachable_anchor_leaves_the_group_hostless_until_it_heals() {
 
     let net = Network::new();
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
-        external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
+        external_profile(LEASE_MS, Some(anchor.as_anchor()))
     })
     .await;
     let refs = fleet.refs();
@@ -499,7 +498,7 @@ async fn cutting_only_the_incumbents_anchor_lapses_its_lease_and_pins_the_group(
     let anchors: Vec<Arc<FakeAnchor>> = IDS.iter().map(|_| FakeAnchor::healthy(&object)).collect();
     let net = Network::new();
     let mut fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
-        external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
+        external_profile(LEASE_MS, Some(anchor.as_anchor()))
     })
     .await;
 
@@ -594,7 +593,7 @@ async fn unknown_writes_that_applied_are_resolved_by_read_back() {
         IDS.iter().map(|_| FakeAnchor::ambiguous(&object)).collect();
     let net = Network::new();
     let fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
-        external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
+        external_profile(LEASE_MS, Some(anchor.as_anchor()))
     })
     .await;
     let logs: Vec<LeadershipLog> = fleet.groups.iter().map(watch_leadership).collect();
@@ -689,7 +688,7 @@ async fn writes_that_fail_while_reads_work_lapse_the_lease_instead_of_extending_
     let anchors: Vec<Arc<FakeAnchor>> = IDS.iter().map(|_| FakeAnchor::healthy(&object)).collect();
     let net = Network::new();
     let mut fleet = spawn_fleet(&net, GROUP, &IDS, &anchors, |anchor| {
-        external_profile(LEASE_MS).with_anchor(anchor.as_anchor())
+        external_profile(LEASE_MS, Some(anchor.as_anchor()))
     })
     .await;
 

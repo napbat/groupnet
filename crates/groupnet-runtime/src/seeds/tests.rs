@@ -12,8 +12,8 @@ use groupnet_core::NodeId;
 use groupnet_transport::{Inbound, Transport};
 
 use super::{
-    MIN_INTERVAL, NamedSeeds, NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
-    resolve_named_seeds,
+    MAX_WAIT, MIN_INTERVAL, NamedSeeds, NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
+    resolve_named_seeds, schedule,
 };
 
 const RETRY: Duration = Duration::from_secs(1);
@@ -115,14 +115,23 @@ struct Harness {
 
 impl Harness {
     fn spawn(seeds: &[(&str, &str)], resolver: Scripted) -> Self {
+        Self::spawn_with(seeds, resolver, RETRY, REFRESH)
+    }
+
+    fn spawn_with(
+        seeds: &[(&str, &str)],
+        resolver: Scripted,
+        retry: Duration,
+        refresh: Duration,
+    ) -> Self {
         let transport = Arc::new(Recording::default());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         let mut config = NamedSeeds::new(resolver.clone())
-            .retry_interval(RETRY)
-            .startup_attempts(ATTEMPTS)
-            .refresh_interval(REFRESH)
-            .on_event(move |event| {
+            .with_retry_interval(retry)
+            .with_startup_attempts(ATTEMPTS)
+            .with_refresh_interval(refresh)
+            .with_observer(move |event| {
                 let seen = match event {
                     SeedEvent::Resolved {
                         node,
@@ -137,7 +146,7 @@ impl Harness {
                 sink.lock().expect("seen lock").push(seen);
             });
         for (node, name) in seeds {
-            config = config.seed(NodeId::new(*node), *name);
+            config = config.with_seed(NodeId::new(*node), *name);
         }
         let task = tokio::spawn(resolve_named_seeds(
             Arc::downgrade(&transport),
@@ -323,20 +332,66 @@ async fn the_task_ends_with_its_transport() {
     assert!(task.is_finished());
 }
 
+#[tokio::test(start_paused = true)]
+async fn unrepresentable_intervals_saturate_instead_of_panicking_the_resolver() {
+    let resolver = Scripted::default();
+    resolver.set("b.svc:7000", "10.0.0.2:7000");
+    let h = Harness::spawn_with(
+        &[("b", "b.svc:7000"), ("c", "c.svc:7000")],
+        resolver,
+        Duration::MAX,
+        Duration::MAX,
+    );
+    advance(Duration::ZERO).await;
+    assert_eq!(
+        h.transport.taught(),
+        vec![(NodeId::new("b"), "10.0.0.2:7000".to_owned())],
+        "the first attempt runs at once"
+    );
+    advance(Duration::from_hours(24 * 365)).await;
+    assert!(!h.task.is_finished(), "the resolver task panicked or ended");
+    assert_eq!(
+        h.resolver.lookups("b.svc:7000"),
+        1,
+        "a saturated refresh fired"
+    );
+    assert_eq!(
+        h.resolver.lookups("c.svc:7000"),
+        1,
+        "a saturated retry fired"
+    );
+}
+
+#[test]
+fn schedule_saturates_at_the_far_future() {
+    let now = tokio::time::Instant::now();
+    assert_eq!(schedule(now, RETRY), now + RETRY);
+    assert_eq!(schedule(now, Duration::MAX), now + MAX_WAIT);
+    assert_eq!(schedule(now, MAX_WAIT), now + MAX_WAIT);
+}
+
 #[test]
 fn validate_rejects_intervals_below_the_minimum_by_field_without_flooring() {
     let seeds = || NamedSeeds::new(Scripted::default());
     assert_eq!(seeds().validate(), Ok(()));
     assert_eq!(
         seeds()
-            .retry_interval(MIN_INTERVAL)
-            .refresh_interval(MIN_INTERVAL)
+            .with_retry_interval(MIN_INTERVAL)
+            .with_refresh_interval(MIN_INTERVAL)
             .validate(),
         Ok(()),
         "the minimum itself is accepted"
     );
     assert_eq!(
-        seeds().retry_interval(Duration::ZERO).validate(),
+        seeds()
+            .with_retry_interval(Duration::MAX)
+            .with_refresh_interval(Duration::MAX)
+            .validate(),
+        Ok(()),
+        "an unrepresentable interval is accepted and saturates when scheduled"
+    );
+    assert_eq!(
+        seeds().with_retry_interval(Duration::ZERO).validate(),
         Err(NamedSeedsError::RetryIntervalTooShort {
             interval: Duration::ZERO,
             min: MIN_INTERVAL,
@@ -344,7 +399,7 @@ fn validate_rejects_intervals_below_the_minimum_by_field_without_flooring() {
     );
     let short = Duration::from_micros(999);
     assert_eq!(
-        seeds().refresh_interval(short).validate(),
+        seeds().with_refresh_interval(short).validate(),
         Err(NamedSeedsError::RefreshIntervalTooShort {
             interval: short,
             min: MIN_INTERVAL,
@@ -352,7 +407,7 @@ fn validate_rejects_intervals_below_the_minimum_by_field_without_flooring() {
     );
     let error = io::Error::from(
         seeds()
-            .retry_interval(Duration::ZERO)
+            .with_retry_interval(Duration::ZERO)
             .validate()
             .unwrap_err(),
     );

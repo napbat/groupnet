@@ -69,12 +69,12 @@ async fn a_seed_whose_name_moves_is_rejoined_without_its_help() {
     let a = Node::builder(a_id.clone())
         .link(BoundLink::new(a_udp, LinkConfig::new(vec![b_id.clone()])))
         .routing(routing.clone())
-        .gossip_interval_ms(GOSSIP_MS)
+        .gossip_interval(Duration::from_millis(GOSSIP_MS))
         .named_seeds(
             NamedSeeds::new(Moving(Arc::clone(&answer)))
-                .seed(b_id.clone(), SEED_NAME)
-                .refresh_interval(REFRESH)
-                .on_event(move |event| {
+                .with_seed(b_id.clone(), SEED_NAME)
+                .with_refresh_interval(REFRESH)
+                .with_observer(move |event| {
                     if let SeedEvent::Resolved { addr, previous, .. } = event {
                         sink.lock().expect("moves lock").push((*addr, *previous));
                     }
@@ -86,7 +86,7 @@ async fn a_seed_whose_name_moves_is_rejoined_without_its_help() {
     let b = Node::builder(b_id)
         .link(BoundLink::new(b_udp, LinkConfig::new(vec![a_id])))
         .routing(routing)
-        .gossip_interval_ms(GOSSIP_MS)
+        .gossip_interval(Duration::from_millis(GOSSIP_MS))
         .start()
         .await
         .expect("b UDP link binds");
@@ -155,7 +155,7 @@ async fn pending_lookup_stops(explicit_close: bool) {
     let peer = NodeId::new("pending-peer");
     let node = Node::builder(local.clone())
         .link(MemLink::new(net.endpoint(local), vec![peer.clone()]))
-        .named_seeds(NamedSeeds::new(resolver).seed(peer, SEED_NAME))
+        .named_seeds(NamedSeeds::new(resolver).with_seed(peer, SEED_NAME))
         .start()
         .await
         .expect("memory link binds");
@@ -218,8 +218,8 @@ async fn start_rejects_a_too_short_seed_interval_by_field_before_binding() {
                 started: Arc::clone(&started),
                 cancelled: Arc::new(AtomicUsize::new(0)),
             })
-            .seed(peer, SEED_NAME)
-            .retry_interval(Duration::ZERO),
+            .with_seed(peer, SEED_NAME)
+            .with_retry_interval(Duration::ZERO),
         )
         .start()
         .await

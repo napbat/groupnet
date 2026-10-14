@@ -47,6 +47,31 @@
 //! # }
 //! ```
 //!
+//! Ordered streams are scoped by an application [`StreamProtocolId`]: each id
+//! has its own accept queue on every node, named in the stream's authenticated
+//! setup, so independent consumers run independent accept loops and never
+//! receive each other's streams. [`Ordered::protocol`] selects an id, and a
+//! protocol-scoped [`Endpoint<Ordered>`](Endpoint) is itself a
+//! [`BulkTransport`](groupnet_transport::bulk::BulkTransport), so an RPC
+//! server or any other bulk consumer runs over its own protocol:
+//!
+//! ```no_run
+//! use groupnet_runtime::{Node, Ordered, StreamProtocolId};
+//! use groupnet_transport::bulk::DataPlane;
+//!
+//! const RPC: StreamProtocolId = StreamProtocolId::new(1);
+//! const BLOBS: StreamProtocolId = StreamProtocolId::new(2);
+//!
+//! # async fn demo(node: Node) -> std::io::Result<()> {
+//! let rpc = DataPlane::new(node.endpoint(Ordered::protocol(RPC))?);
+//! let blobs = DataPlane::new(node.endpoint(Ordered::protocol(BLOBS))?);
+//! // Each accept loop sees only its own protocol's streams.
+//! let ((_, rpc_stream), (_, blob_stream)) = tokio::try_join!(rpc.accept(), blobs.accept())?;
+//! # let _ = (rpc_stream, blob_stream);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Coordination protocol logic lives entirely in the sans-IO [`groupnet-core`];
 //! [`groupnet-messaging`] owns opaque application frames and their delivery
 //! receipts. This crate drives both through the managed network. Swap the
@@ -68,6 +93,7 @@
 
 mod anchor;
 mod capability;
+mod clock;
 mod driver;
 mod group;
 pub mod messaging;
@@ -81,14 +107,16 @@ pub use anchor::{Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf};
 pub use driver::GroupEvent;
 pub use group::{
     BoundedRosterError, CommandRejected, EntryBudget, EntryInspectionError, EntryInspectionLimits,
-    EntryMutationError, EntryMutationLimits, EntryRevision, Group, InspectedEntries,
-    InspectedEntry, InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
+    EntryInspectionLimitsError, EntryMutationError, EntryMutationLimits, EntryMutationLimitsError,
+    EntryRemoval, EntryRevision, EntryWrite, Group, InspectedEntries, InspectedEntry,
+    InspectedPair, InspectedPairEntry, Leadership, SyncCtx,
 };
 pub use groupnet_network::tunnel::{PeerIdentity, TlsIdentity, TunnelTransport, TunneledStream};
 pub use groupnet_network::{LinkProvider, Router, RouterConfig, TunnelConfig};
 pub use groupnet_streams::{
-    OrderedProtocol, SessionProtocol, UnorderedConfig, UnorderedConfigError, UnorderedDelivery,
-    UnorderedOptions, UnorderedProtocol, UnorderedSession,
+    OrderedConfig, OrderedConfigError, OrderedProtocol, SessionProtocol, StreamProtocolId,
+    UnorderedConfig, UnorderedConfigError, UnorderedDelivery, UnorderedOptions, UnorderedProtocol,
+    UnorderedSession, ValidOrderedConfig,
 };
 pub use node::{
     Endpoint, GroupProfile, ManagedProtocol, Messages, Node, NodeBuilder, Ordered, Peer,
@@ -101,4 +129,4 @@ pub use seeds::{
     DEFAULT_REFRESH_INTERVAL, DEFAULT_RETRY_INTERVAL, DEFAULT_STARTUP_ATTEMPTS, NamedSeeds,
     NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
 };
-pub use store::{FileGrantStore, GrantStore};
+pub use store::{FileGrantStore, GrantStore, VoterStorage};

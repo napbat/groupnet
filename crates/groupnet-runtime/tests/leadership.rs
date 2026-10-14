@@ -74,8 +74,11 @@ const fn hosted_config() -> HostedConfig {
     }
 }
 
-fn hosted() -> GroupProfile {
-    GroupProfile::hosted(hosted_config())
+const fn hosted() -> GroupProfile {
+    GroupProfile::Settle {
+        lease_ms: LEASE_MS,
+        claim_settle_ms: CLAIM_SETTLE_MS,
+    }
 }
 
 /// Every [`GroupEvent::LeadershipChanged`] one group handle has published, in
@@ -390,7 +393,7 @@ async fn a_repeat_join_keeps_the_first_profile() {
     let rejoined: Vec<Group> = cluster
         .nodes
         .iter()
-        .map(|node| node.join_group_with(GROUP, GroupProfile::eventual()))
+        .map(|node| node.join_group_with(GROUP, GroupProfile::Eventual))
         .collect();
     let plain = cluster.nodes[0].join_group(GROUP);
 
@@ -443,7 +446,7 @@ async fn a_repeat_join_keeps_the_first_profile() {
 /// Eventual — from two tasks released together, and hands back both handles.
 async fn race_join(node: &Node, group: &str) -> (Group, Group) {
     let gate = Arc::new(tokio::sync::Barrier::new(2));
-    let racers: Vec<_> = [hosted(), GroupProfile::eventual()]
+    let racers: Vec<_> = [hosted(), GroupProfile::Eventual]
         .into_iter()
         .map(|profile| {
             let (node, group, gate) = (node.clone(), group.to_owned(), gate.clone());

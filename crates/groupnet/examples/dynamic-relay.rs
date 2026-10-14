@@ -47,7 +47,7 @@ async fn main() -> io::Result<()> {
         nodes.push(
             Node::builder(id.clone())
                 .link(transport.clone().into_bound_link(1))
-                .gossip_interval_ms(50)
+                .gossip_interval(Duration::from_millis(50))
                 .start()
                 .await?,
         );

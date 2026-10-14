@@ -2,7 +2,10 @@
 
 use super::{ManagedProtocol, Node, PeerImplementation};
 use groupnet_messaging::{Delivery, Messaging, SendOptions};
-use groupnet_streams::{OrderedProtocol, UnorderedDelivery, UnorderedOptions, UnorderedProtocol};
+use groupnet_streams::{
+    OrderedProtocol, StreamProtocolId, UnorderedConfig, UnorderedDelivery, UnorderedOptions,
+    UnorderedProtocol,
+};
 use std::{io, time::Duration};
 
 /// Application messages with a delivery boundary fixed once at binding time.
@@ -55,15 +58,46 @@ impl PeerImplementation for Messages {
     }
 }
 
-/// Authenticated ordered TLS bytes on the node's existing tunnel plane.
+/// Authenticated ordered TLS bytes on the node's existing tunnel plane, for
+/// one application stream protocol.
+///
+/// Each [`StreamProtocolId`] has its own accept queue on every node, so
+/// independent consumers — an RPC server beside a blob service, say — each run
+/// their own accept loop and never receive each other's streams. The connector
+/// names the protocol in the stream's authenticated setup; a peer with no
+/// endpoint bound for it refuses the stream (`ConnectionRefused`).
+///
+/// ```no_run
+/// use groupnet_runtime::{Node, Ordered, StreamProtocolId};
+///
+/// const RPC: StreamProtocolId = StreamProtocolId::new(1);
+///
+/// # async fn demo(node: Node) -> std::io::Result<()> {
+/// // Accepts only streams connected with `Ordered::protocol(RPC)`.
+/// let rpc = node.endpoint(Ordered::protocol(RPC))?;
+/// let (origin, stream) = rpc.accept().await?;
+/// # let _ = (origin, stream);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Ordered;
+pub struct Ordered {
+    protocol: StreamProtocolId,
+}
 
 impl Ordered {
-    /// Selects ordered reliable byte-stream sessions.
+    /// Selects ordered reliable byte-stream sessions of the default
+    /// [`StreamProtocolId::DEFAULT`] protocol.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self::protocol(StreamProtocolId::DEFAULT)
+    }
+
+    /// Selects ordered reliable byte-stream sessions of `protocol`, with
+    /// their own accept queue on every node.
+    #[must_use]
+    pub const fn protocol(protocol: StreamProtocolId) -> Self {
+        Self { protocol }
     }
 }
 
@@ -72,7 +106,8 @@ impl PeerImplementation for Ordered {
     type Options = ();
 
     fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
-        Ok((ManagedProtocol::new(node.cached_ordered()?), ()))
+        let protocol = node.cached_ordered()?.scoped(self.protocol);
+        Ok((ManagedProtocol::new(protocol), ()))
     }
 }
 
@@ -113,8 +148,26 @@ impl PeerImplementation for Unordered {
     type Options = UnorderedOptions;
 
     fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
+        // Checked against the node-wide policy before the shared engine is
+        // created or cached, so an invalid descriptor starts nothing.
+        validate_unordered(&self.options, &node.inner.unordered_config)?;
         let protocol = node.cached_unordered()?;
-        protocol.validate_options(&self.options)?;
         Ok((ManagedProtocol::new(protocol), self.options))
     }
+}
+
+/// Descriptor options against the node's fixed unordered policy, without an
+/// engine: a positive setup deadline and a delivery policy the node allows.
+fn validate_unordered(options: &UnorderedOptions, policy: &UnorderedConfig) -> io::Result<()> {
+    let allowed = match options.delivery {
+        UnorderedDelivery::Reliable => policy.allow_reliable,
+        UnorderedDelivery::Unreliable => policy.allow_unreliable,
+    };
+    if options.timeout.is_zero() || !allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unordered policy or setup timeout disallowed locally",
+        ));
+    }
+    Ok(())
 }

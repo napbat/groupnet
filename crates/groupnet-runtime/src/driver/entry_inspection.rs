@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use groupnet_core::{GroupEngine, Time};
 
+use crate::clock::from_core_millis;
 use crate::group::{
     EntryInspectionError, EntryInspectionLimits, InspectedEntries, InspectedEntry, InspectedPair,
     InspectedPairEntry,
@@ -24,16 +25,16 @@ pub(super) fn inspect_scoped_entry(
         count = count
             .checked_add(1)
             .ok_or(EntryInspectionError::TooManyMembers)?;
-        if count > limits.max_members {
+        if count > limits.max_members.get() {
             return Err(EntryInspectionError::TooManyMembers);
         }
         let node_bytes = node.as_str().len();
-        if node_bytes > limits.max_member_bytes {
+        if node_bytes > limits.max_member_bytes.get() {
             return Err(EntryInspectionError::IdentityTooLong);
         }
         let value = visible_value(engine, node, key, now);
         let value_bytes = value.map_or(0, <[u8]>::len);
-        if value_bytes > limits.max_value_bytes {
+        if value_bytes > limits.max_value_bytes.get() {
             return Err(EntryInspectionError::ValueTooLong);
         }
         charged = charged
@@ -41,7 +42,7 @@ pub(super) fn inspect_scoped_entry(
             .and_then(|bytes| bytes.checked_add(node_bytes))
             .and_then(|bytes| bytes.checked_add(value_bytes))
             .ok_or(EntryInspectionError::Capacity)?;
-        if charged > limits.max_response_bytes {
+        if charged > limits.max_response_bytes.get() {
             return Err(EntryInspectionError::Capacity);
         }
     }
@@ -57,16 +58,16 @@ pub(super) fn inspect_scoped_entry(
     )?;
     for (node, status, _) in engine.member_statuses_since() {
         let value = visible_value(engine, node, key, now).map(<[u8]>::to_vec);
-        let remaining_ttl_ms = value.as_ref().and_then(|_| {
+        let remaining_ttl = value.as_ref().and_then(|_| {
             engine
                 .node_entry_expires_at(node, key)
-                .map(|expiry| expiry.0.saturating_sub(now.0))
+                .map(|expiry| from_core_millis(expiry.0.saturating_sub(now.0)))
         });
         entries.push(InspectedEntry {
             node: node.clone(),
             status,
             value,
-            remaining_ttl_ms,
+            remaining_ttl,
         });
         charge_entry(
             entries.last().ok_or(EntryInspectionError::Capacity)?,
@@ -94,16 +95,17 @@ pub(super) fn inspect_scoped_pair(
         count = count
             .checked_add(1)
             .ok_or(EntryInspectionError::TooManyMembers)?;
-        if count > limits.max_members {
+        if count > limits.max_members.get() {
             return Err(EntryInspectionError::TooManyMembers);
         }
         let node_bytes = node.as_str().len();
-        if node_bytes > limits.max_member_bytes {
+        if node_bytes > limits.max_member_bytes.get() {
             return Err(EntryInspectionError::IdentityTooLong);
         }
         let first_bytes = visible_value(engine, node, first, now).map_or(0, <[u8]>::len);
         let second_bytes = visible_value(engine, node, second, now).map_or(0, <[u8]>::len);
-        if first_bytes > limits.max_value_bytes || second_bytes > limits.max_value_bytes {
+        if first_bytes > limits.max_value_bytes.get() || second_bytes > limits.max_value_bytes.get()
+        {
             return Err(EntryInspectionError::ValueTooLong);
         }
         charged = charged
@@ -112,7 +114,7 @@ pub(super) fn inspect_scoped_pair(
             .and_then(|bytes| bytes.checked_add(first_bytes))
             .and_then(|bytes| bytes.checked_add(second_bytes))
             .ok_or(EntryInspectionError::Capacity)?;
-        if charged > limits.max_response_bytes {
+        if charged > limits.max_response_bytes.get() {
             return Err(EntryInspectionError::Capacity);
         }
     }
@@ -129,31 +131,31 @@ pub(super) fn inspect_scoped_pair(
     for (node, status, _) in engine.member_statuses_since() {
         let first_value = visible_value(engine, node, first, now).map(<[u8]>::to_vec);
         let second_value = visible_value(engine, node, second, now).map(<[u8]>::to_vec);
-        let first_remaining_ttl_ms = first_value.as_ref().and_then(|_| {
+        let first_remaining_ttl = first_value.as_ref().and_then(|_| {
             engine
                 .node_entry_expires_at(node, first)
-                .map(|expiry| expiry.0.saturating_sub(now.0))
+                .map(|expiry| from_core_millis(expiry.0.saturating_sub(now.0)))
         });
-        let second_remaining_ttl_ms = second_value.as_ref().and_then(|_| {
+        let second_remaining_ttl = second_value.as_ref().and_then(|_| {
             engine
                 .node_entry_expires_at(node, second)
-                .map(|expiry| expiry.0.saturating_sub(now.0))
+                .map(|expiry| from_core_millis(expiry.0.saturating_sub(now.0)))
         });
         entries.push(InspectedPairEntry {
             node: node.clone(),
             status,
             member_incarnation: engine
                 .member_incarnation(node)
-                .ok_or(EntryInspectionError::Unavailable)?,
+                .ok_or(EntryInspectionError::MissingMemberState)?,
             member_state_version: engine
                 .member_state_version(node)
-                .ok_or(EntryInspectionError::Unavailable)?,
+                .ok_or(EntryInspectionError::MissingMemberState)?,
             first: first_value,
             first_version: engine.node_entry_version(node, first),
-            first_remaining_ttl_ms,
+            first_remaining_ttl,
             second: second_value,
             second_version: engine.node_entry_version(node, second),
-            second_remaining_ttl_ms,
+            second_remaining_ttl,
         });
         charge_pair_entry(
             entries.last().ok_or(EntryInspectionError::Capacity)?,
@@ -172,14 +174,14 @@ fn response_vec_charge<T>(
     limits: EntryInspectionLimits,
     header: usize,
 ) -> Result<usize, EntryInspectionError> {
-    if capacity > limits.max_members {
+    if capacity > limits.max_members.get() {
         return Err(EntryInspectionError::Capacity);
     }
     let charged = capacity
         .checked_mul(size_of::<T>())
         .and_then(|bytes| header.checked_add(bytes))
         .ok_or(EntryInspectionError::Capacity)?;
-    if charged > limits.max_response_bytes {
+    if charged > limits.max_response_bytes.get() {
         return Err(EntryInspectionError::Capacity);
     }
     Ok(charged)
@@ -191,14 +193,14 @@ fn charge_entry(
     limits: EntryInspectionLimits,
 ) -> Result<(), EntryInspectionError> {
     let capacity = entry.value.as_ref().map_or(0, Vec::capacity);
-    if capacity > limits.max_value_bytes {
+    if capacity > limits.max_value_bytes.get() {
         return Err(EntryInspectionError::Capacity);
     }
     *retained = retained
         .checked_add(entry.node.as_str().len())
         .and_then(|bytes| bytes.checked_add(capacity))
         .ok_or(EntryInspectionError::Capacity)?;
-    if *retained > limits.max_response_bytes {
+    if *retained > limits.max_response_bytes.get() {
         return Err(EntryInspectionError::Capacity);
     }
     Ok(())
@@ -211,7 +213,7 @@ fn charge_pair_entry(
 ) -> Result<(), EntryInspectionError> {
     let first = entry.first.as_ref().map_or(0, Vec::capacity);
     let second = entry.second.as_ref().map_or(0, Vec::capacity);
-    if first > limits.max_value_bytes || second > limits.max_value_bytes {
+    if first > limits.max_value_bytes.get() || second > limits.max_value_bytes.get() {
         return Err(EntryInspectionError::Capacity);
     }
     *retained = retained
@@ -219,7 +221,7 @@ fn charge_pair_entry(
         .and_then(|bytes| bytes.checked_add(first))
         .and_then(|bytes| bytes.checked_add(second))
         .ok_or(EntryInspectionError::Capacity)?;
-    if *retained > limits.max_response_bytes {
+    if *retained > limits.max_response_bytes.get() {
         return Err(EntryInspectionError::Capacity);
     }
     Ok(())

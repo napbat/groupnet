@@ -1,176 +1,96 @@
-use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use groupnet_core::{Command, Config, GroupId, NetStats, NodeId, Role, Status};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use groupnet_core::{Command, Config, GroupId, NetStats, NodeId, Role};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::clock::core_millis;
 use crate::driver::{
     Event, GroupEvent, GroupViews, MembersSnapshot, MetaSnapshot, NodeEntriesSnapshot,
     StatusesSnapshot,
 };
 
+mod entries;
 mod messaging;
 mod roster;
 
-/// A local command could not be enqueued: the group actor's bounded inbox is
-/// full (sustained overload) or the actor has shut down. Callers retry after a
-/// beat or treat it as the group being gone.
+pub use entries::{
+    EntryBudget, EntryInspectionError, EntryInspectionLimits, EntryInspectionLimitsError,
+    EntryMutationError, EntryMutationLimits, EntryMutationLimitsError, EntryRemoval, EntryRevision,
+    EntryWrite, InspectedEntries, InspectedEntry, InspectedPair, InspectedPairEntry,
+};
+
+/// Why a local command was not enqueued into the group actor. Nothing was
+/// applied either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CommandRejected;
-
-/// A membership snapshot exceeded a caller's allocation bound.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BoundedRosterError {
-    /// A zero count or identity-byte limit cannot describe a roster.
-    InvalidLimit,
-    /// The observed roster has more identities than the caller can retain.
-    TooManyMembers,
-    /// At least one observed identity exceeds the caller's byte limit.
-    IdentityTooLong,
+pub enum CommandRejected {
+    /// The actor's bounded inbox is full (sustained overload). Retry after a
+    /// beat; the write is state, so a later one carries the same intent.
+    InboxFull,
+    /// The group actor has shut down (its node closed or the group was left).
+    /// Retrying cannot succeed; treat the group as gone.
+    GroupClosed,
 }
 
-/// Finite actor-side observation limits, checked before cloning any entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EntryInspectionLimits {
-    /// Maximum bytes in the requested key.
-    pub max_key_bytes: usize,
-    /// Maximum returned members, including the local node.
-    pub max_members: usize,
-    /// Maximum bytes in one member identity.
-    pub max_member_bytes: usize,
-    /// Maximum bytes in one entry value.
-    pub max_value_bytes: usize,
-    /// Maximum combined response charge, including the fixed result and
-    /// per-entry record headers, identities, and value bytes.
-    pub max_response_bytes: usize,
+impl CommandRejected {
+    /// Classifies a refused send into the actor's bounded inbox.
+    pub(crate) fn from_send<T>(error: &TrySendError<T>) -> Self {
+        match error {
+            TrySendError::Full(_) => Self::InboxFull,
+            TrySendError::Closed(_) => Self::GroupClosed,
+        }
+    }
 }
 
-/// Exact actor-cut revision precondition for one local entry mutation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EntryRevision {
-    /// Retained key revision, including a tombstone. An absent revision also
-    /// binds `member` to prevent an old create after a publish and removal.
-    pub key: Option<u64>,
-    /// Native member state high-water at the observation cut.
-    pub member: u64,
-}
-
-/// Actor-side byte limits for one conditional entry publication.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EntryMutationLimits {
-    /// Maximum owned bytes in the scoped key.
-    pub max_key_bytes: usize,
-    /// Maximum owned bytes in its value.
-    pub max_value_bytes: usize,
-}
-
-/// An owned admission guard carried through the actor queue and response.
-///
-/// A cancelled requester does not release its budget while the actor still
-/// owns or allocates the reply. The runtime is independent of any particular
-/// admission implementation.
-pub trait EntryBudget: Any + Send {
-    /// Maximum queued or response bytes already reserved by this owner.
-    fn bytes(&self) -> usize;
-}
-
-/// One member and exactly one scoped entry from an actor-state cut.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InspectedEntry {
-    /// Member identity.
-    pub node: NodeId,
-    /// Membership status at the same actor cut.
-    pub status: Status,
-    /// Entry bytes, if present and unexpired.
-    pub value: Option<Vec<u8>>,
-    /// Observer-local remaining TTL in milliseconds, if the entry has one.
-    pub remaining_ttl_ms: Option<u64>,
-}
-
-/// One complete bounded actor-state cut with its monotonic sample instant.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InspectedEntries {
-    /// Local monotonic instant at or before the actor's expiry calculation.
-    pub sampled_at: Instant,
-    /// Complete known roster in node-id order, including absent entries.
-    pub entries: Vec<InspectedEntry>,
-}
-
-/// One member and two scoped entries from the same actor-state cut.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InspectedPairEntry {
-    /// Native member identity.
-    pub node: NodeId,
-    /// Native membership status.
-    pub status: Status,
-    /// SWIM refutation incarnation; the entry's boot token fences restarts.
-    pub member_incarnation: u64,
-    /// Native high-water version including deleted entries. Conditional local
-    /// publication binds this value so an old absent-value create cannot
-    /// revive after a newer publication and withdrawal.
-    pub member_state_version: u64,
-    /// First entry bytes, if present and unexpired.
-    pub first: Option<Vec<u8>>,
-    /// Retained first-entry revision, including an absent tombstone.
-    pub first_version: Option<u64>,
-    /// Native remaining TTL for the first entry at the sample.
-    pub first_remaining_ttl_ms: Option<u64>,
-    /// Second entry bytes, if present and unexpired.
-    pub second: Option<Vec<u8>>,
-    /// Retained second-entry revision, including an absent tombstone.
-    pub second_version: Option<u64>,
-    /// Native remaining TTL for the second entry at the sample.
-    pub second_remaining_ttl_ms: Option<u64>,
-}
-
-/// Complete bounded two-entry roster at one observer-local actor instant.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InspectedPair {
-    /// Instant at or before the actor's native TTL calculation.
-    pub sampled_at: Instant,
-    /// Complete known roster in `NodeId` order, including absent entries.
-    pub entries: Vec<InspectedPairEntry>,
-}
-
-/// A bounded actor-side inspection failed without returning a partial roster.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EntryInspectionError {
-    /// Zero, inverted, or unrepresentable bound.
-    InvalidLimit,
-    /// The complete roster exceeded its count cap.
-    TooManyMembers,
-    /// One member identity exceeded its byte cap.
-    IdentityTooLong,
-    /// One present value exceeded its byte cap.
-    ValueTooLong,
-    /// The complete response exceeded the caller's owned budget.
-    Capacity,
-    /// The group actor is full or closed, or its reply was lost.
-    Unavailable,
-    /// The runtime could not recover its exact type-erased budget owner.
-    Internal,
-}
-
-/// A confirmed local entry mutation failed or its outcome is unknown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EntryMutationError {
-    /// The key or value violates the caller's finite bounds.
-    InvalidLimit,
-    /// The actor inbox is full or closed, or its reply was lost. The caller
-    /// must read back the exact value before deciding whether it applied.
-    Unavailable,
-    /// The actor did not apply a local set operation.
-    NotApplied,
-}
-
-impl std::fmt::Display for CommandRejected {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("group actor inbox full or closed")
+impl fmt::Display for CommandRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InboxFull => "group actor inbox full",
+            Self::GroupClosed => "group actor closed",
+        })
     }
 }
 
 impl std::error::Error for CommandRejected {}
+
+/// A membership snapshot exceeded a caller's allocation bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundedRosterError {
+    /// The observed roster has more identities than the caller can retain.
+    TooManyMembers {
+        /// Observed members, including the local node.
+        members: usize,
+        /// The caller's bound.
+        max: usize,
+    },
+    /// At least one observed identity exceeds the caller's byte limit.
+    IdentityTooLong {
+        /// Bytes in the first identity over the bound.
+        bytes: usize,
+        /// The caller's bound.
+        max: usize,
+    },
+}
+
+impl fmt::Display for BoundedRosterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyMembers { members, max } => {
+                write!(f, "roster has {members} members, above the bound of {max}")
+            }
+            Self::IdentityTooLong { bytes, max } => {
+                write!(
+                    f,
+                    "member identity has {bytes} bytes, above the bound of {max}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundedRosterError {}
 
 /// What this node believes its group's leadership to be: the adopted
 /// `(epoch, host)` pair, and the part this node plays in it.
@@ -416,8 +336,12 @@ impl Group {
     }
 
     /// Set one key of this node's app-defined state. Independently versioned
-    /// per key and gossiped; `ttl_ms` (if `Some`) makes every receiver expire
+    /// per key and gossiped; `ttl` (if `Some`) makes every receiver expire
     /// the entry that long after last adopting it — refresh by re-setting.
+    ///
+    /// The core's clock is whole milliseconds: a sub-millisecond remainder
+    /// rounds up to the next millisecond and a TTL beyond `u64::MAX`
+    /// milliseconds saturates there.
     ///
     /// # Errors
     /// [`CommandRejected`] if the group actor's bounded inbox is full or the
@@ -426,136 +350,15 @@ impl Group {
         &self,
         key: impl Into<String>,
         value: impl Into<Vec<u8>>,
-        ttl_ms: Option<u64>,
+        ttl: Option<Duration>,
     ) -> Result<(), CommandRejected> {
         self.tx
             .try_send(Event::Local(Command::SetLocalEntry {
                 key: key.into(),
                 value: value.into(),
-                ttl_ms,
+                ttl_ms: ttl.map(core_millis),
             }))
-            .map_err(|_| CommandRejected)
-    }
-
-    /// Applies a bounded local entry and waits until the actor has published
-    /// the resulting local view. This confirms only local publication; gossip
-    /// delivery and remote adoption remain advisory.
-    ///
-    /// A lost reply has an unknown outcome. Read back the exact scoped entry
-    /// rather than issuing an unrelated claim with the same identity.
-    ///
-    /// # Errors
-    /// Returns [`EntryMutationError`] for invalid bounds, actor overload or
-    /// closure, a lost reply, or a rejected local application.
-    pub async fn set_entry_confirmed<B: EntryBudget>(
-        &self,
-        key: impl Into<String>,
-        value: impl Into<Vec<u8>>,
-        ttl_ms: Option<u64>,
-        max_key_bytes: usize,
-        max_value_bytes: usize,
-        budget: B,
-    ) -> Result<B, EntryMutationError> {
-        let key = key.into();
-        let value = value.into();
-        if key.is_empty()
-            || max_key_bytes == 0
-            || max_value_bytes == 0
-            || key.len() > max_key_bytes
-            || value.len() > max_value_bytes
-            || key.capacity() > max_key_bytes
-            || value.capacity() > max_value_bytes
-            || key
-                .capacity()
-                .checked_add(value.capacity())
-                .is_none_or(|bytes| bytes > budget.bytes())
-        {
-            return Err(EntryMutationError::InvalidLimit);
-        }
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .try_send(Event::SetEntryConfirmed {
-                key,
-                value,
-                ttl_ms,
-                budget: Box::new(budget),
-                reply,
-            })
-            .map_err(|_| EntryMutationError::Unavailable)?;
-        let (applied, erased) = response
-            .await
-            .map_err(|_| EntryMutationError::Unavailable)?;
-        let budget = erased
-            .downcast::<B>()
-            .map_err(|_| EntryMutationError::Unavailable)?;
-        if applied {
-            Ok(*budget)
-        } else {
-            Err(EntryMutationError::NotApplied)
-        }
-    }
-
-    /// Publishes one bounded local entry only while its retained per-key
-    /// revision still matches the actor cut. An absent key also binds the
-    /// member's state-version high-water mark, so a delayed old create cannot
-    /// revive after a newer create and withdrawal have both disappeared.
-    /// Unrelated local writes do not reject a renewal with a retained key
-    /// revision. The actor checks the condition after processing expiries.
-    ///
-    /// A `false` result confirms rejection without mutation. A lost reply is
-    /// unknown and requires exact readback. The owned budget follows queued
-    /// work and the response even if the requester is cancelled.
-    ///
-    /// # Errors
-    /// Rejects invalid limits, an unavailable actor, or a lost reply.
-    pub async fn set_entry_if_revision<B: EntryBudget>(
-        &self,
-        key: impl Into<String>,
-        value: impl Into<Vec<u8>>,
-        ttl_ms: Option<u64>,
-        expected: EntryRevision,
-        limits: EntryMutationLimits,
-        budget: B,
-    ) -> Result<(bool, B), EntryMutationError> {
-        let key = key.into();
-        let value = value.into();
-        if key.is_empty()
-            || limits.max_key_bytes == 0
-            || limits.max_value_bytes == 0
-            || key.len() > limits.max_key_bytes
-            || value.len() > limits.max_value_bytes
-            || key.capacity() > limits.max_key_bytes
-            || value.capacity() > limits.max_value_bytes
-            || expected.member == u64::MAX
-            || expected.key == Some(u64::MAX)
-            || key
-                .capacity()
-                .checked_add(value.capacity())
-                .is_none_or(|bytes| bytes > budget.bytes())
-        {
-            return Err(EntryMutationError::InvalidLimit);
-        }
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .try_send(Event::SetEntryIfRevision {
-                key,
-                value,
-                ttl_ms,
-                expected,
-                budget: Box::new(budget),
-                reply,
-            })
-            .map_err(|_| EntryMutationError::Unavailable)?;
-        let (applied, erased) = response
-            .await
-            .map_err(|_| EntryMutationError::Unavailable)?;
-        match erased.downcast::<B>() {
-            Ok(budget) => Ok((applied, *budget)),
-            Err(erased) => {
-                drop(erased);
-                Err(EntryMutationError::Unavailable)
-            }
-        }
+            .map_err(|error| CommandRejected::from_send(&error))
     }
 
     /// Delete one key of this node's state (a versioned tombstone disseminates
@@ -567,57 +370,7 @@ impl Group {
     pub fn delete_entry(&self, key: impl Into<String>) -> Result<(), CommandRejected> {
         self.tx
             .try_send(Event::Local(Command::DeleteLocalEntry { key: key.into() }))
-            .map_err(|_| CommandRejected)
-    }
-
-    /// Deletes this node's entry only if its actor-visible bytes exactly match
-    /// `expected`. A distinct renewal/incarnation must change those bytes for
-    /// this to fence delayed withdrawals. A `false` result does not delete a
-    /// newer claim. Publication precedes the successful reply.
-    ///
-    /// # Errors
-    /// Returns [`EntryMutationError`] for invalid bounds or an unavailable
-    /// actor/reply. A lost reply has an unknown outcome and needs readback.
-    pub async fn delete_entry_if_value<B: EntryBudget>(
-        &self,
-        key: impl Into<String>,
-        expected: impl Into<Vec<u8>>,
-        max_key_bytes: usize,
-        max_value_bytes: usize,
-        budget: B,
-    ) -> Result<(bool, B), EntryMutationError> {
-        let key = key.into();
-        let expected = expected.into();
-        if key.is_empty()
-            || max_key_bytes == 0
-            || max_value_bytes == 0
-            || key.len() > max_key_bytes
-            || expected.len() > max_value_bytes
-            || key.capacity() > max_key_bytes
-            || expected.capacity() > max_value_bytes
-            || key
-                .capacity()
-                .checked_add(expected.capacity())
-                .is_none_or(|bytes| bytes > budget.bytes())
-        {
-            return Err(EntryMutationError::InvalidLimit);
-        }
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .try_send(Event::DeleteEntryIfValue {
-                key,
-                expected,
-                budget: Box::new(budget),
-                reply,
-            })
-            .map_err(|_| EntryMutationError::Unavailable)?;
-        let (deleted, erased) = response
-            .await
-            .map_err(|_| EntryMutationError::Unavailable)?;
-        let budget = erased
-            .downcast::<B>()
-            .map_err(|_| EntryMutationError::Unavailable)?;
-        Ok((deleted, *budget))
+            .map_err(|error| CommandRejected::from_send(&error))
     }
 
     /// One key of `node`'s state, as this node currently sees it.
@@ -634,128 +387,6 @@ impl Group {
             .get(node)
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default()
-    }
-
-    /// Samples one key across the complete group roster inside the group
-    /// actor, including each entry's observer-local remaining TTL.
-    ///
-    /// The budget moves into the bounded actor command before any response
-    /// allocation. If this future is cancelled, that command or its reply
-    /// keeps the budget until its cloned bytes are dropped.
-    ///
-    /// # Errors
-    /// Rejects invalid limits, a full/closed actor, or any response overflow
-    /// without returning a truncated roster.
-    pub async fn inspect_scoped_entry<B: EntryBudget>(
-        &self,
-        key: impl Into<String>,
-        limits: EntryInspectionLimits,
-        budget: B,
-    ) -> Result<(InspectedEntries, B), EntryInspectionError> {
-        let key = key.into();
-        if key.is_empty()
-            || limits.max_key_bytes == 0
-            || key.len() > limits.max_key_bytes
-            || key.capacity() > limits.max_key_bytes
-            || limits.max_members == 0
-            || limits.max_member_bytes == 0
-            || limits.max_value_bytes == 0
-            || limits.max_response_bytes == 0
-            || limits
-                .max_response_bytes
-                .checked_add(key.capacity())
-                .is_none_or(|bytes| bytes > budget.bytes())
-        {
-            return Err(EntryInspectionError::InvalidLimit);
-        }
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .try_send(Event::InspectScopedEntry {
-                key,
-                limits,
-                budget: Box::new(budget),
-                reply,
-            })
-            .map_err(|_| EntryInspectionError::Unavailable)?;
-        let (entries, erased) = response
-            .await
-            .map_err(|_| EntryInspectionError::Unavailable)??;
-        match erased.downcast::<B>() {
-            Ok(budget) => Ok((entries, *budget)),
-            Err(erased) => {
-                drop(entries);
-                drop(erased);
-                Err(EntryInspectionError::Internal)
-            }
-        }
-    }
-
-    /// Samples two scoped keys and native membership incarnations from one
-    /// complete actor cut, with the owned budget held through cancellation.
-    ///
-    /// # Errors
-    /// Rejects invalid limits, a full/closed actor, or a response too large
-    /// to retain without returning a truncated roster.
-    pub async fn inspect_scoped_pair<B: EntryBudget>(
-        &self,
-        first: &str,
-        second: &str,
-        limits: EntryInspectionLimits,
-        budget: B,
-    ) -> Result<(InspectedPair, B), EntryInspectionError> {
-        let key_bytes = first
-            .len()
-            .checked_add(second.len())
-            .ok_or(EntryInspectionError::InvalidLimit)?;
-        if first.is_empty()
-            || second.is_empty()
-            || first == second
-            || first.len() > limits.max_key_bytes
-            || second.len() > limits.max_key_bytes
-            || limits.max_members == 0
-            || limits.max_member_bytes == 0
-            || limits.max_value_bytes == 0
-            || limits.max_response_bytes == 0
-            || limits
-                .max_response_bytes
-                .checked_add(key_bytes)
-                .is_none_or(|bytes| bytes > budget.bytes())
-        {
-            return Err(EntryInspectionError::InvalidLimit);
-        }
-        let first = first.to_owned();
-        let second = second.to_owned();
-        if first.capacity() > limits.max_key_bytes
-            || second.capacity() > limits.max_key_bytes
-            || limits
-                .max_response_bytes
-                .checked_add(first.capacity())
-                .and_then(|bytes| bytes.checked_add(second.capacity()))
-                .is_none_or(|bytes| bytes > budget.bytes())
-        {
-            return Err(EntryInspectionError::InvalidLimit);
-        }
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .try_send(Event::InspectScopedPair {
-                first,
-                second,
-                limits,
-                budget: Box::new(budget),
-                reply,
-            })
-            .map_err(|_| EntryInspectionError::Unavailable)?;
-        let (entries, erased) = response
-            .await
-            .map_err(|_| EntryInspectionError::Unavailable)??;
-        match erased.downcast::<B>() {
-            Ok(budget) => Ok((entries, *budget)),
-            Err(erased) => {
-                drop(entries);
-                drop(erased);
-                Err(EntryInspectionError::Internal)
-            }
-        }
     }
 
     /// A snapshot of every node's live state entries (the full map, one
@@ -806,5 +437,27 @@ impl Group {
     /// publishing coordinator identity into the routing group).
     pub(crate) fn command_sender(&self) -> mpsc::Sender<Event> {
         self.tx.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use tokio::sync::mpsc;
+
+    use super::CommandRejected;
+
+    #[test]
+    fn a_refused_send_names_why_it_was_refused() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(()).expect("one slot");
+        let full = CommandRejected::from_send(&tx.try_send(()).unwrap_err());
+        assert_eq!(full, CommandRejected::InboxFull);
+        drop(rx);
+        let closed = CommandRejected::from_send(&tx.try_send(()).unwrap_err());
+        assert_eq!(closed, CommandRejected::GroupClosed);
+        assert_eq!(closed.to_string(), "group actor closed");
+        assert!(closed.source().is_none());
     }
 }

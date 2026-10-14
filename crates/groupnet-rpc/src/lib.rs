@@ -9,100 +9,68 @@
 //! RPC composes with the other stream consumers of a node; it does not need
 //! a bulk listener of its own. There are two ways to serve:
 //!
+//! * **Plane-owning** — [`RpcServer::bind`]`(plane, handler)` (or
+//!   [`bind_with`](RpcServer::bind_with)) runs the accept loop itself, on top
+//!   of the connection-level API: every inbound stream on that plane is an
+//!   RPC connection, and a full server stops accepting until one ends. Use it
+//!   for a plane that carries nothing but RPC: on a runtime `Node`, an
+//!   ordered endpoint scoped to RPC's own stream protocol (below); for TCP,
+//!   its own `TcpBulkTransport` bound to its own port.
 //! * **Connection-level** — the application owns [`DataPlane::accept`] and
 //!   hands each stream that is meant for RPC to
 //!   [`RpcServer::serve`]`(from, stream)`. Every connection handed over is
 //!   served under the same server limits; at `max_connections` `serve`
 //!   refuses it with [`RpcServeError::AtCapacity`] (the stream is dropped),
-//!   while [`RpcServer::reserve`] waits for a slot instead. This is how one
-//!   plane — a runtime `Node`'s tunnel streams, say, which every bulk and
-//!   ordered-session consumer on that node shares — carries RPC next to
-//!   anything else: the application decides which consumer each inbound
-//!   stream belongs to (for example by a tag byte its dialers write first).
-//! * **Plane-owning** — [`RpcServer::bind`]`(plane, handler)` (or
-//!   [`bind_with`](RpcServer::bind_with)) runs the accept loop itself, on top
-//!   of the connection-level API: every inbound stream on that plane is an
-//!   RPC connection, and a full server stops accepting until one ends. Use it
-//!   for a plane that carries nothing but RPC (for TCP, its own
-//!   `TcpBulkTransport` bound to its own port).
+//!   while [`RpcServer::reserve`] waits for a slot instead. Use it when the
+//!   application itself decides which streams are RPC.
 //!
-//! A client only connects, so it shares a plane with any other consumer
-//! freely — but the *remote* end of every stream it opens must reach an
-//! [`RpcServer`], so on a shared plane its transport writes whatever the
-//! remote dispatcher expects (the tag below) before the first frame.
+//! On a runtime `Node`, every stream consumer binds its own ordered stream
+//! protocol — `node.endpoint(Ordered::protocol(id))`, which is itself a
+//! [`BulkTransport`] — and runs its own independent accept loop. The node
+//! routes each inbound stream to the accept queue of the protocol its
+//! connector named in the authenticated stream setup, so the RPC server, an
+//! RPC client and any other consumer (blob transfer, say) share the node's
+//! tunnels without a shared dispatcher, a tag byte, or ever receiving each
+//! other's streams. Every node must agree on what each protocol id means.
 //!
 //! ```no_run
-//! use std::io;
 //! use std::time::Duration;
 //!
-//! use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 //! use groupnet_core::NodeId;
-//! use groupnet_rpc::{Bytes, BulkTransport, DataPlane, DataStream, RpcClient, RpcServer, RpcStatus};
+//! use groupnet_rpc::{Bytes, DataPlane, DataStream, RpcClient, RpcServer, RpcStatus};
+//! use groupnet_runtime::{Node, Ordered, StreamProtocolId};
 //!
-//! /// The first byte of every stream on the shared plane names its consumer.
-//! const RPC: u8 = 1;
-//! const BLOBS: u8 = 2;
-//!
-//! /// Dials through `B`, then writes `tag`: what an RPC client on a shared
-//! /// plane connects with.
-//! struct Tagged<B> {
-//!     inner: B,
-//!     tag: u8,
-//! }
-//!
-//! impl<B: BulkTransport> BulkTransport for Tagged<B> {
-//!     type Error = io::Error;
-//!     type Stream = B::Stream;
-//!
-//!     async fn connect(&self, to: &NodeId) -> io::Result<B::Stream> {
-//!         let mut stream = self.inner.connect(to).await.map_err(io::Error::other)?;
-//!         stream.write_all(&[self.tag]).await?;
-//!         Ok(stream)
-//!     }
-//!
-//!     async fn accept(&self) -> io::Result<(NodeId, B::Stream)> {
-//!         self.inner.accept().await.map_err(io::Error::other)
-//!     }
-//! }
+//! /// The stream protocols every node in the cluster agrees on.
+//! const RPC: StreamProtocolId = StreamProtocolId::new(1);
+//! const BLOBS: StreamProtocolId = StreamProtocolId::new(2);
 //!
 //! # async fn blobs<S>(from: NodeId, stream: DataStream<S>) {}
-//! # async fn demo<B: BulkTransport + Clone>(node: B) -> io::Result<()> {
-//! // Calling side: one client, cloned freely, tagging every stream it opens.
-//! let client = RpcClient::new(DataPlane::new(Tagged { inner: node.clone(), tag: RPC }));
+//! # async fn demo(node: Node) -> std::io::Result<()> {
+//! // Serving side: RPC owns the accept loop of its own protocol...
+//! let server = RpcServer::bind(
+//!     DataPlane::new(node.endpoint(Ordered::protocol(RPC))?),
+//!     |from: NodeId, request: Bytes| async move {
+//!         if request.is_empty() {
+//!             return Err(RpcStatus::new(400, format!("{from} sent nothing")));
+//!         }
+//!         Ok(request)
+//!     },
+//! );
+//! // ...while the blob consumer runs an independent one beside it.
+//! let blob_plane = DataPlane::new(node.endpoint(Ordered::protocol(BLOBS))?);
+//! tokio::spawn(async move {
+//!     while let Ok((from, stream)) = blob_plane.accept().await {
+//!         tokio::spawn(blobs(from, stream));
+//!     }
+//! });
+//!
+//! // Calling side: one client, cloned freely, dialing RPC's protocol.
+//! let client = RpcClient::new(DataPlane::new(node.endpoint(Ordered::protocol(RPC))?));
 //! let reply = client
 //!     .call(&NodeId::new("node-b"), Bytes::from_static(b"ping"), Duration::from_secs(1))
 //!     .await;
-//! # drop(reply);
-//!
-//! // Serving side: the application owns `accept` and dispatches by tag.
-//! let rpc = RpcServer::new(|from: NodeId, request: Bytes| async move {
-//!     if request.is_empty() {
-//!         return Err(RpcStatus::new(400, format!("{from} sent nothing")));
-//!     }
-//!     Ok(request)
-//! });
-//! let plane = DataPlane::new(node);
-//! loop {
-//!     let Ok((from, stream)) = plane.accept().await else { continue };
-//!     let rpc = rpc.clone();
-//!     // Read the tag off the accept loop, so a slow dialer stalls no one.
-//!     tokio::spawn(async move {
-//!         let mut raw = stream.into_inner();
-//!         let mut tag = [0];
-//!         if raw.read_exact(&mut tag).await.is_err() {
-//!             return;
-//!         }
-//!         match tag[0] {
-//!             // At capacity the stream is refused and dropped; the caller's
-//!             // client reconnects on its next call.
-//!             RPC => {
-//!                 let _ = rpc.serve(from, DataStream::new(raw));
-//!             }
-//!             BLOBS => blobs(from, DataStream::new(raw)).await,
-//!             _ => {}
-//!         }
-//!     });
-//! }
+//! # drop((server, reply));
+//! # Ok(())
 //! # }
 //! ```
 //!

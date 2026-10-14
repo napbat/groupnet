@@ -592,6 +592,8 @@ Select the protocol features you need (`tcp` for this example; also `udp`,
 `ipc`; enable `connectivity` for native TCP/UDP paths). Add links to bridge protocols:
 
 ```rust
+use std::time::Duration;
+
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
 use groupnet::transport::{link::PeerEndpoint, tcp::TcpLink};
@@ -602,7 +604,7 @@ async fn join_devices() -> Result<(), Box<dyn std::error::Error>> {
             "127.0.0.1:7000".parse()?,
             vec![PeerEndpoint::new(NodeId::new("bridge"), "127.0.0.1:7001".parse()?)],
         ))
-        .gossip_interval_ms(100)
+        .gossip_interval(Duration::from_millis(100))
         .start()
         .await?;
     let devices = node.join_group("devices");
@@ -970,7 +972,7 @@ async fn start_with_named_seed(resolver: impl SeedResolver) -> io::Result<Node> 
     let udp = UdpTransport::bind(id.clone(), "0.0.0.0:7000").await?;
     Node::builder(id)
         .link(BoundLink::new(udp, LinkConfig::new(vec![peer.clone()])))
-        .named_seeds(NamedSeeds::new(resolver).seed(peer, "node-b.peers:7000"))
+        .named_seeds(NamedSeeds::new(resolver).with_seed(peer, "node-b.peers:7000"))
         .start()
         .await
 }

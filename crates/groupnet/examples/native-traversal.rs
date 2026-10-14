@@ -145,12 +145,12 @@ async fn udp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
     exchange(&left, &right).await?;
     let first = Node::builder(NodeId::new("native-a"))
         .link(left.into_bound_link(1))
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .start()
         .await?;
     let second = Node::builder(NodeId::new("native-b"))
         .link(right.into_bound_link(1))
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .start()
         .await?;
     let result = membership(first, second).await;
@@ -182,12 +182,12 @@ async fn tcp(bind: SocketAddr, policy: PathPolicy) -> io::Result<()> {
     exchange(&left, &right).await?;
     let first = Node::builder(NodeId::new("native-a"))
         .link(left.into_bound_link(1))
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .start()
         .await?;
     let second = Node::builder(NodeId::new("native-b"))
         .link(right.into_bound_link(1))
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .start()
         .await?;
     let result = membership(first, second).await;

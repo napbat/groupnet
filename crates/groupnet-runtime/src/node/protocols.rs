@@ -78,6 +78,9 @@ impl Node {
         ManagedProtocol::new(self.inner.messaging.sender().clone())
     }
 
+    /// Resolves the shared ordered engine with the node-wide
+    /// [`OrderedConfig`](groupnet_streams::OrderedConfig) validated at
+    /// [`NodeBuilder::start`](crate::NodeBuilder::start).
     fn cached_ordered(&self) -> io::Result<OrderedProtocol> {
         let mut protocol = self
             .inner
@@ -88,7 +91,8 @@ impl Node {
         if let Some(protocol) = protocol.as_ref() {
             return Ok(protocol.clone());
         }
-        let ordered = OrderedProtocol::new(self.tunnels()?.clone());
+        let ordered =
+            OrderedProtocol::with_validated(self.tunnels()?.clone(), self.inner.ordered_config)?;
         *protocol = Some(ordered.clone());
         Ok(ordered)
     }

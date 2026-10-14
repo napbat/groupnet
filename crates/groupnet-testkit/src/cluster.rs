@@ -107,7 +107,7 @@ impl NodeOpts {
     }
 
     /// Overrides the gossip round's cadence — see
-    /// [`NodeBuilder::gossip_interval_ms`](groupnet_runtime::NodeBuilder::gossip_interval_ms).
+    /// [`NodeBuilder::gossip_interval`](groupnet_runtime::NodeBuilder::gossip_interval).
     /// The fixture also paces the router's route announcements on it.
     #[must_use]
     pub fn gossip_interval_ms(mut self, ms: u64) -> Self {
@@ -138,7 +138,7 @@ impl NodeOpts {
     /// Unset (the default) is a plain `join_group`, i.e. the node config's own
     /// mode, i.e. `Eventual` — so every existing fixture keeps joining exactly
     /// the group it always did. Set it to
-    /// [`GroupProfile::hosted`](groupnet_runtime::GroupProfile::hosted) for a
+    /// a hosted [`GroupProfile`] variant for a
     /// cluster that must elect a host.
     #[must_use]
     pub fn group_profile(mut self, profile: GroupProfile) -> Self {
@@ -209,7 +209,7 @@ async fn build_node(net: &Network, id: NodeId, seeds: Vec<NodeId>, opts: &NodeOp
         builder = builder.seed(seed);
     }
     if let Some(ms) = opts.gossip_interval_ms {
-        builder = builder.gossip_interval_ms(ms);
+        builder = builder.gossip_interval(Duration::from_millis(ms));
     }
     if let Some(bytes) = opts.max_delta_frame_bytes {
         builder = builder.max_delta_frame_bytes(bytes);

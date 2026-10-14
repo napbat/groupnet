@@ -355,7 +355,7 @@ async fn dispatcher_rejects_unjoined_groups_and_unknown_group_sources() {
     let b = NodeId::new("b");
     let receiver = Node::builder(a.clone())
         .link(MemLink::new(net.endpoint(a.clone()), vec![b.clone()]))
-        .gossip_interval_ms(20)
+        .gossip_interval(Duration::from_millis(20))
         .start()
         .await
         .unwrap();

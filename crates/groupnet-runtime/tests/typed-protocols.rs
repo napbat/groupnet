@@ -222,7 +222,7 @@ async fn messaging_nodes() -> io::Result<(Node, Node)> {
             a_identity,
             [PeerIdentity::new(b_id.clone(), &b_leaf)?],
         ))
-        .gossip_interval_ms(20)
+        .gossip_interval(Duration::from_millis(20))
         .start()
         .await?;
     let b = Node::builder(b_id.clone())
@@ -234,7 +234,7 @@ async fn messaging_nodes() -> io::Result<(Node, Node)> {
             b_identity,
             [PeerIdentity::new(a_id.clone(), &a_leaf)?],
         ))
-        .gossip_interval_ms(20)
+        .gossip_interval(Duration::from_millis(20))
         .start()
         .await?;
     eventually_within("typed protocol routes", WAIT, || {
@@ -513,6 +513,111 @@ async fn node_unordered_settings_are_fixed_by_the_builder() -> io::Result<()> {
     Ok(())
 }
 
+/// Writes `tag` on a fresh stream from `connect`.
+async fn opened_with(
+    connect: impl Future<Output = io::Result<TunneledStream>>,
+    tag: u8,
+) -> io::Result<TunneledStream> {
+    let mut stream = connect.await?;
+    stream.write_all(&[tag]).await?;
+    stream.flush().await?;
+    Ok(stream)
+}
+
+/// The first byte of an accepted stream.
+async fn first_byte(
+    accept: impl Future<Output = io::Result<(NodeId, TunneledStream)>>,
+) -> io::Result<u8> {
+    let (_, mut stream) = accept.await?;
+    let mut tag = [0];
+    stream.read_exact(&mut tag).await?;
+    Ok(tag[0])
+}
+
+#[tokio::test]
+async fn ordered_protocols_have_independent_accept_queues_on_one_node() -> io::Result<()> {
+    use groupnet_runtime::StreamProtocolId;
+    use groupnet_transport::bulk::BulkTransport;
+
+    const RPC: StreamProtocolId = StreamProtocolId::new(1);
+    const BLOBS: StreamProtocolId = StreamProtocolId::new(2);
+    let (a, b) = messaging_nodes().await?;
+    let b_id = b.id().clone();
+    let (b_rpc, b_blobs) = (
+        b.endpoint(Ordered::protocol(RPC))?,
+        b.endpoint(Ordered::protocol(BLOBS))?,
+    );
+    let a_rpc = a.peer(b_id.clone(), Ordered::protocol(RPC))?;
+    let a_blobs = a.endpoint(Ordered::protocol(BLOBS))?;
+    let held = tokio::time::timeout(WAIT, async {
+        // Every stream is queued before either consumer accepts one.
+        let rpc = opened_with(a_rpc.connect(), b'r').await?;
+        let blob = opened_with(BulkTransport::connect(&a_blobs, &b_id), b'b').await?;
+        let default = opened_with(BulkTransport::connect(&a, &b_id), b'd').await?;
+        assert_eq!(first_byte(BulkTransport::accept(&b_blobs)).await?, b'b');
+        assert_eq!(first_byte(b_rpc.accept()).await?, b'r');
+        assert_eq!(first_byte(BulkTransport::accept(&b)).await?, b'd');
+        Ok::<_, io::Error>((rpc, blob, default))
+    })
+    .await??;
+    for (name, accepted) in [
+        (
+            "rpc",
+            tokio::time::timeout(Duration::from_millis(100), b_rpc.accept()).await,
+        ),
+        (
+            "blobs",
+            tokio::time::timeout(Duration::from_millis(100), b_blobs.accept()).await,
+        ),
+    ] {
+        assert!(
+            accepted.is_err(),
+            "{name} received another protocol's stream"
+        );
+    }
+    let unbound = a.peer(b_id, Ordered::protocol(StreamProtocolId::new(3)))?;
+    assert_eq!(
+        tokio::time::timeout(WAIT, unbound.connect())
+            .await?
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::ConnectionRefused
+    );
+    drop(held);
+    a.close().await;
+    b.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unordered_descriptors_are_validated_before_the_shared_engine_exists() -> io::Result<()> {
+    // Without tunnels the engine cannot exist (`Unsupported`), so a descriptor
+    // error proves validation ran first.
+    let node = Node::builder(NodeId::new("descriptor-first"))
+        .unordered(UnorderedConfig {
+            allow_unreliable: false,
+            ..UnorderedConfig::default()
+        })
+        .start()
+        .await?;
+    let zero_deadline = groupnet_runtime::UnorderedOptions {
+        timeout: Duration::ZERO,
+        ..groupnet_runtime::UnorderedOptions::default()
+    };
+    for invalid in [Unordered::new(zero_deadline), Unordered::unreliable()] {
+        assert_eq!(
+            node.endpoint(invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    assert_eq!(
+        node.endpoint(Unordered::reliable()).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    node.close().await;
+    Ok(())
+}
+
 /// Records whether start ever tried to bind it.
 #[derive(Debug)]
 struct BindProbe {
@@ -553,6 +658,31 @@ async fn start_rejects_invalid_unordered_settings_by_field_before_binding() {
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<UnorderedConfigError>()),
         Some(&UnorderedConfigError::NoPolicyAllowed)
+    );
+    assert!(!bound.load(Ordering::SeqCst), "validation precedes binding");
+}
+
+#[tokio::test]
+async fn start_rejects_invalid_ordered_settings_by_field_before_binding() {
+    let bound = Arc::new(AtomicBool::new(false));
+    let error = Node::builder(NodeId::new("invalid-ordered"))
+        .link(BindProbe {
+            peers: vec![NodeId::new("peer")],
+            bound: bound.clone(),
+        })
+        .ordered(groupnet_runtime::OrderedConfig {
+            setup_timeout: Duration::ZERO,
+            ..groupnet_runtime::OrderedConfig::default()
+        })
+        .start()
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<groupnet_runtime::OrderedConfigError>()),
+        Some(&groupnet_runtime::OrderedConfigError::ZeroSetupTimeout)
     );
     assert!(!bound.load(Ordering::SeqCst), "validation precedes binding");
 }

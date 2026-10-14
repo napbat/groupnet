@@ -30,7 +30,8 @@ async fn keyed_entries_disseminate_expire_and_delete() {
 
     // Cross-node dissemination of independent keys, one with a TTL.
     a.set_entry("ready", b"1", None).unwrap();
-    a.set_entry("hot/0", b"page-0", Some(400)).unwrap();
+    a.set_entry("hot/0", b"page-0", Some(Duration::from_millis(400)))
+        .unwrap();
     eventually("b sees a's entries", || {
         b.node_entry(&ids[0], "ready").is_some() && b.node_entry(&ids[0], "hot/0").is_some()
     })

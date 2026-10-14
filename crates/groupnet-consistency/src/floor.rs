@@ -272,7 +272,7 @@ impl SeqFloors {
         self.group.set_entry(
             entry_key(&self.prefix, key),
             encode(value),
-            Some(self.ttl_ms),
+            Some(Duration::from_millis(self.ttl_ms)),
         )
     }
 

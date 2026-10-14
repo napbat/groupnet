@@ -230,7 +230,7 @@ impl Shared {
         self.group.set_entry(
             self.renewal_key.clone(),
             encode_renewal(id),
-            Some(self.cfg.duration_ms()),
+            Some(Duration::from_millis(self.cfg.duration_ms())),
         )
     }
 

@@ -70,10 +70,10 @@ impl Pair {
     pub(super) async fn new(path: Path) -> io::Result<Self> {
         let [left_tls, right_tls] = credentials()?;
         let left = Node::builder(NodeId::new(LEFT))
-            .gossip_interval_ms(50)
+            .gossip_interval(Duration::from_millis(50))
             .tunnels(left_tls);
         let right = Node::builder(NodeId::new(RIGHT))
-            .gossip_interval_ms(50)
+            .gossip_interval(Duration::from_millis(50))
             .tunnels(right_tls);
         let bind: SocketAddr = "127.0.0.1:0".parse().map_err(io::Error::other)?;
         let (left, right, relay, monitor) = match path {

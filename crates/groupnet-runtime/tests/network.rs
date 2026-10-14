@@ -24,20 +24,20 @@ async fn initialized_nodes_route_membership_and_entries_across_a_bridge() -> io:
     let node_a = Node::builder(a.clone())
         .routing(configure())
         .link(MemLink::new(left.endpoint(a.clone()), vec![b.clone()]))
-        .gossip_interval_ms(30)
+        .gossip_interval(Duration::from_millis(30))
         .start()
         .await?;
     let node_b = Node::builder(b.clone())
         .routing(configure())
         .link(MemLink::new(left.endpoint(b.clone()), vec![a.clone()]))
         .link(MemLink::new(right.endpoint(b.clone()), vec![c.clone()]))
-        .gossip_interval_ms(30)
+        .gossip_interval(Duration::from_millis(30))
         .start()
         .await?;
     let node_c = Node::builder(c.clone())
         .routing(configure())
         .link(MemLink::new(right.endpoint(c.clone()), vec![b.clone()]))
-        .gossip_interval_ms(30)
+        .gossip_interval(Duration::from_millis(30))
         .start()
         .await?;
     let groups = [

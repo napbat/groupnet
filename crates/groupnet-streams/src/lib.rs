@@ -1,6 +1,7 @@
 //! Static-dispatch session protocols over authenticated group-network peers.
 //!
-//! [`OrderedProtocol`] preserves byte order through the existing pinned TLS tunnels.
+//! [`OrderedProtocol`] preserves byte order through the existing pinned TLS tunnels,
+//! with an isolated accept queue per application [`StreamProtocolId`].
 //! [`UnorderedProtocol`] preserves message boundaries and explicitly selects reliable
 //! or unreliable delivery without imposing head-of-line ordering. Session
 //! protocols need not implement byte-oriented IO, and callers can implement
@@ -21,7 +22,9 @@ pub use bytes::Bytes;
 pub use groupnet_network::Router;
 pub use groupnet_network::tunnel::{TunnelTransport, TunneledStream};
 pub use groupnet_transport::QueueCapacity;
-pub use ordered::OrderedProtocol;
+pub use ordered::{
+    OrderedConfig, OrderedConfigError, OrderedProtocol, StreamProtocolId, ValidOrderedConfig,
+};
 pub use unordered::{
     UnorderedConfig, UnorderedConfigError, UnorderedDelivery, UnorderedOptions, UnorderedProtocol,
     UnorderedSession,

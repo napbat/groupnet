@@ -71,7 +71,7 @@ async fn main() -> io::Result<()> {
             memory.endpoint(NodeId::new("memory-a")),
             vec![NodeId::new("edge-b")],
         ))
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .tunnels(a_tls)
         .start()
         .await?;
@@ -81,13 +81,13 @@ async fn main() -> io::Result<()> {
             vec![NodeId::new("memory-a")],
         ))
         .link(b_tcp.into_bound_link(1))
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .tunnels(b_tls)
         .start()
         .await?;
     let c = Node::builder(NodeId::new("remote-c"))
         .link(c_tcp.into_bound_link(1))
-        .gossip_interval_ms(50)
+        .gossip_interval(Duration::from_millis(50))
         .tunnels(c_tls)
         .start()
         .await?;
