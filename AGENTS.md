@@ -148,20 +148,32 @@ These hold in every published crate; a change that breaks one is a defect.
 
 - **Configuration** values are plain structs with public fields and
   `Default`, built with struct-update syntax (no `#[non_exhaustive]`). A config
-  with bounds or cross-field rules exposes `validate(&self) -> Result<(), XError>`
-  where `XError` is a typed enum with one variant per violated rule naming the
-  field, implementing `Display` + `Error`, plus `From<XError> for io::Error`
+  that needs mandatory identity or security inputs (a local id, a key, a TLS
+  identity) takes exactly those in a constructor and keeps its operational
+  policy in public, `Default`-able fields or a nested limits value; it never
+  invents a default identity. A config with bounds or cross-field rules exposes
+  `validate(&self) -> Result<(), XError>` where `XError` is a typed enum with one
+  variant per violated rule naming the field, implementing `Display` + `Error`
+  (with `source()` for wrapped errors), plus `From<XError> for io::Error`
   (`InvalidInput`, error kept as the inner error) where the API returns
   `io::Result`. Constructors, binders and builders validate once, before any
-  side effect, and never clamp, correct or ignore a value. A setting that
-  cannot apply in some mode must not exist in that mode: model the mode in the
-  type (`TcpLink<TcpDirect>` vs `TcpLink<TcpConnectivity>`).
+  side effect (no socket, listener, task or reservation exists when validation
+  fails), and never clamp, correct or ignore a value. A setting that cannot
+  apply in some mode must not exist in that mode: model the mode in the type
+  (`TcpLink<TcpDirect>` vs `TcpLink<TcpConnectivity>`, an enum carrying each
+  mode's own options) or reject the call with a typed error.
 - **Bounds**: queue capacities are `QueueCapacity`; other counts that must be
   nonzero are `NonZero*`; async-layer timers are `Duration`. The sans-IO core
   keeps integer milliseconds because its clock is `u64` ms.
 - **Errors**: `io::Error` only at I/O boundaries. Validation and domain
   failures are typed enums (never unit-struct errors) that keep their cause as
   `source()`. Fallible input validation returns `Result`; it never panics.
+- **Exceptions** (the only permitted corrections and panics): `const`
+  constructors meant for compile-time constants (`QueueCapacity::of`,
+  `SegmentSize::of`) may panic, and each has a fallible runtime counterpart
+  (`TryFrom`); helpers named `saturating_*` saturate by name; a timeout or
+  interval longer than a clock or wire field can represent saturates to that
+  maximum (the difference is unobservable), and never overflows or panics.
 - **Construction**: socket-owning endpoints use `bind(..)` / `bind_with(.., config)`;
   in-memory and pure values use `new()` / `with_config(config)`; `*Builder`
   types use bare-noun setters and a terminal `start` / `build` / `bind`; other
@@ -172,11 +184,14 @@ These hold in every published crate; a change that breaks one is a defect.
   after shutdown; live state is an `Option`/`bool` query named as such.
 - **Re-exports**: a crate re-exports every non-core type its public signatures
   require callers to name — sibling-crate types, `bytes::Bytes`, and (under
-  `connectivity`) the punch types TCP/UDP links take. `groupnet-core`'s shared
-  vocabulary (`NodeId`, `GroupId`, `Config`, `Role`, `Status`, …) is never
-  re-exported: consumers depend on `groupnet-core` or the facade. Consistency
-  tiers re-export the tier-specific core domain types their adapters need.
-  Nothing else gets a second path.
+  `connectivity`) the punch types TCP/UDP links take — at one canonical path,
+  gated with the feature that exposes it. A public module whose items are also
+  re-exported at the root is private (one path per item). Async-ecosystem types
+  (`tokio`, `tokio-util`, `futures-io`) in signatures are the runtime contract
+  and are not re-exported. `groupnet-core`'s shared vocabulary (`NodeId`,
+  `GroupId`, `Config`, `Role`, `Status`, `Time`, …) is never re-exported:
+  consumers depend on `groupnet-core` or the facade. Consistency tiers re-export
+  the tier-specific core domain types their adapters need.
 - **Async traits**: statically dispatched adapter traits use
   `fn … -> impl Future<Output = …> + Send`; boxed futures only where object
   safety requires them (`LinkProvider`, `Admission`, `BootstrapDriver`).
