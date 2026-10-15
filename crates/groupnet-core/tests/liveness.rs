@@ -368,14 +368,11 @@ fn a_frame_with_an_unknown_status_code_is_dropped_whole() {
     assert_eq!(a.member_status(&NodeId::new("b")), None);
     assert_eq!(a.member_status(&NodeId::new("c")), None);
 
-    let mut member = member_delta("c", vec![entry("k", 1, 0, false, b"v")]);
+    let mut member = member_delta("c", vec![entry("k", 1, b"v")]);
     member.status = UNKNOWN;
     let effects = a.on_message(
         NodeId::new("b"),
-        &delta_frame(vec![
-            member_delta("b", vec![entry("k", 1, 0, false, b"v")]),
-            member,
-        ]),
+        &delta_frame(vec![member_delta("b", vec![entry("k", 1, b"v")]), member]),
         Time(2),
     );
     assert_eq!(effects, [] as [groupnet_core::Effect; 0]);
