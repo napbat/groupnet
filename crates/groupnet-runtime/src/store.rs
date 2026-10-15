@@ -15,7 +15,7 @@ use groupnet_core::{NodeId, RecoveredGrant};
 
 mod file;
 
-pub use file::FileGrantStore;
+pub use file::{FileGrantStore, GrantStorePathError};
 
 /// Durable storage for one group's voter ledger: the `(epoch, claimant)` pair
 /// this node last granted.

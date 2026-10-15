@@ -32,8 +32,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::{error, fmt};
 
 use groupnet_core::{NodeId, RecoveredGrant};
+use groupnet_transport::NodeIdError;
 
 use super::GrantStore;
 
@@ -46,7 +48,35 @@ const HEADER_LEN: usize = 4 + 1 + 8 + 2;
 /// Trailing checksum bytes.
 const CHECKSUM_LEN: usize = 4;
 /// Largest well-formed record: a maximal claimant between header and checksum.
-const MAX_RECORD_LEN: usize = HEADER_LEN + u16::MAX as usize + CHECKSUM_LEN;
+const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_CLAIMANT_BYTES + CHECKSUM_LEN;
+/// Longest claimant the `u16` length field carries.
+const MAX_CLAIMANT_BYTES: usize = u16::MAX as usize;
+
+/// A [`FileGrantStore::open`] path that cannot hold a grant record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantStorePathError {
+    /// The path names no file (it is empty, a root, or ends in `..`).
+    NoFileName,
+    /// The path's parent exists but is not a directory.
+    ParentNotDirectory,
+}
+
+impl fmt::Display for GrantStorePathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoFileName => f.write_str("grant store path names no file"),
+            Self::ParentNotDirectory => f.write_str("grant store parent is not a directory"),
+        }
+    }
+}
+
+impl error::Error for GrantStorePathError {}
+
+impl From<GrantStorePathError> for io::Error {
+    fn from(error: GrantStorePathError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
 
 /// A durable [`GrantStore`] backed by one file.
 ///
@@ -95,15 +125,13 @@ impl FileGrantStore {
     /// A store whose record lives at `path`. Nothing is read or written yet.
     ///
     /// # Errors
-    /// `NotFound` if the parent directory does not exist, `InvalidInput` if
-    /// `path` names no file or its parent is not a directory.
+    /// `NotFound` if the parent directory does not exist; `InvalidInput`
+    /// wrapping a [`GrantStorePathError`] if `path` names no file or its
+    /// parent is not a directory.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let Some(name) = path.file_name() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "grant store path names no file",
-            ));
+            return Err(GrantStorePathError::NoFileName.into());
         };
         let mut tmp_name = OsString::from(name);
         tmp_name.push(".tmp");
@@ -112,10 +140,7 @@ impl FileGrantStore {
             _ => PathBuf::from("."),
         };
         if !fs::metadata(&dir)?.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "grant store parent is not a directory",
-            ));
+            return Err(GrantStorePathError::ParentNotDirectory.into());
         }
         Ok(Self {
             tmp: dir.join(tmp_name),
@@ -152,6 +177,10 @@ impl FileGrantStore {
 }
 
 impl GrantStore for FileGrantStore {
+    /// # Errors
+    /// `InvalidInput` wrapping the [`NodeIdError`] for an empty claimant or one
+    /// longer than the record's 65,535-byte field, before touching disk; any
+    /// write, sync or rename error.
     fn persist(&self, epoch: u64, claimant: &NodeId) -> io::Result<()> {
         let record = encode(epoch, claimant)?;
         // A poisoned lock only means another persist panicked mid-write; the
@@ -179,15 +208,17 @@ impl GrantStore for FileGrantStore {
 /// Encodes one version-1 record.
 fn encode(epoch: u64, claimant: &NodeId) -> io::Result<Vec<u8>> {
     let id = claimant.as_str().as_bytes();
-    let len = u16::try_from(id.len())
-        .ok()
-        .filter(|len| *len > 0)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "claimant id must be 1..=65535 bytes",
-            )
-        })?;
+    let len = match u16::try_from(id.len()) {
+        Ok(0) => return Err(NodeIdError::Empty.into()),
+        Ok(len) => len,
+        Err(_) => {
+            return Err(NodeIdError::TooLong {
+                len: id.len(),
+                max: MAX_CLAIMANT_BYTES,
+            }
+            .into());
+        }
+    };
     let mut record = Vec::with_capacity(HEADER_LEN + id.len() + CHECKSUM_LEN);
     record.extend_from_slice(&MAGIC);
     record.push(VERSION);
@@ -379,12 +410,47 @@ mod tests {
     fn an_unencodable_claimant_is_refused_before_touching_disk() {
         let scratch = Scratch::new("too-long");
         let store = scratch.store();
-        let huge = NodeId::new("x".repeat(usize::from(u16::MAX) + 1));
-        assert_eq!(
-            store.persist(1, &huge).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
+        let huge = NodeId::new("x".repeat(MAX_CLAIMANT_BYTES + 1));
+        for (claimant, expected) in [
+            (
+                huge,
+                NodeIdError::TooLong {
+                    len: MAX_CLAIMANT_BYTES + 1,
+                    max: MAX_CLAIMANT_BYTES,
+                },
+            ),
+            (NodeId::new(""), NodeIdError::Empty),
+        ] {
+            let err = store.persist(1, &claimant).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                err.get_ref()
+                    .and_then(|inner| inner.downcast_ref::<NodeIdError>()),
+                Some(&expected)
+            );
+        }
         assert_eq!(store.load().unwrap(), RecoveredGrant::none());
+    }
+
+    #[test]
+    fn a_path_without_a_file_or_directory_parent_is_a_typed_error() {
+        let scratch = Scratch::new("bad-path");
+        let typed = |err: io::Error| {
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            *err.get_ref()
+                .and_then(|inner| inner.downcast_ref::<GrantStorePathError>())
+                .expect("typed path error")
+        };
+        assert_eq!(
+            typed(FileGrantStore::open(scratch.0.join("..")).unwrap_err()),
+            GrantStorePathError::NoFileName
+        );
+        let file = scratch.0.join("file");
+        fs::write(&file, b"").unwrap();
+        assert_eq!(
+            typed(FileGrantStore::open(file.join("grant")).unwrap_err()),
+            GrantStorePathError::ParentNotDirectory
+        );
     }
 
     #[test]

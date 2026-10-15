@@ -325,6 +325,38 @@ impl From<UnorderedOptionsError> for io::Error {
     }
 }
 
+/// A message an established [`UnorderedSession`] refuses before sending it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnorderedSendError {
+    /// The message exceeds the session's negotiated payload bound: the lower
+    /// of both peers' [`UnorderedConfig::max_payload`] and the routed room.
+    PayloadTooLarge {
+        /// The rejected message length.
+        len: usize,
+        /// The session's negotiated maximum message length.
+        max: NonZeroUsize,
+    },
+}
+
+impl fmt::Display for UnorderedSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge { len, max } => write!(
+                f,
+                "unordered message of {len} bytes exceeds the session's {max}-byte bound"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnorderedSendError {}
+
+impl From<UnorderedSendError> for io::Error {
+    fn from(error: UnorderedSendError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
 /// A shared, bounded authenticated unordered protocol engine.
 #[derive(Clone, Debug)]
 pub struct UnorderedProtocol {

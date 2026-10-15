@@ -5,15 +5,15 @@ use std::sync::{Arc, atomic::Ordering};
 
 use bytes::{Buf, Bytes};
 use groupnet_core::NodeId;
-use groupnet_transport::Inbound;
 use groupnet_transport::admission::SessionId;
 use groupnet_transport::link::AdmittedInbound;
+use groupnet_transport::{Inbound, MAX_NODE_ID_BYTES, validate_node_id};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{
     AdvertisedRoute, ApplicationPacket, Candidate, Event, PacketBuffer, Queued, Route,
-    RouterConfig, Shared, Table, TransportId, closed, replay::ReplayWindows,
+    RoutedSendError, RouterConfig, Shared, Table, TransportId, closed, replay::ReplayWindows,
 };
 use crate::wire::{self, Frame, PayloadKind, Reassembly};
 
@@ -40,15 +40,18 @@ impl Shared {
         if self.cancel.is_cancelled() {
             return Err(closed());
         }
-        if !wire::id_valid(to)
-            || payload.len()
-                > self
-                    .config
-                    .max_frame
-                    .get()
-                    .saturating_sub(kind.header_len(&self.local, to))
-        {
-            return Err(wire::invalid("routed message exceeds bound"));
+        validate_node_id(to, MAX_NODE_ID_BYTES).map_err(RoutedSendError::Destination)?;
+        let max = self
+            .config
+            .max_frame
+            .get()
+            .saturating_sub(kind.header_len(&self.local, to));
+        if payload.len() > max {
+            return Err(RoutedSendError::PayloadTooLarge {
+                len: payload.len(),
+                max,
+            }
+            .into());
         }
         if to == &self.local {
             return self.deliver_owned(kind, self.local.clone(), payload);

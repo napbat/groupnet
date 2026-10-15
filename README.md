@@ -105,8 +105,9 @@ Every runtime node owns a routed network. Use
 protocol choices do not change the `Node` type or its coordination API. Links and
 membership settings share one builder; startup binds all links before spawning
 coordination. `groupnet-transport` without features and `groupnet` with
-`default-features = false` retain their dependency-free core surface. Protocol
-implementations never enter `groupnet-core`.
+`default-features = false` stay runtime-free: `groupnet-core` is
+dependency-free, and the transport traits add only `bytes`, no async runtime.
+Protocol implementations never enter `groupnet-core`.
 
 `groupnet-network` implements routed networks independently of the transport
 contracts and protocol implementations. The facade exposes it as

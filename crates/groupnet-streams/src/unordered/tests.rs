@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use super::{
     UnorderedConfigError,
     UnorderedDelivery::{Reliable, Unreliable},
-    UnorderedOptions, UnorderedOptionsError, ValidUnorderedConfig,
+    UnorderedOptions, UnorderedOptionsError, UnorderedSendError, ValidUnorderedConfig,
     wire::{self, Kind, TxCrypto, Window},
 };
 use fabric::{DROP_ALL, DROP_FIRST, Fabric, HOLD_FIRST, PASS, TAMPER_FIRST, config};
@@ -562,15 +562,26 @@ async fn pinned_admission_and_negotiated_payload_bounds_are_enforced() {
         .await
         .unwrap_err();
     assert_eq!(unadmitted.kind(), io::ErrorKind::PermissionDenied);
+    let too_large = UnorderedSendError::PayloadTooLarge {
+        len: 5,
+        max: NonZeroUsize::new(4).unwrap(),
+    };
     for policy in [Reliable, Unreliable] {
         let (a, b) = fabric.pair(policy).await;
-        assert_eq!(
-            a.send(Bytes::from_static(b"12345"))
+        // Both ends hold the negotiated bound: the larger side was lowered.
+        for session in [&a, &b] {
+            let error = session
+                .send(Bytes::from_static(b"12345"))
                 .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<UnorderedSendError>()),
+                Some(&too_large)
+            );
+        }
         a.send(Bytes::from_static(b"1234")).await.unwrap();
         assert_eq!(b.recv().await.unwrap(), b"1234"[..]);
     }

@@ -27,7 +27,8 @@ pub use ordered::{
 };
 pub use unordered::{
     UnorderedConfig, UnorderedConfigError, UnorderedDelivery, UnorderedOptions,
-    UnorderedOptionsError, UnorderedProtocol, UnorderedSession, ValidUnorderedConfig,
+    UnorderedOptionsError, UnorderedProtocol, UnorderedSendError, UnorderedSession,
+    ValidUnorderedConfig,
 };
 
 /// A statically dispatched protocol establishing sessions with logical peers.

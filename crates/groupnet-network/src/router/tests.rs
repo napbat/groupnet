@@ -298,15 +298,18 @@ async fn send_validation_keeps_ordinary_capacity_and_prices_only_application_nam
             };
             assert_eq!(received, payload);
             payload.push(7);
-            assert_eq!(
-                router
-                    .inner
-                    .shared
-                    .send(router.local_id(), &payload, kind)
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::InvalidData
-            );
+            let error = router
+                .inner
+                .shared
+                .send(router.local_id(), &payload, kind)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<RoutedSendError>()),
+                Some(RoutedSendError::PayloadTooLarge { len, max }) if *len == payload.len() && *max + 1 == *len
+            ));
         }
         router.close().await;
     }

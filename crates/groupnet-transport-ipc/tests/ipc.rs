@@ -5,7 +5,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_network::Router;
+use groupnet_network::{RoutedSendError, Router};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::link::{LinkConfigError, LinkLifecycle, LinkProvider};
@@ -508,13 +508,17 @@ async fn provider_routes_bounded_frames_and_router_drains_listener() {
     })
     .await;
     assert_eq!(left.route_to(right.local_id()).unwrap().cost, 7);
-    assert_eq!(
-        left.send(right.local_id(), &vec![0x5a; MAX_FRAME + 1])
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidData
-    );
+    let oversized = left
+        .send(right.local_id(), &vec![0x5a; MAX_FRAME + 1])
+        .await
+        .unwrap_err();
+    assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
+    assert!(matches!(
+        oversized
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<RoutedSendError>()),
+        Some(RoutedSendError::PayloadTooLarge { .. })
+    ));
     let payload = vec![0x5a; 60_000];
     left.send(right.local_id(), &payload).await.unwrap();
     let received = timeout(DEADLINE, right.recv()).await.unwrap().unwrap();

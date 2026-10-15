@@ -80,9 +80,11 @@
 //!
 //! The sibling-crate types this crate's signatures take or return are
 //! re-exported: routing and tunnel types ([`Router`], [`RouterConfig`],
-//! [`TunnelConfig`], [`TunnelTransport`], [`LinkProvider`]) and session types
+//! [`TunnelConfig`], [`TunnelTransport`], [`LinkProvider`]), session types
 //! ([`OrderedProtocol`], [`TunneledStream`], [`UnorderedProtocol`],
-//! [`UnorderedSession`], …) at the root, and message types in [`messaging`].
+//! [`UnorderedSession`], [`UnorderedSendError`], …) and the [`NodeIdError`]
+//! that identity rejections carry at the root, and message types in
+//! [`messaging`].
 //!
 //! [`GroupEngine`]: groupnet_core::GroupEngine
 //! [`join_group`]: Node::join_group
@@ -119,8 +121,9 @@ pub use groupnet_network::{LinkProvider, Router, RouterConfig, TunnelConfig, Tun
 pub use groupnet_streams::{
     OrderedConfig, OrderedConfigError, OrderedProtocol, SessionProtocol, StreamProtocolId,
     UnorderedConfig, UnorderedConfigError, UnorderedDelivery, UnorderedOptions,
-    UnorderedOptionsError, UnorderedProtocol, UnorderedSession,
+    UnorderedOptionsError, UnorderedProtocol, UnorderedSendError, UnorderedSession,
 };
+pub use groupnet_transport::NodeIdError;
 pub use node::{
     Endpoint, GroupProfile, ManagedProtocol, Messages, Node, NodeBuilder, Ordered, Peer,
     PeerImplementation, ReceiveBinding, Unordered,
@@ -132,4 +135,4 @@ pub use seeds::{
     DEFAULT_REFRESH_INTERVAL, DEFAULT_RETRY_INTERVAL, DEFAULT_STARTUP_ATTEMPTS, NamedSeeds,
     NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
 };
-pub use store::{FileGrantStore, GrantStore, VoterStorage};
+pub use store::{FileGrantStore, GrantStore, GrantStorePathError, VoterStorage};
