@@ -33,11 +33,15 @@
 //! tunnels without a shared dispatcher, a tag byte, or ever receiving each
 //! other's streams. Every node must agree on what each protocol id means.
 //!
-//! This crate supplies no managed protocol binding: on a shared plane the
-//! application's dispatcher is the **only** accept loop, and every inbound
-//! consumer — RPC included — is served through it. Independent accept loops
-//! (an RPC [`bind`](RpcServer::bind) beside a runtime `Ordered` endpoint, say)
-//! would race for the same inbound streams and are not supported.
+//! This crate supplies no managed protocol binding of its own, and accept
+//! loops compete only within one scope: consumers that accept on the same
+//! `StreamProtocolId` (two `node.endpoint(Ordered::protocol(id))` handles with
+//! the same `id`, including `Ordered::new()`'s `StreamProtocolId::DEFAULT`, or
+//! an RPC [`bind`](RpcServer::bind) beside another loop on RPC's protocol)
+//! share one inbound queue and race for its streams. Give each consumer its
+//! own protocol id, or make one application dispatcher the only accept loop of
+//! a shared scope and hand RPC's streams to [`RpcServer::serve`]. Likewise, a
+//! plain plane such as one `TcpBulkTransport` has a single inbound scope.
 //!
 //! ```no_run
 //! use std::time::Duration;

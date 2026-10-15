@@ -53,6 +53,8 @@ use crate::{Router, TunnelConfig};
 use bytes::Bytes;
 use wire::{Kind, Packet, SessionId};
 
+/// The rustls version whose error types [`TlsIdentityError`]'s variants carry.
+pub use rustls;
 pub use stream::TunneledStream;
 pub use tls::{PeerIdentity, PeerIdentityError, TlsIdentity, TlsIdentityError};
 

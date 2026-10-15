@@ -20,9 +20,11 @@
 //!   one is not re-taught. A failed lookup keeps the last address — a DNS blip
 //!   must not churn the book.
 //!
-//! An interval longer than the clock can schedule (up to [`Duration::MAX`])
-//! saturates to the furthest representable wait: the seed is simply not
-//! retried within the node's life, and the resolver never overflows.
+//! Every representable interval is waited exactly. An interval that takes the
+//! next attempt beyond what the clock can represent (up to [`Duration::MAX`])
+//! leaves that seed with no deadline: it is not retried within the node's
+//! life, the resolver never overflows, and once no seed has a deadline the
+//! task waits for cancellation only.
 //!
 //! Every named seed joins the node's seed set at [`start`](crate::NodeBuilder::start),
 //! so every group contacts it the moment its address is known; until then a
@@ -60,10 +62,6 @@ pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// The shortest interval [`NamedSeeds::validate`] accepts: a zero would
 /// busy-spin the resolver task.
 const MIN_INTERVAL: Duration = Duration::from_millis(1);
-
-/// The longest wait the resolver schedules (about thirty years, Tokio's own
-/// "far future"): a longer interval saturates here, an unobservable difference.
-const MAX_WAIT: Duration = Duration::from_hours(24 * 365 * 30);
 
 /// A future returned by [`SeedResolver::resolve`].
 ///
@@ -198,7 +196,7 @@ impl NamedSeeds {
 
     /// The wait between attempts while a seed has never resolved. Stored as
     /// given; [`validate`](Self::validate) rejects anything under 1 ms, and a
-    /// wait beyond what the clock can schedule saturates.
+    /// wait beyond what the clock can represent leaves the seed unscheduled.
     #[must_use]
     pub fn with_retry_interval(mut self, interval: Duration) -> Self {
         self.retry_interval = interval;
@@ -216,7 +214,7 @@ impl NamedSeeds {
     /// The re-resolution cadence once a seed has resolved, and the retry
     /// cadence after its startup window. Stored as given;
     /// [`validate`](Self::validate) rejects anything under 1 ms, and a wait
-    /// beyond what the clock can schedule saturates.
+    /// beyond what the clock can represent leaves the seed unscheduled.
     #[must_use]
     pub fn with_refresh_interval(mut self, interval: Duration) -> Self {
         self.refresh_interval = interval;
@@ -314,8 +312,9 @@ struct Slot {
     current: Option<SocketAddr>,
     /// Failed attempts before the first success.
     failures: u32,
-    /// When the next attempt is due.
-    due: Instant,
+    /// When the next attempt is due; `None` when that lies beyond the clock,
+    /// so the seed is never attempted again.
+    due: Option<Instant>,
 }
 
 /// Resolves `seeds` for the life of `transport`, teaching each new address via
@@ -337,38 +336,27 @@ pub(crate) async fn resolve_named_seeds<T: Transport>(
             name: name.clone(),
             current: None,
             failures: 0,
-            due: start,
+            due: Some(start),
         })
         .collect();
-    loop {
-        let Some(next) = slots.iter().map(|slot| slot.due).min() else {
-            return;
-        };
-        tokio::time::sleep_until(next).await;
+    while !slots.is_empty() {
+        match slots.iter().filter_map(|slot| slot.due).min() {
+            Some(next) => tokio::time::sleep_until(next).await,
+            // No attempt is representable on the clock: only cancellation ends
+            // the wait.
+            None => std::future::pending().await,
+        }
         for slot in &mut slots {
-            if slot.due > Instant::now() {
+            if slot.due.is_none_or(|due| due > Instant::now()) {
                 continue;
             }
             let outcome = seeds.resolver.resolve(&slot.name).await;
             let Some(transport) = transport.upgrade() else {
                 return;
             };
-            let now = Instant::now();
-            slot.due = schedule(now, attempt(&*transport, slot, outcome, &seeds));
+            let wait = attempt(&*transport, slot, outcome, &seeds);
+            slot.due = Instant::now().checked_add(wait);
         }
-    }
-}
-
-/// The instant `wait` after `now`, saturating at [`MAX_WAIT`] instead of
-/// overflowing the clock. Halving finds the furthest representable instant on
-/// a platform whose clock cannot reach `now + MAX_WAIT`.
-fn schedule(now: Instant, wait: Duration) -> Instant {
-    let mut wait = wait.min(MAX_WAIT);
-    loop {
-        if let Some(due) = now.checked_add(wait) {
-            return due;
-        }
-        wait /= 2;
     }
 }
 

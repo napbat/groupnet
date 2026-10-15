@@ -82,11 +82,13 @@ impl MessagingConfig {
         Ok(())
     }
 
-    /// Validates an operation against this endpoint's configured bounds.
+    /// Validates an operation against these bounds. Total on any configuration,
+    /// validated or not.
     ///
     /// # Errors
-    /// Returns the [`SendValidationError`] naming an oversized payload or an
-    /// acknowledgement deadline outside `(0, max_timeout]`.
+    /// Returns the [`SendValidationError`] naming an oversized payload, an
+    /// acknowledgement deadline outside `(0, max_timeout]`, or a deadline the
+    /// wire's `u64` milliseconds cannot carry.
     pub fn validate_send(
         &self,
         options: SendOptions,
@@ -95,10 +97,9 @@ impl MessagingConfig {
         self.retry_horizon_ms(options, payload_len).map(drop)
     }
 
-    /// Validates a send once against these (validated) bounds and returns its
-    /// wire retry horizon: zero for best effort, else the deadline rounded up
-    /// to milliseconds. Bounded by `max_payload`/`max_timeout`, a passing send
-    /// is wire-representable without re-checking.
+    /// Validates a send once against these bounds and returns its wire retry
+    /// horizon: zero for best effort, else the deadline rounded up to
+    /// milliseconds.
     pub(crate) fn retry_horizon_ms(
         &self,
         options: SendOptions,
@@ -122,7 +123,7 @@ impl MessagingConfig {
                 max: self.max_timeout,
             });
         }
-        Ok(timeout_ms(timeout).expect("a timeout within the validated max_timeout fits"))
+        timeout_ms(timeout).ok_or(SendValidationError::UnrepresentableTimeout { timeout })
     }
 
     pub(crate) fn retention_ms(&self) -> u64 {
@@ -195,6 +196,13 @@ pub enum SendValidationError {
         /// The configured `max_timeout`.
         max: Duration,
     },
+    /// An acknowledged send's deadline exceeds the wire's `u64` milliseconds
+    /// or the monotonic clock. A deadline within `max_timeout` of a
+    /// configuration that passed [`MessagingConfig::validate`] fits both.
+    UnrepresentableTimeout {
+        /// The rejected deadline.
+        timeout: Duration,
+    },
 }
 
 impl fmt::Display for SendValidationError {
@@ -208,6 +216,10 @@ impl fmt::Display for SendValidationError {
             Self::TimeoutAboveMax { timeout, max } => write!(
                 f,
                 "acknowledged send timeout {timeout:?} exceeds max_timeout {max:?}"
+            ),
+            Self::UnrepresentableTimeout { timeout } => write!(
+                f,
+                "acknowledged send timeout {timeout:?} exceeds the wire or monotonic clock"
             ),
         }
     }
@@ -419,6 +431,43 @@ mod tests {
                 Some(&expected)
             );
         }
+    }
+
+    #[test]
+    fn standalone_send_check_is_total_on_unrepresentable_timeouts() {
+        let unvalidated = MessagingConfig {
+            max_timeout: Duration::MAX,
+            ..MessagingConfig::default()
+        };
+        assert!(unvalidated.validate().is_err());
+        let beyond_wire = Duration::from_millis(u64::MAX) + Duration::from_nanos(1);
+        for timeout in [Duration::MAX, beyond_wire] {
+            for options in [
+                SendOptions::Delivered { timeout },
+                SendOptions::Applied { timeout },
+            ] {
+                let expected = SendValidationError::UnrepresentableTimeout { timeout };
+                assert_eq!(unvalidated.validate_send(options, 0), Err(expected));
+                assert_eq!(unvalidated.retry_horizon_ms(options, 0), Err(expected));
+                let error = io::Error::from(expected);
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(
+                    error
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<SendValidationError>()),
+                    Some(&expected)
+                );
+            }
+        }
+        let wire_max = Duration::from_millis(u64::MAX);
+        assert_eq!(
+            unvalidated.retry_horizon_ms(SendOptions::Applied { timeout: wire_max }, 0),
+            Ok(u64::MAX)
+        );
+        assert_eq!(
+            unvalidated.validate_send(SendOptions::BestEffort, 0),
+            Ok(())
+        );
     }
 
     #[test]

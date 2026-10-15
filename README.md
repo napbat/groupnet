@@ -660,7 +660,7 @@ Initialization returns a non-generic `Node`. Every node clone retains network
 ownership; a raw router clone or group handle does not. Closing any node clone
 closes connections for all of them; dropping the last node clone initiates
 shutdown. Configure membership with `.config(...)`, `.seed(...)`,
-`.named_seeds(...)`, and the timing setters (`gossip_interval_ms`,
+`.named_seeds(...)`, and the timing setters (`gossip_interval(Duration)`,
 `gossip_fanout`, `max_delta_frame_bytes`, `full_digest_every`; the counts are
 `NonZero*` values) directly on the same builder. `start()` validates the core
 `Config` first and fails with its field-specific `ConfigError` instead of
