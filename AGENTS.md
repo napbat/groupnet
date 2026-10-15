@@ -52,12 +52,11 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    there. (Largest today, and the only ones still within ~60 lines of the
    limit, so the next addition to them splits them *first*:
    `groupnet-consistency`'s `tests/lease-dst.rs` ~980, `tests/replication.rs`
-   ~974, `src/replication/shell/driver.rs` ~967,
-   `src/volatile_recovery/bootstrap/bulk_wire/phase.rs` ~946 (its reply side
-   lives in `phase/reply.rs`), `tests/volatile-bootstrap-runtime/scenarios.rs`
-   ~938 (new runtime scenarios go in their own `volatile-bootstrap-runtime/`
-   children, as `follower_progress.rs` does; the parent `main.rs`, ~649, keeps
-   the shared fakes) and `tests/volatile-bootstrap-bulk-adapter.rs` ~951;
+   ~970, `src/replication/shell/driver.rs` ~968,
+   `tests/volatile-bootstrap-runtime/scenarios.rs` ~938 (new runtime
+   scenarios go in their own `volatile-bootstrap-runtime/` children, as
+   `follower_progress.rs` does; the parent `main.rs`, ~649, keeps the shared
+   fakes) and `tests/volatile-bootstrap-bulk-adapter.rs` ~955;
    `groupnet-runtime`'s `src/driver.rs` ~960; `groupnet-core`'s
    `src/volatile_recovery/tests.rs` ~940 (the next lapse-arm test goes in a
    sibling file, as `peer_tests.rs` and `seal_tests.rs` did). The band under
@@ -77,7 +76,7 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `tests/lease-dst-liveness.rs` ~883, `tests/hosted-dst-liveness.rs` ~880,
    `tests/replication-snapshot.rs` ~870,
    `src/volatile_recovery/bootstrap/session/run.rs` ~869,
-   `tests/replication-ack.rs` ~864 and `src/lease/shell.rs` ~863 (a coherent
+   `tests/replication-ack.rs` ~862 and `src/lease/shell.rs` ~863 (a coherent
    write's wait lives in `lease/shell/writes.rs`); `groupnet-transport-tcp`'s
    `src/msg.rs` ~886 and `src/msg/admitted/tests.rs` ~870;
    `groupnet-transport-punch`'s `src/punch/server.rs` ~885;
@@ -89,9 +88,11 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `group/roster.rs`); `groupnet-consistency`'s
    `src/replication/shell/driver/snapshot.rs` ~847, `src/hosted/writes.rs`
    ~840, `src/hosted/handoff/stream.rs` ~828, `src/hosted/lineage.rs` ~818,
-   `src/volatile_recovery/bootstrap/bulk_wire.rs` ~808,
+   `src/volatile_recovery/bootstrap/bulk_wire.rs` ~832,
+   `src/volatile_recovery/bootstrap/bulk_wire/phase/reply.rs` ~803 (requests
+   stay in `phase.rs`, ~678, and its tests in `phase/tests.rs`),
    `src/volatile_recovery/shell.rs` ~765, `tests/handoff-fence.rs` ~759,
-   `src/volatile_recovery/bootstrap/ports.rs` ~763,
+   `src/volatile_recovery/bootstrap/ports.rs` ~764,
    `tests/handoff-migration.rs` ~757, `tests/hosted-migration.rs` ~748,
    `src/hosted/ledger.rs` ~742, `tests/handoff.rs` ~740,
    `src/hosted/handoff/wire.rs` ~721 and `tests/handoff-resync.rs` ~715;
