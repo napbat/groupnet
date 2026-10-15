@@ -52,12 +52,12 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    there. (Largest today, and the only ones still within ~60 lines of the
    limit, so the next addition to them splits them *first*:
    `groupnet-consistency`'s `tests/lease-dst.rs` ~980, `tests/replication.rs`
-   ~969, `src/replication/shell/driver.rs` ~967,
+   ~969, `src/replication/shell/driver.rs` ~975,
    `src/volatile_recovery/bootstrap/bulk_wire/phase.rs` ~946 (its reply side
    lives in `phase/reply.rs`), `tests/volatile-bootstrap-runtime/scenarios.rs`
-   ~944 (new runtime scenarios go in their own `volatile-bootstrap-runtime/`
+   ~938 (new runtime scenarios go in their own `volatile-bootstrap-runtime/`
    children, as `follower_progress.rs` does; the parent `main.rs`, ~649, keeps
-   the shared fakes) and `tests/volatile-bootstrap-bulk-adapter.rs` ~942;
+   the shared fakes) and `tests/volatile-bootstrap-bulk-adapter.rs` ~951;
    `groupnet-runtime`'s `src/driver.rs` ~960; `groupnet-core`'s
    `src/volatile_recovery/tests.rs` ~940 (the next lapse-arm test goes in a
    sibling file, as `peer_tests.rs` and `seal_tests.rs` did). The band under
@@ -69,14 +69,14 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `src/engine/election.rs` ~872, `src/volatile_recovery/engine.rs` ~870 (its
    fallback paths moved to `engine/fallback.rs`, its head evidence to
    `engine/evidence.rs`), `src/replication/session/subscription.rs` ~864,
-   `src/engine/election/quorum.rs` ~863 and
-   `src/volatile_bootstrap/journal/tests.rs` ~850; `groupnet-runtime`'s
+   `src/engine/election/quorum.rs` ~855 and
+   `src/volatile_bootstrap/journal/tests.rs` ~891; `groupnet-runtime`'s
    `tests/typed-protocols.rs` ~924 and `src/group/entries.rs` ~850;
    `groupnet-sim`'s `tests/election-external-skew.rs` ~909 and
    `tests/election-quorum.rs` ~892; `groupnet-consistency`'s
    `src/lease/core.rs` ~902, `src/replication/shell.rs` ~895,
    `tests/lease-dst-liveness.rs` ~883, `tests/hosted-dst-liveness.rs` ~880,
-   `tests/replication-snapshot.rs` ~870,
+   `tests/replication-snapshot.rs` ~874,
    `src/volatile_recovery/bootstrap/session/run.rs` ~869,
    `tests/replication-ack.rs` ~864 and `src/lease/shell.rs` ~863 (a coherent
    write's wait lives in `lease/shell/writes.rs`); `groupnet-transport-tcp`'s
@@ -87,20 +87,20 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `tests/quorum.rs` ~716 (`src/group.rs`, ~463, keeps the handle; entries
    live in `group/entries.rs`, membership and status reads in
    `group/roster.rs`); `groupnet-consistency`'s
-   `src/replication/shell/driver/snapshot.rs` ~843, `src/hosted/writes.rs`
+   `src/replication/shell/driver/snapshot.rs` ~853, `src/hosted/writes.rs`
    ~840, `src/hosted/handoff/stream.rs` ~828, `src/hosted/lineage.rs` ~818,
    `src/volatile_recovery/bootstrap/bulk_wire.rs` ~808,
    `src/volatile_recovery/shell.rs` ~765, `tests/handoff-fence.rs` ~759,
-   `src/volatile_recovery/bootstrap/ports.rs` ~758,
+   `src/volatile_recovery/bootstrap/ports.rs` ~763,
    `tests/handoff-migration.rs` ~757, `tests/hosted-migration.rs` ~748,
    `src/hosted/ledger.rs` ~742, `tests/handoff.rs` ~740,
    `src/hosted/handoff/wire.rs` ~721 and `tests/handoff-resync.rs` ~715;
-   `groupnet-core`'s `src/volatile_bootstrap/journal/core.rs` ~793,
+   `groupnet-core`'s `src/volatile_bootstrap/journal/core.rs` ~783,
    `src/replication/subscription.rs` ~786 and `tests/state.rs` ~778;
    `groupnet-transport-tcp`'s `src/msg/admitted/tests.rs` ~846;
    `groupnet-transport-punch`'s `src/tcp/endpoint.rs` ~844 and
    `src/punch/wire.rs` ~780; `groupnet-transport-udp`'s `src/udp.rs` ~775;
-   `groupnet-messaging`'s `src/tests.rs` ~757;
+   `groupnet-messaging`'s `src/tests.rs` ~808;
    `groupnet-sim/tests/election-external.rs` ~785. `groupnet-sim`'s
    `simulation.rs` (~559) delegates probe/liveness dispatch to
    `simulation/liveness.rs` and the anchor driver to `simulation/external.rs`;
