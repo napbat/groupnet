@@ -1,6 +1,7 @@
 //! Bounded, versioned native-entry encoding for advisory bootstrap claims.
 
 use std::fmt::Write;
+use std::num::NonZeroUsize;
 
 use super::{
     BootId, BootstrapClaim, BootstrapConfig, BootstrapPresence, BootstrapScope, ClaimIdentity,
@@ -40,9 +41,9 @@ impl std::error::Error for ClaimCodecError {}
 /// Rejects an empty scope or a key that exceeds `max_key_bytes`.
 pub fn claim_entry_key(
     scope: &BootstrapScope,
-    max_key_bytes: usize,
+    max_key_bytes: NonZeroUsize,
 ) -> Result<String, ClaimCodecError> {
-    if scope.domain.is_empty() || scope.partition.is_empty() || max_key_bytes == 0 {
+    if scope.domain.is_empty() || scope.partition.is_empty() {
         return Err(ClaimCodecError::Bound);
     }
     let prefix_len = "~volatile-bootstrap/v1/".len();
@@ -52,7 +53,7 @@ pub fn claim_entry_key(
         .and_then(|n| n.checked_add(scope.domain.len()))
         .and_then(|n| n.checked_add(scope.partition.len()))
         .ok_or(ClaimCodecError::Bound)?;
-    if size > max_key_bytes {
+    if size > max_key_bytes.get() {
         return Err(ClaimCodecError::Bound);
     }
     let mut key = String::new();
@@ -230,9 +231,9 @@ pub fn decode_claim_value(
 /// Rejects empty or over-limit scope names.
 pub fn presence_entry_key(
     scope: &BootstrapScope,
-    max_key_bytes: usize,
+    max_key_bytes: NonZeroUsize,
 ) -> Result<String, ClaimCodecError> {
-    if scope.domain.is_empty() || scope.partition.is_empty() || max_key_bytes == 0 {
+    if scope.domain.is_empty() || scope.partition.is_empty() {
         return Err(ClaimCodecError::Bound);
     }
     let prefix = "~volatile-presence/v1/";
@@ -243,7 +244,7 @@ pub fn presence_entry_key(
         .and_then(|n| n.checked_add(scope.domain.len()))
         .and_then(|n| n.checked_add(scope.partition.len()))
         .ok_or(ClaimCodecError::Bound)?;
-    if size > max_key_bytes {
+    if size > max_key_bytes.get() {
         return Err(ClaimCodecError::Bound);
     }
     let mut key = String::new();
@@ -521,10 +522,26 @@ mod tests {
             domain: "a:".into(),
             partition: "b".into(),
         };
+        let max_key = NonZeroUsize::new(128).unwrap();
         assert_ne!(
-            claim_entry_key(&left, 128).unwrap(),
-            claim_entry_key(&right, 128).unwrap()
+            claim_entry_key(&left, max_key).unwrap(),
+            claim_entry_key(&right, max_key).unwrap()
         );
+    }
+
+    #[test]
+    fn entry_keys_fit_an_exact_nonzero_budget() {
+        for key in [claim_entry_key, presence_entry_key] {
+            let unbounded = key(&scope(), NonZeroUsize::MAX).unwrap();
+            let exact = NonZeroUsize::new(unbounded.len()).unwrap();
+            assert_eq!(key(&scope(), exact), Ok(unbounded));
+            let short = NonZeroUsize::new(exact.get() - 1).unwrap();
+            assert_eq!(key(&scope(), short), Err(ClaimCodecError::Bound));
+            assert_eq!(
+                key(&scope(), NonZeroUsize::MIN),
+                Err(ClaimCodecError::Bound)
+            );
+        }
     }
 
     #[test]
@@ -627,9 +644,10 @@ mod tests {
         assert_eq!(decoded.identity, presence.identity);
         assert_eq!(decoded.renewal, 4);
         assert_eq!(decoded.remaining_ms, 0);
+        let max_key = NonZeroUsize::new(256).unwrap();
         assert_ne!(
-            presence_entry_key(&scope(), 256).unwrap(),
-            claim_entry_key(&scope(), 256).unwrap()
+            presence_entry_key(&scope(), max_key).unwrap(),
+            claim_entry_key(&scope(), max_key).unwrap()
         );
         let mut trailing = bytes.clone();
         trailing.push(0);

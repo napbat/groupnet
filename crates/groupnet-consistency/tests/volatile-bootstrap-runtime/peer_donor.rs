@@ -82,7 +82,7 @@ impl PeerDonor {
         admission: &ByteAdmission,
         event: TransferEvent,
     ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
-        let charge = admission.reserve(AdmissionClass::Inflight, 256)?;
+        let charge = admission.reserve(AdmissionClass::Inflight, nz(256))?;
         Ok(Some(charge.hold(event)))
     }
 }
@@ -135,7 +135,7 @@ impl DonorPort for PeerDonor {
         } = call;
         match effect {
             TransferEffect::FetchOffer { op, .. } => {
-                let charge = admission.reserve(AdmissionClass::Inflight, 256)?;
+                let charge = admission.reserve(AdmissionClass::Inflight, nz(256))?;
                 Ok(Some(charge.hold(TransferEvent::Offered {
                     op,
                     offer: self.offer.clone(),
@@ -147,8 +147,8 @@ impl DonorPort for PeerDonor {
                 decoded_bytes,
                 ..
             } => {
-                let encoded = admission.reserve(AdmissionClass::Encoded, encoded_bytes.get())?;
-                let decoded = admission.reserve(AdmissionClass::Decoded, decoded_bytes.get())?;
+                let encoded = admission.reserve(AdmissionClass::Encoded, encoded_bytes)?;
+                let decoded = admission.reserve(AdmissionClass::Decoded, decoded_bytes)?;
                 resources.stage = Some(StageResources::new(Vec::new(), encoded, decoded)?);
                 Self::admitted(admission, TransferEvent::StageReserved { op })
             }

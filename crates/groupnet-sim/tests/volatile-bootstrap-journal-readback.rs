@@ -120,7 +120,7 @@ fn seeded_lost_duplicate_reordered_replies_recover_or_expire_without_wrong_ack()
             journal.read_batch(Time(4), &reservation, &barrier),
             Ok(Some(batch.clone()))
         );
-        assert_eq!(journal.inflight_bytes(), batch.bytes);
+        assert_eq!(journal.inflight_bytes(), batch.bytes.get());
         let wrong_operation = batch.operation.checked_add(1).unwrap();
         assert_eq!(
             journal.ack_batch(Time(5), &reservation, wrong_operation, &batch.through),

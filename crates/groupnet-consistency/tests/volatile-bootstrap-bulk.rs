@@ -2,6 +2,7 @@
 
 #![cfg(feature = "volatile-bootstrap-bulk")]
 
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
@@ -213,7 +214,7 @@ async fn full_donor_inbox_returns_exact_capacity_refusal_and_retires_charge() {
     let (sender, inbox) = DonorInbox::new(QueueCapacity::of(1));
     inbox.set_identity(Some(correlation.donor.clone()));
     let occupied = server_budget
-        .reserve(AdmissionClass::Inflight, 512)
+        .reserve(AdmissionClass::Inflight, NonZeroUsize::new(512).unwrap())
         .unwrap()
         .hold(request.clone());
     let pending = sender.try_submit(occupied).unwrap();

@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
-    Comparison, Cursor, InstallPermit, Limits, Materialized, OpenError, ProofId, ReadVerdict,
-    Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory,
-    SourceProof, Stage, Stream, TailLimit,
+    AdapterFailure, ApplicationAdapter, ApplyRequest, BoundComparison, CatchUp, Checkpoint,
+    CheckpointLimit, Comparison, Cursor, InstallPermit, Limits, Materialized, OpenError, ProofId,
+    ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch,
+    SourceHistory, SourceProof, Stage, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -246,9 +246,9 @@ impl ApplicationAdapter<u64, u64> for MemApp {
     async fn apply(
         &self,
         _scope: Scope,
-        _from: u64,
-        through: u64,
-        native: u64,
+        ApplyRequest {
+            through, native, ..
+        }: ApplyRequest<u64, u64>,
         permit: InstallPermit,
     ) -> Result<Materialized<u64>, AdapterFailure<io::Error>> {
         assert_eq!(through, native);
@@ -320,12 +320,10 @@ impl ApplicationAdapter<u64, u64> for DetachedRevokeApp {
     async fn apply(
         &self,
         scope: Scope,
-        from: u64,
-        through: u64,
-        native: u64,
+        request: ApplyRequest<u64, u64>,
         permit: InstallPermit,
     ) -> Result<Materialized<u64>, AdapterFailure<io::Error>> {
-        self.inner.apply(scope, from, through, native, permit).await
+        self.inner.apply(scope, request, permit).await
     }
 
     fn may_serve(&self, scope: &Scope, through: &u64) -> bool {
@@ -367,15 +365,13 @@ impl ApplicationAdapter<u64, u64> for SlowApp {
     async fn apply(
         &self,
         scope: Scope,
-        from: u64,
-        through: u64,
-        native: u64,
+        request: ApplyRequest<u64, u64>,
         permit: InstallPermit,
     ) -> Result<Materialized<u64>, AdapterFailure<io::Error>> {
         *self.captured.lock().expect("captured permit lock") = Some(permit.clone());
         self.entered.store(true, Ordering::Release);
         self.release.notified().await;
-        self.inner.apply(scope, from, through, native, permit).await
+        self.inner.apply(scope, request, permit).await
     }
 
     fn may_serve(&self, scope: &Scope, through: &u64) -> bool {

@@ -10,14 +10,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, BoundComparison, Checkpoint, CheckpointLimit,
+    AdapterFailure, ApplicationAdapter, ApplyRequest, BoundComparison, Checkpoint, CheckpointLimit,
     CommitSubscriberAck, Comparison, Cursor, DurableDeliveryReceipt, DurableEventSink,
     DurableSubscriptionSource, FencedCheckpoint, InstallPermit, Limits, Materialized, OpenError,
     ProofId, RegisterReceipt, RegisterSubscriber, Replication, RetentionPolicy, RevocationPermit,
     ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory, SourceProof,
-    SourceSubscriberState, Stage, Stream, SubscriberAckReceipt, SubscriberId, SubscriberKey,
-    SubscriptionEpoch, SubscriptionError, SubscriptionLimits, SubscriptionSourceResult,
-    SubscriptionStart, TailLimit, TerminalReceipt,
+    SourceSubscriberState, Stage, Stream, SubscriberAckReceipt, SubscriberApplyRequest,
+    SubscriberId, SubscriberKey, SubscriptionEpoch, SubscriptionError, SubscriptionLimits,
+    SubscriptionSourceResult, SubscriptionStart, TailLimit, TerminalReceipt,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 
@@ -194,9 +194,7 @@ impl ApplicationAdapter<u64, Vec<u64>> for StubApp {
     async fn apply(
         &self,
         _scope: Scope,
-        _from: u64,
-        _through: u64,
-        _native: Vec<u64>,
+        _request: ApplyRequest<u64, Vec<u64>>,
         _permit: InstallPermit,
     ) -> Result<Materialized<u64>, AdapterFailure<io::Error>> {
         Err(AdapterFailure::Terminal(io::Error::other("unused")))
@@ -291,11 +289,13 @@ impl DurableEventSink<u64, Vec<u64>> for MemSink {
 
     async fn apply_subscriber_batch(
         &self,
-        registration: RegisterReceipt,
-        _from: u64,
-        through: u64,
-        previous_sink: u64,
-        native: Vec<u64>,
+        SubscriberApplyRequest {
+            registration,
+            through,
+            previous_sink,
+            native,
+            ..
+        }: SubscriberApplyRequest<u64, Vec<u64>>,
         permit: InstallPermit,
     ) -> Result<DurableDeliveryReceipt, AdapterFailure<io::Error>> {
         let key = registration.key.clone();

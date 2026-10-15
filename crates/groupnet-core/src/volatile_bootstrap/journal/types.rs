@@ -305,12 +305,13 @@ pub struct JournalBatch {
     pub operation: u64,
     /// Last previously acknowledged position.
     pub from: JournalCursor,
-    /// Last included position; equal to `from` only for an empty result.
+    /// Last included position; a batch always advances past `from`.
     pub through: JournalCursor,
     /// Contiguous deltas after `from`.
     pub deltas: Vec<JournalDelta>,
-    /// Reserved cloned identity plus effect bytes.
-    pub bytes: usize,
+    /// Reserved cloned identity plus effect bytes; a batch always charges
+    /// at least one byte.
+    pub bytes: NonZeroUsize,
 }
 
 /// Candidate lifecycle; none of these states grants local read authority.

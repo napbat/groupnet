@@ -3,6 +3,7 @@
 //! Network phase selection and exact correlation stay here. The consumer
 //! implements only private index, native-feed, and guarded publication work.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use groupnet_core::Time;
@@ -62,7 +63,7 @@ pub trait BootstrapStatePort: Send + Sync + 'static {
     fn image_offer(
         &self,
         capture: &DonorCapture<Self::Image>,
-        max_metadata_bytes: usize,
+        max_metadata_bytes: NonZeroUsize,
         admission: &ByteAdmission,
     ) -> Result<Admitted<groupnet_core::volatile_bootstrap::transfer::TransferOffer>, AdapterError>;
 
@@ -74,7 +75,7 @@ pub trait BootstrapStatePort: Send + Sync + 'static {
         &self,
         capture: &DonorCapture<Self::Image>,
         sequence: usize,
-        max_bytes: usize,
+        max_bytes: NonZeroUsize,
         admission: &ByteAdmission,
     ) -> Result<Admitted<Vec<u8>>, AdapterError>;
 
@@ -300,16 +301,15 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         let bytes = self
             .limits
             .decoded_charge()?
-            .checked_add(self.limits.correlation_charge()?)
+            .checked_add(self.limits.correlation_charge()?.get())
             .ok_or(AdapterErrorKind::Capacity)?;
         Ok(self.admission.reserve(AdmissionClass::Inflight, bytes)?)
     }
 
     fn retained_charge(&self) -> Result<Reservation, AdapterError> {
-        let bytes = self
-            .limits
-            .decoded_charge()?
-            .checked_mul(2)
+        let decoded = self.limits.decoded_charge()?;
+        let bytes = decoded
+            .checked_add(decoded.get())
             .ok_or(AdapterErrorKind::Capacity)?;
         Ok(self.admission.reserve(AdmissionClass::Inflight, bytes)?)
     }

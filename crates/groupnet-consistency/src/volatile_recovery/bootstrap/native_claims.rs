@@ -41,6 +41,12 @@ fn key_bytes(key: &str) -> Result<NonZeroUsize, AdapterError> {
     NonZeroUsize::new(key.len()).ok_or(MALFORMED)
 }
 
+/// A measured admission charge; a zero length has nothing to admit and is
+/// refused as capacity, as [`ByteAdmission::reserve`] requires.
+fn charge(bytes: usize) -> Result<NonZeroUsize, AdapterError> {
+    NonZeroUsize::new(bytes).ok_or(CAPACITY)
+}
+
 /// A native remaining TTL in the policy's whole milliseconds, if present and
 /// representable.
 fn remaining_ms(ttl: Option<Duration>) -> Option<u64> {
@@ -85,9 +91,9 @@ impl NativeClaimOptions {
         {
             return Err(NativeClaimSourceError::ScopeTooLong);
         }
-        let key = claim_entry_key(&self.scope, self.max_key_bytes.get())
+        let key = claim_entry_key(&self.scope, self.max_key_bytes)
             .map_err(NativeClaimSourceError::ClaimKey)?;
-        let presence_key = presence_entry_key(&self.scope, self.max_key_bytes.get())
+        let presence_key = presence_entry_key(&self.scope, self.max_key_bytes)
             .map_err(NativeClaimSourceError::PresenceKey)?;
         Ok((key, presence_key))
     }
@@ -240,7 +246,6 @@ impl NativeClaimSource {
         let inspection_limits = self.inspection_limits(limits)?;
         let raw_charge = limits
             .max_metadata_bytes
-            .get()
             .checked_add(self.key.len())
             .ok_or(CAPACITY)?;
         let raw_budget = admission.reserve(AdmissionClass::Inflight, raw_charge)?;
@@ -250,7 +255,7 @@ impl NativeClaimSource {
             .await
             .map_err(|_| UNAVAILABLE)?;
         let raw = raw_budget.hold(raw);
-        let converted_bytes = converted_charge(raw.get(), limits.max_metadata_bytes.get())?;
+        let converted_bytes = converted_charge(raw.get(), limits.max_metadata_bytes)?;
         let converted_budget = admission.reserve(AdmissionClass::Inflight, converted_bytes)?;
         let snapshot = raw.consume(|raw| self.convert(raw))?;
         Ok(converted_budget.hold(snapshot))
@@ -319,7 +324,6 @@ impl NativeClaimSource {
         let inspection_limits = self.inspection_limits(limits)?;
         let raw_charge = limits
             .max_metadata_bytes
-            .get()
             .checked_add(self.key.len())
             .ok_or(CAPACITY)?;
         let budget = self
@@ -370,13 +374,15 @@ impl ClaimSource for NativeClaimSource {
         let value_len =
             encoded_claim_len(&self.scope, self.policy, &claim, self.max_value_bytes.get())
                 .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
-        let queued_bytes = self.key.len().checked_add(value_len).ok_or(CAPACITY)?;
+        let queued_bytes = key_bytes(&self.key)?
+            .checked_add(value_len)
+            .ok_or(CAPACITY)?;
         let queued = self
             .admission
             .reserve(AdmissionClass::Inflight, queued_bytes)?;
         let retained = self
             .admission
-            .reserve(AdmissionClass::Inflight, value_len)?;
+            .reserve(AdmissionClass::Inflight, charge(value_len)?)?;
         let value =
             encode_claim_value(&self.scope, self.policy, &claim, self.max_value_bytes.get())
                 .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
@@ -405,9 +411,7 @@ impl ClaimSource for NativeClaimSource {
         if *identity != selected {
             return Ok(());
         }
-        let queued_bytes = self
-            .key
-            .len()
+        let queued_bytes = key_bytes(&self.key)?
             .checked_add(value.get().len())
             .ok_or(CAPACITY)?;
         let queued = self
@@ -460,7 +464,7 @@ impl ClaimSource for NativeClaimSource {
         let Some(selected_claim) = selected_claim else {
             return Ok(None);
         };
-        let charge_bytes = size_of::<TimedClaim>()
+        let charge_bytes = charge(size_of::<TimedClaim>())?
             .checked_add(selected.node.as_str().len())
             .ok_or(CAPACITY)?;
         let charge = admission.reserve(AdmissionClass::Inflight, charge_bytes)?;
@@ -473,7 +477,10 @@ impl ClaimSource for NativeClaimSource {
     }
 }
 
-fn converted_charge(raw: &InspectedEntries, max_bytes: usize) -> Result<usize, AdapterError> {
+fn converted_charge(
+    raw: &InspectedEntries,
+    max_bytes: NonZeroUsize,
+) -> Result<NonZeroUsize, AdapterError> {
     let members = raw
         .entries
         .len()
@@ -492,8 +499,8 @@ fn converted_charge(raw: &InspectedEntries, max_bytes: usize) -> Result<usize, A
         .and_then(|bytes| bytes.checked_add(claims))
         .and_then(|bytes| bytes.checked_add(identities?))
         .ok_or(CAPACITY)?;
-    if total == 0 || total > max_bytes {
-        return Err(CAPACITY);
-    }
-    Ok(total)
+    charge(total)
+        .ok()
+        .filter(|total| *total <= max_bytes)
+        .ok_or(CAPACITY)
 }

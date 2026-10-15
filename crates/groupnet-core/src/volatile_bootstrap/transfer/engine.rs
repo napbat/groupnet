@@ -343,8 +343,7 @@ impl TransferSession {
             || batch.through.position > barrier.cursor.position
             || batch.deltas.is_empty()
             || batch.deltas.len() > self.config.max_batch_events.get()
-            || batch.bytes == 0
-            || batch.bytes > self.config.max_batch_bytes.get()
+            || batch.bytes > self.config.max_batch_bytes
             || batch.operation == 0
         {
             return false;
@@ -405,7 +404,7 @@ impl TransferSession {
             bytes = next_bytes;
         }
         position == batch.through.position
-            && bytes == batch.bytes
+            && bytes == batch.bytes.get()
             && self
                 .replayed_events
                 .checked_add(batch.deltas.len())
@@ -471,7 +470,7 @@ impl TransferSession {
                 self.stage = TransferStage::RequestingOffer;
                 self.ok(vec![TransferEffect::FetchOffer {
                     op,
-                    max_metadata_bytes: self.config.max_metadata_bytes.get(),
+                    max_metadata_bytes: self.config.max_metadata_bytes,
                 }])
             }
             TransferEvent::Offered { op, offer } => {
@@ -537,7 +536,7 @@ impl TransferSession {
                 self.ok(vec![TransferEffect::FetchChunk {
                     op: next,
                     sequence: 0,
-                    max_bytes: self.config.max_chunk_bytes.get(),
+                    max_bytes: self.config.max_chunk_bytes,
                 }])
             }
             TransferEvent::ChunkStored {
@@ -583,7 +582,7 @@ impl TransferSession {
                     self.ok(vec![TransferEffect::FetchChunk {
                         op: next,
                         sequence: self.next_chunk,
-                        max_bytes: self.config.max_chunk_bytes.get(),
+                        max_bytes: self.config.max_chunk_bytes,
                     }])
                 }
             }

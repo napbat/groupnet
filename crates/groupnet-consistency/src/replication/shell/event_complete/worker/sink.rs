@@ -7,7 +7,9 @@ use groupnet_core::replication::{Batch, Cursor, Event, Operation, RegisterReceip
 
 use super::Driver;
 use crate::replication::ApplicationAdapter;
-use crate::replication::subscription_api::{DurableEventSink, DurableSubscriptionSource};
+use crate::replication::subscription_api::{
+    DurableEventSink, DurableSubscriptionSource, SubscriberApplyRequest,
+};
 
 impl<S, A, D, M> Driver<S, A, D, M>
 where
@@ -89,8 +91,15 @@ where
         let Some(through) = self.decode(op, &batch.coverage.through) else {
             return;
         };
-        let Some(previous) = self.decode(op, &previous_sink) else {
+        let Some(previous_sink_position) = self.decode(op, &previous_sink) else {
             return;
+        };
+        let request = SubscriberApplyRequest {
+            registration,
+            from,
+            through,
+            previous_sink: previous_sink_position,
+            native: payload.native,
         };
         let Some(permit) = self.shared.fence.issue(op, due) else {
             self.reply(op, Event::Failed { op });
@@ -98,17 +107,7 @@ where
         };
         let sink = Arc::clone(&self.sink);
         let result = self
-            .sink_call(
-                due,
-                sink.apply_subscriber_batch(
-                    registration,
-                    from,
-                    through,
-                    previous,
-                    payload.native,
-                    permit,
-                ),
-            )
+            .sink_call(due, sink.apply_subscriber_batch(request, permit))
             .await;
         self.shared.fence.invalidate();
         // Keep the native batch's byte reservation through the complete

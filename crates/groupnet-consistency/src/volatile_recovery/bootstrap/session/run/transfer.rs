@@ -1,5 +1,7 @@
 //! Exact transfer-effect dispatch without another scheduler or hidden stage map.
 
+use std::num::NonZeroUsize;
+
 use super::super::{AcquisitionBinding, AdmissionClass, BootstrapOperation};
 use super::{
     BootstrapEvent, BootstrapOutcome, BootstrapSession, BootstrapStage, ClaimSource, DeclineReason,
@@ -28,12 +30,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         // The installed receipt is cloned only after a second, conservative
         // reservation. Reserve before the application could swap a candidate.
         let handoff_charge = if installing {
-            let bytes = self
-                .config
-                .transfer
-                .max_metadata_bytes
-                .get()
-                .checked_mul(4)
+            let bytes = NonZeroUsize::new(4)
+                .and_then(|copies| self.config.transfer.max_metadata_bytes.checked_mul(copies))
                 .and_then(|bytes| bytes.checked_add(256));
             let Some(bytes) = bytes else {
                 return Some(self.declined(DeclineReason::Admission));

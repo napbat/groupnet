@@ -44,7 +44,7 @@ impl BootstrapStatePort for RecaptureState {
     fn image_offer(
         &self,
         _capture: &DonorCapture<Self::Image>,
-        _max_metadata_bytes: usize,
+        _max_metadata_bytes: NonZeroUsize,
         _admission: &ByteAdmission,
     ) -> Result<Admitted<TransferOffer>, AdapterError> {
         Err(AdapterErrorKind::Unsupported.into())
@@ -54,7 +54,7 @@ impl BootstrapStatePort for RecaptureState {
         &self,
         _capture: &DonorCapture<Self::Image>,
         _sequence: usize,
-        _max_bytes: usize,
+        _max_bytes: NonZeroUsize,
         _admission: &ByteAdmission,
     ) -> Result<Admitted<Vec<u8>>, AdapterError> {
         Err(AdapterErrorKind::Unsupported.into())
@@ -102,8 +102,8 @@ impl RecaptureState {
         request: ReadyCaptureRequest,
         admission: &ByteAdmission,
     ) -> Result<DonorCapture<Vec<u8>>, AdapterError> {
-        let encoded = admission.reserve(AdmissionClass::Encoded, 1)?;
-        let decoded = admission.reserve(AdmissionClass::Decoded, 1)?;
+        let encoded = admission.reserve(AdmissionClass::Encoded, nz(1))?;
+        let decoded = admission.reserve(AdmissionClass::Decoded, nz(1))?;
         let suffix = admission.reserve(
             AdmissionClass::Suffix,
             DonorJournal::storage_bound(journal_config()).map_err(fenced)?,

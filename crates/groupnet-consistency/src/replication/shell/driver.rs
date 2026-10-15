@@ -15,8 +15,8 @@ use tokio::sync::{OwnedSemaphorePermit, watch};
 use super::{Command, Manager, Published, SessionShared};
 use crate::replication::ack_api::AckWaitStartError;
 use crate::replication::api::{
-    ApplicationAdapter, Checkpoint, CheckpointLimit, FailureClass, ScanLimit, SourceAdapter,
-    SourceBatch, TailLimit,
+    ApplicationAdapter, ApplyRequest, Checkpoint, CheckpointLimit, FailureClass, ScanLimit,
+    SourceAdapter, SourceBatch, TailLimit,
 };
 use crate::replication::snapshot_runtime::SnapshotMode;
 
@@ -691,6 +691,11 @@ where
             Ok(value) => value,
             Err(error) => return self.adapter_failure(op, error.class()),
         };
+        let request = ApplyRequest {
+            from,
+            through,
+            native: payload.native,
+        };
         let Some(_operation) = Self::operation_permit(&self.manager, deadline).await else {
             return self.step(Event::Failed { op });
         };
@@ -706,13 +711,9 @@ where
         }
         let result = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            self.manager.app.apply(
-                self.shared.scope.clone(),
-                from,
-                through,
-                payload.native,
-                permit,
-            ),
+            self.manager
+                .app
+                .apply(self.shared.scope.clone(), request, permit),
         )
         .await;
         self.shared.fence.invalidate();

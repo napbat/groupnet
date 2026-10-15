@@ -1,5 +1,7 @@
 //! Bounded follower attachment, barrier, and batch lifecycle.
 
+use std::num::NonZeroUsize;
+
 use super::{DonorJournal, Follower, OutstandingBatch};
 use crate::Time;
 use crate::volatile_bootstrap::ClaimIdentity;
@@ -333,11 +335,12 @@ impl DonorJournal {
         if count == 0 || new_inflight > self.config.max_inflight_bytes.get() {
             return Err(JournalError::Capacity);
         }
+        let charged = NonZeroUsize::new(bytes).ok_or(JournalError::Capacity)?;
         let operation = self.operation_token()?;
         self.followers[index].outstanding = Some(OutstandingBatch {
             operation,
             through: last,
-            bytes,
+            bytes: charged,
         });
         self.inflight_bytes = new_inflight;
         let deltas = self
@@ -353,7 +356,7 @@ impl DonorJournal {
             from: self.cursor(from),
             through: self.cursor(last),
             deltas,
-            bytes,
+            bytes: charged,
         }))
     }
 
@@ -385,7 +388,7 @@ impl DonorJournal {
         {
             return Err(JournalError::Stale);
         }
-        self.inflight_bytes -= outstanding.bytes;
+        self.inflight_bytes -= outstanding.bytes.get();
         self.followers[index].acked = outstanding.through;
         self.followers[index].last_acked = Some((operation, through.position));
         self.followers[index].outstanding = None;
@@ -417,7 +420,7 @@ impl DonorJournal {
         let index = self.follower_index(reservation)?;
         let follower = self.followers.remove(index);
         if let Some(outstanding) = follower.outstanding {
-            self.inflight_bytes -= outstanding.bytes;
+            self.inflight_bytes -= outstanding.bytes.get();
         }
         Ok(())
     }

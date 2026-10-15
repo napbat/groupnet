@@ -108,11 +108,10 @@ impl BootstrapRuntimeConfig {
     /// count-bound charge. Real image, suffix, native and wire buffers are
     /// charged separately to their actual owners. This is an admission bound,
     /// not a claim of byte-exact allocator RSS.
-    fn core_metadata_bytes(&self) -> Option<usize> {
+    fn core_metadata_bytes(&self) -> Option<NonZeroUsize> {
         self.transfer
             .max_metadata_bytes
-            .get()
-            .checked_mul(12)?
+            .checked_mul(NonZeroUsize::new(12)?)?
             .checked_add(self.max_claim_metadata_bytes.get())?
             .checked_add(self.claim.max_members.get().checked_mul(128)?)?
             .checked_add(self.transfer.max_cuts.get().checked_mul(64)?)?

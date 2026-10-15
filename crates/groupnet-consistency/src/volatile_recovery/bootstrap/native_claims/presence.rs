@@ -15,7 +15,7 @@ use groupnet_runtime::{
 
 use super::{
     AdapterError, AdapterErrorKind, AdmissionClass, Admitted, CAPACITY, MALFORMED,
-    NativeClaimSource, UNAVAILABLE, key_bytes,
+    NativeClaimSource, UNAVAILABLE, charge, key_bytes,
 };
 
 /// A newer or concurrent presence for this member holds the entry.
@@ -52,7 +52,6 @@ impl NativeClaimSource {
         let limits = self.pair_limits()?;
         let charge = limits
             .max_response_bytes
-            .get()
             .checked_add(self.presence_key.len())
             .and_then(|bytes| bytes.checked_add(self.key.len()))
             .ok_or(CAPACITY)?;
@@ -92,9 +91,7 @@ impl NativeClaimSource {
             self.max_value_bytes.get(),
         )
         .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
-        let queued_bytes = self
-            .presence_key
-            .len()
+        let queued_bytes = key_bytes(&self.presence_key)?
             .checked_add(value_len)
             .ok_or(CAPACITY)?;
         let mut queued = self
@@ -102,7 +99,7 @@ impl NativeClaimSource {
             .reserve(AdmissionClass::Inflight, queued_bytes)?;
         let retained = self
             .admission
-            .reserve(AdmissionClass::Inflight, value_len)?;
+            .reserve(AdmissionClass::Inflight, charge(value_len)?)?;
         let value = encode_presence_value(
             &self.scope,
             self.policy,
@@ -218,9 +215,7 @@ impl NativeClaimSource {
         if current != &identity {
             return Ok(());
         }
-        let queued_bytes = self
-            .presence_key
-            .len()
+        let queued_bytes = key_bytes(&self.presence_key)?
             .checked_add(value.get().len())
             .ok_or(CAPACITY)?;
         let queued = self

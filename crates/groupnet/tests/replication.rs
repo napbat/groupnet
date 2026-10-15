@@ -8,10 +8,10 @@ use std::io;
 
 use groupnet::consistency::replication::{
     AckEvidenceSource, AckObservation, AckSourceFailure, AckWaitLimits, AckWaitRequest,
-    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
-    CheckpointLoadResult, CoreConfig, Cursor, InstallPermit, Limits, LimitsError, Materialized,
-    NamedAckRequest, Operation, RequiredSubscriber, RevocationPermit, ScanLimit, Scope,
-    SourceAdapter, SourceProof, SourceScanResult, TailLimit,
+    AdapterFailure, ApplicationAdapter, ApplyRequest, BoundComparison, CatchUp, Checkpoint,
+    CheckpointLimit, CheckpointLoadResult, CoreConfig, Cursor, InstallPermit, Limits, LimitsError,
+    Materialized, NamedAckRequest, Operation, RequiredSubscriber, RevocationPermit, ScanLimit,
+    Scope, SourceAdapter, SourceProof, SourceScanResult, TailLimit,
 };
 
 /// Adapters written against the tier module alone, with no `groupnet_core`
@@ -97,9 +97,7 @@ impl ApplicationAdapter<u64, Vec<u8>> for TierOnly {
     fn apply(
         &self,
         _: Scope,
-        _: u64,
-        _: u64,
-        _: Vec<u8>,
+        _: ApplyRequest<u64, Vec<u8>>,
         _: InstallPermit,
     ) -> impl Future<Output = Result<Materialized<u64>, AdapterFailure<io::Error>>> + Send {
         ready(Err(AdapterFailure::Terminal(unsupported())))

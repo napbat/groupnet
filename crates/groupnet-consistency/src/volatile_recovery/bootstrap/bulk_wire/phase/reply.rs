@@ -1,7 +1,5 @@
 //! Typed donor replies; private image bytes remain opaque to Groupnet.
 
-use std::num::NonZeroUsize;
-
 use groupnet_core::volatile_bootstrap::journal::{
     AttachToken, BarrierReceipt, DeltaIdentity, JournalBatch, JournalDelta, NativeCut,
     ReservationId,
@@ -10,7 +8,7 @@ use groupnet_core::volatile_bootstrap::transfer::TransferOffer;
 
 use super::{
     PhaseLimits, Reader, Writer, read_barrier, read_blob, read_capture, read_cursor, read_member,
-    read_reservation, read_size, valid_barrier,
+    read_positive_size, read_reservation, valid_barrier,
 };
 use crate::volatile_recovery::bootstrap::bulk_wire::{
     Correlation, Envelope, ExchangeKind, Message, WireError,
@@ -161,7 +159,7 @@ fn valid_batch(value: &JournalBatch, correlation: &Correlation, limits: PhaseLim
         || value.from.capture != value.reservation.capture
         || value.through.capture != value.reservation.capture
         || value.deltas.len() > limits.max_events.get()
-        || value.bytes > limits.max_body_bytes.get()
+        || value.bytes > limits.max_body_bytes
     {
         return false;
     }
@@ -202,11 +200,6 @@ fn write_offer(
     writer.put(&offer.commitment)?;
     write_members(writer, &offer.members, limits)?;
     write_cuts(writer, &offer.cuts, limits)
-}
-
-/// An offer count the protocol requires to be positive; zero is invalid input.
-fn read_positive_size(reader: &mut Reader<'_>) -> Result<NonZeroUsize, WireError> {
-    NonZeroUsize::new(read_size(reader)?).ok_or(WireError::Invalid)
 }
 
 fn read_offer(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<TransferOffer, WireError> {
@@ -261,7 +254,7 @@ fn write_batch(
         )?;
         writer.put(&delta.effect)?;
     }
-    writer.number(batch.bytes)
+    writer.number(batch.bytes.get())
 }
 
 fn read_batch(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<JournalBatch, WireError> {
@@ -311,7 +304,7 @@ fn read_batch(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<JournalBat
         from,
         through,
         deltas,
-        bytes: read_size(reader)?,
+        bytes: read_positive_size(reader)?,
     })
 }
 
@@ -444,6 +437,8 @@ pub fn decode_reply(frame: &Envelope, limits: PhaseLimits) -> Result<WireReply, 
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
     use crate::volatile_recovery::bootstrap::admission::{
         AdmissionClass, AdmissionLimits, Admitted, ByteAdmission,
@@ -480,7 +475,7 @@ mod tests {
             max_reservations: std::num::NonZeroUsize::new(4).unwrap(),
         })
         .unwrap()
-        .reserve(AdmissionClass::Inflight, 4096)
+        .reserve(AdmissionClass::Inflight, NonZeroUsize::new(4096).unwrap())
         .unwrap()
         .hold(value)
     }
@@ -598,7 +593,7 @@ mod tests {
                 identity: DeltaIdentity::Local(b"repair".to_vec()),
                 effect: vec![1],
             }],
-            bytes: 7,
+            bytes: NonZeroUsize::new(7).unwrap(),
         };
         let replies = [
             (
@@ -709,6 +704,48 @@ mod tests {
         }
     }
 
+    /// A batch always charges at least one byte: the boundary value 1
+    /// round-trips and a peer frame whose trailing charge is zero does not
+    /// decode.
+    #[test]
+    fn a_batch_frame_with_a_zero_charge_does_not_decode() {
+        let (correlation, capture, reservation, _barrier) = fixture();
+        let batch = JournalBatch {
+            reservation,
+            operation: 8,
+            from: JournalCursor {
+                capture: capture.clone(),
+                position: 0,
+            },
+            through: JournalCursor {
+                capture,
+                position: 1,
+            },
+            deltas: vec![JournalDelta {
+                position: 1,
+                identity: DeltaIdentity::Local(b"r".to_vec()),
+                effect: vec![],
+            }],
+            bytes: NonZeroUsize::MIN,
+        };
+        let frame = encode_reply(
+            &DonorReply::Batch(admitted(batch.clone())),
+            correlation,
+            ExchangeKind::Batch,
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(decode_reply(&frame, limits()), Ok(WireReply::Batch(batch)));
+        let mut zeroed = frame;
+        let Message::Reply(body) = &mut zeroed.message else {
+            panic!("an encoded reply frame");
+        };
+        let start = body.len() - 8;
+        assert_eq!(body[start..], 1_u64.to_be_bytes());
+        body[start..].fill(0);
+        assert_eq!(decode_reply(&zeroed, limits()), Err(WireError::Invalid));
+    }
+
     #[test]
     fn wrong_capture_and_noncontiguous_batch_are_rejected() {
         let (correlation, _capture, reservation, _barrier) = fixture();
@@ -740,7 +777,7 @@ mod tests {
                 identity: DeltaIdentity::Local(b"repair".to_vec()),
                 effect: vec![],
             }],
-            bytes: 6,
+            bytes: NonZeroUsize::new(6).unwrap(),
         };
         assert_eq!(
             encode_reply(

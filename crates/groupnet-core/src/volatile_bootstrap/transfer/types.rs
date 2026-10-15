@@ -360,7 +360,7 @@ pub enum TransferEffect {
         /// Exact offer fetch operation.
         op: BootstrapOperation,
         /// Pre-allocation cap for offer variable metadata.
-        max_metadata_bytes: usize,
+        max_metadata_bytes: NonZeroUsize,
     },
     /// Acquire real global private stage and image memory admission.
     ReserveStage {
@@ -391,7 +391,7 @@ pub enum TransferEffect {
         /// Zero-based chunk sequence.
         sequence: usize,
         /// Maximum allowed encoded chunk bytes.
-        max_bytes: usize,
+        max_bytes: NonZeroUsize,
     },
     /// Verify the assembled image's exact full commitment.
     VerifyImage {

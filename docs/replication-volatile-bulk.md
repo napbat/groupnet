@@ -171,7 +171,13 @@ The image-offer callback receives the exact metadata cap before allocation;
 Groupnet checks the completed offer as well. The offer's encoded and decoded
 sizes and chunk count are `NonZeroUsize`; the reply decoder rejects a frame
 carrying zero in any of them as `WireError::Invalid`, and the encoding is
-unchanged. A stored chunk's length is likewise nonzero by type. The donor
+unchanged. A stored chunk's length is likewise nonzero by type. Every
+`DonorRequest` reply budget (offer and barrier metadata bytes, chunk bytes,
+batch bytes and events) and a `JournalBatch`'s byte charge are
+`NonZeroUsize`; the request and reply decoders reject a zero in any of them
+as `WireError::Invalid`, again with the encoding unchanged. Every
+`ByteAdmission::reserve` charge is a `NonZeroUsize`, so a measured length
+converts fallibly before it is admitted. The donor
 journal admits a `CapturePlan` whose `ImageSize` budgets are nonzero by type.
 Donor journal limits for roster, cuts, and batches must fit that same local
 policy before any mutable request.

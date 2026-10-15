@@ -37,6 +37,10 @@ use groupnet_core::{NodeId, Status};
 use groupnet_transport_mem::MemBulkNet;
 use tokio::sync::{Notify, watch};
 
+fn nz(bytes: usize) -> NonZeroUsize {
+    NonZeroUsize::new(bytes).expect("a nonzero test size")
+}
+
 #[derive(Debug)]
 struct PrivateState;
 
@@ -71,10 +75,10 @@ impl BootstrapStatePort for PrivateState {
     fn image_offer(
         &self,
         capture: &DonorCapture<Self::Image>,
-        _max_metadata_bytes: usize,
+        _max_metadata_bytes: NonZeroUsize,
         admission: &ByteAdmission,
     ) -> Result<Admitted<TransferOffer>, AdapterError> {
-        let charge = admission.reserve(AdmissionClass::Inflight, 512)?;
+        let charge = admission.reserve(AdmissionClass::Inflight, nz(512))?;
         let id = capture
             .ingress()
             .with_journal(|journal| journal.id().clone());
@@ -99,10 +103,10 @@ impl BootstrapStatePort for PrivateState {
         &self,
         capture: &DonorCapture<Self::Image>,
         _sequence: usize,
-        _max_bytes: usize,
+        _max_bytes: NonZeroUsize,
         admission: &ByteAdmission,
     ) -> Result<Admitted<Vec<u8>>, AdapterError> {
-        let charge = admission.reserve(AdmissionClass::Inflight, 8)?;
+        let charge = admission.reserve(AdmissionClass::Inflight, nz(8))?;
         Ok(charge.hold(capture.image().clone()))
     }
 
@@ -280,7 +284,7 @@ async fn wrong_admission_pool_is_rejected_before_network_allocation() {
         .execute(
             TransferEffect::FetchOffer {
                 op: op(32),
-                max_metadata_bytes: 512,
+                max_metadata_bytes: nz(512),
             },
             &mut resources,
             EffectContext {
@@ -430,25 +434,25 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
             let reply = match (phase, incoming.request()) {
                 (0, DonorRequest::Offer { .. }) => DonorReply::Offer(
                     donor_budget
-                        .reserve(AdmissionClass::Inflight, 512)
+                        .reserve(AdmissionClass::Inflight, nz(512))
                         .unwrap()
                         .hold(offer.clone()),
                 ),
                 (1, DonorRequest::Reserve { .. }) => DonorReply::Reserved(
                     donor_budget
-                        .reserve(AdmissionClass::Inflight, 512)
+                        .reserve(AdmissionClass::Inflight, nz(512))
                         .unwrap()
                         .hold(donor_reservation.clone()),
                 ),
                 (2, DonorRequest::Chunk { sequence: 0, .. }) => DonorReply::Chunk(
                     donor_budget
-                        .reserve(AdmissionClass::Inflight, 8)
+                        .reserve(AdmissionClass::Inflight, nz(8))
                         .unwrap()
                         .hold(vec![9]),
                 ),
                 (3, DonorRequest::Attach { .. }) => DonorReply::Attached(
                     donor_budget
-                        .reserve(AdmissionClass::Inflight, 512)
+                        .reserve(AdmissionClass::Inflight, nz(512))
                         .unwrap()
                         .hold(donor_attachment.clone()),
                 ),
@@ -481,7 +485,7 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
         .execute(
             TransferEffect::FetchOffer {
                 op: op(32),
-                max_metadata_bytes: 512,
+                max_metadata_bytes: nz(512),
             },
             &mut resources,
             call(),
@@ -514,7 +518,7 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
             TransferEffect::FetchChunk {
                 op: op(34),
                 sequence: 0,
-                max_bytes: 8,
+                max_bytes: nz(8),
             },
             &mut resources,
             call(),
@@ -609,8 +613,8 @@ fn capture_for_test(budget: &ByteAdmission) -> DonorCapture<Vec<u8>> {
     journal.finish_capture(Time(2), UNIT_IMAGE).unwrap();
     let suffix = budget.reserve(AdmissionClass::Suffix, storage).unwrap();
     let ingress = JournalIngress::new(journal, suffix, Arc::new(Notify::new())).unwrap();
-    let encoded = budget.reserve(AdmissionClass::Encoded, 1).unwrap();
-    let decoded = budget.reserve(AdmissionClass::Decoded, 1).unwrap();
+    let encoded = budget.reserve(AdmissionClass::Encoded, nz(1)).unwrap();
+    let decoded = budget.reserve(AdmissionClass::Decoded, nz(1)).unwrap();
     DonorCapture::new(vec![9], ingress, encoded, decoded).unwrap()
 }
 
@@ -657,8 +661,8 @@ fn capturing_ingress_records_live_effects_but_cannot_offer_until_finished() {
             .unwrap();
         assert_eq!(journal.finish_capture(Time(3), UNIT_IMAGE).unwrap(), c);
     });
-    let encoded = budget.reserve(AdmissionClass::Encoded, 1).unwrap();
-    let decoded = budget.reserve(AdmissionClass::Decoded, 1).unwrap();
+    let encoded = budget.reserve(AdmissionClass::Encoded, nz(1)).unwrap();
+    let decoded = budget.reserve(AdmissionClass::Decoded, nz(1)).unwrap();
     let capture = DonorCapture::new(vec![9], ingress, encoded, decoded).unwrap();
     assert_eq!(
         capture
@@ -699,7 +703,7 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
     let offer = adapter
         .prepare_follower(
             &DonorRequest::Offer {
-                max_metadata_bytes: 512,
+                max_metadata_bytes: nz(512),
             },
             &capture,
             Time(3),
@@ -742,7 +746,7 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
             &DonorRequest::Chunk {
                 reservation: reservation.clone(),
                 sequence: 0,
-                max_bytes: 8,
+                max_bytes: nz(8),
             },
             &capture,
             Time(4),
@@ -780,7 +784,7 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
         .prepare_follower(
             &DonorRequest::Barrier {
                 attachment: token,
-                max_metadata_bytes: 512,
+                max_metadata_bytes: nz(512),
             },
             &capture,
             Time(5),
@@ -797,8 +801,8 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
         .prepare_follower(
             &DonorRequest::Batch {
                 barrier: receipt.clone(),
-                max_bytes: 8,
-                max_events: 2,
+                max_bytes: nz(8),
+                max_events: nz(2),
             },
             &capture,
             Time(5),
@@ -813,8 +817,8 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
         .prepare_follower(
             &DonorRequest::Batch {
                 barrier: receipt.clone(),
-                max_bytes: 8,
-                max_events: 2,
+                max_bytes: nz(8),
+                max_events: nz(2),
             },
             &capture,
             Time(5),
@@ -830,7 +834,7 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
         .ingress()
         .with_journal(|journal| journal.acknowledged(Time(6), &reservation).unwrap());
     let held = budget
-        .reserve(AdmissionClass::Inflight, 100_000 - budget.usage().0)
+        .reserve(AdmissionClass::Inflight, nz(100_000 - budget.usage().0))
         .unwrap();
     assert!(
         adapter
@@ -892,7 +896,7 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
         .prepare_follower(
             &DonorRequest::AdvanceBarrier {
                 expected: receipt,
-                max_metadata_bytes: 512,
+                max_metadata_bytes: nz(512),
             },
             &capture,
             Time(7),
@@ -909,8 +913,8 @@ fn generic_donor_journal_handles_nonempty_suffix_and_exact_ack_readback() {
         .prepare_follower(
             &DonorRequest::Batch {
                 barrier: second,
-                max_bytes: 8,
-                max_events: 2,
+                max_bytes: nz(8),
+                max_events: nz(2),
             },
             &capture,
             Time(7),

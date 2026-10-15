@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 
 use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
-    Comparison, Cursor, IdlePolicy, InstallPermit, Limits, Materialized, ProofId, ReadVerdict,
-    Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory,
-    SourceProof, Stage, Stream, TailLimit,
+    AdapterFailure, ApplicationAdapter, ApplyRequest, BoundComparison, CatchUp, Checkpoint,
+    CheckpointLimit, Comparison, Cursor, IdlePolicy, InstallPermit, Limits, Materialized, ProofId,
+    ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch,
+    SourceHistory, SourceProof, Stage, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -214,9 +214,9 @@ impl ApplicationAdapter<u64, u64> for App {
     async fn apply(
         &self,
         _scope: Scope,
-        _from: u64,
-        through: u64,
-        native: u64,
+        ApplyRequest {
+            through, native, ..
+        }: ApplyRequest<u64, u64>,
         permit: InstallPermit,
     ) -> Result<Materialized<u64>, AdapterFailure<io::Error>> {
         assert_eq!(through, native);
