@@ -207,7 +207,6 @@ fn frame_length_errors_convert_at_the_stream_boundary() {
     for caller in [
         FrameLengthError::AboveCeiling { length: 1 },
         FrameLengthError::Overflow,
-        FrameLengthError::ZeroLimit,
         FrameLengthError::LimitAboveCeiling { max_bytes: 1 },
         FrameLengthError::SendAboveLimit {
             length: 2,

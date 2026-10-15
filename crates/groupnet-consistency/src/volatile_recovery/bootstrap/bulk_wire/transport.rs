@@ -312,8 +312,8 @@ async fn recv_envelope<S: futures_util::io::AsyncRead + Unpin>(
     limits: BulkLimits,
     deadline: Instant,
 ) -> Result<Option<Admitted<Envelope>>, BulkError> {
-    let max_frame_bytes = limits.wire.max_frame_bytes.get();
-    let raw_budget = reserve(admission, max_frame_bytes)?;
+    let max_frame_bytes = limits.wire.max_frame_bytes;
+    let raw_budget = reserve(admission, max_frame_bytes.get())?;
     let raw = before(deadline, stream.recv_bounded(max_frame_bytes))
         .await?
         .map_err(|_| BulkError::Transport)?;
@@ -339,7 +339,7 @@ async fn send_envelope<S: futures_util::io::AsyncWrite + Unpin>(
     let raw = raw_budget.hold(raw);
     before(
         deadline,
-        stream.send_bounded_ref(raw.get(), limits.wire.max_frame_bytes.get()),
+        stream.send_bounded_ref(raw.get(), limits.wire.max_frame_bytes),
     )
     .await?
     .map_err(|_| BulkError::Transport)
@@ -423,7 +423,7 @@ impl<B: BulkTransport> BootstrapBulkClient<B> {
         .map_err(|_| BulkError::Transport)?;
         before(
             deadline,
-            stream.send_bounded_ref(raw.get(), self.limits.wire.max_frame_bytes.get()),
+            stream.send_bounded_ref(raw.get(), self.limits.wire.max_frame_bytes),
         )
         .await?
         .map_err(|_| BulkError::Transport)?;

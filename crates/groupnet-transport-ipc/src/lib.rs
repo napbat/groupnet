@@ -26,6 +26,7 @@ mod link;
 pub use groupnet_transport::link::PeerEndpoint;
 pub use groupnet_transport::{NodeIdError, QueueCapacity};
 pub use ipc::{
-    IpcAddress, IpcAddressError, IpcConfig, IpcConfigError, IpcPeerError, IpcTransport, MAX_FRAME,
+    IpcAddress, IpcAddressError, IpcConfig, IpcConfigError, IpcPeerError, IpcSendError,
+    IpcTransport, MAX_FRAME,
 };
 pub use link::IpcLink;

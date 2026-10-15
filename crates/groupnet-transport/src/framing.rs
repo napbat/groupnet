@@ -119,8 +119,6 @@ pub enum FrameLengthError {
     },
     /// The summed lengths of a frame's parts overflow `usize`.
     Overflow,
-    /// A frame limit is zero where a frame must carry at least one byte.
-    ZeroLimit,
     /// A frame limit exceeds [`MAX_FRAME_BYTES`].
     LimitAboveCeiling {
         /// The refused limit.
@@ -150,7 +148,6 @@ impl fmt::Display for FrameLengthError {
                 "frame of {length} bytes exceeds the {MAX_FRAME_BYTES}-byte stream ceiling"
             ),
             Self::Overflow => f.write_str("frame length overflows usize"),
-            Self::ZeroLimit => f.write_str("frame limit must be nonzero"),
             Self::LimitAboveCeiling { max_bytes } => write!(
                 f,
                 "frame limit {max_bytes} exceeds the {MAX_FRAME_BYTES}-byte stream ceiling"

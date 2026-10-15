@@ -3,6 +3,7 @@
 
 mod error;
 
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use groupnet_transport::QueueCapacity;
@@ -23,17 +24,22 @@ pub const MAX_TIMEOUT: Duration = Duration::from_millis(u32::MAX as u64);
 /// longest RPC head, at most the data plane's
 /// [`MAX_FRAME_BYTES`](groupnet_transport::framing::MAX_FRAME_BYTES).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FrameLimit(usize);
+pub struct FrameLimit(NonZeroUsize);
 
 impl FrameLimit {
     /// The smallest limit: a request head with an empty payload.
-    pub const MIN: Self = Self(REQUEST_HEAD);
+    pub const MIN: Self = Self::of(REQUEST_HEAD);
 
     /// The data plane's frame ceiling.
-    pub const MAX: Self = Self(MAX_FRAME_BYTES);
+    pub const MAX: Self = Self::of(MAX_FRAME_BYTES);
 
     /// The default on both sides: 16 MiB.
-    pub const DEFAULT: Self = Self(16 << 20);
+    pub const DEFAULT: Self = Self::of(16 << 20);
+
+    /// One of the nonzero constants above.
+    const fn of(bytes: usize) -> Self {
+        Self(NonZeroUsize::new(bytes).expect("RPC frame limit constants are nonzero"))
+    }
 
     /// Validates a limit of `bytes`.
     ///
@@ -41,25 +47,28 @@ impl FrameLimit {
     /// [`FrameLimitError::BelowMin`] under [`MIN`](Self::MIN),
     /// [`FrameLimitError::AboveMax`] over [`MAX`](Self::MAX).
     pub const fn new(bytes: usize) -> Result<Self, FrameLimitError> {
-        if bytes < Self::MIN.0 {
-            Err(FrameLimitError::BelowMin(bytes))
-        } else if bytes > Self::MAX.0 {
-            Err(FrameLimitError::AboveMax(bytes))
-        } else {
-            Ok(Self(bytes))
+        match NonZeroUsize::new(bytes) {
+            Some(limit) if bytes >= Self::MIN.get() && bytes <= Self::MAX.get() => Ok(Self(limit)),
+            _ if bytes > Self::MAX.get() => Err(FrameLimitError::AboveMax(bytes)),
+            _ => Err(FrameLimitError::BelowMin(bytes)),
         }
     }
 
     /// The limit in bytes.
     #[must_use]
     pub const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    /// The limit as the data plane's bounded send/receive argument.
+    pub(crate) const fn frame_bytes(self) -> NonZeroUsize {
         self.0
     }
 
     /// Body bytes left under this limit after an RPC head of `head` bytes;
     /// every RPC head fits [`MIN`](Self::MIN).
     pub(crate) const fn body(self, head: usize) -> usize {
-        self.0 - head
+        self.get() - head
     }
 }
 

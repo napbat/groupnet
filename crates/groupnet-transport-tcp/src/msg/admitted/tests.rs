@@ -844,3 +844,27 @@ async fn hello_codec_round_trips_its_typed_network_layout() {
         Some(io::ErrorKind::InvalidData)
     );
 }
+
+#[tokio::test]
+async fn connect_peer_requires_an_admission_enabled_endpoint() {
+    let admitted = endpoint("connect-admitted", Arc::new(OpenAdmission), b"").await;
+    admitted
+        .connect_peer(&NodeId::new("unregistered"))
+        .expect("an admitted endpoint starts admission");
+    let raw = TcpMsgTransport::bind(NodeId::new("connect-raw"), "127.0.0.1:0")
+        .await
+        .expect("raw bind");
+    let error = raw
+        .connect_peer(admitted.local_id())
+        .expect_err("no admission to start");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<TcpConnectPeerError>()),
+        Some(&TcpConnectPeerError::AdmissionNotConfigured)
+    );
+    assert_ne!(TcpConnectPeerError::AdmissionNotConfigured.to_string(), "");
+    raw.close().await;
+    admitted.close().await;
+}

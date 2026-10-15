@@ -510,7 +510,7 @@ async fn drive<S>(
     let read = async {
         // A clean end, a read error, a malformed frame or a request from
         // the server all end the connection.
-        while let Ok(Some(bytes)) = reader.recv_bounded(max_frame_bytes.get()).await {
+        while let Ok(Some(bytes)) = reader.recv_bounded(max_frame_bytes.frame_bytes()).await {
             match Frame::decode(&bytes) {
                 Ok(Frame::Response { id, payload }) => calls.answer(id, Ok(payload)),
                 Ok(Frame::Error { id, status }) => calls.answer(id, Err(status)),

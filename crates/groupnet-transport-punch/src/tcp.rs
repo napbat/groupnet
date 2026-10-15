@@ -22,7 +22,7 @@ mod sockets;
 mod wire;
 
 use crate::PeerPath;
-use crate::common::{closed, invalid, lock, random};
+use crate::common::{PunchSendError, closed, invalid, lock, random};
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::{
@@ -295,7 +295,11 @@ impl TcpConnection {
     ) -> io::Result<()> {
         self.ensure_open()?;
         if length > MAX_TCP_MESSAGE {
-            return Err(invalid("TCP message exceeds MAX_TCP_MESSAGE"));
+            return Err(PunchSendError::PayloadTooLarge {
+                len: length,
+                max: MAX_TCP_MESSAGE,
+            }
+            .into());
         }
         let peers = self.inner.peers.read();
         let Some(peer) = peers.get(to) else {
@@ -321,7 +325,8 @@ impl TcpConnection {
     /// Unknown peers and full queues are dropped without blocking.
     ///
     /// # Errors
-    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    /// Returns `NotConnected` after shutdown, or `InvalidInput` carrying
+    /// [`PunchSendError`] for oversized data.
     pub fn send(&self, to: &NodeId, message: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
         std::future::ready(self.enqueue(
             to,
@@ -335,7 +340,8 @@ impl TcpConnection {
     /// Missing or stale generations and full queues are dropped without blocking.
     ///
     /// # Errors
-    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    /// Returns `NotConnected` after shutdown, or `InvalidInput` carrying
+    /// [`PunchSendError`] for oversized data.
     pub fn send_admitted(
         &self,
         to: &NodeId,
@@ -357,7 +363,8 @@ impl TcpConnection {
     /// Transfers an owned packet to the bounded queue without copying its payload.
     ///
     /// # Errors
-    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    /// Returns `NotConnected` after shutdown, or `InvalidInput` carrying
+    /// [`PunchSendError`] for oversized data.
     pub fn send_owned(
         &self,
         to: &NodeId,
@@ -370,7 +377,8 @@ impl TcpConnection {
     /// Missing/stale generations and full queues are dropped without blocking.
     ///
     /// # Errors
-    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    /// Returns `NotConnected` after shutdown, or `InvalidInput` carrying
+    /// [`PunchSendError`] for oversized data.
     pub fn send_owned_admitted(
         &self,
         to: &NodeId,

@@ -119,11 +119,13 @@ async fn a_dropped_writer_is_a_clean_eof_at_the_frame_boundary() {
 #[tokio::test]
 async fn write_half_shutdown_preserves_the_reply_half() {
     let (a, b) = pair();
+    let request = NonZeroUsize::new(7).unwrap();
+    let reply = NonZeroUsize::new(5).unwrap();
     let mut outbound = a.connect(&NodeId::new("bulk-b")).await.expect("connect");
     let (_, mut inbound) = b.accept().await.expect("accept");
 
     outbound
-        .send_bounded(Bytes::from_static(b"request"), 7)
+        .send_bounded(Bytes::from_static(b"request"), request)
         .await
         .expect("request");
     outbound
@@ -131,21 +133,21 @@ async fn write_half_shutdown_preserves_the_reply_half() {
         .await
         .expect("request write shutdown");
     assert_eq!(
-        inbound.recv_bounded(7).await.unwrap().unwrap(),
+        inbound.recv_bounded(request).await.unwrap().unwrap(),
         &b"request"[..]
     );
-    assert!(inbound.recv_bounded(7).await.unwrap().is_none());
+    assert!(inbound.recv_bounded(request).await.unwrap().is_none());
 
     inbound
-        .send_bounded(Bytes::from_static(b"reply"), 5)
+        .send_bounded(Bytes::from_static(b"reply"), reply)
         .await
         .expect("reply");
     inbound.finish_write().await.expect("reply write shutdown");
     assert_eq!(
-        outbound.recv_bounded(5).await.unwrap().unwrap(),
+        outbound.recv_bounded(reply).await.unwrap().unwrap(),
         &b"reply"[..]
     );
-    assert!(outbound.recv_bounded(5).await.unwrap().is_none());
+    assert!(outbound.recv_bounded(reply).await.unwrap().is_none());
 }
 
 /// Two streams between the *same* pair are independent pipes: frames written

@@ -31,13 +31,18 @@
 //!   `TcpMsgTransport::path_changes` observes direct/relay path changes.
 //!   The configuration and path types these signatures name (`TcpPunchConfig`,
 //!   `TcpPunchConfigError`, `PeerPolicy`, `NetworkKey`, `PathPolicy`,
-//!   `PeerPath`) are re-exported here, so standalone users need no direct
+//!   `PeerPath`) and the `PunchSendError` a connected send carries are
+//!   re-exported here, so standalone users need no direct
 //!   `groupnet-transport-punch` dependency; only a self-hosted rendezvous
 //!   (`TcpRendezvous`) comes from that crate.
 //!
 //! `TcpMsgTransport::closed` resolves, stickily, once an endpoint shuts down.
 //! `TcpMsgTransport::register_peer` records a direct endpoint's dial address
-//! and rejects a connectivity endpoint with `TcpRegisterPeerError`.
+//! and rejects a connectivity endpoint with `TcpRegisterPeerError`;
+//! `TcpMsgTransport::connect_peer` refuses a direct endpoint bound without
+//! admission with `TcpConnectPeerError`. `TcpBulkTransport::register_peer_host`
+//! names a malformed `host:port` endpoint's violated rule with
+//! `TcpHostEndpointError`.
 //!
 //! The low-level message and bulk APIs retain trusted-topology identity
 //! attribution. Managed message admission uses its own bounded wire exchange,
@@ -60,7 +65,7 @@ mod handshake;
 #[cfg(feature = "bulk")]
 mod bulk;
 #[cfg(feature = "bulk")]
-pub use bulk::{TcpBulkConfig, TcpBulkConfigError, TcpBulkTransport};
+pub use bulk::{TcpBulkConfig, TcpBulkConfigError, TcpBulkTransport, TcpHostEndpointError};
 #[cfg(feature = "bulk")]
 pub use groupnet_transport::NodeIdError;
 #[cfg(any(feature = "bulk", feature = "msg"))]
@@ -75,12 +80,13 @@ pub use groupnet_transport::{
 mod msg;
 #[cfg(feature = "connectivity")]
 pub use groupnet_transport_punch::{
-    NetworkKey, PathPolicy, PeerPath, PeerPolicy, TcpPunchConfig, TcpPunchConfigError,
+    NetworkKey, PathPolicy, PeerPath, PeerPolicy, PunchSendError, TcpPunchConfig,
+    TcpPunchConfigError,
 };
 #[cfg(feature = "connectivity")]
 pub use msg::TcpPathChanges;
 #[cfg(feature = "link")]
-pub use msg::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError};
+pub use msg::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError, TcpConnectPeerError};
 #[cfg(feature = "msg")]
 pub use msg::{TcpMsgConfig, TcpMsgConfigError, TcpMsgTransport, TcpRegisterPeerError};
 

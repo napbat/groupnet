@@ -86,14 +86,21 @@ async fn owned_queue_preserves_storage_and_full_queue_skips_borrowed_copy() {
 async fn owned_sends_reject_oversize_missing_generation_and_closed_connection() {
     let (connection, mut outgoing) = connection();
     let remote = NodeId::from("remote");
+    let oversized = connection
+        .send_owned(&remote, Bytes::from(vec![0; MAX_UDP_MESSAGE + 1]))
+        .await
+        .unwrap_err();
+    assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        connection
-            .send_owned(&remote, Bytes::from(vec![0; MAX_UDP_MESSAGE + 1]))
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        oversized
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<PunchSendError>()),
+        Some(&PunchSendError::PayloadTooLarge {
+            len: MAX_UDP_MESSAGE + 1,
+            max: MAX_UDP_MESSAGE,
+        })
     );
+    assert_ne!(oversized.to_string(), "");
     assert_eq!(
         connection
             .send_owned_admitted(&remote, Bytes::from_static(b"untagged"), None)

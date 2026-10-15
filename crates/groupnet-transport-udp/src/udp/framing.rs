@@ -1,16 +1,17 @@
 //! The raw self-attribution prefix, preserving its little-endian wire layout.
 
-use std::io;
-
 use groupnet_core::NodeId;
+use groupnet_transport::{NodeIdError, validate_node_id};
 use zerocopy::byteorder::little_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
+use super::UdpSendError;
 
 /// Largest receive buffer and accepted raw datagram, including its prefix.
 pub(super) const MAX_DATAGRAM: usize = 65_535;
 
 /// Longest accepted sender id in the self-attribution prefix.
-const MAX_ID_LEN: usize = 1024;
+pub(super) const MAX_ID_LEN: usize = 1024;
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
 #[repr(C)]
@@ -18,7 +19,7 @@ struct DatagramHeader {
     id_len: U32,
 }
 
-const HEADER_SIZE: usize = core::mem::size_of::<DatagramHeader>();
+pub(super) const HEADER_SIZE: usize = core::mem::size_of::<DatagramHeader>();
 
 /// One socket's reusable concatenation buffer. The immutable sender prefix is
 /// constructed once; only the payload is copied on each send. A caller must
@@ -30,16 +31,14 @@ pub(super) struct SendBuffer {
 }
 
 impl SendBuffer {
-    pub(super) fn new(local: &NodeId) -> io::Result<Self> {
+    /// Builds the prefix for `local`, which must be nonempty and at most
+    /// [`MAX_ID_LEN`] bytes.
+    pub(super) fn new(local: &NodeId) -> Result<Self, NodeIdError> {
+        validate_node_id(local, MAX_ID_LEN)?;
         let id = local.as_str().as_bytes();
-        if id.len() > MAX_ID_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UDP sender id exceeds the wire limit",
-            ));
-        }
-        let id_len = u32::try_from(id.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "UDP sender id exceeds u32")
+        let id_len = u32::try_from(id.len()).map_err(|_| NodeIdError::TooLong {
+            len: id.len(),
+            max: MAX_ID_LEN,
         })?;
         let header = DatagramHeader {
             id_len: U32::new(id_len),
@@ -51,12 +50,18 @@ impl SendBuffer {
         Ok(Self { bytes, prefix_len })
     }
 
-    pub(super) fn frame(&mut self, msg: &[u8]) -> io::Result<&[u8]> {
-        if msg.len() > MAX_DATAGRAM - self.prefix_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UDP datagram exceeds the wire limit",
-            ));
+    /// The largest payload that fits one datagram after this sender's prefix.
+    pub(super) const fn max_payload(&self) -> usize {
+        MAX_DATAGRAM - self.prefix_len
+    }
+
+    pub(super) fn frame(&mut self, msg: &[u8]) -> Result<&[u8], UdpSendError> {
+        let max = self.max_payload();
+        if msg.len() > max {
+            return Err(UdpSendError::PayloadTooLarge {
+                len: msg.len(),
+                max,
+            });
         }
         self.bytes.truncate(self.prefix_len);
         self.bytes.extend_from_slice(msg);
@@ -83,8 +88,9 @@ pub(super) fn unframe(datagram: &[u8]) -> Option<(NodeId, &[u8])> {
 #[cfg(test)]
 mod tests {
     use groupnet_core::NodeId;
+    use groupnet_transport::NodeIdError;
 
-    use super::{HEADER_SIZE, MAX_DATAGRAM, MAX_ID_LEN, SendBuffer, unframe};
+    use super::{HEADER_SIZE, MAX_DATAGRAM, MAX_ID_LEN, SendBuffer, UdpSendError, unframe};
 
     #[test]
     fn prefix_layout_and_roundtrip_preserve_little_endian() {
@@ -123,16 +129,24 @@ mod tests {
         assert_eq!(
             buffer
                 .frame(&vec![0; payload.len() + 1])
-                .expect_err("oversized payload")
-                .kind(),
-            std::io::ErrorKind::InvalidInput
+                .expect_err("oversized payload"),
+            UdpSendError::PayloadTooLarge {
+                len: payload.len() + 1,
+                max: payload.len(),
+            }
         );
         assert!(unframe(&vec![0; MAX_DATAGRAM + 1]).is_none());
         assert_eq!(
             SendBuffer::new(&NodeId::new("x".repeat(MAX_ID_LEN + 1)))
-                .expect_err("oversized identity")
-                .kind(),
-            std::io::ErrorKind::InvalidInput
+                .expect_err("oversized identity"),
+            NodeIdError::TooLong {
+                len: MAX_ID_LEN + 1,
+                max: MAX_ID_LEN,
+            }
+        );
+        assert_eq!(
+            SendBuffer::new(&NodeId::new("")).expect_err("empty identity"),
+            NodeIdError::Empty
         );
         let mut oversized_id = vec![0; HEADER_SIZE + MAX_ID_LEN + 1];
         oversized_id[..4].copy_from_slice(&[1, 4, 0, 0]);

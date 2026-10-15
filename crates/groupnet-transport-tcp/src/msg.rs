@@ -29,7 +29,7 @@ mod framing;
 
 use addresses::AddressBook;
 #[cfg(feature = "link")]
-pub use admitted::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError};
+pub use admitted::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError, TcpConnectPeerError};
 pub use config::{TcpMsgConfig, TcpMsgConfigError};
 #[cfg(feature = "connectivity")]
 pub use connectivity::TcpPathChanges;

@@ -11,8 +11,8 @@ use groupnet_transport::Transport;
 use groupnet_transport::link::{LinkConfigError, LinkLifecycle, LinkProvider};
 // The adapter re-exports the shared types its own signatures name.
 use groupnet_transport_ipc::{
-    IpcAddress, IpcAddressError, IpcConfig, IpcConfigError, IpcLink, IpcPeerError, IpcTransport,
-    MAX_FRAME, NodeIdError, PeerEndpoint, QueueCapacity,
+    IpcAddress, IpcAddressError, IpcConfig, IpcConfigError, IpcLink, IpcPeerError, IpcSendError,
+    IpcTransport, MAX_FRAME, NodeIdError, PeerEndpoint, QueueCapacity,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -108,6 +108,16 @@ async fn persistent_messages_and_reverse_without_address_registration() {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcSendError>()),
+        Some(&IpcSendError::PayloadTooLarge {
+            len: MAX_FRAME + 1,
+            max: MAX_FRAME,
+        })
+    );
+    assert_ne!(error.to_string(), "");
     left.send(&NodeId::new("right"), b"still alive")
         .await
         .unwrap();

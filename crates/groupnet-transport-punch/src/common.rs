@@ -1,9 +1,10 @@
-//! Crate-private helpers shared by the UDP and TCP traversal endpoints.
+//! Crate-private helpers, and the public send error, shared by the UDP and
+//! TCP traversal endpoints.
 
 use std::collections::HashSet;
-use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex, MutexGuard};
+use std::{error, fmt, io};
 
 use groupnet_core::NodeId;
 use groupnet_transport::{NodeIdError, validate_node_id};
@@ -54,6 +55,42 @@ pub(crate) fn closed() -> io::Error {
         io::ErrorKind::NotConnected,
         "native traversal connection closed",
     )
+}
+
+/// Why a [`UdpConnection`](crate::UdpConnection) or
+/// [`TcpConnection`](crate::TcpConnection) refused to queue a message.
+/// Converts into an `InvalidInput` `io::Error` that keeps this error as its
+/// inner error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PunchSendError {
+    /// The message is longer than the protocol's message bound
+    /// ([`MAX_UDP_MESSAGE`](crate::MAX_UDP_MESSAGE) or
+    /// [`MAX_TCP_MESSAGE`](crate::MAX_TCP_MESSAGE)).
+    PayloadTooLarge {
+        /// The message's length in bytes.
+        len: usize,
+        /// The protocol's message bound in bytes.
+        max: usize,
+    },
+}
+
+impl fmt::Display for PunchSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge { len, max } => write!(
+                f,
+                "native traversal message of {len} bytes exceeds the {max}-byte bound"
+            ),
+        }
+    }
+}
+
+impl error::Error for PunchSendError {}
+
+impl From<PunchSendError> for io::Error {
+    fn from(error: PunchSendError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
 }
 
 /// Locks `mutex`, recovering the guard if a panicking holder poisoned it.
