@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
-    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
-    Comparison, Cursor, HoldReceipt, InstallPermit, Limits, Materialized, NativeSnapshot, ProofId,
-    ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope, SnapshotApplicationAdapter,
-    SnapshotAttachment, SnapshotConfig, SnapshotHold, SnapshotHoldRequest, SnapshotImage,
-    SnapshotOffer, SnapshotSourceAdapter, SnapshotStage, SourceAdapter, SourceBatch, SourceHistory,
-    SourceProof, Stream, TailLimit,
+    AdapterFailure, ApplicationAdapter, ApplyRequest, BoundComparison, CatchUp, Checkpoint,
+    CheckpointLimit, Comparison, Cursor, HoldReceipt, InstallPermit, Limits, Materialized,
+    NativeSnapshot, ProofId, ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope,
+    SnapshotApplicationAdapter, SnapshotAttachment, SnapshotConfig, SnapshotHold,
+    SnapshotHoldRequest, SnapshotImage, SnapshotOffer, SnapshotSourceAdapter, SnapshotStage,
+    SourceAdapter, SourceBatch, SourceHistory, SourceProof, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -455,9 +455,9 @@ impl ApplicationAdapter<u64, Vec<Mutation>> for App {
     async fn apply(
         &self,
         _scope: Scope,
-        _from: u64,
-        through: u64,
-        native: Vec<Mutation>,
+        ApplyRequest {
+            through, native, ..
+        }: ApplyRequest<u64, Vec<Mutation>>,
         permit: InstallPermit,
     ) -> Result<Materialized<u64>, AdapterFailure<io::Error>> {
         permit

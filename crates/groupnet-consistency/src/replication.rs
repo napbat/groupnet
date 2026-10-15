@@ -29,9 +29,9 @@ pub use ack_api::{
     NamedAckResult,
 };
 pub use api::{
-    AdapterFailure, ApplicationAdapter, CatchUp, Checkpoint, CheckpointLimit, CheckpointLoadResult,
-    FailureClass, Materialized, ReadVerdict, ScanLimit, SourceAdapter, SourceBatch,
-    SourceScanResult, TailLimit,
+    AdapterFailure, ApplicationAdapter, ApplyRequest, CatchUp, Checkpoint, CheckpointLimit,
+    CheckpointLoadResult, FailureClass, Materialized, ReadVerdict, ScanLimit, SourceAdapter,
+    SourceBatch, SourceScanResult, TailLimit,
 };
 pub use fence::{InstallPermit, OperationFence, RevocationPermit};
 pub use groupnet_core::replication::{
@@ -57,4 +57,6 @@ pub use snapshot_api::{
     NativeSnapshot, ReplayOnly, SnapshotApplicationAdapter, SnapshotAttachment, SnapshotHold,
     SnapshotHoldRequest, SnapshotImage, SnapshotSourceAdapter, SnapshotStage,
 };
-pub use subscription_api::{DurableEventSink, DurableSubscriptionSource, SubscriptionSourceResult};
+pub use subscription_api::{
+    DurableEventSink, DurableSubscriptionSource, SubscriberApplyRequest, SubscriptionSourceResult,
+};

@@ -44,6 +44,10 @@ use tokio::sync::Notify;
 
 const SETTLE: Duration = Duration::from_secs(2);
 
+fn nz(bytes: usize) -> NonZeroUsize {
+    NonZeroUsize::new(bytes).expect("a nonzero test size")
+}
+
 /// A one-byte encoded and decoded test image.
 const UNIT_IMAGE: ImageSize = ImageSize {
     encoded_bytes: NonZeroUsize::MIN,
@@ -94,8 +98,7 @@ impl ClaimSource for Claims {
         limits: ClaimObservationLimits,
         admission: &ByteAdmission,
     ) -> Result<Admitted<ParticipationSnapshot>, AdapterError> {
-        let charge =
-            admission.reserve(AdmissionClass::Inflight, limits.max_metadata_bytes.get())?;
+        let charge = admission.reserve(AdmissionClass::Inflight, limits.max_metadata_bytes)?;
         let presence = self
             .presence
             .lock()
@@ -225,7 +228,7 @@ impl ClaimSource for Claims {
         _limits: ClaimObservationLimits,
         admission: &ByteAdmission,
     ) -> Result<Admitted<ClaimSnapshot>, AdapterError> {
-        let charge = admission.reserve(AdmissionClass::Inflight, 64)?;
+        let charge = admission.reserve(AdmissionClass::Inflight, nz(64))?;
         let claim = self
             .local
             .lock()
@@ -262,7 +265,7 @@ impl ClaimSource for Claims {
         let Some(peer) = peer.filter(|peer| peer.identity == selected) else {
             return Ok(None);
         };
-        let reservation = admission.reserve(AdmissionClass::Inflight, 64)?;
+        let reservation = admission.reserve(AdmissionClass::Inflight, nz(64))?;
         Ok(Some(reservation.hold(TimedClaim {
             sampled_at: Instant::now(),
             claim: peer,
@@ -351,8 +354,8 @@ impl DonorPort for OriginDonor {
             wake,
             ..
         } = request;
-        let encoded = admission.reserve(AdmissionClass::Encoded, 1)?;
-        let decoded = admission.reserve(AdmissionClass::Decoded, 1)?;
+        let encoded = admission.reserve(AdmissionClass::Encoded, nz(1))?;
+        let decoded = admission.reserve(AdmissionClass::Decoded, nz(1))?;
         let mut config = journal_config();
         let capture_max_ms = self.capture_max_ms.load(Ordering::SeqCst);
         if capture_max_ms > 0 {
@@ -415,8 +418,8 @@ impl DonorPort for OriginDonor {
         if !self.allow_recapture.load(Ordering::SeqCst) {
             return Err(AdapterErrorKind::Unsupported.into());
         }
-        let encoded = admission.reserve(AdmissionClass::Encoded, 1)?;
-        let decoded = admission.reserve(AdmissionClass::Decoded, 1)?;
+        let encoded = admission.reserve(AdmissionClass::Encoded, nz(1))?;
+        let decoded = admission.reserve(AdmissionClass::Decoded, nz(1))?;
         let config = JournalConfig {
             max_members: std::num::NonZeroUsize::new(2).expect("nonzero"),
             max_membership_bytes: std::num::NonZeroUsize::new(128).expect("nonzero"),

@@ -154,16 +154,18 @@ impl DonorInbox {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::super::admission::{AdmissionClass, AdmissionLimits, ByteAdmission};
     use super::*;
     use crate::volatile_recovery::AdapterErrorKind;
 
     fn admitted_request(admission: &ByteAdmission) -> Admitted<DonorRequest> {
         admission
-            .reserve(AdmissionClass::Inflight, 1)
+            .reserve(AdmissionClass::Inflight, NonZeroUsize::MIN)
             .unwrap()
             .hold(DonorRequest::Offer {
-                max_metadata_bytes: 8,
+                max_metadata_bytes: NonZeroUsize::new(8).unwrap(),
             })
     }
 

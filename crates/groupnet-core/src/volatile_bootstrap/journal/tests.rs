@@ -41,7 +41,7 @@ fn default_config_is_valid_and_its_storage_bound_is_modest() {
     let config = JournalConfig::default();
     assert_eq!(config.validate(), Ok(()));
     let bound = DonorJournal::storage_bound(config).expect("representable");
-    assert!(bound <= 128 * 1024 * 1024, "storage bound {bound}");
+    assert!(bound.get() <= 128 * 1024 * 1024, "storage bound {bound}");
 }
 
 #[test]
@@ -285,7 +285,7 @@ fn encoding_phase_overflow_or_cancel_cannot_finish_or_advertise() {
 #[test]
 fn whole_journal_charge_is_finite_and_rejects_oversized_retained_vectors() {
     let bound = DonorJournal::storage_bound(config()).unwrap();
-    assert!(bound > config().max_suffix_bytes.get());
+    assert!(bound > config().max_suffix_bytes);
     let mut impossible = config();
     impossible.max_followers = NonZeroUsize::MAX;
     assert_eq!(
@@ -780,7 +780,7 @@ fn capacity_and_time_expiry_release_all_followers_without_truncating_shared_suff
     let held_bytes = held_b.bytes;
     let held_operation = held_b.operation;
     journal.tick(Time(15)).unwrap();
-    assert_eq!(journal.inflight_bytes(), held_bytes);
+    assert_eq!(journal.inflight_bytes(), held_bytes.get());
     assert_eq!(journal.take_aborted(), vec![a.clone(), b.clone()]);
     assert_eq!(
         journal.take_aborted(),

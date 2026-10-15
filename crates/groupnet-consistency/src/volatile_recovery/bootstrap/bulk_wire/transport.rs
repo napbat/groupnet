@@ -1,6 +1,7 @@
 //! Bounded one-operation-per-stream donor client and worker-owned listener.
 
 use std::mem::size_of;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use groupnet_core::NodeId;
@@ -47,7 +48,7 @@ impl Default for BulkLimits {
 }
 
 impl BulkLimits {
-    pub(crate) fn decoded_charge(self) -> Result<usize, BulkLimitsError> {
+    pub(crate) fn decoded_charge(self) -> Result<NonZeroUsize, BulkLimitsError> {
         // The body cap covers variable identity/effect/string bytes. These
         // terms cover the owned enum/header and bounded Vec elements, whose
         // in-memory size need not equal their encoded representation. Scope
@@ -68,7 +69,6 @@ impl BulkLimits {
             .ok_or(BulkLimitsError::ChargeOverflow)?;
         self.phase
             .max_body_bytes
-            .get()
             .checked_add(header)
             .and_then(|value| {
                 value.checked_add(
@@ -98,31 +98,28 @@ impl BulkLimits {
             .ok_or(BulkLimitsError::ChargeOverflow)
     }
 
-    fn envelope_charge(self) -> Result<usize, BulkLimitsError> {
+    fn envelope_charge(self) -> Result<NonZeroUsize, BulkLimitsError> {
         // Scope's two String headers are in Envelope. The encoded cap covers
         // variable bytes; four Arc-header slots conservatively cover its two
         // NodeIds and any refcounted identity copy.
         self.wire
             .max_frame_bytes
-            .get()
             .checked_add(size_of::<Envelope>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
             .ok_or(BulkLimitsError::ChargeOverflow)
     }
 
-    fn tracker_charge(self) -> Result<usize, BulkLimitsError> {
+    fn tracker_charge(self) -> Result<NonZeroUsize, BulkLimitsError> {
         self.wire
             .max_frame_bytes
-            .get()
             .checked_add(size_of::<ReplyTracker>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
             .ok_or(BulkLimitsError::ChargeOverflow)
     }
 
-    pub(crate) fn correlation_charge(self) -> Result<usize, BulkLimitsError> {
+    pub(crate) fn correlation_charge(self) -> Result<NonZeroUsize, BulkLimitsError> {
         self.wire
             .max_frame_bytes
-            .get()
             .checked_add(size_of::<Correlation>())
             .and_then(|value| value.checked_add(size_of::<[usize; 8]>()))
             .ok_or(BulkLimitsError::ChargeOverflow)
@@ -299,7 +296,7 @@ async fn before<T>(deadline: Instant, future: impl Future<Output = T>) -> Result
 
 fn reserve(
     admission: &ByteAdmission,
-    bytes: usize,
+    bytes: NonZeroUsize,
 ) -> Result<crate::volatile_recovery::bootstrap::admission::Reservation, BulkError> {
     admission
         .reserve(AdmissionClass::Inflight, bytes)
@@ -313,7 +310,7 @@ async fn recv_envelope<S: futures_util::io::AsyncRead + Unpin>(
     deadline: Instant,
 ) -> Result<Option<Admitted<Envelope>>, BulkError> {
     let max_frame_bytes = limits.wire.max_frame_bytes;
-    let raw_budget = reserve(admission, max_frame_bytes.get())?;
+    let raw_budget = reserve(admission, max_frame_bytes)?;
     let raw = before(deadline, stream.recv_bounded(max_frame_bytes))
         .await?
         .map_err(|_| BulkError::Transport)?;
@@ -334,7 +331,7 @@ async fn send_envelope<S: futures_util::io::AsyncWrite + Unpin>(
     limits: BulkLimits,
     deadline: Instant,
 ) -> Result<(), BulkError> {
-    let raw_budget = reserve(admission, limits.wire.max_frame_bytes.get())?;
+    let raw_budget = reserve(admission, limits.wire.max_frame_bytes)?;
     let raw = encode(envelope, limits.wire).map_err(|_| BulkError::Protocol)?;
     let raw = raw_budget.hold(raw);
     before(
@@ -404,14 +401,14 @@ impl<B: BulkTransport> BootstrapBulkClient<B> {
         let envelope = encode_request(request, correlation, self.limits.phase)
             .map_err(|_| BulkError::Protocol)?;
         let envelope = phase_budget.hold(envelope);
-        let raw_budget = reserve(&self.admission, self.limits.wire.max_frame_bytes.get())?;
+        let raw_budget = reserve(&self.admission, self.limits.wire.max_frame_bytes)?;
         let raw = encode(envelope.get(), self.limits.wire).map_err(|_| BulkError::Protocol)?;
         let raw = raw_budget.hold(raw);
         let tracker_budget = reserve(&self.admission, self.limits.tracker_charge()?)?;
         let mut tracker = ReplyTracker::new(
             envelope.get(),
-            1,
-            u64::try_from(self.limits.phase.max_body_bytes.get())
+            NonZeroU32::MIN,
+            NonZeroU64::try_from(self.limits.phase.max_body_bytes)
                 .map_err(|_| BulkLimitsError::ChargeOverflow)?,
         )
         .map_err(|_| BulkError::Protocol)?;
@@ -661,10 +658,10 @@ mod tests {
     fn decoded_collection_and_header_charges_are_finite_and_checked() {
         let limits = limits();
         limits.validate().unwrap();
-        assert!(limits.decoded_charge().unwrap() > limits.phase.max_body_bytes.get());
-        assert!(limits.envelope_charge().unwrap() > limits.wire.max_frame_bytes.get());
-        assert!(limits.tracker_charge().unwrap() > limits.wire.max_frame_bytes.get());
-        assert!(limits.correlation_charge().unwrap() > limits.wire.max_frame_bytes.get());
+        assert!(limits.decoded_charge().unwrap() > limits.phase.max_body_bytes);
+        assert!(limits.envelope_charge().unwrap() > limits.wire.max_frame_bytes);
+        assert!(limits.tracker_charge().unwrap() > limits.wire.max_frame_bytes);
+        assert!(limits.correlation_charge().unwrap() > limits.wire.max_frame_bytes);
         assert_eq!(BulkLimits::default().validate(), Ok(()));
     }
 

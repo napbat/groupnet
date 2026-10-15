@@ -113,6 +113,23 @@ pub trait DurableSubscriptionSource: SourceAdapter {
     ) -> impl Future<Output = SubscriptionSourceResult<Option<TerminalReceipt>, Self::Error>> + Send;
 }
 
+/// One whole native batch handed to [`DurableEventSink::apply_subscriber_batch`]:
+/// the bound subscriber epoch, the batch's exact native interval, the sink
+/// cursor the transaction is conditioned on, and the batch itself.
+#[derive(Debug)]
+pub struct SubscriberApplyRequest<P, B> {
+    /// Source-certified subscriber epoch the transaction is fenced by.
+    pub registration: RegisterReceipt,
+    /// Exclusive prior native position of the batch.
+    pub from: P,
+    /// Inclusive native position the batch reaches.
+    pub through: P,
+    /// Durable sink cursor the transaction must still find in place.
+    pub previous_sink: P,
+    /// Application-native batch of records.
+    pub native: B,
+}
+
 /// Application transaction that fences an exact subscriber source epoch.
 ///
 /// The sink must atomically reject a lower durable fence ordinal even if an
@@ -141,11 +158,7 @@ pub trait DurableEventSink<P, B>: Send + Sync + 'static {
     /// The stable source-ack request ID is persisted with the sink effects.
     fn apply_subscriber_batch(
         &self,
-        registration: RegisterReceipt,
-        from: P,
-        through: P,
-        previous_sink: P,
-        native: B,
+        request: SubscriberApplyRequest<P, B>,
         permit: InstallPermit,
     ) -> impl Future<
         Output = Result<

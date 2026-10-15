@@ -3,7 +3,7 @@
 //! This public opt-in peer data-plane API carries only the nine typed donor
 //! phases. Its codec frames are transport data, never source authority.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use groupnet_core::NodeId;
 use groupnet_core::volatile_bootstrap::{
@@ -517,8 +517,8 @@ pub fn decode(bytes: &[u8], limits: WireLimits) -> Result<Envelope, WireError> {
 pub struct ReplyTracker {
     correlation: Correlation,
     exchange: ExchangeKind,
-    max_frames: u32,
-    max_bytes: u64,
+    max_frames: NonZeroU32,
+    max_bytes: NonZeroU64,
     frames: u32,
     bytes: u64,
     refusal: Option<Refusal>,
@@ -526,12 +526,17 @@ pub struct ReplyTracker {
 }
 
 impl ReplyTracker {
-    /// Pins the exact request and finite reply shape before reading frames.
+    /// Pins the exact request and finite, nonzero reply shape before reading
+    /// frames.
     ///
     /// # Errors
-    /// Rejects a non-request frame or invalid finite response bounds.
-    pub fn new(request: &Envelope, max_frames: u32, max_bytes: u64) -> Result<Self, WireError> {
-        if !matches!(&request.message, Message::Request(_)) || max_frames == 0 || max_bytes == 0 {
+    /// Rejects a non-request frame.
+    pub fn new(
+        request: &Envelope,
+        max_frames: NonZeroU32,
+        max_bytes: NonZeroU64,
+    ) -> Result<Self, WireError> {
+        if !matches!(&request.message, Message::Request(_)) {
             return Err(WireError::Invalid);
         }
         Ok(Self {
@@ -564,7 +569,7 @@ impl ReplyTracker {
                     .bytes
                     .checked_add(u64::try_from(payload.len()).map_err(|_| WireError::Capacity)?)
                     .ok_or(WireError::Capacity)?;
-                if next_frames > self.max_frames || next_bytes > self.max_bytes {
+                if next_frames > self.max_frames.get() || next_bytes > self.max_bytes.get() {
                     return Err(WireError::Capacity);
                 }
                 self.frames = next_frames;
@@ -747,7 +752,8 @@ mod tests {
             frames: 1,
             bytes: 2,
         });
-        let mut tracker = ReplyTracker::new(&request, 1, 2).unwrap();
+        let mut tracker =
+            ReplyTracker::new(&request, NonZeroU32::MIN, NonZeroU64::new(2).unwrap()).unwrap();
         assert_eq!(tracker.clone().finish_eof(), Err(WireError::Invalid));
         tracker.accept(&reply).unwrap();
         assert_eq!(tracker.clone().finish_eof(), Err(WireError::Invalid));
@@ -759,7 +765,8 @@ mod tests {
     #[test]
     fn reply_rejects_wrong_correlation_counts_and_over_budget_payload() {
         let request = fixture(Message::Request(vec![]));
-        let mut tracker = ReplyTracker::new(&request, 1, 2).unwrap();
+        let mut tracker =
+            ReplyTracker::new(&request, NonZeroU32::MIN, NonZeroU64::new(2).unwrap()).unwrap();
         let mut wrong = fixture(Message::Reply(vec![1]));
         wrong.correlation.child.token += 1;
         assert_eq!(tracker.accept(&wrong), Err(WireError::Invalid));
@@ -786,7 +793,7 @@ mod tests {
     #[test]
     fn refusal_needs_matching_zero_count_terminal() {
         let request = fixture(Message::Request(vec![]));
-        let mut tracker = ReplyTracker::new(&request, 1, 1).unwrap();
+        let mut tracker = ReplyTracker::new(&request, NonZeroU32::MIN, NonZeroU64::MIN).unwrap();
         tracker
             .accept(&fixture(Message::Refused(Refusal::Expired)))
             .unwrap();
@@ -804,5 +811,22 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(tracker.finish_eof(), Ok(Some(Refusal::Expired)));
+    }
+
+    #[test]
+    fn tracker_pins_only_a_request_frame() {
+        let bounds = (NonZeroU32::MIN, NonZeroU64::MIN);
+        let reply = fixture(Message::Reply(vec![1]));
+        assert_eq!(
+            ReplyTracker::new(&reply, bounds.0, bounds.1).unwrap_err(),
+            WireError::Invalid
+        );
+        let request = fixture(Message::Request(vec![1]));
+        let mut tracker = ReplyTracker::new(&request, bounds.0, bounds.1).unwrap();
+        tracker.accept(&fixture(Message::Reply(vec![2]))).unwrap();
+        assert_eq!(
+            tracker.accept(&fixture(Message::Reply(vec![3]))),
+            Err(WireError::Capacity)
+        );
     }
 }

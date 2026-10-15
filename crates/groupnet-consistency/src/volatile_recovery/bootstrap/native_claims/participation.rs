@@ -1,6 +1,7 @@
 //! One admitted native actor cut for membership, presence, and builder hints.
 
 use std::mem::size_of;
+use std::num::NonZeroUsize;
 
 use groupnet_core::Status;
 use groupnet_core::volatile_bootstrap::{
@@ -11,7 +12,7 @@ use groupnet_runtime::InspectedPair;
 use super::{
     AdapterError, AdapterErrorKind, AdmissionClass, Admitted, BootstrapClaim, BootstrapMember,
     ByteAdmission, CAPACITY, ClaimObservationLimits, MALFORMED, NativeClaimSource, UNAVAILABLE,
-    allocation, key_bytes, remaining_ms,
+    allocation, charge, key_bytes, remaining_ms,
 };
 use crate::volatile_recovery::bootstrap::ports::{ParticipationSnapshot, TimedParticipant};
 
@@ -28,7 +29,6 @@ impl NativeClaimSource {
         inspection.max_key_bytes = key_bytes(self.longer_key())?;
         let raw_charge = limits
             .max_metadata_bytes
-            .get()
             .checked_add(self.key.len())
             .and_then(|bytes| bytes.checked_add(self.presence_key.len()))
             .ok_or(CAPACITY)?;
@@ -39,7 +39,7 @@ impl NativeClaimSource {
             .await
             .map_err(|_| UNAVAILABLE)?;
         let raw = raw_budget.hold(raw);
-        let decoded_bytes = decoded_charge(raw.get(), limits.max_metadata_bytes.get())?;
+        let decoded_bytes = decoded_charge(raw.get(), limits.max_metadata_bytes)?;
         let decoded_budget = admission.reserve(AdmissionClass::Inflight, decoded_bytes)?;
         let converted = raw.consume(|raw| self.convert_participation(raw))?;
         Ok(decoded_budget.hold(converted))
@@ -133,7 +133,10 @@ impl NativeClaimSource {
     }
 }
 
-fn decoded_charge(raw: &InspectedPair, max_bytes: usize) -> Result<usize, AdapterError> {
+fn decoded_charge(
+    raw: &InspectedPair,
+    max_bytes: NonZeroUsize,
+) -> Result<NonZeroUsize, AdapterError> {
     let per_member = size_of::<BootstrapMember>()
         .checked_add(size_of::<BootstrapMemberIdentity>())
         .and_then(|bytes| bytes.checked_add(size_of::<TimedParticipant>()))
@@ -147,8 +150,8 @@ fn decoded_charge(raw: &InspectedPair, max_bytes: usize) -> Result<usize, Adapte
             })
         })
         .ok_or(CAPACITY)?;
-    if total == 0 || total > max_bytes {
-        return Err(CAPACITY);
-    }
-    Ok(total)
+    charge(total)
+        .ok()
+        .filter(|total| *total <= max_bytes)
+        .ok_or(CAPACITY)
 }

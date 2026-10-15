@@ -179,7 +179,7 @@ async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_prese
     old.publish_presence(presence(b_id.clone(), 7, 8))
         .await
         .unwrap();
-    let key = presence_entry_key(&scope(), KEY_BYTES.get()).unwrap();
+    let key = presence_entry_key(&scope(), KEY_BYTES).unwrap();
     eventually("the survivor holds the old life's presence", || {
         a_group.node_entry(&b_id, &key).is_some()
     })
@@ -225,7 +225,7 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
     let mut old_presence = presence(cluster.ids[0].clone(), 7, 8);
     old.publish_presence(old_presence.clone()).await.unwrap();
     for _ in 0..24 {
-        let queued = budget.reserve(AdmissionClass::Inflight, 32).unwrap();
+        let queued = budget.reserve(AdmissionClass::Inflight, nz(32)).unwrap();
         cluster.groups[0]
             .set_entry_confirmed(
                 EntryWrite::new("hot", b"x").with_limits(limits_of(32, 32)),
@@ -242,7 +242,7 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
     let replacement = presence(cluster.ids[0].clone(), 9, 10);
     new.publish_presence(replacement.clone()).await.unwrap();
     old.withdraw_presence(old_presence.identity).await.unwrap();
-    let key = presence_entry_key(&scope(), 128).unwrap();
+    let key = presence_entry_key(&scope(), KEY_BYTES).unwrap();
     let bytes = cluster.groups[0]
         .node_entry(&cluster.ids[0], &key)
         .expect("new presence remains");
@@ -291,7 +291,7 @@ async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_a
         let budget = budget.clone();
         tokio::spawn(async move {
             for _ in 0..2 {
-                let queued = budget.reserve(AdmissionClass::Inflight, 32).unwrap();
+                let queued = budget.reserve(AdmissionClass::Inflight, nz(32)).unwrap();
                 group
                     .set_entry_confirmed(
                         EntryWrite::new("hot", b"x").with_limits(limits_of(32, 32)),
@@ -305,7 +305,7 @@ async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_a
     let published = presence(cluster.ids[0].clone(), 7, 8);
     source.publish_presence(published.clone()).await.unwrap();
     writer.await.unwrap();
-    let key = presence_entry_key(&scope(), 128).unwrap();
+    let key = presence_entry_key(&scope(), KEY_BYTES).unwrap();
     let bytes = cluster.groups[0]
         .node_entry(&cluster.ids[0], &key)
         .expect("the created presence is visible");
@@ -367,8 +367,8 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
     second.publish_presence(second_presence).await.unwrap();
     let first_claim = claim(cluster.ids[0].clone());
     first.publish_claim(first_claim.clone()).await.unwrap();
-    let presence_key = presence_entry_key(&scope(), 128).unwrap();
-    let claim_key = claim_entry_key(&scope(), 128).unwrap();
+    let presence_key = presence_entry_key(&scope(), KEY_BYTES).unwrap();
+    let claim_key = claim_entry_key(&scope(), KEY_BYTES).unwrap();
     eventually("paired source metadata reaches the second member", || {
         cluster.groups[1]
             .node_entry(&cluster.ids[0], &presence_key)
@@ -416,7 +416,7 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
         [] as [groupnet_core::volatile_bootstrap::BootstrapClaim; 0]
     );
     drop(cut);
-    let queued = budget.reserve(AdmissionClass::Inflight, 128).unwrap();
+    let queued = budget.reserve(AdmissionClass::Inflight, nz(128)).unwrap();
     cluster.groups[0]
         .set_entry_confirmed(
             EntryWrite::new(&presence_key, b"malformed")
@@ -477,7 +477,7 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
         .publish_claim(claim(cluster.ids[0].clone()))
         .await
         .unwrap();
-    let key = claim_entry_key(&scope(), 128).unwrap();
+    let key = claim_entry_key(&scope(), KEY_BYTES).unwrap();
     eventually("peer receives native TTL claim and complete roster", || {
         cluster.groups[1]
             .node_entry(&cluster.ids[0], &key)
@@ -514,7 +514,7 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
             .is_err()
     );
 
-    let queued = budget.reserve(AdmissionClass::Inflight, 128).unwrap();
+    let queued = budget.reserve(AdmissionClass::Inflight, nz(128)).unwrap();
     cluster.groups[1]
         .set_entry_confirmed(
             EntryWrite::new(&key, b"malformed")
@@ -585,8 +585,8 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
     assert_eq!(snapshot.get().claims.len(), 1);
     assert_eq!(snapshot.get().claims[0].identity, new_claim.identity);
     drop(snapshot);
-    let key = claim_entry_key(&scope(), 128).unwrap();
-    let queued = budget.reserve(AdmissionClass::Inflight, 128).unwrap();
+    let key = claim_entry_key(&scope(), KEY_BYTES).unwrap();
+    let queued = budget.reserve(AdmissionClass::Inflight, nz(128)).unwrap();
     cluster.groups[0]
         .set_entry_confirmed(
             EntryWrite::new(&key, b"present-without-ttl").with_limits(limits_of(128, 256)),
@@ -603,7 +603,7 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
 #[tokio::test]
 async fn failed_converted_admission_retires_raw_actor_response_first() {
     let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
-    let raw_charge = 2_048 + claim_entry_key(&scope(), 128).unwrap().len();
+    let raw_charge = 2_048 + claim_entry_key(&scope(), KEY_BYTES).unwrap().len();
     let budget = ByteAdmission::new(AdmissionLimits {
         max_total_bytes: std::num::NonZeroUsize::new(raw_charge + 1).unwrap(),
         max_encoded_bytes: 0,

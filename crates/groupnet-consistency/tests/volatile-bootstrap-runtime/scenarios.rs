@@ -6,7 +6,7 @@ use super::{
     DonorCapture, DonorJournal, DonorPort, DonorRequest, Duration, JournalIngress, Mutex, NodeId,
     Notify, Ordering, OriginDonor, PeerDonor, ReadAdapter, RecoveryConfig, RecoveryHandle,
     RecoveryMode, RecoveryRearm, SETTLE, Time, UNIT_IMAGE, admission, bootstrap_config,
-    eventually_within, journal_config, member_from_claim, unit_capture,
+    eventually_within, journal_config, member_from_claim, nz, unit_capture,
 };
 use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::volatile_recovery::bootstrap::PresenceIdentity;
@@ -36,8 +36,8 @@ fn captured_for_cleanup(
     let storage = DonorJournal::storage_bound(journal_config()).unwrap();
     let suffix = admission.reserve(AdmissionClass::Suffix, storage).unwrap();
     let ingress = JournalIngress::new(journal, suffix, Arc::new(Notify::new())).unwrap();
-    let encoded = admission.reserve(AdmissionClass::Encoded, 1).unwrap();
-    let decoded = admission.reserve(AdmissionClass::Decoded, 1).unwrap();
+    let encoded = admission.reserve(AdmissionClass::Encoded, nz(1)).unwrap();
+    let decoded = admission.reserve(AdmissionClass::Decoded, nz(1)).unwrap();
     DonorCapture::new(vec![42], ingress, encoded, decoded).unwrap()
 }
 
@@ -69,7 +69,7 @@ fn ingress_rejects_an_undercharged_whole_journal() {
     journal.finish_capture(Time(0), UNIT_IMAGE).unwrap();
     let storage = DonorJournal::storage_bound(journal_config()).unwrap();
     let insufficient = admission
-        .reserve(AdmissionClass::Suffix, storage - 1)
+        .reserve(AdmissionClass::Suffix, nz(storage.get() - 1))
         .unwrap();
     assert!(JournalIngress::new(journal, insufficient, Arc::new(Notify::new())).is_err());
     assert_eq!(admission.usage().0, 0);
@@ -100,7 +100,7 @@ fn delayed_old_capture_unlink_preserves_replacement_and_its_charge() {
     assert!(replacement.is_active());
     assert_eq!(
         admission.usage().0,
-        2 * (DonorJournal::storage_bound(journal_config()).unwrap() + 2)
+        2 * (DonorJournal::storage_bound(journal_config()).unwrap().get() + 2)
     );
     drop(old);
     assert!(replacement.is_active());
@@ -364,10 +364,10 @@ async fn one_coalesced_wake_serves_a_bounded_burst_without_waiting_for_renewal()
     let mut replies = Vec::new();
     for _ in 0..4 {
         let request = admission
-            .reserve(AdmissionClass::Inflight, 1)
+            .reserve(AdmissionClass::Inflight, nz(1))
             .unwrap()
             .hold(DonorRequest::Offer {
-                max_metadata_bytes: 8,
+                max_metadata_bytes: nz(8),
             });
         replies.push(sender.try_submit(request).unwrap());
     }
@@ -436,10 +436,10 @@ async fn stalled_ready_renewal_cannot_serve_a_request_after_capture_expiry() {
         .await
         .expect("claim maintenance is blocked");
     let request = admission
-        .reserve(AdmissionClass::Inflight, 1)
+        .reserve(AdmissionClass::Inflight, nz(1))
         .unwrap()
         .hold(DonorRequest::Offer {
-            max_metadata_bytes: 8,
+            max_metadata_bytes: nz(8),
         });
     let reply = sender.try_submit(request).unwrap();
     let blocked_at = std::time::Instant::now();

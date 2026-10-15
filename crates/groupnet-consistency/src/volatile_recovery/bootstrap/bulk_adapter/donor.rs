@@ -49,7 +49,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
         }
         match request {
             DonorRequest::Offer { max_metadata_bytes } => {
-                if *max_metadata_bytes != self.policy.max_metadata_bytes.get() {
+                if *max_metadata_bytes != self.policy.max_metadata_bytes {
                     return Err(INVALID);
                 }
                 let offer = self
@@ -74,7 +74,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                             .iter()
                             .try_fold(bytes, |sum, cut| sum.checked_add(cut.writer.len()))
                     });
-                if variable_bytes.is_none_or(|bytes| bytes > *max_metadata_bytes) {
+                if variable_bytes.is_none_or(|bytes| bytes > max_metadata_bytes.get()) {
                     return Err(AdapterErrorKind::Malformed.into());
                 }
                 if !capture
@@ -99,7 +99,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                         && journal.acknowledged(now, reservation).is_ok()
                 });
                 drop(cursor_charge);
-                if *max_bytes == 0 || *max_bytes > self.policy.max_chunk_bytes.get() {
+                if *max_bytes > self.policy.max_chunk_bytes {
                     return Err(INVALID);
                 }
                 if !valid_reservation {
@@ -108,7 +108,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 let chunk = self
                     .state
                     .image_chunk(capture, *sequence, *max_bytes, admission)?;
-                if chunk.get().is_empty() || chunk.get().len() > *max_bytes {
+                if chunk.get().is_empty() || chunk.get().len() > max_bytes.get() {
                     return Err(AdapterErrorKind::Malformed.into());
                 }
                 Ok(DonorReply::Chunk(chunk))
@@ -144,7 +144,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 attachment,
                 max_metadata_bytes,
             } => {
-                if *max_metadata_bytes != self.policy.max_metadata_bytes.get() {
+                if *max_metadata_bytes != self.policy.max_metadata_bytes {
                     return Err(INVALID);
                 }
                 let charge = self.reply_charge(admission)?;
@@ -164,7 +164,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 expected,
                 max_metadata_bytes,
             } => {
-                if *max_metadata_bytes != self.policy.max_metadata_bytes.get() {
+                if *max_metadata_bytes != self.policy.max_metadata_bytes {
                     return Err(INVALID);
                 }
                 let charge = self.reply_charge(admission)?;
@@ -181,8 +181,8 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 max_bytes,
                 max_events,
             } => {
-                if *max_bytes != self.policy.max_batch_bytes.get()
-                    || *max_events != self.policy.max_batch_events.get()
+                if *max_bytes != self.policy.max_batch_bytes
+                    || *max_events != self.policy.max_batch_events
                 {
                     return Err(INVALID);
                 }
@@ -192,7 +192,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                     .with_journal(|journal| journal.read_batch(now, &barrier.reservation, barrier))
                     .map_err(|_| FENCED)?
                     .ok_or(FENCED)?;
-                if batch.bytes > *max_bytes || batch.deltas.len() > *max_events {
+                if batch.bytes > *max_bytes || batch.deltas.len() > max_events.get() {
                     return Err(AdapterErrorKind::Malformed.into());
                 }
                 Ok(DonorReply::Batch(charge.hold(batch)))

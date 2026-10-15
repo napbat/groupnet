@@ -106,7 +106,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 };
                 let reply = self.request(context, op, &request, deadline).await?;
                 let chunk = reply.try_map(|reply| match reply {
-                    WireReply::Chunk(chunk) if chunk.len() <= max_bytes => Ok(chunk),
+                    WireReply::Chunk(chunk) if chunk.len() <= max_bytes.get() => Ok(chunk),
                     _ => Err(MALFORMED),
                 })?;
                 let bytes = NonZeroUsize::new(chunk.get().len()).ok_or(MALFORMED)?;
@@ -142,14 +142,14 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 }
                 let request = DonorRequest::Barrier {
                     attachment,
-                    max_metadata_bytes: self.policy.max_metadata_bytes.get(),
+                    max_metadata_bytes: self.policy.max_metadata_bytes,
                 };
                 self.barrier(context, op, request, deadline).await
             }
             TransferEffect::AdvanceBarrier { op, expected } => {
                 let request = DonorRequest::AdvanceBarrier {
                     expected,
-                    max_metadata_bytes: self.policy.max_metadata_bytes.get(),
+                    max_metadata_bytes: self.policy.max_metadata_bytes,
                 };
                 self.barrier(context, op, request, deadline).await
             }
@@ -163,8 +163,8 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 }
                 let request = DonorRequest::Batch {
                     barrier: receipt,
-                    max_bytes: self.policy.max_batch_bytes.get(),
-                    max_events: self.policy.max_batch_events.get(),
+                    max_bytes: self.policy.max_batch_bytes,
+                    max_events: self.policy.max_batch_events,
                 };
                 let reply = self.request(context, op, &request, deadline).await?;
                 let batch = reply.try_map(|reply| match reply {

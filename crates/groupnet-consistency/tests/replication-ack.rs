@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 use groupnet_consistency::replication::{
     AckEvidence, AckEvidenceSource, AckKind, AckObservation, AckSourceFailure, AckTarget,
     AckWaitLimits, AckWaitLimitsError, AckWaitOutcome, AckWaitRequest, AckWaitStartError,
-    AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, CertifiedRoster, Checkpoint,
-    CheckpointLimit, Comparison, Cursor, InstallPermit, Limits, Materialized, NamedAckRequest,
-    NamedAckResult, OpenError, Operation, ProofId, Replication, RequiredSubscriber,
-    RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory, SourceProof,
-    Stream, TailLimit,
+    AdapterFailure, ApplicationAdapter, ApplyRequest, BoundComparison, CatchUp, CertifiedRoster,
+    Checkpoint, CheckpointLimit, Comparison, Cursor, InstallPermit, Limits, Materialized,
+    NamedAckRequest, NamedAckResult, OpenError, Operation, ProofId, Replication,
+    RequiredSubscriber, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch,
+    SourceHistory, SourceProof, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -261,9 +261,7 @@ impl ApplicationAdapter<u64, ()> for App {
     async fn apply(
         &self,
         _scope: Scope,
-        _from: u64,
-        through: u64,
-        _native: (),
+        ApplyRequest { through, .. }: ApplyRequest<u64, ()>,
         permit: InstallPermit,
     ) -> Result<Materialized<u64>, AdapterFailure<io::Error>> {
         permit

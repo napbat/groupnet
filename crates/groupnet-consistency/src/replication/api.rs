@@ -96,6 +96,19 @@ pub struct SourceBatch<P, B> {
 /// Bounded source replay result.
 pub type SourceScanResult<P, B, E> = Result<SourceBatch<P, B>, AdapterFailure<E>>;
 
+/// One native committed prefix handed to [`ApplicationAdapter::apply`]: the
+/// exact source interval it covers and the batch that covers it.
+#[derive(Debug)]
+pub struct ApplyRequest<P, B> {
+    /// Exclusive prior native position; the materialized cursor the apply
+    /// must still find in place.
+    pub from: P,
+    /// Inclusive native position the apply materializes.
+    pub through: P,
+    /// Application-native replay window, private fork, or record collection.
+    pub native: B,
+}
+
 /// Validated recoverable state/cursor candidate, private until guarded install.
 #[derive(Debug)]
 pub struct Checkpoint<P, R> {
@@ -251,16 +264,15 @@ pub trait ApplicationAdapter<P, B>: Send + Sync + 'static {
         permit: RevocationPermit,
     ) -> impl Future<Output = Result<(), AdapterFailure<Self::Error>>> + Send;
 
-    /// Applies one native committed prefix. Final synchronous publication must
-    /// use [`InstallPermit::commit_sync`]. An async durable transaction must
+    /// Applies one native committed prefix, `request.from` exclusive through
+    /// `request.through` inclusive. Final synchronous publication must use
+    /// [`InstallPermit::commit_sync`]. An async durable transaction must
     /// condition its state/cursor commit on the same operation fence *inside*
     /// that transaction before calling `confirm_durable_transaction`.
     fn apply(
         &self,
         scope: Scope,
-        from: P,
-        through: P,
-        native: B,
+        request: ApplyRequest<P, B>,
         permit: InstallPermit,
     ) -> impl Future<Output = Result<Materialized<P>, AdapterFailure<Self::Error>>> + Send;
 

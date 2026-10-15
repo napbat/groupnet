@@ -264,9 +264,11 @@ The implemented traits are in
 `read_current_terminal`. `SubscriptionSourceResult` distinguishes accepted
 conditional writes, conclusive no-write rejections, and ambiguous failures.
 `DurableEventSink<P, B>` provides `bind_subscriber_epoch` and
-`apply_subscriber_batch`; the latter takes both the batch's native interval and
-the previous sink cursor, and persists the stable source-ack request ID with
-the effects. Standard futures keep typed native records in the adapter.
+`apply_subscriber_batch`; the latter takes a `SubscriberApplyRequest` carrying
+the registration, the batch's native interval, the previous sink cursor and
+the native batch, plus the install permit, and persists the stable source-ack
+request ID with the effects. Standard futures keep typed native records in the
+adapter.
 
 The [manager API](../crates/groupnet-consistency/src/replication/shell/event_complete.rs)
 uses an explicit fresh nonzero session incarnation:

@@ -95,7 +95,7 @@ impl std::error::Error for AdmissionLimitsError {}
 /// Failed admission never licenses an allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionError {
-    /// Requested charge is zero or exceeds its class cap.
+    /// Requested charge exceeds its class cap.
     InvalidCharge,
     /// Aggregate, class, or reservation capacity is exhausted.
     Full,
@@ -104,7 +104,7 @@ pub enum AdmissionError {
 impl std::fmt::Display for AdmissionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::InvalidCharge => "admission charge is zero or exceeds its class cap",
+            Self::InvalidCharge => "admission charge exceeds its class cap",
             Self::Full => "admission capacity is exhausted",
         })
     }
@@ -189,18 +189,21 @@ impl ByteAdmission {
         })))
     }
 
-    /// Charges bytes and one slot before the caller allocates work.
+    /// Charges bytes and one slot before the caller allocates work. A charge
+    /// is nonzero by type: a measured length converts fallibly first.
     ///
     /// # Errors
-    /// Rejects invalid charge or exhausted capacity without changing usage.
+    /// Rejects a charge above its class cap, or exhausted capacity, without
+    /// changing usage.
     pub fn reserve(
         &self,
         class: AdmissionClass,
-        bytes: usize,
+        bytes: NonZeroUsize,
     ) -> Result<Reservation, AdmissionError> {
+        let bytes = bytes.get();
         let index = class.index();
         let cap = self.0.limits.class_cap(class);
-        if bytes == 0 || bytes > cap {
+        if bytes > cap {
             return Err(AdmissionError::InvalidCharge);
         }
         let mut used = self
@@ -374,16 +377,18 @@ mod tests {
         let budget = ByteAdmission::new(limits()).unwrap();
         let other = budget.clone();
         let image = budget
-            .reserve(AdmissionClass::Encoded, 6)
+            .reserve(AdmissionClass::Encoded, NonZeroUsize::new(6).unwrap())
             .unwrap()
             .hold(vec![0; 6]);
         let batch = other
-            .reserve(AdmissionClass::Inflight, 4)
+            .reserve(AdmissionClass::Inflight, NonZeroUsize::new(4).unwrap())
             .unwrap()
             .hold(vec![0; 4]);
         assert_eq!(budget.usage(), (10, [6, 0, 0, 0, 4], 2));
         assert_eq!(
-            budget.reserve(AdmissionClass::Suffix, 1).unwrap_err(),
+            budget
+                .reserve(AdmissionClass::Suffix, NonZeroUsize::MIN)
+                .unwrap_err(),
             AdmissionError::Full
         );
         drop(batch);
@@ -416,11 +421,13 @@ mod tests {
         .unwrap();
         let retired = Arc::new(AtomicUsize::new(0));
         let value = budget
-            .reserve(AdmissionClass::Inflight, 1)
+            .reserve(AdmissionClass::Inflight, NonZeroUsize::new(1).unwrap())
             .unwrap()
             .hold(Retired(Arc::clone(&retired), budget.clone()));
         assert_eq!(
-            budget.reserve(AdmissionClass::Encoded, 1).unwrap_err(),
+            budget
+                .reserve(AdmissionClass::Encoded, NonZeroUsize::MIN)
+                .unwrap_err(),
             AdmissionError::Full
         );
         drop(value);
@@ -442,7 +449,7 @@ mod tests {
         .unwrap();
         let retired = Arc::new(AtomicUsize::new(0));
         budget
-            .reserve(AdmissionClass::Inflight, 1)
+            .reserve(AdmissionClass::Inflight, NonZeroUsize::new(1).unwrap())
             .unwrap()
             .hold(Retired(Arc::clone(&retired), budget.clone()))
             .consume(drop);
@@ -464,7 +471,7 @@ mod tests {
         .unwrap();
         let retired = Arc::new(AtomicUsize::new(0));
         let value = budget
-            .reserve(AdmissionClass::Inflight, 1)
+            .reserve(AdmissionClass::Inflight, NonZeroUsize::new(1).unwrap())
             .unwrap()
             .hold(Retired(Arc::clone(&retired), budget.clone()));
         let mapped = value.map(Some);
@@ -474,7 +481,7 @@ mod tests {
 
         retired.store(0, Ordering::Release);
         let value = budget
-            .reserve(AdmissionClass::Inflight, 1)
+            .reserve(AdmissionClass::Inflight, NonZeroUsize::new(1).unwrap())
             .unwrap()
             .hold(Retired(Arc::clone(&retired), budget.clone()));
         assert!(matches!(
@@ -501,12 +508,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            budget.reserve(AdmissionClass::Encoded, 3).unwrap_err(),
+            budget
+                .reserve(AdmissionClass::Encoded, NonZeroUsize::new(3).unwrap())
+                .unwrap_err(),
             AdmissionError::InvalidCharge
         );
-        let first = budget.reserve(AdmissionClass::Encoded, 2).unwrap();
+        let first = budget
+            .reserve(AdmissionClass::Encoded, NonZeroUsize::new(2).unwrap())
+            .unwrap();
         assert_eq!(
-            budget.reserve(AdmissionClass::Encoded, 1).unwrap_err(),
+            budget
+                .reserve(AdmissionClass::Encoded, NonZeroUsize::MIN)
+                .unwrap_err(),
             AdmissionError::Full
         );
         assert_eq!(budget.usage(), (2, [2, 0, 0, 0, 0], 1));
@@ -524,11 +537,15 @@ mod tests {
         assert_eq!(budget.usage(), (0, [0; 5], 0));
         assert_eq!(
             budget
-                .reserve(AdmissionClass::NativeOverlap, 1)
+                .reserve(AdmissionClass::NativeOverlap, NonZeroUsize::MIN)
                 .unwrap_err(),
             AdmissionError::InvalidCharge
         );
-        assert!(budget.reserve(AdmissionClass::Encoded, 1).is_ok());
+        assert!(
+            budget
+                .reserve(AdmissionClass::Encoded, NonZeroUsize::MIN)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -564,7 +581,10 @@ mod tests {
             AdmissionClass::NativeOverlap,
             AdmissionClass::Inflight,
         ] {
-            assert!(budget.reserve(class, 1).is_ok(), "{class:?}");
+            assert!(
+                budget.reserve(class, NonZeroUsize::MIN).is_ok(),
+                "{class:?}"
+            );
         }
     }
 
@@ -573,7 +593,11 @@ mod tests {
         use std::error::Error as _;
 
         let budget = ByteAdmission::new(limits()).unwrap();
-        let error = AdapterError::from(budget.reserve(AdmissionClass::Encoded, 11).unwrap_err());
+        let error = AdapterError::from(
+            budget
+                .reserve(AdmissionClass::Encoded, NonZeroUsize::new(11).unwrap())
+                .unwrap_err(),
+        );
         assert_eq!(error.kind(), AdapterErrorKind::Capacity);
         assert_eq!(
             error.source().map(ToString::to_string),

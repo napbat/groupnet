@@ -2,11 +2,14 @@
 
 mod followers;
 
+use std::num::NonZeroUsize;
+
 use super::types::{
     BarrierReceipt, CaptureCharge, CaptureId, CapturePlan, DeltaIdentity, ImageSize, Invalidation,
     JournalConfig, JournalConfigError, JournalCursor, JournalDelta, JournalError, JournalState,
     NativeCut, NativeRenewal, ReservationId, ReservationStage,
 };
+
 use crate::Time;
 use crate::volatile_bootstrap::{BootstrapMemberIdentity, same_membership};
 
@@ -14,7 +17,7 @@ use crate::volatile_bootstrap::{BootstrapMemberIdentity, same_membership};
 struct OutstandingBatch {
     operation: u64,
     through: u64,
-    bytes: usize,
+    bytes: NonZeroUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -101,7 +104,7 @@ impl DonorJournal {
 
     /// The retained-heap reservation of [`Self::storage_bound`], or `None`
     /// when the configured caps overflow `usize`.
-    pub(super) fn checked_storage_bound(config: &JournalConfig) -> Option<usize> {
+    pub(super) fn checked_storage_bound(config: &JournalConfig) -> Option<NonZeroUsize> {
         use std::mem::size_of;
 
         let slots = |count: usize, size: usize| Self::storage_slots(count)?.checked_mul(size);
@@ -142,7 +145,9 @@ impl DonorJournal {
             .checked_add(cuts.checked_mul(cut_bytes)?)?
             .checked_add(scope_bytes.checked_mul(8)?)?
             .checked_add(follower_id_bytes.checked_mul(8)?)?;
-        total.checked_add(config.max_followers.get().checked_mul(per_follower)?)
+        total
+            .checked_add(config.max_followers.get().checked_mul(per_follower)?)
+            .and_then(NonZeroUsize::new)
     }
 
     /// Conservative retained-heap reservation for one journal, excluding the
@@ -156,7 +161,7 @@ impl DonorJournal {
     /// # Errors
     /// Returns [`JournalError::Config`] for an invalid config, including
     /// [`JournalConfigError::StorageBoundOverflow`] when the bound overflows.
-    pub fn storage_bound(config: JournalConfig) -> Result<usize, JournalError> {
+    pub fn storage_bound(config: JournalConfig) -> Result<NonZeroUsize, JournalError> {
         config.validate().map_err(JournalError::Config)?;
         Self::checked_storage_bound(&config).ok_or(JournalError::Config(
             JournalConfigError::StorageBoundOverflow,
@@ -369,7 +374,7 @@ impl DonorJournal {
         }
         let aborted = self.aborted.remove(index);
         if let Some(batch) = aborted.outstanding {
-            self.inflight_bytes -= batch.bytes;
+            self.inflight_bytes -= batch.bytes.get();
         }
         Ok(())
     }

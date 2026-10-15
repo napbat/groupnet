@@ -253,7 +253,7 @@ impl JournalIngress {
         } else if suffix.class() != AdmissionClass::Suffix
             || DonorJournal::storage_bound(journal.config())
                 .ok()
-                .is_none_or(|needed| suffix.bytes() < needed)
+                .is_none_or(|needed| suffix.bytes() < needed.get())
         {
             Some(AdapterErrorKind::InvalidInput)
         } else {
@@ -572,12 +572,13 @@ impl<S, A, N> Default for TransferResources<S, A, N> {
 }
 
 /// One bounded incoming follower request against the active local capture.
+/// Every reply budget is nonzero by type; a decoded zero budget fails closed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DonorRequest {
     /// Read an offer, including complete metadata, before allocation limits.
     Offer {
         /// Maximum returned variable metadata bytes.
-        max_metadata_bytes: usize,
+        max_metadata_bytes: NonZeroUsize,
     },
     /// Retain the exact suffix starting at C for this follower.
     Reserve {
@@ -593,7 +594,7 @@ pub enum DonorRequest {
         /// Sequential chunk index.
         sequence: usize,
         /// Maximum returned encoded bytes.
-        max_bytes: usize,
+        max_bytes: NonZeroUsize,
     },
     /// Attach a live donor stream before reading B.
     Attach {
@@ -605,23 +606,23 @@ pub enum DonorRequest {
         /// Exact attached stream.
         attachment: AttachToken,
         /// Maximum returned complete barrier metadata bytes.
-        max_metadata_bytes: usize,
+        max_metadata_bytes: NonZeroUsize,
     },
     /// Sample a later B only after the previous B was fully acknowledged.
     AdvanceBarrier {
         /// Exact previously acknowledged barrier.
         expected: BarrierReceipt,
         /// Maximum returned complete barrier metadata bytes.
-        max_metadata_bytes: usize,
+        max_metadata_bytes: NonZeroUsize,
     },
     /// Read one contiguous bounded suffix batch through exact B.
     Batch {
         /// Exact previously sampled barrier.
         barrier: BarrierReceipt,
         /// Maximum returned bytes.
-        max_bytes: usize,
+        max_bytes: NonZeroUsize,
         /// Maximum returned events.
-        max_events: usize,
+        max_events: NonZeroUsize,
     },
     /// Confirm or read back one exact applied batch acknowledgment.
     Ack {

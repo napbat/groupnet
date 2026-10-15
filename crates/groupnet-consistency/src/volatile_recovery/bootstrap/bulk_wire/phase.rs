@@ -306,6 +306,11 @@ fn read_size(reader: &mut Reader<'_>) -> Result<usize, WireError> {
     usize::try_from(u64::from_be_bytes(reader.number()?)).map_err(|_| WireError::Capacity)
 }
 
+/// A size the protocol requires to be positive; a zero is invalid input.
+fn read_positive_size(reader: &mut Reader<'_>) -> Result<NonZeroUsize, WireError> {
+    NonZeroUsize::new(read_size(reader)?).ok_or(WireError::Invalid)
+}
+
 fn read_blob(reader: &mut Reader<'_>, cap: usize) -> Result<Vec<u8>, WireError> {
     let length = usize::from(u16::from_be_bytes(reader.number()?));
     if length == 0 || length > cap {
@@ -521,25 +526,10 @@ fn validate_request(request: &DonorRequest, correlation: &Correlation) -> Result
         return Err(WireError::Invalid);
     }
     match request {
-        DonorRequest::Offer { max_metadata_bytes } if *max_metadata_bytes == 0 => {
-            Err(WireError::Invalid)
-        }
         DonorRequest::Reserve { cut, .. } if cut.position != 0 => Err(WireError::Invalid),
-        DonorRequest::Chunk { max_bytes, .. } if *max_bytes == 0 => Err(WireError::Invalid),
         DonorRequest::Reserve { follower, .. } if *follower != correlation.follower => {
             Err(WireError::Invalid)
         }
-        DonorRequest::Barrier {
-            max_metadata_bytes, ..
-        }
-        | DonorRequest::AdvanceBarrier {
-            max_metadata_bytes, ..
-        } if *max_metadata_bytes == 0 => Err(WireError::Invalid),
-        DonorRequest::Batch {
-            max_bytes,
-            max_events,
-            ..
-        } if *max_bytes == 0 || *max_events == 0 => Err(WireError::Invalid),
         DonorRequest::AdvanceBarrier { expected, .. } if !valid_barrier(expected) => {
             Err(WireError::Invalid)
         }
@@ -570,7 +560,7 @@ pub fn encode_request(
     validate_request(request, &correlation)?;
     let mut body = Writer::new(limits.max_body_bytes.get());
     match request {
-        DonorRequest::Offer { max_metadata_bytes } => body.number(*max_metadata_bytes)?,
+        DonorRequest::Offer { max_metadata_bytes } => body.number(max_metadata_bytes.get())?,
         DonorRequest::Reserve { follower, cut } => {
             body.identity(follower, limits)?;
             body.cursor(cut, limits)?;
@@ -582,7 +572,7 @@ pub fn encode_request(
         } => {
             body.reservation(reservation, limits)?;
             body.number(*sequence)?;
-            body.number(*max_bytes)?;
+            body.number(max_bytes.get())?;
         }
         DonorRequest::Attach { reservation } | DonorRequest::Release { reservation } => {
             body.reservation(reservation, limits)?;
@@ -592,14 +582,14 @@ pub fn encode_request(
             max_metadata_bytes,
         } => {
             body.attachment(attachment, limits)?;
-            body.number(*max_metadata_bytes)?;
+            body.number(max_metadata_bytes.get())?;
         }
         DonorRequest::AdvanceBarrier {
             expected,
             max_metadata_bytes,
         } => {
             body.barrier(expected, limits)?;
-            body.number(*max_metadata_bytes)?;
+            body.number(max_metadata_bytes.get())?;
         }
         DonorRequest::Batch {
             barrier,
@@ -607,8 +597,8 @@ pub fn encode_request(
             max_events,
         } => {
             body.barrier(barrier, limits)?;
-            body.number(*max_bytes)?;
-            body.number(*max_events)?;
+            body.number(max_bytes.get())?;
+            body.number(max_events.get())?;
         }
         DonorRequest::Ack {
             reservation,
@@ -641,7 +631,7 @@ pub fn decode_request(frame: &Envelope, limits: PhaseLimits) -> Result<DonorRequ
     let mut reader = Reader { bytes, position: 0 };
     let request = match frame.exchange {
         ExchangeKind::Offer => DonorRequest::Offer {
-            max_metadata_bytes: read_size(&mut reader)?,
+            max_metadata_bytes: read_positive_size(&mut reader)?,
         },
         ExchangeKind::Reserve => DonorRequest::Reserve {
             follower: read_identity(&mut reader, limits)?,
@@ -650,23 +640,23 @@ pub fn decode_request(frame: &Envelope, limits: PhaseLimits) -> Result<DonorRequ
         ExchangeKind::Chunk => DonorRequest::Chunk {
             reservation: read_reservation(&mut reader, limits)?,
             sequence: read_size(&mut reader)?,
-            max_bytes: read_size(&mut reader)?,
+            max_bytes: read_positive_size(&mut reader)?,
         },
         ExchangeKind::Attach => DonorRequest::Attach {
             reservation: read_reservation(&mut reader, limits)?,
         },
         ExchangeKind::Barrier => DonorRequest::Barrier {
             attachment: read_attachment(&mut reader, limits)?,
-            max_metadata_bytes: read_size(&mut reader)?,
+            max_metadata_bytes: read_positive_size(&mut reader)?,
         },
         ExchangeKind::AdvanceBarrier => DonorRequest::AdvanceBarrier {
             expected: read_barrier(&mut reader, limits)?,
-            max_metadata_bytes: read_size(&mut reader)?,
+            max_metadata_bytes: read_positive_size(&mut reader)?,
         },
         ExchangeKind::Batch => DonorRequest::Batch {
             barrier: read_barrier(&mut reader, limits)?,
-            max_bytes: read_size(&mut reader)?,
-            max_events: read_size(&mut reader)?,
+            max_bytes: read_positive_size(&mut reader)?,
+            max_events: read_positive_size(&mut reader)?,
         },
         ExchangeKind::Ack => DonorRequest::Ack {
             reservation: read_reservation(&mut reader, limits)?,
@@ -685,262 +675,4 @@ pub fn decode_request(frame: &Envelope, limits: PhaseLimits) -> Result<DonorRequ
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use groupnet_core::volatile_bootstrap::BootstrapOperation;
-
-    fn limits() -> PhaseLimits {
-        PhaseLimits {
-            max_body_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
-            max_scope_bytes: std::num::NonZeroUsize::new(32).unwrap(),
-            max_node_bytes: std::num::NonZeroUsize::new(32).unwrap(),
-            max_writer_bytes: std::num::NonZeroUsize::new(16).unwrap(),
-            max_cuts: std::num::NonZeroUsize::new(4).unwrap(),
-            max_members: std::num::NonZeroUsize::new(4).unwrap(),
-            max_events: std::num::NonZeroUsize::new(4).unwrap(),
-            max_identity_bytes: std::num::NonZeroUsize::new(16).unwrap(),
-            max_effect_bytes: std::num::NonZeroUsize::new(64).unwrap(),
-        }
-    }
-
-    #[test]
-    fn phase_limits_name_each_bound_its_field_cannot_carry() {
-        assert_eq!(limits().validate(), Ok(()));
-        assert_eq!(PhaseLimits::default().validate(), Ok(()));
-        let wide = nonzero(usize::from(u16::MAX) + 1);
-        let cases = [
-            (
-                PhaseLimits {
-                    max_node_bytes: wide,
-                    ..limits()
-                },
-                PhaseLimitsError::NodeAboveLengthField,
-            ),
-            (
-                PhaseLimits {
-                    max_writer_bytes: wide,
-                    ..limits()
-                },
-                PhaseLimitsError::WriterAboveLengthField,
-            ),
-            (
-                PhaseLimits {
-                    max_identity_bytes: wide,
-                    ..limits()
-                },
-                PhaseLimitsError::IdentityAboveLengthField,
-            ),
-            (
-                PhaseLimits {
-                    max_cuts: wide,
-                    ..limits()
-                },
-                PhaseLimitsError::CutsAboveCountField,
-            ),
-            (
-                PhaseLimits {
-                    max_members: wide,
-                    ..limits()
-                },
-                PhaseLimitsError::MembersAboveCountField,
-            ),
-            (
-                PhaseLimits {
-                    max_events: wide,
-                    ..limits()
-                },
-                PhaseLimitsError::EventsAboveCountField,
-            ),
-        ];
-        for (limits, expected) in cases {
-            assert_eq!(limits.validate(), Err(expected));
-        }
-        // The widest bound is a u32 length; it only binds on 64-bit targets.
-        if let Ok(beyond) = usize::try_from(u64::from(u32::MAX) + 1) {
-            assert_eq!(
-                PhaseLimits {
-                    max_effect_bytes: nonzero(beyond),
-                    ..limits()
-                }
-                .validate(),
-                Err(PhaseLimitsError::EffectAboveLengthField)
-            );
-        }
-    }
-
-    fn identities() -> (Correlation, CaptureId, ReservationId, BarrierReceipt) {
-        let scope = BootstrapScope {
-            domain: "origin".into(),
-            partition: "bucket".into(),
-        };
-        let donor = ClaimIdentity {
-            node: NodeId::from("donor"),
-            incarnation: BootId(11),
-            session: 12,
-            attempt: 13,
-        };
-        let follower = ClaimIdentity {
-            node: NodeId::from("follower"),
-            incarnation: BootId(21),
-            session: 22,
-            attempt: 23,
-        };
-        let correlation = Correlation {
-            scope: scope.clone(),
-            donor: donor.clone(),
-            follower: follower.clone(),
-            parent: BootstrapOperation {
-                incarnation: BootId(21),
-                session: 22,
-                generation: 1,
-                token: 31,
-            },
-            child: BootstrapOperation {
-                incarnation: BootId(21),
-                session: 22,
-                generation: 1,
-                token: 32,
-            },
-        };
-        let capture = CaptureId {
-            scope,
-            donor,
-            recovery_generation: 2,
-            serial: 3,
-        };
-        let reservation = ReservationId {
-            capture: capture.clone(),
-            follower: follower.clone(),
-            serial: 4,
-        };
-        let barrier = BarrierReceipt {
-            reservation: reservation.clone(),
-            attach_operation: 5,
-            barrier_operation: 6,
-            cursor: JournalCursor {
-                capture: capture.clone(),
-                position: 7,
-            },
-            covered_cuts: vec![NativeCut {
-                writer: b"writer".to_vec(),
-                epoch: 1,
-                sequence: 0,
-            }],
-            members: vec![
-                BootstrapMemberIdentity {
-                    node: follower.node.clone(),
-                    presence: Some(PresenceIdentity {
-                        node: follower.node,
-                        boot: follower.incarnation,
-                        session: follower.session,
-                    }),
-                    member_incarnation: 1,
-                    status: Status::Alive,
-                },
-                BootstrapMemberIdentity {
-                    node: NodeId::from("quiet"),
-                    presence: None,
-                    member_incarnation: 4,
-                    status: Status::Suspect,
-                },
-            ],
-        };
-        (correlation, capture, reservation, barrier)
-    }
-
-    #[test]
-    fn all_nine_request_bodies_round_trip_with_exact_nested_identity() {
-        let (correlation, capture, reservation, barrier) = identities();
-        let requests = [
-            DonorRequest::Offer {
-                max_metadata_bytes: 100,
-            },
-            DonorRequest::Reserve {
-                follower: correlation.follower.clone(),
-                cut: JournalCursor {
-                    capture: capture.clone(),
-                    position: 0,
-                },
-            },
-            DonorRequest::Chunk {
-                reservation: reservation.clone(),
-                sequence: 0,
-                max_bytes: 40,
-            },
-            DonorRequest::Attach {
-                reservation: reservation.clone(),
-            },
-            DonorRequest::Barrier {
-                attachment: AttachToken {
-                    reservation: reservation.clone(),
-                    operation: 5,
-                },
-                max_metadata_bytes: 100,
-            },
-            DonorRequest::AdvanceBarrier {
-                expected: barrier.clone(),
-                max_metadata_bytes: 100,
-            },
-            DonorRequest::Batch {
-                barrier,
-                max_bytes: 50,
-                max_events: 2,
-            },
-            DonorRequest::Ack {
-                reservation: reservation.clone(),
-                batch_operation: 8,
-                through: JournalCursor {
-                    capture,
-                    position: 7,
-                },
-            },
-            DonorRequest::Release { reservation },
-        ];
-        for request in requests {
-            let frame = encode_request(&request, correlation.clone(), limits()).unwrap();
-            assert_eq!(decode_request(&frame, limits()).unwrap(), request);
-        }
-    }
-
-    #[test]
-    fn stale_nested_capture_and_noncanonical_barrier_fail_closed() {
-        let (correlation, capture, reservation, mut barrier) = identities();
-        let mut wrong = capture.clone();
-        wrong.serial += 1;
-        wrong.scope.partition = "other".into();
-        let request = DonorRequest::Reserve {
-            follower: correlation.follower.clone(),
-            cut: JournalCursor {
-                capture: wrong,
-                position: 0,
-            },
-        };
-        assert_eq!(
-            encode_request(&request, correlation.clone(), limits()),
-            Err(WireError::Invalid)
-        );
-        barrier.covered_cuts.push(barrier.covered_cuts[0].clone());
-        assert_eq!(
-            encode_request(
-                &DonorRequest::Batch {
-                    barrier,
-                    max_bytes: 1,
-                    max_events: 1,
-                },
-                correlation.clone(),
-                limits(),
-            ),
-            Err(WireError::Invalid)
-        );
-        let mut frame = encode_request(
-            &DonorRequest::Release { reservation },
-            correlation,
-            limits(),
-        )
-        .unwrap();
-        if let Message::Request(body) = &mut frame.message {
-            body.push(0);
-        }
-        assert_eq!(decode_request(&frame, limits()), Err(WireError::Invalid));
-    }
-}
+mod tests;
