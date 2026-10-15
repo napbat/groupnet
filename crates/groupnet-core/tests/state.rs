@@ -103,7 +103,7 @@ fn per_node_state_merges_by_last_writer_wins() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry(GroupEngine::BLOB_KEY, 2, 0, false, b"v2")],
+            vec![entry(GroupEngine::BLOB_KEY, 2, b"v2")],
         )]),
         Time(1),
     );
@@ -114,7 +114,7 @@ fn per_node_state_merges_by_last_writer_wins() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry(GroupEngine::BLOB_KEY, 3, 0, false, b"v3")],
+            vec![entry(GroupEngine::BLOB_KEY, 3, b"v3")],
         )]),
         Time(2),
     );
@@ -123,7 +123,7 @@ fn per_node_state_merges_by_last_writer_wins() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry(GroupEngine::BLOB_KEY, 1, 0, false, b"old")],
+            vec![entry(GroupEngine::BLOB_KEY, 1, b"old")],
         )]),
         Time(3),
     );
@@ -142,7 +142,7 @@ fn a_node_authors_only_its_own_state() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "a",
-            vec![entry(GroupEngine::BLOB_KEY, 999, 0, false, b"forged")],
+            vec![entry(GroupEngine::BLOB_KEY, 999, b"forged")],
         )]),
         Time(1),
     );
@@ -157,7 +157,7 @@ fn state_and_liveness_merge_independently() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry(GroupEngine::BLOB_KEY, 1, 0, false, b"s1")],
+            vec![entry(GroupEngine::BLOB_KEY, 1, b"s1")],
         )]),
         Time(1),
     );
@@ -182,10 +182,7 @@ fn keys_version_independently() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![
-                entry("x", 5, 0, false, b"x5"),
-                entry("y", 1, 0, false, b"y1"),
-            ],
+            vec![entry("x", 5, b"x5"), entry("y", 1, b"y1")],
         )]),
         Time(1),
     );
@@ -194,10 +191,7 @@ fn keys_version_independently() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![
-                entry("x", 4, 0, false, b"stale"),
-                entry("y", 2, 0, false, b"y2"),
-            ],
+            vec![entry("x", 4, b"stale"), entry("y", 2, b"y2")],
         )]),
         Time(2),
     );
@@ -214,7 +208,7 @@ fn ttl_entries_expire_and_a_refresh_rearms() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry("hot", 1, 100, false, b"v1")],
+            vec![leased_entry("hot", 1, 100, b"v1")],
         )]),
         Time(0),
     );
@@ -224,7 +218,7 @@ fn ttl_entries_expire_and_a_refresh_rearms() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry("hot", 2, 100, false, b"v2")],
+            vec![leased_entry("hot", 2, 100, b"v2")],
         )]),
         Time(60),
     );
@@ -281,9 +275,9 @@ fn adoption_arms_the_lapse_instant_on_the_receivers_clock() {
         &delta_frame(vec![member_delta(
             "b",
             vec![
-                entry("leased", 1, 100, false, b"v1"),
-                entry("forever", 2, 0, false, b"static"),
-                entry("gone", 3, 100, true, b""),
+                leased_entry("leased", 1, 100, b"v1"),
+                entry("forever", 2, b"static"),
+                tombstone_entry("gone", 3, 100),
             ],
         )]),
         Time(40),
@@ -314,7 +308,7 @@ fn adoption_arms_the_lapse_instant_on_the_receivers_clock() {
         b.clone(),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry("leased", 1, 100, false, b"v1")],
+            vec![leased_entry("leased", 1, 100, b"v1")],
         )]),
         Time(90),
     );
@@ -334,7 +328,7 @@ fn a_same_version_regossip_does_not_rearm_the_lapse_instant() {
     let mut a = engine("a", &["b"]);
     let frame = delta_frame(vec![member_delta(
         "b",
-        vec![entry("leased", 1, 100, false, b"v1")],
+        vec![leased_entry("leased", 1, 100, b"v1")],
     )]);
 
     a.on_message(b.clone(), &frame, Time(40));
@@ -373,7 +367,7 @@ fn a_newer_version_rearms_the_lapse_instant() {
         b.clone(),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry("leased", 1, 100, false, b"v1")],
+            vec![leased_entry("leased", 1, 100, b"v1")],
         )]),
         Time(40),
     );
@@ -384,7 +378,7 @@ fn a_newer_version_rearms_the_lapse_instant() {
         b.clone(),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry("leased", 2, 100, false, b"v2")],
+            vec![leased_entry("leased", 2, 100, b"v2")],
         )]),
         Time(90),
     );
@@ -399,7 +393,7 @@ fn a_newer_version_rearms_the_lapse_instant() {
         b.clone(),
         &delta_frame(vec![member_delta(
             "b",
-            vec![entry("leased", 1, 100, false, b"v1")],
+            vec![leased_entry("leased", 1, 100, b"v1")],
         )]),
         Time(150),
     );
@@ -477,20 +471,14 @@ fn a_truncated_delta_triggers_a_continuation_request() {
     // only the newest entry — holes below it.
     a.on_message(
         NodeId::new("b"),
-        &delta_frame(vec![member_delta(
-            "b",
-            vec![entry("k3", 3, 0, false, b"v3")],
-        )]),
+        &delta_frame(vec![member_delta("b", vec![entry("k3", 3, b"v3")])]),
         Time(0),
     );
     // A backfill arrives truncated: entries through v1, advertised max 1,
     // below our stored high-water of 3 — the merge must ask for the rest.
     let effects = a.on_message(
         NodeId::new("b"),
-        &delta_frame(vec![member_delta(
-            "b",
-            vec![entry("k1", 1, 0, false, b"v1")],
-        )]),
+        &delta_frame(vec![member_delta("b", vec![entry("k1", 1, b"v1")])]),
         Time(1),
     );
     let request = effects
@@ -510,10 +498,7 @@ fn a_truncated_delta_triggers_a_continuation_request() {
         NodeId::new("b"),
         &delta_frame(vec![member_delta(
             "b",
-            vec![
-                entry("k2", 2, 0, false, b"v2"),
-                entry("k3", 3, 0, false, b"v3"),
-            ],
+            vec![entry("k2", 2, b"v2"), entry("k3", 3, b"v3")],
         )]),
         Time(2),
     );
@@ -704,7 +689,7 @@ fn restart_out_versions_an_equal_version_echo_with_a_different_value() {
     // A peer echoes the PREVIOUS life's ~addr — same version, dead value.
     let echo = delta_frame(vec![member_delta(
         "a",
-        vec![entry("~addr", 1, 0, false, b"10.0.0.4:7946")],
+        vec![entry("~addr", 1, b"10.0.0.4:7946")],
     )]);
     let _ = a.on_message(NodeId::new("b"), &echo, Time(10));
 
@@ -734,10 +719,7 @@ fn restart_adopts_echoed_entries_for_unauthored_keys() {
     let mut a = engine("a", &["b"]);
     let effects = a.on_message(
         NodeId::new("b"),
-        &delta_frame(vec![member_delta(
-            "a",
-            vec![entry("addr", 7, 0, false, b"10.0.0.1")],
-        )]),
+        &delta_frame(vec![member_delta("a", vec![entry("addr", 7, b"10.0.0.1")])]),
         Time(1),
     );
     // Adopted verbatim (NOT wiped by out-versioning with emptiness)...
@@ -765,10 +747,7 @@ fn restart_adopts_echoed_entries_for_unauthored_keys() {
     // rule): the forged/echoed 999 only bumps our version past it.
     a.on_message(
         NodeId::new("b"),
-        &delta_frame(vec![member_delta(
-            "a",
-            vec![entry("addr", 999, 0, false, b"forged")],
-        )]),
+        &delta_frame(vec![member_delta("a", vec![entry("addr", 999, b"forged")])]),
         Time(2),
     );
     assert_eq!(

@@ -399,21 +399,35 @@ pub fn ndigest(node: &str, inc: u64, status: Status, max_version: u64) -> wire::
     }
 }
 
-/// One keyed state entry, as it rides a delta frame.
+/// One live keyed state entry without a TTL, as it rides a delta frame.
 #[must_use]
-pub fn entry(
-    key: &str,
-    version: u64,
-    ttl_ms: u64,
-    tombstone: bool,
-    value: &[u8],
-) -> wire::EntryDelta {
+pub fn entry(key: &str, version: u64, value: &[u8]) -> wire::EntryDelta {
     wire::EntryDelta {
         key: key.to_owned(),
         version,
-        ttl_ms,
-        tombstone,
+        ttl_ms: 0,
+        tombstone: false,
         value: value.to_vec(),
+    }
+}
+
+/// One live keyed state entry that expires `ttl_ms` after it is applied.
+#[must_use]
+pub fn leased_entry(key: &str, version: u64, ttl_ms: u64, value: &[u8]) -> wire::EntryDelta {
+    wire::EntryDelta {
+        ttl_ms,
+        ..entry(key, version, value)
+    }
+}
+
+/// One tombstone for `key` at `version`, carrying `ttl_ms` on the wire (a
+/// tombstone never lapses on a TTL; a nonzero value shows it is ignored).
+#[must_use]
+pub fn tombstone_entry(key: &str, version: u64, ttl_ms: u64) -> wire::EntryDelta {
+    wire::EntryDelta {
+        ttl_ms,
+        tombstone: true,
+        ..entry(key, version, &[])
     }
 }
 
