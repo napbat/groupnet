@@ -438,23 +438,13 @@ async fn configured_peer_and_pending_policy_limits_independently_reject_overflow
                 credential: &[],
             },
         };
-        register(
-            &socket,
-            None,
-            &policy,
-            false,
-            &mut state,
-            packet,
-            registration,
-        )
-        .await;
+        register(&socket, None, &policy, &mut state, packet, registration).await;
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.decisions.len(), 1);
         register(
             &socket,
             None,
             &policy,
-            false,
             &mut state,
             Packet {
                 sender: "overflow",

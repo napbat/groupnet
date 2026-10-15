@@ -110,14 +110,19 @@ Link setters only store values. Every link provider (memory, TCP, UDP, IPC)
 validates once, when it binds, and completely before it opens any socket or
 listener: its own configuration, the `LinkConfig` it will register (cost and
 MTU are nonzero by type; `LinkConfig::validate_for(&local)` rejects an
-invalid, duplicated or local peer identity), and each configured peer endpoint
-(IPC also checks every peer against its 64-byte identity bound, `max_peers`
-and the platform address rules `register_peer` enforces). A failure is
-`InvalidInput` carrying the typed error (`LinkConfigError`,
-`TcpMsgConfigError`, `TcpAdmissionError`, `IpcConfigError`, `IpcPeerError`,
-the native configuration's error, or `NodeIdError`), and no endpoint exists.
-Callers preflight with the configurations' `validate()` and
-`LinkConfig::validate_for`. The router still applies its own bounds when the
+invalid, duplicated or local peer identity), the identity of a provider built
+for one (a memory endpoint, a native punch configuration) against the binding
+node, and each configured peer endpoint. IPC also checks every peer against
+its 64-byte identity bound, `max_peers` and the platform address rules
+`register_peer` enforces, then opens its listener with that validated peer
+book already in place instead of registering the peers again. A failure is
+`InvalidInput` carrying the typed error (`LinkConfigError`, `LinkBindError`
+for a memory endpoint or native `TcpPunchConfig` / `UdpPunchConfig` built for
+another node, `TcpMsgConfigError`, `TcpAdmissionError`, `IpcConfigError`,
+`IpcPeerError` — whose `Address` variant wraps the platform's
+`IpcAddressError` — the native configuration's error, or `NodeIdError`), and
+no endpoint exists. Callers preflight with the configurations' `validate()`
+and `LinkConfig::validate_for`. The router still applies its own bounds when the
 bound link registers (route capacity, and an MTU its fragment header and frame
 ceiling can use). A raw
 `TcpMsgTransport::bind_admitted(local, addr, config, admission)` takes the

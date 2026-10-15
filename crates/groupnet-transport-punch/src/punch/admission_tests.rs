@@ -108,6 +108,10 @@ impl Raw {
     }
 
     async fn register(&mut self, address: SocketAddr) -> Vec<u8> {
+        self.register_with(address, b"opaque").await
+    }
+
+    async fn register_with(&mut self, address: SocketAddr, credential: &[u8]) -> Vec<u8> {
         let (nonce, cookie) = self.challenge(address).await;
         self.send(
             address,
@@ -115,10 +119,18 @@ impl Raw {
                 nonce,
                 cookie,
                 relay_only: true,
-                credential: b"opaque",
+                credential,
             },
         )
         .await
+    }
+
+    async fn registration_result(&self) -> Body<'static> {
+        match wire::decode_mode(&self.receive().await, None).unwrap().body {
+            Body::Registered { proof } => Body::Registered { proof },
+            Body::Denied { proof } => Body::Denied { proof },
+            other => panic!("expected a registration result, got {other:?}"),
+        }
     }
 }
 
@@ -213,6 +225,74 @@ async fn open_policy_is_not_invoked_before_address_proof_and_proof_is_single_use
         wire::decode_mode(&raw.receive().await, None).unwrap().body,
         Body::Registered { .. }
     ));
+    relay.close().await;
+}
+
+/// Admits exactly the identities presenting `invite`, reporting every request.
+#[derive(Debug)]
+struct InvitePolicy(mpsc::UnboundedSender<(String, Vec<u8>)>);
+
+impl Admission for InvitePolicy {
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
+        Box::pin(async move {
+            let _ = self.0.send((
+                request.claimed.as_str().to_owned(),
+                request.credential.to_vec(),
+            ));
+            if request.credential == b"invite" {
+                Ok(AcceptedPeer::new(request.claimed.clone()))
+            } else {
+                Err(AdmissionError::UnknownPeer {
+                    claimed: request.claimed.clone(),
+                })
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn static_allowlist_forwards_credentials_to_admission_after_address_proof() {
+    let (requests, mut seen) = mpsc::unbounded_channel();
+    let policy = Arc::new(InvitePolicy(requests));
+    let relay = UdpRendezvous::bind(UdpRendezvousConfig::new(
+        loopback(),
+        None,
+        PeerPolicy::Static(vec!["listed".into(), "uninvited".into()]),
+        policy,
+    ))
+    .await
+    .unwrap();
+    let address = relay.local_addr();
+    // An identity outside the allowlist is dropped before the challenge, so
+    // its credential never reaches the policy.
+    let mut outsider = Raw::new("outsider".into()).await;
+    outsider.send(address, Body::Hello { nonce: [3; 16] }).await;
+    outsider.silent().await;
+    // A listed identity is still judged by the policy, with its credential.
+    let mut uninvited = Raw::new("uninvited".into()).await;
+    uninvited.register_with(address, b"wrong").await;
+    assert!(matches!(
+        uninvited.registration_result().await,
+        Body::Denied { .. }
+    ));
+    let mut listed = Raw::new("listed".into()).await;
+    listed.register_with(address, b"invite").await;
+    assert!(matches!(
+        listed.registration_result().await,
+        Body::Registered { .. }
+    ));
+    assert_eq!(
+        seen.try_recv().unwrap(),
+        ("uninvited".to_owned(), b"wrong".to_vec())
+    );
+    assert_eq!(
+        seen.try_recv().unwrap(),
+        ("listed".to_owned(), b"invite".to_vec())
+    );
+    assert!(seen.try_recv().is_err());
     relay.close().await;
 }
 

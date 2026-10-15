@@ -92,8 +92,10 @@ impl UdpTransport {
     }
 
     /// Binds native connectivity using the connection's actual leased sockets.
-    /// Peer admission, candidate checks and relay fallback are session-fenced;
-    /// address advertisements and [`register_peer`](Self::register_peer) have no effect.
+    /// Peer admission, candidate checks and relay fallback are session-fenced.
+    /// Address advertisements fed through `Transport::learn_peer` are hints and
+    /// are ignored, while [`register_peer`](Self::register_peer) is refused
+    /// with [`UdpRegisterPeerError::Connectivity`]; neither records an address.
     ///
     /// # Errors
     /// Propagates invalid configuration, admission and socket errors.

@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{AcceptedPeer, Admission, AdmissionError, JoinRequest};
+#[cfg(feature = "connectivity")]
+use groupnet_transport::link::LinkBindError;
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider, PeerEndpoint};
 
 use crate::{TcpAdmission, TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
@@ -37,9 +39,11 @@ use crate::{TcpAdmission, TcpAdmissionConfig, TcpMsgConfig, TcpMsgTransport};
 /// ([`LinkConfigError`](groupnet_transport::link::LinkConfigError) for the
 /// configured peers, [`TcpMsgConfigError`](crate::TcpMsgConfigError),
 /// [`TcpAdmissionError`](crate::TcpAdmissionError), the local
-/// [`NodeIdError`](crate::NodeIdError) or the native configuration's error)
-/// before opening any socket or listener. Preflight with
-/// [`LinkConfig::validate_for`], [`TcpMsgConfig::validate`] and
+/// [`NodeIdError`](crate::NodeIdError), or for a native link
+/// [`LinkBindError`](groupnet_transport::link::LinkBindError) when its
+/// configured local identity is not the binding node's, and the native
+/// configuration's error) before opening any socket or listener. Preflight
+/// with [`LinkConfig::validate_for`], [`TcpMsgConfig::validate`] and
 /// [`TcpAdmission::validate`].
 #[cfg_attr(
     feature = "connectivity",
@@ -261,13 +265,11 @@ impl LinkProvider for TcpLink<TcpConnectivity> {
                 cost,
             } = *self;
             if config.local != local {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "TcpPunchConfig.local {} differs from the binding node {local}",
-                        config.local
-                    ),
-                ));
+                return Err(LinkBindError::IdentityMismatch {
+                    configured: config.local,
+                    binding: local,
+                }
+                .into());
             }
             let transport = TcpMsgTransport::bind_connectivity(config).await?;
             Ok(transport.into_bound_link(cost))

@@ -410,6 +410,12 @@ address, optional `NetworkKey`, a `PeerPolicy` (`Static` allowlist or
 `Dynamic`), `Admission` policy, protocol-specific limits (`UdpRendezvousLimits`,
 `TcpRendezvousLimits`) and `relay_pacing`, and is built with
 `new(bind, key, peers, admission)`.
+The peer and admission policies compose in the same order on both services:
+a `Static` allowlist refuses every other identity before the `Admission`
+policy runs, and a listed identity is admitted only if that policy accepts
+it. The UDP service consults the policy after the return-routability
+challenge, as for `Dynamic` peers. Both pass the client's bounded credential
+to it unchanged, so a credential-checking policy gates a static allowlist too.
 Endpoint (`UdpPunchConfig`, `TcpPunchConfig`) and rendezvous configurations
 expose `validate()`, returning a typed error enum with one field-named variant
 per rule; every binder runs it first and fails with `InvalidInput` wrapping

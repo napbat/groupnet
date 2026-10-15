@@ -10,7 +10,7 @@
 mod config;
 mod worker;
 
-pub use config::{LinkConfig, LinkConfigError};
+pub use config::{LinkBindError, LinkConfig, LinkConfigError};
 
 #[cfg(test)]
 mod tests;

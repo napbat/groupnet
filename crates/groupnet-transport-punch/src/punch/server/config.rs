@@ -47,9 +47,12 @@ pub struct UdpRendezvousConfig {
     pub bind: SocketAddr,
     /// Optional trusted-fabric key; keyed traffic never downgrades.
     pub key: Option<NetworkKey>,
-    /// A fixed identity allowlist, or dynamic application admission.
+    /// A fixed identity allowlist (packets from other identities are dropped
+    /// unanswered), or dynamic discovery.
     pub peers: PeerPolicy,
-    /// Application admission policy, evaluated only after return-routability.
+    /// Application admission policy, evaluated only after the allowlist and
+    /// return-routability checks, with the client's bounded credential, in
+    /// either peer mode.
     pub admission: Arc<dyn Admission>,
     /// Operational capacities; control-rate limits and challenge/session
     /// deadlines stay fixed. Default: [`UdpRendezvousLimits::default`].

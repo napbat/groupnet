@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 
 use groupnet_core::NodeId;
+#[cfg(feature = "connectivity")]
+use groupnet_transport::link::LinkBindError;
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider, PeerEndpoint};
 
 use crate::UdpTransport;
@@ -24,7 +26,9 @@ use crate::UdpTransport;
 /// is the one validation point: it fails with `InvalidInput` carrying the
 /// typed cause — the direct peers'
 /// [`LinkConfigError`](groupnet_transport::link::LinkConfigError), the local
-/// [`NodeIdError`](groupnet_transport::NodeIdError) or the native
+/// [`NodeIdError`](groupnet_transport::NodeIdError), a native link's
+/// [`LinkBindError`](groupnet_transport::link::LinkBindError) when its
+/// configured local identity is not the binding node's, or the native
 /// configuration's error — before opening any socket.
 #[derive(Debug)]
 pub struct UdpLink<M = UdpDirect> {
@@ -81,7 +85,8 @@ impl UdpLink<UdpDirect> {
 #[cfg(feature = "connectivity")]
 impl UdpLink<UdpConnectivity> {
     /// Configures session-fenced native connectivity for the declared local id.
-    /// Binding rejects a mismatch with the managed node's identity.
+    /// Binding rejects a mismatch with the managed node's identity as
+    /// [`LinkBindError::IdentityMismatch`].
     #[must_use]
     pub const fn connectivity(config: crate::UdpPunchConfig) -> Self {
         Self {
@@ -135,13 +140,11 @@ impl LinkProvider for UdpLink<UdpConnectivity> {
                 cost,
             } = *self;
             if config.local != local {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "UdpPunchConfig.local {} differs from the binding node {local}",
-                        config.local
-                    ),
-                ));
+                return Err(LinkBindError::IdentityMismatch {
+                    configured: config.local,
+                    binding: local,
+                }
+                .into());
             }
             let transport = UdpTransport::bind_connectivity(config).await?;
             Ok(transport.into_bound_link(cost))
@@ -244,9 +247,14 @@ mod tests {
             .await
             .expect_err("identity mismatch");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            error.to_string().contains("UdpPunchConfig.local"),
-            "{error}"
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<LinkBindError>()),
+            Some(&LinkBindError::IdentityMismatch {
+                configured: NodeId::new("configured-local"),
+                binding: NodeId::new("different-local"),
+            })
         );
         assert!(std::net::UdpSocket::bind(address).is_err());
     }

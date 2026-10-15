@@ -11,14 +11,21 @@ use groupnet_transport::Transport;
 use groupnet_transport::link::{LinkConfigError, LinkLifecycle, LinkProvider};
 // The adapter re-exports the shared types its own signatures name.
 use groupnet_transport_ipc::{
-    IpcAddress, IpcConfig, IpcConfigError, IpcLink, IpcPeerError, IpcTransport, MAX_FRAME,
-    NodeIdError, PeerEndpoint, QueueCapacity,
+    IpcAddress, IpcAddressError, IpcConfig, IpcConfigError, IpcLink, IpcPeerError, IpcTransport,
+    MAX_FRAME, NodeIdError, PeerEndpoint, QueueCapacity,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 const DEADLINE: Duration = Duration::from_secs(5);
+
+/// Recognizes the expected typed rejection in a table-driven test.
+type PeerCheck = fn(&IpcPeerError) -> bool;
+
+/// Recognizes the expected typed address rejection in a table-driven test.
+#[cfg(windows)]
+type AddressCheck = fn(&IpcAddressError) -> bool;
 
 #[derive(Debug)]
 struct Address {
@@ -151,47 +158,45 @@ async fn bounded_peer_book_and_node_ids() {
     let peer_error = |error: io::Error| {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         *error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<IpcPeerError>())
+            .into_inner()
+            .and_then(|inner| inner.downcast::<IpcPeerError>().ok())
             .expect("typed peer error")
     };
-    assert_eq!(
+    assert!(matches!(
         peer_error(
             transport
                 .register_peer(NodeId::new("overflow"), address.ipc.clone())
                 .unwrap_err()
         ),
-        IpcPeerError::PeerLimit {
-            max_peers: NonZeroUsize::new(128).unwrap()
-        }
-    );
+        IpcPeerError::PeerLimit { max_peers } if max_peers.get() == 128
+    ));
     transport
         .register_peer(NodeId::new("peer-0"), address.ipc.clone())
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         peer_error(
             transport
                 .register_peer(NodeId::new("local"), address.ipc.clone())
                 .unwrap_err()
         ),
         IpcPeerError::Local
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         peer_error(
             transport
                 .register_peer(NodeId::new("x".repeat(65)), address.ipc.clone())
                 .unwrap_err()
         ),
         IpcPeerError::Identity(NodeIdError::TooLong { len: 65, max: 64 })
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         peer_error(
             transport
                 .register_peer(NodeId::new(""), address.ipc.clone())
                 .unwrap_err()
         ),
         IpcPeerError::Identity(NodeIdError::Empty)
-    );
+    ));
     transport
         .send(&NodeId::new("unknown"), b"drop")
         .await
@@ -323,18 +328,41 @@ async fn occupied_listener_cannot_be_replaced() {
 async fn windows_rejects_remote_and_non_pipe_addresses() {
     let address = Address::new();
     let transport = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap();
-    for name in [
-        r"\\remote\pipe\groupnet",
-        r"C:\groupnet",
-        r"\\.\pipe\",
-        "\\\\.\\pipe\\bad\0name",
-    ] {
-        let invalid = IpcAddress::NamedPipe(name.to_owned());
-        assert!(IpcTransport::bind(NodeId::new("bad"), &invalid).is_err());
+    let cases: [(String, AddressCheck); 5] = [
+        (r"\\remote\pipe\groupnet".to_owned(), |error| {
+            matches!(error, IpcAddressError::NotLocalPipe)
+        }),
+        (r"C:\groupnet".to_owned(), |error| {
+            matches!(error, IpcAddressError::NotLocalPipe)
+        }),
+        (r"\\.\pipe\".to_owned(), |error| {
+            matches!(error, IpcAddressError::EmptyPipeName)
+        }),
+        ("\\\\.\\pipe\\bad\0name".to_owned(), |error| {
+            matches!(error, IpcAddressError::PipeNameCharacter)
+        }),
+        (format!(r"\\.\pipe\{}", "x".repeat(248)), |error| {
+            matches!(error, IpcAddressError::PipeNameTooLong { len: 257 })
+        }),
+    ];
+    for (name, expected) in cases {
+        let invalid = IpcAddress::NamedPipe(name);
+        let error = IpcTransport::bind(NodeId::new("bad"), &invalid).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let typed = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcAddressError>())
+            .expect("typed address error");
+        assert!(expected(typed), "{typed:?}");
+        let error = transport
+            .register_peer(NodeId::new("peer"), invalid)
+            .unwrap_err();
         assert!(
-            transport
-                .register_peer(NodeId::new("peer"), invalid)
-                .is_err()
+            matches!(
+                error.get_ref().and_then(|inner| inner.downcast_ref::<IpcPeerError>()),
+                Some(IpcPeerError::Address(cause)) if expected(cause)
+            ),
+            "{error:?}"
         );
     }
     transport.close().await;
@@ -351,7 +379,23 @@ async fn unix_permissions_and_existing_files_are_preserved() {
     assert_eq!(std::fs::read(path).unwrap(), b"not a socket");
     std::fs::remove_file(path).unwrap();
     std::fs::set_permissions(&address.directory, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(IpcTransport::bind(NodeId::new("local"), &address.ipc).is_err());
+    let error = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(matches!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcAddressError>()),
+        Some(IpcAddressError::ParentNotPrivate { mode: 0o755 })
+    ));
+    let missing = IpcAddress::Unix(address.directory.join("missing").join("socket"));
+    let error = IpcTransport::bind(NodeId::new("local"), &missing).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(matches!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcAddressError>()),
+        Some(IpcAddressError::ParentInaccessible(cause)) if cause.kind() == io::ErrorKind::NotFound
+    ));
     assert!(!path.exists());
     std::fs::set_permissions(&address.directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     let transport = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap();
@@ -530,31 +574,97 @@ async fn provider_preflights_every_peer_before_opening_a_listener() {
         max_peers: NonZeroUsize::MIN,
         ..IpcConfig::default()
     };
-    let ipc_cases = [
+    let malformed = PeerEndpoint::new(NodeId::new("a"), malformed_address());
+    let ipc_cases: [(IpcLink, PeerCheck); 3] = [
         (
             IpcLink::new(address.ipc.clone(), vec![peer(&"x".repeat(65))]),
-            IpcPeerError::Identity(NodeIdError::TooLong { len: 65, max: 64 }),
+            |error| {
+                matches!(
+                    error,
+                    IpcPeerError::Identity(NodeIdError::TooLong { len: 65, max: 64 })
+                )
+            },
         ),
         (
             IpcLink::new(address.ipc.clone(), vec![peer("a"), peer("b")]).with_config(one_peer),
-            IpcPeerError::PeerLimit {
-                max_peers: NonZeroUsize::MIN,
-            },
+            |error| matches!(error, IpcPeerError::PeerLimit { max_peers } if *max_peers == NonZeroUsize::MIN),
+        ),
+        (
+            IpcLink::new(address.ipc.clone(), vec![malformed]),
+            |error| matches!(error, IpcPeerError::Address(address) if is_malformed(address)),
         ),
     ];
     for (provider, expected) in ipc_cases {
         let error = Box::new(provider).bind(local.clone()).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(
-            error
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<IpcPeerError>()),
-            Some(&expected)
-        );
+        let typed = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcPeerError>())
+            .expect("typed peer error");
+        assert!(expected(typed), "{typed:?}");
     }
     occupant.close().await;
     let replacement = IpcTransport::bind(NodeId::new("replacement"), &address.ipc).unwrap();
     replacement.close().await;
+}
+
+/// A peer address this platform rejects as malformed, before any I/O.
+fn malformed_address() -> IpcAddress {
+    #[cfg(unix)]
+    {
+        IpcAddress::Unix("relative/socket".into())
+    }
+    #[cfg(windows)]
+    {
+        IpcAddress::NamedPipe(r"\\remote\pipe\groupnet".to_owned())
+    }
+}
+
+/// Whether `error` is the reason [`malformed_address`] is rejected.
+fn is_malformed(error: &IpcAddressError) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error, IpcAddressError::RelativePath)
+    }
+    #[cfg(windows)]
+    {
+        matches!(error, IpcAddressError::NotLocalPipe)
+    }
+}
+
+#[tokio::test]
+async fn malformed_addresses_are_typed_for_bind_and_registration() {
+    use std::error::Error as _;
+
+    let error = IpcTransport::bind(NodeId::new("local"), &malformed_address()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(is_malformed(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcAddressError>())
+            .expect("typed address error")
+    ));
+    let address = Address::new();
+    let transport = IpcTransport::bind(NodeId::new("local"), &address.ipc).unwrap();
+    let error = transport
+        .register_peer(NodeId::new("peer"), malformed_address())
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    let typed = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<IpcPeerError>())
+        .expect("typed peer error");
+    let IpcPeerError::Address(cause) = typed else {
+        panic!("expected an address error, got {typed:?}");
+    };
+    assert!(is_malformed(cause));
+    assert!(
+        typed
+            .source()
+            .and_then(|source| source.downcast_ref::<IpcAddressError>())
+            .is_some_and(is_malformed)
+    );
+    transport.close().await;
 }
 
 #[tokio::test]

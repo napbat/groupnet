@@ -441,16 +441,7 @@ async fn handle_packet(
             let Some(registration) = state.challenges.prove(packet, address, now) else {
                 return;
             };
-            register(
-                socket,
-                key,
-                admission,
-                allowed.is_some(),
-                state,
-                packet,
-                registration,
-            )
-            .await;
+            register(socket, key, admission, state, packet, registration).await;
         }
         Body::Heartbeat { .. }
         | Body::Depart { .. }
@@ -616,11 +607,13 @@ fn pair_secret(left: &Registration, right: &Registration) -> Session {
     secret
 }
 
+/// Admits a return-routable registration. A static allowlist has already
+/// dropped every other identity, so the bounded credential reaches the
+/// application policy exactly as it does for dynamic admission.
 async fn register(
     socket: &UdpSocket,
     key: Option<&NetworkKey>,
     admission: &Arc<dyn Admission>,
-    static_allowed: bool,
     state: &mut ServerState,
     packet: Packet<'_>,
     registration: Registration,
@@ -629,19 +622,6 @@ async fn register(
         return;
     };
     let now = registration.seen;
-    if static_allowed && !credential.is_empty() {
-        respond(
-            socket,
-            key,
-            registration.address,
-            packet,
-            Body::Denied {
-                proof: registration.proof,
-            },
-        )
-        .await;
-        return;
-    }
     if let Some(entry) = state.entries.get_mut(packet.sender)
         && entry.live(now).is_some()
     {

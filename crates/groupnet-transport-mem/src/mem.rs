@@ -101,22 +101,34 @@ impl Drop for MemTransport {
     }
 }
 
-/// The endpoint's receiver was closed.
-#[derive(Debug)]
-pub struct Closed;
+/// Why a [`MemTransport`] can no longer receive.
+///
+/// Sending never fails: a missing or dead peer is a silent drop under the
+/// best-effort [`Transport`] contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemTransportError {
+    /// [`Network::endpoint`] registered a newer endpoint at this identity on
+    /// the same fabric. Messages already queued are still delivered; then the
+    /// displaced endpoint's inbox ends, because no sender can reach it.
+    Displaced,
+}
 
-impl fmt::Display for Closed {
+impl fmt::Display for MemTransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("transport endpoint closed")
+        match self {
+            Self::Displaced => {
+                f.write_str("memory endpoint displaced by a newer endpoint at the same identity")
+            }
+        }
     }
 }
 
-impl std::error::Error for Closed {}
+impl std::error::Error for MemTransportError {}
 
 impl Transport for MemTransport {
-    type Error = Closed;
+    type Error = MemTransportError;
 
-    async fn send(&self, to: &NodeId, msg: &[u8]) -> Result<(), Closed> {
+    async fn send(&self, to: &NodeId, msg: &[u8]) -> Result<(), MemTransportError> {
         if let Some(tx) = self.target(to) {
             // Wait before allocating the borrowed packet. Dead peers still drop.
             if let Ok(permit) = tx.reserve().await {
@@ -135,7 +147,7 @@ impl Transport for MemTransport {
         to: &NodeId,
         msg: Bytes,
         session: Option<groupnet_transport::admission::SessionId>,
-    ) -> Result<(), Closed> {
+    ) -> Result<(), MemTransportError> {
         if session.is_some() {
             return Ok(());
         }
@@ -150,11 +162,13 @@ impl Transport for MemTransport {
         Ok(())
     }
 
-    async fn recv(&self) -> Result<Inbound, Closed> {
+    async fn recv(&self) -> Result<Inbound, MemTransportError> {
         // The tokio mutex is held across the await intentionally; only the
-        // single receive loop ever calls this.
+        // single receive loop ever calls this. Only the fabric's routing
+        // table holds a strong sender, and only displacement drops it while
+        // this endpoint is alive.
         let mut inbox = self.inbox.lock().await;
-        inbox.recv().await.ok_or(Closed)
+        inbox.recv().await.ok_or(MemTransportError::Displaced)
     }
 }
 
