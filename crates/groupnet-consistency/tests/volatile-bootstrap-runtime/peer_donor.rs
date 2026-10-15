@@ -123,13 +123,16 @@ impl DonorPort for PeerDonor {
     )]
     async fn execute(
         &self,
-        context: &TransferContext,
         effect: TransferEffect,
         resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-        admission: &ByteAdmission,
-        permit: Option<PublicationPermit>,
-        _deadline: Instant,
+        call: EffectContext<'_>,
     ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
+        let EffectContext {
+            transfer: context,
+            admission,
+            permit,
+            ..
+        } = call;
         match effect {
             TransferEffect::FetchOffer { op, .. } => {
                 let charge = admission.reserve(AdmissionClass::Inflight, 256)?;

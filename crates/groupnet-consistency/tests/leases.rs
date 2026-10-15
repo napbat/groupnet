@@ -12,11 +12,12 @@
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use groupnet_consistency::lease::{decode_renewal, grant_entry_key, renewal_entry_key};
+use groupnet_consistency::lease::{
+    CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseConfigError, LeaseStartError, LeaseState,
+    LeaseView, Leases, decode_renewal, grant_entry_key, renewal_entry_key,
+};
 use groupnet_consistency::{
-    AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Group, LeaseConfig, LeaseConfigError,
-    LeaseStartError, LeaseState, LeaseView, Leases, PeerWrite, PeerWrites, WriteFeed, WriteToken,
-    applied_by,
+    AckLedger, CAP_ACKS, Group, PeerWrite, PeerWrites, WriteFeed, WriteToken, applied_by,
 };
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::{

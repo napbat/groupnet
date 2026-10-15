@@ -7,7 +7,8 @@ use crate::Time;
 use crate::volatile_recovery::RecoveryOperation;
 
 use super::super::journal::{
-    AttachToken, BarrierReceipt, CaptureId, JournalBatch, JournalCursor, NativeCut, ReservationId,
+    AttachToken, BarrierReceipt, CaptureId, JournalBatch, JournalConfig, JournalCursor, NativeCut,
+    ReservationId,
 };
 use super::super::{BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, ClaimIdentity};
 
@@ -38,12 +39,13 @@ pub(crate) fn native_cuts_cover(actual: &[NativeCut], expected: &[NativeCut]) ->
 /// checks the coverage cadence and the chunk budgets against the image cap.
 ///
 /// The expected schema identifies the application's image format, so there
-/// is no default config: [`TransferConfig::new`] takes exactly the schema and
-/// fills the budgets to match [`JournalConfig::default`](super::super::journal::JournalConfig)
-/// — a 64 MiB encoded and decoded image in up to 1024 chunks of 1 MiB, 1 MiB
-/// of offer metadata, 256-event 1 MiB batches, 4096 replayed events, 16 MiB of
-/// buffered native effects, 1024 members, 256 writer cuts and a 100 ms
-/// coverage poll.
+/// is no default config: [`TransferConfig::new`] takes exactly the schema.
+/// Its image, batch, replay, membership and cut budgets are those of
+/// [`JournalConfig::default`] — a 64 MiB encoded and decoded image, 256-event
+/// 1 MiB batches, the journal's 4096 retained events replayed, 1024 members
+/// and 256 writer cuts — so a default follower fits a default donor; the rest
+/// are its own: up to 1024 image chunks of 1 MiB, 1 MiB of offer metadata,
+/// 16 MiB of buffered native effects and a 100 ms coverage poll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferConfig {
     /// Application schema this follower can decode and install.
@@ -107,19 +109,20 @@ impl TransferConfig {
     /// default budgets; refine them with struct-update syntax.
     #[must_use]
     pub const fn new(expected_schema: NonZeroU32) -> Self {
+        let journal = JournalConfig::DEFAULT;
         Self {
             expected_schema,
             max_metadata_bytes: const { NonZeroUsize::new(1024 * 1024).unwrap() },
-            max_encoded_bytes: const { NonZeroUsize::new(64 * 1024 * 1024).unwrap() },
-            max_decoded_bytes: const { NonZeroUsize::new(64 * 1024 * 1024).unwrap() },
+            max_encoded_bytes: journal.max_encoded_bytes,
+            max_decoded_bytes: journal.max_decoded_bytes,
             max_chunk_bytes: const { NonZeroUsize::new(1024 * 1024).unwrap() },
             max_chunks: const { NonZeroUsize::new(1024).unwrap() },
-            max_batch_bytes: const { NonZeroUsize::new(1024 * 1024).unwrap() },
-            max_batch_events: const { NonZeroUsize::new(256).unwrap() },
-            max_replay_events: const { NonZeroUsize::new(4096).unwrap() },
+            max_batch_bytes: journal.max_batch_bytes,
+            max_batch_events: journal.max_batch_events,
+            max_replay_events: journal.max_events,
             max_native_buffer_bytes: const { NonZeroUsize::new(16 * 1024 * 1024).unwrap() },
-            max_members: const { NonZeroUsize::new(1024).unwrap() },
-            max_cuts: const { NonZeroUsize::new(256).unwrap() },
+            max_members: journal.max_members,
+            max_cuts: journal.max_cuts,
             coverage_poll_ms: 100,
         }
     }

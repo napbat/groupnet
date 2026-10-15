@@ -405,11 +405,15 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         step.rejection.is_none()
     }
 
-    fn claim_limits(&self, max_members: usize, max_member_bytes: usize) -> ClaimObservationLimits {
+    fn claim_limits(
+        &self,
+        max_members: NonZeroUsize,
+        max_member_bytes: NonZeroUsize,
+    ) -> ClaimObservationLimits {
         ClaimObservationLimits {
             max_members,
             max_member_bytes,
-            max_metadata_bytes: self.config.max_claim_metadata_bytes.get(),
+            max_metadata_bytes: self.config.max_claim_metadata_bytes,
         }
     }
 

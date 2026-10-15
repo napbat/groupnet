@@ -16,8 +16,8 @@ use groupnet_consistency::volatile_recovery::bootstrap::admission::{
 };
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
     BootstrapCapabilities, ClaimObservationLimits, ClaimSnapshot, ClaimSource, DonorCapture,
-    DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureOutcome, LocalCaptureRequest,
-    ParticipationSnapshot, ReadyCaptureRequest, TimedClaim, TimedParticipant, TransferContext,
+    DonorPort, DonorReply, DonorRequest, EffectContext, JournalIngress, LocalCaptureOutcome,
+    LocalCaptureRequest, ParticipationSnapshot, ReadyCaptureRequest, TimedClaim, TimedParticipant,
     TransferResources,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::session::{
@@ -79,7 +79,8 @@ impl ClaimSource for Claims {
         limits: ClaimObservationLimits,
         admission: &ByteAdmission,
     ) -> Result<Admitted<ParticipationSnapshot>, AdapterError> {
-        let charge = admission.reserve(AdmissionClass::Inflight, limits.max_metadata_bytes)?;
+        let charge =
+            admission.reserve(AdmissionClass::Inflight, limits.max_metadata_bytes.get())?;
         let presence = self
             .presence
             .lock()
@@ -461,12 +462,9 @@ impl DonorPort for OriginDonor {
 
     fn execute(
         &self,
-        _context: &TransferContext,
         _effect: TransferEffect,
         _resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-        _admission: &ByteAdmission,
-        _permit: Option<PublicationPermit>,
-        _deadline: Instant,
+        _context: EffectContext<'_>,
     ) -> impl Future<Output = Result<Option<Admitted<TransferEvent>>, AdapterError>> + Send {
         ready(Err(AdapterErrorKind::Unsupported.into()))
     }

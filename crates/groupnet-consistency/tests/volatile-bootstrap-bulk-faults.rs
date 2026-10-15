@@ -13,12 +13,12 @@ use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
     PhaseLimits, WireLimits, encode,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::ports::DonorRequest;
+use groupnet_consistency::{DataPlane, DataStream};
 use groupnet_core::NodeId;
 use groupnet_core::volatile_bootstrap::journal::{CaptureId, JournalCursor, ReservationId};
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapOperation, BootstrapScope, ClaimIdentity,
 };
-use groupnet_transport::bulk::{DataPlane, DataStream};
 use groupnet_transport_mem::MemBulkNet;
 use tokio::sync::oneshot;
 

@@ -11,7 +11,7 @@ use groupnet_runtime::InspectedPair;
 use super::{
     AdapterError, AdapterErrorKind, AdmissionClass, Admitted, BootstrapClaim, BootstrapMember,
     ByteAdmission, CAPACITY, ClaimObservationLimits, MALFORMED, NativeClaimSource, UNAVAILABLE,
-    allocation, nonzero, remaining_ms,
+    allocation, key_bytes, remaining_ms,
 };
 use crate::volatile_recovery::bootstrap::ports::{ParticipationSnapshot, TimedParticipant};
 
@@ -25,9 +25,10 @@ impl NativeClaimSource {
             return Err(AdapterErrorKind::InvalidInput.into());
         }
         let mut inspection = self.inspection_limits(limits)?;
-        inspection.max_key_bytes = nonzero(self.key.len().max(self.presence_key.len()))?;
+        inspection.max_key_bytes = key_bytes(self.longer_key())?;
         let raw_charge = limits
             .max_metadata_bytes
+            .get()
             .checked_add(self.key.len())
             .and_then(|bytes| bytes.checked_add(self.presence_key.len()))
             .ok_or(CAPACITY)?;
@@ -38,7 +39,7 @@ impl NativeClaimSource {
             .await
             .map_err(|_| UNAVAILABLE)?;
         let raw = raw_budget.hold(raw);
-        let decoded_bytes = decoded_charge(raw.get(), limits.max_metadata_bytes)?;
+        let decoded_bytes = decoded_charge(raw.get(), limits.max_metadata_bytes.get())?;
         let decoded_budget = admission.reserve(AdmissionClass::Inflight, decoded_bytes)?;
         let converted = raw.consume(|raw| self.convert_participation(raw))?;
         Ok(decoded_budget.hold(converted))
@@ -85,7 +86,7 @@ impl NativeClaimSource {
                         author: &node,
                         value: &value,
                     },
-                    self.max_value_bytes,
+                    self.max_value_bytes.get(),
                 )
                 .map_err(|_| MALFORMED)?;
                 exact.presence = Some(presence.identity);
@@ -109,7 +110,7 @@ impl NativeClaimSource {
                         author: &node,
                         value: &value,
                     },
-                    self.max_value_bytes,
+                    self.max_value_bytes.get(),
                 )
                 .map_err(|_| MALFORMED)?;
                 claim.remaining_ms = remaining_ms;

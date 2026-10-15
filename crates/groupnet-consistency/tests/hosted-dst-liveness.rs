@@ -24,7 +24,7 @@
 //! Modelled, exactly as the safety file models it and for the same reasons: the
 //! feed is harness-authored in `WriteFeed`'s own layout under the tier's own
 //! feed name; "apply" is the watermark advance, folded and published the way
-//! [`CommitLedger`](groupnet_consistency::CommitLedger) folds and publishes;
+//! [`CommitLedger`](groupnet_consistency::hosted::CommitLedger) folds and publishes;
 //! the follower is durable across restarts and does not replay history. The one
 //! difference is the **leadership watch does not lag** here — the shell's watch
 //! republish is prompt on a healthy fabric, and a lagging watch is a *safety*

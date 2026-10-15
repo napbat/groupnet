@@ -3,14 +3,17 @@
 use std::num::NonZeroUsize;
 
 use groupnet_core::volatile_bootstrap::journal::{
-    AttachToken, BarrierReceipt, CaptureId, JournalCursor, NativeCut, ReservationId,
+    AttachToken, BarrierReceipt, CaptureId, JournalConfig, JournalCursor, NativeCut, ReservationId,
 };
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapMemberIdentity, BootstrapScope, ClaimIdentity, PresenceIdentity,
+    BootId, BootstrapConfig, BootstrapMemberIdentity, BootstrapScope, ClaimIdentity,
+    PresenceIdentity,
 };
 use groupnet_core::{NodeId, Status};
 
-use super::{Correlation, Envelope, ExchangeKind, Message, Reader, WireError, nonzero};
+use super::{
+    Correlation, DEFAULT_BODY_BYTES, Envelope, ExchangeKind, Message, Reader, WireError, nonzero,
+};
 use crate::volatile_recovery::bootstrap::ports::DonorRequest;
 
 mod reply;
@@ -44,19 +47,25 @@ pub struct PhaseLimits {
 }
 
 impl Default for PhaseLimits {
-    /// 2 MiB bodies covering the core's default transfer policy: 1024
-    /// members, 256 cuts and 256 events per batch, 256-byte identities and
-    /// 64 KiB effects.
+    /// 2 MiB bodies, the default wire payload, carrying the core's default
+    /// policies: the scopes and member (and so writer) identities of
+    /// [`BootstrapConfig::default`], and the members, writer cuts, batch
+    /// events and mutation identities of [`JournalConfig::default`], whose
+    /// budgets the default
+    /// [`TransferConfig`](groupnet_core::volatile_bootstrap::transfer::TransferConfig)
+    /// shares; plus 64 KiB index effects.
     fn default() -> Self {
+        let claims = BootstrapConfig::default();
+        let journal = JournalConfig::default();
         Self {
-            max_body_bytes: nonzero(2 * 1024 * 1024),
-            max_scope_bytes: nonzero(512),
-            max_node_bytes: nonzero(256),
-            max_writer_bytes: nonzero(256),
-            max_cuts: nonzero(256),
-            max_members: nonzero(1024),
-            max_events: nonzero(256),
-            max_identity_bytes: nonzero(256),
+            max_body_bytes: DEFAULT_BODY_BYTES,
+            max_scope_bytes: claims.max_scope_bytes,
+            max_node_bytes: claims.max_member_bytes,
+            max_writer_bytes: claims.max_member_bytes,
+            max_cuts: journal.max_cuts,
+            max_members: journal.max_members,
+            max_events: journal.max_batch_events,
+            max_identity_bytes: journal.max_identity_bytes,
             max_effect_bytes: nonzero(64 * 1024),
         }
     }

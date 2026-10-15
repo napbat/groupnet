@@ -4,7 +4,6 @@
 //! implements only private index, native-feed, and guarded publication work.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use groupnet_core::Time;
 use groupnet_core::volatile_bootstrap::BootstrapScope;
@@ -17,10 +16,10 @@ use groupnet_transport::bulk::{BulkTransport, DataPlane};
 use super::admission::{AdmissionClass, Admitted, ByteAdmission, Reservation};
 use super::bulk_wire::{BootstrapBulkClient, BulkLimits, BulkLimitsError, Correlation};
 use super::ports::{
-    DonorCapture, DonorPort, DonorReply, DonorRequest, LocalCaptureOutcome, LocalCaptureRequest,
-    ReadyCaptureRequest, TransferContext, TransferResources,
+    DonorCapture, DonorPort, DonorReply, DonorRequest, EffectContext, LocalCaptureOutcome,
+    LocalCaptureRequest, ReadyCaptureRequest, TransferContext, TransferResources,
 };
-use crate::volatile_recovery::{AdapterError, AdapterErrorKind, PublicationPermit};
+use crate::volatile_recovery::{AdapterError, AdapterErrorKind};
 
 /// Application-only behavior required for a peer bootstrap. It never chooses
 /// a donor request, allocates a transfer operation, or schedules a retry.
@@ -83,12 +82,9 @@ pub trait BootstrapStatePort: Send + Sync + 'static {
     /// `InstallCandidate`, or `DiscardStage` under the worker's deadline.
     fn execute_local(
         &self,
-        context: &TransferContext,
         effect: TransferEffect,
         resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-        admission: &ByteAdmission,
-        permit: Option<PublicationPermit>,
-        deadline: Instant,
+        context: EffectContext<'_>,
     ) -> impl Future<Output = Result<Option<Admitted<TransferEvent>>, AdapterError>> + Send;
 
     /// Privately verify and store one admitted encoded image chunk. The
@@ -371,18 +367,16 @@ impl<A: BootstrapStatePort, B: BulkTransport> DonorPort for BulkDonorPort<A, B> 
 
     async fn execute(
         &self,
-        context: &TransferContext,
         effect: TransferEffect,
         resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-        admission: &ByteAdmission,
-        permit: Option<PublicationPermit>,
-        deadline: Instant,
+        context: EffectContext<'_>,
     ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
-        if !self.admission.same_pool(admission) || !self.client.uses_admission(admission) {
+        if !self.admission.same_pool(context.admission)
+            || !self.client.uses_admission(context.admission)
+        {
             return Err(AdapterErrorKind::InvalidInput.into());
         }
-        self.execute_one(context, effect, resources, admission, permit, deadline)
-            .await
+        self.execute_one(effect, resources, context).await
     }
 
     fn detach(
@@ -400,6 +394,9 @@ mod mapping;
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+
+    use groupnet_core::volatile_bootstrap::BootstrapConfig;
+    use groupnet_core::volatile_bootstrap::journal::JournalConfig;
 
     use super::*;
 
@@ -421,6 +418,28 @@ mod tests {
     #[test]
     fn the_default_limits_carry_the_default_policy() {
         assert_eq!(options().validate(), Ok(()));
+    }
+
+    /// The default limits take every shared bound from the core's defaults
+    /// rather than restating them: claim scopes and identities from
+    /// `BootstrapConfig`, mutation identities from `JournalConfig`, and the
+    /// members, cuts and batch events the default transfer policy carries.
+    #[test]
+    fn the_default_limits_follow_the_core_defaults() {
+        let claims = BootstrapConfig::default();
+        let journal = JournalConfig::default();
+        let policy = TransferConfig::new(NonZeroU32::MIN);
+        let BulkLimits { wire, phase, .. } = BulkLimits::default();
+        assert_eq!(wire.max_scope_bytes, claims.max_scope_bytes);
+        assert_eq!(wire.max_node_bytes, claims.max_member_bytes);
+        assert_eq!(phase.max_scope_bytes, claims.max_scope_bytes);
+        assert_eq!(phase.max_node_bytes, claims.max_member_bytes);
+        assert_eq!(phase.max_writer_bytes, claims.max_member_bytes);
+        assert_eq!(phase.max_identity_bytes, journal.max_identity_bytes);
+        assert_eq!(phase.max_members, policy.max_members);
+        assert_eq!(phase.max_cuts, policy.max_cuts);
+        assert_eq!(phase.max_events, policy.max_batch_events);
+        assert_eq!(phase.max_body_bytes, wire.max_payload_bytes);
     }
 
     #[test]

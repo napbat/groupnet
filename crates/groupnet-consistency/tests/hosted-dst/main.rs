@@ -31,7 +31,7 @@
 //! * **"Apply" is the watermark advance** ([`Harness::apply`]): there is no data
 //!   plane, so a node has applied a write exactly when its own engine can see it
 //!   in the host's feed and its follower loop has folded the token in — a fold
-//!   that mirrors [`CommitLedger`](groupnet_consistency::CommitLedger), stamp
+//!   that mirrors [`CommitLedger`](groupnet_consistency::hosted::CommitLedger), stamp
 //!   `max`-folded from the leadership epoch *at the publish instant*, a `record`
 //!   that moves nothing publishing nothing, a leadership change forcing a
 //!   `refresh`. Every applied key is checked against the sequence it was

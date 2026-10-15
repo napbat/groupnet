@@ -32,11 +32,11 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use groupnet_consistency::hosted::handoff::{Bytes, DataPlane};
-use groupnet_consistency::{
-    ChunkLimit, Commit, CommitLedger, Frontier, Group, Handoff, HostedRead, HostedReads,
-    HostedWrites, Snapshot, SnapshotChunks, SnapshotSink, SnapshotSource, WriteToken,
+use groupnet_consistency::hosted::handoff::{
+    ChunkLimit, Handoff, Snapshot, SnapshotChunks, SnapshotSink, SnapshotSource,
 };
+use groupnet_consistency::hosted::{Commit, CommitLedger, HostedRead, HostedReads, HostedWrites};
+use groupnet_consistency::{Bytes, DataPlane, Frontier, Group, WriteToken};
 use groupnet_core::{NodeId, VoterRoster, placement};
 use groupnet_runtime::{GroupProfile, Node};
 use groupnet_transport_mem::{MemBulkNet, MemBulkTransport, MemLink, Network};

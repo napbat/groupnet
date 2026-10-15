@@ -60,12 +60,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::io::{AsyncRead, AsyncWrite};
-use groupnet_consistency::hosted::handoff::{Bytes, DataPlane, DataStream};
-use groupnet_consistency::hosted::{Watermarks, commit_reading};
-use groupnet_consistency::{
-    ChunkLimit, CommitLedger, Handoff, HandoffError, Snapshot, SnapshotChunks, SnapshotSink,
-    SnapshotSource, WriteToken,
+use groupnet_consistency::hosted::handoff::{
+    ChunkLimit, Handoff, HandoffError, Snapshot, SnapshotChunks, SnapshotSink, SnapshotSource,
 };
+use groupnet_consistency::hosted::{CommitLedger, Watermarks, commit_reading};
+use groupnet_consistency::{Bytes, DataPlane, DataStream, WriteToken};
 use groupnet_core::{NodeId, Role, VoterRoster};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};

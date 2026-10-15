@@ -130,12 +130,13 @@ an application-owned network/retry state machine. The default S3 path still
 makes zero coordination or metadata writes to origin.
 
 `BootstrapSession` remains the sole scheduler. It supplies the exact current
-effect, `TransferContext` (original parent and full donor/follower identities),
-owned `TransferResources`, shared `ByteAdmission`, and the **absolute child
-operation deadline** to one `DonorPort::execute` call. The worker already
+effect, owned `TransferResources`, and one `EffectContext` — the
+`TransferContext` (original parent and full donor/follower identities), shared
+`ByteAdmission`, the install's publication permit, and the **absolute child
+operation deadline** — to one `DonorPort::execute` call. The worker already
 intersects that deadline with the original recovery episode, ticks the core
 after every await, and ignores stale callbacks. The deadline is an explicit
-port argument, not a fresh duration derived inside a network adapter.
+port input, not a fresh duration derived inside a network adapter.
 `BulkDonorPort<A, B>` wraps a consumer `A: BootstrapStatePort` and a
 `BootstrapBulkClient<B: BulkTransport>`; it implements `DonorPort` for the
 existing worker without a new task, timer, map of stages, or operation

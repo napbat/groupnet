@@ -7,10 +7,9 @@
 //! consistency tier, because this is the only one that spans both planes:
 //!
 //! * `consistency-handoff` turns on the underlying crate's `handoff` (and the
-//!   `hosted` tier it is built on), so `consistency::hosted::handoff` exists and
-//!   its application vocabulary (`Handoff`, the source/sink traits,
-//!   `ChunkLimit`) is reachable at the facade's crate root like every other
-//!   tier's;
+//!   `hosted` tier it is built on), so `consistency::hosted::handoff` exists
+//!   with its application vocabulary (`Handoff`, the source/sink traits,
+//!   `ChunkLimit`) at that one path, beside the `hosted` tier's `CommitLedger`;
 //! * it turns on the facade's own `bulk`, so `transport::bulk` — the
 //!   `DataPlane` a fetch is driven over — is there to drive it with;
 //! * and it reaches **into the in-memory binding**: `transport::mem` must expose
@@ -26,14 +25,14 @@
 
 use std::io;
 
-use groupnet::consistency::hosted::Watermarks;
-use groupnet::consistency::hosted::handoff::{Bytes, Offered};
-use groupnet::consistency::{
-    ChunkLimit, CommitLedger, Frontier, Handoff, Snapshot, SnapshotChunks, SnapshotSink,
-    SnapshotSource, WriteToken,
+use groupnet::consistency::hosted::handoff::{
+    ChunkLimit, Handoff, Offered, Snapshot, SnapshotChunks, SnapshotSink, SnapshotSource,
 };
+use groupnet::consistency::hosted::{CommitLedger, Watermarks};
+use groupnet::consistency::{Frontier, WriteToken};
 use groupnet::core::NodeId;
 use groupnet::runtime::Node;
+use groupnet::transport::Bytes;
 use groupnet::transport::bulk::DataPlane;
 use groupnet::transport::mem::{MemBulkNet, MemLink, Network};
 

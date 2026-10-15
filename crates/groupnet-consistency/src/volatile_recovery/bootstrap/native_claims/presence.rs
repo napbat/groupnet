@@ -15,7 +15,7 @@ use groupnet_runtime::{
 
 use super::{
     AdapterError, AdapterErrorKind, AdmissionClass, Admitted, CAPACITY, MALFORMED,
-    NativeClaimSource, UNAVAILABLE, nonzero,
+    NativeClaimSource, UNAVAILABLE, key_bytes,
 };
 
 /// A newer or concurrent presence for this member holds the entry.
@@ -27,25 +27,24 @@ const MAX_PRESENCE_ATTEMPTS: usize = 4;
 
 impl NativeClaimSource {
     fn pair_limits(&self) -> Result<EntryInspectionLimits, AdapterError> {
-        let per_member = size_of::<InspectedPairEntry>()
-            .checked_add(self.policy.max_member_bytes.get())
-            .and_then(|bytes| bytes.checked_add(self.max_value_bytes.checked_mul(2)?))
+        let per_member = self
+            .policy
+            .max_member_bytes
+            .checked_add(size_of::<InspectedPairEntry>())
+            .and_then(|bytes| bytes.checked_add(self.max_value_bytes.get().checked_mul(2)?))
             .ok_or(CAPACITY)?;
-        let max_response_bytes = size_of::<InspectedPair>()
-            .checked_add(
-                self.policy
-                    .max_members
-                    .get()
-                    .checked_mul(per_member)
-                    .ok_or(CAPACITY)?,
-            )
+        let max_response_bytes = self
+            .policy
+            .max_members
+            .checked_mul(per_member)
+            .and_then(|bytes| bytes.checked_add(size_of::<InspectedPair>()))
             .ok_or(CAPACITY)?;
         Ok(EntryInspectionLimits {
-            max_key_bytes: nonzero(self.key.len().max(self.presence_key.len()))?,
+            max_key_bytes: key_bytes(self.longer_key())?,
             max_members: self.policy.max_members,
             max_member_bytes: self.policy.max_member_bytes,
-            max_value_bytes: nonzero(self.max_value_bytes)?,
-            max_response_bytes: nonzero(max_response_bytes)?,
+            max_value_bytes: self.max_value_bytes,
+            max_response_bytes,
         })
     }
 
@@ -86,9 +85,13 @@ impl NativeClaimSource {
         {
             return Err(FENCED);
         }
-        let value_len =
-            encoded_presence_len(&self.scope, self.policy, &presence, self.max_value_bytes)
-                .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
+        let value_len = encoded_presence_len(
+            &self.scope,
+            self.policy,
+            &presence,
+            self.max_value_bytes.get(),
+        )
+        .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
         let queued_bytes = self
             .presence_key
             .len()
@@ -100,9 +103,13 @@ impl NativeClaimSource {
         let retained = self
             .admission
             .reserve(AdmissionClass::Inflight, value_len)?;
-        let value =
-            encode_presence_value(&self.scope, self.policy, &presence, self.max_value_bytes)
-                .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
+        let value = encode_presence_value(
+            &self.scope,
+            self.policy,
+            &presence,
+            self.max_value_bytes.get(),
+        )
+        .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
         let value = retained.hold(value);
         let mut attempts = 0;
         loop {
@@ -122,7 +129,7 @@ impl NativeClaimSource {
                         author: &local.node,
                         value: existing,
                     },
-                    self.max_value_bytes,
+                    self.max_value_bytes.get(),
                 )
                 .map_err(|_| MALFORMED)?;
                 if existing.identity != presence.identity {

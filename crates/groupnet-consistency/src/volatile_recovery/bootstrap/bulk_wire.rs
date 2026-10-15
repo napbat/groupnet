@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 
 use groupnet_core::NodeId;
 use groupnet_core::volatile_bootstrap::{
-    BootId, BootstrapOperation, BootstrapScope, ClaimIdentity,
+    BootId, BootstrapConfig, BootstrapOperation, BootstrapScope, ClaimIdentity,
 };
 use groupnet_transport::framing::MAX_FRAME_BYTES;
 
@@ -185,15 +185,21 @@ pub struct WireLimits {
     pub max_payload_bytes: NonZeroUsize,
 }
 
+/// The default operation payload a frame carries, and so the default phase
+/// body: room for the default transfer policy's 1 MiB metadata, chunks and
+/// batches with their envelope.
+const DEFAULT_BODY_BYTES: NonZeroUsize = nonzero(2 * 1024 * 1024);
+
 impl Default for WireLimits {
-    /// 4 MiB frames carrying up to 2 MiB of operation payload, for scopes and
-    /// node identities within the core's default claim limits.
+    /// 4 MiB frames carrying up to 2 MiB of operation payload, for the scopes
+    /// and node identities of the core's default [`BootstrapConfig`].
     fn default() -> Self {
+        let claims = BootstrapConfig::default();
         Self {
             max_frame_bytes: nonzero(4 * 1024 * 1024),
-            max_scope_bytes: nonzero(512),
-            max_node_bytes: nonzero(256),
-            max_payload_bytes: nonzero(2 * 1024 * 1024),
+            max_scope_bytes: claims.max_scope_bytes,
+            max_node_bytes: claims.max_member_bytes,
+            max_payload_bytes: DEFAULT_BODY_BYTES,
         }
     }
 }
