@@ -15,6 +15,7 @@ use super::{Driver, Manager, Payload, PrivateCheckpoint};
 use crate::replication::api::{
     ApplicationAdapter, CheckpointLimit, FailureClass, ScanLimit, SourceAdapter, SourceBatch,
 };
+use crate::replication::snapshot_api::SnapshotHoldRequest;
 use crate::replication::snapshot_runtime::SnapshotMode;
 
 impl<S, A, M> Driver<S, A, M>
@@ -122,16 +123,15 @@ where
         else {
             return self.stop(FailureClass::Terminal);
         };
+        let request = SnapshotHoldRequest {
+            operation: op,
+            total_due,
+            wall_deadline: total_deadline,
+            limit,
+        };
         let result = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            M::acquire(
-                &self.manager.source,
-                scope,
-                op,
-                total_due,
-                total_deadline,
-                limit,
-            ),
+            M::acquire(&self.manager.source, scope, request),
         )
         .await;
         self.tick();
@@ -481,12 +481,6 @@ where
         {
             Ok(value) => value,
             Err(error) => return self.snapshot_failure(op, error.class()),
-        };
-        // An empty batch is no progress and breaks the source contract; the
-        // core cannot represent one.
-        let (Some(events), Some(bytes)) = (NonZeroUsize::new(events), NonZeroUsize::new(bytes))
-        else {
-            return self.stop(FailureClass::Terminal);
         };
         self.payloads.insert(
             op.token,

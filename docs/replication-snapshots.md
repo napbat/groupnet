@@ -27,9 +27,10 @@ dependencies, or new wire frame.
 The public capabilities live in
 [`snapshot_api.rs`](../crates/groupnet-consistency/src/replication/snapshot_api.rs).
 `SnapshotSourceAdapter` supplies typed `Hold`, `ReadHandle`, and `Attachment`
-handles. Its `acquire_hold` receives the exact acquire `Operation`, the core's
-absolute logical deadline, the corresponding runtime `Instant`, and bounded
-`SnapshotConfig`. It returns a `SnapshotHold` containing both the handle and
+handles. Its `acquire_hold` receives the scope and one `SnapshotHoldRequest`:
+the exact acquire `Operation`, the core's absolute logical deadline
+(`total_due`), the corresponding runtime `Instant` (`wall_deadline`), and
+bounded `SnapshotConfig` (`limit`). It returns a `SnapshotHold` containing both the handle and
 an operation-bound `HoldReceipt`. `offer` returns `SnapshotImage<ReadHandle>`;
 `attach` returns `SnapshotAttachment<Attachment>`. `barrier`, bounded
 `read_chunk`, and `release_hold` complete the source capability.

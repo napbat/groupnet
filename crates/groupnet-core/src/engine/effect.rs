@@ -102,7 +102,7 @@ pub enum Effect {
     /// bug: the engine's **boot blackout** (a freshly started voter refuses to
     /// grant for one `lease_ms`) converts the durability requirement into a
     /// timing one — see
-    /// [`GroupEngine::with_recovered`](crate::GroupEngine::with_recovered) for
+    /// [`GroupEngine::recovering`](crate::GroupEngine::recovering) for
     /// the durable posture and what recovery does and does not buy.
     PersistGrant {
         /// The epoch granted.

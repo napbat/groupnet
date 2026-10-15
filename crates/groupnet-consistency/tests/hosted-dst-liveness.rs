@@ -18,8 +18,8 @@
 //! majority over a real network; every ledger entry is authored with the tier's
 //! own exported codec ([`encode_ledger`]) under its own key
 //! ([`ledger_entry_key`]) and read back with [`decode_ledger`] out of *the
-//! reading node's* entry view; a restart is [`GroupEngine::with_recovered`] fed
-//! the sim's persisted grant, the `GrantStore` posture this tier presumes.
+//! reading node's* entry view; a restart is [`GroupEngine::recovering`] restored
+//! with the sim's persisted grant, the `GrantStore` posture this tier presumes.
 //!
 //! Modelled, exactly as the safety file models it and for the same reasons: the
 //! feed is harness-authored in `WriteFeed`'s own layout under the tier's own
@@ -675,9 +675,9 @@ impl Harness {
         };
         let seeds: Vec<NodeId> = self.all.iter().filter(|x| *x != id).cloned().collect();
         let (group, cfg) = (self.group.clone(), cfg(&self.voters));
-        let engine = GroupEngine::new(group, id.clone(), seeds, cfg)
+        let engine = GroupEngine::recovering(group, id.clone(), seeds, cfg)
             .expect("valid config")
-            .with_recovered(recovered);
+            .restore(recovered);
         self.sim.add(engine).expect("distinct node");
         let applied = self.store.get(id).cloned().unwrap_or_default();
         self.reborn.insert(id.clone());

@@ -26,7 +26,7 @@
 //!
 //! The honest matrix, stated once so no suite has to hedge:
 //!
-//! | property | never restarts | `with_recovered` | amnesiac restart |
+//! | property | never restarts | recovered restart | amnesiac restart |
 //! |---|---|---|---|
 //! | S3 minority freeze | ✓ | ✓ | ✓ |
 //! | S4c-global (≤1 unexpired lease, cluster-wide, across partitions) | ✓ | ✓ | ✓ |
@@ -37,7 +37,7 @@
 //! boot, and boot is at or after the grant it forgot. What the blackout cannot
 //! restore is the *ledger*, so a voter with no store may re-grant an epoch
 //! number it already spent in a previous life — which is why S1-strict is a
-//! `with_recovered` property and is asserted in
+//! recovered-restart property and is asserted in
 //! `election-quorum-durability.rs`, not here. Nothing in this file asserts it
 //! under amnesia.
 //!

@@ -2,7 +2,6 @@
 //! operation turn at a time in FIFO order across scopes.
 
 use std::collections::{HashMap, VecDeque};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -645,13 +644,6 @@ where
         {
             Ok(value) => value,
             Err(error) => return self.adapter_failure(op, error.class()),
-        };
-        // An empty batch is no progress and breaks the source contract; the
-        // core cannot represent one.
-        let (Some(events), Some(encoded_bytes)) =
-            (NonZeroUsize::new(events), NonZeroUsize::new(encoded_bytes))
-        else {
-            return self.stop(FailureClass::Terminal);
         };
         let meta = Batch {
             coverage: Coverage {

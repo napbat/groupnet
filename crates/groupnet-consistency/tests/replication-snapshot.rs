@@ -11,13 +11,12 @@ use std::time::{Duration, Instant};
 
 use groupnet_consistency::replication::{
     AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
-    Comparison, Cursor, HoldReceipt, InstallPermit, Limits, Materialized, NativeSnapshot,
-    Operation, ProofId, ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope,
-    SnapshotApplicationAdapter, SnapshotAttachment, SnapshotConfig, SnapshotHold, SnapshotImage,
+    Comparison, Cursor, HoldReceipt, InstallPermit, Limits, Materialized, NativeSnapshot, ProofId,
+    ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope, SnapshotApplicationAdapter,
+    SnapshotAttachment, SnapshotConfig, SnapshotHold, SnapshotHoldRequest, SnapshotImage,
     SnapshotOffer, SnapshotSourceAdapter, SnapshotStage, SourceAdapter, SourceBatch, SourceHistory,
     SourceProof, Stream, TailLimit,
 };
-use groupnet_core::Time;
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
 
@@ -244,8 +243,8 @@ impl SourceAdapter for Source {
             through,
             proof: proof.id,
             certificate: vec![1],
-            events: 1,
-            bytes: 1,
+            events: NonZeroUsize::MIN,
+            bytes: NonZeroUsize::MIN,
             native: vec![mutation],
         })
     }
@@ -273,24 +272,21 @@ impl SnapshotSourceAdapter for Source {
     async fn acquire_hold(
         &self,
         scope: Scope,
-        request: Operation,
-        total_due: Time,
-        wall_deadline: Instant,
-        _limit: SnapshotConfig,
+        request: SnapshotHoldRequest,
     ) -> Result<SnapshotHold<Hold>, AdapterFailure<io::Error>> {
-        if Instant::now() >= wall_deadline {
+        if Instant::now() >= request.wall_deadline {
             return Err(AdapterFailure::Terminal(io::Error::other("expired hold")));
         }
         Ok(SnapshotHold {
             receipt: HoldReceipt {
-                request,
+                request: request.operation,
                 history: cursor(&scope, 0).history,
-                retained_until: total_due,
+                retained_until: request.total_due,
                 certificate: vec![1],
             },
             handle: Hold {
                 scope,
-                deadline: wall_deadline,
+                deadline: request.wall_deadline,
             },
         })
     }

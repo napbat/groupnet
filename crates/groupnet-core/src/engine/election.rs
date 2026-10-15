@@ -146,7 +146,7 @@ use order::{ClaimGuard, cmp_pair};
 use quorum::QuorumState;
 
 pub use order::Role;
-pub use quorum::RecoveredGrant;
+pub use quorum::{RecoveredGrant, RecoveringEngine};
 
 /// A standing bid for an epoch: what row 1 opens and row 4 closes.
 #[derive(Clone, Copy, Debug)]

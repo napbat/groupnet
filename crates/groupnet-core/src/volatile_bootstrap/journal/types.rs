@@ -415,8 +415,9 @@ pub struct CaptureCharge {
     /// Current private image bytes.
     pub image: ImageSize,
     /// Logical identity-plus-effect suffix limit, excluding retained journal
-    /// headers, barrier copies, and vector capacity.
-    pub suffix_bytes: usize,
+    /// headers, barrier copies, and vector capacity — the journal's
+    /// [`JournalConfig::max_suffix_bytes`], positive by construction.
+    pub suffix_bytes: NonZeroUsize,
     /// Admission started at this caller-supplied logical time.
     pub started: Time,
 }

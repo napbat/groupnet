@@ -59,8 +59,8 @@ impl SourceAdapter for MemSource {
             through,
             proof: proof.id,
             certificate: vec![1],
-            events: 1,
-            bytes: 8,
+            events: NonZeroUsize::MIN,
+            bytes: NonZeroUsize::new(8).expect("nonzero"),
             native: vec![through],
         })
     }
@@ -220,8 +220,8 @@ impl DurableSubscriptionSource for MemSource {
             through,
             proof: proof.id,
             certificate: vec![1],
-            events: 1,
-            bytes: 8,
+            events: NonZeroUsize::MIN,
+            bytes: NonZeroUsize::new(8).expect("nonzero"),
             native: vec![through],
         })
     }

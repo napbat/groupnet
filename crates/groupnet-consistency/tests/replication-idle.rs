@@ -1,5 +1,5 @@
 //! Optional idle polling over the real async shell and an in-memory source,
-//! and the shell's refusal of a source batch that covers nothing.
+//! and the shell's replay of the smallest batch a source can return.
 
 #![cfg(feature = "replication")]
 
@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::replication::{
     AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
-    Comparison, Cursor, FailureClass, IdlePolicy, InstallPermit, Limits, Materialized, ProofId,
-    ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch,
-    SourceHistory, SourceProof, Stage, Stream, TailLimit,
+    Comparison, Cursor, IdlePolicy, InstallPermit, Limits, Materialized, ProofId, ReadVerdict,
+    Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory,
+    SourceProof, Stage, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -56,8 +56,9 @@ struct Source {
     calls: Arc<Mutex<Vec<Instant>>>,
     hold: Arc<AtomicBool>,
     release: Arc<Notify>,
-    /// Report every scanned batch as covering zero events and bytes.
-    empty: Arc<AtomicBool>,
+    /// Report every scanned batch as one event and one byte — the smallest
+    /// batch [`SourceBatch`]'s nonzero counts admit.
+    single: Arc<AtomicBool>,
 }
 
 impl Source {
@@ -132,18 +133,27 @@ impl SourceAdapter for Source {
         proof: SourceProof,
         limit: ScanLimit,
     ) -> Result<SourceBatch<u64, u64>, AdapterFailure<io::Error>> {
-        let through = position(&proof.head)?.min(from.saturating_add(limit.events as u64));
-        let mut events = usize::try_from(through - from).expect("bounded by scan limit");
-        if self.empty.load(Ordering::Acquire) {
-            events = 0;
+        let mut through = position(&proof.head)?.min(from.saturating_add(limit.events as u64));
+        if self.single.load(Ordering::Acquire) {
+            through = through.min(from.saturating_add(1));
         }
+        let nothing = || AdapterFailure::Terminal(io::Error::other("nothing retained past from"));
+        let events = usize::try_from(through - from)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(nothing)?;
+        let bytes = if self.single.load(Ordering::Acquire) {
+            NonZeroUsize::MIN
+        } else {
+            NonZeroUsize::new(events.get().min(limit.bytes)).ok_or_else(nothing)?
+        };
         Ok(SourceBatch {
             from,
             through,
             proof: proof.id,
             certificate: vec![1],
             events,
-            bytes: events.min(limit.bytes),
+            bytes,
             native: through,
         })
     }
@@ -240,22 +250,23 @@ fn limits() -> Limits {
     limits
 }
 
-/// The core's replay batch counts are nonzero by type, so a source batch that
-/// reports zero events and bytes breaks the adapter contract: the shell fails
-/// the scope terminally instead of handing it to the engine.
+/// [`SourceBatch`] counts are nonzero by type, so an empty batch is not a
+/// value a source can return. The boundary that remains — one event, one
+/// byte — is replayed like any other: two minimal batches reach head 2.
 #[tokio::test]
-async fn an_empty_source_batch_fails_the_scope_terminally() {
-    let cluster = MemCluster::builder(&["empty-reader"])
+async fn the_smallest_source_batch_is_replayed() {
+    let cluster = MemCluster::builder(&["single-reader"])
         .group("stores")
         .spawn()
         .await;
     let source = Source::default();
-    source.empty.store(true, Ordering::Release);
+    source.single.store(true, Ordering::Release);
     source.head.store(2, Ordering::Release);
+    let app = App::default();
     let manager = Replication::new(
         cluster.groups[0].clone(),
         source.clone(),
-        App::default(),
+        app.clone(),
         limits(),
     )
     .expect("valid limits");
@@ -265,12 +276,10 @@ async fn an_empty_source_batch_fails_the_scope_terminally() {
     handle.set_authority(true).expect("authority");
     assert_eq!(
         handle.catch_up(2, Instant::now() + SETTLE).await,
-        CatchUp::Failed(FailureClass::Terminal)
+        CatchUp::Ready(2)
     );
-    assert_eq!(
-        handle.status().expect("status").failure,
-        Some(FailureClass::Terminal)
-    );
+    assert_eq!(app.state.load(Ordering::Acquire), 2);
+    assert_eq!(handle.status().expect("status").failure, None);
 }
 
 #[tokio::test]

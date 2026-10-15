@@ -1,14 +1,12 @@
 //! Composition check: native state snapshots and durable named events share a manager.
 
 use std::future::Future;
-use std::time::Instant;
 
 use super::*;
 use groupnet_consistency::replication::{
-    Operation, SnapshotApplicationAdapter, SnapshotAttachment, SnapshotConfig, SnapshotHold,
-    SnapshotImage, SnapshotOffer, SnapshotSourceAdapter, SnapshotStage,
+    SnapshotApplicationAdapter, SnapshotAttachment, SnapshotConfig, SnapshotHold,
+    SnapshotHoldRequest, SnapshotImage, SnapshotOffer, SnapshotSourceAdapter, SnapshotStage,
 };
-use groupnet_core::Time;
 
 fn unused<T>() -> Result<T, AdapterFailure<io::Error>> {
     Err(AdapterFailure::Terminal(io::Error::other(
@@ -24,10 +22,7 @@ impl SnapshotSourceAdapter for MemSource {
     fn acquire_hold(
         &self,
         _scope: Scope,
-        _request: Operation,
-        _total_due: Time,
-        _wall_deadline: Instant,
-        _limit: SnapshotConfig,
+        _request: SnapshotHoldRequest,
     ) -> impl Future<Output = Result<SnapshotHold<()>, AdapterFailure<io::Error>>> + Send {
         std::future::ready(unused())
     }

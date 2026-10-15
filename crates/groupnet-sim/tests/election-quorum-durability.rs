@@ -14,7 +14,7 @@
 //!   rule really does stand in for the durability one, in exact virtual time.
 //! * **Q-DUR-recovered —
 //!   [`dst_quorum_recovered_grants_restore_global_epoch_uniqueness`].** Every
-//!   restart is a [`GroupEngine::with_recovered`] fed the pair the simulation's
+//!   restart is a [`GroupEngine::recovering`] engine restored with the pair the simulation's
 //!   stand-in store wrote from [`Effect::PersistGrant`]. That buys back the two
 //!   things the blackout cannot: an epoch is globally unique again, and the
 //!   sitting host does not have to wait out a lease to be re-granted.
@@ -139,7 +139,7 @@ fn draw_topology(rng: &mut SplitMix64, name: &str) -> Topology {
 enum Durability {
     /// [`GroupEngine::new`]: no store, so nothing but the boot blackout.
     Blackout,
-    /// [`GroupEngine::with_recovered`], fed whatever the sim's stand-in store
+    /// [`GroupEngine::recovering`], restored with whatever the sim's stand-in store
     /// holds for the node — [`RecoveredGrant::none`] when it holds nothing,
     /// which is storage *attesting* the voter never granted rather than a
     /// driver guessing it.
@@ -283,12 +283,14 @@ fn reboot(
         Durability::Blackout => {
             GroupEngine::new(topo.group.clone(), node.clone(), seeds, config).expect("valid config")
         }
-        Durability::Recovered => GroupEngine::new(topo.group.clone(), node.clone(), seeds, config)
-            .expect("valid config")
-            .with_recovered(match recovered {
-                None => RecoveredGrant::none(),
-                Some((epoch, claimant)) => RecoveredGrant::granted(epoch, claimant),
-            }),
+        Durability::Recovered => {
+            GroupEngine::recovering(topo.group.clone(), node.clone(), seeds, config)
+                .expect("valid config")
+                .restore(match recovered {
+                    None => RecoveredGrant::none(),
+                    Some((epoch, claimant)) => RecoveredGrant::granted(epoch, claimant),
+                })
+        }
     }
 }
 
@@ -497,7 +499,7 @@ fn assert_blackout_covers_every_grant(run: &Run) {
 
 /// **Q-DUR-recovered.** The same schedule, with every restart replaying the
 /// pair the simulation's stand-in store recorded from `Effect::PersistGrant`
-/// into [`GroupEngine::with_recovered`]. Two things come back that the blackout
+/// into [`GroupEngine::recovering`]. Two things come back that the blackout
 /// alone cannot give:
 ///
 /// * **Global epoch uniqueness — S1-strict, and with it E4-impossibility.** No

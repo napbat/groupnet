@@ -200,8 +200,8 @@ impl SourceAdapter for Source {
             through,
             proof: proof.id,
             certificate: vec![1],
-            events: 1,
-            bytes: 1,
+            events: NonZeroUsize::MIN,
+            bytes: NonZeroUsize::MIN,
             native: (),
         })
     }

@@ -4,14 +4,13 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
 
-use groupnet_core::replication::{Operation, Scope, SnapshotConfig, SnapshotOffer, SourceProof};
+use groupnet_core::replication::{Scope, SnapshotConfig, SnapshotOffer, SourceProof};
 
 use super::api::{ApplicationAdapter, Checkpoint, CheckpointLimit, FailureClass, SourceAdapter};
 use super::snapshot_api::{
     NativeSnapshot, ReplayOnly, SnapshotApplicationAdapter, SnapshotAttachment, SnapshotHold,
-    SnapshotImage, SnapshotSourceAdapter, SnapshotStage,
+    SnapshotHoldRequest, SnapshotImage, SnapshotSourceAdapter, SnapshotStage,
 };
 
 /// A replay-only mode has no snapshot capability: every operation resolves at
@@ -44,10 +43,7 @@ where
     fn acquire(
         _: &S,
         _: Scope,
-        _: Operation,
-        _: groupnet_core::Time,
-        _: Instant,
-        _: SnapshotConfig,
+        _: SnapshotHoldRequest,
     ) -> impl Future<Output = Result<SnapshotHold<Self::Hold>, FailureClass>> + Send + '_ {
         unavailable()
     }
@@ -165,13 +161,10 @@ where
     async fn acquire(
         source: &S,
         scope: Scope,
-        request: Operation,
-        due: groupnet_core::Time,
-        wall_deadline: Instant,
-        limit: SnapshotConfig,
+        request: SnapshotHoldRequest,
     ) -> Result<SnapshotHold<Self::Hold>, FailureClass> {
         source
-            .acquire_hold(scope, request, due, wall_deadline, limit)
+            .acquire_hold(scope, request)
             .await
             .map_err(|e| e.class())
     }

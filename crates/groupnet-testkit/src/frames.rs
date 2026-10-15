@@ -190,8 +190,8 @@ pub fn hosted_engine(id: &str, seeds: &[&str], claim_settle_ms: u64, lease_ms: u
 }
 
 /// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`], built over
-/// `config` and refined with [`GroupEngine::with_recovered`] — the
-/// voter-durability fixture.
+/// `config` through [`GroupEngine::recovering`] and restored with `recovered` —
+/// the voter-durability fixture.
 ///
 /// Pair it with [`quorum_config`] for the posture `recovered` actually means
 /// something in, and with [`settle_config`] or a plain [`Config::default`] to
@@ -207,14 +207,14 @@ pub fn recovered_engine(
     config: Config,
     recovered: RecoveredGrant,
 ) -> GroupEngine {
-    GroupEngine::new(
+    GroupEngine::recovering(
         GroupId::new(TEST_GROUP),
         NodeId::new(id),
         seeds.iter().map(|s| NodeId::new(*s)),
         config,
     )
     .expect("valid config")
-    .with_recovered(recovered)
+    .restore(recovered)
 }
 
 /// An engine for node `id` seeded with `seeds`, in [`TEST_GROUP`], opted into

@@ -15,7 +15,7 @@
 //! **own key** ([`ledger_entry_key`]), gossiped, and read back with
 //! [`decode_ledger`] out of *the reading node's* entry view — so a commit
 //! majority is assembled from bytes that genuinely crossed the fabric. Restarts
-//! are [`GroupEngine::with_recovered`] fed the sim's persisted grant: the
+//! are [`GroupEngine::recovering`] restored with the sim's persisted grant: the
 //! **`GrantStore` posture S5 presumes**.
 //!
 //! Modelled, deliberately, and named so nobody mistakes it for tested:
