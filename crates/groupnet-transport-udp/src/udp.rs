@@ -74,7 +74,10 @@ impl UdpTransport {
     /// [`register_peer`](Self::register_peer) before use.
     ///
     /// # Errors
-    /// Propagates any socket bind error or rejects an oversized local identity.
+    /// Returns `InvalidInput` carrying the
+    /// [`NodeIdError`](groupnet_transport::NodeIdError) for a local identity
+    /// that is empty or longer than the 1024-byte sender prefix allows, before
+    /// opening a socket, and propagates any socket bind error.
     pub async fn bind(local: NodeId, bind_addr: impl ToSocketAddrs) -> io::Result<Self> {
         let send_buffer = SendBuffer::new(&local)?;
         let socket = UdpSocket::bind(bind_addr).await?;
@@ -467,6 +470,39 @@ impl error::Error for UdpRegisterPeerError {}
 
 impl From<UdpRegisterPeerError> for io::Error {
     fn from(error: UdpRegisterPeerError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
+/// Why a raw [`UdpTransport`] refused to send. Converts into an
+/// `InvalidInput` `io::Error` that keeps this error as its inner error. A
+/// connectivity endpoint reports its own connection's errors instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UdpSendError {
+    /// The payload does not fit one datagram after the sender-id prefix.
+    PayloadTooLarge {
+        /// The payload's length in bytes.
+        len: usize,
+        /// The largest payload this endpoint's datagrams carry.
+        max: usize,
+    },
+}
+
+impl fmt::Display for UdpSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge { len, max } => write!(
+                f,
+                "UDP payload of {len} bytes exceeds the {max}-byte datagram limit"
+            ),
+        }
+    }
+}
+
+impl error::Error for UdpSendError {}
+
+impl From<UdpSendError> for io::Error {
+    fn from(error: UdpSendError) -> Self {
         Self::new(io::ErrorKind::InvalidInput, error)
     }
 }

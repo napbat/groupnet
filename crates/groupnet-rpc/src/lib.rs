@@ -294,7 +294,7 @@ async fn write_frames<W: AsyncWrite + Unpin>(
 ) {
     while let Some(frame) = frames.recv().await {
         if writer
-            .send_bounded_parts(frame.head(), frame.body(), max_frame_bytes.get())
+            .send_bounded_parts(frame.head(), frame.body(), max_frame_bytes.frame_bytes())
             .await
             .is_err()
         {

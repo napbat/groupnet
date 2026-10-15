@@ -96,15 +96,20 @@ its `TcpPunchConfig` / `UdpPunchConfig`. `with_cost` (a `NonZeroU32`) applies
 to both. It is one link type per protocol; no separate link is registered.
 The same rule holds below the links: `register_peer` on a connectivity-mode
 `TcpMsgTransport` or `UdpTransport` returns `TcpRegisterPeerError` /
-`UdpRegisterPeerError` instead of silently recording nothing, and a native
+`UdpRegisterPeerError` instead of silently recording nothing, `connect_peer`
+on a direct `TcpMsgTransport` bound without admission returns
+`InvalidInput` carrying `TcpConnectPeerError`, and a native
 configuration's `peers` is a `PeerPolicy` — `Static(allowlist)` or `Dynamic` —
 so a dynamic endpoint has no allowlist to ignore. Each adapter crate
 re-exports the connectivity types its signatures name (`TcpPunchConfig` or
 `UdpPunchConfig` with its error, `PeerPolicy`, `NetworkKey`, `PathPolicy`,
-`PeerPath`, and `UdpConnection` for UDP) and the shared transport types they
+`PeerPath`, and `UdpConnection` for UDP), the `PunchSendError` a connected
+send carries for an oversized message, and the shared transport types they
 take (`QueueCapacity`, `PeerEndpoint`, `BoundLink`, `SessionRegistry`,
 `Admission`, `NodeIdError` as applicable), so a standalone adapter user depends
-on `groupnet-transport-punch` only to host a rendezvous.
+on `groupnet-transport-punch` only to host a rendezvous. Raw sends name an
+oversized payload the same way: `UdpSendError` and `IpcSendError` carry the
+payload's length and the transport's bound.
 
 Link setters only store values. Every link provider (memory, TCP, UDP, IPC)
 validates once, when it binds, and completely before it opens any socket or

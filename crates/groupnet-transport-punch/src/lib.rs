@@ -37,7 +37,9 @@
 //! paths, with bounded best-effort I/O, admission generations, and explicit
 //! cancellation/drain. They do not implement router transport or link traits.
 //! TCP/UDP transport adapters own routing integration; the router alone performs
-//! logical multi-hop forwarding. UDP does not fragment oversized payloads.
+//! logical multi-hop forwarding. UDP does not fragment oversized payloads: a
+//! message over [`MAX_UDP_MESSAGE`] or [`MAX_TCP_MESSAGE`] is refused as
+//! `InvalidInput` carrying [`PunchSendError`].
 //! Local bind addresses and candidates are cached at bind and retained after
 //! shutdown; peer paths and observed addresses are live queries.
 //!
@@ -58,6 +60,7 @@ mod peers;
 mod punch;
 mod tcp;
 
+pub use common::PunchSendError;
 pub use groupnet_transport::admission::{Admission, SessionId, SessionRegistry};
 pub use groupnet_transport::link::AdmittedInbound;
 pub use groupnet_transport::{Bytes, Inbound, NodeIdError, QueueCapacity};

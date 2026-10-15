@@ -131,3 +131,33 @@ impl From<TcpAdmissionError> for io::Error {
         Self::new(io::ErrorKind::InvalidInput, error)
     }
 }
+
+/// Why [`TcpMsgTransport::connect_peer`](crate::TcpMsgTransport::connect_peer)
+/// started nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpConnectPeerError {
+    /// The endpoint is direct but was bound without a [`TcpAdmission`]
+    /// ([`bind`](crate::TcpMsgTransport::bind) rather than
+    /// [`bind_admitted`](crate::TcpMsgTransport::bind_admitted)): it has no
+    /// admission exchange to start.
+    AdmissionNotConfigured,
+}
+
+impl fmt::Display for TcpConnectPeerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AdmissionNotConfigured => f.write_str(
+                "connect_peer needs an admission-enabled endpoint (bind_admitted), \
+                 and this endpoint was bound without TCP admission",
+            ),
+        }
+    }
+}
+
+impl error::Error for TcpConnectPeerError {}
+
+impl From<TcpConnectPeerError> for io::Error {
+    fn from(error: TcpConnectPeerError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}

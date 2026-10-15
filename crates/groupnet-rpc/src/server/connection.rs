@@ -115,7 +115,7 @@ where
             return ReadEnd::Closed;
         };
         let read = tokio::select! {
-            read = reader.recv_bounded(config.max_frame_bytes.get()) => read,
+            read = reader.recv_bounded(config.max_frame_bytes.frame_bytes()) => read,
             () = idle_out(&mut work, config.idle_timeout) => return ReadEnd::Idle,
         };
         let Ok(Some(bytes)) = read else {

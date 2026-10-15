@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{closed, invalid, lock, random};
+use crate::common::{PunchSendError, closed, lock, random};
 
 pub use config::{UdpPunchConfig, UdpPunchConfigError};
 pub use server::{
@@ -489,7 +489,11 @@ impl UdpConnection {
     ) -> io::Result<()> {
         self.ensure_open()?;
         if length > MAX_UDP_MESSAGE {
-            return Err(invalid("UDP message exceeds MAX_UDP_MESSAGE"));
+            return Err(PunchSendError::PayloadTooLarge {
+                len: length,
+                max: MAX_UDP_MESSAGE,
+            }
+            .into());
         }
         if (!self.inner.dynamic && !self.inner.configured.contains(to))
             || (self.inner.dynamic && self.path_to(to).is_none())
@@ -526,7 +530,8 @@ impl UdpConnection {
     /// Unknown peers and full queues are dropped without blocking.
     ///
     /// # Errors
-    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    /// Returns `NotConnected` after shutdown, or `InvalidInput` carrying
+    /// [`PunchSendError`] for oversized data.
     pub fn send(&self, to: &NodeId, message: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
         std::future::ready(
             self.enqueue(to, message.len(), None, || Bytes::copy_from_slice(message)),
@@ -538,7 +543,7 @@ impl UdpConnection {
     ///
     /// # Errors
     /// Returns `NotConnected` after shutdown or when no generation is supplied,
-    /// and `InvalidInput` for oversized data.
+    /// and `InvalidInput` carrying [`PunchSendError`] for oversized data.
     pub fn send_admitted(
         &self,
         to: &NodeId,
@@ -561,7 +566,8 @@ impl UdpConnection {
     /// Unknown peers and full queues are dropped without blocking.
     ///
     /// # Errors
-    /// Returns `NotConnected` after shutdown or `InvalidInput` for oversized data.
+    /// Returns `NotConnected` after shutdown, or `InvalidInput` carrying
+    /// [`PunchSendError`] for oversized data.
     pub fn send_owned(
         &self,
         to: &NodeId,
@@ -576,7 +582,7 @@ impl UdpConnection {
     ///
     /// # Errors
     /// Returns `NotConnected` after shutdown or when no generation is supplied,
-    /// and `InvalidInput` for oversized data.
+    /// and `InvalidInput` carrying [`PunchSendError`] for oversized data.
     pub fn send_owned_admitted(
         &self,
         to: &NodeId,

@@ -21,11 +21,12 @@
 //! `UdpRegisterPeerError::Connectivity` instead of recording an address. The
 //! configuration, connection and path types these signatures name
 //! (`UdpPunchConfig`, `UdpPunchConfigError`, `PeerPolicy`, `UdpConnection`,
-//! `NetworkKey`, `PathPolicy`, `PeerPath`) are re-exported here, so standalone
-//! users need no direct `groupnet-transport-punch` dependency; only a
-//! self-hosted rendezvous (`UdpRendezvous`) comes from that crate. With
-//! `link`, so are the shared link types `UdpLink` and `into_bound_link` name
-//! (`BoundLink`, `PeerEndpoint`, `SessionRegistry`).
+//! `NetworkKey`, `PathPolicy`, `PeerPath`) and the `PunchSendError` a
+//! connected send carries are re-exported here, so standalone users need no
+//! direct `groupnet-transport-punch` dependency; only a self-hosted rendezvous
+//! (`UdpRendezvous`) comes from that crate. With `link`, so are the shared
+//! link types `UdpLink` and `into_bound_link` name (`BoundLink`,
+//! `PeerEndpoint`, `SessionRegistry`).
 //!
 //! ## Raw datagram behavior
 //!
@@ -37,7 +38,9 @@
 //!   the book through `Transport::learn_peer` (the runtime feeds them
 //!   automatically). Inbound datagrams carry their sender's id, so a peer the
 //!   book has never heard of is attributed and learned from its first frame.
-//! * **One frame per datagram.** A raw frame must fit in a single UDP packet.
+//! * **One frame per datagram.** A raw frame must fit in a single UDP packet;
+//!   a larger one is refused as `InvalidInput` carrying
+//!   `UdpSendError::PayloadTooLarge`.
 //!   Managed connected links advertise the native protocol's smaller message MTU
 //!   so routing can fragment frames before sending.
 //!
@@ -48,7 +51,7 @@
 
 mod udp;
 
-pub use udp::{UdpRegisterPeerError, UdpTransport};
+pub use udp::{UdpRegisterPeerError, UdpSendError, UdpTransport};
 
 #[cfg(feature = "link")]
 pub use groupnet_transport::{
@@ -57,7 +60,7 @@ pub use groupnet_transport::{
 };
 #[cfg(feature = "connectivity")]
 pub use groupnet_transport_punch::{
-    NetworkKey, PathPolicy, PeerPath, PeerPolicy, UdpConnection, UdpPunchConfig,
+    NetworkKey, PathPolicy, PeerPath, PeerPolicy, PunchSendError, UdpConnection, UdpPunchConfig,
     UdpPunchConfigError,
 };
 

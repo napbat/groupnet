@@ -12,8 +12,8 @@ use groupnet_transport::{
 use groupnet_transport_punch::{MAX_TCP_MESSAGE, TcpRendezvous, TcpRendezvousConfig};
 // Endpoint configuration and path types come only from the adapter's re-exports.
 use groupnet_transport_tcp::{
-    NetworkKey, PathPolicy, PeerPath, PeerPolicy, TcpLink, TcpMsgTransport, TcpPunchConfig,
-    TcpPunchConfigError,
+    NetworkKey, PathPolicy, PeerPath, PeerPolicy, PunchSendError, TcpLink, TcpMsgTransport,
+    TcpPunchConfig, TcpPunchConfigError,
 };
 use std::{io, net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
@@ -144,12 +144,19 @@ async fn direct_candidates_reuse_registration_port_and_preserve_message_boundari
     ] {
         exchange(&a, &b, &data).await;
     }
+    let oversized = a
+        .send(&"b".into(), &vec![0; MAX_TCP_MESSAGE + 1])
+        .await
+        .unwrap_err();
+    assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        a.send(&"b".into(), &vec![0; MAX_TCP_MESSAGE + 1])
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        oversized
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<PunchSendError>()),
+        Some(&PunchSendError::PayloadTooLarge {
+            len: MAX_TCP_MESSAGE + 1,
+            max: MAX_TCP_MESSAGE,
+        })
     );
     relay.close().await;
     // Established authenticated direct sessions are independent of control loss.

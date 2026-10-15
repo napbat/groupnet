@@ -29,7 +29,7 @@ use crate::handshake::{
 };
 
 mod config;
-pub use config::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError};
+pub use config::{TcpAdmission, TcpAdmissionConfig, TcpAdmissionError, TcpConnectPeerError};
 
 const MAGIC: &[u8; 8] = b"GNJOIN01";
 
@@ -124,32 +124,30 @@ impl TcpMsgTransport {
     /// that its endpoint is still running and does not admit a supplied hint.
     ///
     /// # Errors
-    /// Returns an error if this endpoint is shut down or is not admission-enabled.
+    /// Returns `InvalidInput` carrying [`TcpConnectPeerError`] for a direct
+    /// endpoint bound without admission, and `NotConnected` or `BrokenPipe`
+    /// once the endpoint is shut down.
     ///
     /// # Panics
     /// If a connection or address-book lock was poisoned.
     pub fn connect_peer(&self, node: &NodeId) -> io::Result<()> {
+        #[cfg(not(feature = "connectivity"))]
+        let super::Backend::Direct(inner) = &self.backend;
         #[cfg(feature = "connectivity")]
-        if let super::Backend::Connectivity { connection, .. } = &self.backend {
-            if connection.is_closed() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "tcp msg transport shut down",
-                ));
+        let inner = match &self.backend {
+            super::Backend::Direct(inner) => inner,
+            super::Backend::Connectivity { connection, .. } => {
+                if connection.is_closed() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "tcp msg transport shut down",
+                    ));
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        let Some(inner) = self.direct() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "not a direct endpoint",
-            ));
         };
         let Some(managed) = &inner.admission else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TCP admission is not configured",
-            ));
+            return Err(TcpConnectPeerError::AdmissionNotConfigured.into());
         };
         managed.send(inner, node, None)
     }

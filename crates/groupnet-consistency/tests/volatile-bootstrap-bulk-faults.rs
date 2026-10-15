@@ -127,8 +127,9 @@ async fn serve_fault<S: AsyncRead + AsyncWrite + Unpin>(
     fault: Fault,
     released: oneshot::Receiver<()>,
 ) {
-    assert!(stream.recv_bounded(4096).await.unwrap().is_some());
-    assert!(stream.recv_bounded(4096).await.unwrap().is_none());
+    let max = limits().wire.max_frame_bytes;
+    assert!(stream.recv_bounded(max).await.unwrap().is_some());
+    assert!(stream.recv_bounded(max).await.unwrap().is_none());
     let reply = Envelope {
         exchange: ExchangeKind::Release,
         correlation,
@@ -146,14 +147,14 @@ async fn serve_fault<S: AsyncRead + AsyncWrite + Unpin>(
             let mut wrong = reply;
             wrong.correlation.child.token += 1;
             stream
-                .send_bounded(encode(&wrong, limits().wire).unwrap().into(), 4096)
+                .send_bounded(encode(&wrong, limits().wire).unwrap().into(), max)
                 .await
                 .unwrap();
         }
         Fault::TrailingReply | Fault::DuplicateTerminal | Fault::StalledEof => {
             for frame in [&reply, &terminal] {
                 stream
-                    .send_bounded(encode(frame, limits().wire).unwrap().into(), 4096)
+                    .send_bounded(encode(frame, limits().wire).unwrap().into(), max)
                     .await
                     .unwrap();
             }
@@ -166,14 +167,14 @@ async fn serve_fault<S: AsyncRead + AsyncWrite + Unpin>(
                     &terminal
                 };
                 stream
-                    .send_bounded(encode(extra, limits().wire).unwrap().into(), 4096)
+                    .send_bounded(encode(extra, limits().wire).unwrap().into(), max)
                     .await
                     .unwrap();
             }
         }
         Fault::MissingTerminal => {
             stream
-                .send_bounded(encode(&reply, limits().wire).unwrap().into(), 4096)
+                .send_bounded(encode(&reply, limits().wire).unwrap().into(), max)
                 .await
                 .unwrap();
         }

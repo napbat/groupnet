@@ -105,7 +105,8 @@ impl Drop for Handle {
 /// with 5 s setup and per-frame write deadlines and a 60 s idle read deadline;
 /// [`IpcConfig`] selects other finite limits. Unknown peers, busy connections
 /// and full outbound queues drop messages under the best-effort [`Transport`]
-/// contract. Each session introduces its node ID
+/// contract; a message longer than [`MAX_FRAME`] is refused as `InvalidInput`
+/// carrying [`IpcSendError`]. Each session introduces its node ID
 /// once and can carry messages in either direction without a second connection.
 /// Dropping the last handle cancels all workers; [`Self::close`] also waits for
 /// workers to stop and for the owned listener to be released.
@@ -235,10 +236,11 @@ impl IpcTransport {
             return Err(closed());
         }
         if length > MAX_FRAME {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IPC message exceeds frame limit",
-            ));
+            return Err(IpcSendError::PayloadTooLarge {
+                len: length,
+                max: MAX_FRAME,
+            }
+            .into());
         }
         let mut book = state
             .book
@@ -419,6 +421,40 @@ impl error::Error for IpcPeerError {
 
 impl From<IpcPeerError> for io::Error {
     fn from(error: IpcPeerError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
+/// Why an [`IpcTransport`] refused to send. Converts into an `InvalidInput`
+/// `io::Error` that keeps this error as its inner error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcSendError {
+    /// The message is longer than [`MAX_FRAME`].
+    PayloadTooLarge {
+        /// The message's length in bytes.
+        len: usize,
+        /// The largest message accepted, [`MAX_FRAME`].
+        max: usize,
+    },
+}
+
+impl fmt::Display for IpcSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge { len, max } => {
+                write!(
+                    f,
+                    "IPC message of {len} bytes exceeds the {max}-byte frame limit"
+                )
+            }
+        }
+    }
+}
+
+impl error::Error for IpcSendError {}
+
+impl From<IpcSendError> for io::Error {
+    fn from(error: IpcSendError) -> Self {
         Self::new(io::ErrorKind::InvalidInput, error)
     }
 }

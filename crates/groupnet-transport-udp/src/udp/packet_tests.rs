@@ -3,10 +3,18 @@
 use std::time::Duration;
 
 use groupnet_core::NodeId;
-use groupnet_transport::Transport;
+use groupnet_transport::{NodeIdError, Transport};
 
-use super::UdpTransport;
-use super::framing::{MAX_DATAGRAM, SendBuffer};
+use super::framing::{HEADER_SIZE, MAX_DATAGRAM, MAX_ID_LEN, SendBuffer};
+use super::{UdpSendError, UdpTransport};
+
+fn typed<E: std::error::Error + Copy + 'static>(error: &std::io::Error) -> E {
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    *error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<E>())
+        .expect("typed inner error")
+}
 
 async fn bind(id: &str) -> UdpTransport {
     UdpTransport::bind(NodeId::new(id), "127.0.0.1:0")
@@ -84,14 +92,21 @@ async fn oversized_outbound_frame_is_rejected_without_poisoning_buffer() {
     sender
         .register_peer(receiver_id.clone(), receiver.local_addr())
         .unwrap();
+    let max = MAX_DATAGRAM - HEADER_SIZE - "sender".len();
+    let error = sender
+        .send(&receiver_id, &vec![0; max + 1])
+        .await
+        .expect_err("oversized datagram");
     assert_eq!(
-        sender
-            .send(&receiver_id, &vec![0; MAX_DATAGRAM])
-            .await
-            .expect_err("oversized datagram")
-            .kind(),
-        std::io::ErrorKind::InvalidInput
+        typed::<UdpSendError>(&error),
+        UdpSendError::PayloadTooLarge { len: max + 1, max }
     );
+    // The largest payload passes validation; IPv4 itself may drop a datagram
+    // this large, which the best-effort send tolerates.
+    sender
+        .send(&receiver_id, &vec![7; max])
+        .await
+        .expect("largest datagram");
     sender.send(&receiver_id, b"next").await.expect("next send");
     let arrivals = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
         .await
@@ -101,14 +116,23 @@ async fn oversized_outbound_frame_is_rejected_without_poisoning_buffer() {
 }
 
 #[tokio::test]
-async fn oversized_local_identity_is_rejected_at_bind() {
-    assert_eq!(
-        UdpTransport::bind(NodeId::new("x".repeat(1025)), "127.0.0.1:0")
+async fn local_identity_outside_the_prefix_bound_is_rejected_at_bind() {
+    bind(&"x".repeat(MAX_ID_LEN)).await;
+    for (id, expected) in [
+        (
+            "x".repeat(MAX_ID_LEN + 1),
+            NodeIdError::TooLong {
+                len: MAX_ID_LEN + 1,
+                max: MAX_ID_LEN,
+            },
+        ),
+        (String::new(), NodeIdError::Empty),
+    ] {
+        let error = UdpTransport::bind(NodeId::new(id), "127.0.0.1:0")
             .await
-            .expect_err("oversized identity")
-            .kind(),
-        std::io::ErrorKind::InvalidInput
-    );
+            .expect_err("invalid identity");
+        assert_eq!(typed::<NodeIdError>(&error), expected);
+    }
 }
 
 #[cfg(feature = "link")]

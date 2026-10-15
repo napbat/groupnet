@@ -95,6 +95,61 @@ impl From<TcpBulkConfigError> for io::Error {
     }
 }
 
+/// Why [`TcpBulkTransport::register_peer_host`] rejected a `host:port`
+/// endpoint. Converts into an `InvalidInput` `io::Error` that keeps this
+/// error as its inner error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpHostEndpointError {
+    /// The endpoint is longer than the host-endpoint bound.
+    TooLong {
+        /// The endpoint's length in bytes.
+        len: usize,
+        /// The longest endpoint accepted, in bytes.
+        max: usize,
+    },
+    /// The endpoint contains ASCII whitespace or one of `/`, `\`, `@`, `#`.
+    ForbiddenByte {
+        /// The offending byte.
+        byte: u8,
+        /// Its offset in the endpoint.
+        index: usize,
+    },
+    /// The endpoint has no `:port` suffix.
+    MissingPort,
+    /// The host before the final `:` is empty.
+    EmptyHost,
+    /// The port after the final `:` is not a decimal number from 1 to 65535.
+    InvalidPort,
+}
+
+impl std::fmt::Display for TcpHostEndpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong { len, max } => {
+                write!(
+                    f,
+                    "host endpoint is {len} bytes, above the {max}-byte bound"
+                )
+            }
+            Self::ForbiddenByte { byte, index } => write!(
+                f,
+                "host endpoint byte {byte:#04x} at offset {index} is not allowed"
+            ),
+            Self::MissingPort => f.write_str("host endpoint requires a :port suffix"),
+            Self::EmptyHost => f.write_str("host endpoint has an empty host"),
+            Self::InvalidPort => f.write_str("host endpoint port must be 1 to 65535"),
+        }
+    }
+}
+
+impl std::error::Error for TcpHostEndpointError {}
+
+impl From<TcpHostEndpointError> for io::Error {
+    fn from(error: TcpHostEndpointError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
 /// A TCP-backed data-plane transport endpoint.
 ///
 /// [`bind`](Self::bind) makes an endpoint that listens and dials.
@@ -224,36 +279,52 @@ impl TcpBulkTransport {
     /// bulk protocol's exact peer identity.
     ///
     /// # Errors
-    /// Rejects an empty, malformed, or overlong host:port endpoint.
+    /// Returns the [`TcpHostEndpointError`] for an overlong endpoint, one with
+    /// whitespace or a `/`, `\`, `@` or `#` byte, or one without a nonempty
+    /// host and a port from 1 to 65535, and records nothing.
     ///
     /// # Panics
     /// If the address book was poisoned by a panic in another thread.
-    pub fn register_peer_host(&self, node: NodeId, host: String) -> io::Result<()> {
-        let Some((name, port)) = host.rsplit_once(':') else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "host requires port",
-            ));
-        };
-        if host.is_empty()
-            || host.len() > MAX_HOST_ENDPOINT_BYTES
-            || name.is_empty()
-            || port.parse::<u16>().ok().is_none_or(|port| port == 0)
-            || host.bytes().any(|byte| {
-                byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'@' | b'#')
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid host endpoint",
-            ));
-        }
+    pub fn register_peer_host(
+        &self,
+        node: NodeId,
+        host: String,
+    ) -> Result<(), TcpHostEndpointError> {
+        check_host_endpoint(&host)?;
         self.peers
             .write()
             .expect("peers lock poisoned")
             .insert(node, PeerEndpoint::Host(host));
         Ok(())
     }
+}
+
+/// Checks a `host:port` endpoint for [`TcpBulkTransport::register_peer_host`].
+fn check_host_endpoint(host: &str) -> Result<(), TcpHostEndpointError> {
+    if host.len() > MAX_HOST_ENDPOINT_BYTES {
+        return Err(TcpHostEndpointError::TooLong {
+            len: host.len(),
+            max: MAX_HOST_ENDPOINT_BYTES,
+        });
+    }
+    let forbidden =
+        |byte: u8| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'@' | b'#');
+    if let Some(index) = host.bytes().position(forbidden) {
+        return Err(TcpHostEndpointError::ForbiddenByte {
+            byte: host.as_bytes()[index],
+            index,
+        });
+    }
+    let Some((name, port)) = host.rsplit_once(':') else {
+        return Err(TcpHostEndpointError::MissingPort);
+    };
+    if name.is_empty() {
+        return Err(TcpHostEndpointError::EmptyHost);
+    }
+    if port.parse::<u16>().ok().is_none_or(|port| port == 0) {
+        return Err(TcpHostEndpointError::InvalidPort);
+    }
+    Ok(())
 }
 
 impl BulkTransport for TcpBulkTransport {
