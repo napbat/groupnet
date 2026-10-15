@@ -49,50 +49,60 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
 ## Engineering rules (owner-set, 2026-08-05)
 
 1. **No Rust source file over 1000 lines.** Split modules before they get
-   there. (Largest today, and the only ones still within ~50 lines of the
+   there. (Largest today, and the only ones still within ~60 lines of the
    limit, so the next addition to them splits them *first*:
-   `groupnet-consistency`'s `tests/lease-dst.rs` ~979, `tests/replication.rs`
-   ~969, `src/replication/shell/driver.rs` ~967 and
-   `tests/volatile-bootstrap-runtime/scenarios.rs` ~951 (new runtime
-   scenarios go in their own `volatile-bootstrap-runtime/` children, as
-   `follower_progress.rs` does; the parent `main.rs`, ~650, keeps the shared
-   fakes); `groupnet-runtime`'s `src/driver.rs` ~960. The band under them,
-   with ~60–150 lines of room: `groupnet-core`'s
+   `groupnet-consistency`'s `tests/lease-dst.rs` ~980, `tests/replication.rs`
+   ~969, `src/replication/shell/driver.rs` ~967,
+   `src/volatile_recovery/bootstrap/bulk_wire/phase.rs` ~946 (its reply side
+   lives in `phase/reply.rs`), `tests/volatile-bootstrap-runtime/scenarios.rs`
+   ~944 (new runtime scenarios go in their own `volatile-bootstrap-runtime/`
+   children, as `follower_progress.rs` does; the parent `main.rs`, ~649, keeps
+   the shared fakes) and `tests/volatile-bootstrap-bulk-adapter.rs` ~942;
+   `groupnet-runtime`'s `src/driver.rs` ~960; `groupnet-core`'s
    `src/volatile_recovery/tests.rs` ~940 (the next lapse-arm test goes in a
-   sibling file, as `peer_tests.rs` and `seal_tests.rs` did),
-   `src/volatile_bootstrap/engine.rs` ~933 (the next recapture state goes in
+   sibling file, as `peer_tests.rs` and `seal_tests.rs` did). The band under
+   them, with ~60–150 lines of room: `groupnet-core`'s
+   `src/volatile_bootstrap/engine.rs` ~937 (the next recapture state goes in
    `engine/recapture.rs`, ~426), `tests/election.rs` ~928,
    `src/volatile_bootstrap/transfer/tests.rs` ~906,
-   `src/volatile_bootstrap/engine/participation.rs` ~883,
+   `src/volatile_bootstrap/engine/participation.rs` ~904,
    `src/engine/election.rs` ~872, `src/volatile_recovery/engine.rs` ~870 (its
    fallback paths moved to `engine/fallback.rs`, its head evidence to
-   `engine/evidence.rs`), `src/replication/session/subscription.rs` ~864 and
-   `src/engine/election/quorum.rs` ~863; `groupnet-sim`'s
-   `tests/election-external-skew.rs` ~909 and `tests/election-quorum.rs` ~892;
-   `groupnet-consistency`'s `tests/volatile-bootstrap-bulk-adapter.rs` ~910,
-   `src/replication/shell.rs` ~895, `src/lease/core.rs` ~885,
-   `tests/lease-dst-liveness.rs` ~882, `tests/hosted-dst-liveness.rs` ~880,
-   `tests/replication-snapshot.rs` ~869, `tests/replication-ack.rs` ~864,
-   `src/volatile_recovery/bootstrap/session/run.rs` ~863 and
-   `src/lease/shell.rs` ~861 (a coherent write's wait lives in
-   `lease/shell/writes.rs`); `groupnet-transport-punch`'s `src/punch/server.rs`
-   ~902; `groupnet-transport-tcp`'s `src/msg.rs` ~871.
-   With room still: `groupnet-runtime`'s `src/group.rs` ~810 (membership and
-   status reads live in `group/roster.rs`), `tests/typed-protocols.rs` ~791,
-   `tests/external-faults.rs` ~782, `src/anchor.rs` ~773, `tests/quorum.rs`
-   ~771, `tests/application-messages.rs` ~755, `tests/external.rs` ~708 and
-   `src/node.rs` ~701; `groupnet-consistency`'s
+   `engine/evidence.rs`), `src/replication/session/subscription.rs` ~864,
+   `src/engine/election/quorum.rs` ~863 and
+   `src/volatile_bootstrap/journal/tests.rs` ~850; `groupnet-runtime`'s
+   `tests/typed-protocols.rs` ~924 and `src/group/entries.rs` ~850;
+   `groupnet-sim`'s `tests/election-external-skew.rs` ~909 and
+   `tests/election-quorum.rs` ~892; `groupnet-consistency`'s
+   `src/lease/core.rs` ~902, `src/replication/shell.rs` ~895,
+   `tests/lease-dst-liveness.rs` ~883, `tests/hosted-dst-liveness.rs` ~880,
+   `tests/replication-snapshot.rs` ~870,
+   `src/volatile_recovery/bootstrap/session/run.rs` ~869,
+   `tests/replication-ack.rs` ~864 and `src/lease/shell.rs` ~863 (a coherent
+   write's wait lives in `lease/shell/writes.rs`); `groupnet-transport-tcp`'s
+   `src/msg.rs` ~886; `groupnet-transport-punch`'s `src/punch/server.rs` ~885;
+   `groupnet-transport-ipc`'s `tests/ipc.rs` ~883.
+   With room still: `groupnet-runtime`'s `tests/external-faults.rs` ~781,
+   `src/anchor.rs` ~772, `tests/application-messages.rs` ~735 and
+   `tests/quorum.rs` ~716 (`src/group.rs`, ~463, keeps the handle; entries
+   live in `group/entries.rs`, membership and status reads in
+   `group/roster.rs`); `groupnet-consistency`'s
    `src/replication/shell/driver/snapshot.rs` ~843, `src/hosted/writes.rs`
-   ~839, `src/hosted/handoff/stream.rs` ~828, `src/hosted/lineage.rs` ~818,
-   `src/volatile_recovery/shell.rs` ~765, `tests/handoff-fence.rs` ~763,
-   `tests/handoff-migration.rs` ~757, `tests/hosted-migration.rs` ~749,
-   `tests/handoff.rs` ~742, `src/hosted/ledger.rs` ~732,
+   ~840, `src/hosted/handoff/stream.rs` ~828, `src/hosted/lineage.rs` ~818,
+   `src/volatile_recovery/bootstrap/bulk_wire.rs` ~808,
+   `src/volatile_recovery/shell.rs` ~765, `tests/handoff-fence.rs` ~759,
+   `src/volatile_recovery/bootstrap/ports.rs` ~758,
+   `tests/handoff-migration.rs` ~757, `tests/hosted-migration.rs` ~748,
+   `src/hosted/ledger.rs` ~742, `tests/handoff.rs` ~740,
    `src/hosted/handoff/wire.rs` ~721 and `tests/handoff-resync.rs` ~715;
-   `groupnet-core`'s `src/volatile_bootstrap/journal/tests.rs` ~840 and
-   `tests/state.rs` ~778; `groupnet-transport-punch`'s `src/tcp/endpoint.rs`
-   ~841; `groupnet-transport-tcp`'s `src/msg/admitted/tests.rs` ~828;
+   `groupnet-core`'s `src/volatile_bootstrap/journal/core.rs` ~793,
+   `src/replication/subscription.rs` ~786 and `tests/state.rs` ~778;
+   `groupnet-transport-tcp`'s `src/msg/admitted/tests.rs` ~846;
+   `groupnet-transport-punch`'s `src/tcp/endpoint.rs` ~844 and
+   `src/punch/wire.rs` ~780; `groupnet-transport-udp`'s `src/udp.rs` ~775;
+   `groupnet-messaging`'s `src/tests.rs` ~757;
    `groupnet-sim/tests/election-external.rs` ~785. `groupnet-sim`'s
-   `simulation.rs` (~558) delegates probe/liveness dispatch to
+   `simulation.rs` (~559) delegates probe/liveness dispatch to
    `simulation/liveness.rs` and the anchor driver to `simulation/external.rs`;
    a new subsystem's event kinds get their own child the same way.) Four splits
    worth copying:
@@ -185,11 +195,14 @@ These hold in every published crate; a change that breaks one is a defect.
 - **Re-exports**: a crate re-exports every non-core type its public signatures
   require callers to name — sibling-crate types, `bytes::Bytes`, and (under
   `connectivity`) the punch types TCP/UDP links take — at one canonical path,
-  gated with the feature that exposes it. A public module whose items are also
-  re-exported at the root is private (one path per item). Async-ecosystem types
-  (`tokio`, `tokio-util`, `futures-io`) in signatures are the runtime contract
-  and are not re-exported. `groupnet-core`'s shared vocabulary (`NodeId`,
-  `GroupId`, `Config`, `Role`, `Status`, `Time`, …) is never re-exported:
+  gated with the feature that exposes it. Each item has one path: a public
+  module's items are not also re-exported at the root, and the root re-exports
+  only items of private modules (`groupnet-consistency`'s `hosted`, `lease`,
+  `replication` and `volatile_recovery` tiers are named through their
+  modules). Async-ecosystem types (`tokio`, `tokio-util`, `futures-io`) in
+  signatures are the runtime contract and are not re-exported.
+  `groupnet-core`'s shared vocabulary (`NodeId`, `GroupId`, `Config`, `Role`,
+  `Status`, `Time`, …) is never re-exported:
   consumers depend on `groupnet-core` or the facade. Consistency tiers re-export
   the tier-specific core domain types their adapters need.
 - **Async traits**: statically dispatched adapter traits use
