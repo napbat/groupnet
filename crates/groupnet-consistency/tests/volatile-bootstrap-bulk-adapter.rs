@@ -3,6 +3,7 @@
 #![cfg(feature = "volatile-bootstrap-bulk")]
 
 use std::future::ready;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,8 +26,9 @@ use groupnet_consistency::volatile_recovery::bootstrap::ports::{
 };
 use groupnet_consistency::volatile_recovery::bootstrap::{
     AttachToken, BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, CaptureId,
-    ClaimIdentity, DeltaIdentity, DonorJournal, JournalBatch, JournalConfig, JournalCursor,
-    PresenceIdentity, ReservationId, TransferConfig, TransferConfigError, TransferOffer,
+    CapturePlan, ClaimIdentity, DeltaIdentity, DonorJournal, ImageSize, JournalBatch,
+    JournalConfig, JournalCursor, PresenceIdentity, ReservationId, TransferConfig,
+    TransferConfigError, TransferOffer,
 };
 use groupnet_consistency::volatile_recovery::{AdapterError, AdapterErrorKind};
 use groupnet_core::Time;
@@ -84,9 +86,9 @@ impl BootstrapStatePort for PrivateState {
                 position: 0,
             },
             schema: 1,
-            encoded_bytes: 1,
-            decoded_bytes: 1,
-            chunks: 1,
+            encoded_bytes: NonZeroUsize::MIN,
+            decoded_bytes: NonZeroUsize::MIN,
+            chunks: NonZeroUsize::MIN,
             commitment: [9; 32],
             members: vec![member(context.donor), member(context.follower)],
             cuts: vec![],
@@ -404,9 +406,9 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
         capture: capture.clone(),
         image_cut: cut.clone(),
         schema: 1,
-        encoded_bytes: 1,
-        decoded_bytes: 1,
-        chunks: 1,
+        encoded_bytes: NonZeroUsize::MIN,
+        decoded_bytes: NonZeroUsize::MIN,
+        chunks: NonZeroUsize::MIN,
         commitment: [9; 32],
         members: vec![
             member(context.donor.clone()),
@@ -522,7 +524,7 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
         .unwrap();
     assert!(matches!(
         chunk_event.get(),
-        TransferEvent::ChunkStored { bytes: 1, .. }
+        TransferEvent::ChunkStored { bytes, .. } if bytes.get() == 1
     ));
     drop(chunk_event);
     let attach_event = adapter
@@ -584,6 +586,11 @@ fn journal_config_for_test() -> JournalConfig {
     }
 }
 
+const UNIT_IMAGE: ImageSize = ImageSize {
+    encoded_bytes: NonZeroUsize::MIN,
+    decoded_bytes: NonZeroUsize::MIN,
+};
+
 fn capture_for_test(budget: &ByteAdmission) -> DonorCapture<Vec<u8>> {
     let (_, context, id, _, _) = setup();
     let config = journal_config_for_test();
@@ -592,13 +599,14 @@ fn capture_for_test(budget: &ByteAdmission) -> DonorCapture<Vec<u8>> {
     journal
         .begin_capture(
             Time(1),
-            1,
-            1,
-            vec![member(context.donor), member(context.follower)],
-            vec![],
+            CapturePlan {
+                image: UNIT_IMAGE,
+                members: vec![member(context.donor), member(context.follower)],
+                cuts: vec![],
+            },
         )
         .unwrap();
-    journal.finish_capture(Time(2), 1, 1).unwrap();
+    journal.finish_capture(Time(2), UNIT_IMAGE).unwrap();
     let suffix = budget.reserve(AdmissionClass::Suffix, storage).unwrap();
     let ingress = JournalIngress::new(journal, suffix, Arc::new(Notify::new())).unwrap();
     let encoded = budget.reserve(AdmissionClass::Encoded, 1).unwrap();
@@ -615,10 +623,11 @@ fn capturing_ingress_records_live_effects_but_cannot_offer_until_finished() {
     journal
         .begin_capture(
             Time(1),
-            1,
-            1,
-            vec![member(context.donor), member(context.follower.clone())],
-            vec![],
+            CapturePlan {
+                image: UNIT_IMAGE,
+                members: vec![member(context.donor), member(context.follower.clone())],
+                cuts: vec![],
+            },
         )
         .unwrap();
     let suffix = budget
@@ -646,7 +655,7 @@ fn capturing_ingress_records_live_effects_but_cannot_offer_until_finished() {
                 b"p".to_vec(),
             )
             .unwrap();
-        assert_eq!(journal.finish_capture(Time(3), 1, 1).unwrap(), c);
+        assert_eq!(journal.finish_capture(Time(3), UNIT_IMAGE).unwrap(), c);
     });
     let encoded = budget.reserve(AdmissionClass::Encoded, 1).unwrap();
     let decoded = budget.reserve(AdmissionClass::Decoded, 1).unwrap();

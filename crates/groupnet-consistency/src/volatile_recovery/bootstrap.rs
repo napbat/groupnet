@@ -17,9 +17,9 @@ pub mod report;
 pub mod session;
 
 pub use groupnet_core::volatile_bootstrap::journal::{
-    AttachToken, BarrierReceipt, CaptureId, DeltaIdentity, DonorJournal, Invalidation,
-    JournalBatch, JournalConfig, JournalConfigError, JournalCursor, JournalDelta, JournalError,
-    JournalState, NativeCut, ReservationId,
+    AttachToken, BarrierReceipt, CaptureId, CapturePlan, DeltaIdentity, DonorJournal, ImageSize,
+    Invalidation, JournalBatch, JournalConfig, JournalConfigError, JournalCursor, JournalDelta,
+    JournalError, JournalState, NativeCut, NativeRenewal, ReservationId,
 };
 pub use groupnet_core::volatile_bootstrap::transfer::{
     NativeHandoffReceipt, TransferConfig, TransferConfigError, TransferError, TransferOffer,

@@ -162,13 +162,32 @@ fn cuts() -> Vec<NativeCut> {
     }]
 }
 
+fn image(encoded: usize, decoded: usize) -> ImageSize {
+    ImageSize {
+        encoded_bytes: nz(encoded),
+        decoded_bytes: nz(decoded),
+    }
+}
+
+fn plan(encoded: usize, decoded: usize, cuts: Vec<NativeCut>) -> CapturePlan {
+    CapturePlan {
+        image: image(encoded, decoded),
+        members: members(),
+        cuts,
+    }
+}
+
+fn renewal(sealed: NativeCut, epoch: u64) -> NativeRenewal {
+    NativeRenewal { sealed, epoch }
+}
+
 fn captured() -> (DonorJournal, JournalCursor) {
     let mut journal = DonorJournal::new(config(), capture_id()).unwrap();
     let admission = journal
-        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .begin_capture(Time(1), plan(64, 64, cuts()))
         .unwrap();
     assert_eq!(admission.started, Time(1));
-    let cut = journal.finish_capture(Time(2), 20, 24).unwrap();
+    let cut = journal.finish_capture(Time(2), image(20, 24)).unwrap();
     (journal, cut)
 }
 
@@ -176,7 +195,7 @@ fn captured() -> (DonorJournal, JournalCursor) {
 fn encoding_phase_records_suffix_from_c_but_cannot_serve_a_follower() {
     let mut journal = DonorJournal::new(config(), capture_id()).unwrap();
     journal
-        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .begin_capture(Time(1), plan(64, 64, cuts()))
         .unwrap();
     assert_eq!(journal.state(), JournalState::Capturing);
     assert_eq!(journal.current_cursor(), None);
@@ -207,7 +226,7 @@ fn encoding_phase_records_suffix_from_c_but_cannot_serve_a_follower() {
             .position,
         2
     );
-    let finished = journal.finish_capture(Time(4), 20, 24).unwrap();
+    let finished = journal.finish_capture(Time(4), image(20, 24)).unwrap();
     assert_eq!(finished, c, "the encoded image still represents C");
     assert_eq!(journal.image_cuts()[0].sequence, 0);
     assert_eq!(journal.covered_cuts()[0].sequence, 1);
@@ -219,7 +238,7 @@ fn encoding_phase_records_suffix_from_c_but_cannot_serve_a_follower() {
 fn encoding_phase_overflow_or_cancel_cannot_finish_or_advertise() {
     let mut overflow = DonorJournal::new(config(), capture_id()).unwrap();
     overflow
-        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .begin_capture(Time(1), plan(64, 64, cuts()))
         .unwrap();
     assert_eq!(
         overflow.append(
@@ -232,25 +251,25 @@ fn encoding_phase_overflow_or_cancel_cannot_finish_or_advertise() {
     );
     assert_eq!(overflow.state(), JournalState::Invalidated);
     assert_eq!(
-        overflow.finish_capture(Time(3), 20, 24),
+        overflow.finish_capture(Time(3), image(20, 24)),
         Err(JournalError::Stage)
     );
     assert_eq!(overflow.current_cursor(), None);
 
     let mut cancelled = DonorJournal::new(config(), capture_id()).unwrap();
     cancelled
-        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .begin_capture(Time(1), plan(64, 64, cuts()))
         .unwrap();
     cancelled.invalidate(Invalidation::DonorLost);
     assert_eq!(
-        cancelled.finish_capture(Time(2), 20, 24),
+        cancelled.finish_capture(Time(2), image(20, 24)),
         Err(JournalError::Stage)
     );
     assert_eq!(cancelled.current_cursor(), None);
 
     let mut changed_roster = DonorJournal::new(config(), capture_id()).unwrap();
     changed_roster
-        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .begin_capture(Time(1), plan(64, 64, cuts()))
         .unwrap();
     assert_eq!(
         changed_roster.observe_membership(Time(2), &[member("donor", 1)]),
@@ -258,7 +277,7 @@ fn encoding_phase_overflow_or_cancel_cannot_finish_or_advertise() {
     );
     assert_eq!(changed_roster.state(), JournalState::Invalidated);
     assert_eq!(
-        changed_roster.finish_capture(Time(3), 20, 24),
+        changed_roster.finish_capture(Time(3), image(20, 24)),
         Err(JournalError::Stage)
     );
 }
@@ -280,7 +299,14 @@ fn whole_journal_charge_is_finite_and_rejects_oversized_retained_vectors() {
     let mut oversized_members = Vec::with_capacity(2 * config().max_members.get() + 1);
     oversized_members.extend(members());
     assert_eq!(
-        journal.begin_capture(Time(1), 1, 1, oversized_members, cuts()),
+        journal.begin_capture(
+            Time(1),
+            CapturePlan {
+                image: image(1, 1),
+                members: oversized_members,
+                cuts: cuts(),
+            }
+        ),
         Err(JournalError::Capacity)
     );
     assert_eq!(journal.state(), JournalState::Invalidated);
@@ -300,14 +326,15 @@ fn whole_journal_charge_is_finite_and_rejects_oversized_retained_vectors() {
     assert_eq!(
         journal.begin_capture(
             Time(1),
-            1,
-            1,
-            members(),
-            vec![NativeCut {
-                writer: oversized_writer,
-                epoch: 1,
-                sequence: 0,
-            }],
+            plan(
+                1,
+                1,
+                vec![NativeCut {
+                    writer: oversized_writer,
+                    epoch: 1,
+                    sequence: 0,
+                }],
+            ),
         ),
         Err(JournalError::Capacity)
     );
@@ -380,12 +407,13 @@ fn local(name: &str) -> DeltaIdentity {
 fn image_admission_precedes_clone_and_retains_exact_cut() {
     let mut journal = DonorJournal::new(config(), capture_id()).unwrap();
     let admission = journal
-        .begin_capture(Time(1), 64, 64, members(), cuts())
+        .begin_capture(Time(1), plan(64, 64, cuts()))
         .unwrap();
     assert_eq!(journal.state(), JournalState::Capturing);
     assert_eq!(journal.current_cursor(), None);
-    assert_eq!(admission.encoded_bytes, 64);
-    let cut = journal.finish_capture(Time(2), 20, 24).unwrap();
+    assert_eq!(admission.image, image(64, 64));
+    let cut = journal.finish_capture(Time(2), image(20, 24)).unwrap();
+    assert_eq!(journal.image_charge().unwrap().image, image(20, 24));
     assert_eq!(cut.position, 0);
     assert_eq!(cut.capture, capture_id());
     assert_eq!(journal.image_charge().unwrap().started, Time(1));
@@ -393,19 +421,29 @@ fn image_admission_precedes_clone_and_retains_exact_cut() {
 
     let (mut too_large, _) = captured();
     assert_eq!(
-        too_large.begin_capture(Time(3), 1, 1, members(), cuts()),
+        too_large.begin_capture(Time(3), plan(1, 1, cuts())),
         Err(JournalError::Stage)
     );
     let mut bad_clone = DonorJournal::new(config(), capture_id()).unwrap();
     bad_clone
-        .begin_capture(Time(1), 8, 8, members(), cuts())
+        .begin_capture(Time(1), plan(8, 8, cuts()))
         .unwrap();
     assert_eq!(
-        bad_clone.finish_capture(Time(2), 9, 8),
+        bad_clone.finish_capture(Time(2), image(9, 8)),
         Err(JournalError::Capacity)
     );
     assert_eq!(bad_clone.state(), JournalState::Invalidated);
     assert_eq!(bad_clone.image_charge(), None);
+
+    let max = config().max_encoded_bytes.get();
+    for over in [plan(max + 1, 1, cuts()), plan(1, max + 1, cuts())] {
+        let mut over_budget = DonorJournal::new(config(), capture_id()).unwrap();
+        assert_eq!(
+            over_budget.begin_capture(Time(1), over),
+            Err(JournalError::Capacity)
+        );
+        assert_eq!(over_budget.state(), JournalState::Invalidated);
+    }
 }
 
 #[test]
@@ -479,13 +517,13 @@ fn a_sealed_renewal_continues_the_writer_into_its_next_life() {
         .append(Time(3), 2, native(2), b"seal".to_vec())
         .unwrap();
     let renewed = journal
-        .renew(Time(4), 2, &cut_at(1, 2), 5, b"noop".to_vec())
+        .renew(Time(4), 2, renewal(cut_at(1, 2), 5), b"noop".to_vec())
         .unwrap();
     assert_eq!(renewed.position, 3);
     assert_eq!(journal.covered_cuts(), [cut_at(5, 0)]);
     assert_eq!(journal.image_cuts(), [cut_at(1, 0)]);
     assert_eq!(
-        journal.renew(Time(4), 2, &cut_at(1, 2), 5, b"noop".to_vec()),
+        journal.renew(Time(4), 2, renewal(cut_at(1, 2), 5), b"noop".to_vec()),
         Ok(renewed)
     );
     let next = journal
@@ -513,7 +551,7 @@ fn a_move_into_another_life_that_is_not_a_sealed_renewal_withdraws_the_candidate
             .append(Time(3), 2, native(1), b"put".to_vec())
             .unwrap();
         assert_eq!(
-            journal.renew(Time(4), 2, &sealed, epoch, b"noop".to_vec()),
+            journal.renew(Time(4), 2, renewal(sealed.clone(), epoch), b"noop".to_vec()),
             Err(JournalError::Conflict),
             "{sealed:?} into {epoch}"
         );
@@ -817,10 +855,13 @@ fn locked_capture_and_mutation_put_effect_in_image_or_contiguous_suffix() {
                 let mut model = shared.lock().unwrap();
                 model
                     .journal
-                    .begin_capture(Time(1), 64, 64, members(), cuts())
+                    .begin_capture(Time(1), plan(64, 64, cuts()))
                     .unwrap();
                 model.image = Some(model.index.clone());
-                model.journal.finish_capture(Time(1), 16, 16).unwrap();
+                model
+                    .journal
+                    .finish_capture(Time(1), image(16, 16))
+                    .unwrap();
             })
         };
         let mutation = {

@@ -4,6 +4,8 @@
 //! application receipts. It deliberately does not use sockets or the existing
 //! membership simulation: these are replay-session protocol properties.
 
+use std::num::NonZeroUsize;
+
 use groupnet_core::Time;
 use groupnet_core::replication::{
     ApplyReceipt, Batch, BoundComparison, Comparison, Config, Coverage, Cursor, Effect, Event,
@@ -80,8 +82,8 @@ fn batch(id: usize, from: u8, through: u8, head: u8) -> Batch {
             certificate: vec![1],
         },
         payload_id: u64::from(through),
-        events: usize::from(through - from),
-        bytes: 16 * usize::from(through - from),
+        events: NonZeroUsize::new(usize::from(through - from)).expect("a batch advances"),
+        bytes: NonZeroUsize::new(16 * usize::from(through - from)).expect("a batch advances"),
         advance: cmp(&p, cursor(id, from), cursor(id, through)),
         end_to_head: cmp(&p, cursor(id, through), p.head.clone()),
     }

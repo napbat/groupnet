@@ -1,5 +1,6 @@
 //! One worker's bounded native snapshot I/O; the core chooses every phase.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -260,11 +261,16 @@ where
         )
         .await;
         self.tick();
-        match result {
-            Ok(Ok(bytes))
-                if self.engine.accepts_operation(op) && !bytes.is_empty() && bytes.len() <= max =>
-            {
-                let len = bytes.len();
+        let accepted = match result {
+            Ok(Ok(bytes)) if self.engine.accepts_operation(op) && bytes.len() <= max => {
+                NonZeroUsize::new(bytes.len()).map(|len| (len, bytes))
+            }
+            Ok(Ok(_)) => None,
+            Ok(Err(class)) => return self.snapshot_failure(op, class),
+            Err(_) => return self.step(Event::Failed { op }),
+        };
+        match accepted {
+            Some((len, bytes)) => {
                 self.snapshot_chunk = Some((offset, bytes, quota, global));
                 self.step(Event::SnapshotRead {
                     op,
@@ -279,9 +285,7 @@ where
                     self.snapshot_chunk = None;
                 }
             }
-            Ok(Ok(_)) => self.stop(FailureClass::Terminal),
-            Ok(Err(class)) => self.snapshot_failure(op, class),
-            Err(_) => self.step(Event::Failed { op }),
+            None => self.stop(FailureClass::Terminal),
         }
     }
 
@@ -292,7 +296,7 @@ where
         let Some((offset, bytes, _quota, _global)) = self.snapshot_chunk.take() else {
             return self.stop(FailureClass::Terminal);
         };
-        if offset != chunk.offset || bytes.len() != chunk.bytes {
+        if offset != chunk.offset || bytes.len() != chunk.bytes.get() {
             return self.stop(FailureClass::Terminal);
         }
         let Some(_operation) = Self::snapshot_op_permits(&self.manager, deadline).await else {
@@ -312,7 +316,7 @@ where
                 self.step(Event::SnapshotWritten {
                     op,
                     index: chunk.index,
-                    through: offset + chunk.bytes as u64,
+                    through: offset + chunk.bytes.get() as u64,
                     charged_bytes: charged as u64,
                 });
             }
@@ -477,6 +481,12 @@ where
         {
             Ok(value) => value,
             Err(error) => return self.snapshot_failure(op, error.class()),
+        };
+        // An empty batch is no progress and breaks the source contract; the
+        // core cannot represent one.
+        let (Some(events), Some(bytes)) = (NonZeroUsize::new(events), NonZeroUsize::new(bytes))
+        else {
+            return self.stop(FailureClass::Terminal);
         };
         self.payloads.insert(
             op.token,

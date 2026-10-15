@@ -1,5 +1,7 @@
 //! Typed donor replies; private image bytes remain opaque to Groupnet.
 
+use std::num::NonZeroUsize;
+
 use groupnet_core::volatile_bootstrap::journal::{
     AttachToken, BarrierReceipt, DeltaIdentity, JournalBatch, JournalDelta, NativeCut,
     ReservationId,
@@ -142,9 +144,6 @@ fn valid_offer(offer: &TransferOffer, correlation: &Correlation) -> bool {
         && offer.image_cut.capture == offer.capture
         && offer.image_cut.position == 0
         && offer.schema != 0
-        && offer.encoded_bytes != 0
-        && offer.decoded_bytes != 0
-        && offer.chunks != 0
 }
 
 fn valid_reservation(value: &ReservationId, correlation: &Correlation) -> bool {
@@ -197,12 +196,17 @@ fn write_offer(
     writer.capture(&offer.capture, limits)?;
     writer.cursor(&offer.image_cut, limits)?;
     writer.put(&offer.schema.to_be_bytes())?;
-    writer.number(offer.encoded_bytes)?;
-    writer.number(offer.decoded_bytes)?;
-    writer.number(offer.chunks)?;
+    writer.number(offer.encoded_bytes.get())?;
+    writer.number(offer.decoded_bytes.get())?;
+    writer.number(offer.chunks.get())?;
     writer.put(&offer.commitment)?;
     write_members(writer, &offer.members, limits)?;
     write_cuts(writer, &offer.cuts, limits)
+}
+
+/// An offer count the protocol requires to be positive; zero is invalid input.
+fn read_positive_size(reader: &mut Reader<'_>) -> Result<NonZeroUsize, WireError> {
+    NonZeroUsize::new(read_size(reader)?).ok_or(WireError::Invalid)
 }
 
 fn read_offer(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<TransferOffer, WireError> {
@@ -210,9 +214,9 @@ fn read_offer(reader: &mut Reader<'_>, limits: PhaseLimits) -> Result<TransferOf
         capture: read_capture(reader, limits)?,
         image_cut: read_cursor(reader, limits)?,
         schema: u32::from_be_bytes(reader.number()?),
-        encoded_bytes: read_size(reader)?,
-        decoded_bytes: read_size(reader)?,
-        chunks: read_size(reader)?,
+        encoded_bytes: read_positive_size(reader)?,
+        decoded_bytes: read_positive_size(reader)?,
+        chunks: read_positive_size(reader)?,
         commitment: reader.number()?,
         members: read_members(reader, limits)?,
         cuts: read_cuts(reader, limits)?,
@@ -571,9 +575,9 @@ mod tests {
                 position: 0,
             },
             schema: 1,
-            encoded_bytes: 3,
-            decoded_bytes: 3,
-            chunks: 1,
+            encoded_bytes: NonZeroUsize::new(3).unwrap(),
+            decoded_bytes: NonZeroUsize::new(3).unwrap(),
+            chunks: NonZeroUsize::MIN,
             commitment: [7; 32],
             members: barrier.members.clone(),
             cuts: barrier.covered_cuts.clone(),
@@ -648,6 +652,60 @@ mod tests {
         for (kind, reply, expected) in replies {
             let frame = encode_reply(&reply, correlation.clone(), kind, limits()).unwrap();
             assert_eq!(decode_reply(&frame, limits()).unwrap(), expected);
+        }
+    }
+
+    /// The offer's sizes and chunk count are positive by type, so the decoder
+    /// fails closed on a peer frame that carries zero in any of them.
+    #[test]
+    fn an_offer_frame_with_a_zero_count_does_not_decode() {
+        let (correlation, capture, _reservation, barrier) = fixture();
+        let offer = |encoded: usize, decoded: usize, chunks: usize| TransferOffer {
+            capture: capture.clone(),
+            image_cut: JournalCursor {
+                capture: capture.clone(),
+                position: 0,
+            },
+            schema: 1,
+            encoded_bytes: NonZeroUsize::new(encoded).unwrap(),
+            decoded_bytes: NonZeroUsize::new(decoded).unwrap(),
+            chunks: NonZeroUsize::new(chunks).unwrap(),
+            commitment: [7; 32],
+            members: barrier.members.clone(),
+            cuts: barrier.covered_cuts.clone(),
+        };
+        let frame = |offer: TransferOffer| {
+            encode_reply(
+                &DonorReply::Offer(admitted(offer)),
+                correlation.clone(),
+                ExchangeKind::Offer,
+                limits(),
+            )
+            .unwrap()
+        };
+        let body = |frame: &Envelope| match &frame.message {
+            Message::Reply(bytes) => bytes.clone(),
+            other => panic!("not a reply: {other:?}"),
+        };
+        let valid = frame(offer(3, 3, 1));
+        let base = body(&valid);
+        assert!(decode_reply(&valid, limits()).is_ok());
+        // Each count is a big-endian u64 holding 3, 3 or 1; the one byte that
+        // changes with it is its low byte, which zeroing makes the count zero.
+        for changed in [offer(2, 3, 1), offer(3, 2, 1), offer(3, 3, 2)] {
+            let other = body(&frame(changed));
+            let at = base
+                .iter()
+                .zip(&other)
+                .position(|(left, right)| left != right)
+                .expect("the count is encoded");
+            let mut zeroed = base.clone();
+            zeroed[at] = 0;
+            let zero = Envelope {
+                message: Message::Reply(zeroed),
+                ..valid.clone()
+            };
+            assert_eq!(decode_reply(&zero, limits()), Err(WireError::Invalid));
         }
     }
 

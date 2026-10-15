@@ -126,14 +126,14 @@ impl RecaptureState {
                 )
                 .map_err(fenced)?;
                 journal
-                    .begin_capture(request.clock.now(), 1, 1, request.members, Vec::new())
+                    .begin_capture(request.clock.now(), unit_capture(request.members))
                     .map_err(fenced)?;
                 self.captures.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, AdapterError>(journal)
             })
             .ok_or(AdapterErrorKind::Fenced)??;
         journal
-            .finish_capture(request.clock.now(), 1, 1)
+            .finish_capture(request.clock.now(), UNIT_IMAGE)
             .map_err(fenced)?;
         let ingress = JournalIngress::new(journal, suffix, request.wake)?;
         DonorCapture::new(vec![42], ingress, encoded, decoded)

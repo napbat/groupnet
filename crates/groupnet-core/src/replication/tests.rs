@@ -98,8 +98,8 @@ fn batch(p: &SourceProof, from: u8, through: u8) -> Batch {
             certificate: vec![1],
         },
         payload_id: 9,
-        events: usize::from(through - from),
-        bytes: 32,
+        events: NonZeroUsize::new(usize::from(through - from)).expect("a batch advances"),
+        bytes: NonZeroUsize::new(32).unwrap(),
         advance: relation(p, from, through),
         end_to_head: relation(p, through, p.head.position[0]),
     }

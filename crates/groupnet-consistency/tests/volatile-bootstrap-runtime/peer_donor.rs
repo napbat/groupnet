@@ -20,7 +20,7 @@ pub(super) struct PeerDonor {
 
 impl PeerDonor {
     pub(super) fn new(peer: &ClaimIdentity, follower: &ClaimIdentity) -> Self {
-        Self::paced(peer, follower, 1, 0)
+        Self::paced(peer, follower, NonZeroUsize::MIN, 0)
     }
 
     /// A donor whose image is `chunks` one-byte chunks, each served after
@@ -28,7 +28,7 @@ impl PeerDonor {
     pub(super) fn paced(
         peer: &ClaimIdentity,
         follower: &ClaimIdentity,
-        chunks: usize,
+        chunks: NonZeroUsize,
         chunk_ms: u64,
     ) -> Self {
         let scope = BootstrapScope {
@@ -51,9 +51,9 @@ impl PeerDonor {
         .unwrap();
         let members = vec![member_from_claim(follower), member_from_claim(peer)];
         journal
-            .begin_capture(Time(0), 1, 1, members.clone(), Vec::new())
+            .begin_capture(Time(0), unit_capture(members.clone()))
             .unwrap();
-        let image_cut = journal.finish_capture(Time(0), 1, 1).unwrap();
+        let image_cut = journal.finish_capture(Time(0), UNIT_IMAGE).unwrap();
         let offer = TransferOffer {
             capture: image_cut.capture.clone(),
             image_cut,
@@ -147,8 +147,8 @@ impl DonorPort for PeerDonor {
                 decoded_bytes,
                 ..
             } => {
-                let encoded = admission.reserve(AdmissionClass::Encoded, encoded_bytes)?;
-                let decoded = admission.reserve(AdmissionClass::Decoded, decoded_bytes)?;
+                let encoded = admission.reserve(AdmissionClass::Encoded, encoded_bytes.get())?;
+                let decoded = admission.reserve(AdmissionClass::Decoded, decoded_bytes.get())?;
                 resources.stage = Some(StageResources::new(Vec::new(), encoded, decoded)?);
                 Self::admitted(admission, TransferEvent::StageReserved { op })
             }
@@ -165,7 +165,7 @@ impl DonorPort for PeerDonor {
                 Self::admitted(admission, TransferEvent::DonorReserved { op, reservation })
             }
             TransferEffect::FetchChunk { op, sequence, .. } => {
-                if sequence >= self.offer.chunks {
+                if sequence >= self.offer.chunks.get() {
                     return Err(INVALID);
                 }
                 tokio::time::sleep(Duration::from_millis(self.chunk_ms)).await;
@@ -176,7 +176,7 @@ impl DonorPort for PeerDonor {
                     TransferEvent::ChunkStored {
                         op,
                         sequence,
-                        bytes: 1,
+                        bytes: NonZeroUsize::MIN,
                         decoded_charge: 1,
                     },
                 )
@@ -184,7 +184,7 @@ impl DonorPort for PeerDonor {
             TransferEffect::VerifyImage { op, commitment } => {
                 if commitment != [9; 32]
                     || resources.stage.as_mut().is_none_or(|stage| {
-                        stage.stage_mut().as_slice() != vec![42; self.offer.chunks].as_slice()
+                        stage.stage_mut().as_slice() != vec![42; self.offer.chunks.get()].as_slice()
                     })
                 {
                     return Err(AdapterErrorKind::Malformed.into());

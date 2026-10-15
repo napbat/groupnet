@@ -283,17 +283,12 @@ fn reboot(
         Durability::Blackout => {
             GroupEngine::new(topo.group.clone(), node.clone(), seeds, config).expect("valid config")
         }
-        Durability::Recovered => GroupEngine::with_recovered(
-            topo.group.clone(),
-            node.clone(),
-            seeds,
-            config,
-            match recovered {
+        Durability::Recovered => GroupEngine::new(topo.group.clone(), node.clone(), seeds, config)
+            .expect("valid config")
+            .with_recovered(match recovered {
                 None => RecoveredGrant::none(),
                 Some((epoch, claimant)) => RecoveredGrant::granted(epoch, claimant),
-            },
-        )
-        .expect("valid config"),
+            }),
     }
 }
 

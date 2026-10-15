@@ -420,8 +420,9 @@ impl Harness {
         };
         let seeds: Vec<NodeId> = self.all.iter().filter(|x| *x != id).cloned().collect();
         let (group, cfg) = (self.group.clone(), cfg(&self.voters));
-        let engine = GroupEngine::with_recovered(group, id.clone(), seeds, cfg, recovered)
-            .expect("valid config");
+        let engine = GroupEngine::new(group, id.clone(), seeds, cfg)
+            .expect("valid config")
+            .with_recovered(recovered);
         self.sim.add(engine).expect("distinct node");
         let applied = self.store.get(id).cloned().unwrap_or_default();
         self.reborn.insert(id.clone());

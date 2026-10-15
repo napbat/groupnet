@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -307,6 +307,11 @@ impl SnapshotSourceAdapter for Source {
             (log.head, log.rows.clone())
         };
         let bytes = encode(&rows);
+        let empty = || AdapterFailure::Terminal(io::Error::other("an empty image cannot install"));
+        let total_bytes = NonZeroU64::new(bytes.len() as u64).ok_or_else(empty)?;
+        let chunks =
+            u32::try_from(bytes.len().div_ceil(limit.max_chunk_bytes.get())).expect("small image");
+        let chunks = NonZeroU32::new(chunks).ok_or_else(empty)?;
         let proof = self.proof(&scope);
         let cut_cursor = cursor(&scope, cut);
         let offer = SnapshotOffer {
@@ -316,9 +321,8 @@ impl SnapshotSourceAdapter for Source {
             cut_to_head: self.compare(&cut_cursor, &proof.head, &proof)?,
             retained_to_cut: self.compare(&proof.retained_from, &cut_cursor, &proof)?,
             proof,
-            total_bytes: bytes.len() as u64,
-            chunks: u32::try_from(bytes.len().div_ceil(limit.max_chunk_bytes.get()))
-                .expect("small image"),
+            total_bytes,
+            chunks,
             digest: digest(&bytes),
             certificate: vec![1],
         };

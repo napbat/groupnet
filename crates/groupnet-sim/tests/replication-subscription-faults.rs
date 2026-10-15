@@ -1,7 +1,7 @@
 //! Queued virtual-time faults for a durable named event subscriber.
 
 use std::collections::HashMap;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use groupnet_core::Time;
 use groupnet_core::replication::{
@@ -443,8 +443,8 @@ impl Model {
                             certificate: vec![8],
                         },
                         payload_id: op.token,
-                        events: 1,
-                        bytes: 8,
+                        events: NonZeroUsize::MIN,
+                        bytes: NonZeroUsize::new(8).unwrap(),
                         advance: comparison(1, 2),
                         end_to_head: comparison(2, 2),
                     }),

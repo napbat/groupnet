@@ -5,8 +5,8 @@ use super::{
     BootstrapScope, BootstrapSession, ByteAdmission, CaptureId, ClaimIdentity, Claims,
     DonorCapture, DonorJournal, DonorPort, DonorRequest, Duration, JournalIngress, Mutex, NodeId,
     Notify, Ordering, OriginDonor, PeerDonor, ReadAdapter, RecoveryConfig, RecoveryHandle,
-    RecoveryMode, RecoveryRearm, SETTLE, Time, admission, bootstrap_config, eventually_within,
-    journal_config, member_from_claim,
+    RecoveryMode, RecoveryRearm, SETTLE, Time, UNIT_IMAGE, admission, bootstrap_config,
+    eventually_within, journal_config, member_from_claim, unit_capture,
 };
 use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::volatile_recovery::bootstrap::PresenceIdentity;
@@ -30,9 +30,9 @@ fn captured_for_cleanup(
     )
     .unwrap();
     journal
-        .begin_capture(Time(0), 1, 1, vec![member_from_claim(selected)], Vec::new())
+        .begin_capture(Time(0), unit_capture(vec![member_from_claim(selected)]))
         .unwrap();
-    journal.finish_capture(Time(0), 1, 1).unwrap();
+    journal.finish_capture(Time(0), UNIT_IMAGE).unwrap();
     let storage = DonorJournal::storage_bound(journal_config()).unwrap();
     let suffix = admission.reserve(AdmissionClass::Suffix, storage).unwrap();
     let ingress = JournalIngress::new(journal, suffix, Arc::new(Notify::new())).unwrap();
@@ -64,15 +64,9 @@ fn ingress_rejects_an_undercharged_whole_journal() {
     )
     .unwrap();
     journal
-        .begin_capture(
-            Time(0),
-            1,
-            1,
-            vec![member_from_claim(&selected)],
-            Vec::new(),
-        )
+        .begin_capture(Time(0), unit_capture(vec![member_from_claim(&selected)]))
         .unwrap();
-    journal.finish_capture(Time(0), 1, 1).unwrap();
+    journal.finish_capture(Time(0), UNIT_IMAGE).unwrap();
     let storage = DonorJournal::storage_bound(journal_config()).unwrap();
     let insufficient = admission
         .reserve(AdmissionClass::Suffix, storage - 1)

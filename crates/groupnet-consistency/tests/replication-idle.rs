@@ -1,4 +1,5 @@
-//! Optional idle polling over the real async shell and an in-memory source.
+//! Optional idle polling over the real async shell and an in-memory source,
+//! and the shell's refusal of a source batch that covers nothing.
 
 #![cfg(feature = "replication")]
 
@@ -11,9 +12,9 @@ use std::time::{Duration, Instant};
 use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::replication::{
     AdapterFailure, ApplicationAdapter, BoundComparison, CatchUp, Checkpoint, CheckpointLimit,
-    Comparison, Cursor, IdlePolicy, InstallPermit, Limits, Materialized, ProofId, ReadVerdict,
-    Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch, SourceHistory,
-    SourceProof, Stage, Stream, TailLimit,
+    Comparison, Cursor, FailureClass, IdlePolicy, InstallPermit, Limits, Materialized, ProofId,
+    ReadVerdict, Replication, RevocationPermit, ScanLimit, Scope, SourceAdapter, SourceBatch,
+    SourceHistory, SourceProof, Stage, Stream, TailLimit,
 };
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use tokio::sync::Notify;
@@ -55,6 +56,8 @@ struct Source {
     calls: Arc<Mutex<Vec<Instant>>>,
     hold: Arc<AtomicBool>,
     release: Arc<Notify>,
+    /// Report every scanned batch as covering zero events and bytes.
+    empty: Arc<AtomicBool>,
 }
 
 impl Source {
@@ -130,7 +133,10 @@ impl SourceAdapter for Source {
         limit: ScanLimit,
     ) -> Result<SourceBatch<u64, u64>, AdapterFailure<io::Error>> {
         let through = position(&proof.head)?.min(from.saturating_add(limit.events as u64));
-        let events = usize::try_from(through - from).expect("bounded by scan limit");
+        let mut events = usize::try_from(through - from).expect("bounded by scan limit");
+        if self.empty.load(Ordering::Acquire) {
+            events = 0;
+        }
         Ok(SourceBatch {
             from,
             through,
@@ -232,6 +238,39 @@ fn limits() -> Limits {
         jitter_ms: 0,
     });
     limits
+}
+
+/// The core's replay batch counts are nonzero by type, so a source batch that
+/// reports zero events and bytes breaks the adapter contract: the shell fails
+/// the scope terminally instead of handing it to the engine.
+#[tokio::test]
+async fn an_empty_source_batch_fails_the_scope_terminally() {
+    let cluster = MemCluster::builder(&["empty-reader"])
+        .group("stores")
+        .spawn()
+        .await;
+    let source = Source::default();
+    source.empty.store(true, Ordering::Release);
+    source.head.store(2, Ordering::Release);
+    let manager = Replication::new(
+        cluster.groups[0].clone(),
+        source.clone(),
+        App::default(),
+        limits(),
+    )
+    .expect("valid limits");
+    let handle = manager
+        .open(scope(), NonZeroU64::new(1).expect("nonzero"))
+        .expect("open");
+    handle.set_authority(true).expect("authority");
+    assert_eq!(
+        handle.catch_up(2, Instant::now() + SETTLE).await,
+        CatchUp::Failed(FailureClass::Terminal)
+    );
+    assert_eq!(
+        handle.status().expect("status").failure,
+        Some(FailureClass::Terminal)
+    );
 }
 
 #[tokio::test]

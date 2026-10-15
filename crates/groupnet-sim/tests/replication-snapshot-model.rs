@@ -1,6 +1,7 @@
 //! Source/model-driven snapshot schedules with commits during cutover.
 
 use std::collections::VecDeque;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use groupnet_core::Time;
 use groupnet_core::replication::{
@@ -189,8 +190,8 @@ fn seeded_source_model_keeps_delete_and_every_commit_through_attach() {
                             proof: p.clone(),
                             cut_to_head: cmp(&p, cut, cut),
                             retained_to_cut: cmp(&p, 1, cut),
-                            total_bytes: 1,
-                            chunks: 1,
+                            total_bytes: NonZeroU64::MIN,
+                            chunks: NonZeroU32::MIN,
                             digest: vec![1],
                             certificate: vec![1],
                         }),
@@ -215,7 +216,7 @@ fn seeded_source_model_keeps_delete_and_every_commit_through_attach() {
                         chunk: ChunkReceipt {
                             index,
                             offset,
-                            bytes: 1,
+                            bytes: NonZeroUsize::MIN,
                             payload_id: op.token,
                         },
                     })
@@ -265,8 +266,8 @@ fn seeded_source_model_keeps_delete_and_every_commit_through_attach() {
                                 certificate: vec![1],
                             },
                             payload_id: op.token,
-                            events: count,
-                            bytes: count,
+                            events: NonZeroUsize::new(count).expect("scanned behind the barrier"),
+                            bytes: NonZeroUsize::new(count).expect("scanned behind the barrier"),
                             advance: cmp(&p, from.position[0], head),
                             end_to_head: cmp(&p, head, head),
                         }),
@@ -350,8 +351,8 @@ fn seeded_source_model_keeps_delete_and_every_commit_through_attach() {
                                 certificate: vec![1],
                             },
                             payload_id: op.token,
-                            events: count,
-                            bytes: count,
+                            events: NonZeroUsize::new(count).expect("scanned behind the tail"),
+                            bytes: NonZeroUsize::new(count).expect("scanned behind the tail"),
                             advance: cmp(&p, from.position[0], head),
                             end_to_head: cmp(&p, head, head),
                         }),

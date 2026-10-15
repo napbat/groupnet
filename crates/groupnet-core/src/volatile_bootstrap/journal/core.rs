@@ -3,9 +3,9 @@
 mod followers;
 
 use super::types::{
-    BarrierReceipt, CaptureCharge, CaptureId, DeltaIdentity, Invalidation, JournalConfig,
-    JournalConfigError, JournalCursor, JournalDelta, JournalError, JournalState, NativeCut,
-    ReservationId, ReservationStage,
+    BarrierReceipt, CaptureCharge, CaptureId, CapturePlan, DeltaIdentity, ImageSize, Invalidation,
+    JournalConfig, JournalConfigError, JournalCursor, JournalDelta, JournalError, JournalState,
+    NativeCut, NativeRenewal, ReservationId, ReservationStage,
 };
 use crate::Time;
 use crate::volatile_bootstrap::{BootstrapMemberIdentity, same_membership};
@@ -493,19 +493,19 @@ impl DonorJournal {
     pub fn begin_capture(
         &mut self,
         now: Time,
-        planned_encoded: usize,
-        planned_decoded: usize,
-        members: Vec<BootstrapMemberIdentity>,
-        cuts: Vec<NativeCut>,
+        plan: CapturePlan,
     ) -> Result<CaptureCharge, JournalError> {
         self.advance(now)?;
         if self.state != JournalState::Uncaptured {
             return Err(JournalError::Stage);
         }
-        if planned_encoded == 0
-            || planned_decoded == 0
-            || planned_encoded > self.config.max_encoded_bytes.get()
-            || planned_decoded > self.config.max_decoded_bytes.get()
+        let CapturePlan {
+            image,
+            members,
+            cuts,
+        } = plan;
+        if image.encoded_bytes > self.config.max_encoded_bytes
+            || image.decoded_bytes > self.config.max_decoded_bytes
         {
             self.invalidate_inner(Invalidation::Capacity);
             return Err(JournalError::Capacity);
@@ -545,15 +545,14 @@ impl DonorJournal {
         };
         self.expires = Some(expires);
         self.capture_started = Some(now);
-        self.reserved_encoded = planned_encoded;
-        self.reserved_decoded = planned_decoded;
+        self.reserved_encoded = image.encoded_bytes.get();
+        self.reserved_decoded = image.decoded_bytes.get();
         self.members = members;
         self.image_cuts = image_cuts;
         self.cuts = cuts;
         self.state = JournalState::Capturing;
         Ok(CaptureCharge {
-            encoded_bytes: planned_encoded,
-            decoded_bytes: planned_decoded,
+            image,
             suffix_bytes: self.config.max_suffix_bytes.get(),
             started: now,
         })
@@ -566,24 +565,20 @@ impl DonorJournal {
     pub fn finish_capture(
         &mut self,
         now: Time,
-        actual_encoded: usize,
-        actual_decoded: usize,
+        actual: ImageSize,
     ) -> Result<JournalCursor, JournalError> {
         self.advance(now)?;
         if self.state != JournalState::Capturing {
             return Err(JournalError::Stage);
         }
-        if actual_encoded == 0
-            || actual_decoded == 0
-            || actual_encoded > self.reserved_encoded
-            || actual_decoded > self.reserved_decoded
+        if actual.encoded_bytes.get() > self.reserved_encoded
+            || actual.decoded_bytes.get() > self.reserved_decoded
         {
             self.invalidate_inner(Invalidation::Capacity);
             return Err(JournalError::Capacity);
         }
         self.charge = Some(CaptureCharge {
-            encoded_bytes: actual_encoded,
-            decoded_bytes: actual_decoded,
+            image: actual,
             suffix_bytes: self.config.max_suffix_bytes.get(),
             started: self.capture_started.ok_or(JournalError::Stage)?,
         });
@@ -647,11 +642,12 @@ impl DonorJournal {
         self.record(now, recovery_generation, identity, effect, None)
     }
 
-    /// Record that the native writer of `sealed` sealed its life exactly at
-    /// `sealed`, that the application applied that life through the seal,
-    /// and that the writer now continues in the newer `epoch`. `effect` is
-    /// the application's own no-op. The covered cut moves to `(epoch, 0)`
-    /// with no gap, and a follower replaying the suffix crosses with it.
+    /// Record that the native writer of `renewal.sealed` sealed its life
+    /// exactly there, that the application applied that life through the
+    /// seal, and that the writer now continues in the newer `renewal.epoch`.
+    /// `effect` is the application's own no-op. The covered cut moves to
+    /// `(epoch, 0)` with no gap, and a follower replaying the suffix crosses
+    /// with it.
     ///
     /// Only a feed that proved the seal may call this. Any other move into
     /// a newer epoch is a gap: [`Self::append`] of a native effect in another
@@ -665,18 +661,12 @@ impl DonorJournal {
         &mut self,
         now: Time,
         recovery_generation: u64,
-        sealed: &NativeCut,
-        epoch: u64,
+        renewal: NativeRenewal,
         effect: Vec<u8>,
     ) -> Result<JournalCursor, JournalError> {
-        let mut writer = Vec::new();
-        if writer.try_reserve_exact(sealed.writer.len()).is_err() {
-            self.invalidate_inner(Invalidation::Capacity);
-            return Err(JournalError::Capacity);
-        }
-        writer.extend_from_slice(&sealed.writer);
+        let NativeRenewal { sealed, epoch } = renewal;
         let identity = DeltaIdentity::Native(NativeCut {
-            writer,
+            writer: sealed.writer,
             epoch,
             sequence: 0,
         });

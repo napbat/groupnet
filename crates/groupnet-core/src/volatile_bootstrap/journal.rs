@@ -8,9 +8,9 @@ mod types;
 pub use core::DonorJournal;
 pub use cuts::{Alignment, CutAlignment, CutDifference, align_cuts};
 pub use types::{
-    AttachToken, BarrierReceipt, CaptureCharge, CaptureId, DeltaIdentity, Invalidation,
-    JournalBatch, JournalConfig, JournalConfigError, JournalCursor, JournalDelta, JournalError,
-    JournalState, NativeCut, ReservationId, ReservationStage,
+    AttachToken, BarrierReceipt, CaptureCharge, CaptureId, CapturePlan, DeltaIdentity, ImageSize,
+    Invalidation, JournalBatch, JournalConfig, JournalConfigError, JournalCursor, JournalDelta,
+    JournalError, JournalState, NativeCut, NativeRenewal, ReservationId, ReservationStage,
 };
 
 #[cfg(test)]

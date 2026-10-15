@@ -531,8 +531,8 @@ CP path.
   persistent-vote problem). Raft solves it by *requiring* a persisted vote;
   that is the one place this design deviates from the standard safety model,
   and the deviation must not be the default posture. The rule: **a driver
-  with durable storage persists the grant** (a recovered-state constructor,
-  `GroupEngine::with_recovered(...)`, restores it on boot — docres-shaped
+  with durable storage persists the grant** (a boot-time refinement,
+  `GroupEngine::new(..)?.with_recovered(grant)`, restores it — docres-shaped
   deployments always have a store); the **post-restart grant blackout** — a
   freshly booted voter refuses to grant for ≥ `lease_ms` — is the documented
   fallback for genuinely storage-free deployments, converting durability

@@ -126,7 +126,7 @@
 use std::collections::BTreeSet;
 
 use crate::config::{Activation, VoterRoster};
-use crate::{Config, ConfigError, Effect, GroupEngine, GroupId, NodeId, Time, wire};
+use crate::{Effect, GroupEngine, NodeId, Time, wire};
 
 use super::{Election, Role};
 
@@ -312,32 +312,24 @@ impl Election {
 }
 
 impl GroupEngine {
-    /// Builds an engine that **recovers a voter's persisted grant**, for a
-    /// driver that provides durability under
-    /// [`Activation::Quorum`](crate::Activation::Quorum).
+    /// Restores **a voter's persisted grant** into a freshly built engine, for
+    /// a driver that provides durability under
+    /// [`Activation::Quorum`](crate::Activation::Quorum):
+    /// `GroupEngine::new(group, local, seeds, config)?.with_recovered(grant)`.
     ///
-    /// Identical to [`new`](GroupEngine::new) in every other respect, and
-    /// identical to it *outright* unless the group's activation is `Quorum` —
-    /// a `Settle` or [`Eventual`](crate::GroupMode::Eventual) group has no
-    /// voter ledger, so `recovered` is ignored rather than half-applied.
+    /// Apply it before [`start`](GroupEngine::start), to the engine
+    /// [`new`](GroupEngine::new) returned, with exactly what the store holds,
+    /// so the ledger is a floor from the first tick. Unless the group's
+    /// activation is `Quorum` the engine is returned unchanged — a `Settle` or
+    /// [`Eventual`](crate::GroupMode::Eventual) group has no voter ledger, so
+    /// `recovered` is ignored rather than half-applied.
     ///
     /// See [`RecoveredGrant`] for the contract, and in particular for why
     /// recovery restores the granted **pair** and not the instant it was
     /// granted at.
-    ///
-    /// # Errors
-    ///
-    /// The [`ConfigError`] from [`Config::validate`] when `config` breaks one of
-    /// its rules, exactly as [`new`](GroupEngine::new) reports it.
-    pub fn with_recovered(
-        group: GroupId,
-        local: NodeId,
-        seeds: impl IntoIterator<Item = NodeId>,
-        config: Config,
-        recovered: RecoveredGrant,
-    ) -> Result<Self, ConfigError> {
-        let mut engine = Self::new(group, local, seeds, config)?;
-        if let Some(q) = engine.quorum_mut() {
+    #[must_use]
+    pub fn with_recovered(mut self, recovered: RecoveredGrant) -> Self {
+        if let Some(q) = self.quorum_mut() {
             match recovered.0 {
                 // Attested never-granted: nothing to restore, and the boot
                 // blackout is what durability was standing in for.
@@ -346,7 +338,7 @@ impl GroupEngine {
                 Some(pair) => q.granted = Some(pair),
             }
         }
-        Ok(engine)
+        self
     }
 
     /// The `(epoch, claimant)` pair this node has granted as a voter, if any.

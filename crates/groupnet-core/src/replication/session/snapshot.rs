@@ -157,14 +157,12 @@ impl SessionEngine {
             || offer
                 .charged_metadata_bytes()
                 .is_none_or(|n| n > limit.max_metadata_bytes.get())
-            || offer.total_bytes > limit.max_snapshot_bytes.get()
-            || offer.chunks > limit.max_chunks.get()
-            || offer.total_bytes == 0
-            || offer.chunks == 0
-            || offer.total_bytes < u64::from(offer.chunks)
-            || u64::from(offer.chunks)
+            || offer.total_bytes > limit.max_snapshot_bytes
+            || offer.chunks > limit.max_chunks
+            || offer.total_bytes.get() < u64::from(offer.chunks.get())
+            || u64::from(offer.chunks.get())
                 .checked_mul(limit.max_chunk_bytes.get() as u64)
-                .is_none_or(|capacity| offer.total_bytes > capacity)
+                .is_none_or(|capacity| offer.total_bytes.get() > capacity)
         {
             return Step::reject(Reject::Backpressure);
         }
@@ -220,8 +218,8 @@ impl SessionEngine {
         let Some(offer) = progress.offer.as_ref() else {
             return Step::reject(Reject::Stage);
         };
-        if progress.next_index == offer.chunks {
-            if progress.next_offset != offer.total_bytes {
+        if progress.next_index == offer.chunks.get() {
+            if progress.next_offset != offer.total_bytes.get() {
                 return Step::reject(Reject::Discontinuity);
             }
             let digest = offer.digest.clone();
@@ -231,7 +229,7 @@ impl SessionEngine {
         }
         let index = progress.next_index;
         let offset = progress.next_offset;
-        let remaining = offer.total_bytes - offset;
+        let remaining = offer.total_bytes.get() - offset;
         let max_bytes = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
             .min(self.snapshot_limits().max_chunk_bytes.get());
@@ -258,12 +256,11 @@ impl SessionEngine {
         if chunk.index != progress.next_index
             || chunk.offset != progress.next_offset
             || chunk.payload_id != op.token
-            || chunk.bytes == 0
-            || chunk.bytes > self.snapshot_limits().max_chunk_bytes.get()
+            || chunk.bytes > self.snapshot_limits().max_chunk_bytes
             || chunk
                 .offset
-                .checked_add(chunk.bytes as u64)
-                .is_none_or(|end| end > offer.total_bytes)
+                .checked_add(chunk.bytes.get() as u64)
+                .is_none_or(|end| end > offer.total_bytes.get())
         {
             return Step::reject(Reject::Discontinuity);
         }
@@ -294,8 +291,8 @@ impl SessionEngine {
             return Step::reject(Reject::Stage);
         };
         if index != progress.next_index
-            || through != chunk.offset + chunk.bytes as u64
-            || through > offer.total_bytes
+            || through != chunk.offset + chunk.bytes.get() as u64
+            || through > offer.total_bytes.get()
             || charged_bytes > max_candidate_bytes
         {
             return Step::reject(Reject::Discontinuity);
@@ -406,10 +403,8 @@ impl SessionEngine {
             || batch.coverage.proof != proof.id
             || batch.coverage.certificate.is_empty()
             || batch.coverage.certificate.len() > self.config.max_cursor_bytes.get()
-            || batch.events == 0
-            || batch.events > self.config.max_batch_events.get()
-            || batch.bytes == 0
-            || batch.bytes > self.config.max_batch_bytes.get()
+            || batch.events > self.config.max_batch_events
+            || batch.bytes > self.config.max_batch_bytes
             || batch
                 .advance
                 .for_operands(from, &batch.coverage.through, &proof.id)

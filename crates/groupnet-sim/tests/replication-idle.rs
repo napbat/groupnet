@@ -1,6 +1,7 @@
 //! Seeded missed-hint idle schedules driven only by core-emitted timers.
 
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 use groupnet_core::Time;
 use groupnet_core::replication::{
@@ -77,8 +78,8 @@ fn batch(op: Operation) -> Batch {
             certificate: vec![1],
         },
         payload_id: op.token,
-        events: 1,
-        bytes: 1,
+        events: NonZeroUsize::MIN,
+        bytes: NonZeroUsize::MIN,
         advance: compare(&source, 1, 2),
         end_to_head: compare(&source, 2, 2),
     }
