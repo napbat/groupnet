@@ -223,9 +223,10 @@ impl NetworkBuilder {
     /// Nothing is constructed or bound when a policy is invalid.
     ///
     /// # Errors
-    /// Returns `InvalidInput` wrapping a [`RouterConfigError`](crate::RouterConfigError)
-    /// or [`TunnelConfigError`] before binding, and rejects an invalid local
-    /// identifier; propagates bind/initialization errors.
+    /// Returns `InvalidInput` wrapping a [`RouterConfigError`](crate::RouterConfigError),
+    /// [`TunnelConfigError`] or the local identifier's
+    /// [`NodeIdError`](crate::NodeIdError) before binding; propagates
+    /// bind/initialization errors.
     /// # Panics
     /// Requires a Tokio runtime. Propagates an earlier poisoned adapter lock.
     pub async fn bind(self, local: NodeId) -> io::Result<Network> {

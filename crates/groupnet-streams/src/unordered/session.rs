@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     io,
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
 
@@ -17,7 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    UnorderedConfig, UnorderedDelivery, aborted,
+    UnorderedConfig, UnorderedDelivery, UnorderedSendError, aborted,
     endpoint::Lease,
     wire::{self, Kind, RxCrypto, SessionId, TxCrypto, Window},
 };
@@ -40,7 +41,7 @@ pub(super) struct State {
     pub(super) id: SessionId,
     pub(super) delivery: UnorderedDelivery,
     pub(super) config: UnorderedConfig,
-    pub(super) max_payload: usize,
+    pub(super) max_payload: NonZeroUsize,
     pub(super) io: ProtocolIo,
     pub(super) cancel: CancellationToken,
     pub(super) endpoint_cancel: CancellationToken,
@@ -103,15 +104,18 @@ impl UnorderedSession {
     /// advancing it would evict an unresolved send from the peer's dedup window.
     ///
     /// # Errors
-    /// Returns payload/capacity errors, local route errors, cancellation or a finite deadline.
+    /// Returns `InvalidInput` wrapping [`UnorderedSendError::PayloadTooLarge`]
+    /// for a message above the session's negotiated bound; otherwise capacity
+    /// errors, local route errors, cancellation or a finite deadline.
     pub async fn send(&self, payload: Bytes) -> io::Result<()> {
         let state = &self.handle.state;
         state.ensure_open()?;
-        if payload.len() > state.max_payload {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unordered message too large",
-            ));
+        if payload.len() > state.max_payload.get() {
+            return Err(UnorderedSendError::PayloadTooLarge {
+                len: payload.len(),
+                max: state.max_payload,
+            }
+            .into());
         }
         let _slot = state.slots.clone().try_acquire_owned().map_err(|_| {
             io::Error::new(io::ErrorKind::WouldBlock, "unordered pending sends full")
@@ -208,7 +212,7 @@ pub(super) struct Parameters {
     pub(super) id: SessionId,
     pub(super) delivery: UnorderedDelivery,
     pub(super) config: UnorderedConfig,
-    pub(super) max_payload: usize,
+    pub(super) max_payload: NonZeroUsize,
     pub(super) io: ProtocolIo,
     pub(super) endpoint_cancel: CancellationToken,
     pub(super) lease: Lease,
@@ -302,7 +306,7 @@ impl State {
             .rx
             .lock()
             .map_err(|_| poisoned())?
-            .open(packet, self.max_payload)?;
+            .open(packet, self.max_payload.get())?;
         let mut reply = None;
         {
             let mut receive = self.receive.lock().map_err(|_| poisoned())?;

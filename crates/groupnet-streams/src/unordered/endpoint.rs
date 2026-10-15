@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     io,
+    num::NonZeroUsize,
     sync::{Arc, Mutex, Weak},
 };
 
@@ -407,7 +408,7 @@ async fn receive_control(
     let id = request.identity.session;
     let remote_max = payload_bound(request.max_payload)?;
     let inner = owner.upgrade().ok_or_else(aborted)?;
-    let maximum = remote_max.min(inner.config.max_payload.get()).min(
+    let maximum = remote_max.get().min(inner.config.max_payload.get()).min(
         inner
             .io
             .max_payload(&peer)
@@ -422,7 +423,7 @@ async fn receive_control(
         },
         status: 0,
     };
-    payload_bound(reply.request.max_payload)?;
+    let maximum = payload_bound(reply.request.max_payload)?;
     if !inner.config.allows(delivery) {
         reply.status = 1;
         drop(inner);
@@ -481,7 +482,7 @@ fn establish(
     peer: NodeId,
     id: SessionId,
     delivery: super::UnorderedDelivery,
-    max_payload: usize,
+    max_payload: NonZeroUsize,
     lease: Lease,
     control: &TunneledStream,
     request: &SetupRequest,
@@ -530,11 +531,9 @@ fn request(
     })
 }
 
-fn payload_bound(bound: U32) -> io::Result<usize> {
-    if bound.get() == 0 {
-        return Err(invalid("invalid payload bound"));
-    }
-    usize::try_from(bound.get()).map_err(|_| invalid("payload bound overflow"))
+fn payload_bound(bound: U32) -> io::Result<NonZeroUsize> {
+    let bound = usize::try_from(bound.get()).map_err(|_| invalid("payload bound overflow"))?;
+    NonZeroUsize::new(bound).ok_or_else(|| invalid("invalid payload bound"))
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -561,7 +560,7 @@ mod tests {
         assert_eq!(request.identity.as_bytes().len(), 25);
         let decoded = SetupRequest::read_from_bytes(request.as_bytes()).unwrap();
         assert_eq!(decoded.identity, request.identity);
-        assert_eq!(payload_bound(decoded.max_payload).unwrap(), 96 * 1024);
+        assert_eq!(payload_bound(decoded.max_payload).unwrap().get(), 96 * 1024);
         let reply = SetupReply { request, status: 1 };
         let decoded = SetupReply::read_from_bytes(reply.as_bytes()).unwrap();
         assert_eq!(decoded.status, 1);

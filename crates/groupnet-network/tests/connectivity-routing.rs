@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use groupnet_core::NodeId;
-use groupnet_network::{Router, RouterConfig};
+use groupnet_network::{RoutedSendError, Router, RouterConfig};
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::Transport;
 use groupnet_transport::admission::OpenAdmission;
@@ -102,10 +102,14 @@ async fn memory_only_peer_crosses_tcp_direct_and_relay_edges_and_withdraws_depar
     for policy in [PathPolicy::DirectPreferred, PathPolicy::RelayOnly] {
         let (relay, a, b, c) = topology(policy).await;
         let mut payload: Vec<u8> = (0..=255).cycle().take(64_975).collect();
-        assert_eq!(
-            a.send(c.local_id(), &payload).await.unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
+        let error = a.send(c.local_id(), &payload).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<RoutedSendError>()),
+            Some(RoutedSendError::PayloadTooLarge { .. })
+        ));
         payload.pop();
         exchange(&a, &c, &payload).await;
         c.close().await;

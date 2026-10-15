@@ -18,7 +18,8 @@
 //! and shutdown belong to the engine owner ([`Messaging::recv`],
 //! [`Messaging::shutdown`]): a managed runtime keeps them for its dispatcher.
 //! The network and transport types this crate's signatures take ([`Router`],
-//! [`ProtocolIo`], [`ProtocolId`], [`QueueCapacity`]) are re-exported here.
+//! [`ProtocolIo`], [`ProtocolId`], [`QueueCapacity`], and the [`NodeIdError`]
+//! that [`SendValidationError::Destination`] carries) are re-exported here.
 
 mod codec;
 mod config;
@@ -33,7 +34,7 @@ mod tests;
 
 use groupnet_core::{GroupId, NodeId};
 pub use groupnet_network::{ProtocolId, ProtocolIo, Router};
-pub use groupnet_transport::QueueCapacity;
+pub use groupnet_transport::{NodeIdError, QueueCapacity};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::HashMap,
@@ -51,7 +52,7 @@ pub use bytes::Bytes;
 pub use codec::{
     DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, DataPacket,
     DecodeError, Delivery, EncodeError, MessageId, Outcome, Packet, ReceiptState, Rejection, ack,
-    completes, data, decode, destination_valid,
+    completes, data, decode, validate_destination,
 };
 
 /// Static-dispatch application message sends with protocol-specific receipts.
@@ -441,7 +442,8 @@ impl Messaging {
 
     /// Creates a messaging implementation on its pre-bound namespace.
     /// # Errors
-    /// Rejects a wrong namespace, unavailable executor or OS randomness.
+    /// Returns `InvalidInput` wrapping a [`MessagingBindError`] for a wrong
+    /// namespace; rejects an unavailable executor or OS randomness.
     pub fn from_io(io: ProtocolIo) -> io::Result<Self> {
         Self::from_io_with_config(io, MessagingConfig::default())
     }
@@ -449,15 +451,18 @@ impl Messaging {
     /// Creates messaging on a pre-bound namespace with explicit endpoint bounds.
     ///
     /// # Errors
-    /// Rejects invalid bounds, wrong namespace, unavailable executor or randomness.
+    /// Returns `InvalidInput` wrapping a [`MessagingConfigError`] or a
+    /// [`MessagingBindError`] for a wrong namespace; rejects an unavailable
+    /// executor or randomness.
     pub fn from_io_with_config(io: ProtocolIo, config: MessagingConfig) -> io::Result<Self> {
         config.validate()?;
         tokio::runtime::Handle::try_current().map_err(|_| closed())?;
         if io.id() != Self::ID {
-            return Err(error(
-                io::ErrorKind::InvalidInput,
-                "wrong messaging namespace",
-            ));
+            return Err(MessagingBindError::WrongNamespace {
+                expected: Self::ID,
+                actual: io.id(),
+            }
+            .into());
         }
         let mut nonce = [0; 8];
         SystemRandom::new()
@@ -513,9 +518,10 @@ impl Messaging {
     /// Retries retain application identity but allocate fresh router packet IDs.
     /// Cancelling this future removes its bounded outstanding-send reservation.
     /// # Errors
-    /// Reports invalid input (`InvalidInput` wrapping a [`SendValidationError`]
-    /// or an [`EncodeError`]), local backpressure/no route, explicit rejection,
-    /// shutdown, or `TimedOut` (remote outcome unknown).
+    /// Reports invalid input (`InvalidInput` wrapping a [`SendValidationError`],
+    /// including [`Destination`](SendValidationError::Destination) for an
+    /// invalid destination, or an [`EncodeError`]), local backpressure/no
+    /// route, explicit rejection, shutdown, or `TimedOut` (remote outcome unknown).
     pub async fn send(
         &self,
         to: &NodeId,
@@ -524,12 +530,7 @@ impl Messaging {
         options: SendOptions,
     ) -> io::Result<MessageId> {
         let retry_horizon_ms = self.inner.config.retry_horizon_ms(options, payload.len())?;
-        if !codec::destination_valid(to) {
-            return Err(error(
-                io::ErrorKind::InvalidInput,
-                "invalid application destination",
-            ));
-        }
+        codec::validate_destination(to).map_err(SendValidationError::Destination)?;
         if self.inner.cancel.is_cancelled() {
             return Err(closed());
         }
@@ -651,6 +652,38 @@ impl MessageProtocol for Messaging {
         options: SendOptions,
     ) -> io::Result<MessageId> {
         Self::send(self, to, group, payload, options).await
+    }
+}
+
+/// A pre-bound [`ProtocolIo`] that [`Messaging::from_io`] cannot adopt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessagingBindError {
+    /// The endpoint is bound to another namespace than [`Messaging`]'s
+    /// [`MessageProtocol::ID`].
+    WrongNamespace {
+        /// The namespace messaging requires.
+        expected: ProtocolId,
+        /// The namespace the endpoint is bound to.
+        actual: ProtocolId,
+    },
+}
+
+impl std::fmt::Display for MessagingBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongNamespace { expected, actual } => write!(
+                f,
+                "messaging requires protocol namespace {expected}, not {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MessagingBindError {}
+
+impl From<MessagingBindError> for io::Error {
+    fn from(error: MessagingBindError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
     }
 }
 

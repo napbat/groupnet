@@ -5,6 +5,7 @@
 use std::{fmt, str::Utf8Error};
 
 use groupnet_core::{GroupId, NodeId};
+use groupnet_transport::NodeIdError;
 use zerocopy::byteorder::network_endian::U64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -531,9 +532,12 @@ pub(crate) fn encode_ack(id: MessageId, outcome: Outcome, mut append: impl FnMut
 }
 
 /// Validates a destination without imposing application authorization.
-#[must_use]
-pub fn destination_valid(node: &NodeId) -> bool {
-    !node.as_str().is_empty() && node.as_str().len() <= 255
+///
+/// # Errors
+/// Returns the [`NodeIdError`] for an empty identity or one longer than
+/// [`MAX_NODE_ID_BYTES`](groupnet_transport::MAX_NODE_ID_BYTES).
+pub fn validate_destination(node: &NodeId) -> Result<(), NodeIdError> {
+    groupnet_transport::validate_node_id(node, groupnet_transport::MAX_NODE_ID_BYTES)
 }
 
 #[cfg(test)]

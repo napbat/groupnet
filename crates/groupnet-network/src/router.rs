@@ -1,6 +1,7 @@
 //! Router lifecycle, typed links, path-vector learning, and packet forwarding.
 
 mod adapters;
+mod bounds;
 mod config;
 mod packet;
 mod pool;
@@ -8,6 +9,7 @@ mod protocol;
 mod replay;
 mod routing;
 
+pub use bounds::{LinkRegistrationError, RoutedSendError};
 pub use config::{ReassemblyConfig, ReassemblyConfigError, RouterConfig, RouterConfigError};
 pub use packet::PacketBuffer;
 pub(crate) use packet::TunnelBuffers;
@@ -19,6 +21,9 @@ mod tests;
 
 #[cfg(test)]
 mod admission_tests;
+
+#[cfg(test)]
+mod bounds_tests;
 
 #[cfg(test)]
 mod outbound_tests;
@@ -35,7 +40,7 @@ use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::admission::{SessionId, SessionRegistry};
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkControl};
-use groupnet_transport::{Inbound, Transport};
+use groupnet_transport::{Inbound, MAX_NODE_ID_BYTES, Transport, validate_node_id};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio::time::Instant;
@@ -221,7 +226,9 @@ impl Router {
     /// Tokio runtime.
     ///
     /// # Errors
-    /// Rejects an invalid local identifier or unavailable OS randomness.
+    /// Returns `InvalidInput` wrapping the
+    /// [`NodeIdError`](crate::NodeIdError) for an invalid local identifier;
+    /// rejects unavailable OS randomness.
     /// # Panics
     /// Panics if called outside a Tokio runtime.
     pub fn new(local: NodeId) -> io::Result<Self> {
@@ -232,8 +239,9 @@ impl Router {
     /// Tokio runtime. Nothing starts when validation fails.
     ///
     /// # Errors
-    /// Returns `InvalidInput` wrapping a [`RouterConfigError`], rejects an
-    /// invalid local identifier or unavailable OS randomness.
+    /// Returns `InvalidInput` wrapping a [`RouterConfigError`] or the local
+    /// identifier's [`NodeIdError`](crate::NodeIdError); rejects unavailable
+    /// OS randomness.
     /// # Panics
     /// Panics if called outside a Tokio runtime.
     pub fn with_config(local: NodeId, config: RouterConfig) -> io::Result<Self> {
@@ -294,7 +302,10 @@ impl Router {
     /// Registers and starts an adapter. Neighbor lists are explicit link admission.
     ///
     /// # Errors
-    /// Rejects invalid peer IDs/cost/MTU, exhausted adapter capacity, or a closed router.
+    /// Returns `InvalidInput` wrapping the link's
+    /// [`LinkConfigError`](groupnet_transport::link::LinkConfigError) or a
+    /// [`LinkRegistrationError`]; rejects exhausted adapter capacity or a
+    /// closed router.
     /// # Panics
     /// Panics if an earlier panic poisoned the internal table or no Tokio runtime exists.
     pub fn add_transport<T: Transport>(
@@ -310,7 +321,9 @@ impl Router {
     /// Failed registration drains the endpoint before returning.
     ///
     /// # Errors
-    /// Rejects invalid admission/cost/MTU, exhausted capacity, or a closed router.
+    /// Returns `InvalidInput` wrapping the link's
+    /// [`LinkConfigError`](groupnet_transport::link::LinkConfigError) or a
+    /// [`LinkRegistrationError`]; rejects exhausted capacity or a closed router.
     /// # Panics
     /// Requires a Tokio runtime; propagates a poisoned routing-state lock.
     pub async fn add_link(&self, link: BoundLink) -> io::Result<TransportId> {
@@ -331,12 +344,31 @@ impl Router {
         }
         let mtu = config.mtu.get();
         let max_frame = shared.config.max_frame.get();
-        if config.peers.len() > shared.config.max_routes.get()
-            || !(wire::FRAGMENT + 1..=max_frame).contains(&mtu)
-            || max_frame.div_ceil(mtu.saturating_sub(wire::FRAGMENT).max(1))
-                > usize::from(shared.config.reassembly.max_fragments.get())
-        {
-            return Err((wire::invalid("invalid link configuration"), link));
+        let max_routes = shared.config.max_routes.get();
+        if config.peers.len() > max_routes {
+            let error = LinkRegistrationError::PeersAboveMaxRoutes {
+                peers: config.peers.len(),
+                max_routes,
+            };
+            return Err((error.into(), link));
+        }
+        let min = wire::FRAGMENT + 1;
+        if !(min..=max_frame).contains(&mtu) {
+            let error = LinkRegistrationError::MtuOutOfRange {
+                mtu,
+                min,
+                max: max_frame,
+            };
+            return Err((error.into(), link));
+        }
+        let fragments = max_frame.div_ceil(mtu - wire::FRAGMENT);
+        let max_fragments = usize::from(shared.config.reassembly.max_fragments.get());
+        if fragments > max_fragments {
+            let error = LinkRegistrationError::FragmentsAboveReassembly {
+                fragments,
+                max_fragments,
+            };
+            return Err((error.into(), link));
         }
         let mut table = shared.table.lock().expect("router table poisoned");
         if shared.cancel.is_cancelled() {
@@ -617,8 +649,5 @@ fn closed() -> io::Error {
 
 /// Rejects a local identity the routing wire cannot carry.
 pub(crate) fn validate_local(local: &NodeId) -> io::Result<()> {
-    if !wire::id_valid(local) {
-        return Err(wire::invalid("invalid router identity"));
-    }
-    Ok(())
+    Ok(validate_node_id(local, MAX_NODE_ID_BYTES)?)
 }

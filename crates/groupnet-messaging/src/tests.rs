@@ -755,3 +755,54 @@ async fn invalid_bounds_bind_nothing_and_proven_bounds_bind_unchecked() -> io::R
     router.close().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn invalid_destination_and_foreign_namespace_are_typed_input_errors() -> io::Result<()> {
+    let router = router("typed")?;
+    let messages = Messaging::new(&router)?;
+    let long = NodeId::new("d".repeat(groupnet_transport::MAX_NODE_ID_BYTES + 1));
+    for (to, expected) in [
+        (NodeId::new(""), NodeIdError::Empty),
+        (
+            long,
+            NodeIdError::TooLong {
+                len: groupnet_transport::MAX_NODE_ID_BYTES + 1,
+                max: groupnet_transport::MAX_NODE_ID_BYTES,
+            },
+        ),
+    ] {
+        assert_eq!(validate_destination(&to), Err(expected));
+        let error = messages
+            .send(&to, None, Bytes::new(), SendOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let typed = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<SendValidationError>())
+            .copied();
+        assert_eq!(typed, Some(SendValidationError::Destination(expected)));
+        assert_eq!(
+            typed
+                .as_ref()
+                .and_then(std::error::Error::source)
+                .and_then(|source| source.downcast_ref::<NodeIdError>()),
+            Some(&expected)
+        );
+    }
+    let foreign = router.bind_protocol(Messaging::ID + 1)?;
+    let error = Messaging::from_io(foreign).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<MessagingBindError>()),
+        Some(&MessagingBindError::WrongNamespace {
+            expected: Messaging::ID,
+            actual: Messaging::ID + 1,
+        })
+    );
+    messages.close().await;
+    router.close().await;
+    Ok(())
+}

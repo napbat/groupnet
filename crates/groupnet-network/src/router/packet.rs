@@ -1,12 +1,13 @@
 //! Owned application encoding buffers with router-reserved headroom.
 
 use super::{
-    Shared,
+    RoutedSendError, Shared,
     pool::{PacketPool, Recycled},
 };
 use crate::wire::{self, PayloadKind};
 use bytes::Bytes;
 use groupnet_core::NodeId;
+use groupnet_transport::{MAX_NODE_ID_BYTES, validate_node_id};
 use std::{fmt, io, sync::Arc};
 
 /// A uniquely owned encoding buffer with reserved routing-envelope headroom.
@@ -29,11 +30,11 @@ impl PacketBuffer {
         capacity: usize,
         kind: PayloadKind,
     ) -> io::Result<Self> {
+        validate_node_id(target, MAX_NODE_ID_BYTES).map_err(RoutedSendError::Destination)?;
         let headroom = kind.header_len(&shared.local, target);
-        if !wire::id_valid(target)
-            || capacity > shared.config.max_frame.get().saturating_sub(headroom)
-        {
-            return Err(wire::invalid("routed packet capacity exceeds bound"));
+        let max = shared.config.max_frame.get().saturating_sub(headroom);
+        if capacity > max {
+            return Err(RoutedSendError::PayloadTooLarge { len: capacity, max }.into());
         }
         let mut bytes = shared.pool.take(headroom + capacity);
         bytes.resize(headroom, 0);
@@ -88,11 +89,16 @@ impl PacketBuffer {
         if &self.target != target
             || self.kind != kind
             || self.headroom != kind.header_len(&shared.local, target)
-            || self.bytes.len() > shared.config.max_frame.get()
         {
-            return Err(wire::invalid(
-                "routed packet target, headroom or bound mismatch",
-            ));
+            return Err(RoutedSendError::PacketMismatch.into());
+        }
+        let max_frame = shared.config.max_frame.get();
+        if self.bytes.len() > max_frame {
+            return Err(RoutedSendError::PayloadTooLarge {
+                len: self.len(),
+                max: max_frame - self.headroom,
+            }
+            .into());
         }
         wire::stamp(
             &mut self.bytes[..self.headroom],

@@ -96,7 +96,9 @@ impl ProtocolIo {
 
     /// Locally enqueues opaque bytes; success is not a remote receipt.
     /// # Errors
-    /// Reports shutdown, routing bounds, missing routes, or local backpressure.
+    /// Returns `InvalidInput` wrapping a [`RoutedSendError`](crate::RoutedSendError)
+    /// for an invalid destination or oversized payload; reports shutdown,
+    /// missing routes, or local backpressure.
     pub fn send(&self, to: &groupnet_core::NodeId, payload: &[u8]) -> io::Result<()> {
         let mut packet = self.packet_buffer(to, payload.len())?;
         packet.extend_from_slice(payload);
@@ -116,7 +118,8 @@ impl ProtocolIo {
 
     /// Allocates an encoding buffer with the exact routing header reserved.
     /// # Errors
-    /// Rejects an invalid destination, excessive capacity, or a closed endpoint.
+    /// Returns `InvalidInput` wrapping a [`RoutedSendError`](crate::RoutedSendError)
+    /// for an invalid destination or excessive capacity; rejects a closed endpoint.
     pub fn packet_buffer(
         &self,
         to: &groupnet_core::NodeId,
@@ -135,7 +138,9 @@ impl ProtocolIo {
 
     /// Transfers an encoded packet without copying its protocol bytes.
     /// # Errors
-    /// Rejects target/bound mismatches, shutdown, missing routes, or backpressure.
+    /// Returns `InvalidInput` wrapping a [`RoutedSendError`](crate::RoutedSendError)
+    /// when the buffer was allocated for another destination or namespace or
+    /// outgrew its bound; reports shutdown, missing routes, or backpressure.
     pub fn send_packet(&self, to: &groupnet_core::NodeId, packet: PacketBuffer) -> io::Result<()> {
         if self.inner.cancel.is_cancelled() {
             return Err(closed());
@@ -150,7 +155,9 @@ impl ProtocolIo {
     /// Transfers owned protocol bytes. Remote sends copy once to prepend routing;
     /// use [`send_packet`](Self::send_packet) to encode with reserved headroom.
     /// # Errors
-    /// Reports invalid bounds, shutdown, missing routes, or backpressure.
+    /// Returns `InvalidInput` wrapping a [`RoutedSendError`](crate::RoutedSendError)
+    /// for an invalid destination or oversized payload; reports shutdown,
+    /// missing routes, or backpressure.
     pub fn send_owned(&self, to: &groupnet_core::NodeId, payload: Bytes) -> io::Result<()> {
         if self.inner.cancel.is_cancelled() {
             return Err(closed());

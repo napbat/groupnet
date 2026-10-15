@@ -2,7 +2,7 @@
 
 use std::{fmt, io, num::NonZeroUsize, ops::Deref, time::Duration};
 
-use groupnet_transport::QueueCapacity;
+use groupnet_transport::{NodeIdError, QueueCapacity};
 
 use crate::{
     DEFAULT_DEDUP_RETENTION_MS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_TIMEOUT_MS, SendOptions,
@@ -177,9 +177,13 @@ impl ValidMessagingConfig {
     }
 }
 
-/// A send that violates its endpoint's [`MessagingConfig`] bounds.
+/// A send that violates its endpoint's [`MessagingConfig`] bounds or names a
+/// destination the application codec cannot carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendValidationError {
+    /// The destination is not an identity the application codec can carry;
+    /// keeps the [`NodeIdError`] as its source.
+    Destination(NodeIdError),
     /// The payload exceeds `max_payload`.
     PayloadTooLarge {
         /// The rejected payload length.
@@ -208,6 +212,7 @@ pub enum SendValidationError {
 impl fmt::Display for SendValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Destination(_) => f.write_str("invalid application destination"),
             Self::PayloadTooLarge { len, max } => write!(
                 f,
                 "application payload of {len} bytes exceeds max_payload {max}"
@@ -225,7 +230,17 @@ impl fmt::Display for SendValidationError {
     }
 }
 
-impl std::error::Error for SendValidationError {}
+impl std::error::Error for SendValidationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Destination(error) => Some(error),
+            Self::PayloadTooLarge { .. }
+            | Self::ZeroTimeout
+            | Self::TimeoutAboveMax { .. }
+            | Self::UnrepresentableTimeout { .. } => None,
+        }
+    }
+}
 
 impl From<SendValidationError> for io::Error {
     fn from(error: SendValidationError) -> Self {
