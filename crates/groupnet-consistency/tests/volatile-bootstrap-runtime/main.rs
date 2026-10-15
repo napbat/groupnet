@@ -6,6 +6,7 @@
 )]
 
 use std::future::ready;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,9 +26,9 @@ use groupnet_consistency::volatile_recovery::bootstrap::session::{
 };
 use groupnet_consistency::volatile_recovery::bootstrap::{
     AttachToken, BootId, BootstrapClaim, BootstrapConfig, BootstrapMember, BootstrapMemberIdentity,
-    BootstrapOperation, BootstrapPresence, BootstrapScope, CaptureId, ClaimIdentity, ClaimPhase,
-    DonorJournal, JournalConfig, NativeHandoffReceipt, PresenceIdentity, TransferConfig,
-    TransferOffer,
+    BootstrapOperation, BootstrapPresence, BootstrapScope, CaptureId, CapturePlan, ClaimIdentity,
+    ClaimPhase, DonorJournal, ImageSize, JournalConfig, NativeHandoffReceipt, PresenceIdentity,
+    TransferConfig, TransferOffer,
 };
 use groupnet_consistency::volatile_recovery::{
     AdapterError, AdapterErrorKind, Mark, Peer, PeerObservation, PublicationPermit,
@@ -43,6 +44,20 @@ use tokio::sync::Notify;
 
 const SETTLE: Duration = Duration::from_secs(2);
 
+/// A one-byte encoded and decoded test image.
+const UNIT_IMAGE: ImageSize = ImageSize {
+    encoded_bytes: NonZeroUsize::MIN,
+    decoded_bytes: NonZeroUsize::MIN,
+};
+
+/// A capture of the unit image over `members`, with no native writers.
+fn unit_capture(members: Vec<BootstrapMemberIdentity>) -> CapturePlan {
+    CapturePlan {
+        image: UNIT_IMAGE,
+        members,
+        cuts: Vec::new(),
+    }
+}
 fn member_from_claim(claim: &ClaimIdentity) -> BootstrapMemberIdentity {
     BootstrapMemberIdentity {
         node: claim.node.clone(),
@@ -362,10 +377,7 @@ impl DonorPort for OriginDonor {
         journal
             .begin_capture(
                 clock.now(),
-                1,
-                1,
-                vec![member_from_claim(&selected)],
-                Vec::new(),
+                unit_capture(vec![member_from_claim(&selected)]),
             )
             .map_err(fenced)?;
         self.build_starts.fetch_add(1, Ordering::SeqCst);
@@ -386,7 +398,9 @@ impl DonorPort for OriginDonor {
         if self.local_only.load(Ordering::SeqCst) {
             return Ok(LocalCaptureOutcome::LocalOnly);
         }
-        journal.finish_capture(clock.now(), 1, 1).map_err(fenced)?;
+        journal
+            .finish_capture(clock.now(), UNIT_IMAGE)
+            .map_err(fenced)?;
         let ingress = JournalIngress::new(journal, suffix, wake)?;
         *self.ingress.lock().unwrap() = Some(ingress.clone());
         DonorCapture::new(vec![42], ingress, encoded, decoded).map(LocalCaptureOutcome::Ready)
@@ -436,13 +450,13 @@ impl DonorPort for OriginDonor {
                     std::thread::sleep(Duration::from_millis(block));
                 }
                 journal
-                    .begin_capture(request.clock.now(), 1, 1, request.members, Vec::new())
+                    .begin_capture(request.clock.now(), unit_capture(request.members))
                     .map_err(fenced)?;
                 Ok(journal)
             })
             .ok_or(AdapterErrorKind::Fenced)??;
         journal
-            .finish_capture(request.clock.now(), 1, 1)
+            .finish_capture(request.clock.now(), UNIT_IMAGE)
             .map_err(fenced)?;
         let ingress = JournalIngress::new(journal, suffix, request.wake)?;
         *self.ingress.lock().unwrap() = Some(ingress.clone());

@@ -1,5 +1,7 @@
 //! Seeded virtual-time state-sync snapshot cutover schedules.
 
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+
 use groupnet_core::Time;
 use groupnet_core::replication::{
     ApplyReceipt, Batch, BoundComparison, ChunkReceipt, Comparison, Config, Coverage, Cursor,
@@ -133,8 +135,8 @@ fn seeded_concurrent_commit_cut_barrier_attach_and_delayed_reply() {
             proof: p.clone(),
             cut_to_head: cmp(&p, 1, 2),
             retained_to_cut: cmp(&p, 1, 1),
-            total_bytes: 1,
-            chunks: 1,
+            total_bytes: NonZeroU64::MIN,
+            chunks: NonZeroU32::MIN,
             digest: vec![1],
             certificate: vec![1],
         };
@@ -149,7 +151,7 @@ fn seeded_concurrent_commit_cut_barrier_attach_and_delayed_reply() {
         let chunk = ChunkReceipt {
             index: 0,
             offset: 0,
-            bytes: 1,
+            bytes: NonZeroUsize::MIN,
             payload_id: read.token,
         };
         let write = op(&e.step(Event::SnapshotRead { op: read, chunk }));
@@ -177,8 +179,8 @@ fn seeded_concurrent_commit_cut_barrier_attach_and_delayed_reply() {
                 certificate: vec![1],
             },
             payload_id: scan.token,
-            events: 2,
-            bytes: 2,
+            events: NonZeroUsize::new(2).unwrap(),
+            bytes: NonZeroUsize::new(2).unwrap(),
             advance: cmp(&barrier, 1, 3),
             end_to_head: cmp(&barrier, 3, 3),
         };
@@ -230,8 +232,8 @@ fn seeded_concurrent_commit_cut_barrier_attach_and_delayed_reply() {
                 certificate: vec![1],
             },
             payload_id: scan.token,
-            events: 1,
-            bytes: 1,
+            events: NonZeroUsize::MIN,
+            bytes: NonZeroUsize::MIN,
             advance: cmp(&source_tail, 3, 4),
             end_to_head: cmp(&source_tail, 4, 4),
         };
@@ -296,8 +298,8 @@ fn seeded_chunk_faults_timeout_cancel_and_restart_remain_unready() {
                 proof: p.clone(),
                 cut_to_head: cmp(&p, 1, 1),
                 retained_to_cut: cmp(&p, 1, 1),
-                total_bytes: 1,
-                chunks: 1,
+                total_bytes: NonZeroU64::MIN,
+                chunks: NonZeroU32::MIN,
                 digest: vec![1],
                 certificate: vec![1],
             }),
@@ -309,7 +311,7 @@ fn seeded_chunk_faults_timeout_cancel_and_restart_remain_unready() {
         let valid = ChunkReceipt {
             index: 0,
             offset: 0,
-            bytes: 1,
+            bytes: NonZeroUsize::MIN,
             payload_id: read.token,
         };
         match seed % 4 {

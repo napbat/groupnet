@@ -1,8 +1,8 @@
 //! Seeded response-loss schedules for exact donor reservation and batch replay.
 
 use groupnet_core::volatile_bootstrap::journal::{
-    AttachToken, CaptureId, DeltaIdentity, DonorJournal, Invalidation, JournalBatch, JournalConfig,
-    JournalCursor, JournalError, ReservationId,
+    AttachToken, CaptureId, CapturePlan, DeltaIdentity, DonorJournal, ImageSize, Invalidation,
+    JournalBatch, JournalConfig, JournalCursor, JournalError, ReservationId,
 };
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapMemberIdentity, BootstrapScope, ClaimIdentity, PresenceIdentity,
@@ -73,16 +73,21 @@ fn captured(seed: u64) -> (DonorJournal, JournalCursor, ClaimIdentity) {
         serial: seed + 1,
     };
     let mut journal = DonorJournal::new(config, id).unwrap();
+    let image = ImageSize {
+        encoded_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+        decoded_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+    };
     journal
         .begin_capture(
             Time(0),
-            8,
-            8,
-            vec![member(&donor), member(&follower)],
-            vec![],
+            CapturePlan {
+                image,
+                members: vec![member(&donor), member(&follower)],
+                cuts: vec![],
+            },
         )
         .unwrap();
-    let cut = journal.finish_capture(Time(0), 8, 8).unwrap();
+    let cut = journal.finish_capture(Time(0), image).unwrap();
     (journal, cut, follower)
 }
 

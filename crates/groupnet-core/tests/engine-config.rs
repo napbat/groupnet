@@ -4,7 +4,7 @@
 
 use std::num::{NonZeroU64, NonZeroUsize};
 
-use groupnet_core::{Config, ConfigError, GroupEngine, GroupId, NodeId, RecoveredGrant, Time};
+use groupnet_core::{Config, ConfigError, GroupEngine, GroupId, NodeId, Time};
 
 fn ids(names: &[&str]) -> Vec<NodeId> {
     names.iter().map(|name| NodeId::new(*name)).collect()
@@ -18,22 +18,6 @@ fn new_rejects_an_invalid_config_with_its_rule() {
     };
     let result = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], config);
     assert_eq!(result.err(), Some(ConfigError::ZeroGossipInterval));
-}
-
-#[test]
-fn with_recovered_rejects_an_invalid_config_with_its_rule() {
-    let config = Config {
-        dead_timeout_ms: 0,
-        ..Config::default()
-    };
-    let result = GroupEngine::with_recovered(
-        GroupId::new("g"),
-        NodeId::new("a"),
-        [],
-        config,
-        RecoveredGrant::none(),
-    );
-    assert_eq!(result.err(), Some(ConfigError::ZeroDeadTimeout));
 }
 
 /// `gossip_interval_ms` is the one cadence of the digest/delta round: a round

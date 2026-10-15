@@ -1,6 +1,6 @@
 //! Seeded source-ack ambiguity, crash, duplicate, and retention-gap schedules.
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use groupnet_core::Time;
 use groupnet_core::replication::{
@@ -161,8 +161,8 @@ fn deliver(engine: &mut SessionEngine, receipt: &RegisterReceipt, sink_before: u
                 certificate: vec![4],
             },
             payload_id: 1,
-            events: 1,
-            bytes: 8,
+            events: NonZeroUsize::MIN,
+            bytes: NonZeroUsize::new(8).unwrap(),
             advance: comparison(1, 2),
             end_to_head: comparison(2, 2),
         }),

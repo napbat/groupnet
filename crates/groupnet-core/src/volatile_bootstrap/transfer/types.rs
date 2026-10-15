@@ -155,11 +155,11 @@ pub struct TransferOffer {
     /// Application index schema version, equal to the follower's declared schema.
     pub schema: u32,
     /// Total encoded image bytes.
-    pub encoded_bytes: usize,
+    pub encoded_bytes: NonZeroUsize,
     /// Maximum decoded private stage bytes charged before transfer.
-    pub decoded_bytes: usize,
+    pub decoded_bytes: NonZeroUsize,
     /// Number of nonempty sequential chunks.
-    pub chunks: usize,
+    pub chunks: NonZeroUsize,
     /// Opaque full-image commitment verified by the adapter.
     pub commitment: [u8; 32],
     /// Exact complete member identities observed at C, sorted by node.
@@ -278,8 +278,8 @@ pub enum TransferEvent {
         op: BootstrapOperation,
         /// Zero-based sequential chunk index.
         sequence: usize,
-        /// Verified encoded chunk bytes.
-        bytes: usize,
+        /// Verified encoded chunk bytes; a chunk is never empty.
+        bytes: NonZeroUsize,
         /// Current bounded decoded stage charge.
         decoded_charge: usize,
     },
@@ -369,11 +369,11 @@ pub enum TransferEffect {
         /// Exact accepted image cut, binding the private stage to C.
         image_cut: JournalCursor,
         /// Accepted finite image chunk count.
-        chunks: usize,
+        chunks: NonZeroUsize,
         /// Encoded image memory to admit.
-        encoded_bytes: usize,
+        encoded_bytes: NonZeroUsize,
         /// Decoded stage memory to admit.
-        decoded_bytes: usize,
+        decoded_bytes: NonZeroUsize,
     },
     /// Reserve the donor's suffix from exact C before transfer.
     ReserveDonor {

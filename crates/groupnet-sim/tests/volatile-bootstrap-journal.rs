@@ -1,8 +1,8 @@
 //! Seeded image-cut and donor-local suffix schedules under virtual time.
 
 use groupnet_core::volatile_bootstrap::journal::{
-    CaptureId, DeltaIdentity, DonorJournal, Invalidation, JournalConfig, JournalCursor,
-    JournalError, JournalState, NativeCut,
+    CaptureId, CapturePlan, DeltaIdentity, DonorJournal, ImageSize, Invalidation, JournalConfig,
+    JournalCursor, JournalError, JournalState, NativeCut,
 };
 use groupnet_core::volatile_bootstrap::{
     BootstrapMemberIdentity, BootstrapScope, ClaimIdentity, PresenceIdentity,
@@ -29,6 +29,14 @@ fn member(claim: &ClaimIdentity) -> BootstrapMemberIdentity {
         }),
         member_incarnation: 1,
         status: Status::Alive,
+    }
+}
+
+fn image(bytes: usize) -> ImageSize {
+    let bytes = std::num::NonZeroUsize::new(bytes).unwrap();
+    ImageSize {
+        encoded_bytes: bytes,
+        decoded_bytes: bytes,
     }
 }
 
@@ -74,17 +82,18 @@ fn captured_with(seed: u64, limits: JournalConfig) -> (DonorJournal, JournalCurs
     journal
         .begin_capture(
             Time(0),
-            32,
-            32,
-            vec![member(&donor), member(&identity("peer", seed + 100))],
-            vec![NativeCut {
-                writer: b"w".to_vec(),
-                epoch: 1,
-                sequence: 0,
-            }],
+            CapturePlan {
+                image: image(32),
+                members: vec![member(&donor), member(&identity("peer", seed + 100))],
+                cuts: vec![NativeCut {
+                    writer: b"w".to_vec(),
+                    epoch: 1,
+                    sequence: 0,
+                }],
+            },
         )
         .unwrap();
-    let cut = journal.finish_capture(Time(0), 8, 8).unwrap();
+    let cut = journal.finish_capture(Time(0), image(8)).unwrap();
     (journal, cut)
 }
 
@@ -113,14 +122,15 @@ fn encoding_schedule_keeps_c_fixed_while_live_suffix_advances() {
         journal
             .begin_capture(
                 Time(0),
-                32,
-                32,
-                vec![member(&donor), member(&follower)],
-                vec![NativeCut {
-                    writer: b"w".to_vec(),
-                    epoch: 1,
-                    sequence: 0,
-                }],
+                CapturePlan {
+                    image: image(32),
+                    members: vec![member(&donor), member(&follower)],
+                    cuts: vec![NativeCut {
+                        writer: b"w".to_vec(),
+                        epoch: 1,
+                        sequence: 0,
+                    }],
+                },
             )
             .unwrap();
         let encode_due = 3 + u64::from(rng.up_to(2));
@@ -153,13 +163,16 @@ fn encoding_schedule_keeps_c_fixed_while_live_suffix_advances() {
         if fail {
             aborted += 1;
             assert_eq!(
-                journal.finish_capture(Time(encode_due), 8, 8),
+                journal.finish_capture(Time(encode_due), image(8)),
                 Err(JournalError::Stage)
             );
             assert!(journal.current_cursor().is_none());
         } else {
             completed += 1;
-            assert_eq!(journal.finish_capture(Time(encode_due), 8, 8).unwrap(), c);
+            assert_eq!(
+                journal.finish_capture(Time(encode_due), image(8)).unwrap(),
+                c
+            );
             assert_eq!(journal.image_cuts()[0].sequence, 0);
             assert_eq!(journal.covered_cuts()[0].sequence, encode_due - 1);
             assert_eq!(journal.current_cursor().unwrap().position, encode_due - 1);

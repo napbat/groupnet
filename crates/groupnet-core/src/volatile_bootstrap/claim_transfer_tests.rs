@@ -450,9 +450,9 @@ fn installing() -> (
         capture,
         image_cut: cursor.clone(),
         schema: 1,
-        encoded_bytes: 1,
-        decoded_bytes: 1,
-        chunks: 1,
+        encoded_bytes: NonZeroUsize::MIN,
+        decoded_bytes: NonZeroUsize::MIN,
+        chunks: NonZeroUsize::MIN,
         commitment: [8; 32],
         members: members.clone(),
         cuts: cuts.clone(),
@@ -496,7 +496,7 @@ fn installing() -> (
         TransferEvent::ChunkStored {
             op: chunk,
             sequence: 0,
-            bytes: 1,
+            bytes: NonZeroUsize::MIN,
             decoded_charge: 1,
         },
     ) else {

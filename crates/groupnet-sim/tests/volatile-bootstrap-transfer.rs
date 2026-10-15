@@ -2,9 +2,11 @@
 //! with the donor's native writer either continuing its life or sealing it
 //! and renewing into its next life between the barrier sample and delivery.
 
+use std::num::NonZeroUsize;
+
 use groupnet_core::volatile_bootstrap::journal::{
-    AttachToken, BarrierReceipt, CaptureId, DeltaIdentity, DonorJournal, JournalConfig,
-    JournalCursor, NativeCut, ReservationId,
+    AttachToken, BarrierReceipt, CaptureId, CapturePlan, DeltaIdentity, DonorJournal, ImageSize,
+    JournalConfig, JournalCursor, NativeCut, NativeRenewal, ReservationId,
 };
 use groupnet_core::volatile_bootstrap::transfer::{
     NativeCoverageReceipt, NativeHandoffReceipt, TransferConfig, TransferEffect, TransferEvent,
@@ -231,16 +233,29 @@ fn start(renews: bool) -> (ClaimEngine, Fixture, Vec<BootstrapEffect>) {
         capture: capture.clone(),
         image_cut: cursor.clone(),
         schema: 1,
-        encoded_bytes: 1,
-        decoded_bytes: 1,
-        chunks: 1,
+        encoded_bytes: NonZeroUsize::MIN,
+        decoded_bytes: NonZeroUsize::MIN,
+        chunks: NonZeroUsize::MIN,
         commitment: [7; 32],
         members: members.clone(),
         cuts: cuts.clone(),
     };
     let mut journal = DonorJournal::new(journal_config(), capture).unwrap();
-    journal.begin_capture(Time(3), 1, 1, members, cuts).unwrap();
-    assert_eq!(journal.finish_capture(Time(3), 1, 1).unwrap(), cursor);
+    let image = ImageSize {
+        encoded_bytes: NonZeroUsize::MIN,
+        decoded_bytes: NonZeroUsize::MIN,
+    };
+    journal
+        .begin_capture(
+            Time(3),
+            CapturePlan {
+                image,
+                members,
+                cuts,
+            },
+        )
+        .unwrap();
+    assert_eq!(journal.finish_capture(Time(3), image).unwrap(), cursor);
     journal
         .append(
             Time(3),
@@ -325,7 +340,7 @@ fn reply(
             TransferEvent::ChunkStored {
                 op,
                 sequence,
-                bytes: 1,
+                bytes: NonZeroUsize::MIN,
                 decoded_charge: 1,
             }
         }
@@ -360,7 +375,13 @@ fn reply(
                 fixture
                     .journal
                     .append(Time(now), 1, DeltaIdentity::Native(seal.clone()), vec![2])
-                    .and_then(|_| fixture.journal.renew(Time(now), 1, &seal, 2, vec![2]))
+                    .and_then(|_| {
+                        let renewal = NativeRenewal {
+                            sealed: seal,
+                            epoch: 2,
+                        };
+                        fixture.journal.renew(Time(now), 1, renewal, vec![2])
+                    })
                     .and_then(|_| {
                         fixture.journal.append(
                             Time(now),

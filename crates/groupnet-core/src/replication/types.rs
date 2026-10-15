@@ -354,10 +354,10 @@ pub struct Batch {
     pub coverage: Coverage,
     /// Driver-private handle to the native records, scoped to the scan operation.
     pub payload_id: u64,
-    /// Number of committed records in this batch.
-    pub events: usize,
+    /// Number of committed records in this batch; an empty batch is no progress.
+    pub events: NonZeroUsize,
     /// Total encoded byte budget charged to this batch.
-    pub bytes: usize,
+    pub bytes: NonZeroUsize,
     /// Proof-bound strict progress from the prior cursor to the batch end.
     pub advance: BoundComparison,
     /// Comparison of batch end to the checked source head.

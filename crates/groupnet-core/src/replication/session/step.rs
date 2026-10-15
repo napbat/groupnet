@@ -384,10 +384,8 @@ impl SessionEngine {
                 {
                     return Step::reject(Reject::Identity(e));
                 }
-                if batch.events == 0
-                    || batch.events > self.config.max_batch_events.get()
-                    || batch.bytes == 0
-                    || batch.bytes > self.config.max_batch_bytes.get()
+                if batch.events > self.config.max_batch_events
+                    || batch.bytes > self.config.max_batch_bytes
                 {
                     return Step::reject(Reject::Backpressure);
                 }

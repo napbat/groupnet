@@ -3,6 +3,10 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use super::*;
 use crate::Time;
 
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap()
+}
+
 fn scope() -> Scope {
     Scope {
         stream: Stream {
@@ -101,8 +105,8 @@ fn offer() -> SnapshotOffer {
         cut_to_head: compare(&p, 1, 2),
         retained_to_cut: compare(&p, 0, 1),
         proof: p,
-        total_bytes: 5,
-        chunks: 2,
+        total_bytes: NonZeroU64::new(5).unwrap(),
+        chunks: NonZeroU32::new(2).unwrap(),
         digest: vec![42],
         certificate: vec![7],
     }
@@ -140,7 +144,7 @@ fn through_image(e: &mut SessionEngine) -> Operation {
         let chunk = ChunkReceipt {
             index,
             offset,
-            bytes,
+            bytes: nz(bytes),
             payload_id: read.token,
         };
         let write = operation(&e.step(Event::SnapshotRead { op: read, chunk }));
@@ -180,8 +184,8 @@ fn snapshot_replays_private_suffix_then_attaches_before_ready() {
             certificate: vec![1],
         },
         payload_id: scan.token,
-        events: 2,
-        bytes: 4,
+        events: nz(2),
+        bytes: nz(4),
         advance: compare(&p, 1, 3),
         end_to_head: compare(&p, 3, 3),
     };
@@ -253,8 +257,8 @@ fn snapshot_replays_private_suffix_then_attaches_before_ready() {
             certificate: vec![1],
         },
         payload_id: scan.token,
-        events: 1,
-        bytes: 4,
+        events: nz(1),
+        bytes: nz(4),
         advance: compare(&tail_proof, 3, 4),
         end_to_head: compare(&tail_proof, 4, 4),
     };
@@ -448,7 +452,7 @@ fn bad_offer_and_chunk_do_not_advance_or_install() {
             chunk: ChunkReceipt {
                 index: 1,
                 offset: 0,
-                bytes: 4,
+                bytes: nz(4),
                 payload_id: read.token
             }
         })
@@ -464,7 +468,7 @@ fn impossible_offer_and_cross_history_private_batch_are_rejected() {
     let mut e = engine();
     let offered = through_offer(&mut e);
     let mut impossible = offer();
-    impossible.total_bytes = 9; // Two chunks of at most four bytes cannot cover it.
+    impossible.total_bytes = NonZeroU64::new(9).unwrap(); // Two chunks of at most four bytes cannot cover it.
     assert_eq!(
         e.step(Event::SnapshotOffered {
             op: offered,
@@ -486,7 +490,7 @@ fn impossible_offer_and_cross_history_private_batch_are_rejected() {
         let chunk = ChunkReceipt {
             index,
             offset,
-            bytes,
+            bytes: nz(bytes),
             payload_id: read.token,
         };
         let write = operation(&e.step(Event::SnapshotRead { op: read, chunk }));
@@ -518,8 +522,8 @@ fn impossible_offer_and_cross_history_private_batch_are_rejected() {
             certificate: vec![1],
         },
         payload_id: scan.token,
-        events: 2,
-        bytes: 4,
+        events: nz(2),
+        bytes: nz(4),
         advance: BoundComparison {
             left: cursor(1),
             right: through.clone(),

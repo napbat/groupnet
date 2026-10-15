@@ -102,10 +102,10 @@ pub struct SnapshotOffer {
     pub cut_to_head: BoundComparison,
     /// Exact comparison of retention boundary with cut.
     pub retained_to_cut: BoundComparison,
-    /// Exact encoded image size.
-    pub total_bytes: u64,
-    /// Number of sequential chunks.
-    pub chunks: u32,
+    /// Exact encoded image size; an empty image cannot install.
+    pub total_bytes: NonZeroU64,
+    /// Number of sequential nonempty chunks.
+    pub chunks: NonZeroU32,
     /// Source-verified digest of the complete image.
     pub digest: Vec<u8>,
     /// Source-specific consistent-cut certificate.
@@ -159,8 +159,8 @@ pub struct ChunkReceipt {
     pub index: u32,
     /// Offset in the encoded image.
     pub offset: u64,
-    /// Bounded nonzero encoded chunk length.
-    pub bytes: usize,
+    /// Bounded encoded chunk length.
+    pub bytes: NonZeroUsize,
     /// Worker-held payload identifier, equal to its read operation token.
     pub payload_id: u64,
 }

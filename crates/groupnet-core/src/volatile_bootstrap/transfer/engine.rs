@@ -216,16 +216,14 @@ impl TransferSession {
             || offer.capture.serial == 0
             || offer.image_cut.capture != offer.capture
             || offer.image_cut.position != 0
-            || offer.encoded_bytes == 0
-            || offer.decoded_bytes == 0
-            || offer.chunks == 0
-            || offer.encoded_bytes > self.config.max_encoded_bytes.get()
-            || offer.decoded_bytes > self.config.max_decoded_bytes.get()
-            || offer.chunks > self.config.max_chunks.get()
+            || offer.encoded_bytes > self.config.max_encoded_bytes
+            || offer.decoded_bytes > self.config.max_decoded_bytes
+            || offer.chunks > self.config.max_chunks
             || offer.encoded_bytes < offer.chunks
-            || offer.encoded_bytes
+            || offer.encoded_bytes.get()
                 > offer
                     .chunks
+                    .get()
                     .checked_mul(self.config.max_chunk_bytes.get())
                     .ok_or(TransferError::Capacity)?
             || offer.members.is_empty()
@@ -554,22 +552,21 @@ impl TransferSession {
                 let Some(offer) = &self.offer else {
                     return self.abort(TransferError::Continuity);
                 };
-                let Some(total) = self.encoded_received.checked_add(bytes) else {
+                let Some(total) = self.encoded_received.checked_add(bytes.get()) else {
                     return self.abort(TransferError::Capacity);
                 };
                 if sequence != self.next_chunk
-                    || bytes == 0
-                    || bytes > self.config.max_chunk_bytes.get()
-                    || total > offer.encoded_bytes
-                    || decoded_charge > offer.decoded_bytes
+                    || bytes > self.config.max_chunk_bytes
+                    || total > offer.encoded_bytes.get()
+                    || decoded_charge > offer.decoded_bytes.get()
                     || decoded_charge > self.config.max_decoded_bytes.get()
                 {
                     return self.abort(TransferError::Capacity);
                 }
                 self.encoded_received = total;
                 self.next_chunk += 1;
-                let complete = self.next_chunk == offer.chunks;
-                if complete && total != offer.encoded_bytes {
+                let complete = self.next_chunk == offer.chunks.get();
+                if complete && total != offer.encoded_bytes.get() {
                     return self.abort(TransferError::Continuity);
                 }
                 let commitment = offer.commitment;

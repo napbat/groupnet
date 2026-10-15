@@ -1,5 +1,6 @@
 //! Source-authoritative registration, bounded protected replay, and ack I/O.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -245,10 +246,13 @@ where
             bytes,
             native,
         } = source_batch;
-        if events == 0
-            || events > self.manager.limits.core.max_batch_events.get()
-            || bytes == 0
-            || bytes > self.manager.limits.core.max_batch_bytes.get()
+        let (Some(events), Some(bytes)) = (NonZeroUsize::new(events), NonZeroUsize::new(bytes))
+        else {
+            self.conclusive(op, SubscriptionError::Backpressured);
+            return;
+        };
+        if events > self.manager.limits.core.max_batch_events
+            || bytes > self.manager.limits.core.max_batch_bytes
         {
             self.conclusive(op, SubscriptionError::Backpressured);
             return;

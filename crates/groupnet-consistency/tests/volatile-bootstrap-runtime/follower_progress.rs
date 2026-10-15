@@ -115,7 +115,7 @@ async fn progressing_transfer_outlives_the_donor_wait_and_every_episode_bound() 
     config.transfer.max_decoded_bytes = chunks;
     let (donor, admission, handle, reads) = open_follower(
         &claims,
-        PeerDonor::paced(&peer_identity(), &follower_identity(), CHUNKS, 50),
+        PeerDonor::paced(&peer_identity(), &follower_identity(), chunks, 50),
         config,
         RecoveryMode::Unleased,
         short_recovery(),

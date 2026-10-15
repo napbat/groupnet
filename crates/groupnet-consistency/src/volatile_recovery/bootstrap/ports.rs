@@ -457,7 +457,7 @@ pub struct TransferContext {
 
 /// What one transfer effect executes under: its claim-selected transfer, the
 /// worker's shared admission, the outer publication permission, and the
-/// worker's original absolute episode deadline.
+/// effective absolute deadline for this one effect.
 #[derive(Debug)]
 pub struct EffectContext<'a> {
     /// Exact claim-selected peer transfer the effect belongs to.
@@ -467,7 +467,12 @@ pub struct EffectContext<'a> {
     /// The outer recovery's publication permission; `InstallCandidate` uses
     /// it for its one fenced swap.
     pub permit: Option<PublicationPermit>,
-    /// Absolute deadline of the worker's episode.
+    /// Effective absolute deadline for this effect, which the worker also
+    /// enforces around the call. Normally it is the effect's child-operation
+    /// deadline intersected with the outer deadline the worker runs under (the
+    /// outer deadline alone for an effect without a child operation); an
+    /// install's `permit` is restricted to it. During cancellation cleanup it
+    /// is the worker's bounded retirement deadline instead.
     pub deadline: Instant,
 }
 
@@ -657,17 +662,17 @@ pub enum DonorReply {
 
 /// One-effect-at-a-time donor and application callbacks.
 ///
-/// The existing recovery worker passes each effect under its original
-/// absolute episode deadline. The port receives the exact worker-owned
-/// resources and shared admission budget, reserves before allocating any
-/// chunk, stage, suffix, native overlap, or returned batch, and leaves no
-/// private stage in an adapter-owned map. It may return an event only for the
-/// requested exact operation. Cleanup effects return None after resources
-/// are retired. `InstallCandidate` must use the supplied publication permit
-/// for one fenced swap and normal-feed handoff; a sampled head or boolean
-/// cannot stand in for the typed Installed receipt. The asynchronous methods
-/// return `Send` futures; implement them as `async fn` or with an
-/// `async move` body.
+/// The existing recovery worker passes each effect under that effect's
+/// effective absolute deadline ([`EffectContext::deadline`]). The port
+/// receives the exact worker-owned resources and shared admission budget,
+/// reserves before allocating any chunk, stage, suffix, native overlap, or
+/// returned batch, and leaves no private stage in an adapter-owned map. It may
+/// return an event only for the requested exact operation. Cleanup effects
+/// return None after resources are retired. `InstallCandidate` must use the
+/// supplied publication permit for one fenced swap and normal-feed handoff; a
+/// sampled head or boolean cannot stand in for the typed Installed receipt. The
+/// asynchronous methods return `Send` futures; implement them as `async fn` or
+/// with an `async move` body.
 pub trait DonorPort: Send + Sync + 'static {
     /// Encoded donor image and its bounded private metadata.
     type Image: Send + 'static;

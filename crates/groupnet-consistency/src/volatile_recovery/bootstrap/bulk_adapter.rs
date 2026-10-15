@@ -79,7 +79,7 @@ pub trait BootstrapStatePort: Send + Sync + 'static {
     ) -> Result<Admitted<Vec<u8>>, AdapterError>;
 
     /// Execute only `ReserveStage`, `VerifyImage`, `CheckNativeCoverage`,
-    /// `InstallCandidate`, or `DiscardStage` under the worker's deadline.
+    /// `InstallCandidate`, or `DiscardStage` under the effect's deadline.
     fn execute_local(
         &self,
         effect: TransferEffect,

@@ -57,7 +57,12 @@ manager's chunk and application-stage quotas do not account for source-owned
 image memory.
 `SnapshotImage` owns the read handle and a bounded `SnapshotOffer` metadata record:
 protocol/schema, scope and source history, source-proven cut `C0`, coverage
-certificate, total encoded bytes, chunk count, and digest.
+certificate, total encoded bytes, chunk count, and digest. The size and count
+are `NonZeroU64` and `NonZeroU32`, so an empty image cannot be offered; a
+chunk receipt's length is a `NonZeroUsize`, and the shell treats an empty
+source read as a terminal adapter failure. Replay batches likewise carry
+nonzero `events` and `bytes`: a source batch that reports either as zero is
+refused before it reaches the core.
 `SnapshotAttachment<T>` owns `T` plus the source-proven attach barrier/cursor and
 retention-continuity certificate. The shell reserves its global byte permits
 **before** each source read. The source must enforce

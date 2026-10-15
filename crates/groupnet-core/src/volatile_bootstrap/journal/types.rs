@@ -194,6 +194,41 @@ pub struct NativeCut {
     pub sequence: u64,
 }
 
+/// A native writer's proven seal and the newer epoch it continues in, for
+/// [`DonorJournal::renew`]: the writer sealed its life exactly at `sealed`,
+/// the application applied that life through the seal, and the writer now
+/// continues in `epoch` from sequence zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeRenewal {
+    /// The sealed position; it must be exactly the writer's covered cut.
+    pub sealed: NativeCut,
+    /// The newer epoch the writer continues in; must exceed `sealed.epoch`.
+    pub epoch: u64,
+}
+
+/// Encoded and decoded byte sizes of one private index image; the journal
+/// never admits an empty image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageSize {
+    /// Encoded image bytes.
+    pub encoded_bytes: NonZeroUsize,
+    /// Decoded private image bytes.
+    pub decoded_bytes: NonZeroUsize,
+}
+
+/// What [`DonorJournal::begin_capture`] admits before the adapter clones the
+/// index at C.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturePlan {
+    /// Planned image budgets, each at most its [`JournalConfig`] maximum;
+    /// [`DonorJournal::finish_capture`] may report less, never more.
+    pub image: ImageSize,
+    /// Exact complete member identities at C, sorted by node.
+    pub members: Vec<BootstrapMemberIdentity>,
+    /// Exact native per-writer cuts at C, sorted by writer.
+    pub cuts: Vec<NativeCut>,
+}
+
 /// Stable mutation identity; every index effect must enter the journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeltaIdentity {
@@ -377,10 +412,8 @@ pub enum ReservationStage {
 /// logical suffix limit. This copyable value does not own heap capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureCharge {
-    /// Current encoded private image bytes.
-    pub encoded_bytes: usize,
-    /// Current decoded private image bytes.
-    pub decoded_bytes: usize,
+    /// Current private image bytes.
+    pub image: ImageSize,
     /// Logical identity-plus-effect suffix limit, excluding retained journal
     /// headers, barrier copies, and vector capacity.
     pub suffix_bytes: usize,

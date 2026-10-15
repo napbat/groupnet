@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use super::tests::{comparison, cursor, engine, receipt, registration_op, request};
 use crate::Time;
 use crate::replication::{
@@ -97,8 +99,8 @@ fn batch() -> Batch {
             certificate: vec![4],
         },
         payload_id: 1,
-        events: 1,
-        bytes: 8,
+        events: NonZeroUsize::MIN,
+        bytes: NonZeroUsize::new(8).unwrap(),
         advance: comparison(cursor(1), cursor(2), Comparison::Before),
         end_to_head: comparison(cursor(2), cursor(3), Comparison::Before),
     }

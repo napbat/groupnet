@@ -1,5 +1,6 @@
 //! Exact network phase mapping; all retry and deadline decisions stay in core.
 
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use groupnet_core::volatile_bootstrap::transfer::{TransferEffect, TransferEvent};
@@ -105,12 +106,10 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
                 };
                 let reply = self.request(context, op, &request, deadline).await?;
                 let chunk = reply.try_map(|reply| match reply {
-                    WireReply::Chunk(chunk) if !chunk.is_empty() && chunk.len() <= max_bytes => {
-                        Ok(chunk)
-                    }
+                    WireReply::Chunk(chunk) if chunk.len() <= max_bytes => Ok(chunk),
                     _ => Err(MALFORMED),
                 })?;
-                let bytes = chunk.get().len();
+                let bytes = NonZeroUsize::new(chunk.get().len()).ok_or(MALFORMED)?;
                 let decoded_charge = self.state.store_chunk(sequence, &chunk, resources).await?;
                 Ok(Some(chunk.map(|_| TransferEvent::ChunkStored {
                     op,
