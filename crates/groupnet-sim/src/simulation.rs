@@ -146,7 +146,7 @@ pub struct Simulation {
     /// durability would provide. Keyed by granter, and deliberately *not* held
     /// inside the engine, so it survives [`crash`](Self::crash) and can be fed
     /// back through
-    /// [`GroupEngine::with_recovered`](groupnet_core::GroupEngine::with_recovered).
+    /// [`RecoveringEngine::restore`](groupnet_core::RecoveringEngine::restore).
     persisted_grants: BTreeMap<NodeId, (u64, NodeId)>,
     /// Every grant frame this sim has seen **issued** — `(when, granter,
     /// epoch, claimant)`, appended at dispatch rather than at delivery, so a
@@ -320,7 +320,7 @@ impl Simulation {
     ///
     /// Survives [`crash`](Self::crash) — that is the whole point of it — so a
     /// restart test reads it here and hands it back through
-    /// [`GroupEngine::with_recovered`](groupnet_core::GroupEngine::with_recovered).
+    /// [`RecoveringEngine::restore`](groupnet_core::RecoveringEngine::restore).
     #[must_use]
     pub fn persisted_grant_of(&self, node: &NodeId) -> Option<(u64, NodeId)> {
         self.persisted_grants.get(node).cloned()

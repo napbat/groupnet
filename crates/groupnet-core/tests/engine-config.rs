@@ -4,7 +4,7 @@
 
 use std::num::{NonZeroU64, NonZeroUsize};
 
-use groupnet_core::{Config, ConfigError, GroupEngine, GroupId, NodeId, Time};
+use groupnet_core::{Config, ConfigError, GroupEngine, GroupId, NodeId, RecoveredGrant, Time};
 
 fn ids(names: &[&str]) -> Vec<NodeId> {
     names.iter().map(|name| NodeId::new(*name)).collect()
@@ -18,6 +18,32 @@ fn new_rejects_an_invalid_config_with_its_rule() {
     };
     let result = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], config);
     assert_eq!(result.err(), Some(ConfigError::ZeroGossipInterval));
+}
+
+/// The restarting voter's constructor validates exactly as `new` does, before
+/// any recovered state is applied: the smallest valid interval builds, one
+/// below it is refused with its rule.
+#[test]
+fn recovering_validates_the_config_like_new() {
+    let config = |gossip_interval_ms| Config {
+        gossip_interval_ms,
+        ..Config::default()
+    };
+    let refused = GroupEngine::recovering(GroupId::new("g"), NodeId::new("a"), [], config(0));
+    assert_eq!(refused.err(), Some(ConfigError::ZeroGossipInterval));
+
+    let mut engine =
+        GroupEngine::recovering(GroupId::new("g"), NodeId::new("a"), ids(&["b"]), config(1))
+            .expect("the smallest positive interval is valid")
+            .restore(RecoveredGrant::none());
+    engine.start(Time::ZERO);
+    assert_eq!(engine.net_stats().digests_built, 1);
+    engine.on_tick(Time(1));
+    assert_eq!(
+        engine.net_stats().digests_built,
+        2,
+        "the restored engine runs the boundary interval exactly as given"
+    );
 }
 
 /// `gossip_interval_ms` is the one cadence of the digest/delta round: a round

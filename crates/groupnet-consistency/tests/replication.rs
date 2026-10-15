@@ -149,14 +149,19 @@ impl SourceAdapter for MemSource {
         self.scans.fetch_add(1, Ordering::Relaxed);
         let head = self.position(&proof.head)?;
         let through = head.min(from.saturating_add(limit.events as u64));
-        let events = usize::try_from(through - from).expect("bounded by limit");
+        let nothing = || AdapterFailure::Terminal(io::Error::other("nothing retained past from"));
+        let events = usize::try_from(through - from)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(nothing)?;
+        let bytes = NonZeroUsize::new(events.get().min(limit.bytes)).ok_or_else(nothing)?;
         Ok(SourceBatch {
             from,
             through,
             proof: proof.id,
             certificate: vec![1],
             events,
-            bytes: events.min(limit.bytes),
+            bytes,
             native: through,
         })
     }

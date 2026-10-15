@@ -168,7 +168,7 @@ pub enum Activation {
     /// claimant for a lease after each grant. That promise is durable when the
     /// driver honours
     /// [`Effect::PersistGrant`](crate::Effect::PersistGrant) (see
-    /// [`GroupEngine::with_recovered`](crate::GroupEngine::with_recovered));
+    /// [`GroupEngine::recovering`](crate::GroupEngine::recovering));
     /// with no store it rests on the post-restart grant blackout, which is a
     /// timing rule rather than a durability one.
     Quorum {

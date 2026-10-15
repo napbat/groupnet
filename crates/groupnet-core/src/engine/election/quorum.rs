@@ -111,7 +111,7 @@
 //! order of strength:
 //!
 //! * **Persisted grants.** [`Effect::PersistGrant`] is emitted before the grant
-//!   frame is sent, and [`GroupEngine::with_recovered`] restores the pair on
+//!   frame is sent, and [`GroupEngine::recovering`] restores the pair on
 //!   boot. This is the posture for any deployment with a store.
 //! * **The boot blackout.** A freshly started voter arms
 //!   `grant_promise_until` one `lease_ms` out, so it refuses every *new*
@@ -129,6 +129,10 @@ use crate::config::{Activation, VoterRoster};
 use crate::{Effect, GroupEngine, NodeId, Time, wire};
 
 use super::{Election, Role};
+
+mod recovery;
+
+pub use recovery::RecoveringEngine;
 
 /// The Quorum-activation state: this node's voter ledger and the grant round it
 /// is currently collecting. Allocated exactly when the group's activation is
@@ -233,7 +237,7 @@ impl QuorumState {
 /// What a restarting voter's storage says it had granted before the crash —
 /// the durable half of Quorum's one-grant-per-epoch rule.
 ///
-/// Handed to [`GroupEngine::with_recovered`]. Meaningful **only** under
+/// Handed to [`RecoveringEngine::restore`]. Meaningful **only** under
 /// [`Activation::Quorum`]: a `Settle` or
 /// [`Eventual`](crate::GroupMode::Eventual) group has no voter ledger to
 /// restore and ignores it entirely.
@@ -312,35 +316,6 @@ impl Election {
 }
 
 impl GroupEngine {
-    /// Restores **a voter's persisted grant** into a freshly built engine, for
-    /// a driver that provides durability under
-    /// [`Activation::Quorum`](crate::Activation::Quorum):
-    /// `GroupEngine::new(group, local, seeds, config)?.with_recovered(grant)`.
-    ///
-    /// Apply it before [`start`](GroupEngine::start), to the engine
-    /// [`new`](GroupEngine::new) returned, with exactly what the store holds,
-    /// so the ledger is a floor from the first tick. Unless the group's
-    /// activation is `Quorum` the engine is returned unchanged — a `Settle` or
-    /// [`Eventual`](crate::GroupMode::Eventual) group has no voter ledger, so
-    /// `recovered` is ignored rather than half-applied.
-    ///
-    /// See [`RecoveredGrant`] for the contract, and in particular for why
-    /// recovery restores the granted **pair** and not the instant it was
-    /// granted at.
-    #[must_use]
-    pub fn with_recovered(mut self, recovered: RecoveredGrant) -> Self {
-        if let Some(q) = self.quorum_mut() {
-            match recovered.0 {
-                // Attested never-granted: nothing to restore, and the boot
-                // blackout is what durability was standing in for.
-                None => q.grant_promise_until = Time::ZERO,
-                // The pair is a floor; the blackout still runs from `start`.
-                Some(pair) => q.granted = Some(pair),
-            }
-        }
-        self
-    }
-
     /// The `(epoch, claimant)` pair this node has granted as a voter, if any.
     ///
     /// `None` outside [`Activation::Quorum`](crate::Activation::Quorum), for a

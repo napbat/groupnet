@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 use groupnet_core::replication::{BoundComparison, Cursor, ProofId, Refusal, Scope, SourceProof};
 
@@ -68,6 +69,10 @@ pub struct CheckpointLimit {
 }
 
 /// Source records remain native and private to the shell until guarded apply.
+///
+/// A batch always makes progress: it covers at least one committed record and
+/// charges at least one byte. A source with nothing retained past `from` has
+/// no batch to return and reports that as an [`AdapterFailure`] instead.
 #[derive(Debug)]
 pub struct SourceBatch<P, B> {
     /// Exclusive prior native position.
@@ -78,10 +83,12 @@ pub struct SourceBatch<P, B> {
     pub proof: ProofId,
     /// Locally verified opaque contiguity certificate.
     pub certificate: Vec<u8>,
-    /// Number of committed records covered.
-    pub events: usize,
-    /// Bytes charged to the configured replay budget.
-    pub bytes: usize,
+    /// Number of committed records covered; at most the request's
+    /// [`ScanLimit::events`].
+    pub events: NonZeroUsize,
+    /// Bytes charged to the configured replay budget; at most the request's
+    /// [`ScanLimit::bytes`].
+    pub bytes: NonZeroUsize,
     /// Application-native replay window, private fork, or record collection.
     pub native: B,
 }

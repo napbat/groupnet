@@ -49,8 +49,9 @@
 //! these.
 //!
 //! * **The group engine:** [`GroupEngine`], the [`Command`]s it accepts, the
-//!   [`Effect`]s it returns, [`Time`] (its logical clock), and
-//!   [`RecoveredGrant`] (durable voter state handed back on restart).
+//!   [`Effect`]s it returns, [`Time`] (its logical clock),
+//!   [`RecoveredGrant`] (durable voter state handed back on restart) and
+//!   [`RecoveringEngine`] (the restarting voter's engine that takes it).
 //! * **The wire:** [`wire`], the frame codec that drivers move between engines.
 //! * **External activation:** [`anchor`], the CAS-anchor records and decision
 //!   rules for [`Activation::External`].
@@ -76,7 +77,9 @@ pub mod volatile_recovery;
 pub mod wire;
 
 pub use config::{Activation, Config, ConfigError, GroupMode, HostedConfig, VoterRoster};
-pub use engine::{Command, Effect, GroupEngine, NetStats, RecoveredGrant, Role, VersionedValue};
+pub use engine::{
+    Command, Effect, GroupEngine, NetStats, RecoveredGrant, RecoveringEngine, Role, VersionedValue,
+};
 pub use id::{GroupId, NodeId};
 pub use membership::Status;
 pub use time::Time;

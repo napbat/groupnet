@@ -553,7 +553,7 @@ impl DonorJournal {
         self.state = JournalState::Capturing;
         Ok(CaptureCharge {
             image,
-            suffix_bytes: self.config.max_suffix_bytes.get(),
+            suffix_bytes: self.config.max_suffix_bytes,
             started: now,
         })
     }
@@ -579,7 +579,7 @@ impl DonorJournal {
         }
         self.charge = Some(CaptureCharge {
             image: actual,
-            suffix_bytes: self.config.max_suffix_bytes.get(),
+            suffix_bytes: self.config.max_suffix_bytes,
             started: self.capture_started.ok_or(JournalError::Stage)?,
         });
         self.state = JournalState::Active;

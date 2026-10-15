@@ -3,11 +3,29 @@
 use std::future::Future;
 use std::time::Instant;
 
+use groupnet_core::Time;
 use groupnet_core::replication::{
     HoldReceipt, Operation, Scope, SnapshotConfig, SnapshotOffer, SourceProof,
 };
 
 use super::api::{AdapterFailure, ApplicationAdapter, Checkpoint, CheckpointLimit, SourceAdapter};
+
+/// One source-hold acquisition, as handed to
+/// [`SnapshotSourceAdapter::acquire_hold`]: the acquire operation, its
+/// deadline in both clocks, and the snapshot bounds the hold serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotHoldRequest {
+    /// The core's acquire operation; the returned [`HoldReceipt`] must be
+    /// bound to it.
+    pub operation: Operation,
+    /// Absolute logical deadline of the whole snapshot attempt; the receipt
+    /// must conservatively cover it from before this request began.
+    pub total_due: Time,
+    /// The runtime instant corresponding to `total_due`.
+    pub wall_deadline: Instant,
+    /// The configured snapshot bounds.
+    pub limit: SnapshotConfig,
+}
 
 /// A finite source retention hold obtained before selecting the snapshot cut.
 #[derive(Debug)]
@@ -67,15 +85,13 @@ pub trait SnapshotSourceAdapter: SourceAdapter {
     /// Attached native continuation.
     type Attachment: Send + 'static;
 
-    /// Acquires a source hold before the snapshot cut is chosen. The receipt
-    /// must conservatively cover `total_due` from before this request began.
+    /// Acquires a source hold for `scope` before the snapshot cut is chosen.
+    /// The receipt must conservatively cover `request.total_due` from before
+    /// this request began.
     fn acquire_hold(
         &self,
         scope: Scope,
-        request: Operation,
-        total_due: groupnet_core::Time,
-        wall_deadline: Instant,
-        limit: SnapshotConfig,
+        request: SnapshotHoldRequest,
     ) -> impl Future<Output = Result<SnapshotHold<Self::Hold>, AdapterFailure<Self::Error>>> + Send;
 
     /// Offers a source-certified consistent cut and a bounded image reader.

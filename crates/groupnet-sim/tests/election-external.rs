@@ -20,7 +20,7 @@
 //!   headline. 128 seeds of the full fault menu — crashes, *amnesiac* restarts,
 //!   partitions, heals, loss, reorder, anchor outages, clock skew — and **no
 //!   epoch is ever activated by two nodes**, across the whole run and both
-//!   sides of every partition. No `with_recovered`, no persisted anything: the
+//!   sides of every partition. No recovered grant, no persisted anything: the
 //!   property is unconditional because the anchor allocates the epoch, so there
 //!   is nothing for a restart to forget. That is strictly stronger than
 //!   `Quorum`'s S1-strict, which is storage-conditional (see

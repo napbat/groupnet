@@ -207,11 +207,11 @@ impl Node {
 
     /// Builds a group's engine from its effective `config`.
     ///
-    /// A profile carrying voter storage refines the fresh engine with
-    /// `with_recovered` before it starts, so the ledger is a floor from the
-    /// first tick rather than something applied after the boot blackout has
-    /// already been armed. Outside `Activation::Quorum` the refinement is a
-    /// no-op — a group with no voter ledger has nothing to restore.
+    /// A profile carrying voter storage builds a recovering engine and restores
+    /// it before it can start, so the ledger is a floor from the first tick
+    /// rather than something applied after the boot blackout has already been
+    /// armed. Outside `Activation::Quorum` the restore is a no-op — a group
+    /// with no voter ledger has nothing to restore.
     fn build_engine(
         &self,
         group: &GroupId,
@@ -222,15 +222,19 @@ impl Node {
         // so the node config `NodeBuilder::start` validated stays valid here.
         const VALIDATED: &str = "NodeBuilder::start validated the node config, and \
                                  Config::validate does not inspect the per-group mode";
+        let (group, local) = (group.clone(), self.inner.id.clone());
         let seeds = self.inner.seeds.iter().cloned();
-        let engine = GroupEngine::new(group.clone(), self.inner.id.clone(), seeds, config.clone())
-            .expect(VALIDATED);
         match storage {
             Some(storage) => (
-                engine.with_recovered(storage.recovered),
+                GroupEngine::recovering(group, local, seeds, config.clone())
+                    .expect(VALIDATED)
+                    .restore(storage.recovered),
                 Some(storage.store),
             ),
-            None => (engine, None),
+            None => (
+                GroupEngine::new(group, local, seeds, config.clone()).expect(VALIDATED),
+                None,
+            ),
         }
     }
 

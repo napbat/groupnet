@@ -412,11 +412,17 @@ fn image_admission_precedes_clone_and_retains_exact_cut() {
     assert_eq!(journal.state(), JournalState::Capturing);
     assert_eq!(journal.current_cursor(), None);
     assert_eq!(admission.image, image(64, 64));
+    assert_eq!(admission.suffix_bytes, config().max_suffix_bytes);
     let cut = journal.finish_capture(Time(2), image(20, 24)).unwrap();
     assert_eq!(journal.image_charge().unwrap().image, image(20, 24));
     assert_eq!(cut.position, 0);
     assert_eq!(cut.capture, capture_id());
     assert_eq!(journal.image_charge().unwrap().started, Time(1));
+    assert_eq!(
+        journal.image_charge().unwrap().suffix_bytes,
+        config().max_suffix_bytes,
+        "the charged suffix keeps the configured nonzero limit"
+    );
     assert_eq!(journal.state(), JournalState::Active);
 
     let (mut too_large, _) = captured();

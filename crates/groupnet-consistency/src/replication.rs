@@ -55,6 +55,6 @@ pub use shell::{
 };
 pub use snapshot_api::{
     NativeSnapshot, ReplayOnly, SnapshotApplicationAdapter, SnapshotAttachment, SnapshotHold,
-    SnapshotImage, SnapshotSourceAdapter, SnapshotStage,
+    SnapshotHoldRequest, SnapshotImage, SnapshotSourceAdapter, SnapshotStage,
 };
 pub use subscription_api::{DurableEventSink, DurableSubscriptionSource, SubscriptionSourceResult};

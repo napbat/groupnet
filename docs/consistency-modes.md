@@ -531,9 +531,11 @@ CP path.
   persistent-vote problem). Raft solves it by *requiring* a persisted vote;
   that is the one place this design deviates from the standard safety model,
   and the deviation must not be the default posture. The rule: **a driver
-  with durable storage persists the grant** (a boot-time refinement,
-  `GroupEngine::new(..)?.with_recovered(grant)`, restores it — docres-shaped
-  deployments always have a store); the **post-restart grant blackout** — a
+  with durable storage persists the grant** (recovery is a construction
+  input: `GroupEngine::recovering(..)?.restore(grant)` restores it, and the
+  `RecoveringEngine` in between can neither start nor be re-entered by a
+  running engine, so a recovered pair can never be applied after boot —
+  docres-shaped deployments always have a store); the **post-restart grant blackout** — a
   freshly booted voter refuses to grant for ≥ `lease_ms` — is the documented
   fallback for genuinely storage-free deployments, converting durability
   into a timing rule DST can prove sufficient in logical time (but which,
@@ -559,7 +561,7 @@ CP path.
 Status: **delivered (pending review)** — `Activation::Quorum { voters }` +
 `VoterRoster`, the voter ledger and grant rounds in
 `engine/election/quorum.rs`, `Effect::PersistGrant`, `RecoveredGrant` +
-`GroupEngine::with_recovered` in `groupnet-core`; the `GrantStore` trait,
+`GroupEngine::recovering` / `RecoveringEngine::restore` in `groupnet-core`; the `GrantStore` trait,
 its bundled durable implementation `FileGrantStore` (one checksummed record,
 replaced by temp-file + `fsync` + rename) and the `VoterStorage` that only
 `GroupProfile::Quorum` carries, in `groupnet-runtime`. The as-built rules
