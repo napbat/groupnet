@@ -55,9 +55,10 @@
 //! `handoff`, module `hosted::handoff`) is the way out: pull a covering snapshot
 //! from a donor over the data plane's `BulkTransport` and verify it at three
 //! points — the donor's fence stamp, its coverage of what was needed, and the
-//! transfer's own counts. It is the only feature here that touches the data
-//! plane, and its honesty box is blunt about what verification can and cannot
-//! prove.
+//! transfer's own counts. It is one of the two features here that touch the
+//! data plane — the other is `volatile-bootstrap-bulk`, volatile recovery's
+//! opt-in peer bootstrap transfer — and its honesty box is blunt about what
+//! verification can and cannot prove.
 //!
 //! Sitting beside both, priced at nothing and gated by nothing, are
 //! **typed watermarks**: [`SeqFloors`] publishes per-node, per-key floors in
@@ -70,16 +71,21 @@
 //!
 //! # Application API
 //!
-//! The crate root carries the handles an application holds and the values
-//! their signatures name: [`WriteFeed`], [`PeerWrites`], [`Frontier`],
-//! [`SeqFloors`], the ack tier's `AckLedger` and waits, the lease tier's
-//! `Leases` / `LeaseView`, the Hosted tier's `HostedWrites` / `HostedReads` /
-//! `CommitLedger`, and the handoff tier's `Handoff` with its snapshot adapter
-//! traits — plus [`Group`], the runtime handle every one of them is built on.
-//! Source-backed replication and volatile recovery are opt-in tiers with
-//! adapter-shaped APIs, so they live entirely under their modules
-//! (`replication`, `volatile_recovery`), each re-exporting the domain types
-//! its adapter traits name.
+//! The crate root carries the session tier's handles and the values their
+//! signatures name — [`WriteFeed`], [`PeerWrites`], [`Frontier`],
+//! [`SeqFloors`] and the ack tier's `AckLedger` and waits — plus [`Group`],
+//! the runtime handle every tier is built on, and the sibling-crate types the
+//! tiers' signatures name: `QueueCapacity`, and the data plane's
+//! `DataPlane`, `BulkTransport`, `DataStream` and `Bytes` under `handoff` or
+//! `volatile-bootstrap-bulk`.
+//!
+//! Every tier with its own module keeps its whole API at that one path: the
+//! lease tier's `lease::Leases` / `lease::LeaseView`, the Hosted tier's
+//! `hosted::HostedWrites` / `hosted::HostedReads` / `hosted::CommitLedger`,
+//! the handoff tier's `hosted::handoff::Handoff` with its snapshot adapter
+//! traits, and the adapter-shaped source-backed replication and volatile
+//! recovery tiers (`replication`, `volatile_recovery`), each re-exporting the
+//! domain types its adapter traits name.
 //!
 //! Every publication reports what it did **locally**: a feed write, a seal or
 //! a ledger advance is recorded first, then *enqueued* into the group actor's
@@ -92,9 +98,9 @@
 //! The sans-IO cores the shells are built on — `hosted::CommitCore` and
 //! `hosted::CompletenessCore`, `hosted::handoff::HandoffCore`,
 //! `lease::LeaseCore`, `lease::CoherenceCore` and `lease::GrantLedger`, and
-//! the entry codecs next to them — stay public for custom drivers and the
-//! deterministic simulator, but only at their tier module path. An
-//! application never needs them.
+//! the entry codecs next to them — stay public beside their tier's
+//! application handles, for custom drivers and the deterministic simulator.
+//! An application never needs them.
 //!
 //! # What you get — and what you deliberately don't
 //!
@@ -294,14 +300,18 @@ pub mod volatile_recovery;
 mod wait;
 mod wire;
 
-// Application handles and the values their signatures name. Protocol-driver
-// cores (sans-IO state machines, codecs, ledger views) stay at their tier
-// module path: `hosted::`, `hosted::handoff::`, `lease::`.
+// The session tier's handles and the values their signatures name. A tier with
+// its own public module (`hosted`, `hosted::handoff`, `lease`, `replication`,
+// `volatile_recovery`) keeps its items at that one path.
 #[cfg(feature = "acks")]
 pub use acks::{
     AckBasis, AckLedger, AckOutcome, AckWait, CAP_ACKS, applied_by, applied_by_roster,
     applied_by_selected, applied_cluster_wide,
 };
+/// The payload type the data plane's frames and the handoff tier's snapshot
+/// chunks carry, re-exported so an adapter needs no direct `bytes` dependency.
+#[cfg(any(feature = "handoff", feature = "volatile-bootstrap-bulk"))]
+pub use bytes::Bytes;
 pub use feed::{PublishError, Unadvertised, WriteFeed};
 pub use floor::{SeqFloors, SeqFloorsError};
 pub use frontier::{Frontier, FrontierView};
@@ -312,21 +322,10 @@ pub use groupnet_runtime::{CommandRejected, Group};
 // configurations name.
 #[cfg(any(feature = "replication", feature = "volatile-recovery"))]
 pub use groupnet_transport::QueueCapacity;
-#[cfg(feature = "handoff")]
-pub use hosted::handoff::{
-    ChunkLimit, ChunkLimitError, Handoff, HandoffError, HandoffReceipt, Snapshot, SnapshotChunks,
-    SnapshotSink, SnapshotSource,
-};
-#[cfg(feature = "hosted")]
-pub use hosted::{
-    CAP_HOSTED, Commit, CommitLedger, CommitOutcome, CommitReceipt, Completeness, Fence,
-    HostedError, HostedRead, HostedReads, HostedSetupError, HostedWrites,
-};
-#[cfg(feature = "leases")]
-pub use lease::{
-    CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseConfigError, LeaseStartError, LeaseState,
-    LeaseView, Leases, LeasesBuilder,
-};
+/// The data plane the handoff tier and the volatile-bootstrap bulk adapter
+/// take and stream over, re-exported so a caller can name it here.
+#[cfg(any(feature = "handoff", feature = "volatile-bootstrap-bulk"))]
+pub use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
 pub use peers::{
     InvalidFeedHead, PeerWrite, PeerWrites, advertised_head, advertised_head_named,
     checked_advertised_head, checked_advertised_head_named,

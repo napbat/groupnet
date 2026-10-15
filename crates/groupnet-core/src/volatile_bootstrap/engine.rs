@@ -435,8 +435,8 @@ impl ClaimEngine {
         }
         effects.push(BootstrapEffect::ObserveClaims {
             op,
-            max_members: self.config.max_members.get(),
-            max_member_bytes: self.config.max_member_bytes.get(),
+            max_members: self.config.max_members,
+            max_member_bytes: self.config.max_member_bytes,
         });
         self.ok(effects)
     }

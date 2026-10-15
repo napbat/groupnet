@@ -6,6 +6,7 @@ use std::future::ready;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use groupnet_consistency::DataPlane;
 use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, Admitted, ByteAdmission,
@@ -19,19 +20,18 @@ use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
 };
 use groupnet_consistency::volatile_recovery::bootstrap::inbox::DonorInbox;
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{
-    DonorCapture, DonorPort, DonorReply, DonorRequest, JournalIngress, LocalCaptureOutcome,
-    LocalCaptureRequest, TransferContext, TransferResources,
+    DonorCapture, DonorPort, DonorReply, DonorRequest, EffectContext, JournalIngress,
+    LocalCaptureOutcome, LocalCaptureRequest, TransferContext, TransferResources,
 };
 use groupnet_consistency::volatile_recovery::bootstrap::{
     AttachToken, BootId, BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, CaptureId,
     ClaimIdentity, DeltaIdentity, DonorJournal, JournalBatch, JournalConfig, JournalCursor,
     PresenceIdentity, ReservationId, TransferConfig, TransferConfigError, TransferOffer,
 };
-use groupnet_consistency::volatile_recovery::{AdapterError, AdapterErrorKind, PublicationPermit};
+use groupnet_consistency::volatile_recovery::{AdapterError, AdapterErrorKind};
 use groupnet_core::Time;
 use groupnet_core::volatile_bootstrap::transfer::{TransferEffect, TransferEvent};
 use groupnet_core::{NodeId, Status};
-use groupnet_transport::bulk::DataPlane;
 use groupnet_transport_mem::MemBulkNet;
 use tokio::sync::{Notify, watch};
 
@@ -106,12 +106,9 @@ impl BootstrapStatePort for PrivateState {
 
     fn execute_local(
         &self,
-        _context: &TransferContext,
         _effect: TransferEffect,
         _resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-        _admission: &ByteAdmission,
-        _permit: Option<PublicationPermit>,
-        _deadline: Instant,
+        _context: EffectContext<'_>,
     ) -> impl Future<Output = Result<Option<Admitted<TransferEvent>>, AdapterError>> + Send {
         ready(Err(AdapterErrorKind::Unsupported.into()))
     }
@@ -279,15 +276,17 @@ async fn wrong_admission_pool_is_rejected_before_network_allocation() {
     let mut resources = TransferResources::default();
     let result = adapter
         .execute(
-            &context,
             TransferEffect::FetchOffer {
                 op: op(32),
                 max_metadata_bytes: 512,
             },
             &mut resources,
-            &foreign,
-            None,
-            Instant::now() + Duration::from_secs(1),
+            EffectContext {
+                transfer: &context,
+                admission: &foreign,
+                permit: None,
+                deadline: Instant::now() + Duration::from_secs(1),
+            },
         )
         .await;
     assert_eq!(result.unwrap_err().kind(), AdapterErrorKind::InvalidInput);
@@ -470,17 +469,20 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
     .unwrap();
     let mut resources = TransferResources::default();
     let due = Instant::now() + Duration::from_secs(3);
+    let call = || EffectContext {
+        transfer: &context,
+        admission: &worker_budget,
+        permit: None,
+        deadline: due,
+    };
     let offer_event = adapter
         .execute(
-            &context,
             TransferEffect::FetchOffer {
                 op: op(32),
                 max_metadata_bytes: 512,
             },
             &mut resources,
-            &worker_budget,
-            None,
-            due,
+            call(),
         )
         .await
         .unwrap()
@@ -489,16 +491,13 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
     drop(offer_event);
     let reserve_event = adapter
         .execute(
-            &context,
             TransferEffect::ReserveDonor {
                 op: op(33),
                 capture,
                 cut,
             },
             &mut resources,
-            &worker_budget,
-            None,
-            due,
+            call(),
         )
         .await
         .unwrap()
@@ -510,16 +509,13 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
     drop(reserve_event);
     let chunk_event = adapter
         .execute(
-            &context,
             TransferEffect::FetchChunk {
                 op: op(34),
                 sequence: 0,
                 max_bytes: 8,
             },
             &mut resources,
-            &worker_budget,
-            None,
-            due,
+            call(),
         )
         .await
         .unwrap()
@@ -531,15 +527,12 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
     drop(chunk_event);
     let attach_event = adapter
         .execute(
-            &context,
             TransferEffect::AttachStream {
                 op: op(35),
                 reservation: reservation.clone(),
             },
             &mut resources,
-            &worker_budget,
-            None,
-            due,
+            call(),
         )
         .await
         .unwrap()
@@ -553,12 +546,9 @@ async fn mapped_network_phases_keep_exact_resources_and_charges() {
     assert!(
         adapter
             .execute(
-                &context,
                 TransferEffect::ReleaseReservation(reservation),
                 &mut resources,
-                &worker_budget,
-                None,
-                due
+                call(),
             )
             .await
             .unwrap()

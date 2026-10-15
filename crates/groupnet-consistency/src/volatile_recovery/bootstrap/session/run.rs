@@ -6,7 +6,7 @@ use super::{
     TransferContext, TransferEffect, TransferEvent, TransferResources,
 };
 use crate::volatile_recovery::bootstrap::ports::{
-    LocalCaptureOutcome, LocalCaptureRequest, ReadyCaptureRequest,
+    EffectContext, LocalCaptureOutcome, LocalCaptureRequest, ReadyCaptureRequest,
 };
 use groupnet_core::volatile_bootstrap::{
     BootstrapMemberIdentity, BootstrapParticipant, ClaimIdentity, ParticipationCut,
@@ -67,8 +67,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
         let op = self.engine.begin_roster_observation().ok()?;
         let operation_due = self.operation_due(op, due)?;
         let limits = self.claim_limits(
-            self.config.claim.max_members.get(),
-            self.config.claim.max_member_bytes.get(),
+            self.config.claim.max_members,
+            self.config.claim.max_member_bytes,
         );
         let snapshot = tokio::time::timeout_at(
             tokio::time::Instant::from_std(operation_due),
@@ -530,8 +530,8 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
             BootstrapEffect::ObserveSelectedClaim { op, selected } => {
                 let operation_due = self.operation_due(op, due)?;
                 let limits = self.claim_limits(
-                    self.config.claim.max_members.get(),
-                    self.config.claim.max_member_bytes.get(),
+                    self.config.claim.max_members,
+                    self.config.claim.max_member_bytes,
                 );
                 let observed = tokio::time::timeout_at(
                     tokio::time::Instant::from_std(operation_due),
@@ -743,12 +743,14 @@ impl<C: ClaimSource, D: DonorPort> BootstrapSession<C, D> {
                     let _ = tokio::time::timeout_at(
                         tokio::time::Instant::from_std(retire_due),
                         self.donor.execute(
-                            context,
                             *effect,
                             &mut self.resources,
-                            &self.admission,
-                            None,
-                            retire_due,
+                            EffectContext {
+                                transfer: context,
+                                admission: &self.admission,
+                                permit: None,
+                                deadline: retire_due,
+                            },
                         ),
                     )
                     .await;

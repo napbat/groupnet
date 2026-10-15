@@ -52,13 +52,14 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use groupnet_consistency::hosted::handoff::{Bytes, DataPlane};
-use groupnet_consistency::hosted::{Completeness, Watermarks};
-use groupnet_consistency::{
-    CAP_HOSTED, ChunkLimit, Commit, CommitLedger, CommitOutcome, Frontier, FrontierView, Handoff,
-    HandoffReceipt, HostedError, HostedRead, HostedReads, HostedWrites, Snapshot, SnapshotChunks,
-    SnapshotSink, SnapshotSource, WriteToken,
+use groupnet_consistency::hosted::handoff::{
+    ChunkLimit, Handoff, HandoffReceipt, Snapshot, SnapshotChunks, SnapshotSink, SnapshotSource,
 };
+use groupnet_consistency::hosted::{
+    CAP_HOSTED, Commit, CommitLedger, CommitOutcome, Completeness, HostedError, HostedRead,
+    HostedReads, HostedWrites, Watermarks,
+};
+use groupnet_consistency::{Bytes, DataPlane, Frontier, FrontierView, WriteToken};
 use groupnet_core::{NodeId, Role, VoterRoster, placement};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};

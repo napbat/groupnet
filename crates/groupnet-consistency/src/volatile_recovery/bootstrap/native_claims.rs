@@ -36,9 +36,9 @@ fn allocation(error: std::collections::TryReserveError) -> AdapterError {
     AdapterError::with_source(AdapterErrorKind::Capacity, error)
 }
 
-/// A caller bound the runtime requires nonzero.
-fn nonzero(bytes: usize) -> Result<NonZeroUsize, AdapterError> {
-    NonZeroUsize::new(bytes).ok_or_else(|| AdapterErrorKind::InvalidInput.into())
+/// A scoped entry key's length: the codecs never produce an empty key.
+fn key_bytes(key: &str) -> Result<NonZeroUsize, AdapterError> {
+    NonZeroUsize::new(key.len()).ok_or(MALFORMED)
 }
 
 /// A native remaining TTL in the policy's whole milliseconds, if present and
@@ -56,7 +56,7 @@ pub struct NativeClaimOptions {
     /// Claim limits; must pass [`BootstrapConfig::validate`].
     pub policy: BootstrapConfig,
     /// Maximum bytes in a scoped claim or presence entry key.
-    pub max_key_bytes: usize,
+    pub max_key_bytes: NonZeroUsize,
     /// Maximum bytes in one native claim entry value.
     pub max_value_bytes: NonZeroUsize,
 }
@@ -85,9 +85,9 @@ impl NativeClaimOptions {
         {
             return Err(NativeClaimSourceError::ScopeTooLong);
         }
-        let key = claim_entry_key(&self.scope, self.max_key_bytes)
+        let key = claim_entry_key(&self.scope, self.max_key_bytes.get())
             .map_err(NativeClaimSourceError::ClaimKey)?;
-        let presence_key = presence_entry_key(&self.scope, self.max_key_bytes)
+        let presence_key = presence_entry_key(&self.scope, self.max_key_bytes.get())
             .map_err(NativeClaimSourceError::PresenceKey)?;
         Ok((key, presence_key))
     }
@@ -156,7 +156,7 @@ pub struct NativeClaimSource {
     policy: BootstrapConfig,
     key: String,
     presence_key: String,
-    max_value_bytes: usize,
+    max_value_bytes: NonZeroUsize,
     admission: ByteAdmission,
     published: Mutex<Option<(ClaimIdentity, Admitted<Vec<u8>>)>>,
     presence_published: Mutex<Option<(PresenceIdentity, Admitted<Vec<u8>>)>>,
@@ -187,7 +187,7 @@ impl NativeClaimSource {
             policy,
             key,
             presence_key,
-            max_value_bytes: max_value_bytes.get(),
+            max_value_bytes,
             admission,
             published: Mutex::new(None),
             presence_published: Mutex::new(None),
@@ -198,29 +198,35 @@ impl NativeClaimSource {
         &self,
         limits: ClaimObservationLimits,
     ) -> Result<EntryInspectionLimits, AdapterError> {
-        if limits.max_members == 0
-            || limits.max_members > self.policy.max_members.get()
-            || limits.max_member_bytes == 0
-            || limits.max_member_bytes > self.policy.max_member_bytes.get()
-            || limits.max_metadata_bytes == 0
+        if limits.max_members > self.policy.max_members
+            || limits.max_member_bytes > self.policy.max_member_bytes
         {
             return Err(AdapterErrorKind::InvalidInput.into());
         }
         Ok(EntryInspectionLimits {
-            max_key_bytes: nonzero(self.key.len())?,
-            max_members: nonzero(limits.max_members)?,
-            max_member_bytes: nonzero(limits.max_member_bytes)?,
-            max_value_bytes: nonzero(self.max_value_bytes)?,
-            max_response_bytes: nonzero(limits.max_metadata_bytes)?,
+            max_key_bytes: key_bytes(&self.key)?,
+            max_members: limits.max_members,
+            max_member_bytes: limits.max_member_bytes,
+            max_value_bytes: self.max_value_bytes,
+            max_response_bytes: limits.max_metadata_bytes,
         })
     }
 
     /// Mutation bounds for `key` and this source's values.
     fn mutation_limits(&self, key: &str) -> Result<EntryMutationLimits, AdapterError> {
         Ok(EntryMutationLimits {
-            max_key_bytes: nonzero(key.len())?,
-            max_value_bytes: nonzero(self.max_value_bytes)?,
+            max_key_bytes: key_bytes(key)?,
+            max_value_bytes: self.max_value_bytes,
         })
+    }
+
+    /// The longer of the two scoped keys a pair inspection reads.
+    fn longer_key(&self) -> &str {
+        if self.key.len() >= self.presence_key.len() {
+            &self.key
+        } else {
+            &self.presence_key
+        }
     }
 
     async fn inspect(
@@ -234,6 +240,7 @@ impl NativeClaimSource {
         let inspection_limits = self.inspection_limits(limits)?;
         let raw_charge = limits
             .max_metadata_bytes
+            .get()
             .checked_add(self.key.len())
             .ok_or(CAPACITY)?;
         let raw_budget = admission.reserve(AdmissionClass::Inflight, raw_charge)?;
@@ -243,7 +250,7 @@ impl NativeClaimSource {
             .await
             .map_err(|_| UNAVAILABLE)?;
         let raw = raw_budget.hold(raw);
-        let converted_bytes = converted_charge(raw.get(), limits.max_metadata_bytes)?;
+        let converted_bytes = converted_charge(raw.get(), limits.max_metadata_bytes.get())?;
         let converted_budget = admission.reserve(AdmissionClass::Inflight, converted_bytes)?;
         let snapshot = raw.consume(|raw| self.convert(raw))?;
         Ok(converted_budget.hold(snapshot))
@@ -272,7 +279,7 @@ impl NativeClaimSource {
                         author: &entry.node,
                         value: &value,
                     },
-                    self.max_value_bytes,
+                    self.max_value_bytes.get(),
                 )
                 .map_err(|_| MALFORMED)?;
                 claim.remaining_ms = remaining_ms;
@@ -293,26 +300,26 @@ impl NativeClaimSource {
     }
 
     async fn exact_local_readback(&self, expected: &[u8]) -> Result<bool, AdapterError> {
-        let per_member = size_of::<groupnet_runtime::InspectedEntry>()
-            .checked_add(self.policy.max_member_bytes.get())
-            .and_then(|bytes| bytes.checked_add(self.max_value_bytes))
+        let per_member = self
+            .policy
+            .max_member_bytes
+            .checked_add(size_of::<groupnet_runtime::InspectedEntry>())
+            .and_then(|bytes| bytes.checked_add(self.max_value_bytes.get()))
             .ok_or(CAPACITY)?;
         let limits = ClaimObservationLimits {
-            max_members: self.policy.max_members.get(),
-            max_member_bytes: self.policy.max_member_bytes.get(),
-            max_metadata_bytes: size_of::<InspectedEntries>()
-                .checked_add(
-                    self.policy
-                        .max_members
-                        .get()
-                        .checked_mul(per_member)
-                        .ok_or(CAPACITY)?,
-                )
+            max_members: self.policy.max_members,
+            max_member_bytes: self.policy.max_member_bytes,
+            max_metadata_bytes: self
+                .policy
+                .max_members
+                .checked_mul(per_member)
+                .and_then(|bytes| bytes.checked_add(size_of::<InspectedEntries>()))
                 .ok_or(CAPACITY)?,
         };
         let inspection_limits = self.inspection_limits(limits)?;
         let raw_charge = limits
             .max_metadata_bytes
+            .get()
             .checked_add(self.key.len())
             .ok_or(CAPACITY)?;
         let budget = self
@@ -360,8 +367,9 @@ impl ClaimSource for NativeClaimSource {
             return Err(AdapterErrorKind::InvalidInput.into());
         }
         let mut published = self.published.lock().await;
-        let value_len = encoded_claim_len(&self.scope, self.policy, &claim, self.max_value_bytes)
-            .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
+        let value_len =
+            encoded_claim_len(&self.scope, self.policy, &claim, self.max_value_bytes.get())
+                .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
         let queued_bytes = self.key.len().checked_add(value_len).ok_or(CAPACITY)?;
         let queued = self
             .admission
@@ -369,8 +377,9 @@ impl ClaimSource for NativeClaimSource {
         let retained = self
             .admission
             .reserve(AdmissionClass::Inflight, value_len)?;
-        let value = encode_claim_value(&self.scope, self.policy, &claim, self.max_value_bytes)
-            .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
+        let value =
+            encode_claim_value(&self.scope, self.policy, &claim, self.max_value_bytes.get())
+                .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
         let value = retained.hold(value);
         let confirmed = self
             .group

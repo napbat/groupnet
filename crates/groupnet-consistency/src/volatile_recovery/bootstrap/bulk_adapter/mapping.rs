@@ -6,12 +6,12 @@ use groupnet_core::volatile_bootstrap::transfer::{TransferEffect, TransferEvent}
 use groupnet_transport::bulk::BulkTransport;
 
 use super::{BootstrapStatePort, BulkDonorPort};
-use crate::volatile_recovery::bootstrap::admission::{Admitted, ByteAdmission};
+use crate::volatile_recovery::bootstrap::admission::Admitted;
 use crate::volatile_recovery::bootstrap::bulk_wire::WireReply;
 use crate::volatile_recovery::bootstrap::ports::{
-    DonorRequest, TransferContext, TransferResources,
+    DonorRequest, EffectContext, TransferContext, TransferResources,
 };
-use crate::volatile_recovery::{AdapterError, AdapterErrorKind, PublicationPermit};
+use crate::volatile_recovery::{AdapterError, AdapterErrorKind};
 
 /// A donor reply of the wrong kind or bound to another reservation.
 const MALFORMED: AdapterError = AdapterError::new(AdapterErrorKind::Malformed);
@@ -26,17 +26,15 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
     )]
     pub(super) async fn execute_one(
         &self,
-        context: &TransferContext,
         effect: TransferEffect,
         resources: &mut TransferResources<
             A::Stage,
             groupnet_core::volatile_bootstrap::journal::AttachToken,
             A::NativeBuffer,
         >,
-        admission: &ByteAdmission,
-        permit: Option<PublicationPermit>,
-        deadline: Instant,
+        call: EffectContext<'_>,
     ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
+        let (context, deadline) = (call.transfer, call.deadline);
         if Instant::now() >= deadline {
             return Err(AdapterErrorKind::Expired.into());
         }
@@ -218,9 +216,7 @@ impl<A: BootstrapStatePort, B: BulkTransport> BulkDonorPort<A, B> {
             | TransferEffect::CheckNativeCoverage { .. }
             | TransferEffect::InstallCandidate { .. }
             | TransferEffect::DiscardStage { .. }) => {
-                self.state
-                    .execute_local(context, local, resources, admission, permit, deadline)
-                    .await
+                self.state.execute_local(local, resources, call).await
             }
             TransferEffect::ArmTimer(_) => Ok(None),
         }

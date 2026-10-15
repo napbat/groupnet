@@ -16,7 +16,7 @@
 //! with nothing to rebuild from and no honest option but to keep refusing
 //! service. This module is the way out: pull a **covering snapshot** from a peer
 //! that already holds one, over the data plane
-//! ([`BulkTransport`]), and verify what
+//! ([`BulkTransport`](crate::BulkTransport)), and verify what
 //! arrives before adopting a byte of it.
 //!
 //! # The shape
@@ -135,13 +135,7 @@ use std::num::NonZeroUsize;
 use groupnet_core::NodeId;
 use groupnet_transport::framing::MAX_FRAME_BYTES;
 
-/// The chunk payload type [`SnapshotChunks`] and [`SnapshotSink`] exchange,
-/// re-exported so an adapter needs no direct `bytes` dependency.
-pub use bytes::Bytes;
-/// The data-plane types [`Handoff::fetch`], [`Handoff::fetch_on`] and
-/// [`Handoff::offer`] take, re-exported so a caller can name them through this
-/// module.
-pub use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
+use crate::Bytes;
 
 pub use self::core::{
     Coverage, DoneCheck, DoneCounts, HandoffCore, HandoffPhase, HandoffStep, Staleness,

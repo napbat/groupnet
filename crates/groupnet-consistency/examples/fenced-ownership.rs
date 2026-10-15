@@ -30,8 +30,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use groupnet_consistency::{
-    Commit, CommitLedger, Group, HostedError, HostedRead, HostedReads, HostedWrites,
+use groupnet_consistency::Group;
+use groupnet_consistency::hosted::{
+    Commit, CommitLedger, HostedError, HostedRead, HostedReads, HostedWrites,
 };
 use groupnet_core::{NodeId, Role, VoterRoster};
 use groupnet_runtime::{GroupProfile, Node};

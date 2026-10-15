@@ -3,6 +3,7 @@
 //! Callbacks return one exact core event per requested effect. They never
 //! schedule claim retries or extend the parent recovery episode themselves.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -74,15 +75,16 @@ pub struct TimedClaim {
     pub claim: BootstrapClaim,
 }
 
-/// Caller-provided pre-allocation bounds for a complete native observation.
+/// Caller-provided pre-allocation bounds for a complete native observation;
+/// every bound is nonzero by type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClaimObservationLimits {
     /// Maximum distinct members and claims.
-    pub max_members: usize,
+    pub max_members: NonZeroUsize,
     /// Maximum bytes in one member identity.
-    pub max_member_bytes: usize,
+    pub max_member_bytes: NonZeroUsize,
     /// Maximum combined encoded roster and claim metadata bytes.
-    pub max_metadata_bytes: usize,
+    pub max_metadata_bytes: NonZeroUsize,
 }
 
 /// Fallible source access for finite, advisory builder claims.
@@ -453,6 +455,22 @@ pub struct TransferContext {
     pub follower: ClaimIdentity,
 }
 
+/// What one transfer effect executes under: its claim-selected transfer, the
+/// worker's shared admission, the outer publication permission, and the
+/// worker's original absolute episode deadline.
+#[derive(Debug)]
+pub struct EffectContext<'a> {
+    /// Exact claim-selected peer transfer the effect belongs to.
+    pub transfer: &'a TransferContext,
+    /// The worker's one shared memory admission.
+    pub admission: &'a ByteAdmission,
+    /// The outer recovery's publication permission; `InstallCandidate` uses
+    /// it for its one fenced swap.
+    pub permit: Option<PublicationPermit>,
+    /// Absolute deadline of the worker's episode.
+    pub deadline: Instant,
+}
+
 /// The one logical clock of a bootstrap session: whole milliseconds since the
 /// session started, rounded down, never decreasing.
 ///
@@ -714,12 +732,9 @@ pub trait DonorPort: Send + Sync + 'static {
     /// Execute one bounded transfer effect without a second scheduler.
     fn execute(
         &self,
-        context: &TransferContext,
         effect: TransferEffect,
         resources: &mut TransferResources<Self::Stage, Self::Attachment, Self::NativeBuffer>,
-        admission: &ByteAdmission,
-        permit: Option<PublicationPermit>,
-        deadline: Instant,
+        context: EffectContext<'_>,
     ) -> impl Future<Output = Result<Option<Admitted<TransferEvent>>, AdapterError>> + Send;
 
     /// Immediately retire an exact attachment after source-side cancellation.

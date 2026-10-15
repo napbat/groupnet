@@ -18,7 +18,8 @@ repository.workspace = true
 #   and `connectivity` (native traversal under TCP/UDP links).
 #
 # The defaults run a managed node over memory links without opening OS sockets.
-# Disable them for the dependency-free core and transport traits.
+# Disable them for the dependency-free core and the runtime-free transport
+# traits.
 default = ["runtime", "mem"]
 runtime = [
     "dep:groupnet-runtime", "dep:groupnet-network", "dep:groupnet-messaging", "dep:groupnet-streams",

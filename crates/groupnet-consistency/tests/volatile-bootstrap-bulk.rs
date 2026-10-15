@@ -4,7 +4,6 @@
 
 use std::time::{Duration, Instant};
 
-use groupnet_consistency::QueueCapacity;
 use groupnet_consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, AdmissionLimits, ByteAdmission,
 };
@@ -14,14 +13,38 @@ use groupnet_consistency::volatile_recovery::bootstrap::bulk_wire::{
 };
 use groupnet_consistency::volatile_recovery::bootstrap::inbox::DonorInbox;
 use groupnet_consistency::volatile_recovery::bootstrap::ports::{DonorReply, DonorRequest};
+use groupnet_consistency::{BulkTransport, Bytes, DataPlane, DataStream, QueueCapacity};
 use groupnet_core::NodeId;
 use groupnet_core::volatile_bootstrap::journal::{CaptureId, ReservationId};
 use groupnet_core::volatile_bootstrap::{
     BootId, BootstrapOperation, BootstrapScope, ClaimIdentity,
 };
-use groupnet_transport::bulk::DataPlane;
-use groupnet_transport_mem::MemBulkNet;
+use groupnet_transport_mem::{MemBulkNet, MemBulkTransport};
 use tokio::sync::{oneshot, watch};
+
+/// With `volatile-bootstrap-bulk` alone, the data-plane vocabulary the bulk
+/// adapter's signatures expose is named through this crate's one path.
+#[tokio::test]
+async fn the_data_plane_vocabulary_is_named_through_this_crate() {
+    fn over<B: BulkTransport>(plane: &DataPlane<B>) -> &B {
+        plane.transport()
+    }
+    let net = MemBulkNet::new();
+    let donor = DataPlane::new(net.endpoint(NodeId::from("donor")));
+    let follower = DataPlane::new(net.endpoint(NodeId::from("follower")));
+    let _: &MemBulkTransport = over(&follower);
+    let accepted = tokio::spawn(async move { donor.accept().await.map(|(peer, _)| peer) });
+    let stream: DataStream<<MemBulkTransport as BulkTransport>::Stream> = follower
+        .connect(&NodeId::from("donor"))
+        .await
+        .expect("the donor listens");
+    drop(stream);
+    assert_eq!(
+        accepted.await.unwrap().expect("one accepted stream"),
+        NodeId::from("follower")
+    );
+    assert_eq!(Bytes::from_static(b"frame").len(), 5);
+}
 
 fn admission() -> ByteAdmission {
     ByteAdmission::new(AdmissionLimits {

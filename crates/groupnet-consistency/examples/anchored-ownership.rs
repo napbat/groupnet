@@ -38,7 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use groupnet_consistency::{Group, HostedWrites};
+use groupnet_consistency::Group;
+use groupnet_consistency::hosted::HostedWrites;
 use groupnet_core::anchor::AnchorRecord;
 use groupnet_core::{NodeId, Role};
 use groupnet_runtime::{

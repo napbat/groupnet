@@ -38,14 +38,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::io::{AsyncRead, AsyncWrite};
-use groupnet_consistency::hosted::Watermarks;
 use groupnet_consistency::hosted::handoff::{
-    Bytes, DataPlane, DataStream, Offered, RefusalCode, is_request,
+    ChunkLimit, Handoff, HandoffError, Offered, RefusalCode, Snapshot, SnapshotChunks,
+    SnapshotSink, SnapshotSource, is_request,
 };
-use groupnet_consistency::{
-    ChunkLimit, CommitLedger, Frontier, Handoff, HandoffError, Snapshot, SnapshotChunks,
-    SnapshotSink, SnapshotSource, WriteToken,
-};
+use groupnet_consistency::hosted::{CommitLedger, Watermarks};
+use groupnet_consistency::{Bytes, DataPlane, DataStream, Frontier, WriteToken};
 use groupnet_core::NodeId;
 use groupnet_testkit::cluster::{MemCluster, eventually_within};
 use groupnet_transport_mem::MemBulkNet;

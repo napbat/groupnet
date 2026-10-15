@@ -32,10 +32,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_consistency::hosted::{commit_applied_by, commit_reading};
-use groupnet_consistency::{
+use groupnet_consistency::WriteToken;
+use groupnet_consistency::hosted::{
     CAP_HOSTED, Commit, CommitLedger, CommitOutcome, Completeness, HostedError, HostedRead,
-    HostedReads, HostedWrites, WriteToken,
+    HostedReads, HostedWrites, commit_applied_by, commit_reading,
 };
 use groupnet_core::{NodeId, Role, VoterRoster};
 use groupnet_runtime::{Group, GroupProfile, Leadership, Node};

@@ -23,6 +23,7 @@ use groupnet_runtime::{EntryMutationLimits, EntryWrite};
 use groupnet_testkit::cluster::{MemCluster, eventually};
 
 const VALUE_BYTES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+const KEY_BYTES: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 
 fn nz(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("nonzero")
@@ -86,9 +87,9 @@ fn claim(node: groupnet_core::NodeId) -> BootstrapClaim {
 
 fn limits() -> ClaimObservationLimits {
     ClaimObservationLimits {
-        max_members: 2,
-        max_member_bytes: 16,
-        max_metadata_bytes: 2_048,
+        max_members: nz(2),
+        max_member_bytes: nz(16),
+        max_metadata_bytes: nz(2_048),
     }
 }
 
@@ -127,14 +128,14 @@ async fn construction_names_each_rejected_argument() {
         partition: "p".into(),
     };
     assert_eq!(
-        open(long, policy(), 128, VALUE_BYTES),
+        open(long, policy(), KEY_BYTES, VALUE_BYTES),
         NativeClaimSourceError::ScopeTooLong
     );
     let invalid = BootstrapConfig {
         max_members: nz(usize::MAX),
         ..policy()
     };
-    let error = open(scope(), invalid, 128, VALUE_BYTES);
+    let error = open(scope(), invalid, KEY_BYTES, VALUE_BYTES);
     assert_eq!(
         error,
         NativeClaimSourceError::Policy(BootstrapConfigError::UnboundedMaxMembers)
@@ -144,7 +145,7 @@ async fn construction_names_each_rejected_argument() {
             .and_then(|source| source.downcast_ref::<BootstrapConfigError>()),
         Some(&BootstrapConfigError::UnboundedMaxMembers)
     );
-    let error = open(scope(), policy(), 4, VALUE_BYTES);
+    let error = open(scope(), policy(), nz(4), VALUE_BYTES);
     assert!(matches!(error, NativeClaimSourceError::ClaimKey(_)));
     assert!(std::error::Error::source(&error).is_some());
 }
@@ -168,7 +169,7 @@ async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_prese
             NativeClaimOptions {
                 scope: scope(),
                 policy: policy(),
-                max_key_bytes: 128,
+                max_key_bytes: KEY_BYTES,
                 max_value_bytes: VALUE_BYTES,
             },
         )
@@ -178,7 +179,7 @@ async fn a_restarted_member_publishes_its_new_life_over_the_previous_lifes_prese
     old.publish_presence(presence(b_id.clone(), 7, 8))
         .await
         .unwrap();
-    let key = presence_entry_key(&scope(), 128).unwrap();
+    let key = presence_entry_key(&scope(), KEY_BYTES.get()).unwrap();
     eventually("the survivor holds the old life's presence", || {
         a_group.node_entry(&b_id, &key).is_some()
     })
@@ -205,7 +206,7 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -216,7 +217,7 @@ async fn presence_renews_under_unrelated_writes_and_old_withdrawal_cannot_erase_
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -278,7 +279,7 @@ async fn first_presence_create_survives_unrelated_local_writes_between_cut_and_a
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -344,7 +345,7 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -355,7 +356,7 @@ async fn paired_cut_retains_transferred_participant_without_a_builder_claim() {
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -456,7 +457,7 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -467,7 +468,7 @@ async fn connected_actor_cut_decodes_claim_and_rejects_malformed_present_peer() 
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -550,7 +551,7 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -561,7 +562,7 @@ async fn late_old_session_withdrawal_cannot_delete_new_local_claim() {
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -619,7 +620,7 @@ async fn failed_converted_admission_retires_raw_actor_response_first() {
         NativeClaimOptions {
             scope: scope(),
             policy: policy(),
-            max_key_bytes: 128,
+            max_key_bytes: KEY_BYTES,
             max_value_bytes: VALUE_BYTES,
         },
     )
@@ -631,5 +632,52 @@ async fn failed_converted_admission_retires_raw_actor_response_first() {
         token: 1,
     };
     assert!(source.observe_claims(op, limits(), &budget).await.is_err());
+    assert_eq!(budget.usage().0, 0);
+}
+
+/// Observation bounds are nonzero by type; one above the source's own policy
+/// is refused as invalid input before any inspection is charged.
+#[tokio::test]
+async fn observation_limits_above_the_policy_are_refused_before_any_charge() {
+    let cluster = MemCluster::builder(&["node-a"]).group("g").spawn().await;
+    let budget = admission();
+    let source = NativeClaimSource::new(
+        cluster.groups[0].clone(),
+        budget.clone(),
+        NativeClaimOptions {
+            scope: scope(),
+            policy: policy(),
+            max_key_bytes: KEY_BYTES,
+            max_value_bytes: VALUE_BYTES,
+        },
+    )
+    .unwrap();
+    let op = BootstrapOperation {
+        session: 8,
+        incarnation: BootId(7),
+        generation: 1,
+        token: 1,
+    };
+    for wide in [
+        ClaimObservationLimits {
+            max_members: policy().max_members.checked_add(1).unwrap(),
+            ..limits()
+        },
+        ClaimObservationLimits {
+            max_member_bytes: policy().max_member_bytes.checked_add(1).unwrap(),
+            ..limits()
+        },
+    ] {
+        let refused = source.observe_claims(op, wide, &budget).await;
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            groupnet_consistency::volatile_recovery::AdapterErrorKind::InvalidInput
+        );
+        let refused = source.observe_participation(op, wide, &budget).await;
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            groupnet_consistency::volatile_recovery::AdapterErrorKind::InvalidInput
+        );
+    }
     assert_eq!(budget.usage().0, 0);
 }

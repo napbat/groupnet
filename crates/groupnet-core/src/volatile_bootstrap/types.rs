@@ -605,9 +605,9 @@ pub enum BootstrapEffect {
         /// Exact observation operation.
         op: BootstrapOperation,
         /// Pre-allocation cap for the complete member and claim roster.
-        max_members: usize,
+        max_members: NonZeroUsize,
         /// Pre-allocation cap for each member identity.
-        max_member_bytes: usize,
+        max_member_bytes: NonZeroUsize,
     },
     /// Begin the existing guarded origin recovery as provisional builder.
     BuildOrigin {
