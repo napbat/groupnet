@@ -4,16 +4,18 @@ use std::io;
 use std::num::NonZeroU32;
 
 use groupnet_core::NodeId;
-use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider};
+use groupnet_transport::link::{BoundLink, LinkBindError, LinkConfig, LinkFuture, LinkProvider};
 
 use crate::MemTransport;
 
 /// An in-process link that consumes an existing fabric endpoint.
 ///
 /// Available with the `link` feature. The endpoint identity must match the
-/// binding node, and the declared peers must pass
-/// [`LinkConfig::validate_for`]; both are checked before the link is handed
-/// over. Dropping the transport releases its channel registration.
+/// binding node ([`LinkBindError::IdentityMismatch`] otherwise), and the
+/// declared peers must pass [`LinkConfig::validate_for`]; both are checked
+/// before the link is handed over, and either failure is `InvalidInput`
+/// carrying the typed error. Dropping the transport releases its channel
+/// registration.
 #[derive(Debug)]
 pub struct MemLink {
     transport: MemTransport,
@@ -47,10 +49,11 @@ impl LinkProvider for MemLink {
         Box::pin(async move {
             let Self { transport, config } = *self;
             if transport.local_id() != &local {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "memory endpoint identity does not match the binding node",
-                ));
+                return Err(LinkBindError::IdentityMismatch {
+                    configured: transport.local_id().clone(),
+                    binding: local,
+                }
+                .into());
             }
             config.validate_for(&local)?;
             Ok(BoundLink::new(transport, config))
@@ -72,6 +75,15 @@ mod tests {
             .await
             .expect_err("identity mismatch must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<LinkBindError>()),
+            Some(&LinkBindError::IdentityMismatch {
+                configured: NodeId::new("actual"),
+                binding: NodeId::new("different"),
+            })
+        );
     }
 
     #[tokio::test]

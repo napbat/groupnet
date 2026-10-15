@@ -45,7 +45,7 @@ pub use config::NetworkConfig;
 pub use config::{MemBulkConfig, MemBulkConfigError};
 /// The bound every queue in [`NetworkConfig`] and `MemBulkConfig` takes.
 pub use groupnet_transport::QueueCapacity;
-pub use mem::{Closed, MemTransport, Network};
+pub use mem::{MemTransport, MemTransportError, Network};
 
 #[cfg(feature = "link")]
 mod link;

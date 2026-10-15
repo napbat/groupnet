@@ -253,3 +253,22 @@ fn link_config_defaults_and_typed_peer_validation() {
             .is_some()
     );
 }
+
+#[test]
+fn link_bind_identity_mismatch_is_typed_invalid_input() {
+    let error = LinkBindError::IdentityMismatch {
+        configured: NodeId::new("configured"),
+        binding: NodeId::new("binding"),
+    };
+    assert_eq!(
+        error.to_string(),
+        "link built for configured cannot bind for node binding"
+    );
+    let io = io::Error::from(error.clone());
+    assert_eq!(io.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        io.get_ref()
+            .and_then(|inner| inner.downcast_ref::<LinkBindError>()),
+        Some(&error)
+    );
+}

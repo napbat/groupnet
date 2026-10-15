@@ -11,6 +11,7 @@ use tokio::net::windows::named_pipe::{
 };
 
 use super::super::IpcAddress;
+use super::super::address::{IpcAddressError, MAX_PIPE_NAME};
 
 #[derive(Debug)]
 pub(in crate::ipc) enum Stream {
@@ -100,21 +101,22 @@ fn create(name: &str, first: bool, max_instances: usize) -> io::Result<NamedPipe
         .create(name)
 }
 
-pub(in crate::ipc) fn validate_address(address: &IpcAddress) -> io::Result<()> {
+pub(in crate::ipc) fn validate_address(address: &IpcAddress) -> Result<(), IpcAddressError> {
     let IpcAddress::NamedPipe(name) = address;
-    let suffix = name.strip_prefix(r"\\.\pipe\");
-    if name.len() > 256
-        || suffix.is_none_or(|suffix| {
-            suffix.is_empty()
-                || suffix
-                    .bytes()
-                    .any(|byte| byte == 0 || byte == b'\\' || byte == b'/')
-        })
+    if name.len() > MAX_PIPE_NAME {
+        return Err(IpcAddressError::PipeNameTooLong { len: name.len() });
+    }
+    let Some(suffix) = name.strip_prefix(r"\\.\pipe\") else {
+        return Err(IpcAddressError::NotLocalPipe);
+    };
+    if suffix.is_empty() {
+        return Err(IpcAddressError::EmptyPipeName);
+    }
+    if suffix
+        .bytes()
+        .any(|byte| byte == 0 || byte == b'\\' || byte == b'/')
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IPC requires a local \\\\.\\pipe\\name address",
-        ));
+        return Err(IpcAddressError::PipeNameCharacter);
     }
     Ok(())
 }

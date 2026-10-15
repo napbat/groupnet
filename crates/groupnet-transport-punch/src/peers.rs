@@ -9,8 +9,10 @@ use groupnet_core::NodeId;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerPolicy {
     /// Exactly these identities. An endpoint registers and connects to them
-    /// alone; a rendezvous admits no one else, after its application
-    /// admission policy also accepts them. An empty list admits no one.
+    /// alone; a rendezvous ignores every other identity and admits a listed
+    /// one only after its application admission policy also accepts it,
+    /// judging the same credential a dynamic rendezvous would. An empty list
+    /// admits no one.
     Static(Vec<NodeId>),
     /// Identities discovered at run time: an endpoint connects to every peer
     /// the rendezvous admits, and a rendezvous admits whoever its application

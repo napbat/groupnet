@@ -7,6 +7,7 @@ use std::sync::Arc;
 use groupnet_core::NodeId;
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider, PeerEndpoint};
 
+use crate::ipc::Preflight;
 use crate::{IpcAddress, IpcConfig, IpcTransport, MAX_FRAME};
 
 /// The link MTU: the IPC framing protocol's largest message.
@@ -14,17 +15,20 @@ const MTU: NonZeroUsize = NonZeroUsize::new(MAX_FRAME).unwrap();
 
 /// A native IPC listener and explicitly configured peer addresses.
 ///
-/// Binding preflights everything before it opens the listener: the
-/// [`IpcConfig`], the local identity, the link's peers through
-/// [`LinkConfig::validate_for`], and every peer exactly as
-/// [`IpcTransport::register_peer`] would check it (the 64-byte IPC identity
-/// bound, `max_peers` and the platform address). A failure is `InvalidInput`
-/// carrying the typed cause ([`IpcConfigError`](crate::IpcConfigError),
-/// [`LinkConfigError`](groupnet_transport::link::LinkConfigError),
-/// [`IpcPeerError`](crate::IpcPeerError) or the local
-/// [`NodeIdError`](crate::NodeIdError)), and no listener exists. Only a
-/// registration racing the transport's own shutdown can still fail after
-/// binding; that closes and drains the new listener before returning.
+/// Binding validates everything once, before it opens the listener: the
+/// link's peers through [`LinkConfig::validate_for`], the [`IpcConfig`], the
+/// local identity, and every peer as [`IpcTransport::register_peer`] would
+/// check it (the 64-byte IPC identity bound, `max_peers` and the platform
+/// address). A failure is `InvalidInput` carrying the typed cause
+/// ([`LinkConfigError`](groupnet_transport::link::LinkConfigError),
+/// [`IpcConfigError`](crate::IpcConfigError), the local
+/// [`NodeIdError`](crate::NodeIdError), or an
+/// [`IpcPeerError`](crate::IpcPeerError), whose `Address` variant wraps the
+/// [`IpcAddressError`](crate::IpcAddressError)), and no listener exists. The
+/// listener then opens with the validated peer book already in place, so
+/// nothing is checked twice and no peer registration can fail afterwards;
+/// only opening the listener itself (its own address, an occupied name, a
+/// missing Tokio runtime) can still fail.
 ///
 /// Setters only store their values. Preflight with [`IpcConfig::validate`] and
 /// [`LinkConfig::validate_for`].
@@ -88,15 +92,8 @@ impl LinkProvider for IpcLink {
                 cost,
                 mtu: MTU,
             };
-            link.validate_for(&local)?;
-            IpcTransport::preflight_peers(&local, &config, &link.peers, &addresses)?;
-            let transport = IpcTransport::bind_with(local, &bind, config)?;
-            for (peer, address) in link.peers.iter().zip(addresses) {
-                if let Err(error) = transport.register_peer(peer.clone(), address) {
-                    transport.close().await;
-                    return Err(error);
-                }
-            }
+            let preflight = Preflight::for_link(local, config, &link, addresses)?;
+            let transport = IpcTransport::start(&bind, preflight)?;
             let lifecycle = Arc::new(transport.clone());
             Ok(BoundLink::new(transport, link).with_lifecycle(lifecycle))
         })

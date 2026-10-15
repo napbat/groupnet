@@ -5,7 +5,7 @@
 
 use groupnet_core::NodeId;
 use groupnet_transport::{QueueCapacity, Transport};
-use groupnet_transport_mem::{Network, NetworkConfig};
+use groupnet_transport_mem::{MemTransportError, Network, NetworkConfig};
 
 /// One slot per endpoint: the second send waits for receive capacity.
 fn single_slot() -> Network {
@@ -107,11 +107,14 @@ async fn dropping_replaced_endpoint_keeps_replacement_reachable() {
     let sender = net.endpoint(NodeId::new("sender"));
     let old = net.endpoint(NodeId::new("replaced"));
     let replacement = net.endpoint(NodeId::new("replaced"));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), old.recv())
-            .await
-            .expect("replacement must close the displaced receiver")
-            .is_err()
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), old.recv())
+        .await
+        .expect("replacement must close the displaced receiver")
+        .expect_err("a displaced endpoint receives nothing further");
+    assert_eq!(error, MemTransportError::Displaced);
+    assert_eq!(
+        error.to_string(),
+        "memory endpoint displaced by a newer endpoint at the same identity"
     );
     drop(old);
 

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::super::IpcAddress;
+use super::super::address::IpcAddressError;
 
 pub(in crate::ipc) type Stream = UnixStream;
 
@@ -20,15 +21,14 @@ struct OwnedPath {
 
 impl Drop for OwnedPath {
     fn drop(&mut self) {
-        if let Ok(metadata) = fs::symlink_metadata(&self.path) {
-            if metadata.file_type().is_socket()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-            {
-                // Never unlink a stale socket, symlink, regular file, or a new
-                // listener that replaced our own path while we were running.
-                let _ = fs::remove_file(&self.path);
-            }
+        if let Ok(metadata) = fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            // Never unlink a stale socket, symlink, regular file, or a new
+            // listener that replaced our own path while we were running.
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
@@ -48,7 +48,7 @@ impl Listener {
         let socket = UnixListener::bind(&path)?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_socket() {
-            return Err(denied("IPC bind path changed during creation"));
+            return Err(IpcAddressError::SocketReplaced.into());
         }
         let owned = OwnedPath {
             path,
@@ -56,7 +56,7 @@ impl Listener {
             inode: metadata.ino(),
         };
         if metadata.uid() != parent.uid() {
-            return Err(denied("IPC directory must belong to the socket creator"));
+            return Err(IpcAddressError::ParentForeignOwner.into());
         }
         fs::set_permissions(&owned.path, fs::Permissions::from_mode(0o600))?;
         Ok(Self {
@@ -70,7 +70,7 @@ impl Listener {
     }
 }
 
-pub(in crate::ipc) fn validate_address(address: &IpcAddress) -> io::Result<()> {
+pub(in crate::ipc) fn validate_address(address: &IpcAddress) -> Result<(), IpcAddressError> {
     let IpcAddress::Unix(path) = address;
     private_path(path).map(|_| ())
 }
@@ -83,38 +83,29 @@ pub(in crate::ipc) async fn connect(address: &IpcAddress) -> io::Result<Stream> 
         || metadata.mode() & 0o077 != 0
         || metadata.uid() != parent.uid()
     {
-        return Err(denied(
-            "IPC peer socket is not private and owner-controlled",
-        ));
+        return Err(IpcAddressError::PeerSocketNotPrivate.into());
     }
     UnixStream::connect(path).await
 }
 
-fn private_path(path: &Path) -> io::Result<(PathBuf, Metadata)> {
+fn private_path(path: &Path) -> Result<(PathBuf, Metadata), IpcAddressError> {
     if !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IPC socket path must be absolute",
-        ));
+        return Err(IpcAddressError::RelativePath);
     }
-    let name = path
-        .file_name()
-        .ok_or_else(|| denied("IPC socket needs a file name"))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| denied("IPC socket needs a parent directory"))?;
-    let metadata = fs::symlink_metadata(parent)?;
-    if !metadata.file_type().is_dir() || metadata.mode() & 0o077 != 0 {
-        return Err(denied(
-            "IPC socket requires a private non-symlink parent directory",
-        ));
+    let (Some(name), Some(parent)) = (path.file_name(), path.parent()) else {
+        return Err(IpcAddressError::NoFileName);
+    };
+    let metadata = fs::symlink_metadata(parent).map_err(IpcAddressError::ParentInaccessible)?;
+    if !metadata.file_type().is_dir() {
+        return Err(IpcAddressError::ParentNotDirectory);
     }
-    let parent = fs::canonicalize(parent)?;
+    if metadata.mode() & 0o077 != 0 {
+        return Err(IpcAddressError::ParentNotPrivate {
+            mode: metadata.mode() & 0o7777,
+        });
+    }
+    let parent = fs::canonicalize(parent).map_err(IpcAddressError::ParentInaccessible)?;
     // Use a canonical parent so subsequent operations do not follow a mutable
     // ancestor symlink to a different directory.
     Ok((parent.join(name), metadata))
-}
-
-fn denied(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, message)
 }

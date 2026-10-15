@@ -129,3 +129,39 @@ impl From<LinkConfigError> for io::Error {
         Self::new(io::ErrorKind::InvalidInput, error)
     }
 }
+
+/// Why a link provider refuses the node that binds it, beyond its
+/// [`LinkConfig`]: the provider was built for another identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkBindError {
+    /// The provider's endpoint or configuration names `configured` as its
+    /// local identity, but `binding` is binding it.
+    IdentityMismatch {
+        /// The local identity the provider was built with.
+        configured: NodeId,
+        /// The identity of the node binding the provider.
+        binding: NodeId,
+    },
+}
+
+impl fmt::Display for LinkBindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdentityMismatch {
+                configured,
+                binding,
+            } => write!(
+                f,
+                "link built for {configured} cannot bind for node {binding}"
+            ),
+        }
+    }
+}
+
+impl error::Error for LinkBindError {}
+
+impl From<LinkBindError> for io::Error {
+    fn from(error: LinkBindError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}

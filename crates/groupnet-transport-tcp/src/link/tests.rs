@@ -292,6 +292,7 @@ async fn static_admission_rejects_unknown_and_bootstrap_recovers_late_listener()
 #[tokio::test]
 async fn native_link_rejects_a_mismatched_identity_before_binding() {
     use crate::{NetworkKey, PeerPolicy, TcpPunchConfig};
+    use groupnet_transport::link::LinkBindError;
 
     let config = TcpPunchConfig::new(
         NodeId::new("configured-local"),
@@ -305,8 +306,13 @@ async fn native_link_rejects_a_mismatched_identity_before_binding() {
         .await
         .expect_err("identity mismatch");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    assert!(
-        error.to_string().contains("TcpPunchConfig.local"),
-        "{error}"
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<LinkBindError>()),
+        Some(&LinkBindError::IdentityMismatch {
+            configured: NodeId::new("configured-local"),
+            binding: NodeId::new("different-local"),
+        })
     );
 }
