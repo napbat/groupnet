@@ -341,6 +341,120 @@ fn a_better_pair_deposes_a_quorum_host_without_a_vote() {
 }
 
 // --------------------------------------------------------------------------
+// Restart: the recovered floor (restore), the floor answer (Q3a) and the
+// learned floor (Q5b).
+// --------------------------------------------------------------------------
+
+/// A restored voter's first claim bids above every epoch it ever granted —
+/// not at epoch 1, which its own ledger and every voter that granted higher
+/// would refuse one window at a time. The self-grant of that claim is fresh
+/// and written down before the claim goes out, as at any round open.
+#[test]
+fn a_restored_claimant_bids_above_its_recovered_grant() {
+    let rank = rank_by_placement(&["a", "b", "c"]);
+    let ids: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
+    for recovered in [(40, rank[0].clone()), (40, rank[1].clone())] {
+        let mut e = recovered_engine(
+            rank[0].as_str(),
+            &[],
+            quorum_config(&ids, LEASE),
+            RecoveredGrant::granted(recovered.0, recovered.1.clone()),
+        );
+        learn_peers(&mut e, &rank[1..], Time::ZERO);
+        e.start(Time::ZERO);
+        assert_eq!(e.observed_epoch(), 40, "the recovered epoch is observed");
+
+        let opened = e.on_tick(Time(LEASE)); // the boot guard is spent
+        let epochs: Vec<u64> = claim_frames(&opened)
+            .into_iter()
+            .map(|(_, epoch, _)| epoch)
+            .collect();
+        assert_eq!(epochs, vec![41, 41], "recovered {recovered:?}");
+        assert_eq!(
+            persisted_grants(&opened),
+            vec![(41, rank[0].clone())],
+            "recovered {recovered:?}"
+        );
+    }
+}
+
+/// Row Q3a's silent half: a claim above the granted epoch that the promise
+/// refuses gets no answer at all. A higher bid cannot clear a promise; only
+/// time can, so an answer would only invite churn.
+#[test]
+fn a_refusal_on_the_promise_stays_silent() {
+    let rank = rank_by_placement(&["a", "b", "c"]);
+    let mut e = voter(&rank[0], &rank[1..], &rank, LEASE);
+    e.on_message(
+        rank[1].clone(),
+        &lead_claim_frame(4, rank[1].as_str()),
+        Time(LEASE),
+    );
+    let effects = e.on_message(
+        rank[2].clone(),
+        &lead_claim_frame(5, rank[2].as_str()),
+        Time(LEASE + 1),
+    );
+    assert!(election_frames(&effects).is_empty(), "{effects:?}");
+    assert_eq!(e.voter_grant(), Some((4, &rank[1])));
+}
+
+/// Rows Q3a and Q5b end to end on a roster of two, the shape where a silent
+/// floor cost one window per epoch: the voter that granted higher answers the
+/// claim with its pair, the claimant learns the epoch, abandons the round that
+/// can no longer reach a majority, and its next claim bids above the floor.
+#[test]
+fn a_floor_answer_moves_a_lost_round_above_the_floor() {
+    let rank = rank_by_placement(&["a", "b"]);
+    let ids: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
+    let mut claimant = voter(&rank[0], &rank[1..], &rank, LEASE);
+    let mut floor = recovered_engine(
+        rank[1].as_str(),
+        &[],
+        quorum_config(&ids, LEASE),
+        RecoveredGrant::granted(9, rank[1].clone()),
+    );
+    learn_peers(&mut floor, &rank[..1], Time::ZERO);
+    floor.start(Time::ZERO);
+
+    let opened = claimant.on_tick(Time(LEASE));
+    assert_eq!(
+        claim_frames(&opened),
+        vec![(rank[1].clone(), 1, rank[0].clone())]
+    );
+    let answer = floor.on_message(
+        rank[0].clone(),
+        &lead_claim_frame(1, rank[0].as_str()),
+        Time(LEASE),
+    );
+    assert_eq!(
+        grant_frames(&answer),
+        vec![(rank[0].clone(), 9, rank[1].clone(), rank[1].clone())],
+        "the floor answer is the granted pair, re-sent as it stands"
+    );
+    assert!(persisted_grants(&answer).is_empty(), "it writes nothing");
+
+    let learned = claimant.on_message(
+        rank[1].clone(),
+        &lead_grant_frame(9, rank[1].as_str(), rank[1].as_str()),
+        Time(LEASE + 1),
+    );
+    assert!(learned.is_empty(), "learning decides and announces nothing");
+    assert_eq!(claimant.observed_epoch(), 9);
+    assert_eq!(
+        claimant.role(),
+        Role::Follower,
+        "a round of two that one voter refuses can never close"
+    );
+    let rebid = claimant.on_tick(Time(LEASE + 2));
+    assert_eq!(
+        claim_frames(&rebid),
+        vec![(rank[1].clone(), 10, rank[0].clone())],
+        "the next claim bids above the floor at once"
+    );
+}
+
+// --------------------------------------------------------------------------
 // Recovery outside Quorum.
 // --------------------------------------------------------------------------
 

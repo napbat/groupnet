@@ -608,6 +608,23 @@ refine the sketch above and are now contract:
   `RecoveredGrant::none()` — storage attesting this voter has *never* granted —
   is the one statement that lifts the blackout outright, and only a driver that
   really did persist every grant may make it.
+* **A restart of every voter elects in one window, not one window per
+  epoch** (napbat/groupnet#8). Recovery also raises the restored engine's
+  observed epoch (`highest_seen`) to the recovered pair's epoch, so its first
+  claim bids above every epoch it granted. And a voter that refuses a claim
+  **at or below its granted epoch** answers it with its granted pair, re-sent
+  as it stands (row Q3a); the claimant learns that epoch from it (row Q5b),
+  bids above it, and abandons at once a round that too few voters can still
+  grant. Before both, a restored claimant bid from epoch 1, every voter that
+  had granted higher refused each bid silently, and each refusal cost a claim
+  window: an election after a full restart took one lease per epoch the
+  cluster had ever reached. Neither rule decides anything: the floor answer
+  names a pair already granted (it writes nothing, and the driver's
+  durability guard withholds it exactly as it withholds that pair's grant),
+  and a learned epoch only moves the next bid up — a claim still activates
+  only on a majority of grants, each above its granter's floor. A refusal on
+  the *promise* stays silent: a higher bid cannot clear a promise, only time
+  can, and answering it would only invite churn.
 * **The honest property matrix.** Two different guarantees, and they are not
   the same strength:
 
@@ -664,6 +681,18 @@ refine the sketch above and are now contract:
   and emits no frame to drop. What this costs is **S1-strict across an amnesiac
   restart** and nothing else — S4c-global is carried by the promise and the
   blackout, timing rules that never consult a store.
+* **A close never waits for ever on a store, and never hides a late grant**
+  (napbat/groupnet#9, #11). `Node::close` stops every group actor of the node,
+  whatever `Group` handles remain, and returns only after each has stopped.
+  Once the close begins, no grant write starts: the pair counts as not durable,
+  so its frames are withheld. A write that is already running is waited for
+  the voter storage's close wait (`VoterStorage::with_close_wait`, default
+  `DEFAULT_CLOSE_WAIT`, 5 s), so a hung disk cannot hold a shutdown. A write
+  still running when that wait runs out is named in the `CloseReport` the
+  close returns (`UnfinishedGrant`): the store can still make that pair
+  durable after the close returned, so the node's next life must not load its
+  store before the write has ended. A complete report means that no grant of
+  the node can become durable after the close.
 * **Voters and members are different sets, and both directions are legal.** The
   roster names who votes, not who is alive and not who is in the membership
   view. A voter gossip has never shown alive is still sent every claim (claim
@@ -1360,13 +1389,15 @@ are contract rather than implementation detail:
   lease spare for a slow round trip, a dropped report or a retry, and stops a
   brisk gossip interval turning into a store write every few milliseconds.
 * **The command channel back into the actor is a `WeakSender`, on purpose.** The
-  group actor stops when its inbox closes — i.e. when every sender is dropped —
-  and the actor itself owns this task's prompt channel. A strong sender here
-  would make the pair mutually immortal: a killed node would keep gossiping *and
-  keep renewing its anchor record*, which is the one leak this tier cannot
-  afford. The task ends when the prompt sender drops, which happens when the
-  actor returns; `feed` upgrades the weak sender per report and gives up quietly
-  if the actor has already stopped.
+  group actor stops when its node closes (`Node::close` waits for it, or a
+  router shutdown, whatever `Group` handles remain — napbat/groupnet#9), or
+  when its inbox closes — i.e. when every sender is dropped — and the actor
+  itself owns this task's prompt channel. A strong sender here would make the
+  pair mutually immortal on the inbox path: a dropped group would keep
+  gossiping *and keep renewing its anchor record*, which is the one leak this
+  tier cannot afford. The task ends when the prompt sender drops, which happens
+  when the actor returns; `feed` upgrades the weak sender per report and gives
+  up quietly if the actor has already stopped.
 * **`AnchorClaimDue` must never block the group actor**, which is the sharp
   inversion of `PersistGrant` (which blocks it *by contract* — a grant must not
   outrun its own durability). Here there is nothing to be ahead of: until the

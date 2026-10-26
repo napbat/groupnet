@@ -106,7 +106,7 @@ mod seeds;
 mod store;
 
 pub use anchor::{Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf};
-pub use driver::GroupEvent;
+pub use driver::{CloseReport, GroupEvent, UnfinishedGrant};
 pub use group::{
     BoundedRosterError, CommandRejected, EntryBudget, EntryInspectionError, EntryInspectionLimits,
     EntryInspectionLimitsError, EntryMutationError, EntryMutationLimits, EntryMutationLimitsError,
@@ -135,4 +135,6 @@ pub use seeds::{
     DEFAULT_REFRESH_INTERVAL, DEFAULT_RETRY_INTERVAL, DEFAULT_STARTUP_ATTEMPTS, NamedSeeds,
     NamedSeedsError, ResolveFuture, SeedEvent, SeedResolver,
 };
-pub use store::{FileGrantStore, GrantStore, GrantStorePathError, VoterStorage};
+pub use store::{
+    DEFAULT_CLOSE_WAIT, FileGrantStore, GrantStore, GrantStorePathError, VoterStorage,
+};

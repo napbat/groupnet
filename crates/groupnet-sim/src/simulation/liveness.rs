@@ -23,7 +23,7 @@ impl Simulation {
     /// after counting it against the issuance probes.
     pub(super) fn send(&mut self, from: &NodeId, to: NodeId, wire: Vec<u8>) {
         self.max_frame_bytes = self.max_frame_bytes.max(wire.len());
-        self.note_lead_frame(from, &wire);
+        self.note_lead_frame(from, &to, &wire);
         // Deterministic per-message jitter in `0..=jitter_ms`, keyed on the
         // sequence number this delivery is about to take, so links can
         // reorder. `u64::MAX` spans the whole word rather than overflowing.
@@ -90,10 +90,16 @@ impl Simulation {
     /// authority on what a frame is, and a byte-offset pre-filter would be a
     /// second, silently drifting copy of the wire format. The cost is test-only
     /// and lands on a path that has already allocated the encoded frame. The
-    /// one decode feeds three probes: [`grant_log`](Self::grant_log),
-    /// [`claim_frames_seen`](Self::claim_frames_seen) and
-    /// [`grant_frames_seen`](Self::grant_frames_seen).
-    fn note_lead_frame(&mut self, from: &NodeId, wire: &[u8]) {
+    /// one decode feeds four probes: [`grant_log`](Self::grant_log),
+    /// [`claim_frames_seen`](Self::claim_frames_seen),
+    /// [`grant_frames_seen`](Self::grant_frames_seen) and
+    /// [`floor_answers_seen`](Self::floor_answers_seen).
+    ///
+    /// A grant frame sent to the claimant it names is an endorsement and goes
+    /// into the log. One sent to anybody else is a voter's floor answer (row
+    /// Q3a): its granted pair re-sent to a claimant it refused. It endorses
+    /// nobody new, so it is counted apart and kept out of the log.
+    fn note_lead_frame(&mut self, from: &NodeId, to: &NodeId, wire: &[u8]) {
         let Some(frame) = wire::decode(wire) else {
             return;
         };
@@ -103,8 +109,12 @@ impl Simulation {
                 epoch, claimant, ..
             }) => {
                 self.grant_frames += 1;
-                self.grant_log
-                    .push((self.now, from.clone(), epoch, claimant));
+                if *to == claimant {
+                    self.grant_log
+                        .push((self.now, from.clone(), epoch, claimant));
+                } else {
+                    self.floor_answers += 1;
+                }
             }
             Some(wire::LeadBody::State { .. }) | None => {}
         }
@@ -151,6 +161,16 @@ impl Simulation {
     #[must_use]
     pub fn grant_frames_seen(&self) -> u64 {
         self.grant_frames
+    }
+
+    /// How many floor answers (row Q3a) the run has **issued**: grant frames
+    /// re-sending a voter's granted pair to a claimant that it refused because
+    /// the claim was at or below that pair's epoch. Counted in
+    /// [`grant_frames_seen`](Self::grant_frames_seen) too, but not logged in
+    /// [`grant_log`](Self::grant_log).
+    #[must_use]
+    pub fn floor_answers_seen(&self) -> u64 {
+        self.floor_answers
     }
 
     /// How many members `node` currently knows about, or `None` if `node` is

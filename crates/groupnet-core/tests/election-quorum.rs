@@ -85,11 +85,12 @@ fn a_grant_is_persisted_before_it_is_sent() {
 }
 
 /// Row Q3, the one-grant-per-epoch half: a second claimant at the epoch already
-/// granted is refused, silently and for ever — no frame, and nothing written
-/// down. Two majorities of one roster always intersect, so this rule alone is
-/// what makes two hosts at one epoch impossible.
+/// granted is refused for ever — nothing written down, and nothing that names
+/// the rival. Two majorities of one roster always intersect, so this rule alone
+/// is what makes two hosts at one epoch impossible. The only answer is row
+/// Q3a's: the pair already granted, re-sent as it stands.
 #[test]
-fn a_rival_at_the_granted_epoch_is_refused_silently() {
+fn a_rival_at_the_granted_epoch_is_refused_and_told_the_granted_pair() {
     let rank = rank_by_placement(&["a", "b", "c"]);
     let mut e = voter(&rank[0], &rank[1..], &rank, LEASE);
     e.on_message(
@@ -104,9 +105,10 @@ fn a_rival_at_the_granted_epoch_is_refused_silently() {
             &lead_claim_frame(4, rank[2].as_str()),
             Time(at),
         );
-        assert!(
-            grant_frames(&effects).is_empty(),
-            "answered a rival at {at}"
+        assert_eq!(
+            grant_frames(&effects),
+            vec![(rank[2].clone(), 4, rank[1].clone(), rank[0].clone())],
+            "the rival is told the granted pair, and endorsed for nothing, at {at}"
         );
         assert!(
             persisted_grants(&effects).is_empty(),
@@ -156,7 +158,9 @@ fn a_re_grant_re_answers_without_persisting_and_slides_the_promise() {
 }
 
 /// Row Q3's monotone half: nothing at or below the granted epoch is ever
-/// granted, whoever asks and however long the promise has been spent.
+/// granted, whoever asks and however long the promise has been spent. Each
+/// such claim is answered with the granted pair (row Q3a), never with a grant
+/// of its own epoch.
 #[test]
 fn nothing_below_the_granted_epoch_is_ever_granted() {
     let rank = rank_by_placement(&["a", "b", "c"]);
@@ -174,9 +178,14 @@ fn nothing_below_the_granted_epoch_is_ever_granted() {
                 &lead_claim_frame(epoch, claimant.as_str()),
                 Time(100_000), // long past every promise
             );
+            assert_eq!(
+                grant_frames(&effects),
+                vec![(claimant.clone(), 4, rank[1].clone(), rank[0].clone())],
+                "{claimant:?} at epoch {epoch} is told the granted 4, and granted nothing"
+            );
             assert!(
-                grant_frames(&effects).is_empty(),
-                "{claimant:?} was granted epoch {epoch}, below the granted 4"
+                persisted_grants(&effects).is_empty(),
+                "wrote epoch {epoch} down"
             );
         }
     }
@@ -269,16 +278,22 @@ fn the_boot_blackout_and_the_two_recovered_postures() {
         Some((4, &rank[1])),
         "the pair survives the restart"
     );
+    assert_eq!(
+        restored.observed_epoch(),
+        4,
+        "the recovered epoch is observed, so this node's own first claim bids above it"
+    );
     assert!(
         grant_frames(&restored.on_message(rank[2].clone(), &claim(5, &rank[2]), Time::ZERO))
             .is_empty(),
         "recovery restores the pair, not the time: a new claimant still waits out the blackout"
     );
     for at in [1, 10 * LEASE] {
-        assert!(
-            grant_frames(&restored.on_message(rank[2].clone(), &claim(4, &rank[2]), Time(at)))
-                .is_empty(),
-            "the recovered epoch is a floor that outlives the blackout (t={at})"
+        assert_eq!(
+            grant_frames(&restored.on_message(rank[2].clone(), &claim(4, &rank[2]), Time(at))),
+            vec![(rank[2].clone(), 4, rank[1].clone(), rank[0].clone())],
+            "the recovered epoch is a floor that outlives the blackout (t={at}): the rival \
+             is told the recovered pair and granted nothing"
         );
     }
     assert_eq!(
@@ -432,10 +447,12 @@ fn a_claim_reaches_every_voter_and_every_live_peer() {
     );
 }
 
-/// Row Q5. A grant is addressed evidence: for us, from a voter, about an epoch
-/// we are actually running a round for. Everything else is dropped — and the
-/// contrast is sharp, because a single *valid* grant would have closed this
-/// round.
+/// Row Q5. A grant counts only as addressed evidence: for us, from a voter,
+/// about an epoch we are actually running a round for. Nothing else closes the
+/// round — and the contrast is sharp, because a single *valid* grant would
+/// have closed it. A voter's grant still teaches its epoch (row Q5b), and one
+/// voter refusing a three-voter round leaves it a majority, so the claim
+/// stands.
 #[test]
 fn grants_that_are_not_evidence_are_dropped() {
     let rank = rank_by_placement(&["a", "b", "c"]);
@@ -444,19 +461,23 @@ fn grants_that_are_not_evidence_are_dropped() {
     assert_eq!(e.role(), Role::Claimant);
 
     let junk = [
-        // A granter outside the roster.
-        lead_grant_frame(1, rank[0].as_str(), "stranger"),
+        // A granter outside the roster: no evidence at all.
+        (lead_grant_frame(1, rank[0].as_str(), "stranger"), 1),
         // A grant for somebody else's claim.
-        lead_grant_frame(1, rank[1].as_str(), rank[1].as_str()),
+        (lead_grant_frame(1, rank[1].as_str(), rank[1].as_str()), 1),
         // A grant for an epoch we hold no round for.
-        lead_grant_frame(2, rank[0].as_str(), rank[1].as_str()),
-        lead_grant_frame(0, rank[0].as_str(), rank[1].as_str()),
+        (lead_grant_frame(2, rank[0].as_str(), rank[1].as_str()), 2),
+        (lead_grant_frame(0, rank[0].as_str(), rank[1].as_str()), 2),
     ];
-    for (i, frame) in junk.iter().enumerate() {
+    for (i, (frame, observed)) in junk.iter().enumerate() {
         let effects = e.on_message(rank[1].clone(), frame, Time(LEASE + 10));
         assert!(effects.is_empty(), "junk grant {i} was not dropped");
         assert_eq!(e.role(), Role::Claimant, "junk grant {i} closed the round");
-        assert_eq!(e.observed_epoch(), 1, "a grant teaches no epoch ({i})");
+        assert_eq!(
+            e.observed_epoch(),
+            *observed,
+            "only a voter's grant teaches its epoch ({i})"
+        );
     }
 
     let closed = e.on_message(

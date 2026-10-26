@@ -66,19 +66,36 @@ impl RecoveringEngine {
     /// a `Settle` or [`Eventual`](crate::GroupMode::Eventual) group has no
     /// voter ledger, so `recovered` is ignored rather than half-applied.
     ///
+    /// A recovered pair also raises the [observed
+    /// epoch](GroupEngine::observed_epoch) to its epoch, so this node's first
+    /// claim after the restart bids above every epoch it ever granted. Without
+    /// that, a restarted claimant bids from epoch 1, its own ledger and every
+    /// voter that granted higher refuse each bid at or below their grant, and
+    /// each refused round costs a whole claim window: a restart of every voter
+    /// spent one lease per epoch the cluster had ever reached. Raising the
+    /// observed epoch decides nothing — a claim still activates only on a
+    /// majority of grants, each above its granter's own floor.
+    ///
     /// See [`RecoveredGrant`] for the contract, and in particular for why
     /// recovery restores the granted **pair** and not the instant it was
     /// granted at.
     #[must_use]
     pub fn restore(self, recovered: RecoveredGrant) -> GroupEngine {
         let mut engine = self.0;
-        if let Some(q) = engine.quorum_mut() {
-            match recovered.0 {
-                // Attested never-granted: nothing to restore, and the boot
-                // blackout is what durability was standing in for.
-                None => q.grant_promise_until = Time::ZERO,
-                // The pair is a floor; the blackout still runs from `start`.
-                Some(pair) => q.granted = Some(pair),
+        let Some(el) = engine.election.as_mut() else {
+            return engine;
+        };
+        let Some(q) = el.quorum.as_mut() else {
+            return engine;
+        };
+        match recovered.0 {
+            // Attested never-granted: nothing to restore, and the boot
+            // blackout is what durability was standing in for.
+            None => q.grant_promise_until = Time::ZERO,
+            // The pair is a floor; the blackout still runs from `start`.
+            Some(pair) => {
+                el.highest_seen = el.highest_seen.max(pair.0);
+                q.granted = Some(pair);
             }
         }
         engine

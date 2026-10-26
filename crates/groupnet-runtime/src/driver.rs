@@ -7,17 +7,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use groupnet_core::{Command, Effect, GroupEngine, GroupId, NetStats, NodeId, Status, Time, wire};
+use groupnet_core::{Command, Effect, GroupEngine, GroupId, NetStats, NodeId, Status, Time};
 use groupnet_transport::Transport;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 
 use crate::group::{
     EntryInspectionError, EntryInspectionLimits, InspectedEntries, InspectedPair, Leadership,
 };
-use crate::store::GrantStore;
 
+mod durability;
 mod entry_inspection;
+use durability::Durability;
+pub(crate) use durability::Grants;
+pub use durability::{CloseReport, UnfinishedGrant};
 use entry_inspection::{inspect_scoped_entry, inspect_scoped_pair};
 
 /// A change notification a consumer can subscribe to via
@@ -374,10 +378,11 @@ pub(crate) struct GroupTask<T: Transport> {
     /// group through this channel. `None` for the routing group itself.
     pub routing: Option<mpsc::Sender<Event>>,
     /// Voter durability for a [`Quorum`](groupnet_core::Activation::Quorum)
-    /// group. `None` is the **blackout posture**: [`Effect::PersistGrant`] is
-    /// ignored and the engine's post-restart grant blackout stands in for
-    /// durability.
-    pub store: Option<Arc<dyn GrantStore>>,
+    /// group: the store, and how long a write that runs when the node closes
+    /// is waited for. `None` is the **blackout posture**:
+    /// [`Effect::PersistGrant`] is ignored and the engine's post-restart grant
+    /// blackout stands in for durability.
+    pub store: Option<Grants>,
     /// Where [`Effect::AnchorClaimDue`]'s epoch hints go: the capacity-one
     /// inbox of this group's [`anchor_task`](crate::anchor::anchor_task).
     /// `None` for every group that is not both
@@ -389,10 +394,25 @@ pub(crate) struct GroupTask<T: Transport> {
     pub start: Instant,
     /// How often the engine is ticked.
     pub tick_period: Duration,
+    /// Cancelled when the node's network shuts down — [`Node::close`] or a
+    /// router shutdown. The actor stops then, whatever `Group` handles remain
+    /// (napbat/groupnet#9): a closed node's engine must not go on claiming
+    /// and writing grants into the store its next life loads.
+    ///
+    /// [`Node::close`]: crate::Node::close
+    pub closed: CancellationToken,
 }
 
-/// Runs a single group's engine as an actor until its inbox closes.
-pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
+/// Runs a single group's engine as an actor until its node closes or its inbox
+/// closes (every handle and route sender dropped).
+///
+/// A turn that is running when the node closes completes; no turn starts after
+/// that. A grant write in that turn is waited for one close wait at most (see
+/// [`UnfinishedGrant`]), which is what the actor returns when the wait ran
+/// out. The `watch` and `broadcast` senders drop with the actor, so a held
+/// handle keeps its last readable views, and each later command on it is
+/// refused as `CommandRejected::GroupClosed`.
+pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) -> Option<UnfinishedGrant> {
     let GroupTask {
         mut engine,
         mut inbox,
@@ -403,19 +423,15 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
         anchor_prompts,
         start,
         tick_period,
+        closed,
     } = task;
+    if closed.is_cancelled() {
+        return None; // joined after the close: nothing to start
+    }
     // The observer whose view every published `Leadership` is derived from.
     // Cloned once so `dispatch` never has to borrow the engine.
     let local = engine.local().clone();
-
-    // The grant this engine believes it made but whose durability the store
-    // refused. It outlives the batch it was armed in, deliberately: the engine
-    // re-answers an already-recorded pair without re-persisting it (a re-grant
-    // decides nothing new), so a guard scoped to one batch would swallow the
-    // first frame and let the very next round leak the same undurable grant.
-    // Disarmed by the next persist that *succeeds* — which supersedes the pair
-    // on disk, making everything at or below it safe to answer again.
-    let mut undurable: Undurable = None;
+    let mut durability = Durability::new(store, closed.clone());
 
     let boot = engine.start(now_since(start));
     dispatch(
@@ -423,9 +439,8 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
         &publishers,
         &local,
         &boot,
-        store.as_ref(),
+        &mut durability,
         anchor_prompts.as_ref(),
-        &mut undurable,
     )
     .await;
 
@@ -444,7 +459,14 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
     let mut entries_master: BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>> = BTreeMap::new();
 
     loop {
+        // Checked before every turn, and not only raced in the `select!`
+        // below: a busy inbox or a due tick must not win a turn after the
+        // close.
+        if closed.is_cancelled() {
+            break;
+        }
         let turn = tokio::select! {
+            () = closed.cancelled() => break,
             maybe = inbox.recv() => match maybe {
                 Some(event) => apply_actor_event(&mut engine, event, start),
                 None => break, // handle and all route senders dropped
@@ -470,9 +492,8 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
             &publishers,
             &local,
             &effects,
-            store.as_ref(),
+            &mut durability,
             anchor_prompts.as_ref(),
-            &mut undurable,
         )
         .await;
         publish_actor_views(
@@ -492,6 +513,7 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
             let _ = reply.send((applied, budget));
         }
     }
+    durability.into_unfinished(engine.group())
 }
 
 /// Republishes all readable views before the matching edge notifications.
@@ -652,17 +674,13 @@ async fn dispatch<T: Transport>(
     publishers: &Publishers,
     local: &NodeId,
     effects: &[Effect],
-    store: Option<&Arc<dyn GrantStore>>,
+    durability: &mut Durability,
     anchor_prompts: Option<&mpsc::Sender<u64>>,
-    undurable: &mut Undurable,
 ) {
     for effect in effects {
         match effect {
             Effect::Send { to, wire } => {
-                if undurable
-                    .as_ref()
-                    .is_some_and(|grant| undurable_frame(wire, grant, local))
-                {
+                if durability.withholds(wire, local) {
                     // Fail closed. The store said no, so this node grants
                     // nothing — see [`GrantStore`] for why silently.
                     continue;
@@ -683,16 +701,7 @@ async fn dispatch<T: Transport>(
             // post-restart grant blackout stands in for durability, and there
             // is nothing to do here.
             Effect::PersistGrant { epoch, claimant } => {
-                if let Some(store) = store {
-                    *undurable = if persist_grant(store, *epoch, claimant).await {
-                        // On disk, and it supersedes whatever was there — so
-                        // any older pair the guard was withholding is covered
-                        // by this one and the node may answer again.
-                        None
-                    } else {
-                        Some((*epoch, claimant.clone()))
-                    };
-                }
+                durability.persist(*epoch, claimant).await;
             }
             Effect::CoordinatorChanged { coordinator } => {
                 // Publish to readers; ignore error if no receivers remain.
@@ -736,225 +745,5 @@ async fn dispatch<T: Transport>(
             | Effect::NodeStateChanged { .. }
             | Effect::MetadataChanged { .. } => {}
         }
-    }
-}
-
-/// The `(epoch, claimant)` a group actor's engine has recorded as granted but
-/// its store has not accepted — `None` while everything the engine believes is
-/// also on disk. See the guard's declaration in [`group_task`].
-type Undurable = Option<(u64, NodeId)>;
-
-/// Completes one grant's write-ahead persist and reports whether the pair is
-/// now **durable**.
-///
-/// Runs on Tokio's blocking pool: a store is real I/O (a write and an `fsync`,
-/// if it means what it says), and a group actor holds no lock but would
-/// otherwise stall a runtime worker for the length of a disk round trip. The
-/// actor still waits for the answer — that wait is the write-ahead contract.
-///
-/// A store error and a *panicking* store answer the same `false`, because
-/// neither proves the pair reached disk.
-async fn persist_grant(store: &Arc<dyn GrantStore>, epoch: u64, claimant: &NodeId) -> bool {
-    let store = store.clone();
-    let claimant = claimant.clone();
-    matches!(
-        tokio::task::spawn_blocking(move || store.persist(epoch, &claimant)).await,
-        Ok(Ok(()))
-    )
-}
-
-/// Whether `wire` is a frame that would publish the undurable `grant` — the one
-/// the driver must therefore swallow.
-///
-/// The engine emits [`Effect::PersistGrant`] before any frame the grant it
-/// records licenses — and only two of that effect's four emission shapes (see
-/// [`Effect::PersistGrant`] for all of them) put such a frame in the batch at
-/// all:
-///
-/// * **A peer's claim answered** — the `LeadGrant` naming this node as granter.
-///   Dropping it means the claimant never counts us toward its majority.
-/// * **Our own claim opened** — the voter's own grant is counted straight into
-///   the round rather than sent, so what the persist precedes is the `LeadClaim`
-///   broadcast itself. Dropping it means nobody answers a round whose first
-///   grant is not durable, so it cannot reach a majority either. The same arm
-///   swallows a *host's* renewal claim once the guard is armed at the pair it is
-///   renewing, which is what bounds the case below.
-///
-/// # What this guard bounds rather than prevents
-///
-/// Row Q4b re-attempts a claimant's self-grant on every tick its round is open,
-/// and that retry's persist precedes no frame at all — the claim went out at
-/// round open, before the ledger had anything to write down. If the retry both
-/// fails to persist *and* completes the majority, the activation's `LeadState`
-/// is not withheld and this node hosts on a grant its disk refused. The same
-/// goes for a **roster of one**, whose majority the self-grant alone satisfies:
-/// row Q4's round is closed before the claim it opened is ever broadcast.
-///
-/// How long that hostship lasts depends on whether renewing costs a frame:
-///
-/// * **A roster of two or more.** One lease and no further. The guard stays
-///   armed, so the renewal round's `LeadClaim` is swallowed by the arm above,
-///   no voter re-grants, and the host demotes when the lease lapses.
-/// * **A roster of one.** Indefinitely. A solo voter's renewal round closes
-///   in-engine on its own re-grant — which persists nothing (row Q2 writes
-///   nothing new) and sends nothing (there is no peer to claim from) — so the
-///   guard never sees a frame to swallow and the lease is extended forever on a
-///   grant the disk refused.
-///
-/// Both are the same risk class, because neither touches the clock: S4c-global
-/// is untouched — the lease is a real one, anchored to the send instant like any
-/// other, and nothing outside this node ever believed the grant. What is at risk
-/// is S1-strict across an amnesiac restart, which is the property a failing
-/// store has already forfeited.
-///
-/// Matched by **content, not by position**, for two reasons. A batch whose
-/// claim fan-out is empty leaves the `PersistGrant` adjacent to unrelated
-/// gossip traffic, so "swallow the next `Send`" would eat a digest. And the
-/// engine re-offers both shapes on the anti-entropy cadence *without* a fresh
-/// `PersistGrant` — a re-grant of a pair already in the ledger writes nothing
-/// new — so positional matching would withhold the first frame and ship the
-/// same undurable grant a round later, which is the whole hole this closes.
-/// The decode is paid only while the guard is armed, i.e. only after a store
-/// has actually failed.
-fn undurable_frame(wire: &[u8], (epoch, claimant): &(u64, NodeId), local: &NodeId) -> bool {
-    let Some(frame) = wire::decode(wire) else {
-        return false;
-    };
-    match frame.lead {
-        Some(wire::LeadBody::Grant {
-            epoch: sent,
-            claimant: to,
-            granter,
-        }) => sent == *epoch && to == *claimant && granter == *local,
-        // A self-grant's claim: the round it opens already counts the grant
-        // this node could not write down, so the claim is what must not fly.
-        Some(wire::LeadBody::Claim {
-            epoch: sent,
-            claimant: bidder,
-        }) => sent == *epoch && bidder == *claimant && bidder == *local,
-        Some(wire::LeadBody::State { .. }) | None => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::undurable_frame;
-    use groupnet_core::{GroupId, NodeId, wire};
-
-    fn n(id: &str) -> NodeId {
-        NodeId::new(id)
-    }
-
-    /// One encoded election frame, kind derived from the body exactly as the
-    /// engine derives it.
-    fn lead(body: wire::LeadBody) -> Vec<u8> {
-        let kind = match body {
-            wire::LeadBody::Claim { .. } => wire::Kind::LeadClaim,
-            wire::LeadBody::Grant { .. } => wire::Kind::LeadGrant,
-            wire::LeadBody::State { .. } => wire::Kind::LeadState,
-        };
-        frame(kind, Some(body))
-    }
-
-    fn frame(kind: wire::Kind, lead: Option<wire::LeadBody>) -> Vec<u8> {
-        wire::encode(&wire::Frame {
-            kind,
-            group: GroupId::new("g"),
-            target: None,
-            digest: Vec::new(),
-            wants: Vec::new(),
-            members: Vec::new(),
-            metadata: Vec::new(),
-            lead,
-        })
-    }
-
-    fn grant(epoch: u64, claimant: &str, granter: &str) -> Vec<u8> {
-        lead(wire::LeadBody::Grant {
-            epoch,
-            claimant: n(claimant),
-            granter: n(granter),
-        })
-    }
-
-    fn claim(epoch: u64, claimant: &str) -> Vec<u8> {
-        lead(wire::LeadBody::Claim {
-            epoch,
-            claimant: n(claimant),
-        })
-    }
-
-    /// The armed guard: this node ("me") could not write down its grant of
-    /// epoch 7 to "them".
-    fn withheld(wire: &[u8]) -> bool {
-        undurable_frame(wire, &(7, n("them")), &n("me"))
-    }
-
-    /// The first shape: a peer's claim answered. The frame that carries the
-    /// undurable grant is exactly the one this node must not send.
-    #[test]
-    fn our_own_grant_of_the_undurable_pair_is_withheld() {
-        assert!(withheld(&grant(7, "them", "me")));
-    }
-
-    /// A grant is withheld only if it is *ours* and *this* pair. Anything else
-    /// is somebody else's business, or a pair the store already accepted.
-    #[test]
-    fn a_grant_that_is_not_this_pair_from_this_node_flies() {
-        assert!(!withheld(&grant(7, "them", "other")), "another granter");
-        assert!(!withheld(&grant(8, "them", "me")), "another epoch");
-        assert!(!withheld(&grant(7, "someone", "me")), "another claimant");
-        assert!(!withheld(&grant(6, "them", "me")), "an earlier epoch");
-    }
-
-    /// The second shape: our own claim. A claimant's self-grant is counted
-    /// into the round rather than sent, so the claim is what publishes it —
-    /// and this is also the arm that swallows a host's *renewal* claim once
-    /// the guard is armed at the pair it is renewing.
-    #[test]
-    fn our_own_claim_for_the_undurable_pair_is_withheld() {
-        assert!(undurable_frame(&claim(7, "me"), &(7, n("me")), &n("me")));
-    }
-
-    /// A claim is only ever withheld when this node is bidding for itself: a
-    /// peer's claim is not ours to drop, and a claim whose claimant is not the
-    /// pair's claimant publishes nothing we failed to write down.
-    #[test]
-    fn somebody_elses_claim_flies() {
-        assert!(!undurable_frame(
-            &claim(7, "them"),
-            &(7, n("them")),
-            &n("me")
-        ));
-        assert!(!withheld(&claim(7, "me")), "our claim, another pair");
-        assert!(!undurable_frame(&claim(8, "me"), &(7, n("me")), &n("me")));
-    }
-
-    /// The documented hole, pinned so it cannot be closed by accident: an
-    /// activation's `LeadState` is **not** withheld. A row Q4b retry (or a
-    /// roster of one) can close a round on the very grant the store refused,
-    /// and by then this node is already host — see the guard's doc for how far
-    /// that reaches.
-    #[test]
-    fn the_activation_state_is_not_withheld() {
-        assert!(!withheld(&lead(wire::LeadBody::State {
-            epoch: 7,
-            host: Some(n("me")),
-        })));
-        assert!(!withheld(&lead(wire::LeadBody::State {
-            epoch: 7,
-            host: None,
-        })));
-    }
-
-    /// Matched by content, not by position: an armed guard must not eat the
-    /// gossip traffic that happens to share the batch, and must not choke on
-    /// bytes it cannot decode.
-    #[test]
-    fn non_election_traffic_and_garbage_fly() {
-        assert!(!withheld(&frame(wire::Kind::Digest, None)));
-        assert!(!withheld(&frame(wire::Kind::Ping, None)));
-        assert!(!withheld(&[]), "an empty frame decodes to nothing");
-        assert!(!withheld(&[0xff, 0xff, 0xff, 0xff]), "garbage");
     }
 }

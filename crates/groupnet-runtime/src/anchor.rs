@@ -247,11 +247,12 @@ pub(crate) struct AnchorTask {
     /// Where [`Command::AnchorActivated`] / [`Command::AnchorObserved`] are
     /// fed back into the group actor.
     ///
-    /// **Weak on purpose.** The group actor stops when its inbox closes, i.e.
-    /// when every sender is dropped; a strong sender here would be one the
-    /// actor itself keeps alive (it owns this task's prompt channel), so
-    /// neither could ever end and a killed node would keep gossiping — and
-    /// keep renewing its anchor record — for ever.
+    /// **Weak on purpose.** The group actor stops when its node closes, or
+    /// when its inbox closes, i.e. when every sender is dropped; a strong
+    /// sender here would be one the actor itself keeps alive (it owns this
+    /// task's prompt channel), so on the inbox path neither could ever end and
+    /// a dropped group would keep gossiping — and keep renewing its anchor
+    /// record — for ever.
     pub commands: mpsc::WeakSender<Event>,
     /// [`Effect::AnchorClaimDue`](groupnet_core::Effect::AnchorClaimDue)'s
     /// epoch hints, one at a time — see [`anchor_task`] for why the capacity is

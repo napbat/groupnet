@@ -6,15 +6,16 @@ use groupnet_core::{Config, GroupEngine, GroupId, GroupMode, NodeId};
 use groupnet_network::{Network, Router};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::anchor::{AnchorTask, anchor_task};
 use crate::driver::{
-    EVENTS_CAPACITY, Event, GroupTask, GroupViews, INBOX_CAPACITY, NodeEntriesSnapshot, Publishers,
-    group_task, statuses_snapshot,
+    CloseReport, EVENTS_CAPACITY, Event, Grants, GroupTask, GroupViews, INBOX_CAPACITY,
+    NodeEntriesSnapshot, Publishers, UnfinishedGrant, group_task, statuses_snapshot,
 };
 use crate::group::{Group, Leadership};
 use crate::routing::Routing;
-use crate::store::{GrantStore, VoterStorage};
+use crate::store::VoterStorage;
 use tokio::sync::broadcast;
 
 mod builder;
@@ -50,6 +51,10 @@ struct Inner {
     /// idempotent: a repeat join returns the existing handle instead of
     /// spawning a second, orphaned actor for the same group.
     routes: Mutex<HashMap<GroupId, Group>>,
+    /// The running group actors, so [`Node::close`] can wait until each has
+    /// stopped. An actor stops when the router is cancelled, whatever
+    /// `Group` handles remain.
+    actors: Mutex<Vec<JoinHandle<Option<UnfinishedGrant>>>>,
     start: Instant,
     /// The routing system group, joined once at spawn.
     routing: OnceLock<Group>,
@@ -217,7 +222,7 @@ impl Node {
         group: &GroupId,
         config: &Config,
         storage: Option<VoterStorage>,
-    ) -> (GroupEngine, Option<Arc<dyn GrantStore>>) {
+    ) -> (GroupEngine, Option<Grants>) {
         // `Config::validate` ignores `mode`, the only thing a group overrides,
         // so the node config `NodeBuilder::start` validated stays valid here.
         const VALIDATED: &str = "NodeBuilder::start validated the node config, and \
@@ -229,13 +234,30 @@ impl Node {
                 GroupEngine::recovering(group, local, seeds, config.clone())
                     .expect(VALIDATED)
                     .restore(storage.recovered),
-                Some(storage.store),
+                Some((storage.store, storage.close_wait)),
             ),
             None => (
                 GroupEngine::new(group, local, seeds, config.clone()).expect(VALIDATED),
                 None,
             ),
         }
+    }
+
+    /// Waits until every group actor of this node has stopped, and reports the
+    /// grant writes that an actor stopped waiting for. The caller has cancelled
+    /// the router first, which is what stops each actor; a turn that was
+    /// running then completes, and a grant write in it is waited for one close
+    /// wait at most.
+    pub(crate) async fn close_groups(&self) -> CloseReport {
+        let actors = std::mem::take(&mut *self.inner.actors.lock().expect("actors mutex poisoned"));
+        let mut unfinished = Vec::new();
+        for actor in actors {
+            // A panicked actor has stopped too; its panic is not this caller's.
+            if let Ok(Some(grant)) = actor.await {
+                unfinished.push(grant);
+            }
+        }
+        CloseReport { unfinished }
     }
 
     /// Spawns a group actor and returns its handle, without touching the routes
@@ -330,7 +352,7 @@ impl Node {
         });
 
         let tick_period = group_tick_period(&config);
-        tokio::spawn(group_task(GroupTask {
+        let actor = tokio::spawn(group_task(GroupTask {
             engine,
             inbox: rx,
             transport: self.inner.transport.clone(),
@@ -349,7 +371,12 @@ impl Node {
             anchor_prompts,
             start: self.inner.start,
             tick_period,
+            closed: self.inner.transport.cancellation(),
         }));
+        let mut actors = self.inner.actors.lock().expect("actors mutex poisoned");
+        actors.retain(|actor| !actor.is_finished());
+        actors.push(actor);
+        drop(actors);
 
         Group::new(
             group,

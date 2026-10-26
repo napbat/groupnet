@@ -909,9 +909,10 @@ fn a_quorum_group_without_a_voter_majority_never_activates() {
         "the claim guard is untouched — claims are still bid, they just never close"
     );
 
-    // And a grant that matches no round this node is running is dropped, and
-    // teaches it nothing — an epoch is learned from a claim or an adopted pair,
-    // never from somebody's endorsement of one.
+    // And a grant that matches no round this node is running is not counted
+    // and activates nothing. It still teaches its epoch (row Q5b): the voter
+    // that sent it refuses every claim at or below it, so the next claim bids
+    // above.
     let before = e.observed_epoch();
     let effects = e.on_message(
         rank[1].clone(),
@@ -920,9 +921,13 @@ fn a_quorum_group_without_a_voter_majority_never_activates() {
     );
     assert!(
         effects.is_empty(),
-        "a grant for no standing round is dropped"
+        "a grant for no standing round is not counted"
     );
-    assert_eq!(e.observed_epoch(), before, "a grant teaches us no epoch");
+    assert_eq!(
+        e.observed_epoch(),
+        before + 5,
+        "a voter's grant teaches its epoch"
+    );
     assert_ne!(e.role(), Role::Host);
     assert_eq!(e.leadership(), (0, None));
 }
