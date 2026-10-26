@@ -172,8 +172,16 @@ const SETTLE: Duration = Duration::from_millis(1);
 
 /// Lets the paused clock run `by` (plus [`SETTLE`]) and every task due in it
 /// run to idle.
+///
+/// Waits until an exact instant, as the resolver does, and not with
+/// [`tokio::time::sleep`]: that one caps every delay at about thirty years
+/// (tokio's `safe_delay`), so a century-long step stopped seventy years short
+/// (napbat/groupnet#10).
 async fn advance(by: Duration) {
-    tokio::time::sleep(by + SETTLE).await;
+    let until = tokio::time::Instant::now()
+        .checked_add(by + SETTLE)
+        .expect("every step of these tests is representable on the clock");
+    tokio::time::sleep_until(until).await;
     tokio::task::yield_now().await;
 }
 
