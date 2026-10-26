@@ -258,6 +258,7 @@ impl NodeBuilder {
             unordered_config: unordered,
             unordered: Mutex::new(None),
             routes: Mutex::new(HashMap::new()),
+            actors: Mutex::new(Vec::new()),
             start: Instant::now(),
             routing: OnceLock::new(),
         });

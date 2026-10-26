@@ -11,6 +11,7 @@ use groupnet_core::{Command, Effect, GroupEngine, GroupId, NetStats, NodeId, Sta
 use groupnet_transport::Transport;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 
 use crate::group::{
     EntryInspectionError, EntryInspectionLimits, InspectedEntries, InspectedPair, Leadership,
@@ -391,9 +392,22 @@ pub(crate) struct GroupTask<T: Transport> {
     pub start: Instant,
     /// How often the engine is ticked.
     pub tick_period: Duration,
+    /// Cancelled when the node's network shuts down — [`Node::close`] or a
+    /// router shutdown. The actor stops then, whatever `Group` handles remain
+    /// (napbat/groupnet#9): a closed node's engine must not go on claiming
+    /// and writing grants into the store its next life loads.
+    ///
+    /// [`Node::close`]: crate::Node::close
+    pub closed: CancellationToken,
 }
 
-/// Runs a single group's engine as an actor until its inbox closes.
+/// Runs a single group's engine as an actor until its node closes or its inbox
+/// closes (every handle and route sender dropped).
+///
+/// A turn that is running when the node closes completes, a persist included;
+/// no turn starts after that. The `watch` and `broadcast` senders drop with the
+/// actor, so a held handle keeps its last readable views, and each later
+/// command on it is refused as `CommandRejected::GroupClosed`.
 pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
     let GroupTask {
         mut engine,
@@ -405,7 +419,11 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
         anchor_prompts,
         start,
         tick_period,
+        closed,
     } = task;
+    if closed.is_cancelled() {
+        return; // joined after the close: nothing to start
+    }
     // The observer whose view every published `Leadership` is derived from.
     // Cloned once so `dispatch` never has to borrow the engine.
     let local = engine.local().clone();
@@ -446,7 +464,14 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
     let mut entries_master: BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>> = BTreeMap::new();
 
     loop {
+        // Checked before every turn, and not only raced in the `select!`
+        // below: a busy inbox or a due tick must not win a turn after the
+        // close.
+        if closed.is_cancelled() {
+            break;
+        }
         let turn = tokio::select! {
+            () = closed.cancelled() => break,
             maybe = inbox.recv() => match maybe {
                 Some(event) => apply_actor_event(&mut engine, event, start),
                 None => break, // handle and all route senders dropped

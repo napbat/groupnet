@@ -6,6 +6,7 @@ use groupnet_core::{Config, GroupEngine, GroupId, GroupMode, NodeId};
 use groupnet_network::{Network, Router};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::anchor::{AnchorTask, anchor_task};
 use crate::driver::{
@@ -50,6 +51,10 @@ struct Inner {
     /// idempotent: a repeat join returns the existing handle instead of
     /// spawning a second, orphaned actor for the same group.
     routes: Mutex<HashMap<GroupId, Group>>,
+    /// The running group actors, so [`Node::close`] can wait until each has
+    /// stopped. An actor stops when the router is cancelled, whatever
+    /// `Group` handles remain.
+    actors: Mutex<Vec<JoinHandle<()>>>,
     start: Instant,
     /// The routing system group, joined once at spawn.
     routing: OnceLock<Group>,
@@ -238,6 +243,18 @@ impl Node {
         }
     }
 
+    /// Waits until every group actor of this node has stopped. The caller has
+    /// cancelled the router first, which is what stops each actor; a turn that
+    /// was running then completes, so after this returns no engine of this
+    /// node claims, grants or writes to its store again.
+    pub(crate) async fn close_groups(&self) {
+        let actors = std::mem::take(&mut *self.inner.actors.lock().expect("actors mutex poisoned"));
+        for actor in actors {
+            // A panicked actor has stopped too; its panic is not this caller's.
+            let _ = actor.await;
+        }
+    }
+
     /// Spawns a group actor and returns its handle, without touching the routes
     /// table — [`get_or_spawn`](Self::get_or_spawn) owns that, and calls this
     /// with the lock held, which is why nothing here may await.
@@ -330,7 +347,7 @@ impl Node {
         });
 
         let tick_period = group_tick_period(&config);
-        tokio::spawn(group_task(GroupTask {
+        let actor = tokio::spawn(group_task(GroupTask {
             engine,
             inbox: rx,
             transport: self.inner.transport.clone(),
@@ -349,7 +366,12 @@ impl Node {
             anchor_prompts,
             start: self.inner.start,
             tick_period,
+            closed: self.inner.transport.cancellation(),
         }));
+        let mut actors = self.inner.actors.lock().expect("actors mutex poisoned");
+        actors.retain(|actor| !actor.is_finished());
+        actors.push(actor);
+        drop(actors);
 
         Group::new(
             group,

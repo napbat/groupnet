@@ -28,9 +28,15 @@ impl Node {
 
     /// Closes connections across all node clones and drains owned network tasks.
     /// Group handles may remain readable, but cannot exchange further messages.
+    /// Every group actor of the node stops, whatever `Group` handles remain,
+    /// and this returns only after each has stopped: no engine of the node
+    /// claims, grants or writes to its store after the close. A command on a
+    /// remaining handle is refused as
+    /// [`CommandRejected::GroupClosed`](crate::CommandRejected::GroupClosed).
     pub async fn close(&self) {
         self.shutdown_protocols();
         self.network.close().await;
+        self.close_groups().await;
         self.close_messaging().await;
         self.close_protocols().await;
     }

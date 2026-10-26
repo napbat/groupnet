@@ -1377,13 +1377,15 @@ are contract rather than implementation detail:
   lease spare for a slow round trip, a dropped report or a retry, and stops a
   brisk gossip interval turning into a store write every few milliseconds.
 * **The command channel back into the actor is a `WeakSender`, on purpose.** The
-  group actor stops when its inbox closes — i.e. when every sender is dropped —
-  and the actor itself owns this task's prompt channel. A strong sender here
-  would make the pair mutually immortal: a killed node would keep gossiping *and
-  keep renewing its anchor record*, which is the one leak this tier cannot
-  afford. The task ends when the prompt sender drops, which happens when the
-  actor returns; `feed` upgrades the weak sender per report and gives up quietly
-  if the actor has already stopped.
+  group actor stops when its node closes (`Node::close` waits for it, or a
+  router shutdown, whatever `Group` handles remain — napbat/groupnet#9), or
+  when its inbox closes — i.e. when every sender is dropped — and the actor
+  itself owns this task's prompt channel. A strong sender here would make the
+  pair mutually immortal on the inbox path: a dropped group would keep
+  gossiping *and keep renewing its anchor record*, which is the one leak this
+  tier cannot afford. The task ends when the prompt sender drops, which happens
+  when the actor returns; `feed` upgrades the weak sender per report and gives
+  up quietly if the actor has already stopped.
 * **`AnchorClaimDue` must never block the group actor**, which is the sharp
   inversion of `PersistGrant` (which blocks it *by contract* — a grant must not
   outrun its own durability). Here there is nothing to be ahead of: until the
