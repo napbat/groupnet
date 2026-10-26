@@ -681,6 +681,18 @@ refine the sketch above and are now contract:
   and emits no frame to drop. What this costs is **S1-strict across an amnesiac
   restart** and nothing else — S4c-global is carried by the promise and the
   blackout, timing rules that never consult a store.
+* **A close never waits for ever on a store, and never hides a late grant**
+  (napbat/groupnet#9, #11). `Node::close` stops every group actor of the node,
+  whatever `Group` handles remain, and returns only after each has stopped.
+  Once the close begins, no grant write starts: the pair counts as not durable,
+  so its frames are withheld. A write that is already running is waited for
+  the voter storage's close wait (`VoterStorage::with_close_wait`, default
+  `DEFAULT_CLOSE_WAIT`, 5 s), so a hung disk cannot hold a shutdown. A write
+  still running when that wait runs out is named in the `CloseReport` the
+  close returns (`UnfinishedGrant`): the store can still make that pair
+  durable after the close returned, so the node's next life must not load its
+  store before the write has ended. A complete report means that no grant of
+  the node can become durable after the close.
 * **Voters and members are different sets, and both directions are legal.** The
   roster names who votes, not who is alive and not who is in the membership
   view. A voter gossip has never shown alive is still sent every claim (claim

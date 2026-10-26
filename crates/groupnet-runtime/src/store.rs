@@ -10,6 +10,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use groupnet_core::{NodeId, RecoveredGrant};
 
@@ -123,14 +124,44 @@ pub struct VoterStorage {
     pub(crate) recovered: RecoveredGrant,
     /// Where grants are written before they reach the wire.
     pub(crate) store: Arc<dyn GrantStore>,
+    /// How long [`Node::close`](crate::Node::close) waits for a grant write
+    /// that is running when the node closes.
+    pub(crate) close_wait: Duration,
 }
+
+/// How long [`Node::close`](crate::Node::close) waits by default for a grant
+/// write that is running when the node closes: longer than any healthy write
+/// and `fsync`, short enough that a hung disk cannot hold a shutdown.
+pub const DEFAULT_CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 impl VoterStorage {
     /// Pairs what `store` said on boot (`recovered`, read **before** joining)
-    /// with the store that persists every later grant.
+    /// with the store that persists every later grant. The close wait is
+    /// [`DEFAULT_CLOSE_WAIT`].
     #[must_use]
     pub fn new(recovered: RecoveredGrant, store: Arc<dyn GrantStore>) -> Self {
-        Self { recovered, store }
+        Self {
+            recovered,
+            store,
+            close_wait: DEFAULT_CLOSE_WAIT,
+        }
+    }
+
+    /// Sets how long [`Node::close`](crate::Node::close) waits for a grant
+    /// write that is running when the node closes (napbat/groupnet#11).
+    ///
+    /// Once the node closes, no new grant write starts. A write that is
+    /// running is waited for this long. If it is still running then, the
+    /// close stops waiting and reports it in
+    /// [`CloseReport::unfinished`](crate::CloseReport::unfinished): the store
+    /// can still make that pair durable after the close returned, so the next
+    /// life of the node must not load the store before the write has ended.
+    /// `Duration::ZERO` waits for nothing; `Duration::MAX` waits as long as
+    /// Tokio's timer can (about thirty years).
+    #[must_use]
+    pub fn with_close_wait(mut self, wait: Duration) -> Self {
+        self.close_wait = wait;
+        self
     }
 }
 
@@ -140,6 +171,7 @@ impl fmt::Debug for VoterStorage {
         // an implementation is free to hold a file handle and nothing else.
         f.debug_struct("VoterStorage")
             .field("recovered", &self.recovered)
+            .field("close_wait", &self.close_wait)
             .finish_non_exhaustive()
     }
 }

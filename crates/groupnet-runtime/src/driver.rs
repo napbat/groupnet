@@ -16,11 +16,12 @@ use tokio_util::sync::CancellationToken;
 use crate::group::{
     EntryInspectionError, EntryInspectionLimits, InspectedEntries, InspectedPair, Leadership,
 };
-use crate::store::GrantStore;
 
 mod durability;
 mod entry_inspection;
-use durability::{Undurable, persist_grant, undurable_frame};
+use durability::Durability;
+pub(crate) use durability::Grants;
+pub use durability::{CloseReport, UnfinishedGrant};
 use entry_inspection::{inspect_scoped_entry, inspect_scoped_pair};
 
 /// A change notification a consumer can subscribe to via
@@ -377,10 +378,11 @@ pub(crate) struct GroupTask<T: Transport> {
     /// group through this channel. `None` for the routing group itself.
     pub routing: Option<mpsc::Sender<Event>>,
     /// Voter durability for a [`Quorum`](groupnet_core::Activation::Quorum)
-    /// group. `None` is the **blackout posture**: [`Effect::PersistGrant`] is
-    /// ignored and the engine's post-restart grant blackout stands in for
-    /// durability.
-    pub store: Option<Arc<dyn GrantStore>>,
+    /// group: the store, and how long a write that runs when the node closes
+    /// is waited for. `None` is the **blackout posture**:
+    /// [`Effect::PersistGrant`] is ignored and the engine's post-restart grant
+    /// blackout stands in for durability.
+    pub store: Option<Grants>,
     /// Where [`Effect::AnchorClaimDue`]'s epoch hints go: the capacity-one
     /// inbox of this group's [`anchor_task`](crate::anchor::anchor_task).
     /// `None` for every group that is not both
@@ -404,11 +406,13 @@ pub(crate) struct GroupTask<T: Transport> {
 /// Runs a single group's engine as an actor until its node closes or its inbox
 /// closes (every handle and route sender dropped).
 ///
-/// A turn that is running when the node closes completes, a persist included;
-/// no turn starts after that. The `watch` and `broadcast` senders drop with the
-/// actor, so a held handle keeps its last readable views, and each later
-/// command on it is refused as `CommandRejected::GroupClosed`.
-pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
+/// A turn that is running when the node closes completes; no turn starts after
+/// that. A grant write in that turn is waited for one close wait at most (see
+/// [`UnfinishedGrant`]), which is what the actor returns when the wait ran
+/// out. The `watch` and `broadcast` senders drop with the actor, so a held
+/// handle keeps its last readable views, and each later command on it is
+/// refused as `CommandRejected::GroupClosed`.
+pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) -> Option<UnfinishedGrant> {
     let GroupTask {
         mut engine,
         mut inbox,
@@ -422,20 +426,12 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
         closed,
     } = task;
     if closed.is_cancelled() {
-        return; // joined after the close: nothing to start
+        return None; // joined after the close: nothing to start
     }
     // The observer whose view every published `Leadership` is derived from.
     // Cloned once so `dispatch` never has to borrow the engine.
     let local = engine.local().clone();
-
-    // The grant this engine believes it made but whose durability the store
-    // refused. It outlives the batch it was armed in, deliberately: the engine
-    // re-answers an already-recorded pair without re-persisting it (a re-grant
-    // decides nothing new), so a guard scoped to one batch would swallow the
-    // first frame and let the very next round leak the same undurable grant.
-    // Disarmed by the next persist that *succeeds* — which supersedes the pair
-    // on disk, making everything at or below it safe to answer again.
-    let mut undurable: Undurable = None;
+    let mut durability = Durability::new(store, closed.clone());
 
     let boot = engine.start(now_since(start));
     dispatch(
@@ -443,9 +439,8 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
         &publishers,
         &local,
         &boot,
-        store.as_ref(),
+        &mut durability,
         anchor_prompts.as_ref(),
-        &mut undurable,
     )
     .await;
 
@@ -497,9 +492,8 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
             &publishers,
             &local,
             &effects,
-            store.as_ref(),
+            &mut durability,
             anchor_prompts.as_ref(),
-            &mut undurable,
         )
         .await;
         publish_actor_views(
@@ -519,6 +513,7 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) {
             let _ = reply.send((applied, budget));
         }
     }
+    durability.into_unfinished(engine.group())
 }
 
 /// Republishes all readable views before the matching edge notifications.
@@ -679,17 +674,13 @@ async fn dispatch<T: Transport>(
     publishers: &Publishers,
     local: &NodeId,
     effects: &[Effect],
-    store: Option<&Arc<dyn GrantStore>>,
+    durability: &mut Durability,
     anchor_prompts: Option<&mpsc::Sender<u64>>,
-    undurable: &mut Undurable,
 ) {
     for effect in effects {
         match effect {
             Effect::Send { to, wire } => {
-                if undurable
-                    .as_ref()
-                    .is_some_and(|grant| undurable_frame(wire, grant, local))
-                {
+                if durability.withholds(wire, local) {
                     // Fail closed. The store said no, so this node grants
                     // nothing — see [`GrantStore`] for why silently.
                     continue;
@@ -710,16 +701,7 @@ async fn dispatch<T: Transport>(
             // post-restart grant blackout stands in for durability, and there
             // is nothing to do here.
             Effect::PersistGrant { epoch, claimant } => {
-                if let Some(store) = store {
-                    *undurable = if persist_grant(store, *epoch, claimant).await {
-                        // On disk, and it supersedes whatever was there — so
-                        // any older pair the guard was withholding is covered
-                        // by this one and the node may answer again.
-                        None
-                    } else {
-                        Some((*epoch, claimant.clone()))
-                    };
-                }
+                durability.persist(*epoch, claimant).await;
             }
             Effect::CoordinatorChanged { coordinator } => {
                 // Publish to readers; ignore error if no receivers remain.

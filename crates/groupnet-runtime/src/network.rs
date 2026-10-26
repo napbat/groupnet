@@ -7,7 +7,7 @@ use groupnet_network::Router;
 use groupnet_network::tunnel::{TunnelTransport, TunneledStream};
 use groupnet_transport::bulk::BulkTransport;
 
-use crate::{Endpoint, Node, Ordered};
+use crate::{CloseReport, Endpoint, Node, Ordered};
 
 impl Node {
     /// The node's router, including route inspection and typed adapter registration.
@@ -29,16 +29,24 @@ impl Node {
     /// Closes connections across all node clones and drains owned network tasks.
     /// Group handles may remain readable, but cannot exchange further messages.
     /// Every group actor of the node stops, whatever `Group` handles remain,
-    /// and this returns only after each has stopped: no engine of the node
-    /// claims, grants or writes to its store after the close. A command on a
-    /// remaining handle is refused as
+    /// and this returns only after each has stopped. A command on a remaining
+    /// handle is refused as
     /// [`CommandRejected::GroupClosed`](crate::CommandRejected::GroupClosed).
-    pub async fn close(&self) {
+    ///
+    /// No grant write starts after the close begins. A write that is running
+    /// is waited for its voter storage's
+    /// [close wait](crate::VoterStorage::with_close_wait) at most, so a hung
+    /// store cannot hold the close. When the report
+    /// [is complete](CloseReport::is_complete), no grant of this node can
+    /// become durable after this returns; otherwise it names each write that
+    /// still can.
+    pub async fn close(&self) -> CloseReport {
         self.shutdown_protocols();
         self.network.close().await;
-        self.close_groups().await;
+        let report = self.close_groups().await;
         self.close_messaging().await;
         self.close_protocols().await;
+        report
     }
 }
 
