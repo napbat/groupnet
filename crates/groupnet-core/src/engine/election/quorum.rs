@@ -21,12 +21,19 @@
 //! * **Q2 (re-grant).** The exact pair we already granted is re-sent verbatim
 //!   and the promise slides — nothing new is written down, because nothing new
 //!   was decided. This is what a host's renewal round collects.
-//! * **Q3 (refusal).** Everything else is refused **silently**: a lower epoch,
-//!   the same epoch under a different claimant (the one-grant-per-epoch rule),
-//!   a higher epoch from a stranger while we are still promised to someone
-//!   else, and — Q15a — anything at all once this node is leaving. Silence, not
-//!   a NACK: a refusal that answered would tell a claimant to try again sooner,
-//!   which is precisely the churn the promise exists to damp.
+//! * **Q3 (refusal).** Everything else is refused: a lower epoch, the same
+//!   epoch under a different claimant (the one-grant-per-epoch rule), a higher
+//!   epoch from a stranger while we are still promised to someone else, and —
+//!   Q15a — anything at all once this node is leaving. Nothing is written
+//!   down and nothing is endorsed. A refusal on the promise is **silent**, not
+//!   a NACK: an answer would tell a claimant to try again sooner, which is
+//!   precisely the churn the promise exists to damp.
+//! * **Q3a (the floor answer).** A claim refused because its epoch is at or
+//!   below the granted one is answered with the granted pair itself, re-sent
+//!   as it stands. That claim can never win this voter, so the answer only
+//!   tells the claimant which epoch to bid above. It is not a new grant: it
+//!   names the pair already granted, writes nothing, and the driver's
+//!   durability guard withholds it exactly as it withholds that pair's grant.
 //! * **Q0.** A node outside the roster, and *any* node under `Settle`, never
 //!   grants at all.
 //!
@@ -52,6 +59,14 @@
 //!   when a *peer's* grant arrives leaves a **roster of one** — whose majority
 //!   the self-grant alone satisfies — permanently hostless, because no peer
 //!   grant is ever coming.
+//! * **Q5b (the learned floor).** Every voter's grant teaches its epoch, the
+//!   floor answer of Q3a included: the next claim bids above it. A voter whose
+//!   grant proves it refuses the standing claim is counted against the round,
+//!   and once too few voters remain for a majority the claim is abandoned at
+//!   once instead of waiting out its window. With
+//!   [`RecoveringEngine::restore`] raising the observed epoch to the recovered
+//!   grant, a restart of every voter elects in about one claim window after
+//!   the boot guard, whatever epoch the cluster had reached.
 //!
 //! **The host half** (rows Q7–Q8) is why renewal costs a round trip here and
 //! not under `Settle`. A `Settle` host renews by re-reading its own rank; a
@@ -160,6 +175,9 @@ pub(super) struct QuorumState {
     /// The voters whose grants this round has collected, this node's own
     /// self-grant included. Reset when a round opens.
     round_grants: BTreeSet<NodeId>,
+    /// The voters this round can no longer win: each sent a grant (row Q5b)
+    /// proving that it refuses the claimed epoch. Reset when a round opens.
+    round_refused: BTreeSet<NodeId>,
 }
 
 /// What a voter does with one inbound claim: rows Q1, Q2 and Q3.
@@ -170,7 +188,8 @@ enum Verdict {
     /// Q2: the pair already granted, asked for again. Answer it again; there is
     /// nothing new to write down.
     Repeat,
-    /// Q3 / Q15a: refused, silently.
+    /// Q3 / Q15a: refused. Nothing is written down or endorsed; only the
+    /// floor answer of row Q3a may follow.
     Refuse,
 }
 
@@ -229,6 +248,7 @@ impl QuorumState {
                 grant_promise_until: Time::MAX,
                 round_sent_at: Time::ZERO,
                 round_grants: BTreeSet::new(),
+                round_refused: BTreeSet::new(),
             }),
         }
     }
@@ -398,7 +418,7 @@ impl GroupEngine {
     ) -> Vec<Effect> {
         let verdict = self.record_grant(epoch, claimant, now);
         if verdict == Verdict::Refuse {
-            return Vec::new(); // Q3: silence, not a NACK
+            return self.floor_answer(epoch, claimant);
         }
         let mut effects = Vec::new();
         if verdict == Verdict::Fresh {
@@ -416,6 +436,44 @@ impl GroupEngine {
             },
         ));
         effects
+    }
+
+    /// Row Q3a: the answer to a claim refused because its epoch is **at or
+    /// below** this voter's grant — the voter's own granted pair, re-sent as it
+    /// stands, to the claimant.
+    ///
+    /// That claim can never win this voter, however long it stands, and a
+    /// silent refusal leaves the claimant re-bidding one epoch higher per
+    /// window: after a restart of every voter, one lease for each epoch up to
+    /// the highest grant. The re-sent grant names the pair already granted, so
+    /// it endorses nothing new and writes nothing down; the claimant learns the
+    /// epoch from it and bids above. A refusal for any other reason stays
+    /// silent — a promise to another claimant, a leaving node, a node outside
+    /// the roster — because only the epoch floor is something a higher bid can
+    /// clear, and a promise is cleared by time alone.
+    fn floor_answer(&self, epoch: u64, claimant: &NodeId) -> Vec<Effect> {
+        if self.leaving || !self.is_voter() || *claimant == self.local {
+            return Vec::new();
+        }
+        let Some((granted_epoch, granted_claimant)) = self
+            .election
+            .as_ref()
+            .and_then(|el| el.quorum.as_ref())
+            .and_then(|q| q.granted.as_ref())
+        else {
+            return Vec::new();
+        };
+        if epoch > *granted_epoch {
+            return Vec::new(); // refused on the promise, not on the floor
+        }
+        vec![self.send_lead(
+            claimant.clone(),
+            wire::LeadBody::Grant {
+                epoch: *granted_epoch,
+                claimant: granted_claimant.clone(),
+                granter: self.local.clone(),
+            },
+        )]
     }
 
     /// Whether this node's own grant is already counted in the round it is
@@ -549,6 +607,7 @@ impl GroupEngine {
         };
         q.round_sent_at = now;
         q.round_grants.clear();
+        q.round_refused.clear();
         self.self_grant(epoch, now)
     }
 
@@ -583,7 +642,8 @@ impl GroupEngine {
                 .is_some_and(|el| el.epoch == epoch && el.host.as_ref() == Some(claimant))
     }
 
-    /// Rows Q4, Q5 and Q8: an inbound grant, dropped or counted.
+    /// Rows Q4, Q5 and Q8: an inbound grant, dropped or counted — and row Q5b,
+    /// the epoch it teaches.
     ///
     /// A counted grant either activates a standing claim (Q4) or extends a
     /// host's lease (Q8); both are anchored to the round's send instant, never
@@ -599,16 +659,18 @@ impl GroupEngine {
         if !self.is_quorum() {
             return Vec::new();
         }
-        // Q5: a grant is addressed evidence — for us, from a voter, about an
-        // epoch we are actually running a round for. Anything else is noise
-        // from a stale round, a third party's election, or a stranger.
-        if *claimant != self.local {
-            return Vec::new();
-        }
+        // Q5: a grant is evidence only from a voter; a stranger's is noise.
         if !self
             .quorum_voters()
             .is_some_and(|voters| voters.contains(granter))
         {
+            return Vec::new();
+        }
+        self.learn_granted_epoch(epoch, claimant, granter);
+        // Q5: and it counts only addressed to us, about an epoch we are
+        // actually running a round for. Anything else is a stale round or the
+        // floor answer of row Q3a, already learned from above.
+        if *claimant != self.local {
             return Vec::new();
         }
         let Some(el) = self.election.as_ref() else {
@@ -627,6 +689,43 @@ impl GroupEngine {
             q.round_grants.insert(granter.clone());
         }
         self.close_round_if_majority(epoch)
+    }
+
+    /// Row Q5b: a voter's grant of `epoch` proves that voter refuses every
+    /// claim at or below it but the granted pair itself. The epoch is learned,
+    /// so the next claim bids above it. A standing claim at or below that
+    /// epoch that the grant does not count toward marks `granter` as a voter
+    /// the round can never win; once too few voters remain for a majority, the
+    /// claim is abandoned at once and the next tick re-bids above, instead of
+    /// waiting out a window that cannot close. Abandoning decides nothing and
+    /// announces nothing — a claim that never activated changed nobody's
+    /// belief.
+    fn learn_granted_epoch(&mut self, epoch: u64, claimant: &NodeId, granter: &NodeId) {
+        let local = self.local.clone();
+        let Some(el) = self.election.as_mut() else {
+            return;
+        };
+        el.highest_seen = el.highest_seen.max(epoch);
+        let refuses = el.role == Role::Claimant
+            && el
+                .claim
+                .is_some_and(|c| c.epoch < epoch || (c.epoch == epoch && *claimant != local));
+        if !refuses {
+            return;
+        }
+        let Some(voters) = el.voters() else {
+            return;
+        };
+        let (count, majority) = (voters.len(), voters.majority());
+        let Some(q) = el.quorum.as_mut() else {
+            return;
+        };
+        if !q.round_grants.contains(granter) {
+            q.round_refused.insert(granter.clone());
+        }
+        if count.saturating_sub(q.round_refused.len()) < majority {
+            self.abandon_claim();
+        }
     }
 
     /// Row Q7: a host's renewal round. Re-claims the epoch it already holds
@@ -662,6 +761,7 @@ impl GroupEngine {
         if let Some(q) = self.quorum_mut() {
             q.round_sent_at = now;
             q.round_grants.clear();
+            q.round_refused.clear();
         }
         let mut effects = self.self_grant(epoch, now);
         let body = wire::LeadBody::Claim {

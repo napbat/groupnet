@@ -673,10 +673,11 @@ impl GroupEngine {
             effects.push(self.send_lead(from.clone(), body));
         }
 
-        // Rows Q1–Q3: the voter's answer. Silent unless this node is in the
-        // roster of a Quorum group — and silent then too, whenever the ledger
-        // refuses. Ordered after row 9 so a repair and a grant can ride the
-        // same batch without either reordering the other.
+        // Rows Q1–Q3a: the voter's answer. Silent unless this node is in the
+        // roster of a Quorum group — and silent then too when the ledger
+        // refuses on its promise; a refusal on its epoch floor re-sends the
+        // granted pair (row Q3a). Ordered after row 9 so a repair and a grant
+        // can ride the same batch without either reordering the other.
         effects.extend(self.on_claim_as_voter(epoch, claimant, now));
 
         // Row 10: a claim that outranks ours ends ours. Both sides apply the

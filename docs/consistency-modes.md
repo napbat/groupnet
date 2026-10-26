@@ -608,6 +608,23 @@ refine the sketch above and are now contract:
   `RecoveredGrant::none()` — storage attesting this voter has *never* granted —
   is the one statement that lifts the blackout outright, and only a driver that
   really did persist every grant may make it.
+* **A restart of every voter elects in one window, not one window per
+  epoch** (napbat/groupnet#8). Recovery also raises the restored engine's
+  observed epoch (`highest_seen`) to the recovered pair's epoch, so its first
+  claim bids above every epoch it granted. And a voter that refuses a claim
+  **at or below its granted epoch** answers it with its granted pair, re-sent
+  as it stands (row Q3a); the claimant learns that epoch from it (row Q5b),
+  bids above it, and abandons at once a round that too few voters can still
+  grant. Before both, a restored claimant bid from epoch 1, every voter that
+  had granted higher refused each bid silently, and each refusal cost a claim
+  window: an election after a full restart took one lease per epoch the
+  cluster had ever reached. Neither rule decides anything: the floor answer
+  names a pair already granted (it writes nothing, and the driver's
+  durability guard withholds it exactly as it withholds that pair's grant),
+  and a learned epoch only moves the next bid up — a claim still activates
+  only on a majority of grants, each above its granter's floor. A refusal on
+  the *promise* stays silent: a higher bid cannot clear a promise, only time
+  can, and answering it would only invite churn.
 * **The honest property matrix.** Two different guarantees, and they are not
   the same strength:
 

@@ -141,6 +141,9 @@ pub struct Simulation {
     /// How many `LeadGrant` frames the sim has seen **issued**. See
     /// [`grant_frames_seen`](Self::grant_frames_seen).
     grant_frames: u64,
+    /// How many floor answers the sim has seen **issued**. See
+    /// [`floor_answers_seen`](Self::floor_answers_seen).
+    floor_answers: u64,
     /// The **durable** voter ledger this sim keeps on each node's behalf,
     /// written from [`Effect::PersistGrant`] — the store a driver with voter
     /// durability would provide. Keyed by granter, and deliberately *not* held
@@ -148,11 +151,13 @@ pub struct Simulation {
     /// back through
     /// [`RecoveringEngine::restore`](groupnet_core::RecoveringEngine::restore).
     persisted_grants: BTreeMap<NodeId, (u64, NodeId)>,
-    /// Every grant frame this sim has seen **issued** — `(when, granter,
-    /// epoch, claimant)`, appended at dispatch rather than at delivery, so a
-    /// grant that is lost or partitioned away still appears here. That is what
-    /// makes it usable as the one-grant-per-epoch-per-voter probe: the property
-    /// is about what a voter *said*, not about what anyone heard.
+    /// Every grant this sim has seen **issued** to the claimant it names —
+    /// `(when, granter, epoch, claimant)`, appended at dispatch rather than at
+    /// delivery, so a grant that is lost or partitioned away still appears
+    /// here. That is what makes it usable as the one-grant-per-epoch-per-voter
+    /// probe: the property is about what a voter *said*, not about what anyone
+    /// heard. A floor answer endorses nobody new and is not logged (see
+    /// [`floor_answers_seen`](Self::floor_answers_seen)).
     pub grant_log: Vec<(Time, NodeId, u64, NodeId)>,
     /// The external CAS anchor: the register, the per-node driver state around
     /// it, and its fault knobs. Inert until
@@ -195,6 +200,7 @@ impl Simulation {
             election_frames: 0,
             claim_frames: 0,
             grant_frames: 0,
+            floor_answers: 0,
             persisted_grants: BTreeMap::new(),
             grant_log: Vec::new(),
             anchor: AnchorModel::default(),
