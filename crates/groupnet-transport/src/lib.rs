@@ -13,7 +13,10 @@
 //! bounded queue capacity, [`validate_node_id`] enforces the routing-identity
 //! bound, and the `framing` module (feature `framing`, implied by `bulk`) owns
 //! the stream-frame ceiling, the typed length prefix and the partial-write-safe
-//! vectored writer. [`Bytes`] is re-exported because [`Inbound`] and the link
+//! vectored writer. The `auth` module (feature `auth`) holds the cluster's
+//! shared `ClusterSecret` that the router and the TCP data plane authenticate
+//! peers with; without one, a cluster belongs on a private network.
+//! [`Bytes`] is re-exported because [`Inbound`] and the link
 //! APIs carry it, so callers need not match the `bytes` version themselves.
 //!
 //! Bindings for either live in their own `groupnet-transport-*` crates.
@@ -88,6 +91,9 @@ pub mod link;
 
 #[cfg(feature = "link")]
 pub mod admission;
+
+#[cfg(feature = "auth")]
+pub mod auth;
 
 #[cfg(doc)]
 use groupnet_core::NodeId;

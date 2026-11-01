@@ -20,6 +20,9 @@ link = [
     "dep:tokio", "tokio/rt", "tokio/sync", "tokio/time", "tokio/macros",
     "dep:tokio-util", "dep:futures-util", "futures-util/sink", "futures-util/async-await",
 ]
+# `auth` adds the shared `ClusterSecret` and its keyed-hash and nonce
+# primitives (HMAC-SHA256 and the OS random source, from `ring`).
+auth = ["dep:ring"]
 
 [dependencies]
 groupnet-core = { workspace = true }
@@ -29,6 +32,7 @@ futures-util = { workspace = true, features = ["io"], optional = true }
 zerocopy = { workspace = true, features = ["derive"], optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["rt"], optional = true }
+ring = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
