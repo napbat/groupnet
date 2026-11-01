@@ -560,6 +560,7 @@ impl Endpoint {
                 packet: Inbound {
                     from: peer.node.clone(),
                     msg: Bytes::copy_from_slice(message),
+                    source: None,
                 },
                 session: Some(peer.lease.id()),
             });

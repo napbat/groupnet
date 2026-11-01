@@ -171,10 +171,14 @@ impl Outgoing {
             if let Some(mut pending) = self.fragments.take()
                 && Instant::now() < pending.deadline
                 && self.admitted(&pending.peer, pending.session)
-                && let Some(bytes) = pending.frames.next()
+                && let Some(mut fragment) = pending.frames.next()
             {
-                let packet = Outbound::owned(pending.peer.clone(), bytes, pending.deadline)
-                    .with_session(pending.session);
+                self.shared
+                    .sealing
+                    .seal_fragment(&self.shared.local, &mut fragment);
+                let packet =
+                    Outbound::owned(pending.peer.clone(), fragment.freeze(), pending.deadline)
+                        .with_session(pending.session);
                 self.fragments = Some(pending);
                 return Some(packet);
             }
@@ -182,7 +186,7 @@ impl Outgoing {
                 result = self.advertisements.changed() => {
                     if result.is_err() { return None; }
                     self.snapshot = self.advertisements.borrow_and_update().clone();
-                    self.remaining = self.snapshot.len() * self.peers.len();
+                    self.restart_pass();
                     continue;
                 }
                 () = async {
@@ -195,7 +199,7 @@ impl Outgoing {
                         self.peers = neighbors.borrow_and_update().iter()
                             .filter(|peer| peer.node != self.shared.local)
                             .map(|peer| (peer.node.clone(), Some(peer.id))).collect();
-                        self.remaining = self.snapshot.len() * self.peers.len();
+                        self.restart_pass();
                         self.fragments = None;
                     }
                     continue;
@@ -226,10 +230,25 @@ impl Outgoing {
             self.fragments = Some(Fragmented {
                 peer,
                 session,
-                frames: wire::fragment(bytes, self.mtu, self.shared.id()),
+                frames: wire::fragment(
+                    bytes,
+                    self.mtu,
+                    self.shared.id(),
+                    self.shared.sealing.fragments(),
+                ),
                 deadline,
             });
         }
+    }
+
+    /// Starts sending the current snapshot to every peer from its first
+    /// advert. A snapshot's adverts carry increasing routed identities in
+    /// snapshot order, and a receiver accepts a neighbor's adverts only in
+    /// increasing order, so every pass starts at the front instead of
+    /// resuming where an interrupted one stopped.
+    fn restart_pass(&mut self) {
+        self.remaining = self.snapshot.len() * self.peers.len();
+        self.position = 0;
     }
 }
 

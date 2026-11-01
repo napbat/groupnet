@@ -44,7 +44,14 @@ mod tests {
         let payload = b"engine control frame";
         let frame = wire::data(PayloadKind::Message, 16, [7; 16], &from, &to, payload);
         assert_eq!(message_payload(&frame), Some(payload.as_slice()));
-        assert!(message_payload(&wire::advert(0, std::slice::from_ref(&from))).is_none());
+        assert!(
+            message_payload(&wire::advert(
+                wire::test_id(1),
+                0,
+                std::slice::from_ref(&from)
+            ))
+            .is_none()
+        );
         assert!(
             message_payload(&wire::data(
                 PayloadKind::Tunnel,
@@ -56,7 +63,7 @@ mod tests {
             ))
             .is_none()
         );
-        for fragment in wire::fragment(frame.clone().into(), 40, [7; 16]) {
+        for fragment in wire::fragment(frame.clone().into(), 40, [7; 16], wire::OPEN_FRAGMENTS) {
             assert!(message_payload(&fragment).is_none());
         }
         for length in 0..frame.len() - payload.len() {

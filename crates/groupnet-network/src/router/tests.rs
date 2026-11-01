@@ -92,14 +92,16 @@ async fn address_updates_reach_only_pre_admitted_links_and_never_admit_a_source(
     incoming
         .send(Inbound {
             from: unknown.clone(),
-            msg: wire::advert(0, std::slice::from_ref(&unknown)).into(),
+            msg: wire::advert(wire::test_id(1), 0, std::slice::from_ref(&unknown)).into(),
+            source: None,
         })
         .await
         .unwrap();
     incoming
         .send(Inbound {
             from: peer.clone(),
-            msg: wire::advert(0, std::slice::from_ref(&peer)).into(),
+            msg: wire::advert(wire::test_id(2), 0, std::slice::from_ref(&peer)).into(),
+            source: None,
         })
         .await
         .unwrap();
@@ -396,6 +398,7 @@ async fn owned_protocol_send_and_receive_preserve_headroom_allocation() -> io::R
         .send(Inbound {
             from: peer,
             msg: frame,
+            source: None,
         })
         .await
         .unwrap();

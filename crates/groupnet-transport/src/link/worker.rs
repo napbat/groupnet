@@ -3,10 +3,13 @@ use super::{LinkFuture, LinkIo};
 use crate::Transport;
 use futures_util::{SinkExt, StreamExt};
 use groupnet_core::NodeId;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub(super) trait Worker: Send + Sync {
     fn learn_peer(&self, peer: &NodeId, address: &str);
+
+    fn confirm_peer(&self, peer: &NodeId, source: SocketAddr);
 
     fn run(self: Arc<Self>, io: LinkIo) -> LinkFuture<'static, ()>;
 }
@@ -16,6 +19,10 @@ pub(super) struct Typed<T>(pub(super) T);
 impl<T: Transport> Worker for Typed<T> {
     fn learn_peer(&self, peer: &NodeId, address: &str) {
         self.0.learn_peer(peer, address);
+    }
+
+    fn confirm_peer(&self, peer: &NodeId, source: SocketAddr) {
+        self.0.confirm_peer(peer, source);
     }
 
     fn run(self: Arc<Self>, mut io: LinkIo) -> LinkFuture<'static, ()> {

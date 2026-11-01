@@ -186,6 +186,16 @@ impl Transport for TcpMsgTransport {
         }
     }
 
+    /// Records an authenticated dialer's introduced listen address, as
+    /// [`learn_peer`](Transport::learn_peer) records a hint. Raw endpoints
+    /// pass it up as [`Inbound::source`](groupnet_transport::Inbound::source)
+    /// instead of recording it when the connection arrives.
+    fn confirm_peer(&self, node: &NodeId, source: SocketAddr) {
+        if let Some(inner) = self.direct() {
+            inner.learn_peer_addr(node, source);
+        }
+    }
+
     #[cfg_attr(
         not(feature = "connectivity"),
         expect(

@@ -17,12 +17,13 @@ pub enum LinkRegistrationError {
         /// The router's `max_routes`.
         max_routes: usize,
     },
-    /// The link's `mtu` cannot carry a fragment header and one byte, or
-    /// exceeds the router's `max_frame`.
+    /// The link's `mtu` cannot carry a fragment header, a fragment tag under a
+    /// cluster secret, and one byte, or exceeds the router's `max_frame`.
     MtuOutOfRange {
         /// The link's `mtu`.
         mtu: usize,
-        /// Smallest accepted `mtu`: the fragment header plus one byte.
+        /// Smallest accepted `mtu`: the fragment header, any fragment tag, and
+        /// one byte.
         min: usize,
         /// Largest accepted `mtu`: the router's `max_frame`.
         max: usize,

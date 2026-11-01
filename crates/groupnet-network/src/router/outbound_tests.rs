@@ -56,14 +56,21 @@ impl Transport for BlockedEndpoint {
     }
 }
 
-async fn advertise(incoming: &mpsc::Sender<AdmittedInbound>, peer: &NodeId, id: SessionId) {
+/// Advertises `peer` under `session`; `sequence` orders its adverts.
+async fn advertise(
+    incoming: &mpsc::Sender<AdmittedInbound>,
+    peer: &NodeId,
+    session: SessionId,
+    sequence: u64,
+) {
     incoming
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(0, std::slice::from_ref(peer)).into(),
+                msg: wire::advert(wire::test_id(sequence), 0, std::slice::from_ref(peer)).into(),
+                source: None,
             },
-            session: Some(id),
+            session: Some(session),
         })
         .await
         .unwrap();
@@ -95,7 +102,7 @@ async fn blocked_and_router_queued_frames_cannot_cross_into_replacement_session(
             .with_sessions(registry.clone()),
         )
         .await?;
-    advertise(&incoming, &peer, first.id()).await;
+    advertise(&incoming, &peer, first.id(), 1).await;
     eventually_within("initial route", WAIT, || router.route_to(&peer).is_some()).await;
     router.send(&peer, b"blocked").await?;
     tokio::time::timeout(WAIT, entered.cancelled())
@@ -105,7 +112,7 @@ async fn blocked_and_router_queued_frames_cannot_cross_into_replacement_session(
     drop(first);
     assert!(router.route_to(&peer).is_none());
     let replacement = registry.try_admit(AcceptedPeer::new(peer.clone()))?;
-    advertise(&incoming, &peer, replacement.id()).await;
+    advertise(&incoming, &peer, replacement.id(), 2).await;
     eventually_within("replacement route", WAIT, || {
         router.route_to(&peer).is_some()
     })

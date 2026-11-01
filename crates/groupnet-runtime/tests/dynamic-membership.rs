@@ -65,6 +65,7 @@ impl Transport for Endpoint {
                     packet: Inbound {
                         from: self.local.clone(),
                         msg: bytes.to_vec().into(),
+                        source: None,
                     },
                     session: Some(session),
                 })

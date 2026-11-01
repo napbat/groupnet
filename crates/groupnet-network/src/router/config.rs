@@ -127,12 +127,23 @@ pub struct RouterConfig {
     /// same size class; zero allocates every packet from the heap.
     pub packet_pool: usize,
     /// The cluster's shared secret. With it, every frame this router sends
-    /// carries a keyed seal and every frame it receives must carry a valid
-    /// one from the neighbor that sent it, or it is dropped and counted in
+    /// carries a keyed seal (and each fragment a keyed tag), and every frame
+    /// it receives must carry a valid one from the neighbor that sent it, or
+    /// it is dropped and counted in
     /// [`Router::auth_failures`](crate::Router::auth_failures); routers with
-    /// another secret or none cannot exchange frames with it. `None` (the
-    /// default) authenticates nothing: anyone who reaches a link can speak
-    /// for any node, so run such a cluster only on a private network.
+    /// another secret or none cannot exchange frames with it. A link's
+    /// address book learns where a neighbor speaks from only after such a
+    /// frame verified and was not a replay. `None` (the default)
+    /// authenticates nothing: anyone who reaches a link can speak for any
+    /// node, so run such a cluster only on a private network.
+    ///
+    /// Replay state is in memory: a router that restarts, or that evicted a
+    /// sender (`replay_capacity / 64` origin streams; `max_routes ×
+    /// max_transports` advert neighbors), accepts captured frames it no
+    /// longer remembers once each, and an advert from a neighbor boot older
+    /// than the last four it saw. Fragment tags are not replay-checked, so
+    /// replayed captured fragments can hold reassembly slots until they time
+    /// out.
     pub cluster_secret: Option<ClusterSecret>,
 }
 

@@ -79,7 +79,8 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `src/volatile_recovery/bootstrap/session/run.rs` ~869,
    `tests/replication-ack.rs` ~862 and `src/lease/shell.rs` ~863 (a coherent
    write's wait lives in `lease/shell/writes.rs`); `groupnet-transport-tcp`'s
-   `src/msg.rs` ~886 and `src/msg/admitted/tests.rs` ~870;
+   `src/msg/admitted/tests.rs` ~870 (`src/msg.rs`, ~483, keeps its tests in
+   `msg/tests.rs`, ~452);
    `groupnet-transport-punch`'s `src/punch/server.rs` ~885;
    `groupnet-transport-ipc`'s `tests/ipc.rs` ~897.
    With room still: `groupnet-runtime`'s `tests/external-faults.rs` ~781,
@@ -102,7 +103,7 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
    `groupnet-core`'s `src/volatile_bootstrap/journal/core.rs` ~788,
    `src/replication/subscription.rs` ~786 and `tests/state.rs` ~757;
    `groupnet-transport-punch`'s `src/tcp/endpoint.rs` ~844 and
-   `src/punch/wire.rs` ~780; `groupnet-transport-udp`'s `src/udp.rs` ~811;
+   `src/punch/wire.rs` ~780; `groupnet-transport-udp`'s `src/udp.rs` ~847;
    `groupnet-messaging`'s `src/tests.rs` ~808;
    `groupnet-sim/tests/election-external.rs` ~785. `groupnet-sim`'s
    `simulation.rs` (~565) delegates probe/liveness dispatch to

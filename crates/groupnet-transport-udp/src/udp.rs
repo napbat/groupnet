@@ -321,6 +321,17 @@ impl Transport for UdpTransport {
         }
     }
 
+    /// Records an authenticated datagram's source address for `node`, as
+    /// [`register_peer`](UdpTransport::register_peer) would. Connectivity
+    /// endpoints ignore it: their native admission owns every path.
+    fn confirm_peer(&self, node: &NodeId, source: SocketAddr) {
+        match &self.backend {
+            Backend::Direct(inner) => inner.register(node.clone(), source),
+            #[cfg(feature = "connectivity")]
+            Backend::Connectivity(_) => {}
+        }
+    }
+
     async fn send(&self, to: &NodeId, msg: &[u8]) -> io::Result<()> {
         #[cfg(not(feature = "connectivity"))]
         let Backend::Direct(inner) = &self.backend;
@@ -403,21 +414,21 @@ impl Transport for UdpTransport {
                 Err(error) => return Err(error),
             };
             if let Some((from, msg)) = unframe(&buf[..n]) {
-                // Self-attributed: learn where this peer speaks from, so the
-                // reverse path works even for a peer nothing told us about
-                // (a restart at a fresh address). Only touch the book when
-                // the binding actually changed.
+                // Self-attributed: anyone can name any id, so a datagram only
+                // reports where it came from. The book changes when a consumer
+                // that authenticated the frame confirms that address
+                // (`Transport::confirm_peer`), which keeps the reverse path
+                // for a peer nothing told us about (a restart at a fresh
+                // address) without letting a claimed id redirect it.
                 let known = inner
                     .peers
                     .read()
                     .expect("peers lock poisoned")
                     .get(&from)
                     .copied();
-                if known != Some(addr) {
-                    inner.register(from.clone(), addr);
-                }
+                let source = (known != Some(addr)).then_some(addr);
                 let msg = Bytes::copy_from_slice(msg);
-                return Ok(Inbound { from, msg });
+                return Ok(Inbound { from, msg, source });
             }
             // Malformed or unattributable datagram — ignore and keep receiving.
         }
@@ -643,10 +654,11 @@ mod tests {
     }
 
     /// The wedge this prefix exists to prevent: a receiver that has NEVER
-    /// been told about a sender still attributes its datagram, learns its
-    /// address, and can reply — no prior registration in that direction.
+    /// been told about a sender still attributes its datagram and reports
+    /// its source; once the consumer confirms it, the receiver can reply —
+    /// no prior registration in that direction.
     #[tokio::test]
-    async fn unknown_sender_is_attributed_and_learned() {
+    async fn unknown_sender_is_attributed_and_confirmed() {
         let sender = bind_as("attr-sender").await;
         let receiver = bind_as("attr-receiver").await;
         let sender_id = NodeId::new("attr-sender");
@@ -668,8 +680,14 @@ mod tests {
             b"hello".to_vec(),
             "payload excludes the prefix"
         );
+        assert_eq!(inbound.source, Some(sender.local_addr()));
+        assert!(
+            receiver.known_peers().is_empty(),
+            "nothing learned unverified"
+        );
 
-        // The reverse path now works without anyone registering it.
+        // The reverse path works once the source is confirmed.
+        receiver.confirm_peer(&inbound.from, sender.local_addr());
         receiver.send(&sender_id, b"reply").await.expect("send");
         let back = tokio::time::timeout(Duration::from_secs(2), sender.recv())
             .await
@@ -679,18 +697,17 @@ mod tests {
         assert_eq!(back.msg, b"reply".to_vec());
     }
 
-    /// A moved peer (restart at a fresh address) re-teaches the book on its
-    /// first datagram, replacing the stale address.
+    /// A moved peer (restart at a fresh address) reports its live address on
+    /// its first datagram; confirming it replaces the stale one.
     #[tokio::test]
-    async fn a_moved_sender_rebinds_the_book() {
+    async fn a_moved_sender_rebinds_the_book_once_confirmed() {
         let receiver = bind_as("move-receiver").await;
         let sender_id = NodeId::new("move-sender");
         let receiver_id = NodeId::new("move-receiver");
+        let stale: SocketAddr = "127.0.0.1:9".parse().expect("addr");
 
         // The receiver holds a STALE address for the sender.
-        receiver
-            .register_peer(sender_id.clone(), "127.0.0.1:9".parse().expect("addr"))
-            .unwrap();
+        receiver.register_peer(sender_id.clone(), stale).unwrap();
 
         let sender = bind_as("move-sender").await;
         sender
@@ -703,15 +720,34 @@ mod tests {
             .expect("recv timed out")
             .expect("recv");
         assert_eq!(inbound.from, sender_id);
-        assert_eq!(
-            raw_inner(&receiver)
+        assert_eq!(inbound.source, Some(sender.local_addr()));
+        let book = |receiver: &UdpTransport| {
+            raw_inner(receiver)
                 .peers
                 .read()
                 .expect("peers")
-                .get(&sender_id),
-            Some(&sender.local_addr()),
+                .get(&sender_id)
+                .copied()
+        };
+        assert_eq!(
+            book(&receiver),
+            Some(stale),
+            "a datagram alone moves nothing"
+        );
+        receiver.confirm_peer(&inbound.from, sender.local_addr());
+        assert_eq!(
+            book(&receiver),
+            Some(sender.local_addr()),
             "the book rebound to the sender's live address"
         );
+
+        // With the book in agreement, later datagrams report no source.
+        sender.send(&receiver_id, b"again").await.expect("send");
+        let inbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
+        assert_eq!(inbound.source, None);
     }
 
     /// A gossiped advertisement teaches the book exactly like registration —

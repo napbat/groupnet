@@ -135,6 +135,7 @@ impl Transport for MemTransport {
                 permit.send(Inbound {
                     from: self.id.clone(),
                     msg: Bytes::copy_from_slice(msg),
+                    source: None,
                 });
             }
         }
@@ -156,6 +157,7 @@ impl Transport for MemTransport {
                 .send(Inbound {
                     from: self.id.clone(),
                     msg,
+                    source: None,
                 })
                 .await;
         }

@@ -284,6 +284,15 @@ impl LinkControl {
             worker.learn_peer(peer, address);
         }
     }
+
+    /// Hands an authenticated frame's [`Inbound::source`](crate::Inbound::source)
+    /// to the concrete transport's [`confirm_peer`](crate::Transport::confirm_peer)
+    /// while it is alive.
+    pub fn confirm_peer(&self, peer: &NodeId, source: std::net::SocketAddr) {
+        if let Some(worker) = self.worker.upgrade() {
+            worker.confirm_peer(peer, source);
+        }
+    }
 }
 
 /// Single-use, protocol-neutral worker owner. Drop initiates protocol shutdown;

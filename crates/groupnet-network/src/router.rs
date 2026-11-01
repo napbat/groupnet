@@ -3,6 +3,7 @@
 mod adapters;
 mod bounds;
 mod config;
+mod freshness;
 mod packet;
 mod pool;
 mod protocol;
@@ -375,7 +376,8 @@ impl Router {
             };
             return Err((error.into(), link));
         }
-        let min = wire::FRAGMENT + 1;
+        let seal = shared.sealing.overhead();
+        let min = wire::FRAGMENT + seal + 1;
         if !(min..=max_frame).contains(&mtu) {
             let error = LinkRegistrationError::MtuOutOfRange {
                 mtu,
@@ -384,7 +386,7 @@ impl Router {
             };
             return Err((error.into(), link));
         }
-        let fragments = (max_frame + shared.sealing.overhead()).div_ceil(mtu - wire::FRAGMENT);
+        let fragments = (max_frame + seal).div_ceil(mtu - wire::FRAGMENT - seal);
         let max_fragments = usize::from(shared.config.reassembly.max_fragments.get());
         if fragments > max_fragments {
             let error = LinkRegistrationError::FragmentsAboveReassembly {

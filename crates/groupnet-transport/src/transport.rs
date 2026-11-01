@@ -3,6 +3,7 @@
 
 use std::error::Error;
 use std::future::Future;
+use std::net::SocketAddr;
 
 use groupnet_core::NodeId;
 
@@ -13,6 +14,13 @@ pub struct Inbound {
     pub from: NodeId,
     /// The opaque frame; hand it to `GroupEngine::on_message`.
     pub msg: bytes::Bytes,
+    /// Where `from` appears to speak from, when the transport's address book
+    /// does not yet hold that address for it: an unverified claim, since
+    /// anyone can send a frame that names `from`. The transport never records
+    /// it on its own; a consumer that authenticates `from` hands it to
+    /// [`Transport::confirm_peer`] once the frame verifies. `None` when the
+    /// book already agrees or the transport keeps no address book.
+    pub source: Option<SocketAddr>,
 }
 
 /// A pluggable, best-effort, message-oriented transport.
@@ -108,5 +116,14 @@ pub trait Transport: Send + Sync + 'static {
     /// never an error.
     fn learn_peer(&self, node: &NodeId, addr: &str) {
         let _ = (node, addr);
+    }
+
+    /// Records `source`, an [`Inbound::source`] of a frame from `node`, as
+    /// `node`'s address, once the consumer has authenticated that frame (the
+    /// router calls it after a frame's seal verifies, or for every admitted
+    /// frame without a cluster secret). Address-book-backed bindings record it
+    /// as they record a learned address; the default does nothing.
+    fn confirm_peer(&self, node: &NodeId, source: SocketAddr) {
+        let _ = (node, source);
     }
 }

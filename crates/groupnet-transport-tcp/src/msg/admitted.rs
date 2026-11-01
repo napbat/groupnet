@@ -631,6 +631,7 @@ async fn run_session(
                     packet: groupnet_transport::Inbound {
                         from: lease.node().clone(),
                         msg,
+                        source: None,
                     },
                     session: Some(lease.id()),
                 };
