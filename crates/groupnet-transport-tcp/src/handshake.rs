@@ -1,6 +1,7 @@
 //! Length-prefixed handshake fields shared by both planes: the dialing side
 //! introduces itself first, because a TCP source address (its port is
 //! ephemeral) cannot identify a peer the way a bound UDP source address can.
+//! The data plane wraps them in its own versioned hello (`bulk::handshake`).
 //!
 //! Every field is a typed [`LengthHeader`] followed by its bytes. Node ids
 //! obey the one identity bound, [`MAX_NODE_ID_BYTES`] and nonempty, on both
@@ -9,9 +10,13 @@
 use std::io;
 
 use groupnet_core::NodeId;
-use groupnet_transport::framing::{LengthHeader, write_vectored};
+use groupnet_transport::framing::LengthHeader;
+#[cfg(feature = "msg")]
+use groupnet_transport::framing::write_vectored;
 use groupnet_transport::{MAX_NODE_ID_BYTES, validate_node_id};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+#[cfg(feature = "msg")]
+use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use zerocopy::{FromZeros, IntoBytes};
 
 /// Longest accepted advertised address in an intro.
@@ -33,10 +38,8 @@ pub(crate) fn field_header(bytes: &[u8]) -> io::Result<LengthHeader> {
 
 /// Sends our node id as one length-prefixed field so the peer can attribute
 /// the connection. A managed session acknowledges it by echoing the accepted
-/// identity back; a bulk stream's dialer writes it and starts streaming
-/// without reading any acknowledgement, and the raw message plane never
-/// acknowledges either.
-#[cfg(any(feature = "bulk", feature = "link"))]
+/// identity back; the raw message plane never acknowledges it.
+#[cfg(feature = "link")]
 pub(crate) async fn write_id(sock: &mut (impl AsyncWrite + Unpin), id: &NodeId) -> io::Result<()> {
     check_id(id)?;
     let id = id.as_str().as_bytes();
@@ -148,7 +151,7 @@ mod tests {
 
     /// The dialer's id survives the wire verbatim, in both directions and for
     /// multi-byte UTF-8 — this attribution is all the accepting side gets.
-    #[cfg(any(feature = "bulk", feature = "link"))]
+    #[cfg(feature = "link")]
     #[tokio::test]
     async fn id_round_trips_over_a_connection() {
         let (mut dialer, mut acceptor) = pair().await;
@@ -172,7 +175,7 @@ mod tests {
 
     /// The length cap is inclusive and shared with session admission: an id
     /// of exactly `MAX_NODE_ID_BYTES` bytes is still a legal handshake.
-    #[cfg(any(feature = "bulk", feature = "link"))]
+    #[cfg(feature = "link")]
     #[tokio::test]
     async fn an_id_at_the_length_cap_is_accepted() {
         let (mut dialer, mut acceptor) = pair().await;
@@ -188,7 +191,7 @@ mod tests {
     }
 
     /// An id the peer would reject is refused locally before any byte is sent.
-    #[cfg(any(feature = "bulk", feature = "link"))]
+    #[cfg(feature = "link")]
     #[tokio::test]
     async fn ids_outside_the_bound_are_never_written() {
         let mut sink = Vec::new();
@@ -229,7 +232,7 @@ mod tests {
     }
 
     /// The field layout is a big-endian u32 length then the bytes.
-    #[cfg(any(feature = "bulk", feature = "link"))]
+    #[cfg(feature = "link")]
     #[tokio::test]
     async fn id_field_keeps_the_network_layout() {
         let mut wire = Vec::new();

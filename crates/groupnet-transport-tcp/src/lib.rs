@@ -13,7 +13,13 @@
 //!   one reliable, ordered byte stream per `connect`, for replication and
 //!   bulk transfer. Both ends set `TCP_NODELAY`; inbound identity handshakes
 //!   run concurrently under a deadline (`TcpBulkConfig`), so a stalled client
-//!   never delays other accepts.
+//!   never delays other accepts. With a `ClusterSecret`
+//!   (`TcpBulkConfig::secret`, `TcpBulkTransport::dial_only_with`) the
+//!   versioned handshake is a mutual challenge: both sides prove they hold the
+//!   cluster's secret before a stream byte flows, and every refusal counts in
+//!   `TcpBulkTransport::auth_failures`. Without one, any party that reaches
+//!   the listener can claim any node id: run such endpoints only on a private
+//!   network.
 //! * **`link` — router registration** (opt-in): `TcpLink` admits peers through
 //!   an explicit application policy (a configured-peer allowlist by default).
 //!   Managed sessions are full-duplex, bounded, and retained while connected;
@@ -45,16 +51,20 @@
 //! `TcpHostEndpointError`.
 //!
 //! The low-level message and bulk APIs retain trusted-topology identity
-//! attribution. Managed message admission uses its own bounded wire exchange,
-//! with no downgrade to that raw handshake. Open admission is unauthenticated.
+//! attribution unless the bulk plane holds a cluster secret. Frames a router
+//! carries over this crate's message plane are authenticated by the router's
+//! own cluster secret (`groupnet_network::RouterConfig::cluster_secret`), not
+//! here. Managed message admission uses its own bounded wire exchange, with
+//! no downgrade to that raw handshake. Open admission is unauthenticated.
 //! Every handshake introduces a node id of 1 to
 //! `groupnet_transport::MAX_NODE_ID_BYTES` bytes, the bound session admission
 //! enforces.
 //!
 //! The shared transport types these signatures name are re-exported at this
 //! crate's root, each with the feature that exposes it: `QueueCapacity`
-//! (`msg` or `bulk`), `NodeIdError` (`bulk`), and `Admission`, `BoundLink`,
-//! `PeerEndpoint` and `SessionRegistry` (`link`).
+//! (`msg` or `bulk`), `NodeIdError`, `ClusterSecret` and `ClusterSecretError`
+//! (`bulk`), and `Admission`, `BoundLink`, `PeerEndpoint` and
+//! `SessionRegistry` (`link`).
 //!
 //! [`Transport`]: groupnet_transport::Transport
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -70,6 +80,8 @@ pub use bulk::{TcpBulkConfig, TcpBulkConfigError, TcpBulkTransport, TcpHostEndpo
 pub use groupnet_transport::NodeIdError;
 #[cfg(any(feature = "bulk", feature = "msg"))]
 pub use groupnet_transport::QueueCapacity;
+#[cfg(feature = "bulk")]
+pub use groupnet_transport::auth::{ClusterSecret, ClusterSecretError};
 #[cfg(feature = "link")]
 pub use groupnet_transport::{
     admission::{Admission, SessionRegistry},
