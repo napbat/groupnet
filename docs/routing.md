@@ -79,7 +79,9 @@ flowchart TD
     MTU -->|"Yes"| Peer{"Source admitted on this link?"}
     Peer -->|"No"| Drop
     Peer -->|"Yes"| Reassemble["Bounded fragment reassembly"]
-    Reassemble --> Decode{"Complete valid routed frame?"}
+    Reassemble --> Seal{"Cluster secret set: valid seal from this neighbor?"}
+    Seal -->|"No: drop and count"| Drop
+    Seal -->|"Yes, or no secret"| Decode{"Complete valid routed frame?"}
     Decode -->|"Invalid"| Drop
     Decode -->|"Incomplete"| Pending["Wait for remaining fragments"]
     Decode -->|"Yes"| Kind{"Frame kind"}
@@ -97,7 +99,7 @@ flowchart TD
     Transit -->|"No"| Drop
     Transit -->|"Yes"| Route{"Live route available?"}
     Route -->|"No"| Drop
-    Route -->|"Yes"| Queue["Decrement hop budget; queue selected next hop"]
+    Route -->|"Yes"| Queue["Decrement hop budget; seal again; queue selected next hop"]
 ```
 
 Routing remains best-effort: queue saturation, a missing route, or a transport
@@ -115,7 +117,9 @@ shares a bounded queue and cancellation lifecycle. `RouterConfig::max_protocols`
 and `protocol_queue` default to 32 namespaces and 128 packets per namespace;
 unknown namespaces fail closed.
 The router neither decodes protocol bodies nor interprets their ACKs.
-`GNR3` carries the protocol ID; communicating nodes must upgrade together.
+`GNR3` carries the protocol ID (`GNS1` when the envelope is sealed under
+`RouterConfig::cluster_secret`; see [cluster secret](tunnels-and-security.md#cluster-secret-on-plain-links-and-the-tcp-data-plane));
+communicating nodes must upgrade together.
 
 ## Packet storage and resource policy
 

@@ -468,6 +468,46 @@ The native UDP format is `GNP4`; TCP frames use version 2. Each rendezvous and
 its endpoints must upgrade together. Earlier formats and authentication-mode
 mismatches are rejected without compatibility fallback.
 
+### Cluster secret on plain links and the TCP data plane
+
+Plain links (UDP, TCP messages, IPC, memory) and the TCP data plane
+(`TcpBulkTransport`) carry a claimed node id and authenticate nothing by
+default: anyone who reaches a node's link or data-plane listener can speak for
+any node, inject gossip (membership, keyed entries such as advertised
+addresses, metadata) and open data-plane streams. **A cluster without a secret
+must run on a private network that only its nodes can reach.**
+
+A shared `ClusterSecret` (`groupnet_transport::auth`, at least 32 bytes, never
+shown by `Debug`) closes both doors without a rendezvous or certificates:
+
+- `RouterConfig::cluster_secret` seals every router frame, adverts and data
+  alike, with an HMAC-SHA256 tag over the sending node's id and the whole
+  envelope (magic `GNS1` instead of the open `GNR3`), before fragmentation.
+  The receiving router verifies the tag in constant time against the neighbor
+  its link attributes the frame to, after reassembly and before it decodes,
+  replay-checks, learns, delivers or forwards anything. A forwarder decrements
+  the hop count and seals again under its own id. Unsealed frames, frames
+  sealed under another secret and frames re-attributed to another neighbor are
+  dropped and counted (`Router::auth_failures`). An outsider can still replay a
+  captured frame: a data frame is then a duplicate the bounded replay windows
+  drop, an advert one the router has already learned.
+- `TcpBulkConfig::secret` (and `TcpBulkTransport::dial_only_with` for clients)
+  turns the versioned data-plane handshake (`GNBH`, version 2) into a mutual
+  challenge. The dialer sends its id and a fresh 32-byte nonce; the acceptor
+  answers with its id, its own fresh nonce and an HMAC over the protocol
+  label, the version, its role, both nonces and both ids; the dialer checks
+  the id is the node it dialed, verifies the tag and answers with its own
+  role's tag, which the acceptor verifies before the stream is accepted. Fresh
+  nonces defeat replay, the role byte defeats reflection, and binding both ids
+  defeats a rewritten identity. Every refusal closes the connection and counts
+  in `TcpBulkTransport::auth_failures`. The unversioned handshake (version 1,
+  a bare id field) is refused.
+
+Keyed and unkeyed nodes refuse each other in both directions, and there is no
+fallback to unauthenticated peers. The secret proves cluster membership, not
+an identity: every holder can claim every node id, and nothing is encrypted.
+Use pinned TLS tunnels to authenticate individual nodes and protect bytes.
+
 ## 4. What each security layer actually grants
 
 These are separate checks, not one inherited permission chain. Applications must
@@ -476,7 +516,7 @@ routing alias or advertised group name.
 
 ```mermaid
 flowchart TB
-    Neighbor["Configured adjacent peers / NetworkKey"] --> Fabric["Routing-fabric participation"]
+    Neighbor["Configured adjacent peers / NetworkKey / ClusterSecret"] --> Fabric["Routing-fabric participation"]
     Pins["Pinned certificates + tunnel admission"] --> Identity["Authenticated encrypted stream"]
     Policy["Application-owned resource policy"] --> Access["Permission to use a resource"]
     Group["Coordination-group membership"] --> Metadata["Membership and coordination metadata"]
@@ -487,7 +527,8 @@ flowchart TB
 
 | Boundary | Implemented guarantee or limitation |
 |---|---|
-| Plain TCP/UDP links | No inherent endpoint authentication or encryption; static configurations assume trusted peers. |
+| Plain TCP/UDP links | No inherent endpoint authentication or encryption; static configurations assume trusted peers on a private network. |
+| Cluster secret | Router frames and TCP data-plane handshakes admit only holders of the shared secret; it does not distinguish holders or encrypt. |
 | Open dynamic admission | Accepts claimed identities without ownership proof; session binding is not account authentication. |
 | Native punching fabric | Keyed mode authenticates fabric membership; explicit keyless mode does not. |
 | Pinned TLS tunnels | End-to-end endpoint identity and application-byte confidentiality across transit peers. |
