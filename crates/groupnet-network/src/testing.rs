@@ -2,15 +2,18 @@
 
 use crate::wire::{self, Frame, PayloadKind};
 
-/// Borrows the control-message payload of an unfragmented routed data frame.
+/// Borrows the control-message payload of an unfragmented routed data frame
+/// from a router without a cluster secret.
 ///
 /// Returns `None` for malformed frames, route advertisements, tunnel traffic,
-/// and physical fragments. Uses the router's decoder at wire representability
-/// bounds; node-specific configured resource limits remain the router's policy.
+/// sealed frames and physical fragments. Uses the router's decoder at wire
+/// representability bounds; node-specific configured resource limits remain
+/// the router's policy.
 #[must_use]
 pub fn message_payload(frame: &[u8]) -> Option<&[u8]> {
     match wire::decode_bounded(
         frame,
+        wire::OPEN,
         usize::try_from(u32::MAX).unwrap_or(usize::MAX),
         usize::from(u8::MAX),
     )

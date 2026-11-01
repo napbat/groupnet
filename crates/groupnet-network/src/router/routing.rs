@@ -14,6 +14,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use super::{
     AdvertisedRoute, ApplicationPacket, Candidate, Event, PacketBuffer, Queued, Route,
     RoutedSendError, RouterConfig, Shared, Table, TransportId, closed, replay::ReplayWindows,
+    seal::Sealing,
 };
 use crate::wire::{self, Frame, PayloadKind, Reassembly};
 
@@ -149,7 +150,7 @@ impl Shared {
         });
         let mut routes = vec![AdvertisedRoute {
             path: vec![self.local.clone()],
-            frame: wire::advert(0, std::slice::from_ref(&self.local)).into(),
+            frame: self.advert(0, std::slice::from_ref(&self.local)),
         }];
         if self.config.forwarding {
             for route in table
@@ -168,12 +169,19 @@ impl Shared {
                 {
                     routes.push(AdvertisedRoute {
                         path: route.path.clone(),
-                        frame: wire::advert(route.cost, &route.path).into(),
+                        frame: self.advert(route.cost, &route.path),
                     });
                 }
             }
         }
         self.advertisements.send_replace(Arc::new(routes));
+    }
+
+    /// One advert envelope, sealed when this router seals.
+    fn advert(&self, cost: u32, path: &[NodeId]) -> Bytes {
+        let mut frame = wire::advert(cost, path);
+        self.sealing.seal(&self.local, &mut frame);
+        frame.into()
     }
 
     pub(super) fn refresh_reachable(&self) {
@@ -222,9 +230,13 @@ pub(super) struct InboundState {
 }
 
 impl InboundState {
-    pub(super) fn new(config: &RouterConfig) -> Self {
+    pub(super) fn new(config: &RouterConfig, sealing: &Sealing) -> Self {
         Self {
-            fragments: Reassembly::new(config.reassembly.clone(), config.max_frame.get()),
+            fragments: Reassembly::new(
+                config.reassembly.clone(),
+                config.max_frame.get() + sealing.overhead(),
+                sealing.magic(),
+            ),
             replay: ReplayWindows::new(config.replay_capacity.get()),
         }
     }
@@ -263,13 +275,18 @@ impl Shared {
     }
 
     /// Processes one admitted physical frame on the link worker that read it:
-    /// reassembly, route learning, replay suppression, then local delivery or
-    /// forwarding. Every hand-off is a bounded `try_send`, so this never waits.
+    /// reassembly, seal verification, route learning, replay suppression,
+    /// then local delivery or forwarding. Every hand-off is a bounded
+    /// `try_send`, so this never waits.
     pub(super) fn receive(&self, link: TransportId, admitted: AdmittedInbound) {
         let Some(cost) = self.admitted_cost(link, &admitted) else {
             return;
         };
         let AdmittedInbound { packet, session } = admitted;
+        if self.sealing.unsealed(&packet.msg) {
+            self.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let mut inbound = self.inbound.lock().expect("router inbound state poisoned");
         let Some(bytes) = inbound
             .fragments
@@ -277,8 +294,14 @@ impl Shared {
         else {
             return;
         };
+        let Some(length) = self.sealing.open(&packet.from, &bytes) else {
+            drop(inbound);
+            self.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         let Ok(frame) = wire::decode_bounded(
-            &bytes,
+            &bytes[..length],
+            self.sealing.magic(),
             self.config.max_frame.get(),
             usize::from(self.config.max_hops.get()),
         ) else {
@@ -304,8 +327,9 @@ impl Shared {
                 payload,
             } => {
                 if to == self.local {
-                    let offset = bytes.len() - payload.len();
+                    let offset = length - payload.len();
                     let mut bytes = bytes;
+                    bytes.truncate(length);
                     bytes.advance(offset);
                     let _ = self.deliver_owned(kind, from, bytes);
                 } else if self.config.forwarding && hops > 1 {
@@ -313,6 +337,7 @@ impl Shared {
                         .try_into_mut()
                         .unwrap_or_else(|shared| bytes::BytesMut::from(shared.as_ref()));
                     wire::decrement_hops(&mut forwarded, kind);
+                    self.sealing.reseal(&self.local, &mut forwarded);
                     self.forward(&to, forwarded.freeze());
                 }
             }

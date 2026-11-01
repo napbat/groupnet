@@ -15,6 +15,13 @@ use crate::router::ReassemblyConfig;
 pub(crate) const MAX_FRAME: usize = 65_000;
 pub(crate) const MAX_HOPS: u8 = 16;
 
+/// Magic of an envelope sent by a router without a cluster secret.
+pub(crate) const OPEN: [u8; 4] = *b"GNR3";
+
+/// Magic of an envelope sealed under a cluster secret (`router::seal`); the
+/// seal follows the envelope.
+pub(crate) const SEALED: [u8; 4] = *b"GNS1";
+
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct Prefix {
@@ -134,17 +141,21 @@ pub(crate) enum Frame<'a> {
 
 #[cfg(test)]
 pub(crate) fn decode(bytes: &[u8]) -> io::Result<Frame<'_>> {
-    decode_bounded(bytes, MAX_FRAME, usize::from(MAX_HOPS))
+    decode_bounded(bytes, OPEN, MAX_FRAME, usize::from(MAX_HOPS))
 }
 
+/// Decodes one complete envelope whose magic must be `magic`: an open router
+/// refuses a sealed envelope, and a sealing router passes only envelopes
+/// whose seal it verified and removed.
 pub(crate) fn decode_bounded(
     bytes: &[u8],
+    magic: [u8; 4],
     max_frame: usize,
     max_hops: usize,
 ) -> io::Result<Frame<'_>> {
     let (prefix, mut body) =
         Prefix::ref_from_prefix(bytes).map_err(|_| invalid("truncated router frame"))?;
-    if bytes.len() > max_frame || prefix.magic != *b"GNR3" {
+    if bytes.len() > max_frame || prefix.magic != magic {
         return Err(invalid("invalid router frame"));
     }
     if prefix.kind == 0 {
@@ -204,7 +215,7 @@ pub(crate) fn advert(cost: u32, path: &[NodeId]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(
         Prefix {
-            magic: *b"GNR3",
+            magic: OPEN,
             kind: 0,
         }
         .as_bytes(),
@@ -232,7 +243,7 @@ pub(crate) fn stamp(
 ) {
     let mut offset = 0;
     let prefix = Prefix {
-        magic: *b"GNR3",
+        magic: OPEN,
         kind: kind.tag(),
     };
     bytes[..size_of::<Prefix>()].copy_from_slice(prefix.as_bytes());
@@ -295,20 +306,24 @@ pub(crate) struct Reassembly {
     pending: HashMap<AssemblyKey, Assembly>,
     config: ReassemblyConfig,
     max_frame: usize,
+    magic: [u8; 4],
 }
 
 impl Default for Reassembly {
     fn default() -> Self {
-        Self::new(ReassemblyConfig::default(), MAX_FRAME)
+        Self::new(ReassemblyConfig::default(), MAX_FRAME, OPEN)
     }
 }
 
 impl Reassembly {
-    pub(crate) fn new(config: ReassemblyConfig, max_frame: usize) -> Self {
+    /// Reassembles frames of at most `max_frame` bytes (seal included); an
+    /// unfragmented frame is recognised by `magic`.
+    pub(crate) fn new(config: ReassemblyConfig, max_frame: usize, magic: [u8; 4]) -> Self {
         Self {
             pending: HashMap::new(),
             config,
             max_frame,
+            magic,
         }
     }
 
@@ -321,7 +336,7 @@ impl Reassembly {
     ) -> Option<Bytes> {
         self.pending
             .retain(|_, entry| entry.created.elapsed() < self.config.timeout);
-        if bytes.starts_with(b"GNR3") {
+        if bytes.starts_with(&self.magic) {
             return (bytes.len() <= self.max_frame).then_some(bytes);
         }
         let (header, body) = FragmentHeader::ref_from_prefix(bytes.as_ref()).ok()?;
@@ -563,6 +578,7 @@ mod tests {
                 ..ReassemblyConfig::default()
             },
             MAX_FRAME,
+            OPEN,
         );
         assert!(bounded.receive(0, None, &from, first).is_none());
         let assembly = bounded.pending.values().next().unwrap();
@@ -585,6 +601,7 @@ mod tests {
                 ..ReassemblyConfig::default()
             },
             MAX_FRAME,
+            OPEN,
         );
         assert!(
             tight

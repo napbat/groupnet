@@ -36,7 +36,10 @@ impl PacketBuffer {
         if capacity > max {
             return Err(RoutedSendError::PayloadTooLarge { len: capacity, max }.into());
         }
-        let mut bytes = shared.pool.take(headroom + capacity);
+        // Room for the seal too, so sealing never reallocates.
+        let mut bytes = shared
+            .pool
+            .take(headroom + capacity + shared.sealing.overhead());
         bytes.resize(headroom, 0);
         Ok(Self {
             bytes,
@@ -108,6 +111,10 @@ impl PacketBuffer {
             &shared.local,
             target,
         );
+        // A packet to this node is delivered without crossing a link.
+        if target != &shared.local {
+            shared.sealing.seal(&shared.local, &mut self.bytes);
+        }
         let storage = std::mem::take(&mut self.bytes);
         let bytes = if PacketPool::pooled(storage.capacity()) {
             Bytes::from_owner(Recycled {

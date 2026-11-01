@@ -8,6 +8,7 @@ mod pool;
 mod protocol;
 mod replay;
 mod routing;
+mod seal;
 
 pub use bounds::{LinkRegistrationError, RoutedSendError};
 pub use config::{ReassemblyConfig, ReassemblyConfigError, RouterConfig, RouterConfigError};
@@ -28,12 +29,18 @@ mod bounds_tests;
 #[cfg(test)]
 mod outbound_tests;
 
+#[cfg(test)]
+mod seal_tests;
+
 use routing::{InboundState, drive};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicU64};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -188,6 +195,8 @@ struct Shared {
     nonce: [u8; 8],
     sequence: AtomicU64,
     pool: Arc<pool::PacketPool>,
+    sealing: seal::Sealing,
+    auth_failures: AtomicU64,
 }
 
 struct Handle {
@@ -206,7 +215,9 @@ impl Drop for Handle {
 /// Adapters are generic at registration, then driven by typed tasks and bounded
 /// channels; each link worker processes its inbound frames inline, and the hot
 /// send path does not box futures. Adjacent peers and transit
-/// routers are trusted for raw message attribution. Use the tunnel layer for
+/// routers are trusted for raw message attribution; with
+/// [`RouterConfig::cluster_secret`] only holders of the cluster's secret are
+/// (every frame is sealed and checked hop by hop). Use the tunnel layer for
 /// independent end-to-end authentication and confidentiality.
 #[derive(Clone)]
 pub struct Router {
@@ -260,13 +271,15 @@ impl Router {
         let (messages, message_rx) = mpsc::channel(config.message_queue.get());
         let (advertisements, _) = watch::channel(Arc::new(Vec::new()));
         let (reachable, _) = watch::channel(Arc::new(Vec::new()));
+        let sealing = seal::Sealing::new(config.cluster_secret.clone());
         let shared = Arc::new(Shared {
             local,
-            inbound: Mutex::new(InboundState::new(&config)),
+            inbound: Mutex::new(InboundState::new(&config, &sealing)),
             pool: Arc::new(pool::PacketPool::new(
                 config.packet_pool,
-                config.max_frame.get(),
+                config.max_frame.get() + sealing.overhead(),
             )),
+            sealing,
             config,
             table: Mutex::new(Table::default()),
             events,
@@ -279,6 +292,7 @@ impl Router {
             tasks: TaskTracker::new(),
             nonce,
             sequence: AtomicU64::new(0),
+            auth_failures: AtomicU64::new(0),
         });
         shared.tasks.spawn(drive(shared.clone(), receive));
         Ok(Self {
@@ -297,6 +311,15 @@ impl Router {
     #[must_use]
     pub fn reachable(&self) -> watch::Receiver<Arc<Vec<NodeId>>> {
         self.inner.shared.reachable.subscribe()
+    }
+
+    /// Frames dropped since the router started because they carried no valid
+    /// seal under [`RouterConfig::cluster_secret`]: unsealed frames from a
+    /// peer without the secret, frames sealed under another secret, and
+    /// forged or altered ones. Always zero without a secret.
+    #[must_use]
+    pub fn auth_failures(&self) -> u64 {
+        self.inner.shared.auth_failures.load(Ordering::Relaxed)
     }
 
     /// Registers and starts an adapter. Neighbor lists are explicit link admission.
@@ -361,7 +384,7 @@ impl Router {
             };
             return Err((error.into(), link));
         }
-        let fragments = max_frame.div_ceil(mtu - wire::FRAGMENT);
+        let fragments = (max_frame + shared.sealing.overhead()).div_ceil(mtu - wire::FRAGMENT);
         let max_fragments = usize::from(shared.config.reassembly.max_fragments.get());
         if fragments > max_fragments {
             let error = LinkRegistrationError::FragmentsAboveReassembly {
