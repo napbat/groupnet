@@ -17,6 +17,12 @@
 //!
 //! A version, magic or mode that does not match is refused: an open endpoint
 //! refuses a keyed hello, a keyed endpoint an open one.
+//!
+//! The handshake authenticates connection setup only. Bytes after it carry no
+//! integrity protection and are not bound to the handshake, so an on-path
+//! attacker can inject into or alter RPC traffic: keep the data plane on a
+//! private network, or use a mutually authenticated TLS mode (not yet
+//! implemented) where it crosses a trust boundary.
 
 use std::io;
 

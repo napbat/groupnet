@@ -15,7 +15,12 @@
 //! sides prove they hold the secret through a mutual challenge before any
 //! stream byte flows, and refuse a peer that holds another secret or none
 //! (see `handshake` for the wire). Refusals close the connection and count
-//! in [`TcpBulkTransport::auth_failures`].
+//! in [`TcpBulkTransport::auth_failures`]. The handshake authenticates
+//! connection setup only: stream bytes after it carry no integrity protection
+//! and are not bound to the handshake, so an on-path attacker can inject into
+//! or alter RPC traffic. Keep the data plane on a private network, or use a
+//! mutually authenticated TLS mode (not yet implemented) when the network
+//! between nodes crosses a trust boundary.
 //!
 //! Accepting is owned by a listener task: every accepted connection runs its
 //! identity handshake in its own task under [`TcpBulkConfig::handshake_timeout`],
@@ -51,8 +56,10 @@ use crate::handshake::check_id;
 /// Accept-side bounds and the cluster secret of a [`TcpBulkTransport`].
 #[derive(Clone, Debug)]
 pub struct TcpBulkConfig {
-    /// Deadline for one accepted connection to complete its identity
-    /// handshake. Must be nonzero. Default: 5s.
+    /// Deadline for one identity handshake to complete, both on accepted
+    /// connections and on connections this endpoint dials (a dialed
+    /// handshake that misses it fails with `TimedOut`). Dial-only endpoints
+    /// use the default. Must be nonzero. Default: 5s.
     pub handshake_timeout: Duration,
     /// Accepted connections held at once between `accept(2)` and
     /// [`accept`](BulkTransport::accept): handshaking or waiting in the queue.
@@ -64,6 +71,11 @@ pub struct TcpBulkConfig {
     /// The cluster secret both directions authenticate with. `None` (the
     /// default) keeps the unauthenticated handshake, for a private network
     /// only; with a secret, peers without it, or with another, are refused.
+    /// The secret authenticates connection setup only: bytes after the
+    /// handshake carry no integrity protection and are not bound to it, so an
+    /// on-path attacker can inject into or alter RPC traffic. Keep the data
+    /// plane on a private network, or use a mutually authenticated TLS mode
+    /// (not yet implemented) where it crosses a trust boundary.
     pub secret: Option<ClusterSecret>,
 }
 
@@ -187,14 +199,16 @@ pub struct TcpBulkTransport {
 struct Identity {
     local: NodeId,
     secret: Option<ClusterSecret>,
+    handshake_timeout: Duration,
     auth_failures: AtomicU64,
 }
 
 impl Identity {
-    fn new(local: NodeId, secret: Option<ClusterSecret>) -> Arc<Self> {
+    fn new(local: NodeId, secret: Option<ClusterSecret>, handshake_timeout: Duration) -> Arc<Self> {
         Arc::new(Self {
             local,
             secret,
+            handshake_timeout,
             auth_failures: AtomicU64::new(0),
         })
     }
@@ -261,7 +275,7 @@ impl TcpBulkTransport {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         let (queue, accepted) = mpsc::channel(config.accept_queue.get());
-        let identity = Identity::new(local, config.secret);
+        let identity = Identity::new(local, config.secret, config.handshake_timeout);
         let task = tokio::spawn(accept_loop(
             listener,
             queue,
@@ -298,7 +312,9 @@ impl TcpBulkTransport {
 
     /// A [`dial_only`](Self::dial_only) endpoint that authenticates every
     /// connection with `secret`: it reaches only endpoints bound with the
-    /// same secret, and refuses a peer that fails the challenge.
+    /// same secret, and refuses a peer that fails the challenge. Each dialed
+    /// handshake is bounded by the default
+    /// [`TcpBulkConfig::handshake_timeout`] (5s).
     ///
     /// # Errors
     /// Returns the [`NodeIdError`] for a `local` id that is empty or longer
@@ -310,7 +326,7 @@ impl TcpBulkTransport {
     fn dialer(local: NodeId, secret: Option<ClusterSecret>) -> Result<Self, NodeIdError> {
         validate_node_id(&local, MAX_NODE_ID_BYTES)?;
         Ok(Self {
-            identity: Identity::new(local, secret),
+            identity: Identity::new(local, secret, TcpBulkConfig::default().handshake_timeout),
             listener: None,
             peers: RwLock::new(HashMap::new()),
         })
@@ -319,8 +335,9 @@ impl TcpBulkTransport {
     /// Handshakes this endpoint refused or that failed since it was made:
     /// accepted connections whose hello had another version or mode, whose
     /// answer was wrong, or that closed or stalled before answering, and
-    /// dialed connections whose peer did not authenticate or refused this
-    /// endpoint. Each one closed its connection.
+    /// dialed connections whose peer did not authenticate, refused this
+    /// endpoint, or missed the handshake deadline. Each one closed its
+    /// connection.
     #[must_use]
     pub fn auth_failures(&self) -> u64 {
         self.identity.auth_failures.load(Ordering::SeqCst)
@@ -450,9 +467,18 @@ impl BulkTransport for TcpBulkTransport {
         };
         sock.set_nodelay(true)?;
         let identity = &self.identity;
-        if let Err(error) =
-            handshake::dial(&mut sock, &identity.local, to, identity.secret.as_ref()).await
-        {
+        let dialed = timeout(
+            identity.handshake_timeout,
+            handshake::dial(&mut sock, &identity.local, to, identity.secret.as_ref()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer missed the handshake deadline",
+            ))
+        });
+        if let Err(error) = dialed {
             identity.refused();
             return Err(error);
         }

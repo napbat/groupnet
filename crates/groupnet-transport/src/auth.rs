@@ -30,8 +30,11 @@ pub const NONCE_LEN: usize = 32;
 /// The shared secret of a cluster: an HMAC-SHA256 key of at least
 /// [`MIN_LEN`](Self::MIN_LEN) bytes.
 ///
-/// It keeps only the derived key, never the bytes it was built from, and its
-/// `Debug` output names no part of it. Cloning it is cheap.
+/// It keeps ring's HMAC key: the precomputed inner and outer pad states,
+/// which are enough to forge tags and which ring does not zero on drop. It
+/// neither keeps nor wipes the bytes it was built from; callers wipe their own
+/// input buffer after [`new`](Self::new). Its `Debug` output names no part of
+/// it. Cloning it is cheap.
 #[derive(Clone)]
 pub struct ClusterSecret {
     key: hmac::Key,
@@ -48,7 +51,8 @@ impl ClusterSecret {
     /// uniformly random bytes, not a password.
     pub const MIN_LEN: usize = 32;
 
-    /// Builds a secret from `bytes`.
+    /// Builds a secret from `bytes`. The caller's `bytes` are neither kept nor
+    /// wiped: read the secret into a buffer and zero it after this returns.
     ///
     /// # Errors
     /// Returns [`ClusterSecretError::TooShort`] for fewer than

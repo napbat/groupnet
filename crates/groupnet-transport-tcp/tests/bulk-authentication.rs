@@ -1,7 +1,8 @@
 //! `TcpBulkTransport` under a cluster secret, over real loopback TCP: peers
 //! holding the same secret connect and stream; a peer with another secret,
 //! with none, or speaking the old unversioned handshake is refused before a
-//! stream byte flows, and every refusal is counted.
+//! stream byte flows, a silent peer fails the dial at the handshake deadline,
+//! and every refusal is counted.
 
 #![cfg(feature = "bulk")]
 
@@ -12,11 +13,17 @@ use groupnet_testkit::cluster::eventually;
 use groupnet_transport::bulk::BulkTransport;
 use groupnet_transport_tcp::{ClusterSecret, TcpBulkConfig, TcpBulkTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 /// Failure-report bound for socket progress; no test waits on it to pass.
 const SETTLE: Duration = Duration::from_secs(5);
+
+/// Handshake deadline of the silent-peer test, far below [`HANG`].
+const DIAL_DEADLINE: Duration = Duration::from_millis(200);
+
+/// Outer bound turning a dial that never ends into a test failure.
+const HANG: Duration = Duration::from_secs(10);
 
 fn secret(byte: u8) -> ClusterSecret {
     ClusterSecret::new([byte; ClusterSecret::MIN_LEN]).expect("valid secret")
@@ -154,4 +161,36 @@ async fn the_unversioned_handshake_is_refused() {
     assert!(matches!(read, Ok(0) | Err(_)));
     assert_eq!(server.auth_failures(), 1);
     accept_genuine(&server).await;
+}
+
+/// A keyed dial to a peer that accepts TCP and never answers fails at the
+/// handshake deadline instead of holding the caller.
+#[tokio::test]
+async fn a_keyed_connect_to_a_silent_listener_times_out() {
+    let silent = TcpListener::bind("127.0.0.1:0").await.expect("bind silent");
+    let silent_addr = silent.local_addr().expect("silent address");
+    let dialer = TcpBulkTransport::bind_with(
+        NodeId::new("dialer"),
+        "127.0.0.1:0",
+        TcpBulkConfig {
+            secret: Some(secret(1)),
+            handshake_timeout: DIAL_DEADLINE,
+            ..TcpBulkConfig::default()
+        },
+    )
+    .await
+    .expect("bind dialer");
+    let peer = NodeId::new("silent");
+    dialer.register_peer(peer.clone(), silent_addr);
+    // Accept and hold the socket open without writing a byte.
+    let (parked, outcome) = tokio::join!(
+        async { silent.accept().await.expect("accept") },
+        timeout(HANG, dialer.connect(&peer)),
+    );
+    let error = outcome
+        .expect("dial ends at its handshake deadline")
+        .expect_err("silent peer never authenticates");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(dialer.auth_failures(), 1);
+    drop(parked);
 }

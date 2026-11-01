@@ -205,6 +205,31 @@ async fn a_forged_dialer_id_is_refused() {
     acceptor.expect_err("forged dialer never accepted");
 }
 
+/// An attacker without the secret cannot answer the challenge with the
+/// acceptor's own tag: the role byte makes it the wrong answer.
+#[tokio::test]
+async fn the_acceptors_own_tag_reflected_back_is_refused() {
+    let (mut attacker, far) = duplex(1024);
+    let attack = async {
+        let mut hello = vec![b'G', b'N', b'B', b'H', VERSION, KEYED, 0, 0, 0, 1, b'a'];
+        hello.extend_from_slice(&[7; NONCE_LEN]);
+        attacker.write_all(&hello).await.expect("keyed hello");
+        let mut challenge = [0; ID_FIELD + NONCE_LEN + TAG_LEN];
+        attacker
+            .read_exact(&mut challenge)
+            .await
+            .expect("challenge");
+        let tag = &challenge[ID_FIELD + NONCE_LEN..];
+        attacker.write_all(tag).await.expect("reflected tag");
+        attacker
+    };
+    let (_attacker, refused) = tokio::join!(attack, accepting(far, node("b"), Some(secret(1))));
+    assert_eq!(
+        refused.expect_err("reflection refused").kind(),
+        io::ErrorKind::PermissionDenied
+    );
+}
+
 /// The unversioned handshake, a bare id field, is refused.
 #[tokio::test]
 async fn the_unversioned_handshake_is_refused() {
