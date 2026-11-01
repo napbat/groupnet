@@ -500,13 +500,15 @@ shown by `Debug`) closes both doors without a rendezvous or certificates:
   datagram that merely claims a member's id never moves that member's address.
   Without a secret the router confirms every admitted frame, as before.
 - **Freshness.** Data frames carry their origin's boot nonce and sequence and
-  pass the bounded replay windows. Every advert now carries its sender's
-  routed identity (boot nonce and a sequence from the same counter), and a
-  receiver accepts an advert from a neighbor on a link only when it is newer
-  than the last one it accepted there: a higher sequence in the same boot, or
-  a boot nonce it has not seen; the last four boot nonces a neighbor left are
-  refused. A captured advert replayed after its route expired therefore does
-  not bring the route back.
+  pass the bounded replay windows. Every advert carries its sender's advert
+  identity: the boot epoch (wall-clock nanoseconds when the sender's router
+  started), the random boot nonce, and a sequence from a counter only adverts
+  use. Boots are ordered by epoch, then nonce. A receiver accepts an advert
+  from a neighbor on a link only when its identity is newer than the last one
+  it accepted there, so any advert from an earlier boot is refused and a
+  refused advert changes nothing. A captured advert replayed after its route
+  expired therefore does not bring the route back, and one replayed from an
+  older boot cannot displace the neighbor's live boot.
 - `TcpBulkConfig::secret` (and `TcpBulkTransport::dial_only_with` for clients)
   turns the versioned data-plane handshake (`GNBH`, version 2) into a mutual
   challenge. The dialer sends its id and a fresh 32-byte nonce; the acceptor
@@ -541,8 +543,11 @@ What the secret leaves open:
   data frame from a sender's current boot until that sender's genuine traffic
   moves its 64-sequence window past it, a data frame from an earlier boot
   whose stream it no longer tracks, and each captured advert once more, in
-  increasing order. Advert boots older than the last four a neighbor left are
-  not remembered either.
+  increasing order (until it accepts one from a later boot).
+- **Advert boots follow the wall clock.** A neighbor whose clock stepped back
+  across its restart, below the epoch of its previous boot, has its adverts
+  refused by receivers that still remember that boot, until its clock passes
+  the old epoch or they forget it (their restart, or eviction at capacity).
 - **Address confirmation inherits those limits.** An accepted replay, or a
   copy of a genuine frame that an on-path attacker delivers from its own
   address before the original arrives, points the member's address at the

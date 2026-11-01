@@ -75,7 +75,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(wire::test_id(1), 1, &[peer.clone(), beyond.clone()]).into(),
+                msg: wire::advert(wire::test_advert(1), 1, &[peer.clone(), beyond.clone()]).into(),
                 source: None,
             },
             session: Some(lease.id()),
@@ -97,7 +97,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(wire::test_id(2), 1, &[peer.clone(), beyond.clone()]).into(),
+                msg: wire::advert(wire::test_advert(2), 1, &[peer.clone(), beyond.clone()]).into(),
                 source: None,
             },
             session: Some(stale),
@@ -109,7 +109,7 @@ async fn live_sessions_refresh_recipients_and_withdraw_dependent_routes() -> io:
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(wire::test_id(3), 0, std::slice::from_ref(&peer)).into(),
+                msg: wire::advert(wire::test_advert(3), 0, std::slice::from_ref(&peer)).into(),
                 source: None,
             },
             session: Some(replacement.id()),

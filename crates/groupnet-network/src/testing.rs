@@ -46,7 +46,7 @@ mod tests {
         assert_eq!(message_payload(&frame), Some(payload.as_slice()));
         assert!(
             message_payload(&wire::advert(
-                wire::test_id(1),
+                wire::test_advert(1),
                 0,
                 std::slice::from_ref(&from)
             ))

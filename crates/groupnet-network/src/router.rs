@@ -195,6 +195,12 @@ struct Shared {
     tasks: TaskTracker,
     nonce: [u8; 8],
     sequence: AtomicU64,
+    /// Wall-clock nanoseconds at start: orders this boot's adverts after
+    /// every earlier boot's (`wire::AdvertId`).
+    boot_epoch: u64,
+    /// Advert sequence, separate from the data `sequence` so announcing many
+    /// routes never moves a receiver's data replay window.
+    advert_sequence: AtomicU64,
     pool: Arc<pool::PacketPool>,
     sealing: seal::Sealing,
     auth_failures: AtomicU64,
@@ -293,6 +299,8 @@ impl Router {
             tasks: TaskTracker::new(),
             nonce,
             sequence: AtomicU64::new(0),
+            boot_epoch: boot_epoch(),
+            advert_sequence: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
         });
         shared.tasks.spawn(drive(shared.clone(), receive));
@@ -675,4 +683,14 @@ fn closed() -> io::Error {
 /// Rejects a local identity the routing wire cannot carry.
 pub(crate) fn validate_local(local: &NodeId) -> io::Result<()> {
     Ok(validate_node_id(local, MAX_NODE_ID_BYTES)?)
+}
+
+/// Wall-clock nanoseconds since the Unix epoch: zero for a clock set before
+/// it, saturating far past it.
+fn boot_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
 }

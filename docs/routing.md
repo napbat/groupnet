@@ -159,11 +159,13 @@ The routing actor keeps only the announcement clock and link lifecycle events.
 Replay suppression keeps a 64-sequence sliding window per `(origin, router
 nonce)` stream: a routed identity seen in the window, or older than it, is
 dropped. At most `replay_capacity / 64` streams (rounded up) are tracked, least
-recently active evicted first. Adverts carry their sender's routed identity
-too, and a neighbor's advert on a link is accepted only when newer than the
-last one accepted there (a higher sequence in the same boot, or a boot nonce
-not among the last four that neighbor left); at most `max_routes ×
-max_transports` neighbor-link pairs are remembered, least recently active
+recently active evicted first. Adverts carry their sender's advert identity
+(boot epoch from the wall clock at start, boot nonce, and a sequence from an
+advert-only counter, so announcements never move the data replay windows),
+and a neighbor's advert on a link is accepted only when that identity is newer
+than the last one accepted there; boots are ordered by epoch, then nonce, so
+any earlier boot's advert is refused. At most `max_routes ×
+max_transports` neighbor-link pairs are remembered, least recently accepted
 forgotten first. Each pass of a link's announcement scheduler therefore starts
 at the snapshot's first advert, so every peer receives a snapshot in sequence
 order. A transport's address book learns a frame's source

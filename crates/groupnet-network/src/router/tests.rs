@@ -92,7 +92,7 @@ async fn address_updates_reach_only_pre_admitted_links_and_never_admit_a_source(
     incoming
         .send(Inbound {
             from: unknown.clone(),
-            msg: wire::advert(wire::test_id(1), 0, std::slice::from_ref(&unknown)).into(),
+            msg: wire::advert(wire::test_advert(1), 0, std::slice::from_ref(&unknown)).into(),
             source: None,
         })
         .await
@@ -100,7 +100,7 @@ async fn address_updates_reach_only_pre_admitted_links_and_never_admit_a_source(
     incoming
         .send(Inbound {
             from: peer.clone(),
-            msg: wire::advert(wire::test_id(2), 0, std::slice::from_ref(&peer)).into(),
+            msg: wire::advert(wire::test_advert(2), 0, std::slice::from_ref(&peer)).into(),
             source: None,
         })
         .await

@@ -121,7 +121,7 @@ fn sealed(secret: ClusterSecret, sender: &NodeId, mut envelope: Vec<u8>) -> Vec<
 
 /// `from`'s own advert, ordered by `sequence`.
 fn advert(from: &NodeId, sequence: u64) -> Vec<u8> {
-    wire::advert(wire::test_id(sequence), 0, std::slice::from_ref(from))
+    wire::advert(wire::test_advert(sequence), 0, std::slice::from_ref(from))
 }
 
 #[tokio::test]
@@ -347,6 +347,58 @@ async fn a_replayed_advert_does_not_revive_an_expired_route() -> io::Result<()> 
     })
     .await;
     assert_eq!(harness.router.auth_failures(), 0);
+    harness.router.close().await;
+    Ok(())
+}
+
+/// The re-review's lockout: a replayed sealed advert from an earlier boot of
+/// the neighbor, one this router never tracked, must not stop the live
+/// boot's adverts from being learned.
+#[tokio::test]
+async fn a_replayed_older_boot_does_not_lock_out_the_live_neighbor() -> io::Result<()> {
+    let peer = NodeId::new("peer");
+    let harness = Harness::with_config(
+        &[&peer],
+        RouterConfig {
+            announce_interval: Duration::from_millis(20),
+            route_ttl: Duration::from_millis(300),
+            ..RouterConfig::default()
+        },
+    )
+    .await?;
+    let live = |sequence| wire::AdvertId {
+        epoch: 20,
+        nonce: [7; 8],
+        sequence,
+    };
+    let older_boot = wire::AdvertId {
+        epoch: 10,
+        nonce: [3; 8],
+        sequence: 50,
+    };
+    let sealed_advert = |id| {
+        sealed(
+            secret(1),
+            &peer,
+            wire::advert(id, 0, std::slice::from_ref(&peer)),
+        )
+    };
+    harness.inject(&peer, sealed_advert(live(1))).await;
+    eventually_within("route learned", WAIT, || {
+        harness.router.route_to(&peer).is_some()
+    })
+    .await;
+    eventually_within("route expired", WAIT, || {
+        harness.router.route_to(&peer).is_none()
+    })
+    .await;
+
+    harness.inject(&peer, sealed_advert(older_boot)).await;
+    harness.inject(&peer, sealed_advert(live(2))).await;
+    eventually_within("the live boot's next advert is learned", WAIT, || {
+        harness.router.route_to(&peer).is_some()
+    })
+    .await;
     harness.router.close().await;
     Ok(())
 }

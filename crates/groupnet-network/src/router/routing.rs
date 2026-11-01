@@ -181,10 +181,16 @@ impl Shared {
         self.advertisements.send_replace(Arc::new(routes));
     }
 
-    /// One advert envelope under a fresh routed identity, so receivers can
-    /// refuse it once a newer one arrived; sealed when this router seals.
+    /// One advert envelope under this boot's next advert identity, so
+    /// receivers can refuse it once a newer one arrived; sealed when this
+    /// router seals. Adverts draw from their own counter, never the data one.
     fn advert(&self, cost: u32, path: &[NodeId]) -> Bytes {
-        let mut frame = wire::advert(self.id(), cost, path);
+        let id = wire::AdvertId {
+            epoch: self.boot_epoch,
+            nonce: self.nonce,
+            sequence: self.advert_sequence.fetch_add(1, Ordering::Relaxed),
+        };
+        let mut frame = wire::advert(id, cost, path);
         self.sealing.seal(&self.local, &mut frame);
         frame.into()
     }
@@ -432,5 +438,32 @@ impl Shared {
             );
         drop(table);
         self.refresh_reachable();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::Router;
+
+    /// Adverts draw from their own counter, so announcing any number of
+    /// routes never moves the data sequence a receiver's replay window
+    /// tracks.
+    #[tokio::test]
+    async fn adverts_leave_the_data_sequence_alone() -> io::Result<()> {
+        let router = Router::new(NodeId::new("local"))?;
+        let shared = &router.inner.shared;
+        let path = [NodeId::new("local")];
+        let before = shared.sequence.load(Ordering::Relaxed);
+        let ids: Vec<_> = (0..3)
+            .map(|_| match wire::decode(&shared.advert(0, &path)) {
+                Ok(Frame::Advert { id, .. }) => id,
+                _ => panic!("an advert"),
+            })
+            .collect();
+        assert_eq!(shared.sequence.load(Ordering::Relaxed), before);
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+        router.close().await;
+        Ok(())
     }
 }

@@ -67,7 +67,8 @@ async fn advertise(
         .send(AdmittedInbound {
             packet: Inbound {
                 from: peer.clone(),
-                msg: wire::advert(wire::test_id(sequence), 0, std::slice::from_ref(peer)).into(),
+                msg: wire::advert(wire::test_advert(sequence), 0, std::slice::from_ref(peer))
+                    .into(),
                 source: None,
             },
             session: Some(session),

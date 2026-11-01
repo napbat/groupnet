@@ -140,10 +140,12 @@ pub struct RouterConfig {
     /// Replay state is in memory: a router that restarts, or that evicted a
     /// sender (`replay_capacity / 64` origin streams; `max_routes ×
     /// max_transports` advert neighbors), accepts captured frames it no
-    /// longer remembers once each, and an advert from a neighbor boot older
-    /// than the last four it saw. Fragment tags are not replay-checked, so
-    /// replayed captured fragments can hold reassembly slots until they time
-    /// out.
+    /// longer remembers once each. Adverts are ordered by their sender's
+    /// boot epoch (its wall clock at start), so a neighbor whose clock
+    /// stepped back across a restart is refused until its clock passes its
+    /// previous boot's epoch or the receiver forgets that boot. Fragment tags
+    /// are not replay-checked, so replayed captured fragments can hold
+    /// reassembly slots until they time out.
     pub cluster_secret: Option<ClusterSecret>,
 }
 

@@ -148,7 +148,7 @@ impl Sealing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Frame, decode_bounded, test_id};
+    use crate::wire::{Frame, decode_bounded, test_advert, test_id};
 
     fn keyed(byte: u8) -> Sealing {
         Sealing::new(Some(
@@ -157,7 +157,7 @@ mod tests {
     }
 
     fn sealed(sealing: &Sealing, sender: &str) -> Vec<u8> {
-        let mut frame = wire::advert(test_id(1), 0, &[NodeId::new(sender)]);
+        let mut frame = wire::advert(test_advert(1), 0, &[NodeId::new(sender)]);
         sealing.seal(&NodeId::new(sender), &mut frame);
         frame
     }
@@ -183,7 +183,7 @@ mod tests {
         let mut flipped = frame.clone();
         flipped[5] ^= 1;
         assert!(sealing.open(&NodeId::new("a"), &flipped).is_none());
-        let open = wire::advert(test_id(1), 0, &[NodeId::new("a")]);
+        let open = wire::advert(test_advert(1), 0, &[NodeId::new("a")]);
         assert!(sealing.open(&NodeId::new("a"), &open).is_none());
         assert!(
             sealing
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn an_open_router_keeps_the_open_envelope() {
         let open = Sealing::new(None);
-        let mut frame = wire::advert(test_id(1), 0, &[NodeId::new("a")]);
+        let mut frame = wire::advert(test_advert(1), 0, &[NodeId::new("a")]);
         let plain = frame.clone();
         open.seal(&NodeId::new("a"), &mut frame);
         assert_eq!(frame, plain);
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn only_a_sealing_router_refuses_open_envelopes_and_fragments() {
-        let open = wire::advert(test_id(1), 0, &[NodeId::new("a")]);
+        let open = wire::advert(test_advert(1), 0, &[NodeId::new("a")]);
         let fragment = open_fragment(Bytes::from(open.clone()));
         assert!(keyed(1).unsealed(&open));
         assert!(keyed(1).unsealed(&fragment));
@@ -284,7 +284,7 @@ mod tests {
         // An open router neither tags fragments nor checks them.
         let open = Sealing::new(None);
         let plain = open_fragment(Bytes::from(wire::advert(
-            test_id(1),
+            test_advert(1),
             0,
             &[NodeId::new("a")],
         )));

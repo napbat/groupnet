@@ -7,7 +7,7 @@ use std::{collections::HashMap, io};
 use tokio::time::Instant;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
-    byteorder::network_endian::{U16, U32},
+    byteorder::network_endian::{U16, U32, U64},
 };
 
 use crate::router::ReassemblyConfig;
@@ -43,15 +43,27 @@ struct DataHeader {
     id: [u8; 16],
 }
 
-/// An advert's header. `id` is the sender's routed identity (its boot nonce
-/// and a sequence from the counter its data packets use), so a receiver can
-/// refuse an advert that is not newer than the last one it accepted.
+/// An advert's header: the sender's [`AdvertId`], so a receiver can refuse an
+/// advert that is not newer than the last one it accepted.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct AdvertHeader {
-    id: [u8; 16],
+    epoch: U64,
+    nonce: [u8; 8],
+    sequence: U64,
     cost: U32,
     length: u8,
+}
+
+/// Where an advert stands in its sender's history, ordered as compared:
+/// first the sender router's boot `epoch` (wall-clock nanoseconds at start),
+/// then its random boot `nonce` (which only separates boots that share an
+/// epoch), then the `sequence` of its own advert counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AdvertId {
+    pub(crate) epoch: u64,
+    pub(crate) nonce: [u8; 8],
+    pub(crate) sequence: u64,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -137,7 +149,7 @@ impl PayloadKind {
 
 pub(crate) enum Frame<'a> {
     Advert {
-        id: [u8; 16],
+        id: AdvertId,
         cost: u32,
         path: Vec<NodeId>,
     },
@@ -189,7 +201,11 @@ pub(crate) fn decode_bounded(
             return Err(invalid("trailing route bytes"));
         }
         Ok(Frame::Advert {
-            id: header.id,
+            id: AdvertId {
+                epoch: header.epoch.get(),
+                nonce: header.nonce,
+                sequence: header.sequence.get(),
+            },
             cost: header.cost.get(),
             path,
         })
@@ -227,8 +243,8 @@ pub(crate) fn decode_bounded(
 /// Bytes an advert spends before its path.
 pub(crate) const ADVERT_HEADER: usize = size_of::<Prefix>() + size_of::<AdvertHeader>();
 
-/// An open advert of `path` at `cost`, carrying the sender's routed `id`.
-pub(crate) fn advert(id: [u8; 16], cost: u32, path: &[NodeId]) -> Vec<u8> {
+/// An open advert of `path` at `cost`, carrying the sender's `id`.
+pub(crate) fn advert(id: AdvertId, cost: u32, path: &[NodeId]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(
         ADVERT_HEADER
             + path
@@ -245,7 +261,9 @@ pub(crate) fn advert(id: [u8; 16], cost: u32, path: &[NodeId]) -> Vec<u8> {
     );
     bytes.extend_from_slice(
         AdvertHeader {
-            id,
+            epoch: id.epoch.into(),
+            nonce: id.nonce,
+            sequence: id.sequence.into(),
             cost: cost.into(),
             length: u8::try_from(path.len()).expect("bounded route"),
         }
@@ -263,6 +281,16 @@ pub(crate) fn test_id(sequence: u64) -> [u8; 16] {
     let mut id = [7; 16];
     id[8..].copy_from_slice(&sequence.to_be_bytes());
     id
+}
+
+/// An advert identity for tests: one fixed boot and `sequence`.
+#[cfg(test)]
+pub(crate) fn test_advert(sequence: u64) -> AdvertId {
+    AdvertId {
+        epoch: 1,
+        nonce: [7; 8],
+        sequence,
+    }
 }
 
 pub(crate) fn stamp(
@@ -586,7 +614,7 @@ mod tests {
     #[test]
     fn advert_roundtrips_its_identity() {
         let path = [NodeId::new("a"), NodeId::new("b")];
-        let envelope = advert(test_id(9), 3, &path);
+        let envelope = advert(test_advert(9), 3, &path);
         assert_eq!(envelope.len(), ADVERT_HEADER + 4);
         let Frame::Advert {
             id,
@@ -596,7 +624,10 @@ mod tests {
         else {
             panic!("expected an advert");
         };
-        assert_eq!((id, cost, decoded.as_slice()), (test_id(9), 3, &path[..]));
+        assert_eq!(
+            (id, cost, decoded.as_slice()),
+            (test_advert(9), 3, &path[..])
+        );
         for end in 0..envelope.len() {
             assert!(decode(&envelope[..end]).is_err());
         }

@@ -1140,8 +1140,10 @@ async fn start(secret: &[u8]) -> Result<(Node, TcpBulkTransport), Box<dyn std::e
   so a node without the secret cannot redirect a member's traffic by claiming
   its id.
 - **Freshness**: data frames pass the router's replay windows, and every
-  advert carries its sender's boot nonce and a sequence, so a replayed advert
-  is refused instead of keeping a dead route alive. That state lives in
+  advert carries its sender's boot epoch (wall clock at start), boot nonce and
+  an advert-only sequence; a receiver accepts only a newer one, so a replayed
+  advert, or one from an earlier boot, is refused instead of keeping a dead
+  route alive or displacing the live boot. That state lives in
   memory: a restarted receiver accepts frames it no longer remembers (see
   [docs/tunnels-and-security.md](docs/tunnels-and-security.md#cluster-secret-on-plain-links-and-the-tcp-data-plane)
   for the exact limits).
