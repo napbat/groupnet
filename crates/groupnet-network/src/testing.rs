@@ -2,15 +2,18 @@
 
 use crate::wire::{self, Frame, PayloadKind};
 
-/// Borrows the control-message payload of an unfragmented routed data frame.
+/// Borrows the control-message payload of an unfragmented routed data frame
+/// from a router without a cluster secret.
 ///
 /// Returns `None` for malformed frames, route advertisements, tunnel traffic,
-/// and physical fragments. Uses the router's decoder at wire representability
-/// bounds; node-specific configured resource limits remain the router's policy.
+/// sealed frames and physical fragments. Uses the router's decoder at wire
+/// representability bounds; node-specific configured resource limits remain
+/// the router's policy.
 #[must_use]
 pub fn message_payload(frame: &[u8]) -> Option<&[u8]> {
     match wire::decode_bounded(
         frame,
+        wire::OPEN,
         usize::try_from(u32::MAX).unwrap_or(usize::MAX),
         usize::from(u8::MAX),
     )
@@ -41,7 +44,14 @@ mod tests {
         let payload = b"engine control frame";
         let frame = wire::data(PayloadKind::Message, 16, [7; 16], &from, &to, payload);
         assert_eq!(message_payload(&frame), Some(payload.as_slice()));
-        assert!(message_payload(&wire::advert(0, std::slice::from_ref(&from))).is_none());
+        assert!(
+            message_payload(&wire::advert(
+                wire::test_advert(1),
+                0,
+                std::slice::from_ref(&from)
+            ))
+            .is_none()
+        );
         assert!(
             message_payload(&wire::data(
                 PayloadKind::Tunnel,
@@ -53,7 +63,7 @@ mod tests {
             ))
             .is_none()
         );
-        for fragment in wire::fragment(frame.clone().into(), 40, [7; 16]) {
+        for fragment in wire::fragment(frame.clone().into(), 40, [7; 16], wire::OPEN_FRAGMENTS) {
             assert!(message_payload(&fragment).is_none());
         }
         for length in 0..frame.len() - payload.len() {

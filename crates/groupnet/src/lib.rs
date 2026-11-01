@@ -94,8 +94,9 @@ pub use groupnet_core as core;
 /// trait, shared [`Bytes`](transport::Bytes) payloads and
 /// [`QueueCapacity`](transport::QueueCapacity) bounds, the data-plane `bulk`
 /// streams and `framing` (feature `bulk`), link registration and admission
-/// (`link` / `admission`, feature `runtime` or any binding's managed link), and
-/// the concrete bindings as submodules.
+/// (`link` / `admission`, feature `runtime` or any binding's managed link), the
+/// cluster's shared `auth::ClusterSecret` (feature `runtime`, or `tcp` with
+/// `bulk`), and the concrete bindings as submodules.
 pub mod transport {
     pub use groupnet_transport::*;
 

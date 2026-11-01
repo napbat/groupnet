@@ -6,6 +6,7 @@ use std::num::{NonZeroU8, NonZeroU16, NonZeroUsize};
 use std::time::Duration;
 
 use groupnet_transport::QueueCapacity;
+use groupnet_transport::auth::{ClusterSecret, TAG_LEN};
 
 use crate::wire;
 
@@ -125,6 +126,27 @@ pub struct RouterConfig {
     /// Bytes of idle packet storage kept for reuse by later packets of the
     /// same size class; zero allocates every packet from the heap.
     pub packet_pool: usize,
+    /// The cluster's shared secret. With it, every frame this router sends
+    /// carries a keyed seal (and each fragment a keyed tag), and every frame
+    /// it receives must carry a valid one from the neighbor that sent it, or
+    /// it is dropped and counted in
+    /// [`Router::auth_failures`](crate::Router::auth_failures); routers with
+    /// another secret or none cannot exchange frames with it. A link's
+    /// address book learns where a neighbor speaks from only after such a
+    /// frame verified and was not a replay. `None` (the default)
+    /// authenticates nothing: anyone who reaches a link can speak for any
+    /// node, so run such a cluster only on a private network.
+    ///
+    /// Replay state is in memory: a router that restarts, or that evicted a
+    /// sender (`replay_capacity / 64` origin streams; `max_routes ×
+    /// max_transports` advert neighbors), accepts captured frames it no
+    /// longer remembers once each. Adverts are ordered by their sender's
+    /// boot epoch (its wall clock at start), so a neighbor whose clock
+    /// stepped back across a restart is refused until its clock passes its
+    /// previous boot's epoch or the receiver forgets that boot. Fragment tags
+    /// are not replay-checked, so replayed captured fragments can hold
+    /// reassembly slots until they time out.
+    pub cluster_secret: Option<ClusterSecret>,
 }
 
 impl Default for RouterConfig {
@@ -146,6 +168,7 @@ impl Default for RouterConfig {
             replay_capacity: const { NonZeroUsize::new(4096).unwrap() },
             send_timeout: Duration::from_secs(5),
             packet_pool: 2 << 20,
+            cluster_secret: None,
         }
     }
 }
@@ -159,9 +182,15 @@ impl RouterConfig {
     /// Returns the first violated [`RouterConfigError`] rule.
     pub fn validate(&self) -> Result<(), RouterConfigError> {
         let max_frame = self.max_frame.get();
+        let seal = if self.cluster_secret.is_some() {
+            TAG_LEN
+        } else {
+            0
+        };
+        let sealed = max_frame.saturating_add(seal);
         if max_frame < wire::MAX_DATA_HEADER
-            || u32::try_from(max_frame).is_err()
-            || max_frame > isize::MAX.unsigned_abs()
+            || u32::try_from(sealed).is_err()
+            || sealed > isize::MAX.unsigned_abs()
         {
             return Err(RouterConfigError::MaxFrameOutOfRange);
         }
@@ -200,8 +229,8 @@ impl RouterConfig {
 /// A violated [`RouterConfig`] rule, naming the offending field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouterConfigError {
-    /// `max_frame` is below the largest data header or above the `u32`
-    /// fragment total.
+    /// `max_frame` is below the largest data header, or it (with the seal of
+    /// a `cluster_secret`) is above the `u32` fragment total.
     MaxFrameOutOfRange,
     /// `max_hops` is below 2.
     MaxHopsBelowTwo,

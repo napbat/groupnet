@@ -37,7 +37,12 @@
 //!   rest arrives from gossiped `advertise_addr` values. Both of those reach
 //!   the book through `Transport::learn_peer` (the runtime feeds them
 //!   automatically). Inbound datagrams carry their sender's id, so a peer the
-//!   book has never heard of is attributed and learned from its first frame.
+//!   book has never heard of is attributed from its first frame. Anyone can
+//!   name any id, so the datagram's source address only goes up as
+//!   `Inbound::source`; the book records it when the consumer confirms it
+//!   through `Transport::confirm_peer` after authenticating the frame. The
+//!   router does that once a frame's seal verifies under
+//!   `RouterConfig::cluster_secret`, or for every admitted frame without one.
 //! * **One frame per datagram.** A raw frame must fit in a single UDP packet;
 //!   a larger one is refused as `InvalidInput` carrying
 //!   `UdpSendError::PayloadTooLarge`.

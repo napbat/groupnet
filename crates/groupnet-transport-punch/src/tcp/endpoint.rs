@@ -531,6 +531,7 @@ impl Runtime {
             packet: Inbound {
                 from: node.clone(),
                 msg: data,
+                source: None,
             },
             session: Some(peer.lease.id()),
         });

@@ -468,6 +468,98 @@ The native UDP format is `GNP4`; TCP frames use version 2. Each rendezvous and
 its endpoints must upgrade together. Earlier formats and authentication-mode
 mismatches are rejected without compatibility fallback.
 
+### Cluster secret on plain links and the TCP data plane
+
+Plain links (UDP, TCP messages, IPC, memory) and the TCP data plane
+(`TcpBulkTransport`) carry a claimed node id and authenticate nothing by
+default: anyone who reaches a node's link or data-plane listener can speak for
+any node, inject gossip (membership, keyed entries such as advertised
+addresses, metadata) and open data-plane streams. **A cluster without a secret
+must run on a private network that only its nodes can reach.**
+
+A shared `ClusterSecret` (`groupnet_transport::auth`, at least 32 bytes, never
+shown by `Debug`) closes both doors without a rendezvous or certificates:
+
+- `RouterConfig::cluster_secret` seals every router frame, adverts and data
+  alike, with an HMAC-SHA256 tag over the sending node's id and the whole
+  envelope (magic `GNS2` instead of the open `GNR4`), before fragmentation. A
+  frame larger than a link's MTU leaves as `GNT1` fragments, each tagged on
+  its own (another domain label, the sending node's id, the fragment header
+  and the chunk). The receiving router verifies, in constant time and against
+  the neighbor its link attributes the datagram to, each fragment's tag before
+  reassembly touches it and the envelope's seal before it decodes,
+  replay-checks, learns, delivers or forwards anything. A forwarder decrements
+  the hop count and seals again under its own id. Unsealed frames and
+  fragments, ones sealed under another secret and ones re-attributed to
+  another neighbor are dropped and counted (`Router::auth_failures`).
+- **Addresses change only after verification.** A UDP datagram, and a raw TCP
+  message connection's dial-back introduction, only report where a claimed id
+  speaks from (`Inbound::source`); the transport's address book records it
+  when the router confirms it (`Transport::confirm_peer`), after the frame's
+  seal verified and the frame passed the replay or advert-freshness check. A
+  datagram that merely claims a member's id never moves that member's address.
+  Without a secret the router confirms every admitted frame, as before.
+- **Freshness.** Data frames carry their origin's boot nonce and sequence and
+  pass the bounded replay windows. Every advert carries its sender's advert
+  identity: the boot epoch (wall-clock nanoseconds when the sender's router
+  started), the random boot nonce, and a sequence from a counter only adverts
+  use. Boots are ordered by epoch, then nonce. A receiver accepts an advert
+  from a neighbor on a link only when its identity is newer than the last one
+  it accepted there, so any advert from an earlier boot is refused and a
+  refused advert changes nothing. A captured advert replayed after its route
+  expired therefore does not bring the route back, and one replayed from an
+  older boot cannot displace the neighbor's live boot.
+- `TcpBulkConfig::secret` (and `TcpBulkTransport::dial_only_with` for clients)
+  turns the versioned data-plane handshake (`GNBH`, version 2) into a mutual
+  challenge. The dialer sends its id and a fresh 32-byte nonce; the acceptor
+  answers with its id, its own fresh nonce and an HMAC over the protocol
+  label, the version, its role, both nonces and both ids; the dialer checks
+  the id is the node it dialed, verifies the tag and answers with its own
+  role's tag, which the acceptor verifies before the stream is accepted. Fresh
+  nonces defeat replay, the role byte defeats reflection, and binding both ids
+  defeats a rewritten identity. Both sides run under
+  `TcpBulkConfig::handshake_timeout` (5 s for dial-only clients); a dial whose
+  peer accepts and never answers fails with `TimedOut`. Every refusal or
+  timeout closes the connection and counts in `TcpBulkTransport::auth_failures`.
+  The unversioned handshake (version 1, a bare id field) is refused.
+
+Keyed and unkeyed nodes refuse each other in both directions, and there is no
+fallback to unauthenticated peers. The secret proves cluster membership, not
+an identity: every holder can claim every node id, and nothing is encrypted.
+Use pinned TLS tunnels to authenticate individual nodes and protect bytes.
+
+What the secret leaves open:
+
+- **The TCP data plane after its handshake.** The handshake authenticates
+  connection setup only. The bytes that follow carry no integrity protection
+  and are not bound to the handshake, so an attacker on the network path can
+  inject into or alter RPC traffic. Keep the data plane on a private network,
+  or use a mutually authenticated TLS mode (not yet implemented) when it
+  crosses a trust boundary.
+- **Replay state lives in memory.** A receiver that restarts, or that evicted
+  a sender (replay windows keep `replay_capacity / 64` origin streams; advert
+  freshness keeps `max_routes × max_transports` neighbor-link pairs, least
+  recently active first), accepts captured frames it no longer remembers: a
+  data frame from a sender's current boot until that sender's genuine traffic
+  moves its 64-sequence window past it, a data frame from an earlier boot
+  whose stream it no longer tracks, and each captured advert once more, in
+  increasing order (until it accepts one from a later boot).
+- **Advert boots follow the wall clock.** A neighbor whose clock stepped back
+  across its restart, below the epoch of its previous boot, has its adverts
+  refused by receivers that still remember that boot, until its clock passes
+  the old epoch or they forget it (their restart, or eviction at capacity).
+- **Address confirmation inherits those limits.** An accepted replay, or a
+  copy of a genuine frame that an on-path attacker delivers from its own
+  address before the original arrives, points the member's address at the
+  attacker until the member's next frame confirms its real address again.
+- **Replayed fragments.** Fragment tags are not replay-checked: an attacker
+  who captured a member's genuine fragments can replay incomplete sets to hold
+  reassembly slots (`ReassemblyConfig::max_pending`) until they time out.
+- The secret wipe: a `ClusterSecret` keeps ring's HMAC key (its precomputed
+  pad states, enough to forge tags), which ring does not zero on drop, and
+  `ClusterSecret::new` neither keeps nor wipes the caller's bytes; callers
+  zero their own buffer after building it.
+
 ## 4. What each security layer actually grants
 
 These are separate checks, not one inherited permission chain. Applications must
@@ -476,7 +568,7 @@ routing alias or advertised group name.
 
 ```mermaid
 flowchart TB
-    Neighbor["Configured adjacent peers / NetworkKey"] --> Fabric["Routing-fabric participation"]
+    Neighbor["Configured adjacent peers / NetworkKey / ClusterSecret"] --> Fabric["Routing-fabric participation"]
     Pins["Pinned certificates + tunnel admission"] --> Identity["Authenticated encrypted stream"]
     Policy["Application-owned resource policy"] --> Access["Permission to use a resource"]
     Group["Coordination-group membership"] --> Metadata["Membership and coordination metadata"]
@@ -487,7 +579,8 @@ flowchart TB
 
 | Boundary | Implemented guarantee or limitation |
 |---|---|
-| Plain TCP/UDP links | No inherent endpoint authentication or encryption; static configurations assume trusted peers. |
+| Plain TCP/UDP links | No inherent endpoint authentication or encryption; static configurations assume trusted peers on a private network. |
+| Cluster secret | Router frames and TCP data-plane handshakes admit only holders of the shared secret; it does not distinguish holders or encrypt. |
 | Open dynamic admission | Accepts claimed identities without ownership proof; session binding is not account authentication. |
 | Native punching fabric | Keyed mode authenticates fabric membership; explicit keyless mode does not. |
 | Pinned TLS tunnels | End-to-end endpoint identity and application-byte confidentiality across transit peers. |

@@ -9,17 +9,24 @@
 //! only explicitly admitted adjacent peers; they never grant admission. Closed
 //! routers retain routing records, not endpoint resources.
 //!
-//! Raw routing messages trust the configured fabric and adjacent peers. The
-//! [`tunnel`] layer separately authenticates pinned TLS identities and encrypts
-//! reliable full-duplex application streams end-to-end across forwarding nodes.
-//! A route or shared group name is not authorization to use an application resource.
+//! Raw routing messages trust the configured fabric and adjacent peers unless
+//! [`RouterConfig::cluster_secret`] is set: then every frame carries a keyed
+//! seal under the cluster's shared secret, checked hop by hop, and frames
+//! from anyone without the secret are dropped and counted
+//! ([`Router::auth_failures`]). Without a secret anyone who reaches a link can
+//! speak for any node, so such a cluster belongs on a private network. The
+//! [`tunnel`] layer separately authenticates pinned TLS identities and
+//! encrypts reliable full-duplex application streams end-to-end across
+//! forwarding nodes. A route or shared group name is not authorization to use
+//! an application resource.
 //!
 //! Routing and reliable streams live here. Link implementations live in their own
 //! crates and register through `groupnet_transport::link`; the transport types
 //! this crate's signatures take ([`Transport`], [`LinkProvider`], [`BoundLink`],
-//! [`LinkConfig`]), the [`QueueCapacity`] bound and the [`NodeIdError`] that
-//! [`RoutedSendError`] carries are re-exported here. The sans-IO coordination
-//! core remains dependency-free.
+//! [`LinkConfig`]), the [`QueueCapacity`] bound, the [`ClusterSecret`] (and its
+//! [`ClusterSecretError`]) and the [`NodeIdError`] that [`RoutedSendError`]
+//! carries are re-exported here. The sans-IO coordination core remains
+//! dependency-free.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod config;
@@ -36,6 +43,7 @@ pub mod tunnel;
 
 pub use bytes::Bytes;
 pub use config::{Network, NetworkBuilder, TunnelConfig, TunnelConfigError};
+pub use groupnet_transport::auth::{ClusterSecret, ClusterSecretError};
 pub use groupnet_transport::link::{BoundLink, LinkConfig, LinkProvider};
 pub use groupnet_transport::{NodeIdError, QueueCapacity, Transport};
 pub use router::{

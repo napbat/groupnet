@@ -187,6 +187,7 @@ async fn worker_offers_the_direct_sink_bounded_by_the_link_mtu() {
             packet: Inbound {
                 from: NodeId::new("peer"),
                 msg: bytes::Bytes::from(vec![0; length]),
+                source: None,
             },
             session: Some(session),
         });

@@ -7,13 +7,27 @@ use std::{collections::HashMap, io};
 use tokio::time::Instant;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
-    byteorder::network_endian::{U16, U32},
+    byteorder::network_endian::{U16, U32, U64},
 };
 
 use crate::router::ReassemblyConfig;
 
 pub(crate) const MAX_FRAME: usize = 65_000;
 pub(crate) const MAX_HOPS: u8 = 16;
+
+/// Magic of an envelope sent by a router without a cluster secret.
+pub(crate) const OPEN: [u8; 4] = *b"GNR4";
+
+/// Magic of an envelope sealed under a cluster secret (`router::seal`); the
+/// seal follows the envelope.
+pub(crate) const SEALED: [u8; 4] = *b"GNS2";
+
+/// Magic of a fragment sent by a router without a cluster secret.
+pub(crate) const OPEN_FRAGMENT: [u8; 4] = *b"GNF1";
+
+/// Magic of a fragment tagged under a cluster secret (`router::seal`); the
+/// tag follows the fragment's chunk.
+pub(crate) const SEALED_FRAGMENT: [u8; 4] = *b"GNT1";
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -29,11 +43,27 @@ struct DataHeader {
     id: [u8; 16],
 }
 
+/// An advert's header: the sender's [`AdvertId`], so a receiver can refuse an
+/// advert that is not newer than the last one it accepted.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct AdvertHeader {
+    epoch: U64,
+    nonce: [u8; 8],
+    sequence: U64,
     cost: U32,
     length: u8,
+}
+
+/// Where an advert stands in its sender's history, ordered as compared:
+/// first the sender router's boot `epoch` (wall-clock nanoseconds at start),
+/// then its random boot `nonce` (which only separates boots that share an
+/// epoch), then the `sequence` of its own advert counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AdvertId {
+    pub(crate) epoch: u64,
+    pub(crate) nonce: [u8; 8],
+    pub(crate) sequence: u64,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -119,6 +149,7 @@ impl PayloadKind {
 
 pub(crate) enum Frame<'a> {
     Advert {
+        id: AdvertId,
         cost: u32,
         path: Vec<NodeId>,
     },
@@ -134,17 +165,21 @@ pub(crate) enum Frame<'a> {
 
 #[cfg(test)]
 pub(crate) fn decode(bytes: &[u8]) -> io::Result<Frame<'_>> {
-    decode_bounded(bytes, MAX_FRAME, usize::from(MAX_HOPS))
+    decode_bounded(bytes, OPEN, MAX_FRAME, usize::from(MAX_HOPS))
 }
 
+/// Decodes one complete envelope whose magic must be `magic`: an open router
+/// refuses a sealed envelope, and a sealing router passes only envelopes
+/// whose seal it verified and removed.
 pub(crate) fn decode_bounded(
     bytes: &[u8],
+    magic: [u8; 4],
     max_frame: usize,
     max_hops: usize,
 ) -> io::Result<Frame<'_>> {
     let (prefix, mut body) =
         Prefix::ref_from_prefix(bytes).map_err(|_| invalid("truncated router frame"))?;
-    if bytes.len() > max_frame || prefix.magic != *b"GNR3" {
+    if bytes.len() > max_frame || prefix.magic != magic {
         return Err(invalid("invalid router frame"));
     }
     if prefix.kind == 0 {
@@ -166,6 +201,11 @@ pub(crate) fn decode_bounded(
             return Err(invalid("trailing route bytes"));
         }
         Ok(Frame::Advert {
+            id: AdvertId {
+                epoch: header.epoch.get(),
+                nonce: header.nonce,
+                sequence: header.sequence.get(),
+            },
             cost: header.cost.get(),
             path,
         })
@@ -200,17 +240,30 @@ pub(crate) fn decode_bounded(
     }
 }
 
-pub(crate) fn advert(cost: u32, path: &[NodeId]) -> Vec<u8> {
-    let mut bytes = Vec::new();
+/// Bytes an advert spends before its path.
+pub(crate) const ADVERT_HEADER: usize = size_of::<Prefix>() + size_of::<AdvertHeader>();
+
+/// An open advert of `path` at `cost`, carrying the sender's `id`.
+pub(crate) fn advert(id: AdvertId, cost: u32, path: &[NodeId]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        ADVERT_HEADER
+            + path
+                .iter()
+                .map(|node| 1 + node.as_str().len())
+                .sum::<usize>(),
+    );
     bytes.extend_from_slice(
         Prefix {
-            magic: *b"GNR3",
+            magic: OPEN,
             kind: 0,
         }
         .as_bytes(),
     );
     bytes.extend_from_slice(
         AdvertHeader {
+            epoch: id.epoch.into(),
+            nonce: id.nonce,
+            sequence: id.sequence.into(),
             cost: cost.into(),
             length: u8::try_from(path.len()).expect("bounded route"),
         }
@@ -220,6 +273,24 @@ pub(crate) fn advert(cost: u32, path: &[NodeId]) -> Vec<u8> {
         put_id(&mut bytes, node);
     }
     bytes
+}
+
+/// A routed identity for tests: a fixed nonce and `sequence`.
+#[cfg(test)]
+pub(crate) fn test_id(sequence: u64) -> [u8; 16] {
+    let mut id = [7; 16];
+    id[8..].copy_from_slice(&sequence.to_be_bytes());
+    id
+}
+
+/// An advert identity for tests: one fixed boot and `sequence`.
+#[cfg(test)]
+pub(crate) fn test_advert(sequence: u64) -> AdvertId {
+    AdvertId {
+        epoch: 1,
+        nonce: [7; 8],
+        sequence,
+    }
 }
 
 pub(crate) fn stamp(
@@ -232,7 +303,7 @@ pub(crate) fn stamp(
 ) {
     let mut offset = 0;
     let prefix = Prefix {
-        magic: *b"GNR3",
+        magic: OPEN,
         kind: kind.tag(),
     };
     bytes[..size_of::<Prefix>()].copy_from_slice(prefix.as_bytes());
@@ -295,20 +366,33 @@ pub(crate) struct Reassembly {
     pending: HashMap<AssemblyKey, Assembly>,
     config: ReassemblyConfig,
     max_frame: usize,
+    magic: [u8; 4],
+    fragment_magic: [u8; 4],
 }
 
 impl Default for Reassembly {
     fn default() -> Self {
-        Self::new(ReassemblyConfig::default(), MAX_FRAME)
+        Self::new(ReassemblyConfig::default(), MAX_FRAME, OPEN, OPEN_FRAGMENT)
     }
 }
 
 impl Reassembly {
-    pub(crate) fn new(config: ReassemblyConfig, max_frame: usize) -> Self {
+    /// Reassembles frames of at most `max_frame` bytes (seal included); an
+    /// unfragmented frame is recognised by `magic`, a fragment by
+    /// `fragment_magic`. A sealing router hands over a tagged fragment only
+    /// after its tag verified, with the tag removed.
+    pub(crate) fn new(
+        config: ReassemblyConfig,
+        max_frame: usize,
+        magic: [u8; 4],
+        fragment_magic: [u8; 4],
+    ) -> Self {
         Self {
             pending: HashMap::new(),
             config,
             max_frame,
+            magic,
+            fragment_magic,
         }
     }
 
@@ -321,11 +405,11 @@ impl Reassembly {
     ) -> Option<Bytes> {
         self.pending
             .retain(|_, entry| entry.created.elapsed() < self.config.timeout);
-        if bytes.starts_with(b"GNR3") {
+        if bytes.starts_with(&self.magic) {
             return (bytes.len() <= self.max_frame).then_some(bytes);
         }
         let (header, body) = FragmentHeader::ref_from_prefix(bytes.as_ref()).ok()?;
-        if header.magic != *b"GNF1" || body.is_empty() {
+        if header.magic != self.fragment_magic || body.is_empty() {
             return None;
         }
         let index = usize::from(header.index.get());
@@ -378,16 +462,39 @@ impl Reassembly {
     }
 }
 
+/// How a router frames its fragments: their magic, and the bytes its seal
+/// appends to each one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FragmentFormat {
+    pub(crate) magic: [u8; 4],
+    pub(crate) seal: usize,
+}
+
+/// The fragments of a router without a cluster secret.
+#[cfg(test)]
+pub(crate) const OPEN_FRAGMENTS: FragmentFormat = FragmentFormat {
+    magic: OPEN_FRAGMENT,
+    seal: 0,
+};
+
 pub(crate) struct Fragments {
     bytes: Bytes,
     chunk: usize,
     id: [u8; 16],
     index: u16,
     count: u16,
+    format: FragmentFormat,
 }
 
-pub(crate) fn fragment(bytes: Bytes, mtu: usize, id: [u8; 16]) -> Fragments {
-    let chunk = mtu - FRAGMENT;
+/// Splits `bytes` into fragments of at most `mtu` bytes once each is sealed
+/// under `format`. Each fragment comes with capacity for its seal.
+pub(crate) fn fragment(
+    bytes: Bytes,
+    mtu: usize,
+    id: [u8; 16],
+    format: FragmentFormat,
+) -> Fragments {
+    let chunk = mtu - FRAGMENT - format.seal;
     let count = u16::try_from(bytes.len().div_ceil(chunk)).expect("validated frame and MTU");
     Fragments {
         bytes,
@@ -395,11 +502,12 @@ pub(crate) fn fragment(bytes: Bytes, mtu: usize, id: [u8; 16]) -> Fragments {
         id,
         index: 0,
         count,
+        format,
     }
 }
 
 impl Iterator for Fragments {
-    type Item = Bytes;
+    type Item = BytesMut;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index == self.count {
@@ -408,7 +516,7 @@ impl Iterator for Fragments {
         let offset = usize::from(self.index) * self.chunk;
         let part = &self.bytes[offset..(offset + self.chunk).min(self.bytes.len())];
         let header = FragmentHeader {
-            magic: *b"GNF1",
+            magic: self.format.magic,
             id: self.id,
             index: self.index.into(),
             count: self.count.into(),
@@ -416,11 +524,11 @@ impl Iterator for Fragments {
                 .expect("validated frame")
                 .into(),
         };
-        let mut packet = BytesMut::with_capacity(FRAGMENT + part.len());
+        let mut packet = BytesMut::with_capacity(FRAGMENT + part.len() + self.format.seal);
         packet.extend_from_slice(header.as_bytes());
         packet.extend_from_slice(part);
         self.index += 1;
-        Some(packet.freeze())
+        Some(packet)
     }
 }
 
@@ -492,13 +600,42 @@ mod tests {
         for end in 0..envelope.len() - 1 {
             assert!(decode(&envelope[..end]).is_err());
         }
-        for version in [b"GNR1", b"GNR2"] {
+        for version in [b"GNR1", b"GNR2", b"GNR3"] {
             envelope[..4].copy_from_slice(version);
             assert!(decode(&envelope).is_err());
         }
-        envelope[..4].copy_from_slice(b"GNR3");
+        envelope[..4].copy_from_slice(&OPEN);
         envelope[4] = 4;
         assert!(decode(&envelope).is_err());
+    }
+
+    /// An advert carries its sender's routed identity; the previous layout,
+    /// without one, is refused by its magic.
+    #[test]
+    fn advert_roundtrips_its_identity() {
+        let path = [NodeId::new("a"), NodeId::new("b")];
+        let envelope = advert(test_advert(9), 3, &path);
+        assert_eq!(envelope.len(), ADVERT_HEADER + 4);
+        let Frame::Advert {
+            id,
+            cost,
+            path: decoded,
+        } = decode(&envelope).unwrap()
+        else {
+            panic!("expected an advert");
+        };
+        assert_eq!(
+            (id, cost, decoded.as_slice()),
+            (test_advert(9), 3, &path[..])
+        );
+        for end in 0..envelope.len() {
+            assert!(decode(&envelope[..end]).is_err());
+        }
+    }
+
+    /// Open fragments of `bytes` under fragment id `id`, at a 128-byte MTU.
+    fn parts(bytes: Bytes, id: u8) -> impl Iterator<Item = Bytes> {
+        fragment(bytes, 128, [id; 16], OPEN_FRAGMENTS).map(BytesMut::freeze)
     }
 
     #[test]
@@ -512,7 +649,7 @@ mod tests {
             &NodeId::new("b"),
             &[8; 512],
         ));
-        let mut frames: Vec<_> = fragment(bytes.clone(), 128, [2; 16]).collect();
+        let mut frames: Vec<_> = parts(bytes.clone(), 2).collect();
         let mut assembly = Reassembly::default();
         let last = frames.pop().unwrap();
         assert!(assembly.receive(0, None, &from, last.clone()).is_none());
@@ -554,8 +691,8 @@ mod tests {
             &NodeId::new("b"),
             &[8; 256],
         ));
-        let mut parts = fragment(frame.clone(), 128, [2; 16]);
-        let first = parts.next().unwrap();
+        let mut parts_of = parts(frame.clone(), 2);
+        let first = parts_of.next().unwrap();
         let ptr = first[FRAGMENT..].as_ptr();
         let mut bounded = Reassembly::new(
             ReassemblyConfig {
@@ -563,20 +700,22 @@ mod tests {
                 ..ReassemblyConfig::default()
             },
             MAX_FRAME,
+            OPEN,
+            OPEN_FRAGMENT,
         );
         assert!(bounded.receive(0, None, &from, first).is_none());
         let assembly = bounded.pending.values().next().unwrap();
         assert_eq!(assembly.parts[0].as_ref().unwrap().as_ptr(), ptr);
-        let competing = fragment(frame.clone(), 128, [3; 16]).next().unwrap();
+        let competing = parts(frame.clone(), 3).next().unwrap();
         assert!(bounded.receive(0, None, &from, competing).is_none());
         assert_eq!(bounded.pending.len(), 1);
         assert!(
             bounded
-                .receive(0, None, &from, parts.next().unwrap())
+                .receive(0, None, &from, parts_of.next().unwrap())
                 .is_none()
         );
         assert_eq!(
-            bounded.receive(0, None, &from, parts.next().unwrap()),
+            bounded.receive(0, None, &from, parts_of.next().unwrap()),
             Some(frame.clone())
         );
         let mut tight = Reassembly::new(
@@ -585,15 +724,12 @@ mod tests {
                 ..ReassemblyConfig::default()
             },
             MAX_FRAME,
+            OPEN,
+            OPEN_FRAGMENT,
         );
         assert!(
             tight
-                .receive(
-                    0,
-                    None,
-                    &from,
-                    fragment(frame, 128, [4; 16]).next().unwrap()
-                )
+                .receive(0, None, &from, parts(frame, 4).next().unwrap())
                 .is_none()
         );
         assert!(tight.pending.is_empty());

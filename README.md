@@ -84,13 +84,13 @@ streams only when the application asks for them.
 | Crate | Plane | Deps | Role |
 |-------|-------|------|------|
 | [`groupnet-core`](crates/groupnet-core) | — | none | sans-IO state machine: engine, ids, wire codec, coordinator selection |
-| [`groupnet-transport`](crates/groupnet-transport) | both | core, bytes *(+framing: zerocopy, tokio I/O traits; +bulk: framing, futures-io; +link: tokio, tokio-util, futures-util)* | runtime-free `Transport` and validated `QueueCapacity`, shared length-prefix `framing`, optional `BulkTransport`, and shared object-safe link registration/lifecycle |
+| [`groupnet-transport`](crates/groupnet-transport) | both | core, bytes *(+framing: zerocopy, tokio I/O traits; +bulk: framing, futures-io; +link: tokio, tokio-util, futures-util; +auth: ring)* | runtime-free `Transport` and validated `QueueCapacity`, shared length-prefix `framing`, optional `BulkTransport`, shared object-safe link registration/lifecycle, and the cluster's shared `auth::ClusterSecret` |
 | [`groupnet-transport-mem`](crates/groupnet-transport-mem) | both | transport, core, tokio(sync) *(+bulk feature: transport(bulk), tokio(io-util), tokio-util(compat))* | in-process bindings (tests, examples, single-process): datagrams always, `MemBulkNet` byte streams under feature `bulk` |
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
-| [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) | persistent TCP messages (`TcpMsgTransport`), TCP streams (`TcpBulkTransport`), and `TcpLink` registration |
+| [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) *(+bulk: transport(auth))* | persistent TCP messages (`TcpMsgTransport`), TCP streams (`TcpBulkTransport`, mutually authenticated under a cluster secret), and `TcpLink` registration |
 | [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | control | transport(link), core, tokio | native named pipes/Unix sockets and `IpcLink` registration |
 | [`groupnet-transport-punch`](crates/groupnet-transport-punch) | connectivity | transport admission/session primitives, core, tokio, ring, socket2, if-addrs | native adjacent-node UDP/TCP connections, candidate checks, rendezvous and relay; no transport or router link |
-| [`groupnet-network`](crates/groupnet-network) | both | transport(bulk, link), tokio, rustls, ring | protocol-independent group-network routing and pinned end-to-end TLS streams |
+| [`groupnet-network`](crates/groupnet-network) | both | transport(auth, bulk, link), tokio, rustls, ring | protocol-independent group-network routing (frames sealed under an optional cluster secret) and pinned end-to-end TLS streams |
 | [`groupnet-messaging`](crates/groupnet-messaging) | application packets | core, network, bytes, ring, tokio, tokio-util | static send-only `MessageProtocol`, generic receipt contexts, `Messaging` endpoint, bounded retry/deduplication |
 | [`groupnet-streams`](crates/groupnet-streams) | sessions | core, network, transport(bulk), bytes, ring, futures-util, tokio, tokio-util | static `SessionProtocol`, shared protocol engines, authenticated session policies |
 | [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), messaging, streams, network, tokio | non-generic managed `Node`, unsealed `PeerImplementation` / `ReceiveBinding`, generic `Endpoint<P>` / `Peer<P>` over restricted `ManagedProtocol` views, group actors, receive callbacks/fanout reports, and `FileGrantStore` |
@@ -355,12 +355,14 @@ outcome**, not proof of nonexecution. There is no ordering, durability, crash
 recovery, or exactly-once guarantee.
 
 These are **trusted-fabric messages, not encrypted/authenticated application
-channels**. Sender attribution and membership checks trust transit peers.
+channels**. Sender attribution and membership checks trust transit peers (with
+a [cluster secret](#cluster-secret), only peers that hold it).
 Use the existing pinned TLS stream API for confidential/authenticated traffic.
 Metadata still converges as replicated state; Hosted/quorum commits, feeds,
 frontiers, and coherence leases retain their existing separate contracts.
 Sending to a Hosted group does not turn a frame into a quorum commit.
-The routed wire guard is `GNR3`, messaging is `GNA2` (including an explicit
+The routed wire guard is `GNR4` (`GNS2` for an envelope sealed under a cluster
+secret; fragments are `GNF1`, or tagged `GNT1` under one), messaging is `GNA2` (including an explicit
 retry horizon), and the authenticated tunnel preamble is `GN-TUNNEL-3` (byte-based
 receive credit);
 upgrade communicating nodes together.
@@ -729,8 +731,10 @@ advertise or forward transit routes. This is a routing-role setting, not an
 access-control policy for peers or groups.
 
 Plain TCP/UDP does not provide endpoint authentication or encryption. Static
-links assume trusted peers; explicitly open admission accepts untrusted identity
-claims and does not make their routing advertisements trustworthy.
+links assume trusted peers on a private network unless every node holds the
+same [cluster secret](#cluster-secret); explicitly open admission accepts
+untrusted identity claims and does not make their routing advertisements
+trustworthy.
 Keyed `UdpPunchConfig::new(local, rendezvous, Some(key), PeerPolicy::Static(peers))` supplies a self-hosted
 rendezvous address, provisioned `NetworkKey`, explicit peers, and `PathPolicy`.
 Direct-preferred mode probes peers simultaneously; relay-only mode never sends
@@ -1081,6 +1085,93 @@ pinned TLS streams form a data plane too: `DataPlane::new(node.clone())` shares
 the node's `Ordered` endpoint. The control-plane coordination core is untouched
 by any of it.
 
+### Cluster secret
+
+By default nothing authenticates a peer: any party that reaches a node's
+routing link or its TCP data-plane listener can claim any node id, inject
+gossip (membership, keyed entries such as advertised RPC addresses, metadata)
+and open data-plane streams. **A cluster without a secret must run on a private
+network that only its nodes can reach.** Otherwise give every node the same
+`groupnet::transport::auth::ClusterSecret` (at least 32 random bytes; its
+`Debug` output shows none of them):
+
+```rust
+use groupnet::core::NodeId;
+use groupnet::network::RouterConfig;
+use groupnet::runtime::Node;
+use groupnet::transport::auth::ClusterSecret;
+use groupnet::transport::link::{BoundLink, LinkConfig};
+use groupnet::transport::tcp::{TcpBulkConfig, TcpBulkTransport};
+use groupnet::transport::udp::UdpTransport;
+
+async fn start(secret: &[u8]) -> Result<(Node, TcpBulkTransport), Box<dyn std::error::Error>> {
+    let secret = ClusterSecret::new(secret)?;
+    let me = NodeId::new("node-a");
+    let udp = UdpTransport::bind(me.clone(), "0.0.0.0:7000").await?;
+    let node = Node::builder(me.clone())
+        .link(BoundLink::new(udp, LinkConfig::new(vec![NodeId::new("node-b")])))
+        .routing(RouterConfig {
+            cluster_secret: Some(secret.clone()),
+            ..RouterConfig::default()
+        })
+        .start()
+        .await?;
+    let config = TcpBulkConfig {
+        secret: Some(secret),
+        ..TcpBulkConfig::default()
+    };
+    let data = TcpBulkTransport::bind_with(me, "0.0.0.0:8000", config).await?;
+    Ok((node, data))
+}
+```
+
+- **Routing and gossip** (`RouterConfig::cluster_secret`, any link: UDP, TCP,
+  IPC, memory): every router frame is sealed with an HMAC-SHA256 tag over the
+  sending node's id and the whole envelope, which then carries the magic
+  `GNS2` instead of `GNR4`; a frame larger than the link's MTU leaves as
+  `GNT1` fragments that each carry their own tag. The receiver checks every
+  fragment's tag before reassembly and the seal before it decodes, learns,
+  delivers or forwards anything, against the neighbor the link attributes the
+  frame to; a forwarder seals again under its own id. Unsealed and wrongly
+  sealed frames are dropped and counted in `node.router().auth_failures()`.
+- **Addresses**: a UDP datagram, or a raw TCP message connection's dial-back
+  introduction, only reports where a claimed id speaks from. The address book
+  records it after the router verified the frame's seal and found it fresh,
+  so a node without the secret cannot redirect a member's traffic by claiming
+  its id.
+- **Freshness**: data frames pass the router's replay windows, and every
+  advert carries its sender's boot epoch (wall clock at start), boot nonce and
+  an advert-only sequence; a receiver accepts only a newer one, so a replayed
+  advert, or one from an earlier boot, is refused instead of keeping a dead
+  route alive or displacing the live boot. That state lives in
+  memory: a restarted receiver accepts frames it no longer remembers (see
+  [docs/tunnels-and-security.md](docs/tunnels-and-security.md#cluster-secret-on-plain-links-and-the-tcp-data-plane)
+  for the exact limits).
+- **Data plane** (`TcpBulkConfig::secret`, or
+  `TcpBulkTransport::dial_only_with` for a client): the versioned handshake
+  (`GNBH`, version 2) becomes a mutual challenge. Each side sends a fresh
+  32-byte nonce and answers with an HMAC over the protocol label, the version,
+  its role, both nonces and both claimed ids; each verifies the other's answer
+  in constant time before a stream byte flows, and the dialer also checks that
+  the answer comes from the node it dialed. Both sides finish within
+  `TcpBulkConfig::handshake_timeout` (5 s for a dial-only client), so `connect`
+  to a peer that accepts and never answers fails with `TimedOut`. Refusals and
+  timeouts close the connection and count in
+  `TcpBulkTransport::auth_failures()`. The unversioned handshake is refused.
+  The handshake authenticates connection setup only: the stream after it has
+  no integrity protection, so an attacker on the network path can inject into
+  or alter RPC bytes. Keep the data plane on a private network, or use a
+  mutually authenticated TLS mode (not yet implemented) when it crosses a
+  trust boundary.
+
+A keyed node refuses unkeyed peers and peers with another secret, in both
+directions; there is no fallback. The secret proves membership of the
+cluster, not one identity: every holder can speak for every node, and it does
+not encrypt anything. Pinned TLS tunnels remain the way to authenticate and
+encrypt between individual nodes. `ClusterSecret` keeps ring's HMAC key (its
+precomputed pad states), which is not zeroed on drop, and does not wipe the
+bytes it was built from: zero your own buffer after `ClusterSecret::new`.
+
 ### Request/response RPC (feature `rpc`)
 
 For calls rather than streams — "read this key from its owner", "apply this
@@ -1372,8 +1463,9 @@ Remaining work and deployment boundaries:
   status in the replication contracts; a byte-stream transport does not supply
   durable application history or storage semantics.
 - Named DNS seeds and native rendezvous discovery are implemented. Plain
-  TCP/UDP addressing still requires a trusted deployment; discovery is not an
-  authorization or private-peer visibility policy.
+  TCP/UDP addressing still requires a private network or a
+  [cluster secret](#cluster-secret); discovery is not an authorization or
+  private-peer visibility policy.
 - Permission-group connection policies and VPN interfaces are not implemented.
 - Public-Internet NAT, Unix runtime behavior, and USB/YubiKey hardware require
   deployment-specific qualification beyond the Windows loopback scenarios.

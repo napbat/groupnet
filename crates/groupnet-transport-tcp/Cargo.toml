@@ -14,9 +14,10 @@ default = ["msg", "bulk"]
 # accept loop and per-connection workers, and the shared stream framing.
 msg = ["groupnet-transport/framing", "tokio/rt", "tokio/sync", "tokio/time", "tokio/macros"]
 # Data plane: `TcpBulkTransport`, reliable byte streams. Pulls the `bulk`
-# trait surface plus the futures-io compat shim, and tokio's task/sync/time
-# slices for the listener task and deadline-bounded handshakes.
-bulk = ["groupnet-transport/bulk", "dep:tokio-util", "tokio/rt", "tokio/sync", "tokio/time"]
+# trait surface plus the futures-io compat shim, tokio's task/sync/time
+# slices for the listener task and deadline-bounded handshakes, and the
+# shared `ClusterSecret` its handshake authenticates with.
+bulk = ["groupnet-transport/bulk", "groupnet-transport/auth", "dep:tokio-util", "tokio/rt", "tokio/sync", "tokio/time"]
 # Router registration also needs the control-plane binding.
 link = ["msg", "groupnet-transport/link"]
 # Native rendezvous, candidate traversal, and relay fallback on the existing link.

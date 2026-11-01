@@ -6,14 +6,15 @@ use std::sync::{Arc, atomic::Ordering};
 use bytes::{Buf, Bytes};
 use groupnet_core::NodeId;
 use groupnet_transport::admission::SessionId;
-use groupnet_transport::link::AdmittedInbound;
+use groupnet_transport::link::{AdmittedInbound, LinkControl};
 use groupnet_transport::{Inbound, MAX_NODE_ID_BYTES, validate_node_id};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{
     AdvertisedRoute, ApplicationPacket, Candidate, Event, PacketBuffer, Queued, Route,
-    RoutedSendError, RouterConfig, Shared, Table, TransportId, closed, replay::ReplayWindows,
+    RoutedSendError, RouterConfig, Shared, Table, TransportId, closed, freshness::AdvertFreshness,
+    replay::ReplayWindows, seal::Sealing,
 };
 use crate::wire::{self, Frame, PayloadKind, Reassembly};
 
@@ -94,7 +95,11 @@ impl Shared {
                 .map_err(|_| io::Error::other("protocol registry poisoned"))?
                 .deliver(id, ApplicationPacket { from, payload }),
             PayloadKind::Message => {
-                let _ = self.messages.try_send(Inbound { from, msg: payload });
+                let _ = self.messages.try_send(Inbound {
+                    from,
+                    msg: payload,
+                    source: None,
+                });
                 Ok(())
             }
             PayloadKind::Tunnel => {
@@ -149,7 +154,7 @@ impl Shared {
         });
         let mut routes = vec![AdvertisedRoute {
             path: vec![self.local.clone()],
-            frame: wire::advert(0, std::slice::from_ref(&self.local)).into(),
+            frame: self.advert(0, std::slice::from_ref(&self.local)),
         }];
         if self.config.forwarding {
             for route in table
@@ -158,7 +163,7 @@ impl Shared {
                 .filter_map(|id| table.route(id, self.config.route_ttl))
             {
                 if route.path.len() < usize::from(self.config.max_hops.get())
-                    && 10
+                    && wire::ADVERT_HEADER
                         + route
                             .path
                             .iter()
@@ -168,12 +173,26 @@ impl Shared {
                 {
                     routes.push(AdvertisedRoute {
                         path: route.path.clone(),
-                        frame: wire::advert(route.cost, &route.path).into(),
+                        frame: self.advert(route.cost, &route.path),
                     });
                 }
             }
         }
         self.advertisements.send_replace(Arc::new(routes));
+    }
+
+    /// One advert envelope under this boot's next advert identity, so
+    /// receivers can refuse it once a newer one arrived; sealed when this
+    /// router seals. Adverts draw from their own counter, never the data one.
+    fn advert(&self, cost: u32, path: &[NodeId]) -> Bytes {
+        let id = wire::AdvertId {
+            epoch: self.boot_epoch,
+            nonce: self.nonce,
+            sequence: self.advert_sequence.fetch_add(1, Ordering::Relaxed),
+        };
+        let mut frame = wire::advert(id, cost, path);
+        self.sealing.seal(&self.local, &mut frame);
+        frame.into()
     }
 
     pub(super) fn refresh_reachable(&self) {
@@ -213,19 +232,32 @@ impl Shared {
     }
 }
 
-/// Reassembly and replay-suppression state shared by every link's inbound
-/// path. Each link worker processes its own frames inline; the lock covers only
-/// reassembly, decoding and the replay check, never delivery or forwarding.
+/// Reassembly, replay-suppression and advert-freshness state shared by every
+/// link's inbound path. Each link worker processes its own frames inline; the
+/// lock covers only reassembly, decoding and the replay and freshness checks,
+/// never delivery, forwarding or address confirmation.
 pub(super) struct InboundState {
     fragments: Reassembly,
     replay: ReplayWindows,
+    adverts: AdvertFreshness,
 }
 
 impl InboundState {
-    pub(super) fn new(config: &RouterConfig) -> Self {
+    pub(super) fn new(config: &RouterConfig, sealing: &Sealing) -> Self {
         Self {
-            fragments: Reassembly::new(config.reassembly.clone(), config.max_frame.get()),
+            fragments: Reassembly::new(
+                config.reassembly.clone(),
+                config.max_frame.get() + sealing.overhead(),
+                sealing.magic(),
+                sealing.fragments().magic,
+            ),
             replay: ReplayWindows::new(config.replay_capacity.get()),
+            adverts: AdvertFreshness::new(
+                config
+                    .max_routes
+                    .get()
+                    .saturating_mul(config.max_transports.get()),
+            ),
         }
     }
 }
@@ -251,7 +283,13 @@ pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>
 }
 
 impl Shared {
-    fn admitted_cost(&self, link: TransportId, admitted: &AdmittedInbound) -> Option<u32> {
+    /// The link's cost for an admitted frame, and its control when the frame
+    /// carries a source address to confirm once it authenticates.
+    fn admitted(
+        &self,
+        link: TransportId,
+        admitted: &AdmittedInbound,
+    ) -> Option<(u32, Option<LinkControl>)> {
         if admitted.packet.from == self.local {
             return None;
         }
@@ -259,42 +297,71 @@ impl Shared {
         let adapter = table.links.get(&link)?;
         adapter
             .admits(&admitted.packet.from, admitted.session)
-            .then_some(adapter.config.cost.get())
+            .then(|| {
+                let control = admitted.packet.source.map(|_| adapter.control.clone());
+                (adapter.config.cost.get(), control)
+            })
     }
 
     /// Processes one admitted physical frame on the link worker that read it:
-    /// reassembly, route learning, replay suppression, then local delivery or
-    /// forwarding. Every hand-off is a bounded `try_send`, so this never waits.
+    /// fragment tag, reassembly, seal verification, replay suppression and
+    /// advert freshness, address confirmation, then route learning, local
+    /// delivery or forwarding. Every hand-off is a bounded `try_send`, so
+    /// this never waits.
+    ///
+    /// The link's address book changes only here, through
+    /// [`LinkControl::confirm_peer`], and only for a frame that passed every
+    /// check before it: a datagram that claims a neighbor's id without its
+    /// seal, or replays one of its frames, never moves that neighbor's
+    /// address.
     pub(super) fn receive(&self, link: TransportId, admitted: AdmittedInbound) {
-        let Some(cost) = self.admitted_cost(link, &admitted) else {
+        let Some((cost, control)) = self.admitted(link, &admitted) else {
             return;
         };
         let AdmittedInbound { packet, session } = admitted;
+        let Inbound { from, msg, source } = packet;
+        if self.sealing.unsealed(&msg) {
+            self.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let Some(msg) = self.sealing.open_fragment(&from, msg) else {
+            self.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         let mut inbound = self.inbound.lock().expect("router inbound state poisoned");
-        let Some(bytes) = inbound
-            .fragments
-            .receive(link.0, session, &packet.from, packet.msg)
-        else {
+        let Some(bytes) = inbound.fragments.receive(link.0, session, &from, msg) else {
+            return;
+        };
+        let Some(length) = self.sealing.open(&from, &bytes) else {
+            drop(inbound);
+            self.auth_failures.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let Ok(frame) = wire::decode_bounded(
-            &bytes,
+            &bytes[..length],
+            self.sealing.magic(),
             self.config.max_frame.get(),
             usize::from(self.config.max_hops.get()),
         ) else {
             return;
         };
-        if let Frame::Data { from, id, .. } = &frame
-            && !inbound.replay.first_sighting(from, *id)
-        {
+        let fresh = match &frame {
+            Frame::Data { from, id, .. } => inbound.replay.first_sighting(from, *id),
+            Frame::Advert { id, .. } => inbound.adverts.accept(link.0, &from, *id),
+        };
+        drop(inbound);
+        if !fresh {
             return;
         }
-        drop(inbound);
+        if let (Some(control), Some(source)) = (control, source) {
+            control.confirm_peer(&from, source);
+        }
         match frame {
             Frame::Advert {
+                id: _,
                 cost: advertised,
                 path,
-            } => self.learn(link, packet.from, session, cost, advertised, path),
+            } => self.learn(link, from, session, cost, advertised, path),
             Frame::Data {
                 kind,
                 hops,
@@ -304,8 +371,9 @@ impl Shared {
                 payload,
             } => {
                 if to == self.local {
-                    let offset = bytes.len() - payload.len();
+                    let offset = length - payload.len();
                     let mut bytes = bytes;
+                    bytes.truncate(length);
                     bytes.advance(offset);
                     let _ = self.deliver_owned(kind, from, bytes);
                 } else if self.config.forwarding && hops > 1 {
@@ -313,6 +381,7 @@ impl Shared {
                         .try_into_mut()
                         .unwrap_or_else(|shared| bytes::BytesMut::from(shared.as_ref()));
                     wire::decrement_hops(&mut forwarded, kind);
+                    self.sealing.reseal(&self.local, &mut forwarded);
                     self.forward(&to, forwarded.freeze());
                 }
             }
@@ -369,5 +438,32 @@ impl Shared {
             );
         drop(table);
         self.refresh_reachable();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::Router;
+
+    /// Adverts draw from their own counter, so announcing any number of
+    /// routes never moves the data sequence a receiver's replay window
+    /// tracks.
+    #[tokio::test]
+    async fn adverts_leave_the_data_sequence_alone() -> io::Result<()> {
+        let router = Router::new(NodeId::new("local"))?;
+        let shared = &router.inner.shared;
+        let path = [NodeId::new("local")];
+        let before = shared.sequence.load(Ordering::Relaxed);
+        let ids: Vec<_> = (0..3)
+            .map(|_| match wire::decode(&shared.advert(0, &path)) {
+                Ok(Frame::Advert { id, .. }) => id,
+                _ => panic!("an advert"),
+            })
+            .collect();
+        assert_eq!(shared.sequence.load(Ordering::Relaxed), before);
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+        router.close().await;
+        Ok(())
     }
 }
