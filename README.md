@@ -361,8 +361,8 @@ Use the existing pinned TLS stream API for confidential/authenticated traffic.
 Metadata still converges as replicated state; Hosted/quorum commits, feeds,
 frontiers, and coherence leases retain their existing separate contracts.
 Sending to a Hosted group does not turn a frame into a quorum commit.
-The routed wire guard is `GNR3` (`GNS1` for an envelope sealed under a cluster
-secret), messaging is `GNA2` (including an explicit
+The routed wire guard is `GNR4` (`GNS2` for an envelope sealed under a cluster
+secret; fragments are `GNF1`, or tagged `GNT1` under one), messaging is `GNA2` (including an explicit
 retry horizon), and the authenticated tunnel preamble is `GN-TUNNEL-3` (byte-based
 receive credit);
 upgrade communicating nodes together.
@@ -1128,26 +1128,47 @@ async fn start(secret: &[u8]) -> Result<(Node, TcpBulkTransport), Box<dyn std::e
 - **Routing and gossip** (`RouterConfig::cluster_secret`, any link: UDP, TCP,
   IPC, memory): every router frame is sealed with an HMAC-SHA256 tag over the
   sending node's id and the whole envelope, which then carries the magic
-  `GNS1` instead of `GNR3`. The receiver checks the seal against the neighbor
-  the link attributes the frame to, before it decodes, learns, delivers or
-  forwards anything; a forwarder seals again under its own id. Unsealed and
-  wrongly sealed frames are dropped and counted in
-  `node.router().auth_failures()`.
+  `GNS2` instead of `GNR4`; a frame larger than the link's MTU leaves as
+  `GNT1` fragments that each carry their own tag. The receiver checks every
+  fragment's tag before reassembly and the seal before it decodes, learns,
+  delivers or forwards anything, against the neighbor the link attributes the
+  frame to; a forwarder seals again under its own id. Unsealed and wrongly
+  sealed frames are dropped and counted in `node.router().auth_failures()`.
+- **Addresses**: a UDP datagram, or a raw TCP message connection's dial-back
+  introduction, only reports where a claimed id speaks from. The address book
+  records it after the router verified the frame's seal and found it fresh,
+  so a node without the secret cannot redirect a member's traffic by claiming
+  its id.
+- **Freshness**: data frames pass the router's replay windows, and every
+  advert carries its sender's boot nonce and a sequence, so a replayed advert
+  is refused instead of keeping a dead route alive. That state lives in
+  memory: a restarted receiver accepts frames it no longer remembers (see
+  [docs/tunnels-and-security.md](docs/tunnels-and-security.md#cluster-secret-on-plain-links-and-the-tcp-data-plane)
+  for the exact limits).
 - **Data plane** (`TcpBulkConfig::secret`, or
   `TcpBulkTransport::dial_only_with` for a client): the versioned handshake
   (`GNBH`, version 2) becomes a mutual challenge. Each side sends a fresh
   32-byte nonce and answers with an HMAC over the protocol label, the version,
   its role, both nonces and both claimed ids; each verifies the other's answer
   in constant time before a stream byte flows, and the dialer also checks that
-  the answer comes from the node it dialed. Refusals close the connection and
-  count in `TcpBulkTransport::auth_failures()`. The unversioned handshake is
-  refused.
+  the answer comes from the node it dialed. Both sides finish within
+  `TcpBulkConfig::handshake_timeout` (5 s for a dial-only client), so `connect`
+  to a peer that accepts and never answers fails with `TimedOut`. Refusals and
+  timeouts close the connection and count in
+  `TcpBulkTransport::auth_failures()`. The unversioned handshake is refused.
+  The handshake authenticates connection setup only: the stream after it has
+  no integrity protection, so an attacker on the network path can inject into
+  or alter RPC bytes. Keep the data plane on a private network, or use a
+  mutually authenticated TLS mode (not yet implemented) when it crosses a
+  trust boundary.
 
 A keyed node refuses unkeyed peers and peers with another secret, in both
 directions; there is no fallback. The secret proves membership of the
 cluster, not one identity: every holder can speak for every node, and it does
 not encrypt anything. Pinned TLS tunnels remain the way to authenticate and
-encrypt between individual nodes.
+encrypt between individual nodes. `ClusterSecret` keeps ring's HMAC key (its
+precomputed pad states), which is not zeroed on drop, and does not wipe the
+bytes it was built from: zero your own buffer after `ClusterSecret::new`.
 
 ### Request/response RPC (feature `rpc`)
 

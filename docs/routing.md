@@ -117,8 +117,9 @@ shares a bounded queue and cancellation lifecycle. `RouterConfig::max_protocols`
 and `protocol_queue` default to 32 namespaces and 128 packets per namespace;
 unknown namespaces fail closed.
 The router neither decodes protocol bodies nor interprets their ACKs.
-`GNR3` carries the protocol ID (`GNS1` when the envelope is sealed under
-`RouterConfig::cluster_secret`; see [cluster secret](tunnels-and-security.md#cluster-secret-on-plain-links-and-the-tcp-data-plane));
+`GNR4` carries the protocol ID (`GNS2` when the envelope is sealed under
+`RouterConfig::cluster_secret`, with `GNT1` fragments that each carry their own
+tag; see [cluster secret](tunnels-and-security.md#cluster-secret-on-plain-links-and-the-tcp-data-plane));
 communicating nodes must upgrade together.
 
 ## Packet storage and resource policy
@@ -144,8 +145,9 @@ enforces its own limits.
 | `message_queue` | 64 per node | Coordination messages awaiting the runtime |
 | `protocol_queue` | 128 per namespace | Application packets awaiting the bound protocol |
 
-Each link worker processes the frames it reads inline — admission, reassembly,
-route learning, replay suppression, then delivery or forwarding — so a data
+Each link worker processes the frames it reads inline — admission, fragment
+tag, reassembly, seal, replay suppression or advert freshness, address
+confirmation, then route learning, delivery or forwarding — so a data
 frame crosses no routing-actor queue. A link worker also offers the transport
 a synchronous `InboundSink` (`Transport::attach_inbound`); admitted and raw
 `TcpMsgTransport` readers adopt it and run the same inline processing on the
@@ -157,7 +159,16 @@ The routing actor keeps only the announcement clock and link lifecycle events.
 Replay suppression keeps a 64-sequence sliding window per `(origin, router
 nonce)` stream: a routed identity seen in the window, or older than it, is
 dropped. At most `replay_capacity / 64` streams (rounded up) are tracked, least
-recently active evicted first. Packet storage larger than 4 KiB comes from a
+recently active evicted first. Adverts carry their sender's routed identity
+too, and a neighbor's advert on a link is accepted only when newer than the
+last one accepted there (a higher sequence in the same boot, or a boot nonce
+not among the last four that neighbor left); at most `max_routes ×
+max_transports` neighbor-link pairs are remembered, least recently active
+forgotten first. Each pass of a link's announcement scheduler therefore starts
+at the snapshot's first advert, so every peer receives a snapshot in sequence
+order. A transport's address book learns a frame's source
+(`Inbound::source`) only through `Transport::confirm_peer`, which the router
+calls after the frame passed every check above. Packet storage larger than 4 KiB comes from a
 per-size-class pool and returns to it when the last `Bytes` view of the sent
 packet drops; `RouterConfig::packet_pool` (default 2 MiB) bounds idle storage.
 
