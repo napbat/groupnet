@@ -246,3 +246,67 @@ fn only_the_granted_host_can_resign_its_own_pair() {
         "the promise to the host still stands"
     );
 }
+
+/// Row Q16b, a duplicated resign: the second copy changes nothing and
+/// announces nothing, and the successor is still granted.
+#[test]
+fn a_duplicated_resign_changes_nothing() {
+    let rank = rank_by_placement(&["a", "b", "c"]);
+    let mut e = promised(&rank);
+    let first = e.on_message(
+        rank[0].clone(),
+        &lead_resign_frame(1, rank[0].as_str()),
+        Time(ACTIVATED + 20),
+    );
+    assert_eq!(leadership_changes(&first), vec![(1, None)]);
+    let second = e.on_message(
+        rank[0].clone(),
+        &lead_resign_frame(1, rank[0].as_str()),
+        Time(ACTIVATED + 30),
+    );
+    assert_eq!(second, Vec::<Effect>::new(), "the copy is a no-op");
+    assert_eq!(e.leadership(), (1, None));
+
+    let granted = e.on_message(
+        rank[2].clone(),
+        &lead_claim_frame(2, rank[2].as_str()),
+        Time(ACTIVATED + 40),
+    );
+    assert_eq!(persisted_grants(&granted), vec![(2, rank[2].clone())]);
+}
+
+/// Row Q16b, a delayed resign: it arrives after the promise to the old host
+/// ended on its own and the voter granted a successor. The resign names a
+/// pair the voter no longer holds, so it releases nothing: the promise to
+/// the successor stands, and another claimant is still refused.
+#[test]
+fn a_delayed_resign_releases_no_later_promise() {
+    let rank = rank_by_placement(&["a", "b", "c"]);
+    let mut e = promised(&rank);
+    let after = ACTIVATED + LEASE;
+    let granted = e.on_message(
+        rank[2].clone(),
+        &lead_claim_frame(2, rank[2].as_str()),
+        Time(after),
+    );
+    assert_eq!(persisted_grants(&granted), vec![(2, rank[2].clone())]);
+
+    e.on_message(
+        rank[0].clone(),
+        &lead_resign_frame(1, rank[0].as_str()),
+        Time(after + 10),
+    );
+    assert_eq!(e.voter_grant(), Some((2, &rank[2])), "the ledger holds");
+
+    let rival = e.on_message(
+        rank[0].clone(),
+        &lead_claim_frame(3, rank[0].as_str()),
+        Time(after + 20),
+    );
+    assert_eq!(
+        persisted_grants(&rival),
+        Vec::new(),
+        "the promise to the successor still stands"
+    );
+    assert_eq!(grant_frames(&rival), Vec::new());
+}

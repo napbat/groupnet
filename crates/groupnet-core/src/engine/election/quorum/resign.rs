@@ -17,7 +17,12 @@
 //!   claimant. A grant of any other pair is not changed: a late resign of an
 //!   earlier epoch releases nothing.
 //! * **Q16c (adopt).** A node that holds `(epoch, Some(host))` adopts
-//!   `(epoch, None)`: it knows the group has no host at that epoch.
+//!   `(epoch, None)`: it knows the group has no host at that epoch. A peer
+//!   that missed the resign can teach it `(epoch, Some(host))` again, because
+//!   `(epoch, None)` is the weakest pair at that epoch (row 12). That changes
+//!   only what the node believes until a later epoch: the voter ledger keeps
+//!   the resigned mark, and a claim depends on rank, not on the believed
+//!   host.
 //!
 //! # Why fencing stays safe
 //!

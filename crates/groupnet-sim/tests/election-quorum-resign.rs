@@ -14,6 +14,15 @@
 //!   lease exists at any instant, no two nodes activate one epoch, no voter
 //!   grants two claimants one epoch, and the remaining majority elects a host
 //!   after each leave.
+//! * **Q-RES-minority — [`dst_quorum_a_resign_that_misses_two_voters_waits_for_their_promise`].**
+//!   The resign reaches only two voters of five. The successor needs one of
+//!   the two others, so it hosts only after the promise of one of them ends.
+//! * **Q-RES-restart — [`dst_quorum_a_voter_that_restarts_after_the_resign_keeps_its_blackout`].**
+//!   A voter crashes right after it released its promise and restarts from
+//!   its stored grant. It applies the boot blackout and never grants the
+//!   resigned pair again.
+//!
+//! Each run also checks at every step that no node that left hosts again.
 //!
 //! A failing seed is a reproducible counterexample, not a flake.
 
@@ -21,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use groupnet_core::{
-    Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId, Time,
-    VoterRoster,
+    Activation, Command, Config, GroupEngine, GroupId, GroupMode, HostedConfig, NodeId,
+    RecoveredGrant, Time, VoterRoster,
 };
 use groupnet_sim::{Percent, Simulation, SplitMix64};
 
@@ -117,8 +126,32 @@ fn assert_grants_single_valued(sim: &Simulation, label: &str) {
     }
 }
 
+/// Panics if a node in `gone` hosts at `now`: a node that left never hosts
+/// again.
+fn assert_gone_never_host(sim: &Simulation, now: u64, gone: &BTreeSet<NodeId>, label: &str) {
+    let back: Vec<NodeId> = sim
+        .hosts()
+        .into_iter()
+        .filter(|h| gone.contains(h))
+        .collect();
+    assert!(back.is_empty(), "{label}: {back:?} left and host at {now}");
+}
+
+/// Runs `sim` in [`STEP_MS`] steps from `from` to `to`, checking S4c and
+/// that no node in `gone` hosts at every step.
+fn run_checked(sim: &mut Simulation, from: u64, to: u64, gone: &BTreeSet<NodeId>, label: &str) {
+    let mut now = from;
+    while now < to {
+        now = (now + STEP_MS).min(to);
+        sim.run_until(Time(now));
+        assert_lease_disjoint(sim, now, label);
+        assert_gone_never_host(sim, now, gone, label);
+    }
+}
+
 /// Runs `sim` in [`STEP_MS`] steps from `now` until a node outside `gone`
-/// hosts, checking S4c at every step. Returns the host and the instant.
+/// hosts, checking S4c and that no node in `gone` hosts at every step.
+/// Returns the host and the instant.
 fn next_host(
     sim: &mut Simulation,
     mut now: u64,
@@ -128,6 +161,7 @@ fn next_host(
 ) -> (NodeId, u64) {
     let until = now + within;
     loop {
+        assert_gone_never_host(sim, now, gone, label);
         if let Some(host) = sim.hosts().into_iter().find(|h| !gone.contains(h)) {
             return (host, now);
         }
@@ -201,24 +235,162 @@ fn dst_quorum_resigns_keep_every_fence() {
         boot(&mut sim, &format!("fence-{seed}"), 5);
 
         let mut gone = BTreeSet::new();
-        let (mut host, mut now) = next_host(&mut sim, 0, SETTLE_MS, &gone, &label);
+        let (_, mut now) = next_host(&mut sim, 0, SETTLE_MS, &gone, &label);
         for _ in 0..2 {
-            now += LEASE_MS + u64::from(rng.up_to(u32::try_from(LEASE_MS).expect("small")));
-            sim.run_until(Time(now));
-            assert_lease_disjoint(&sim, now, &label);
+            let to = now + LEASE_MS + u64::from(rng.up_to(u32::try_from(LEASE_MS).expect("small")));
+            run_checked(&mut sim, now, to, &gone, &label);
+            now = to;
             // The host can have changed while the run went on.
-            let Some(current) = sim.hosts().into_iter().find(|h| !gone.contains(h)) else {
-                (host, now) = next_host(&mut sim, now, SETTLE_MS, &gone, &label);
+            let Some(host) = sim.hosts().into_iter().find(|h| !gone.contains(h)) else {
+                (_, now) = next_host(&mut sim, now, SETTLE_MS, &gone, &label);
                 continue;
             };
-            host = current;
             sim.command(&host, Command::Leave)
                 .expect("the host is in the sim");
-            gone.insert(host.clone());
-            (host, now) = next_host(&mut sim, now, SETTLE_MS, &gone, &label);
+            gone.insert(host);
+            (_, now) = next_host(&mut sim, now, SETTLE_MS, &gone, &label);
         }
-        assert!(!gone.contains(&host), "{label}: {host} left and hosts");
+        // The nodes that left stay out while the run goes on.
+        run_checked(&mut sim, now, now + 4 * LEASE_MS, &gone, &label);
         assert_sole_activator_per_epoch(&sim, &label);
         assert_grants_single_valued(&sim, &label);
     }
+}
+
+/// The link latency of the two shaped cases below.
+const LATENCY_MS: u64 = 5;
+
+/// The host of a fresh cluster of `size` voters, after it renewed for a few
+/// leases: the cluster, the voters, the host, its epoch, and the instant.
+fn settled(group: &str, size: usize, label: &str) -> (Simulation, Vec<NodeId>, NodeId, u64, u64) {
+    let mut sim = Simulation::new(LATENCY_MS);
+    let voters = boot(&mut sim, group, size);
+    let none = BTreeSet::new();
+    let (host, at) = next_host(&mut sim, 0, FIRST_HOST_MS, &none, label);
+    let now = at + 3 * LEASE_MS;
+    run_checked(&mut sim, at, now, &none, label);
+    assert_eq!(sim.hosts(), vec![host.clone()], "{label}: the host stays");
+    let (epoch, _) = sim.leadership_of(&host).expect("a live node");
+    (sim, voters, host, epoch, now)
+}
+
+/// **Q-RES-minority.** The resign reaches only two voters of five: the links
+/// from the host to the two others drop every frame during the turn of the
+/// leave, and then heal. A successor needs a third grant, and each of the two
+/// others refuses every other claimant until its promise to the old host
+/// ends. So the successor hosts only after the earliest of those two
+/// promises ends, and the fences hold.
+#[test]
+fn dst_quorum_a_resign_that_misses_two_voters_waits_for_their_promise() {
+    let label = "Q-RES-minority";
+    let (mut sim, voters, host, epoch, now) = settled("resign-minority", 5, label);
+    let missed: Vec<NodeId> = voters
+        .iter()
+        .filter(|v| **v != host)
+        .take(2)
+        .cloned()
+        .collect();
+    for voter in &missed {
+        sim.block(&host, voter);
+    }
+    let resigns = sim.resign_frames_seen();
+    sim.command(&host, Command::Leave)
+        .expect("the host is in the sim");
+    assert_eq!(
+        sim.resign_frames_seen() - resigns,
+        4,
+        "{label}: one resign to each other voter"
+    );
+    let gone = BTreeSet::from([host.clone()]);
+    let healed = now + 2 * LATENCY_MS;
+    run_checked(&mut sim, now, healed, &gone, label);
+    sim.heal_all();
+
+    // A voter's promise ends one lease after its last grant to the host.
+    let promise_end = |voter: &NodeId| {
+        sim.grant_log
+            .iter()
+            .filter(|(_, granter, granted, claimant)| {
+                granter == voter && *granted == epoch && *claimant == host
+            })
+            .map(|(at, ..)| *at)
+            .max()
+            .expect("the voter renewed the host")
+            .saturating_add(LEASE_MS)
+    };
+    let earliest = missed.iter().map(promise_end).min().expect("two voters");
+    let (successor, at) = next_host(&mut sim, healed, SETTLE_MS, &gone, label);
+    assert!(
+        Time(at) >= earliest,
+        "{label}: {successor} hosts at {at}, before the promise of {missed:?} ends at \
+         {earliest:?}"
+    );
+    run_checked(&mut sim, at, at + 2 * LEASE_MS, &gone, label);
+    assert_sole_activator_per_epoch(&sim, label);
+    assert_grants_single_valued(&sim, label);
+}
+
+/// **Q-RES-restart.** A voter crashes at the instant it released its promise
+/// and restarts from its stored grant, the resigned pair. Nothing about the
+/// release is stored, so the restarted voter applies the boot blackout: the
+/// successor, which needs its grant, hosts no earlier than one lease after
+/// the restart. The restarted voter never grants the resigned pair again, and
+/// the fences hold.
+#[test]
+fn dst_quorum_a_voter_that_restarts_after_the_resign_keeps_its_blackout() {
+    let label = "Q-RES-restart";
+    let group = "resign-restart";
+    let (mut sim, voters, host, epoch, now) = settled(group, 3, label);
+    let voter = voters
+        .iter()
+        .find(|v| **v != host)
+        .expect("another voter")
+        .clone();
+    sim.command(&host, Command::Leave)
+        .expect("the host is in the sim");
+    let gone = BTreeSet::from([host.clone()]);
+
+    // One event at a time, until the voter took the resign.
+    let released = loop {
+        let at = sim
+            .step_until(Time(now + LEASE_MS))
+            .expect("the resign arrives within a lease");
+        assert_lease_disjoint(&sim, at.0, label);
+        assert_gone_never_host(&sim, at.0, &gone, label);
+        if sim.leadership_of(&voter) == Some((epoch, None)) {
+            break at;
+        }
+    };
+    assert_eq!(
+        sim.persisted_grant_of(&voter),
+        Some((epoch, host.clone())),
+        "{label}: the stored grant is the resigned pair"
+    );
+    // The grants that the voter issued before the crash, also a renewal of
+    // the old host in the same instant as the resign, stay out of the check.
+    let restarted = sim.grant_log.len();
+    sim.crash(&voter).expect("the voter runs");
+    let seeds = voters.iter().filter(|v| **v != voter).cloned();
+    let engine = GroupEngine::recovering(GroupId::new(group), voter.clone(), seeds, cfg(&voters))
+        .expect("valid config")
+        .restore(RecoveredGrant::granted(epoch, host.clone()));
+    sim.add(engine).expect("the voter restarts");
+
+    let (successor, at) = next_host(&mut sim, released.0, SETTLE_MS, &gone, label);
+    assert!(
+        Time(at) >= released.saturating_add(LEASE_MS),
+        "{label}: {successor} hosts at {at}, inside the blackout of {voter} that \
+         restarted at {released:?}"
+    );
+    run_checked(&mut sim, at, at + 2 * LEASE_MS, &gone, label);
+    assert!(
+        !sim.grant_log[restarted..]
+            .iter()
+            .any(|(_, granter, granted, claimant)| {
+                *granter == voter && *granted == epoch && *claimant == host
+            }),
+        "{label}: {voter} granted the resigned pair again after its restart"
+    );
+    assert_sole_activator_per_epoch(&sim, label);
+    assert_grants_single_valued(&sim, label);
 }
