@@ -25,7 +25,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::RpcStatus;
 
 /// The codec version byte. Peers upgrade together, so this only rejects a
-/// mis-deployed node's frames; bump it whenever a kind or layout changes.
+/// mis-deployed node's frames; it stays 1 until the first deployment.
 pub(crate) const VERSION: u8 = 1;
 
 const KIND_REQUEST: u8 = 0;

@@ -37,9 +37,9 @@ async fn udp(name: &str) -> io::Result<UdpTransport> {
 async fn impersonate(member: &NodeId, target: &UdpTransport, target_id: &NodeId) -> io::Result<()> {
     let impostor = UdpTransport::bind(member.clone(), "127.0.0.1:0").await?;
     impostor.register_peer(target_id.clone(), target.local_addr())?;
-    impostor.send(target_id, b"GNR4 unsealed frame").await?;
+    impostor.send(target_id, b"GNR1 unsealed frame").await?;
     impostor
-        .send(target_id, &[b"GNS2".as_slice(), &[0; 64]].concat())
+        .send(target_id, &[b"GNS1".as_slice(), &[0; 64]].concat())
         .await
 }
 

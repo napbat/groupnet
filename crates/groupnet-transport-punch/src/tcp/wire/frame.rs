@@ -12,7 +12,7 @@ use super::{Auth, Message};
 use crate::tcp::{MAX_TCP_MESSAGE, invalid};
 
 pub(super) const MAX_FRAME: usize = MAX_TCP_MESSAGE + 4096;
-pub(super) const VERSION: u8 = 2;
+pub(super) const VERSION: u8 = 1;
 const TAG: usize = 32;
 /// A frame header followed by at least the message kind.
 const MIN_FRAME: usize = size_of::<FrameHeader>() + 1;

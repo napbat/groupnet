@@ -59,7 +59,7 @@ pub use stream::TunneledStream;
 pub use tls::{PeerIdentity, PeerIdentityError, TlsIdentity, TlsIdentityError};
 
 /// Authenticated preamble; its digit is the tunnel protocol [`wire::VERSION`].
-const PREAMBLE: &[u8; 11] = b"GN-TUNNEL-3";
+const PREAMBLE: &[u8; 11] = b"GN-TUNNEL-1";
 
 const _: () = assert!(PREAMBLE[10] == b'0' + wire::VERSION);
 

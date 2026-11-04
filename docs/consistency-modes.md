@@ -592,8 +592,8 @@ refine the sketch above and are now contract:
   round trip, not a one-way hop, that has to fit inside the cadence. A deployment
   that cannot
   hold that sizing needs per-round identity on the wire; the escape hatch is a
-  nonce carried in the election frames (a body change, so a `FRAME_VERSION`
-  bump). An election round has no such slack — its anchor is the
+  nonce carried in the election frames (a body change). An election round
+  has no such slack — its anchor is the
   instant the claim was opened, and re-offers deliberately do not move it.
 * **Recovery restores the pair, not the time** — correcting the M1 sketch
   above, which read as though persistence replaced the blackout. It does not:
@@ -717,8 +717,8 @@ refine the sketch above and are now contract:
   without this node as host, also counts as its answer. Under `Settle` and
   `External` a leave sends
   no resign (no voter holds a promise; `External` releases at the anchor). The
-  frame is a new kind, so `FRAME_VERSION` is 4 and a node of version 3 is
-  refused. The leave also stamps the time of death of the leaving node's own
+  frame is a new kind of the version-1 frame set. The leave also stamps the
+  time of death of the leaving node's own
   record, so a digest gossips the leave for `dead_timeout_ms` after it. Before,
   a node up longer than `dead_timeout_ms` never gossiped its leave, and its
   peers saw it go only through the failure detector.
@@ -1904,7 +1904,7 @@ and rendezvous ranking already resident in the engine; zero new dependencies.
 
 | Layer | Implemented surface |
 |---|---|
-| `groupnet-core` | `engine/election/`; `Config.mode: GroupMode` (`Eventual` default / `Hosted(HostedConfig)`); wire kinds `KIND_LEAD_CLAIM=8`, `KIND_LEAD_GRANT=9`, `KIND_LEAD_STATE=10`, `KIND_LEAD_RESIGN=11` inside `FRAME_VERSION 4`; `Effect::LeadershipChanged`; epoch-major fencing-pair adoption |
+| `groupnet-core` | `engine/election/`; `Config.mode: GroupMode` (`Eventual` default / `Hosted(HostedConfig)`); wire kinds `KIND_LEAD_CLAIM=8`, `KIND_LEAD_GRANT=9`, `KIND_LEAD_STATE=10`, `KIND_LEAD_RESIGN=11` inside `FRAME_VERSION 1`; `Effect::LeadershipChanged`; epoch-major fencing-pair adoption |
 | `groupnet-sim` | leadership-effect dispatch and log, election accessors, and a deterministic in-sim CAS register modeling the external anchor |
 | `groupnet-runtime` | `GroupEvent::LeadershipChanged`, `Group::leadership()`, `Node::join_group_with(name, GroupProfile)`; effect plumbing in `driver.rs`; `GrantStore` and `Anchor` integration |
 | `groupnet-consistency` | `hosted`: `HostedWrites` with leadership-epoch tokens; `HostedReads`; fence surfacing; epoch-stamped `CommitLedger` and service recovery gate |

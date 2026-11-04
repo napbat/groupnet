@@ -1,8 +1,7 @@
 //! `TcpBulkTransport` under a cluster secret, over real loopback TCP: peers
-//! holding the same secret connect and stream; a peer with another secret,
-//! with none, or speaking the old unversioned handshake is refused before a
-//! stream byte flows, a silent peer fails the dial at the handshake deadline,
-//! and every refusal is counted.
+//! holding the same secret connect and stream; a peer with another secret or
+//! with none is refused before a stream byte flows, a silent peer fails the
+//! dial at the handshake deadline, and every refusal is counted.
 
 #![cfg(feature = "bulk")]
 
@@ -13,7 +12,7 @@ use groupnet_testkit::cluster::eventually;
 use groupnet_transport::bulk::BulkTransport;
 use groupnet_transport_tcp::{ClusterSecret, TcpBulkConfig, TcpBulkTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::time::timeout;
 
 /// Failure-report bound for socket progress; no test waits on it to pass.
@@ -141,26 +140,6 @@ async fn a_keyed_peer_is_refused_by_an_open_endpoint() {
         server.auth_failures() == 1
     })
     .await;
-}
-
-/// The unversioned handshake, a bare id field claiming any identity, is
-/// refused by a keyed endpoint.
-#[tokio::test]
-async fn the_unversioned_handshake_is_refused() {
-    let server = server(Some(secret(1))).await;
-    let mut raw = TcpStream::connect(server.local_addr().expect("address"))
-        .await
-        .expect("connect");
-    raw.write_all(&[0, 0, 0, 7, b'g', b'e', b'n', b'u', b'i', b'n', b'e'])
-        .await
-        .expect("old handshake");
-    let mut byte = [0];
-    let read = timeout(SETTLE, raw.read(&mut byte))
-        .await
-        .expect("server closes");
-    assert!(matches!(read, Ok(0) | Err(_)));
-    assert_eq!(server.auth_failures(), 1);
-    accept_genuine(&server).await;
 }
 
 /// A keyed dial to a peer that accepts TCP and never answers fails at the

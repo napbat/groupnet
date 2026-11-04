@@ -4,8 +4,7 @@
 //! The dialer opens with a hello: the magic `GNBH`, the version byte
 //! [`VERSION`], a mode byte (open or keyed) and its node id as a
 //! length-prefixed field. An open hello ends there and the stream starts; the
-//! accepting side attributes it to the claimed id, as the unversioned
-//! handshake before it did.
+//! accepting side attributes it to the claimed id.
 //!
 //! A keyed hello carries a fresh 32-byte dialer nonce. The acceptor answers
 //! with its own node id, a fresh acceptor nonce and its tag; the dialer checks
@@ -37,9 +36,8 @@ use crate::handshake::{check_id, field_header, read_id};
 /// The first bytes of every data-plane hello.
 const MAGIC: [u8; 4] = *b"GNBH";
 
-/// The handshake version. The unversioned handshake (a bare id field) was
-/// version 1 and is refused.
-pub(crate) const VERSION: u8 = 2;
+/// The handshake version. A hello with any other version is refused.
+pub(crate) const VERSION: u8 = 1;
 
 /// The domain label of every handshake tag.
 const DOMAIN: &[u8] = b"groupnet tcp bulk handshake";

@@ -342,10 +342,10 @@ must decline recapture on incomplete/uncertain buckets, changed scope, a feed
 gap, or insufficient admission.
 
 The scoped participation entry uses a new reserved key and body kind. The
-existing builder-claim value is unchanged (codec `VBC2` since it gained
+existing builder-claim value is unchanged (codec `VBC1`, which carries
 build progress). The canonical bulk Offer
 and Barrier bodies carry the single canonical full-native roster under bulk
-codec version 2. Peers upgrade together, so there is no parallel bulk-body
+codec version 1. Peers upgrade together, so there is no parallel bulk-body
 path for another version; the version byte only rejects a mis-deployed peer.
 A healthy two-node run with a transferred follower must still
 select the already-Ready donor for a third joining follower. Tests must prove

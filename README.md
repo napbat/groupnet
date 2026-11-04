@@ -361,9 +361,9 @@ Use the existing pinned TLS stream API for confidential/authenticated traffic.
 Metadata still converges as replicated state; Hosted/quorum commits, feeds,
 frontiers, and coherence leases retain their existing separate contracts.
 Sending to a Hosted group does not turn a frame into a quorum commit.
-The routed wire guard is `GNR4` (`GNS2` for an envelope sealed under a cluster
-secret; fragments are `GNF1`, or tagged `GNT1` under one), messaging is `GNA2` (including an explicit
-retry horizon), and the authenticated tunnel preamble is `GN-TUNNEL-3` (byte-based
+The routed wire guard is `GNR1` (`GNS1` for an envelope sealed under a cluster
+secret; fragments are `GNF1`, or tagged `GNT1` under one), messaging is `GNA1` (including an explicit
+retry horizon), and the authenticated tunnel preamble is `GN-TUNNEL-1` (byte-based
 receive credit);
 upgrade communicating nodes together.
 
@@ -804,8 +804,8 @@ reusable credentials over an unencrypted admission exchange.
 See the runnable [dynamic relay/direct example](crates/groupnet/examples/dynamic-relay.rs)
 and [security boundaries](docs/tunnels-and-security.md#3-native-discovery-direct-paths-and-relay).
 
-Native UDP uses `GNP4`; native TCP frames use version 2. Upgrade the rendezvous
-and its endpoints together; earlier formats are rejected without negotiation.
+Native UDP uses `GNP1`; native TCP frames use version 1. Upgrade the rendezvous
+and its endpoints together; other versions are rejected without negotiation.
 
 ### Native UDP and TCP candidate traversal
 
@@ -1128,7 +1128,7 @@ async fn start(secret: &[u8]) -> Result<(Node, TcpBulkTransport), Box<dyn std::e
 - **Routing and gossip** (`RouterConfig::cluster_secret`, any link: UDP, TCP,
   IPC, memory): every router frame is sealed with an HMAC-SHA256 tag over the
   sending node's id and the whole envelope, which then carries the magic
-  `GNS2` instead of `GNR4`; a frame larger than the link's MTU leaves as
+  `GNS1` instead of `GNR1`; a frame larger than the link's MTU leaves as
   `GNT1` fragments that each carry their own tag. The receiver checks every
   fragment's tag before reassembly and the seal before it decodes, learns,
   delivers or forwards anything, against the neighbor the link attributes the
@@ -1149,7 +1149,7 @@ async fn start(secret: &[u8]) -> Result<(Node, TcpBulkTransport), Box<dyn std::e
   for the exact limits).
 - **Data plane** (`TcpBulkConfig::secret`, or
   `TcpBulkTransport::dial_only_with` for a client): the versioned handshake
-  (`GNBH`, version 2) becomes a mutual challenge. Each side sends a fresh
+  (`GNBH`, version 1) becomes a mutual challenge. Each side sends a fresh
   32-byte nonce and answers with an HMAC over the protocol label, the version,
   its role, both nonces and both claimed ids; each verifies the other's answer
   in constant time before a stream byte flows, and the dialer also checks that
@@ -1157,7 +1157,7 @@ async fn start(secret: &[u8]) -> Result<(Node, TcpBulkTransport), Box<dyn std::e
   `TcpBulkConfig::handshake_timeout` (5 s for a dial-only client), so `connect`
   to a peer that accepts and never answers fails with `TimedOut`. Refusals and
   timeouts close the connection and count in
-  `TcpBulkTransport::auth_failures()`. The unversioned handshake is refused.
+  `TcpBulkTransport::auth_failures()`. A hello with any other version is refused.
   The handshake authenticates connection setup only: the stream after it has
   no integrity protection, so an attacker on the network path can inject into
   or alter RPC bytes. Keep the data plane on a private network, or use a

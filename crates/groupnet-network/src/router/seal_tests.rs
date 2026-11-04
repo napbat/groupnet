@@ -190,7 +190,7 @@ async fn every_frame_sent_carries_the_routers_seal() -> io::Result<()> {
         .expect("an announcement")
         .expect("link open");
     assert_eq!(to, peer);
-    assert_eq!(&frame[..4], b"GNS2");
+    assert_eq!(&frame[..4], b"GNS1");
     let opener = Sealing::new(Some(secret(1)));
     assert_eq!(opener.open(&local, &frame), Some(frame.len() - TAG_LEN));
     assert!(opener.open(&peer, &frame).is_none());

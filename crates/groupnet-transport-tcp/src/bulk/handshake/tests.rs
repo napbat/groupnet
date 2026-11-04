@@ -230,14 +230,16 @@ async fn the_acceptors_own_tag_reflected_back_is_refused() {
     );
 }
 
-/// The unversioned handshake, a bare id field, is refused.
+/// A hello stamped with a version other than 1 is refused.
 #[tokio::test]
-async fn the_unversioned_handshake_is_refused() {
+async fn another_handshake_version_is_refused() {
     let (mut near, far) = duplex(1024);
-    near.write_all(&[0, 0, 0, 1, b'a', 0]).await.expect("write");
+    near.write_all(&[b'G', b'N', b'B', b'H', VERSION + 1, OPEN, 0, 0, 0, 1, b'a'])
+        .await
+        .expect("write");
     let error = accepting(far, node("b"), None)
         .await
-        .expect_err("old version refused");
+        .expect_err("another version refused");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
