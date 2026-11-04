@@ -6,6 +6,7 @@
 use super::{Kind, Simulation};
 use crate::rng::SplitMix64;
 use std::collections::BTreeSet;
+use std::mem;
 
 use groupnet_core::{NodeId, Status, Time, wire};
 
@@ -23,7 +24,7 @@ impl Simulation {
     /// after counting it against the issuance probes.
     pub(super) fn send(&mut self, from: &NodeId, to: NodeId, wire: Vec<u8>) {
         self.max_frame_bytes = self.max_frame_bytes.max(wire.len());
-        self.note_lead_frame(from, &to, &wire);
+        self.note_frame(from, &to, &wire);
         // Deterministic per-message jitter in `0..=jitter_ms`, keyed on the
         // sequence number this delivery is about to take, so links can
         // reorder. `u64::MAX` spans the whole word rather than overflowing.
@@ -83,14 +84,17 @@ impl Simulation {
         }
     }
 
-    /// Counts and logs one dispatched election frame, reading its body off the
+    /// Counts one dispatched frame against its destination and kind, then
+    /// counts and logs it if it is an election frame, reading its body off the
     /// encoded bytes rather than off the effect: issuance is a wire fact.
     ///
     /// Every dispatched frame is decoded to find out — the codec is the only
     /// authority on what a frame is, and a byte-offset pre-filter would be a
     /// second, silently drifting copy of the wire format. The cost is test-only
     /// and lands on a path that has already allocated the encoded frame. The
-    /// one decode feeds four probes: [`grant_log`](Self::grant_log),
+    /// one decode feeds five probes:
+    /// [`frames_issued_to`](Self::frames_issued_to),
+    /// [`grant_log`](Self::grant_log),
     /// [`claim_frames_seen`](Self::claim_frames_seen),
     /// [`grant_frames_seen`](Self::grant_frames_seen) and
     /// [`floor_answers_seen`](Self::floor_answers_seen).
@@ -99,10 +103,14 @@ impl Simulation {
     /// into the log. One sent to anybody else is a voter's floor answer (row
     /// Q3a): its granted pair re-sent to a claimant it refused. It endorses
     /// nobody new, so it is counted apart and kept out of the log.
-    fn note_lead_frame(&mut self, from: &NodeId, to: &NodeId, wire: &[u8]) {
+    fn note_frame(&mut self, from: &NodeId, to: &NodeId, wire: &[u8]) {
         let Some(frame) = wire::decode(wire) else {
             return;
         };
+        *self
+            .issued
+            .entry((to.clone(), mem::discriminant(&frame.kind)))
+            .or_default() += 1;
         match frame.lead {
             Some(wire::LeadBody::Claim { .. }) => self.claim_frames += 1,
             Some(wire::LeadBody::Grant {
@@ -126,6 +134,20 @@ impl Simulation {
     #[must_use]
     pub fn max_frame_bytes(&self) -> usize {
         self.max_frame_bytes
+    }
+
+    /// How many frames of `kind` the run has **issued** to `to` — counted at
+    /// dispatch, off the decoded frame, whoever sent them and whether or not
+    /// the loss schedule or a partition later dropped them. The load probe:
+    /// [`PingReq`](wire::Kind::PingReq) counts show how evenly indirect
+    /// probing spreads over the group, [`Ping`](wire::Kind::Ping) counts which
+    /// members a probe round picked.
+    #[must_use]
+    pub fn frames_issued_to(&self, to: &NodeId, kind: wire::Kind) -> u64 {
+        self.issued
+            .get(&(to.clone(), mem::discriminant(&kind)))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// How many election frames (wire kinds `LeadClaim`, `LeadGrant`,

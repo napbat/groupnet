@@ -54,8 +54,7 @@ fn discovery_contacts_are_not_members_and_retry_with_bounded_fanout() {
         recipients(local.disseminate_digest(Time(4))),
         Vec::<NodeId>::new()
     );
-    assert!(local.digest_cursors.is_empty());
-    assert!(local.digest_visits.is_empty());
+    assert!(local.digest_peers.is_empty());
 }
 
 #[test]

@@ -386,13 +386,18 @@ pub struct Config {
     /// entry reaped past it (see [`GroupEngine`](crate::GroupEngine)). Must be
     /// nonzero.
     pub dead_timeout_ms: u64,
-    /// How many indirect probers to enlist when a direct probe goes unanswered.
+    /// How many indirect probers to enlist when a direct probe goes
+    /// unanswered. They are drawn at random (from a deterministic per-node
+    /// stream) among the live members other than the target, so indirect
+    /// probe load spreads evenly over the group.
     pub indirect_probes: NonZeroUsize,
     /// How many peers each gossip round sends a digest to. A targeted pull
     /// needs far less redundancy than a blind push, so 1–2 is plenty; the
-    /// default is 2. Targets rotate round-robin so every peer is covered over
-    /// successive rounds. [`eager_push`](Self::eager_push) and a Hosted
-    /// group's election traffic use the same rotating targets.
+    /// default is 2. Targets rotate round-robin, from an offset hashed from
+    /// the local id, so every peer is covered over successive rounds and
+    /// nodes that start together do not all pick the same peers.
+    /// [`eager_push`](Self::eager_push) and a Hosted group's election traffic
+    /// use the same rotating targets.
     pub gossip_fanout: NonZeroUsize,
     /// Push a just-authored entry (or tombstone) straight to the current
     /// [`gossip_fanout`](Self::gossip_fanout) targets as an unsolicited
@@ -409,16 +414,29 @@ pub struct Config {
     /// single entry whose value alone is larger (it is sent whole rather than
     /// starved).
     pub max_delta_frame_bytes: NonZeroUsize,
-    /// Every Nth digest built for a given peer is a **full** digest (every
-    /// gossipable member listed); the digests in between are per-peer
-    /// **delta digests**, listing only members whose summary changed since
-    /// the last digest built for that peer. Delta digests make the
-    /// steady-state gossip round scale with recent churn instead of
-    /// membership size; the periodic full digest bounds how long anything a
-    /// dropped frame (or TTL-expiry drift) left divergent can stay that way.
-    /// A peer's first digest is always full. `1` disables delta digests
-    /// (every digest full — the pre-delta behaviour). Default: 4.
+    /// Every Nth digest built for a given peer is a **full** digest; the
+    /// digests in between are per-peer **delta digests**, listing only
+    /// members whose summary changed since the last digest built for that
+    /// peer. Delta digests make the steady-state gossip round scale with
+    /// recent churn instead of membership size; the periodic full digest
+    /// bounds how long anything a dropped frame (or TTL-expiry drift) left
+    /// divergent can stay that way. A peer's first digest is always full. `1`
+    /// disables delta digests (every digest full). Default: 4.
     pub full_digest_every: NonZeroU64,
+    /// The most member summaries one digest lists. A full digest leads with
+    /// up to half the window of the members whose summary changed since the
+    /// last digest to that peer (the local member first, then the most
+    /// recently changed), then fills the rest from a **rolling window** over
+    /// the members that resumes, digest after digest, where the previous full
+    /// digest to that peer stopped. So a peer sees every member over
+    /// `⌈N / digest_window⌉` full digests of a quiet group and
+    /// `⌈N / ⌈digest_window / 2⌉⌉` of a busy one, and a receiver that lacks a
+    /// member learns it within that many full digests from any peer that has
+    /// it. A delta digest that would list more than the window is built full
+    /// instead, so no digest's size grows with the group beyond this window
+    /// (`29 + id length` bytes per summary). A group no larger than the
+    /// window lists everyone in every full digest. Default: 64.
+    pub digest_window: NonZeroUsize,
     /// This group's consistency posture. Defaults to
     /// [`GroupMode::Eventual`] — metadata and membership only, no election.
     pub mode: GroupMode,
@@ -581,6 +599,9 @@ const DEFAULT_MAX_DELTA_FRAME_BYTES: NonZeroUsize = NonZeroUsize::new(60_000).un
 /// [`Config::full_digest_every`] by default.
 const DEFAULT_FULL_DIGEST_EVERY: NonZeroU64 = NonZeroU64::new(4).unwrap();
 
+/// [`Config::digest_window`] by default.
+const DEFAULT_DIGEST_WINDOW: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -594,6 +615,7 @@ impl Default for Config {
             eager_push: true,
             max_delta_frame_bytes: DEFAULT_MAX_DELTA_FRAME_BYTES,
             full_digest_every: DEFAULT_FULL_DIGEST_EVERY,
+            digest_window: DEFAULT_DIGEST_WINDOW,
             mode: GroupMode::Eventual,
         }
     }

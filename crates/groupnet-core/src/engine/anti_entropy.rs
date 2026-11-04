@@ -1,13 +1,15 @@
-//! Digest/delta anti-entropy: per-peer delta digests, reconciliation, and
-//! eager push.
+//! Digest/delta anti-entropy: windowed full digests, per-peer delta digests,
+//! reconciliation, and eager push.
 
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
 use crate::membership::{Member, StateEntry, Status};
 use crate::{NodeId, Time, wire};
 
 use super::effect::Effect;
-use super::state::GroupEngine;
+use super::spread;
+use super::state::{GroupEngine, PeerDigest};
 
 impl GroupEngine {
     /// Brings the next anti-entropy round forward to now, so a fresh membership
@@ -58,29 +60,19 @@ impl GroupEngine {
         }
         let mut effects = Vec::new();
         for to in targets {
-            // A peer's first digest — and every Nth after — is full; the rest
-            // are per-peer delta digests listing only members whose summary
-            // changed since the last digest built for this peer. The cursor
-            // advances on build, not delivery: anything a dropped frame loses
-            // stays divergent only until this peer's next full digest.
-            let every = self.config.full_digest_every.get();
-            let visit = self.digest_visits.entry(to.clone()).or_insert(0);
-            let full = (*visit).is_multiple_of(every);
-            *visit += 1;
-            let since = if full {
-                None
-            } else {
-                Some(self.digest_cursors.get(&to).copied().unwrap_or(0))
-            };
-            let (chunks, listed) = self.build_digest_chunks(now, since);
-            self.digest_cursors.insert(to.clone(), self.change_clock);
+            let (summaries, full, peer) = self.digest_for(&to, now);
+            self.digest_peers.insert(to.clone(), peer);
+            let listed = summaries.len() as u64;
+            let chunks = self.build_digest_chunks(summaries);
             self.stats.digests_built += 1;
             if full {
                 self.stats.full_digests_built += 1;
             }
-            self.stats.digest_summaries_listed += listed as u64;
+            self.stats.digest_summaries_listed += listed;
+            self.stats.max_digest_summaries = self.stats.max_digest_summaries.max(listed);
             for chunk in chunks {
                 self.stats.digest_frames_sent += 1;
+                self.stats.digest_bytes_sent += chunk.len() as u64;
                 self.stats.anti_entropy_bytes_sent += chunk.len() as u64;
                 effects.push(Effect::Send {
                     to: to.clone(),
@@ -89,6 +81,100 @@ impl GroupEngine {
             }
         }
         effects
+    }
+
+    /// Chooses the member summaries of the next digest to `to` — at most
+    /// [`Config::digest_window`](crate::Config::digest_window) of them — and
+    /// returns them with whether the digest is full and the peer's updated
+    /// bookkeeping.
+    ///
+    /// Every digest starts from the members whose summary changed since the
+    /// last digest built for this peer. A **delta** digest lists exactly
+    /// those — safe because a digest only ever triggers per-listed-member
+    /// reconciliation (absence is never interpreted).
+    ///
+    /// A peer's first digest, every `full_digest_every`-th after it, and any
+    /// delta that would list more than the window are **full**. A full
+    /// digest leads with up to half the window of those changed members —
+    /// the local member first, then the most recently changed — so fresh
+    /// news keeps riding every digest, and fills the rest from a rolling
+    /// window over the gossipable members that resumes after the last member
+    /// the previous full digest to this peer walked past. The first window
+    /// starts at an offset hashed from the pair, so a node's peers learn
+    /// different slices of its view first. Each full digest walks at least
+    /// `⌈window / 2⌉` members, so a receiver that lacks a member learns it
+    /// within `⌈N / ⌈window / 2⌉⌉` full digests from any peer that has it —
+    /// `⌈N / window⌉` when nothing changed since the previous one.
+    ///
+    /// The cursor advances on build, not delivery: anything a dropped frame,
+    /// or a change a full digest had no room to lead with, left out stays
+    /// divergent only until the rolling window reaches it.
+    fn digest_for(&self, to: &NodeId, now: Time) -> (Vec<wire::NodeDigest>, bool, PeerDigest) {
+        let window = self.config.digest_window.get();
+        let prev = self.digest_peers.get(to);
+        let visits = prev.map_or(0, |p| p.visits);
+        let cursor = prev.map_or(0, |p| p.cursor);
+        let mut peer = PeerDigest {
+            visits: visits + 1,
+            cursor: self.change_clock,
+            resume: prev.and_then(|p| p.resume.clone()),
+        };
+        let gossipable = || {
+            self.members
+                .iter()
+                .filter(|(_, m)| self.should_gossip(m, now))
+        };
+        let mut listed: Vec<(&NodeId, &Member)> = gossipable()
+            .filter(|(_, m)| m.changed_at > cursor)
+            .collect();
+        let scheduled_full = visits.is_multiple_of(self.config.full_digest_every.get());
+        if !scheduled_full && listed.len() <= window {
+            let summaries = listed
+                .into_iter()
+                .map(|(node, m)| self.summary(node, m, now))
+                .collect();
+            return (summaries, false, peer);
+        }
+
+        // Lead: the local member, then the freshest changes, at most half
+        // the window — the rest is the rolling walk's, so it always advances.
+        listed.sort_unstable_by_key(|(node, m)| (**node != self.local, Reverse(m.changed_at)));
+        listed.truncate(window / 2);
+        let lead = listed.len();
+        let ring: Vec<(&NodeId, &Member)> = gossipable().collect();
+        if !ring.is_empty() {
+            let start = match &peer.resume {
+                Some(after) => ring.partition_point(|(node, _)| *node <= after),
+                None => spread::index(spread::pair_hash(&self.local, to), ring.len()),
+            };
+            for step in 0..ring.len() {
+                if listed.len() >= window {
+                    break;
+                }
+                let (node, m) = ring[(start + step) % ring.len()];
+                peer.resume = Some(node.clone());
+                if listed[..lead].iter().any(|(led, _)| *led == node) {
+                    continue; // already leads the digest
+                }
+                listed.push((node, m));
+            }
+        }
+        let summaries = listed
+            .into_iter()
+            .map(|(node, m)| self.summary(node, m, now))
+            .collect();
+        (summaries, true, peer)
+    }
+
+    /// One member's digest line.
+    fn summary(&self, node: &NodeId, m: &Member, now: Time) -> wire::NodeDigest {
+        wire::NodeDigest {
+            node: node.clone(),
+            incarnation: m.incarnation,
+            status: m.status.to_wire(),
+            max_version: m.max_state_version,
+            content_hash: self.content_hash(m, now),
+        }
     }
 
     /// Picks `gossip_fanout` distinct peers, rotating a cursor so every
@@ -108,33 +194,12 @@ impl GroupEngine {
         out
     }
 
-    /// Builds a digest for one peer as encoded [`wire::Kind::Digest`] frames
-    /// within the frame budget, returning the frames and how many member
-    /// summaries they list. `since` of `None` builds a full digest; `Some(c)`
-    /// lists only members stamped after change-clock `c` — a per-peer delta
-    /// digest, safe because a digest only ever triggers per-listed-member
-    /// reconciliation (absence is never interpreted). The metadata register
-    /// set rides the first chunk either way.
-    pub(super) fn build_digest_chunks(
-        &self,
-        now: Time,
-        since: Option<u64>,
-    ) -> (Vec<Vec<u8>>, usize) {
+    /// Encodes one digest's `summaries` as [`wire::Kind::Digest`] frames
+    /// within the frame budget. The metadata register set rides the first
+    /// chunk; a digest with no summaries still sends it when there is any.
+    pub(super) fn build_digest_chunks(&self, summaries: Vec<wire::NodeDigest>) -> Vec<Vec<u8>> {
         let budget = self.config.max_delta_frame_bytes.get();
-        let summaries: Vec<wire::NodeDigest> = self
-            .members
-            .iter()
-            .filter(|(_, m)| self.should_gossip(m, now))
-            .filter(|(_, m)| since.is_none_or(|cursor| m.changed_at > cursor))
-            .map(|(node, m)| wire::NodeDigest {
-                node: node.clone(),
-                incarnation: m.incarnation,
-                status: m.status.to_wire(),
-                max_version: m.max_state_version,
-                content_hash: self.content_hash(m, now),
-            })
-            .collect();
-        let metadata: Vec<wire::MetaDelta> = self
+        let mut metadata: Vec<wire::MetaDelta> = self
             .metadata
             .iter()
             .map(|(key, v)| wire::MetaDelta {
@@ -147,22 +212,19 @@ impl GroupEngine {
 
         let base = 1 + 1 + (4 + self.group.as_str().len()) + 1 + 4; // ..+ digest count
         let mut chunks: Vec<Vec<u8>> = Vec::new();
-        let mut i = 0usize;
+        let mut rest = summaries.into_iter().peekable();
         loop {
-            let first = chunks.is_empty();
-            let meta = if first { metadata.clone() } else { Vec::new() };
+            let meta = std::mem::take(&mut metadata);
             let meta_len = 4 + meta.iter().map(wire::meta_len).sum::<usize>();
             let mut size = base + meta_len;
             let mut slice: Vec<wire::NodeDigest> = Vec::new();
-            while i < summaries.len() {
-                let d = &summaries[i];
+            while let Some(d) = rest.peek() {
                 let dlen = wire::digest_len(d);
                 if size + dlen > budget && !slice.is_empty() {
                     break;
                 }
                 size += dlen;
-                slice.push(d.clone());
-                i += 1;
+                slice.extend(rest.next());
             }
             if slice.is_empty() && meta.is_empty() {
                 break; // nothing left to emit
@@ -177,12 +239,11 @@ impl GroupEngine {
                 metadata: meta,
                 lead: None,
             }));
-            if i >= summaries.len() {
+            if rest.peek().is_none() {
                 break;
             }
         }
-        let listed = summaries.len();
-        (chunks, listed)
+        chunks
     }
 
     /// Merges a peer's digest: reconcile liveness and metadata directly, then

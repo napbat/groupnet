@@ -84,24 +84,45 @@ fn direct_miss_escalates_to_indirect_before_suspecting() {
     );
     a.start(Time(1));
 
-    a.on_tick(Time(1001)); // direct probe to first candidate (b)
+    // The ring starts at an offset hashed from our id: read which of b and c
+    // the direct probe went to; the other one is the only possible prober.
+    let pinged: Vec<NodeId> = a
+        .on_tick(Time(1001))
+        .into_iter()
+        .filter_map(|e| match e {
+            Effect::Send { to, wire: bytes }
+                if wire::decode(&bytes).is_some_and(|f| f.kind == wire::Kind::Ping) =>
+            {
+                Some(to)
+            }
+            _ => None,
+        })
+        .collect();
+    let [target] = pinged.as_slice() else {
+        panic!("one direct probe, got {pinged:?}");
+    };
+    let prober = if *target == NodeId::new("b") {
+        NodeId::new("c")
+    } else {
+        NodeId::new("b")
+    };
     let effects = a.on_tick(Time(1100)); // direct miss -> ping-req, NOT suspect
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::Send { to, .. } if *to == NodeId::new("c"))),
-        "should ask c to probe b indirectly"
+            .any(|e| matches!(e, Effect::Send { to, .. } if *to == prober)),
+        "should ask {prober} to probe {target} indirectly"
     );
-    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Alive));
+    assert_eq!(a.member_status(target), Some(Status::Alive));
 
-    // An indirect ack keeps b alive.
+    // An indirect ack keeps the target alive.
     a.on_message(
-        NodeId::new("c"),
-        &probe_frame(wire::Kind::IndirectAck, Some(NodeId::new("b"))),
+        prober.clone(),
+        &probe_frame(wire::Kind::IndirectAck, Some(target.clone())),
         Time(1120),
     );
     a.on_tick(Time(2000));
-    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Alive));
+    assert_eq!(a.member_status(target), Some(Status::Alive));
 }
 
 #[test]

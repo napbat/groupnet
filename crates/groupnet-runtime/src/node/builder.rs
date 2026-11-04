@@ -190,9 +190,18 @@ impl NodeBuilder {
         self
     }
 
+    /// Overrides the most member summaries one digest lists (default 64) —
+    /// see [`Config::digest_window`]. Full digests walk a rolling window over
+    /// the members, so a digest's size stays flat as the group grows.
+    #[must_use]
+    pub fn digest_window(mut self, members: NonZeroUsize) -> Self {
+        self.config.digest_window = members;
+        self
+    }
+
     /// Replaces the full protocol [`Config`] (gossip cadence and fanout,
     /// probe/suspect/dead timings, indirect probes, frame cap, digest
-    /// cadence, node-wide mode). The narrow per-knob setters remain for the
+    /// cadence and window, node-wide mode). The narrow per-knob setters remain for the
     /// common cases. Stored as given; [`start`](Self::start) validates it.
     #[must_use]
     pub fn config(mut self, config: Config) -> Self {

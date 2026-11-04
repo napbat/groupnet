@@ -9,6 +9,7 @@ mod effect;
 mod election;
 mod liveness;
 mod merge;
+mod spread;
 mod state;
 mod stats;
 
