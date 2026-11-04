@@ -175,6 +175,15 @@ pub(crate) struct Member {
     /// summary (incarnation, status, or version high-water) last changed —
     /// what per-peer delta digests filter on.
     pub(crate) changed_at: u64,
+    /// The member's [content hash](crate::GroupEngine) as last computed, with
+    /// the instant it stops being valid: the next moment an entry's TTL
+    /// expires or a tombstone stops being gossiped. `None` until computed and
+    /// after any change to [`entries`](Self::entries) — every write goes
+    /// through [`put_entry`](Self::put_entry) or
+    /// [`entries_changed`](Self::entries_changed). Computing the hash folds
+    /// every entry's bytes, and a digest lists up to a window of members, so
+    /// recomputing it per digest dominated a busy group's CPU.
+    pub(crate) hash_cache: Option<(u64, Time)>,
 }
 
 impl Member {
@@ -192,6 +201,7 @@ impl Member {
             entries: std::collections::BTreeMap::new(),
             max_state_version: 0,
             changed_at: 0,
+            hash_cache: None,
         }
     }
 
@@ -222,6 +232,17 @@ impl Member {
     /// high-water mark (never regressing it).
     pub(crate) fn observe_version(&mut self, version: u64) {
         self.max_state_version = self.max_state_version.max(version);
+    }
+
+    /// Stores `entry` under `key`, invalidating the cached content hash.
+    pub(crate) fn put_entry(&mut self, key: String, entry: StateEntry) {
+        self.entries.insert(key, entry);
+        self.entries_changed();
+    }
+
+    /// Invalidates the cached content hash after an in-place entry change.
+    pub(crate) fn entries_changed(&mut self) {
+        self.hash_cache = None;
     }
 
     /// SWIM merge precedence: would an incoming `(incarnation, status)` override

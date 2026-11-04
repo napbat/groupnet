@@ -141,9 +141,10 @@ fn a_healthy_group_converges_fast_and_every_member_stays_alive() {
 /// its refutation, and liveness news leads every digest while it is fresh, so
 /// suspicions clear before they turn into deaths.
 ///
-/// Measured: every node knows every member, none `Dead`, at 3.5 s; at most 69
-/// of the 40 000 `(observer, member)` pairs doubted at a sample afterwards,
-/// at most 1 `Dead`. Before, at 8b94666 (liveness news buried under entry
+/// Measured: every node knows every member, none `Dead`, at 2.5 s, and holds
+/// every member `Alive` at 5.5 s; at most 83 of the 40 000
+/// `(observer, member)` pairs doubted at a sample afterwards, at most 1
+/// `Dead`. Before, at 8b94666 (liveness news buried under entry
 /// churn in the windowed digest, no accusation): never converged in 8 s, up
 /// to 170 `Dead` pairs; at 273ad08: never converged, up to 645.
 #[test]

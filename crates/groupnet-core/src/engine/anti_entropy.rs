@@ -12,11 +12,26 @@ use super::spread;
 use super::state::{GroupEngine, PeerDigest};
 
 impl GroupEngine {
-    /// Brings the next anti-entropy round forward to now, so a fresh membership
-    /// change or local write disseminates on the next tick rather than waiting a
-    /// whole interval — restoring the "state change rides the next frame"
-    /// promptness the full-view piggyback used to give for free.
+    /// Brings the next anti-entropy round forward for a change this node
+    /// *learned* or derived (a merged digest or delta, its own probe verdict,
+    /// new contacts) — to now, but no sooner than half a gossip interval
+    /// after the previous round. The floor bounds the round rate at twice the
+    /// configured one: without it, a burst of liveness changes (every learned
+    /// suspicion, refutation and death nudges) runs a round on every tick,
+    /// and on an overloaded host the extra rounds delay the probe acks that
+    /// would have ended the burst.
     pub(super) fn nudge_anti_entropy(&mut self) {
+        let earliest = self
+            .last_round
+            .saturating_add(self.config.gossip_interval_ms / 2);
+        self.next_anti_entropy = self.next_anti_entropy.min(self.now_hint.max(earliest));
+    }
+
+    /// Brings the next anti-entropy round forward to now for a change the
+    /// application made here (a write, a leave, a metadata update, a peer
+    /// it added), so it disseminates on the next tick rather than waiting a
+    /// whole interval.
+    pub(super) fn nudge_anti_entropy_now(&mut self) {
         self.next_anti_entropy = self.next_anti_entropy.min(self.now_hint);
     }
 
@@ -54,10 +69,12 @@ impl GroupEngine {
     /// Runs one anti-entropy round: send a digest (chunked to the frame budget)
     /// to a rotating fanout of peers.
     pub(super) fn disseminate_digest(&mut self, now: Time) -> Vec<Effect> {
+        self.last_round = now;
         let targets = self.select_fanout_targets();
         if targets.is_empty() {
             return Vec::new();
         }
+        self.refresh_content_hashes(now);
         let mut effects = Vec::new();
         for to in targets {
             let (summaries, full, peer) = self.digest_for(&to, now);
@@ -310,6 +327,9 @@ impl GroupEngine {
     ) -> Vec<Effect> {
         let incarnation = self.incarnation;
         let mut effects = self.merge_digest_liveness(&frame.digest, now);
+        for d in &frame.digest {
+            self.refresh_content_hash(&d.node, now);
+        }
         if self.incarnation > incarnation {
             let me = self.local.clone();
             effects.extend(self.liveness_notice(from.clone(), &me, now));

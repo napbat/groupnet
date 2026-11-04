@@ -202,6 +202,7 @@ impl GroupEngine {
                     e.version
                 });
                 if let Some(v) = bumped {
+                    m.entries_changed();
                     m.observe_version(v);
                     state_changed.push((self.local.clone(), entry.key));
                     self.stamp_self();
@@ -210,7 +211,7 @@ impl GroupEngine {
                 // A key we have NOT authored this boot, echoed at a higher
                 // version, is our own pre-restart data — adopt it verbatim.
                 m.observe_version(entry.version);
-                m.entries.insert(
+                m.put_entry(
                     entry.key.clone(),
                     StateEntry::adopted(
                         entry.version,
@@ -248,7 +249,7 @@ impl GroupEngine {
                 for entry in delta.entries {
                     member.observe_version(entry.version);
                     state_changed.push((delta.node.clone(), entry.key.clone()));
-                    member.entries.insert(
+                    member.put_entry(
                         entry.key,
                         StateEntry::adopted(
                             entry.version,
@@ -295,7 +296,7 @@ impl GroupEngine {
                     if !wins {
                         continue;
                     }
-                    member.entries.insert(
+                    member.put_entry(
                         entry.key.clone(),
                         StateEntry::adopted(
                             entry.version,
@@ -358,16 +359,64 @@ impl GroupEngine {
     /// holdings do not (a version reused across a restart). Empty holdings hash to
     /// zero. A tiny dependency-free FNV-1a fold — the core stays dep-free.
     pub(super) fn content_hash(&self, m: &Member, now: Time) -> u64 {
+        match m.hash_cache {
+            Some((hash, until)) if now < until => hash,
+            _ => self.compute_content_hash(m, now).0,
+        }
+    }
+
+    /// [`content_hash`](Self::content_hash) computed afresh, with the instant
+    /// it stops holding: the earliest future moment an advertised entry's TTL
+    /// expires or an advertised tombstone stops being gossiped.
+    fn compute_content_hash(&self, m: &Member, now: Time) -> (u64, Time) {
         let mut h: u64 = 0;
+        let mut until = Time::MAX;
         for (key, e) in &m.entries {
             if !self.should_gossip_entry(e, now) {
                 continue;
             }
+            let ends = if e.tombstone {
+                e.tombstone_since
+                    .saturating_add(self.config.dead_timeout_ms)
+            } else {
+                e.expires_at
+            };
+            until = until.min(ends);
             h = fnv1a(h, key.as_bytes());
             h = fnv1a(h, &e.version.to_le_bytes());
             h = fnv1a(h, &[u8::from(e.tombstone)]);
             h = fnv1a(h, &e.value);
         }
-        h
+        (h, until)
+    }
+
+    /// Refreshes every member's cached content hash that is missing or past
+    /// its validity, so the digests built next read it instead of folding
+    /// every entry again.
+    pub(super) fn refresh_content_hashes(&mut self, now: Time) {
+        let stale: Vec<NodeId> = self
+            .members
+            .iter()
+            .filter(|(_, m)| m.hash_cache.is_none_or(|(_, until)| now >= until))
+            .map(|(node, _)| node.clone())
+            .collect();
+        for node in stale {
+            self.refresh_content_hash(&node, now);
+        }
+    }
+
+    /// Refreshes `node`'s cached content hash if it is missing or past its
+    /// validity.
+    pub(super) fn refresh_content_hash(&mut self, node: &NodeId, now: Time) {
+        let Some(m) = self.members.get(node) else {
+            return;
+        };
+        if m.hash_cache.is_some_and(|(_, until)| now < until) {
+            return;
+        }
+        let fresh = self.compute_content_hash(m, now);
+        if let Some(m) = self.members.get_mut(node) {
+            m.hash_cache = Some(fresh);
+        }
     }
 }

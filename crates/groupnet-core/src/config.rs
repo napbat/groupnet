@@ -365,8 +365,10 @@ pub struct Config {
     /// [`gossip_fanout`](Self::gossip_fanout) peers, which answer with the
     /// deltas the sender lacks and request the ones they lack. It is the
     /// group's only gossip timer: a local write or membership change brings
-    /// the next round forward (and [`eager_push`](Self::eager_push) pushes a
-    /// write at once), but the steady-state cadence is this one. A Hosted
+    /// the next round forward — to no sooner than half an interval after the
+    /// previous one, so a burst of changes cannot run a round on every tick
+    /// (and [`eager_push`](Self::eager_push) pushes a write at once) — but
+    /// the steady-state cadence is this one. A Hosted
     /// group's claims, grants and renewals ride the same round. The runtime
     /// driver sizes its tick from it alongside the probe timers. Must be
     /// nonzero.

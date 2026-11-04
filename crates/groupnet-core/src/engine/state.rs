@@ -108,6 +108,9 @@ pub struct GroupEngine {
     pub(super) config: Config,
     /// When the next periodic anti-entropy (digest) round is due.
     pub(super) next_anti_entropy: Time,
+    /// When the last anti-entropy round ran: a nudge brings the next one no
+    /// closer than half a gossip interval after it.
+    pub(super) last_round: Time,
     pub(super) next_probe: Time,
     /// Round-robin cursor over probe candidates. Starts at an offset hashed
     /// from the local id, so nodes that start together probe different
@@ -196,6 +199,7 @@ impl GroupEngine {
             coordinator: None,
             config,
             next_anti_entropy: Time::ZERO,
+            last_round: Time::ZERO,
             next_probe: Time::ZERO,
             probe_cursor: spread::cursor(seed),
             gossip_cursor: spread::cursor(placement::mix64(seed)),
