@@ -174,6 +174,8 @@ pub(crate) struct Publishers {
     pub statuses: watch::Sender<StatusesSnapshot>,
     pub entries: watch::Sender<NodeEntriesSnapshot>,
     pub net_stats: watch::Sender<NetStats>,
+    /// The voters that did not answer the resign of this node yet.
+    pub resign_pending: watch::Sender<usize>,
     pub events: broadcast::Sender<GroupEvent>,
 }
 
@@ -187,6 +189,7 @@ pub(crate) struct GroupViews {
     pub statuses: watch::Receiver<StatusesSnapshot>,
     pub entries: watch::Receiver<NodeEntriesSnapshot>,
     pub net_stats: watch::Receiver<NetStats>,
+    pub resign_pending: watch::Receiver<usize>,
     pub events: broadcast::Sender<GroupEvent>,
 }
 
@@ -545,6 +548,14 @@ fn publish_actor_views(
             .collect();
         let _ = publishers.metadata.send(Arc::new(snapshot));
     }
+    // Before the statuses: a reader that sees this node dead after its leave
+    // also sees the voters its resign waits for.
+    let pending = engine.resign_pending();
+    publishers.resign_pending.send_if_modified(|current| {
+        let changed = *current != pending;
+        *current = pending;
+        changed
+    });
     if members_dirty {
         let snapshot: MembersSnapshot = engine.members().cloned().collect();
         let _ = publishers.members.send(snapshot);

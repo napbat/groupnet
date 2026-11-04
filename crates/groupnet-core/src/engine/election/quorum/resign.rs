@@ -23,6 +23,15 @@
 //!   only what the node believes until a later epoch: the voter ledger keeps
 //!   the resigned mark, and a claim depends on rank, not on the believed
 //!   host.
+//! * **Q16d (receipt).** A voter answers each resign with
+//!   `LeadState { epoch, host: None }` to the resigning node. The resigning
+//!   node keeps the voters that did not answer yet, and sends them the
+//!   resign again on each anti-entropy round while it runs.
+//!   [`GroupEngine::resign_pending`] counts them, so that a driver can wait
+//!   until each voter has the resign before it stops the node: a resign
+//!   still in a queue of the node when it stops never leaves. A state from a
+//!   pending voter at a higher epoch, or at the resigned epoch with another
+//!   host or none, also counts as the answer: that voter has moved on.
 //!
 //! # Why fencing stays safe
 //!
@@ -40,7 +49,7 @@
 //! pair and applies the boot blackout, which is the posture without a resign.
 //!
 //! A lost resign costs only time: the voter keeps its promise until it ends,
-//! as before this row.
+//! as before this row, unless a later copy of row Q16d reaches it.
 
 use crate::{Effect, GroupEngine, NodeId, Time, wire};
 
@@ -63,16 +72,75 @@ impl GroupEngine {
         }
     }
 
-    /// Row Q16a's frames: the resign of `epoch` to every claim target.
-    pub(in crate::engine::election) fn broadcast_resign(&self, epoch: u64) -> Vec<Effect> {
-        let body = wire::LeadBody::Resign {
-            epoch,
-            host: self.local.clone(),
-        };
+    /// Row Q16a's frames: the resign of `epoch` to every claim target. Every
+    /// other voter of the roster is pending until it answers (row Q16d).
+    pub(in crate::engine::election) fn broadcast_resign(&mut self, epoch: u64) -> Vec<Effect> {
+        let local = self.local.clone();
+        let voters = self
+            .quorum_voters()
+            .map(|voters| voters.iter().filter(|v| **v != local).cloned().collect())
+            .unwrap_or_default();
+        if let Some(q) = self.quorum_mut() {
+            q.resigning = Some((epoch, voters));
+        }
+        let body = wire::LeadBody::Resign { epoch, host: local };
         self.claim_targets()
             .into_iter()
             .map(|to| self.send_lead(to, body.clone()))
             .collect()
+    }
+
+    /// Row Q16d's resend: on an anti-entropy round, the resign again to each
+    /// voter that did not answer it yet.
+    pub(in crate::engine::election) fn resend_resign(&self, anti_entropy_due: bool) -> Vec<Effect> {
+        let Some((epoch, pending)) = self
+            .election
+            .as_ref()
+            .and_then(|el| el.quorum.as_ref())
+            .and_then(|q| q.resigning.as_ref())
+        else {
+            return Vec::new();
+        };
+        if !anti_entropy_due || pending.is_empty() {
+            return Vec::new();
+        }
+        let body = wire::LeadBody::Resign {
+            epoch: *epoch,
+            host: self.local.clone(),
+        };
+        pending
+            .iter()
+            .map(|to| self.send_lead(to.clone(), body.clone()))
+            .collect()
+    }
+
+    /// Row Q16d's receipt: a state from `from` at (`epoch`, `host`) answers
+    /// the resign of this node when it shows that `from` no longer holds
+    /// this node as host of the resigned epoch.
+    pub(in crate::engine::election) fn note_resign_receipt(
+        &mut self,
+        from: &NodeId,
+        epoch: u64,
+        host: Option<&NodeId>,
+    ) {
+        let local = self.local.clone();
+        let Some((resigned, pending)) = self.quorum_mut().and_then(|q| q.resigning.as_mut()) else {
+            return;
+        };
+        if epoch > *resigned || (epoch == *resigned && host != Some(&local)) {
+            pending.remove(from);
+        }
+    }
+
+    /// The voters that did not yet answer the resign of this node (row
+    /// Q16d): zero when it resigned nothing, and once each voter answered.
+    #[must_use]
+    pub fn resign_pending(&self) -> usize {
+        self.election
+            .as_ref()
+            .and_then(|el| el.quorum.as_ref())
+            .and_then(|q| q.resigning.as_ref())
+            .map_or(0, |(_, pending)| pending.len())
     }
 
     /// Rows Q16b and Q16c: an inbound resign. Dropped unless it comes from the
@@ -95,15 +163,21 @@ impl GroupEngine {
             q.resigned = true;
             q.grant_promise_until = q.grant_promise_until.min(now);
         }
+        // Row Q16d: a voter answers every copy, so that the resigning node
+        // can stop.
+        let mut effects = Vec::new();
+        if self.is_voter() {
+            effects.push(self.send_lead(from.clone(), wire::LeadBody::State { epoch, host: None }));
+        }
         let Some(el) = self.election.as_mut() else {
-            return Vec::new();
+            return effects;
         };
         el.highest_seen = el.highest_seen.max(epoch);
-        if el.epoch != epoch || el.host.as_ref() != Some(host) {
-            return Vec::new();
+        if el.epoch == epoch && el.host.as_ref() == Some(host) {
+            el.host = None;
+            effects.insert(0, Effect::LeadershipChanged { epoch, host: None });
         }
-        el.host = None;
-        vec![Effect::LeadershipChanged { epoch, host: None }]
+        effects
     }
 }
 

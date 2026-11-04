@@ -230,9 +230,14 @@ fn only_the_granted_host_can_resign_its_own_pair() {
         Time(ACTIVATED + 30),
     );
     assert_eq!(
-        earlier,
-        Vec::<Effect>::new(),
-        "a resign of another epoch is dropped"
+        leadership_changes(&earlier),
+        Vec::new(),
+        "a resign of another epoch releases nothing"
+    );
+    assert_eq!(
+        state_frames(&earlier),
+        vec![(rank[0].clone(), 0, None)],
+        "only the answer of row Q16d"
     );
     assert_eq!(e.leadership(), (1, Some(&rank[0])));
 
@@ -248,7 +253,8 @@ fn only_the_granted_host_can_resign_its_own_pair() {
 }
 
 /// Row Q16b, a duplicated resign: the second copy changes nothing and
-/// announces nothing, and the successor is still granted.
+/// announces nothing but the answer of row Q16d, and the successor is still
+/// granted.
 #[test]
 fn a_duplicated_resign_changes_nothing() {
     let rank = rank_by_placement(&["a", "b", "c"]);
@@ -264,7 +270,17 @@ fn a_duplicated_resign_changes_nothing() {
         &lead_resign_frame(1, rank[0].as_str()),
         Time(ACTIVATED + 30),
     );
-    assert_eq!(second, Vec::<Effect>::new(), "the copy is a no-op");
+    assert_eq!(
+        leadership_changes(&second),
+        Vec::new(),
+        "the copy releases nothing new"
+    );
+    assert_eq!(
+        state_frames(&second),
+        vec![(rank[0].clone(), 1, None)],
+        "only the answer of row Q16d"
+    );
+    assert_eq!(second.len(), 1);
     assert_eq!(e.leadership(), (1, None));
 
     let granted = e.on_message(
@@ -309,4 +325,67 @@ fn a_delayed_resign_releases_no_later_promise() {
         "the promise to the successor still stands"
     );
     assert_eq!(grant_frames(&rival), Vec::new());
+}
+
+/// Row Q16d, the voter half: a voter answers each copy of a resign with the
+/// resigned epoch and no host, to the resigning node.
+#[test]
+fn a_voter_answers_each_resign() {
+    let rank = rank_by_placement(&["a", "b", "c"]);
+    let mut e = promised(&rank);
+    for at in [ACTIVATED + 20, ACTIVATED + 30] {
+        let answered = e.on_message(
+            rank[0].clone(),
+            &lead_resign_frame(1, rank[0].as_str()),
+            Time(at),
+        );
+        assert_eq!(
+            state_frames(&answered),
+            vec![(rank[0].clone(), 1, None)],
+            "the answer at {at}"
+        );
+    }
+}
+
+/// Row Q16d, the resigning half: the node that left counts the voters that
+/// did not answer, sends them the resign again on each anti-entropy round,
+/// and stops once each answered. A state of a later epoch answers too. A
+/// resign that the stop of the node would drop from a queue reaches the
+/// voter on a later round (napbat/groupnet#13).
+#[test]
+fn a_resign_goes_again_to_each_voter_until_it_answers() {
+    let rank = rank_by_placement(&["a", "b", "c"]);
+    let mut e = host(&rank);
+    assert_eq!(e.resign_pending(), 0, "nothing resigned yet");
+    e.apply(Command::Leave);
+    assert_eq!(e.resign_pending(), 2);
+
+    e.on_message(
+        rank[1].clone(),
+        &lead_state_frame(1, None),
+        Time(ACTIVATED + 10),
+    );
+    assert_eq!(e.resign_pending(), 1, "the answer of {}", rank[1]);
+    let again = e.on_tick(Time(ACTIVATED + 10_000));
+    assert_eq!(
+        resign_frames(&again),
+        vec![(rank[2].clone(), 1, rank[0].clone())],
+        "only the voter that did not answer gets the resign again"
+    );
+
+    // A state that still names this node as host is no answer.
+    e.on_message(
+        rank[2].clone(),
+        &lead_state_frame(1, Some(rank[0].as_str())),
+        Time(ACTIVATED + 10_010),
+    );
+    assert_eq!(e.resign_pending(), 1);
+    e.on_message(
+        rank[2].clone(),
+        &lead_state_frame(2, Some(rank[2].as_str())),
+        Time(ACTIVATED + 10_020),
+    );
+    assert_eq!(e.resign_pending(), 0, "a later epoch answers");
+    let quiet = e.on_tick(Time(ACTIVATED + 20_000));
+    assert_eq!(resign_frames(&quiet), Vec::new(), "nothing to send again");
 }

@@ -677,6 +677,12 @@ async fn a_leaving_host_resigns_and_the_voters_left_elect_a_successor() {
         "the leaving host sent {} resigns, not one to each other voter",
         wired[host].1.resigns()
     );
+    // Row Q16d: each other voter answered, so the node can stop.
+    eventually_within("each voter to answer the resign", SETTLE, || {
+        groups[host].resign_pending() == 0
+    })
+    .await;
+    groups[host].resigned().await;
 }
 
 /// What one node actually put on the wire, by frame kind.

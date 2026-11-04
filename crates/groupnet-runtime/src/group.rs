@@ -196,6 +196,7 @@ pub struct Group {
     statuses_rx: watch::Receiver<StatusesSnapshot>,
     entries_rx: watch::Receiver<NodeEntriesSnapshot>,
     net_stats_rx: watch::Receiver<NetStats>,
+    resign_rx: watch::Receiver<usize>,
     events_tx: broadcast::Sender<GroupEvent>,
 }
 
@@ -223,6 +224,7 @@ impl Group {
             statuses_rx: views.statuses,
             entries_rx: views.entries,
             net_stats_rx: views.net_stats,
+            resign_rx: views.resign_pending,
             events_tx: views.events,
         }
     }
@@ -421,9 +423,29 @@ impl Group {
         }
     }
 
-    /// Leaves the group (best-effort).
+    /// Leaves the group (best-effort). A host (or claimant) of a `Quorum`
+    /// group demotes itself and resigns its epoch to the voters; see
+    /// [`resigned`](Self::resigned).
     pub fn leave(&self) {
         let _ = self.tx.try_send(Event::Local(Command::Leave));
+    }
+
+    /// The voters that did not answer the resign of this node yet: zero when
+    /// it resigned nothing, and once each voter answered. The group sends the
+    /// resign again to each of them on each anti-entropy round while it runs.
+    #[must_use]
+    pub fn resign_pending(&self) -> usize {
+        *self.resign_rx.borrow()
+    }
+
+    /// Resolves once no voter waits for the resign of this node: at once
+    /// when it resigned nothing. A node that leaves waits for it before it
+    /// stops, because a resign still queued on the node when it stops never
+    /// leaves it. Read it after the leave was applied (the group shows this
+    /// node dead): the count is published before the statuses.
+    pub async fn resigned(&self) {
+        let mut pending = self.resign_rx.clone();
+        let _ = pending.wait_for(|count| *count == 0).await;
     }
 
     /// Introduce a peer learned out-of-band (e.g. from an external roster / service
