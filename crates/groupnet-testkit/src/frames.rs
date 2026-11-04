@@ -96,6 +96,18 @@ pub fn state_frames(effects: &[Effect]) -> Vec<(NodeId, u64, Option<NodeId>)> {
         .collect()
 }
 
+/// The resigns `effects` puts on the wire: `(recipient, epoch, host)`.
+#[must_use]
+pub fn resign_frames(effects: &[Effect]) -> Vec<(NodeId, u64, NodeId)> {
+    election_frames(effects)
+        .into_iter()
+        .filter_map(|(to, body)| match body {
+            wire::LeadBody::Resign { epoch, host } => Some((to, epoch, host)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The write-ahead grant persists `effects` asks for, in emission order — the
 /// order itself is the [`Effect::PersistGrant`] contract.
 #[must_use]
@@ -381,6 +393,18 @@ pub fn lead_state_frame(epoch: u64, host: Option<&str>) -> Vec<u8> {
         wire::LeadBody::State {
             epoch,
             host: host.map(NodeId::new),
+        },
+    )
+}
+
+/// A `LeadResign` frame: `host` giving up `epoch` as it leaves.
+#[must_use]
+pub fn lead_resign_frame(epoch: u64, host: &str) -> Vec<u8> {
+    lead_frame(
+        wire::Kind::LeadResign,
+        wire::LeadBody::Resign {
+            epoch,
+            host: NodeId::new(host),
         },
     )
 }

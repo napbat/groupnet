@@ -146,6 +146,10 @@ fn lead_samples() -> Vec<Frame> {
             epoch: 0,
             host: None,
         }),
+        lead_sample(LeadBody::Resign {
+            epoch: 7,
+            host: NodeId::new("node-a"),
+        }),
     ]
 }
 
@@ -182,9 +186,14 @@ fn an_election_frame_decodes_to_the_body_its_kind_names() {
 
 #[test]
 fn an_election_frame_missing_its_body_decodes_to_none() {
-    // A kind in 8..=10 requires a well-formed body: a bare header is not a
+    // A kind in 8..=11 requires a well-formed body: a bare header is not a
     // frame with an empty body, it is undecodable.
-    for kind in [KIND_LEAD_CLAIM, KIND_LEAD_GRANT, KIND_LEAD_STATE] {
+    for kind in [
+        KIND_LEAD_CLAIM,
+        KIND_LEAD_GRANT,
+        KIND_LEAD_STATE,
+        KIND_LEAD_RESIGN,
+    ] {
         let mut bytes = encode(&ping_req_sample());
         bytes[1] = kind;
         assert_eq!(decode(&bytes), None, "kind {kind} accepted a probe body");
@@ -193,10 +202,10 @@ fn an_election_frame_missing_its_body_decodes_to_none() {
 
 #[test]
 fn an_unknown_kind_decodes_to_none() {
-    // 11 is the first unassigned tag: an unknown kind is malformed and must
+    // 12 is the first unassigned tag: an unknown kind is malformed and must
     // be rejected rather than misread as some other body.
     let mut bytes = encode(&digest_sample());
-    bytes[1] = 11;
+    bytes[1] = 12;
     assert_eq!(decode(&bytes), None);
     // ...but the group is still peekable, so a driver can demux it.
     assert_eq!(peek_group(&bytes), Some(GroupId::new("shard-42")));

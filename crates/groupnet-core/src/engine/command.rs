@@ -184,6 +184,10 @@ impl GroupEngine {
                 let now = self.now_hint;
                 if let Some(m) = self.members.get_mut(&self.local) {
                     m.adopt_status(Status::Dead, now);
+                    // The digest gossips a Dead member for `dead_timeout`
+                    // after `dead_since`. Without this stamp the leave of a
+                    // node up longer than that is never gossiped.
+                    m.dead_since = now;
                 }
                 self.stamp_self();
                 effects.push(Effect::MembershipChanged);

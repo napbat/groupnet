@@ -351,6 +351,29 @@ fn voluntary_leave_is_not_refuted() {
     assert_eq!(a.member_status(&NodeId::new("a")), Some(Status::Dead));
 }
 
+/// A node up longer than `dead_timeout` still gossips its leave: the window
+/// in which a digest lists the Dead record starts at the leave, not at the
+/// origin of the timeline. Without it the peers saw the leave only through
+/// the failure detector, and under Quorum the next host waited for it
+/// (napbat/groupnet#13).
+#[test]
+fn a_leave_after_the_dead_timeout_is_still_gossiped() {
+    let late = 3 * Config::default().dead_timeout_ms;
+    let mut a = engine("a", &["b"]);
+    a.on_tick(Time(late));
+    a.apply(Command::Leave);
+    let round = a.on_tick(Time(late + 1));
+    let digest = decode_one_digest(&round);
+    assert!(
+        digest
+            .digest
+            .iter()
+            .any(|d| d.node == NodeId::new("a") && d.status == Status::Dead.to_wire()),
+        "the leave is not in the digest: {:?}",
+        digest.digest
+    );
+}
+
 #[test]
 fn a_frame_with_an_unknown_status_code_is_dropped_whole() {
     // One bad status byte makes the frame malformed. The well-formed member

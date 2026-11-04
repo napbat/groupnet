@@ -10,11 +10,11 @@ use std::collections::BTreeSet;
 use groupnet_core::{NodeId, Status, Time, wire};
 
 /// Whether an encoded frame's kind tag names an election frame — wire kinds
-/// `8..=10` (`LeadClaim`, `LeadGrant`, `LeadState`). Read straight off the
-/// byte after the version, the same cheap peek `wire::peek_group` does, so
-/// counting costs nothing on the delivery path.
+/// `8..=11` (`LeadClaim`, `LeadGrant`, `LeadState`, `LeadResign`). Read
+/// straight off the byte after the version, the same cheap peek
+/// `wire::peek_group` does, so counting costs nothing on the delivery path.
 fn is_election_frame(wire: &[u8]) -> bool {
-    matches!(wire.get(1).copied(), Some(8..=10))
+    matches!(wire.get(1).copied(), Some(8..=11))
 }
 
 impl Simulation {
@@ -116,6 +116,7 @@ impl Simulation {
                     self.floor_answers += 1;
                 }
             }
+            Some(wire::LeadBody::Resign { .. }) => self.resign_frames += 1,
             Some(wire::LeadBody::State { .. }) | None => {}
         }
     }
@@ -128,8 +129,8 @@ impl Simulation {
     }
 
     /// How many election frames (wire kinds `LeadClaim`, `LeadGrant`,
-    /// `LeadState`) the sim has actually delivered to an engine — frames lost
-    /// or blocked by a partition are not counted.
+    /// `LeadState`, `LeadResign`) the sim has actually delivered to an engine
+    /// — frames lost or blocked by a partition are not counted.
     ///
     /// This is the mode-invariance probe: a run of purely
     /// [`GroupMode::Eventual`](groupnet_core::GroupMode) groups must end with
@@ -171,6 +172,13 @@ impl Simulation {
     #[must_use]
     pub fn floor_answers_seen(&self) -> u64 {
         self.floor_answers
+    }
+
+    /// How many `LeadResign` frames (row Q16) the run has **issued**: one to
+    /// each claim target of a host or claimant that left the group.
+    #[must_use]
+    pub fn resign_frames_seen(&self) -> u64 {
+        self.resign_frames
     }
 
     /// How many members `node` currently knows about, or `None` if `node` is
