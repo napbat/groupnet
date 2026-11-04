@@ -611,7 +611,10 @@ impl Transport for Sniffer {
         if let Some(frame) = message_payload(msg).and_then(wire::decode)
             && matches!(
                 frame.kind,
-                wire::Kind::LeadClaim | wire::Kind::LeadGrant | wire::Kind::LeadState
+                wire::Kind::LeadClaim
+                    | wire::Kind::LeadGrant
+                    | wire::Kind::LeadState
+                    | wire::Kind::LeadResign
             )
         {
             self.electing

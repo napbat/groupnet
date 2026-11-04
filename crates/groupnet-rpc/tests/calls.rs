@@ -65,7 +65,7 @@ async fn an_echo_round_trips() {
 
 /// A timeout longer than the wire's `u32` milliseconds saturates to
 /// `MAX_TIMEOUT` rather than overflowing the clock, and the call goes
-/// through; a zero timeout fails `Timeout` without being sent.
+/// through; a zero timeout fails `NotSent` without being sent.
 #[tokio::test]
 async fn timeouts_saturate_at_the_wire_maximum_and_zero_is_refused() {
     let net = MemBulkNet::new();
@@ -93,7 +93,7 @@ async fn timeouts_saturate_at_the_wire_maximum_and_zero_is_refused() {
         client
             .call(&server, Bytes::from_static(b"now"), Duration::ZERO)
             .await,
-        Err(RpcError::Timeout)
+        Err(RpcError::NotSent)
     );
 }
 

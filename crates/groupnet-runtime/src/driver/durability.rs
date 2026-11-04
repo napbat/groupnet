@@ -256,7 +256,9 @@ fn undurable_frame(wire: &[u8], (epoch, claimant): &(u64, NodeId), local: &NodeI
             epoch: sent,
             claimant: bidder,
         }) => sent == *epoch && bidder == *claimant && bidder == *local,
-        Some(wire::LeadBody::State { .. }) | None => false,
+        // A resign (row Q16) releases a promise and endorses nobody: it
+        // depends on no grant write.
+        Some(wire::LeadBody::State { .. } | wire::LeadBody::Resign { .. }) | None => false,
     }
 }
 
@@ -276,6 +278,7 @@ mod tests {
             wire::LeadBody::Claim { .. } => wire::Kind::LeadClaim,
             wire::LeadBody::Grant { .. } => wire::Kind::LeadGrant,
             wire::LeadBody::State { .. } => wire::Kind::LeadState,
+            wire::LeadBody::Resign { .. } => wire::Kind::LeadResign,
         };
         frame(kind, Some(body))
     }
@@ -368,6 +371,16 @@ mod tests {
         assert!(!withheld(&lead(wire::LeadBody::State {
             epoch: 7,
             host: None,
+        })));
+    }
+
+    /// A resign (row Q16) endorses nobody and depends on no grant write, so it
+    /// leaves even while the guard is armed.
+    #[test]
+    fn a_resign_is_not_withheld() {
+        assert!(!withheld(&lead(wire::LeadBody::Resign {
+            epoch: 7,
+            host: n("me"),
         })));
     }
 

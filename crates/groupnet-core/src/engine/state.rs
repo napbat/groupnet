@@ -533,9 +533,10 @@ impl GroupEngine {
             // The Hosted-mode election (see `election.rs`). In an `Eventual`
             // group these decode and are dropped, exactly as they were before
             // the election existed.
-            wire::Kind::LeadClaim | wire::Kind::LeadGrant | wire::Kind::LeadState => {
-                self.on_lead(&from, &frame, now)
-            }
+            wire::Kind::LeadClaim
+            | wire::Kind::LeadGrant
+            | wire::Kind::LeadState
+            | wire::Kind::LeadResign => self.on_lead(&from, &frame, now),
         }
     }
 

@@ -22,7 +22,9 @@
 //!   bids and no epoch is ever closed;
 //! * a voter that restarts with its persisted ledger re-grants the **sitting
 //!   claimant immediately**, so the incumbent is host again well inside the
-//!   `lease_ms` a blackout would have cost.
+//!   `lease_ms` a blackout would have cost;
+//! * a host that leaves puts a **resign** on the wire to each other voter, and
+//!   the voters left elect a successor above its epoch (row Q16).
 //!
 //! Voter storage exists only on `GroupProfile::Quorum`; no other profile can
 //! carry a store (a compile-time property, proven by the `GroupProfile` docs).
@@ -620,6 +622,63 @@ async fn a_recovered_voter_re_grants_the_incumbent_without_a_blackout() {
     .await;
 }
 
+/// Row Q16 over a real driver (napbat/groupnet#13): a host that leaves sends
+/// a `LeadResign` to each other voter, and the two voters left elect a
+/// successor above the old epoch. The sim suite times the election against
+/// the lease on its virtual clock; this test proves that the driver puts the
+/// resign on the wire.
+#[tokio::test]
+async fn a_leaving_host_resigns_and_the_voters_left_elect_a_successor() {
+    const GROUP: &str = "quorum-resign";
+    const IDS: [&str; 3] = ["qs-a", "qs-b", "qs-c"];
+
+    let rank = ranked(GROUP, &IDS);
+    let ordered: Vec<&str> = rank.iter().map(NodeId::as_str).collect();
+    let stores: Vec<Arc<RecordingStore>> = IDS.iter().map(|_| RecordingStore::healthy()).collect();
+    let net = Network::new();
+    let mut wired = Vec::with_capacity(ordered.len());
+    for id in &ordered {
+        wired.push(build_wired(&net, id, &ordered).await);
+    }
+    let groups: Vec<Group> = wired
+        .iter()
+        .zip(&stores)
+        .map(|((node, _), store)| {
+            node.join_group_with(
+                GROUP,
+                quorum_profile(&IDS, store.clone(), store.recovered()),
+            )
+        })
+        .collect();
+
+    let refs: Vec<&Group> = groups.iter().collect();
+    converged_within(&refs, SETTLE).await;
+    eventually_within("the roster to close an epoch", SETTLE, || {
+        agreed(&refs).is_some()
+    })
+    .await;
+    let first = agreed(&refs).expect("agreed just above");
+    let host = ordered
+        .iter()
+        .position(|id| first.host.as_ref().is_some_and(|h| h.as_str() == *id))
+        .expect("the host is one of ours");
+
+    groups[host].leave();
+    let left: Vec<&Group> = (0..groups.len())
+        .filter(|i| *i != host)
+        .map(|i| &groups[i])
+        .collect();
+    eventually_within("the voters left to elect a successor", SETTLE, || {
+        agreed(&left).is_some_and(|lead| lead.host != first.host && lead.epoch > first.epoch)
+    })
+    .await;
+    assert!(
+        wired[host].1.resigns() >= 2,
+        "the leaving host sent {} resigns, not one to each other voter",
+        wired[host].1.resigns()
+    );
+}
+
 /// What one node actually put on the wire, by frame kind.
 ///
 /// A frame the driver dropped is invisible from every other vantage point — the
@@ -632,6 +691,7 @@ struct WireCounts {
     claims: AtomicUsize,
     grants: AtomicUsize,
     frames: AtomicUsize,
+    resigns: AtomicUsize,
 }
 
 impl WireCounts {
@@ -648,6 +708,11 @@ impl WireCounts {
     /// Every engine frame sent: proof gossip is live, not just router adverts.
     fn frames(&self) -> usize {
         self.frames.load(Ordering::Relaxed)
+    }
+
+    /// `LeadResign` frames sent — the epochs a leaving host gave up.
+    fn resigns(&self) -> usize {
+        self.resigns.load(Ordering::Relaxed)
     }
 }
 
@@ -674,6 +739,9 @@ impl Transport for LeadWire {
             }
             Some(wire::Kind::LeadGrant) => {
                 self.counts.grants.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(wire::Kind::LeadResign) => {
+                self.counts.resigns.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }

@@ -19,9 +19,9 @@
 //! * [`Kind::Ping`] / [`Kind::Ack`] / [`Kind::PingReq`] / [`Kind::IndirectAck`] —
 //!   SWIM liveness probes. Since v3 these carry **no** piggybacked view; they are
 //!   tiny.
-//! * [`Kind::LeadClaim`] / [`Kind::LeadGrant`] / [`Kind::LeadState`] — the
-//!   Hosted-mode election, carried in a [`LeadBody`]. An `Eventual` group
-//!   never emits one.
+//! * [`Kind::LeadClaim`] / [`Kind::LeadGrant`] / [`Kind::LeadState`] /
+//!   [`Kind::LeadResign`] — the Hosted-mode election, carried in a
+//!   [`LeadBody`]. An `Eventual` group never emits one.
 //!
 //! The codec is a small hand-rolled length-prefixed format (little-endian),
 //! deliberately dependency-free.
@@ -72,12 +72,16 @@ pub enum Kind {
     /// cadence so a node that missed the election converges on it. Body:
     /// [`LeadBody::State`].
     LeadState,
+    /// A leaving host (or claimant) gives up `epoch`: each voter ends its
+    /// promise to the sender for that epoch at once. Body:
+    /// [`LeadBody::Resign`].
+    LeadResign,
 }
 
 /// The body of an election frame — the payload of a [`Kind::LeadClaim`],
-/// [`Kind::LeadGrant`], or [`Kind::LeadState`].
+/// [`Kind::LeadGrant`], [`Kind::LeadState`], or [`Kind::LeadResign`].
 ///
-/// One enum rather than three sets of optional [`Frame`] fields, because an
+/// One enum rather than four sets of optional [`Frame`] fields, because an
 /// election frame is exactly one of these shapes: the variant and the
 /// [`Kind`] must agree, and [`decode`] only ever produces a matching pair.
 ///
@@ -115,6 +119,17 @@ pub enum LeadBody {
         epoch: u64,
         /// The host of that epoch, or `None` if the sender holds none.
         host: Option<NodeId>,
+    },
+    /// "I give up `epoch`" — sent by a host (or claimant) that leaves the
+    /// group, after it demoted itself. A voter whose grant is exactly
+    /// `(epoch, host)` ends its promise to `host` at once, so another claimant
+    /// can win without waiting for the lease.
+    Resign {
+        /// The epoch given up.
+        epoch: u64,
+        /// The resigning node; a voter acts on the frame only when it comes
+        /// from this node.
+        host: NodeId,
     },
 }
 
@@ -233,9 +248,9 @@ pub struct Frame {
     /// Metadata register set — populated on a [`Kind::Digest`] (small, bounded).
     pub metadata: Vec<MetaDelta>,
     /// The election body — `Some` exactly on a [`Kind::LeadClaim`],
-    /// [`Kind::LeadGrant`], or [`Kind::LeadState`], and `None` on every other
-    /// kind. [`decode`] guarantees the variant matches the kind; [`encode`]
-    /// debug-asserts it.
+    /// [`Kind::LeadGrant`], [`Kind::LeadState`], or [`Kind::LeadResign`], and
+    /// `None` on every other kind. [`decode`] guarantees the variant matches
+    /// the kind; [`encode`] debug-asserts it.
     pub lead: Option<LeadBody>,
 }
 
@@ -243,7 +258,7 @@ pub struct Frame {
 /// runs the same build, so this is not a compatibility mechanism: it is a guard
 /// that makes a mis-deployed node's frames undecodable instead of misparsed.
 /// Frame bodies may change freely; any change to a kind or body bumps it.
-const FRAME_VERSION: u8 = 3;
+const FRAME_VERSION: u8 = 4;
 
 const KIND_DIGEST: u8 = 1;
 const KIND_PING: u8 = 2;
@@ -255,6 +270,7 @@ const KIND_DELTA: u8 = 7;
 const KIND_LEAD_CLAIM: u8 = 8;
 const KIND_LEAD_GRANT: u8 = 9;
 const KIND_LEAD_STATE: u8 = 10;
+const KIND_LEAD_RESIGN: u8 = 11;
 
 /// Caps how much a decoder pre-allocates from a frame's self-declared element
 /// count. A corrupt or hostile frame can claim a huge count, so we reserve at
@@ -274,6 +290,7 @@ fn kind_to_u8(k: Kind) -> u8 {
         Kind::LeadClaim => KIND_LEAD_CLAIM,
         Kind::LeadGrant => KIND_LEAD_GRANT,
         Kind::LeadState => KIND_LEAD_STATE,
+        Kind::LeadResign => KIND_LEAD_RESIGN,
     }
 }
 
@@ -284,6 +301,7 @@ fn lead_kind(body: &LeadBody) -> Kind {
         LeadBody::Claim { .. } => Kind::LeadClaim,
         LeadBody::Grant { .. } => Kind::LeadGrant,
         LeadBody::State { .. } => Kind::LeadState,
+        LeadBody::Resign { .. } => Kind::LeadResign,
     }
 }
 
@@ -299,6 +317,7 @@ fn kind_from_u8(b: u8) -> Option<Kind> {
         KIND_LEAD_CLAIM => Some(Kind::LeadClaim),
         KIND_LEAD_GRANT => Some(Kind::LeadGrant),
         KIND_LEAD_STATE => Some(Kind::LeadState),
+        KIND_LEAD_RESIGN => Some(Kind::LeadResign),
         _ => None,
     }
 }
@@ -361,7 +380,7 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
                 }
             }
         }
-        Kind::LeadClaim | Kind::LeadGrant | Kind::LeadState => {
+        Kind::LeadClaim | Kind::LeadGrant | Kind::LeadState | Kind::LeadResign => {
             debug_assert!(
                 frame.lead.as_ref().map(lead_kind) == Some(frame.kind),
                 "an election frame must carry the body its kind names"
@@ -404,6 +423,10 @@ fn put_lead(out: &mut Vec<u8>, body: &LeadBody) {
                 }
                 None => out.push(0),
             }
+        }
+        LeadBody::Resign { epoch, host } => {
+            put_u64(out, *epoch);
+            put_str(out, host.as_str());
         }
     }
 }
@@ -518,7 +541,7 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
                 });
             }
         }
-        Kind::LeadClaim | Kind::LeadGrant | Kind::LeadState => {
+        Kind::LeadClaim | Kind::LeadGrant | Kind::LeadState | Kind::LeadResign => {
             frame.lead = Some(get_lead(kind, &mut cur)?);
         }
         Kind::Ping | Kind::Ack | Kind::PingReq | Kind::IndirectAck => {}
@@ -527,7 +550,7 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
     Some(frame)
 }
 
-/// Reads the election body an election `kind` promises. A frame of kind 8–10
+/// Reads the election body an election `kind` promises. A frame of kind 8–11
 /// is only well-formed with one, so a missing or truncated body is `None` —
 /// the whole frame is then dropped, like any other malformed input.
 fn get_lead(kind: Kind, cur: &mut &[u8]) -> Option<LeadBody> {
@@ -550,7 +573,11 @@ fn get_lead(kind: Kind, cur: &mut &[u8]) -> Option<LeadBody> {
                 _ => return None,
             },
         },
-        // Only the three election kinds reach here; `decode` matches on them.
+        Kind::LeadResign => LeadBody::Resign {
+            epoch,
+            host: NodeId::new(get_str(cur)?),
+        },
+        // Only the four election kinds reach here; `decode` matches on them.
         _ => return None,
     })
 }

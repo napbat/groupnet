@@ -242,8 +242,13 @@ pub enum RpcError {
     /// No connection to the peer could be opened within the connect timeout
     /// (unregistered, refused, or silent). The request was not sent.
     Unreachable,
-    /// The call's timeout elapsed, on either side. If the request was sent
-    /// the handler may have run; a late response is discarded.
+    /// The call's timeout ended before the request was sent: while the call
+    /// waited for a call slot of the peer, for another call's dial, for the
+    /// connect, or for room in the connection's queue. The handler did not
+    /// run.
+    NotSent,
+    /// The call's timeout elapsed with the request sent, on either side. The
+    /// handler may have run; a late response is discarded.
     Timeout,
     /// The connection broke with this request sent and unanswered: the
     /// outcome is **unknown** — the handler may or may not have run. The next
@@ -265,6 +270,7 @@ impl fmt::Display for RpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unreachable => f.write_str("rpc peer unreachable"),
+            Self::NotSent => f.write_str("rpc call timed out before the request was sent"),
             Self::Timeout => f.write_str("rpc call timed out"),
             Self::ConnectionLost => f.write_str("rpc connection lost with the call in flight"),
             Self::Remote(status) => write!(f, "remote error: {status}"),

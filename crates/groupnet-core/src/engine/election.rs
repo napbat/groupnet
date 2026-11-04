@@ -4,7 +4,7 @@
 //!
 //! Everything here is inert unless the group's [`Config::mode`] is
 //! [`GroupMode::Hosted`]: the state below is not even allocated, no election
-//! frame is ever built, and inbound wire kinds 8–10 decode and drop. An
+//! frame is ever built, and inbound wire kinds 8–11 decode and drop. An
 //! [`Eventual`] group costs exactly what it cost before this module existed.
 //!
 //! # What `Settle` activation guarantees, stated honestly
@@ -593,18 +593,28 @@ impl GroupEngine {
     /// Row 15: a voluntary leave gives up hostship (or a claim) *before* the
     /// leave itself disseminates, so this node never serves an epoch it has
     /// already announced it is gone from.
+    ///
+    /// Row Q16: under Quorum the node then resigns the epoch it gave up, so
+    /// each voter ends its promise to it at once (see
+    /// [`quorum`](self::quorum)). The demotion comes first in the effects, so
+    /// the resign leaves only after this node stopped being host.
     pub(super) fn election_on_leave(&mut self) -> Vec<Effect> {
-        match self.election.as_ref().map(|el| el.role) {
+        let resigned = self.resign_epoch();
+        let mut effects = match self.election.as_ref().map(|el| el.role) {
             Some(Role::Host) => self.demote_host(),
             Some(Role::Claimant) => {
                 self.abandon_claim();
                 Vec::new()
             }
             Some(Role::Follower) | None => Vec::new(),
+        };
+        if let Some(epoch) = resigned {
+            effects.extend(self.broadcast_resign(epoch));
         }
+        effects
     }
 
-    /// Routes an inbound election frame. Kinds 8–10 are dropped outright in an
+    /// Routes an inbound election frame. Kinds 8–11 are dropped outright in an
     /// `Eventual` group — the mode is not a node-wide switch, so a peer that
     /// hosts *its* groups cannot make this one run an election.
     pub(super) fn on_lead(&mut self, from: &NodeId, frame: &wire::Frame, now: Time) -> Vec<Effect> {
@@ -627,6 +637,10 @@ impl GroupEngine {
                 claimant,
                 granter,
             }) => self.on_lead_grant(*epoch, claimant, granter),
+            // Row Q16: a leaving host or claimant resigned its epoch.
+            Some(wire::LeadBody::Resign { epoch, host }) => {
+                self.on_lead_resign(from, *epoch, host, now)
+            }
             None => Vec::new(),
         }
     }
@@ -855,6 +869,7 @@ impl GroupEngine {
             wire::LeadBody::Claim { .. } => wire::Kind::LeadClaim,
             wire::LeadBody::Grant { .. } => wire::Kind::LeadGrant,
             wire::LeadBody::State { .. } => wire::Kind::LeadState,
+            wire::LeadBody::Resign { .. } => wire::Kind::LeadResign,
         };
         Effect::Send {
             to,

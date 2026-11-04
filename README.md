@@ -1207,7 +1207,7 @@ async fn read_key<B: BulkTransport>(client: &RpcClient<B>, owner: &NodeId, key: 
     match client.call(owner, key, Duration::from_millis(200)).await {
         Ok(value) => println!("{} bytes", value.len()),
         Err(RpcError::ConnectionLost | RpcError::Timeout) => { /* outcome unknown */ }
-        Err(other) => println!("not served: {other}"), // Unreachable, TooLarge, Remote(status), …
+        Err(other) => println!("not served: {other}"), // Unreachable, NotSent, TooLarge, Remote(status), …
     }
 }
 

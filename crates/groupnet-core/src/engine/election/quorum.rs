@@ -36,6 +36,9 @@
 //!   durability guard withholds it exactly as it withholds that pair's grant.
 //! * **Q0.** A node outside the roster, and *any* node under `Settle`, never
 //!   grants at all.
+//! * **Q16 (resign).** A host or claimant that leaves resigns its epoch, and
+//!   a voter whose grant is exactly that pair ends its promise at once and
+//!   never answers the pair again. See [`resign`](self::resign).
 //!
 //! **The candidate half** (rows Q4–Q6) counts them. A claim opens a *round*:
 //! the instant it was broadcast (`round_sent_at`) and the set of voters that
@@ -146,6 +149,7 @@ use crate::{Effect, GroupEngine, NodeId, Time, wire};
 use super::{Election, Role};
 
 mod recovery;
+mod resign;
 
 pub use recovery::RecoveringEngine;
 
@@ -178,6 +182,10 @@ pub(super) struct QuorumState {
     /// The voters this round can no longer win: each sent a grant (row Q5b)
     /// proving that it refuses the claimed epoch. Reset when a round opens.
     round_refused: BTreeSet<NodeId>,
+    /// Row Q16: the claimant of `granted` resigned that pair. The promise to
+    /// it ended when the resign arrived, and the pair is never re-granted.
+    /// Cleared when a new pair is granted.
+    resigned: bool,
 }
 
 /// What a voter does with one inbound claim: rows Q1, Q2 and Q3.
@@ -197,11 +205,13 @@ enum Verdict {
 /// only rule that decides whether an epoch can be closed.
 ///
 /// Ordered so each row's veto is visible: leaving first, then the idempotent
-/// re-grant, then monotonicity (which subsumes one-grant-per-epoch: an equal
-/// epoch under a *different* claimant is not an advance), then the promise.
+/// re-grant (refused once its pair resigned, row Q16), then monotonicity
+/// (which subsumes one-grant-per-epoch: an equal epoch under a *different*
+/// claimant is not an advance), then the promise.
 fn grant_verdict(
     leaving: bool,
     granted: Option<&(u64, NodeId)>,
+    resigned: bool,
     grant_promise_until: Time,
     now: Time,
     epoch: u64,
@@ -220,7 +230,12 @@ fn grant_verdict(
         };
     };
     if *granted_epoch == epoch && granted_claimant == claimant {
-        return Verdict::Repeat; // Q2
+        // Q2, or Q16: a resigned pair is never answered again.
+        return if resigned {
+            Verdict::Refuse
+        } else {
+            Verdict::Repeat
+        };
     }
     if epoch <= *granted_epoch {
         return Verdict::Refuse; // Q3: monotone, and one grant per epoch
@@ -249,6 +264,7 @@ impl QuorumState {
                 round_sent_at: Time::ZERO,
                 round_grants: BTreeSet::new(),
                 round_refused: BTreeSet::new(),
+                resigned: false,
             }),
         }
     }
@@ -387,6 +403,7 @@ impl GroupEngine {
         let verdict = grant_verdict(
             leaving,
             q.granted.as_ref(),
+            q.resigned,
             q.grant_promise_until,
             now,
             epoch,
@@ -395,7 +412,10 @@ impl GroupEngine {
         match verdict {
             Verdict::Refuse => return verdict,
             // Q1: the new pair is written down before anything is answered.
-            Verdict::Fresh => q.granted = Some((epoch, claimant.clone())),
+            Verdict::Fresh => {
+                q.granted = Some((epoch, claimant.clone()));
+                q.resigned = false;
+            }
             // Q2: nothing new to write down.
             Verdict::Repeat => {}
         }
@@ -450,7 +470,9 @@ impl GroupEngine {
     /// epoch from it and bids above. A refusal for any other reason stays
     /// silent — a promise to another claimant, a leaving node, a node outside
     /// the roster — because only the epoch floor is something a higher bid can
-    /// clear, and a promise is cleared by time alone.
+    /// clear, and a promise is cleared by time alone. A claim of the exact
+    /// pair that resigned (row Q16) is silent too: re-sent to that claimant,
+    /// the pair would be a grant of its claim.
     fn floor_answer(&self, epoch: u64, claimant: &NodeId) -> Vec<Effect> {
         if self.leaving || !self.is_voter() || *claimant == self.local {
             return Vec::new();
@@ -465,6 +487,9 @@ impl GroupEngine {
         };
         if epoch > *granted_epoch {
             return Vec::new(); // refused on the promise, not on the floor
+        }
+        if epoch == *granted_epoch && claimant == granted_claimant {
+            return Vec::new(); // Q16: the resigned pair itself
         }
         vec![self.send_lead(
             claimant.clone(),
@@ -798,6 +823,7 @@ mod tests {
         grant_verdict(
             false,
             Some(&granted()),
+            false,
             PROMISED_UNTIL,
             Time(now),
             epoch,
@@ -866,7 +892,7 @@ mod tests {
     #[test]
     fn an_empty_ledger_is_gated_only_by_the_blackout() {
         let blackout =
-            |now: u64, until: Time| grant_verdict(false, None, until, Time(now), 1, &n("c"));
+            |now: u64, until: Time| grant_verdict(false, None, false, until, Time(now), 1, &n("c"));
         assert_eq!(blackout(499, Time(500)), Verdict::Refuse);
         assert_eq!(blackout(500, Time(500)), Verdict::Fresh);
         assert_eq!(blackout(0, Time::ZERO), Verdict::Fresh, "attested none");
@@ -888,6 +914,7 @@ mod tests {
                 grant_verdict(
                     true,
                     Some(&granted()),
+                    false,
                     PROMISED_UNTIL,
                     Time(10_000),
                     epoch,
@@ -897,7 +924,15 @@ mod tests {
                 "({epoch}, {claimant})"
             );
             assert_eq!(
-                grant_verdict(true, None, Time::ZERO, Time(10_000), epoch, &n(claimant)),
+                grant_verdict(
+                    true,
+                    None,
+                    false,
+                    Time::ZERO,
+                    Time(10_000),
+                    epoch,
+                    &n(claimant)
+                ),
                 Verdict::Refuse,
                 "({epoch}, {claimant}) with an empty ledger"
             );

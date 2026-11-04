@@ -97,8 +97,8 @@ pub struct RpcConfig {
     /// How long opening a connection to a peer may take before the call
     /// fails [`Unreachable`](crate::RpcError::Unreachable). A call's own
     /// timeout still bounds it (and then fails
-    /// [`Timeout`](crate::RpcError::Timeout)). Nonzero, at most
-    /// [`MAX_TIMEOUT`].
+    /// [`NotSent`](crate::RpcError::NotSent): no connection opened, so
+    /// nothing was sent). Nonzero, at most [`MAX_TIMEOUT`].
     pub connect_timeout: Duration,
     /// How long a connection with no call waiting on it stays open before
     /// the client closes it; the next call reconnects. Nonzero, at most

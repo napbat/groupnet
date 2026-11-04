@@ -693,6 +693,27 @@ refine the sketch above and are now contract:
   durable after the close returned, so the node's next life must not load its
   store before the write has ended. A complete report means that no grant of
   the node can become durable after the close.
+* **A leave resigns** (row Q16, napbat/groupnet#13). `Group::leave` demotes
+  the host on row 15 first. Then the node sends a `LeadResign { epoch, host }`
+  frame to every claim target (every live peer and every voter), with the
+  epoch it gave up (its hostship's, or its standing claim's). A voter whose
+  grant is exactly that pair, and that got the frame from that host, ends its
+  promise at once. It keeps the pair as its floor and never answers it again:
+  no renewal (row Q2) and no floor answer (row Q3a) of it. A node that holds
+  `(epoch, Some(host))` adopts `(epoch, None)`. So a successor wins in one
+  grant round after the leave disseminates, instead of after the promise of
+  each voter ends, which is up to one lease. Fencing does not weaken: the
+  resign leaves only after the host demoted itself, a leaving node never
+  claims or counts a grant again, and no voter re-grants the resigned pair.
+  Nothing is persisted: a voter that restarts recovers the pair and applies
+  the boot blackout, as before. A lost resign costs only time; the promise
+  ends as it did without the row. Under `Settle` and `External` a leave sends
+  no resign (no voter holds a promise; `External` releases at the anchor). The
+  frame is a new kind, so `FRAME_VERSION` is 4 and a node of version 3 is
+  refused. The leave also stamps the time of death of the leaving node's own
+  record, so a digest gossips the leave for `dead_timeout_ms` after it. Before,
+  a node up longer than `dead_timeout_ms` never gossiped its leave, and its
+  peers saw it go only through the failure detector.
 * **Voters and members are different sets, and both directions are legal.** The
   roster names who votes, not who is alive and not who is in the membership
   view. A voter gossip has never shown alive is still sent every claim (claim
@@ -1875,7 +1896,7 @@ and rendezvous ranking already resident in the engine; zero new dependencies.
 
 | Layer | Implemented surface |
 |---|---|
-| `groupnet-core` | `engine/election/`; `Config.mode: GroupMode` (`Eventual` default / `Hosted(HostedConfig)`); wire kinds `KIND_LEAD_CLAIM=8`, `KIND_LEAD_GRANT=9`, `KIND_LEAD_STATE=10` inside `FRAME_VERSION 3`; `Effect::LeadershipChanged`; epoch-major fencing-pair adoption |
+| `groupnet-core` | `engine/election/`; `Config.mode: GroupMode` (`Eventual` default / `Hosted(HostedConfig)`); wire kinds `KIND_LEAD_CLAIM=8`, `KIND_LEAD_GRANT=9`, `KIND_LEAD_STATE=10`, `KIND_LEAD_RESIGN=11` inside `FRAME_VERSION 4`; `Effect::LeadershipChanged`; epoch-major fencing-pair adoption |
 | `groupnet-sim` | leadership-effect dispatch and log, election accessors, and a deterministic in-sim CAS register modeling the external anchor |
 | `groupnet-runtime` | `GroupEvent::LeadershipChanged`, `Group::leadership()`, `Node::join_group_with(name, GroupProfile)`; effect plumbing in `driver.rs`; `GrantStore` and `Anchor` integration |
 | `groupnet-consistency` | `hosted`: `HostedWrites` with leadership-epoch tokens; `HostedReads`; fence surfacing; epoch-stamped `CommitLedger` and service recovery gate |

@@ -144,6 +144,9 @@ pub struct Simulation {
     /// How many floor answers the sim has seen **issued**. See
     /// [`floor_answers_seen`](Self::floor_answers_seen).
     floor_answers: u64,
+    /// How many `LeadResign` frames the sim has seen **issued**. See
+    /// [`resign_frames_seen`](Self::resign_frames_seen).
+    resign_frames: u64,
     /// The **durable** voter ledger this sim keeps on each node's behalf,
     /// written from [`Effect::PersistGrant`] — the store a driver with voter
     /// durability would provide. Keyed by granter, and deliberately *not* held
@@ -201,6 +204,7 @@ impl Simulation {
             claim_frames: 0,
             grant_frames: 0,
             floor_answers: 0,
+            resign_frames: 0,
             persisted_grants: BTreeMap::new(),
             grant_log: Vec::new(),
             anchor: AnchorModel::default(),
