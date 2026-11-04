@@ -125,7 +125,7 @@ impl<B: BulkTransport> RpcClient<B> {
     ///
     /// The server receives the remaining budget, in whole milliseconds rounded
     /// up, as the request's deadline and drops the work once it passes. A
-    /// zero `timeout` fails [`Timeout`](RpcError::Timeout) without sending. A
+    /// zero `timeout` fails [`NotSent`](RpcError::NotSent) without sending. A
     /// timeout above [`MAX_TIMEOUT`](crate::MAX_TIMEOUT) — the longest the
     /// wire's `u32` milliseconds carry, about 49.7 days — saturates to it; the
     /// difference is unobservable, and no timeout overflows the clock.
@@ -134,11 +134,14 @@ impl<B: BulkTransport> RpcClient<B> {
     ///
     /// # Errors
     /// See [`RpcError`]: [`TooLarge`](RpcError::TooLarge),
-    /// [`Saturated`](RpcError::Saturated) and
-    /// [`Unreachable`](RpcError::Unreachable) mean the request was not sent;
+    /// [`Saturated`](RpcError::Saturated),
+    /// [`Unreachable`](RpcError::Unreachable) and
+    /// [`NotSent`](RpcError::NotSent) mean the request was not sent;
     /// [`Timeout`](RpcError::Timeout) and
     /// [`ConnectionLost`](RpcError::ConnectionLost) mean its outcome is
-    /// unknown; [`Remote`](RpcError::Remote) carries the handler's error.
+    /// unknown; [`Remote`](RpcError::Remote) carries the handler's error. A
+    /// timeout that ends before the request is sent, also during the connect,
+    /// is [`NotSent`](RpcError::NotSent), never [`Timeout`](RpcError::Timeout).
     pub async fn call(
         &self,
         to: &NodeId,
@@ -156,12 +159,12 @@ impl<B: BulkTransport> RpcClient<B> {
         // deadline below then always fits the monotonic clock and the wire.
         let timeout = timeout.min(MAX_TIMEOUT);
         if timeout.is_zero() {
-            return Err(RpcError::Timeout);
+            return Err(RpcError::NotSent);
         }
         let deadline = Instant::now() + timeout;
         let peer = inner.peer(to)?;
         let _slot = match timeout_at(deadline, peer.in_flight.clone().acquire_owned()).await {
-            Err(_) => return Err(RpcError::Timeout),
+            Err(_) => return Err(RpcError::NotSent),
             Ok(Err(_closed)) => return Err(RpcError::Shutdown),
             Ok(Ok(slot)) => slot,
         };
@@ -180,7 +183,7 @@ impl<B: BulkTransport> RpcClient<B> {
             let remaining = deadline.saturating_duration_since(Instant::now());
             // An expired budget is not sent: the wire carries no zero deadline.
             let Some(deadline_ms) = wire_deadline_ms(remaining) else {
-                return Err(RpcError::Timeout);
+                return Err(RpcError::NotSent);
             };
             let frame = Frame::Request {
                 id,
@@ -188,8 +191,10 @@ impl<B: BulkTransport> RpcClient<B> {
                 payload: payload.clone(),
             }
             .encode();
+            // A send that the deadline cancels leaves the frame out of the
+            // queue: unsent.
             match timeout_at(deadline, conn.frames.send(frame)).await {
-                Err(_) => return Err(RpcError::Timeout),
+                Err(_) => return Err(RpcError::NotSent),
                 // The writer is gone and never took the frame: unsent.
                 Ok(Err(_)) => continue,
                 Ok(Ok(())) => {}
@@ -271,7 +276,8 @@ impl<B: BulkTransport> Inner<B> {
         Ok(peer)
     }
 
-    /// The peer's live connection, dialing one if there is none.
+    /// The peer's live connection, dialing one if there is none. A deadline
+    /// that ends first is [`RpcError::NotSent`]: nothing was sent.
     async fn connection(
         &self,
         to: &NodeId,
@@ -282,7 +288,7 @@ impl<B: BulkTransport> Inner<B> {
             return Ok(conn);
         }
         let Ok(_dialing) = timeout_at(deadline, peer.dialing.lock()).await else {
-            return Err(RpcError::Timeout);
+            return Err(RpcError::NotSent);
         };
         if let Some(conn) = peer.live() {
             return Ok(conn);
@@ -296,7 +302,9 @@ impl<B: BulkTransport> Inner<B> {
             Ok(Ok(stream)) => stream,
             Ok(Err(_)) => return Err(RpcError::Unreachable),
             Err(_) if connect_by <= deadline => return Err(RpcError::Unreachable),
-            Err(_) => return Err(RpcError::Timeout),
+            // The call's own deadline ended during the connect: no
+            // connection opened, so nothing was sent (napbat/groupnet#12).
+            Err(_) => return Err(RpcError::NotSent),
         };
         let conn = Arc::new(Conn::spawn(stream, &self.config));
         let mut slot = lock(&peer.conn);

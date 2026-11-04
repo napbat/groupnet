@@ -8,10 +8,14 @@
 //! * a server killed mid-call fails that call `ConnectionLost`, and a
 //!   restarted server is reached by the next call over a fresh connection;
 //! * an unregistered peer is `Unreachable`;
+//! * a call whose timeout ends during the connect, or while it waits for
+//!   another call's dial, is `NotSent`, not `Timeout`: no connection opened,
+//!   so nothing was sent (napbat/groupnet#12);
 //! * a shut-down client fails in-flight and later calls `Shutdown`; a
 //!   shut-down server drops its connections and is no longer reachable.
 //!
-//! All waiting is a bounded poll (`eventually`), never a bare sleep.
+//! All waiting is a bounded poll (`eventually`) or paused time, never a bare
+//! sleep.
 
 use std::io;
 use std::sync::Arc;
@@ -208,6 +212,66 @@ async fn an_unregistered_peer_is_unreachable() {
             .call(&NodeId::new("nobody"), Bytes::from_static(b"hi"), CALL)
             .await,
         Err(RpcError::Unreachable)
+    );
+}
+
+/// A client endpoint whose connect never completes: it reports each dial on
+/// `dials` and then holds it, as a Windows loopback connect to a closed port
+/// holds for about two seconds before it is refused.
+#[derive(Debug)]
+struct Held {
+    dials: mpsc::UnboundedSender<()>,
+}
+
+impl BulkTransport for Held {
+    type Error = io::Error;
+    type Stream = <MemBulkTransport as BulkTransport>::Stream;
+
+    fn connect(&self, _to: &NodeId) -> impl Future<Output = io::Result<Self::Stream>> + Send {
+        let _ = self.dials.send(());
+        std::future::pending()
+    }
+
+    fn accept(&self) -> impl Future<Output = io::Result<(NodeId, Self::Stream)>> + Send {
+        std::future::pending()
+    }
+}
+
+/// napbat/groupnet#12: a call whose own timeout ends before the connect
+/// completes sent nothing, so it answers `NotSent`. A caller can then tell it
+/// from a sent request whose outcome is unknown (`Timeout`). The connect
+/// timeout ending first stays `Unreachable`, and a call that waits for the
+/// dial of another call and runs out of time first is `NotSent` too.
+#[tokio::test(start_paused = true)]
+async fn a_deadline_that_ends_during_the_connect_is_not_sent() {
+    let (dials, mut on_dial) = mpsc::unbounded_channel();
+    let client = RpcClient::new(DataPlane::new(Held { dials }));
+    let to = NodeId::new("s");
+    let short = Duration::from_secs(1);
+
+    // The default connect timeout (3 s) is longer than the call's timeout.
+    assert_eq!(
+        client.call(&to, Bytes::from_static(b"hi"), short).await,
+        Err(RpcError::NotSent)
+    );
+
+    // A call with a longer timeout holds the dial; a second call waits for it.
+    let dialing = tokio::spawn({
+        let client = client.clone();
+        let to = to.clone();
+        async move { client.call(&to, Bytes::from_static(b"hi"), CALL).await }
+    });
+    on_dial.recv().await.expect("the short call dialed");
+    on_dial.recv().await.expect("the long call dials");
+    assert_eq!(
+        client.call(&to, Bytes::from_static(b"hi"), short).await,
+        Err(RpcError::NotSent),
+        "the call ran out of time while another call dialed"
+    );
+    assert_eq!(
+        dialing.await.expect("call task"),
+        Err(RpcError::Unreachable),
+        "the connect timeout ended first"
     );
 }
 
