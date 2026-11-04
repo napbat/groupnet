@@ -389,7 +389,10 @@ pub struct Config {
     /// How many indirect probers to enlist when a direct probe goes
     /// unanswered. They are drawn at random (from a deterministic per-node
     /// stream) among the live members other than the target, so indirect
-    /// probe load spreads evenly over the group.
+    /// probe load spreads evenly over the group. A member that still misses
+    /// is suspected and told so at once by a one-line digest; a live one
+    /// refutes and answers the same way, so a false suspicion clears at its
+    /// source within a round trip.
     pub indirect_probes: NonZeroUsize,
     /// How many peers each gossip round sends a digest to. A targeted pull
     /// needs far less redundancy than a blind push, so 1–2 is plenty; the
@@ -425,17 +428,19 @@ pub struct Config {
     pub full_digest_every: NonZeroU64,
     /// The most member summaries one digest lists. A full digest leads with
     /// up to half the window of the members whose summary changed since the
-    /// last digest to that peer (the local member first, then the most
-    /// recently changed), then fills the rest from a **rolling window** over
-    /// the members that resumes, digest after digest, where the previous full
-    /// digest to that peer stopped. So a peer sees every member over
-    /// `⌈N / digest_window⌉` full digests of a quiet group and
-    /// `⌈N / ⌈digest_window / 2⌉⌉` of a busy one, and a receiver that lacks a
-    /// member learns it within that many full digests from any peer that has
-    /// it. A delta digest that would list more than the window is built full
-    /// instead, so no digest's size grows with the group beyond this window
-    /// (`29 + id length` bytes per summary). A group no larger than the
-    /// window lists everyone in every full digest. Default: 64.
+    /// last digest to that peer — the local member first, then members whose
+    /// liveness changed within the last `⌊log2 N⌋ + 2` gossip rounds, then
+    /// the most recently changed — so suspicions, refutations and deaths
+    /// cross the group however busy the entries are. It fills the rest from a
+    /// **rolling window** over the members that resumes, digest after digest,
+    /// where the previous full digest to that peer stopped. So a peer sees
+    /// every member over `⌈N / digest_window⌉` full digests of a quiet group
+    /// and `⌈N / ⌈digest_window / 2⌉⌉` of a busy one, and a receiver that
+    /// lacks a member learns it within that many full digests from any peer
+    /// that has it. A delta digest that would list more than the window is
+    /// built full instead, so no digest's size grows with the group beyond
+    /// this window (`29 + id length` bytes per summary). A group no larger
+    /// than the window lists everyone in every full digest. Default: 64.
     pub digest_window: NonZeroUsize,
     /// This group's consistency posture. Defaults to
     /// [`GroupMode::Eventual`] — metadata and membership only, no election.

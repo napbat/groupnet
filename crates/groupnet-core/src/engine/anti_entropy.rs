@@ -95,15 +95,20 @@ impl GroupEngine {
     ///
     /// A peer's first digest, every `full_digest_every`-th after it, and any
     /// delta that would list more than the window are **full**. A full
-    /// digest leads with up to half the window of those changed members —
-    /// the local member first, then the most recently changed — so fresh
-    /// news keeps riding every digest, and fills the rest from a rolling
-    /// window over the gossipable members that resumes after the last member
-    /// the previous full digest to this peer walked past. The first window
-    /// starts at an offset hashed from the pair, so a node's peers learn
-    /// different slices of its view first. Each full digest walks at least
-    /// `⌈window / 2⌉` members, so a receiver that lacks a member learns it
-    /// within `⌈N / ⌈window / 2⌉⌉` full digests from any peer that has it —
+    /// digest leads with up to half the window of those changed members:
+    /// the local member first, then members whose liveness (incarnation or
+    /// status) changed within the last [`liveness_hot_ms`](Self::liveness_hot_ms),
+    /// most recent first, then the most recently changed. Liveness news so
+    /// rides every digest for long enough to cross the group however busy
+    /// the entries are — a suspicion reaches its subject, and the refutation
+    /// its suspecters, before entry churn can bury them — and entry news
+    /// rides the rest. The digest fills up from a rolling window over the
+    /// gossipable members that resumes after the last member the previous
+    /// full digest to this peer walked past. The first window starts at an
+    /// offset hashed from the pair, so a node's peers learn different slices
+    /// of its view first. Each full digest walks at least `⌈window / 2⌉`
+    /// members, so a receiver that lacks a member learns it within
+    /// `⌈N / ⌈window / 2⌉⌉` full digests from any peer that has it —
     /// `⌈N / window⌉` when nothing changed since the previous one.
     ///
     /// The cursor advances on build, not delivery: anything a dropped frame,
@@ -136,9 +141,19 @@ impl GroupEngine {
             return (summaries, false, peer);
         }
 
-        // Lead: the local member, then the freshest changes, at most half
-        // the window — the rest is the rolling walk's, so it always advances.
-        listed.sort_unstable_by_key(|(node, m)| (**node != self.local, Reverse(m.changed_at)));
+        // Lead: the local member, then hot liveness news, then the freshest
+        // changes, at most half the window — the rest is the rolling walk's,
+        // so it always advances.
+        let hot_ms = self.liveness_hot_ms();
+        listed.sort_unstable_by_key(|(node, m)| {
+            let hot = now.0.saturating_sub(m.liveness_since.0) < hot_ms;
+            (
+                **node != self.local,
+                !hot,
+                Reverse(if hot { m.liveness_since } else { Time::ZERO }),
+                Reverse(m.changed_at),
+            )
+        });
         listed.truncate(window / 2);
         let lead = listed.len();
         let ring: Vec<(&NodeId, &Member)> = gossipable().collect();
@@ -166,6 +181,14 @@ impl GroupEngine {
         (summaries, true, peer)
     }
 
+    /// How long a liveness change stays hot — leads every full digest — at
+    /// this node: `⌊log2 N⌋ + 2` gossip rounds for `N` known members, the
+    /// rounds push gossip needs to carry it across the group.
+    pub(super) fn liveness_hot_ms(&self) -> u64 {
+        let rounds = u64::from(self.members.len().bit_width()) + 1;
+        self.config.gossip_interval_ms.saturating_mul(rounds)
+    }
+
     /// One member's digest line.
     fn summary(&self, node: &NodeId, m: &Member, now: Time) -> wire::NodeDigest {
         wire::NodeDigest {
@@ -175,6 +198,35 @@ impl GroupEngine {
             max_version: m.max_state_version,
             content_hash: self.content_hash(m, now),
         }
+    }
+
+    /// A one-line digest telling `to` how this node holds `about` — the
+    /// accusation a suspecter sends its subject, and the subject's answer
+    /// carrying its refutation back. One hop each way, so a false suspicion
+    /// is refuted at the node that raised it within a round trip instead of
+    /// waiting for gossip to carry it there and back. `None` when `about` is
+    /// unknown.
+    pub(super) fn liveness_notice(
+        &mut self,
+        to: NodeId,
+        about: &NodeId,
+        now: Time,
+    ) -> Option<Effect> {
+        let m = self.members.get(about)?;
+        let wire = wire::encode(&wire::Frame {
+            kind: wire::Kind::Digest,
+            group: self.group.clone(),
+            target: None,
+            digest: vec![self.summary(about, m, now)],
+            wants: Vec::new(),
+            members: Vec::new(),
+            metadata: Vec::new(),
+            lead: None,
+        });
+        self.stats.digest_frames_sent += 1;
+        self.stats.digest_bytes_sent += wire.len() as u64;
+        self.stats.anti_entropy_bytes_sent += wire.len() as u64;
+        Some(Effect::Send { to, wire })
     }
 
     /// Picks `gossip_fanout` distinct peers, rotating a cursor so every
@@ -248,14 +300,20 @@ impl GroupEngine {
 
     /// Merges a peer's digest: reconcile liveness and metadata directly, then
     /// request whatever entries we're behind on and offer whatever we're ahead
-    /// on.
+    /// on. A digest that made us refute a suspicion of ourselves is answered
+    /// at once with our new summary, so its sender stops doubting us now.
     pub(super) fn on_digest(
         &mut self,
         from: &NodeId,
         frame: &wire::Frame,
         now: Time,
     ) -> Vec<Effect> {
+        let incarnation = self.incarnation;
         let mut effects = self.merge_digest_liveness(&frame.digest, now);
+        if self.incarnation > incarnation {
+            let me = self.local.clone();
+            effects.extend(self.liveness_notice(from.clone(), &me, now));
+        }
         effects.extend(self.merge_metadata(frame.metadata.clone()));
 
         let mut wants: Vec<wire::NodeWant> = Vec::new();

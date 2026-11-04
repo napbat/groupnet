@@ -1,5 +1,6 @@
 //! State dissemination tests: digests, deltas, entries, eager push.
 
+use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use groupnet_core::{Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, wire};
@@ -753,5 +754,52 @@ fn restart_adopts_echoed_entries_for_unauthored_keys() {
     assert_eq!(
         a.node_entry(&NodeId::new("a"), "addr"),
         Some(&b"10.0.0.2"[..])
+    );
+}
+
+/// A node that knows 1,000 members never lists more than
+/// `Config::digest_window` of them in a digest, and its full digests' rolling
+/// windows — each starting at its own peer's offset — still list every member
+/// over a few hundred rounds.
+#[test]
+fn digests_of_a_thousand_members_stay_within_the_window() {
+    let config = Config {
+        probe_interval_ms: 1_000_000,
+        ..Config::default()
+    };
+    let window = config.digest_window.get();
+    let mut a = GroupEngine::new(GroupId::new(TEST_GROUP), NodeId::new("a"), [], config)
+        .expect("valid config");
+    let peers: Vec<NodeId> = (0..999).map(|i| NodeId::new(format!("p{i:03}"))).collect();
+    learn_peers(&mut a, &peers, Time(0));
+    a.start(Time(0));
+
+    let mut listed: BTreeSet<NodeId> = BTreeSet::new();
+    for round in 1..=600 {
+        for effect in a.on_tick(Time(round * 200)) {
+            let Effect::Send { wire, .. } = effect else {
+                continue;
+            };
+            if let Some(frame) = wire::decode(&wire).filter(|f| f.kind == wire::Kind::Digest) {
+                assert!(
+                    frame.digest.len() <= window,
+                    "{} summaries",
+                    frame.digest.len()
+                );
+                listed.extend(frame.digest.into_iter().map(|d| d.node));
+            }
+        }
+    }
+    let stats = a.net_stats();
+    assert!(stats.max_digest_summaries <= window as u64);
+    assert!(
+        stats.digests_built >= 1_000,
+        "{} digests",
+        stats.digests_built
+    );
+    assert_eq!(
+        listed.len(),
+        1_000,
+        "the rolling windows cover every member"
     );
 }

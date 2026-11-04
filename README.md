@@ -1418,15 +1418,21 @@ The load-bearing facts:
   group. Per-peer delta digests (`full_digest_every`, default 4) list only
   members whose summary changed since the last digest built for that peer,
   so a quiet cluster's rounds cost near zero and a busy one's cost tracks
-  churn. A *full* digest leads with up to half the window of fresh changes
-  and fills the rest from a rolling window over the members that resumes
-  where the previous full digest to that peer stopped, so every member is
-  listed over `⌈N / ⌈window / 2⌉⌉` full digests at worst — the repair bound
-  for anything a dropped frame or TTL drift left divergent. The price is
-  cold-boot convergence: a node learns at most one window of members per
-  digest (300 nodes booting from three seeds converge in 34 rounds at window
-  64, 7 with an unbounded window); raise `digest_window` if that matters
-  more than digest size.
+  churn. A *full* digest leads with up to half the window of fresh changes —
+  the sender itself, then liveness news (suspicions, refutations, deaths) for
+  `⌊log2 N⌋ + 2` rounds, then the latest entry changes — and fills the rest
+  from a rolling window over the members that resumes where the previous full
+  digest to that peer stopped, so every member is listed over
+  `⌈N / ⌈window / 2⌉⌉` full digests at worst — the repair bound for anything a
+  dropped frame or TTL drift left divergent. In a large group a node meets a
+  given peer only every `N / gossip_fanout` rounds, so under steady entry
+  churn the changes since its last digest to that peer exceed the window and
+  nearly every digest is full; that is the window doing its job, not a
+  fallback. The price is cold-boot convergence from a few seeds: a node
+  learns at most one window of members per digest (300 nodes booting from
+  three seeds converge in 34 rounds at window 64, 7 with an unbounded window;
+  200 nodes that all seed each other converge in 2.5 s under entry churn). Raise
+  `digest_window` if that matters more than digest size.
 * **Watch it, don't guess.** `Group::net_stats()` exposes digests built,
   full digests, summaries listed, the largest digest, digest and delta/request
   frames, and anti-entropy bytes. If `digest_summaries_listed / digests_built`
@@ -1440,7 +1446,10 @@ The load-bearing facts:
   and indirect probers are drawn at random among live peers, so no member
   carries the group's probe traffic (64 nodes under 20% loss: the busiest
   receives 1.2× the mean indirect probe load, where lowest-id probers took
-  31×).
+  31×). A node that suspects a member tells it directly, and the member
+  answers with its refutation, so a false suspicion clears at its source
+  within a round trip rather than when gossip happens to carry it there and
+  back.
 * Groups within a fabric are cheap and independent: the intended shape for a
   big system is many small shard groups (replica sets) plus one membership
   fabric per cell, with an authoritative store owning cross-cell placement.

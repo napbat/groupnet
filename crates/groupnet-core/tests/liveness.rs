@@ -61,6 +61,72 @@ fn two_node_probe_leads_to_suspect_then_dead() {
     assert!(!a.members().any(|n| *n == NodeId::new("b")));
 }
 
+/// The digest frames in `effects` sent to `to`, decoded.
+fn digests_to(effects: &[Effect], to: &str) -> Vec<wire::Frame> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send { to: dest, wire } if *dest == NodeId::new(to) => wire::decode(wire),
+            _ => None,
+        })
+        .filter(|f| f.kind == wire::Kind::Digest)
+        .collect()
+}
+
+/// A suspecter tells its subject at once, and a live subject answers with
+/// its refutation, which clears the suspicion at its source — one round trip,
+/// no gossip round in between.
+#[test]
+fn a_suspecter_tells_its_subject_and_the_refutation_answers_it() {
+    let cfg = Config {
+        probe_interval_ms: 100,
+        probe_timeout_ms: 50,
+        suspect_timeout_ms: 200,
+        gossip_interval_ms: 1_000_000,
+        ..Config::default()
+    };
+    let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], cfg.clone())
+        .expect("valid config");
+    let mut b =
+        GroupEngine::new(GroupId::new("g"), NodeId::new("b"), [], cfg).expect("valid config");
+    a.on_message(
+        NodeId::new("b"),
+        &digest_frame(vec![ndigest("b", 0, Status::Alive, 0)], vec![]),
+        Time(1),
+    );
+    a.start(Time(1));
+    b.start(Time(1));
+
+    a.on_tick(Time(101)); // the direct probe, which "b" never answers
+    let effects = a.on_tick(Time(160)); // no prober to ask: suspect
+    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Suspect));
+    // The suspicion also nudges a gossip round; the accusation is the
+    // one-line digest naming b alone.
+    let b_suspect = |f: &wire::Frame| {
+        matches!(&f.digest[..], [d] if d.node == NodeId::new("b")
+            && d.status == Status::Suspect.to_wire())
+    };
+    let accusation = digests_to(&effects, "b")
+        .into_iter()
+        .find(b_suspect)
+        .expect("an accusation naming b Suspect");
+
+    let answer = b.on_message(NodeId::new("a"), &wire::encode(&accusation), Time(170));
+    let reply = digests_to(&answer, "a")
+        .into_iter()
+        .find(|f| {
+            matches!(&f.digest[..], [d] if d.node == NodeId::new("b")
+                && d.status == Status::Alive.to_wire() && d.incarnation == 1)
+        })
+        .expect("b answers with its refutation");
+    a.on_message(NodeId::new("b"), &wire::encode(&reply), Time(180));
+    assert_eq!(
+        a.member_status(&NodeId::new("b")),
+        Some(Status::Alive),
+        "the refutation cleared the suspicion before any gossip round"
+    );
+}
+
 #[test]
 fn direct_miss_escalates_to_indirect_before_suspecting() {
     let cfg = Config {

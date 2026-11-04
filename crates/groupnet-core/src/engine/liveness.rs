@@ -67,6 +67,9 @@ impl GroupEngine {
         }
     }
 
+    /// Marks `target` `Suspect` and tells it so directly (a one-line digest),
+    /// so a live target refutes within a round trip — its answer comes back
+    /// the same way — rather than when gossip happens to reach it.
     pub(super) fn suspect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
         let became_suspect = match self.members.get_mut(target) {
             Some(m) if m.status == Status::Alive => {
@@ -82,10 +85,13 @@ impl GroupEngine {
         self.stamp(target);
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
+        effects.extend(self.liveness_notice(target.clone(), target, now));
         self.nudge_anti_entropy();
         effects
     }
 
+    /// Declares suspects past their window `Dead`, telling each so directly
+    /// like [`suspect`](Self::suspect) does: a live one refutes and answers.
     pub(super) fn reap_suspects(&mut self, now: Time) -> Vec<Effect> {
         let timeout = self.config.suspect_timeout_ms;
         let dead: Vec<NodeId> = self
@@ -110,6 +116,9 @@ impl GroupEngine {
         }
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
+        for node in dead {
+            effects.extend(self.liveness_notice(node.clone(), &node, now));
+        }
         self.nudge_anti_entropy();
         effects
     }
