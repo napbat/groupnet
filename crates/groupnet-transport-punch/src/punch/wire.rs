@@ -13,10 +13,10 @@ use super::candidates::{Candidates, MAX_CANDIDATES, valid};
 
 pub(super) const MAX_PACKET: usize = 1200;
 const TAG: usize = 32;
-const MAGIC: &[u8; 4] = b"GNP4";
+const MAGIC: &[u8; 4] = b"GNP1";
 pub(super) type Session = [u8; 16];
 
-/// The fixed prefix before the variable-length sender in the GNP4 envelope.
+/// The fixed prefix before the variable-length sender in the GNP1 envelope.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct EnvelopeHeader {

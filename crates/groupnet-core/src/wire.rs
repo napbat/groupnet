@@ -257,8 +257,9 @@ pub struct Frame {
 /// Protocol version, the first byte of every frame. Every peer in a cluster
 /// runs the same build, so this is not a compatibility mechanism: it is a guard
 /// that makes a mis-deployed node's frames undecodable instead of misparsed.
-/// Frame bodies may change freely; any change to a kind or body bumps it.
-const FRAME_VERSION: u8 = 4;
+/// Frame bodies may change freely; the version stays 1 until the first
+/// deployment.
+const FRAME_VERSION: u8 = 1;
 
 const KIND_DIGEST: u8 = 1;
 const KIND_PING: u8 = 2;

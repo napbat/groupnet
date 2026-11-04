@@ -65,12 +65,12 @@ async fn stalled_and_malformed_handshakes_never_block_or_fail_accepts() {
     let server = server(TcpBulkConfig::default()).await;
     let address = server.local_addr().expect("address");
     // Accepted ahead of the real client: one never speaks, one overstates
-    // its id in an otherwise valid open hello (`GNBH`, version 2, open).
+    // its id in an otherwise valid open hello (`GNBH`, version 1, open).
     // Neither may delay the next accept or surface as its error.
     let _stalled = TcpStream::connect(address).await.expect("stalled");
     let mut malformed = TcpStream::connect(address).await.expect("malformed");
     malformed
-        .write_all(&[b'G', b'N', b'B', b'H', 2, 0, 0xff, 0xff, 0xff, 0xff])
+        .write_all(&[b'G', b'N', b'B', b'H', 1, 0, 0xff, 0xff, 0xff, 0xff])
         .await
         .expect("oversized id length");
     connect_and_accept(&client(&server, "client"), &server).await;

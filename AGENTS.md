@@ -40,11 +40,16 @@ the `consistency` + `acks` tiers deeply). Their needs are documented in
   build; groupnet keeps no compatibility with any other peer version (older
   or newer). Frame bodies, frame kinds and bulk/handoff codecs may change
   freely — never add capability negotiation, version gates or fallbacks for
-  another peer version. `FRAME_VERSION` (and each codec's own version byte)
-  stays only as a guard that rejects a mis-deployed node's frames instead of
-  misparsing them; bump it whenever a kind or body changes. Decoders still
-  fail closed on malformed or unknown bytes. Persisted formats keep their
-  migration paths.
+  another peer version. `FRAME_VERSION` (and each codec's own version byte
+  or magic) stays only as a guard that rejects a mis-deployed node's frames
+  instead of misparsing them. Decoders fail closed on malformed or unknown
+  bytes.
+- **Format versions are 1 until the first deployment.** Every format version
+  (persisted and wire, including `FRAME_VERSION` and each codec's version
+  byte or magic) is 1 until the first deployment. Before that, a layout
+  change keeps version 1 and adds no reader for old data. The first
+  deployment freezes version 1; after it, a layout change raises the version
+  and refuses the old one.
 
 ## Engineering rules (owner-set, 2026-08-05)
 

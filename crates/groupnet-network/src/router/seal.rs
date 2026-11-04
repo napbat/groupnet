@@ -3,7 +3,7 @@
 //!
 //! A sealing router seals every complete envelope it sends, adverts and data
 //! alike, before fragmentation: it rewrites the envelope magic from the open
-//! `GNR4` to the sealed `GNS2` and appends a [`TAG_LEN`]-byte HMAC over the
+//! `GNR1` to the sealed `GNS1` and appends a [`TAG_LEN`]-byte HMAC over the
 //! domain label, its own node id and the sealed envelope. A forwarding router
 //! decrements the hop count and seals again under its own id. An envelope
 //! larger than a link's MTU leaves as `GNT1` fragments, each with its own
@@ -166,7 +166,7 @@ mod tests {
     fn a_seal_opens_only_for_its_sender_and_secret() {
         let sealing = keyed(1);
         let frame = sealed(&sealing, "a");
-        assert_eq!(&frame[..4], b"GNS2");
+        assert_eq!(&frame[..4], b"GNS1");
         let length = sealing.open(&NodeId::new("a"), &frame).expect("valid seal");
         assert_eq!(length, frame.len() - TAG_LEN);
         let Ok(Frame::Advert { path, .. }) =

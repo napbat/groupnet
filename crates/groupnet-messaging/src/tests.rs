@@ -228,7 +228,7 @@ async fn ack_requires_exact_source_and_identity_and_ignores_malformed_data() -> 
         &messages.inner,
         ApplicationPacket {
             from: target.clone(),
-            payload: Bytes::from_static(b"GNA2\xffmalformed"),
+            payload: Bytes::from_static(b"GNA1\xffmalformed"),
         },
     );
     assert!(messages.inner.receiver.lock().await.try_recv().is_err());

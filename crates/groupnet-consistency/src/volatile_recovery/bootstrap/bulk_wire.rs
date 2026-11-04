@@ -22,10 +22,9 @@ pub use transport::{
 };
 
 const MAGIC: [u8; 4] = *b"GBST";
-// Peers upgrade together: this byte only rejects a mis-deployed peer, and it
-// is bumped whenever a frame body changes. Version two binds complete presence
-// identities instead of transient claims in Offer and Barrier.
-const VERSION: u8 = 2;
+// Peers upgrade together: this byte only rejects a mis-deployed peer. It stays
+// 1 until the first deployment.
+const VERSION: u8 = 1;
 // Magic/version/kinds, four string lengths, two claim IDs, two operations,
 // and the payload length. Variable strings and payload are charged separately.
 const FIXED_BYTES: usize = 8 + 4 * 2 + 2 * (16 + 8 + 8) + 2 * (16 + 8 + 8 + 8) + 4;

@@ -57,8 +57,8 @@ bytes. This is not a guarantee of availability through arbitrary outages.
 ### Reliable stream contract
 
 - Bounded ordered segments use cumulative acknowledgements and receive credit.
-  Every reliability packet starts with tunnel version byte `3` (also the
-  `GN-TUNNEL-3` preamble); other versions are discarded, never misparsed.
+  Every reliability packet starts with tunnel version byte `1` (also the
+  `GN-TUNNEL-1` preamble); other versions are discarded, never misparsed.
 - Credit is counted in bytes of retained segment cost: each segment costs its
   ciphertext plus the 38-byte reliability header. Every packet carries a `u32`
   credit relative to its cumulative acknowledgement. A sender keeps the cost of
@@ -235,7 +235,7 @@ shared unordered protocol engine behind the generic `Endpoint<P>` handle.
 Pinned TLS is used only for setup and lifetime binding. Its setup accept queues
 are distinct from ordered application accepts and demultiplexed by the bound
 reliable/unreliable policy, so concurrent accepts cannot steal a different
-policy's session. The authenticated `GN-TUNNEL-3` preamble selects the namespace;
+policy's session. The authenticated `GN-TUNNEL-1` preamble selects the namespace;
 unknown namespaces fail closed. Both peers must resolve the unordered protocol
 and explicitly permit the requested policy in node-wide `UnorderedConfig`;
 there is no silent downgrade. Binding an endpoint or peer opens no connection.
@@ -464,8 +464,8 @@ routing authentication is not confidentiality: use pinned TLS tunnels for
 protected application bytes. Shared-key holders are trusted and can impersonate
 routing aliases; the fabric is not Byzantine-safe.
 
-The native UDP format is `GNP4`; TCP frames use version 2. Each rendezvous and
-its endpoints must upgrade together. Earlier formats and authentication-mode
+The native UDP format is `GNP1`; TCP frames use version 1. Each rendezvous and
+its endpoints must upgrade together. Other versions and authentication-mode
 mismatches are rejected without compatibility fallback.
 
 ### Cluster secret on plain links and the TCP data plane
@@ -482,7 +482,7 @@ shown by `Debug`) closes both doors without a rendezvous or certificates:
 
 - `RouterConfig::cluster_secret` seals every router frame, adverts and data
   alike, with an HMAC-SHA256 tag over the sending node's id and the whole
-  envelope (magic `GNS2` instead of the open `GNR4`), before fragmentation. A
+  envelope (magic `GNS1` instead of the open `GNR1`), before fragmentation. A
   frame larger than a link's MTU leaves as `GNT1` fragments, each tagged on
   its own (another domain label, the sending node's id, the fragment header
   and the chunk). The receiving router verifies, in constant time and against
@@ -510,7 +510,7 @@ shown by `Debug`) closes both doors without a rendezvous or certificates:
   expired therefore does not bring the route back, and one replayed from an
   older boot cannot displace the neighbor's live boot.
 - `TcpBulkConfig::secret` (and `TcpBulkTransport::dial_only_with` for clients)
-  turns the versioned data-plane handshake (`GNBH`, version 2) into a mutual
+  turns the versioned data-plane handshake (`GNBH`, version 1) into a mutual
   challenge. The dialer sends its id and a fresh 32-byte nonce; the acceptor
   answers with its id, its own fresh nonce and an HMAC over the protocol
   label, the version, its role, both nonces and both ids; the dialer checks
@@ -521,7 +521,7 @@ shown by `Debug`) closes both doors without a rendezvous or certificates:
   `TcpBulkConfig::handshake_timeout` (5 s for dial-only clients); a dial whose
   peer accepts and never answers fails with `TimedOut`. Every refusal or
   timeout closes the connection and counts in `TcpBulkTransport::auth_failures`.
-  The unversioned handshake (version 1, a bare id field) is refused.
+  A hello with any other version is refused.
 
 Keyed and unkeyed nodes refuse each other in both directions, and there is no
 fallback to unauthenticated peers. The secret proves cluster membership, not

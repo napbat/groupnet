@@ -9,7 +9,7 @@ use super::{
 };
 use crate::NodeId;
 
-const MAGIC: &[u8; 4] = b"VBC2";
+const MAGIC: &[u8; 4] = b"VBC1";
 const PRESENCE_MAGIC: &[u8; 4] = b"VBP1";
 
 /// A bootstrap claim key or value is invalid or exceeds its declared bound.
@@ -600,7 +600,7 @@ mod tests {
             Err(ClaimCodecError::Bound)
         );
         let mut bad_version = bytes;
-        bad_version[3] = b'1';
+        bad_version[3] = b'2';
         assert_eq!(
             decode_claim_value(
                 &scope(),

@@ -117,7 +117,7 @@ shares a bounded queue and cancellation lifecycle. `RouterConfig::max_protocols`
 and `protocol_queue` default to 32 namespaces and 128 packets per namespace;
 unknown namespaces fail closed.
 The router neither decodes protocol bodies nor interprets their ACKs.
-`GNR4` carries the protocol ID (`GNS2` when the envelope is sealed under
+`GNR1` carries the protocol ID (`GNS1` when the envelope is sealed under
 `RouterConfig::cluster_secret`, with `GNT1` fragments that each carry their own
 tag; see [cluster secret](tunnels-and-security.md#cluster-secret-on-plain-links-and-the-tcp-data-plane));
 communicating nodes must upgrade together.

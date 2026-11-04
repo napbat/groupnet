@@ -16,11 +16,11 @@ pub(crate) const MAX_FRAME: usize = 65_000;
 pub(crate) const MAX_HOPS: u8 = 16;
 
 /// Magic of an envelope sent by a router without a cluster secret.
-pub(crate) const OPEN: [u8; 4] = *b"GNR4";
+pub(crate) const OPEN: [u8; 4] = *b"GNR1";
 
 /// Magic of an envelope sealed under a cluster secret (`router::seal`); the
 /// seal follows the envelope.
-pub(crate) const SEALED: [u8; 4] = *b"GNS2";
+pub(crate) const SEALED: [u8; 4] = *b"GNS1";
 
 /// Magic of a fragment sent by a router without a cluster secret.
 pub(crate) const OPEN_FRAGMENT: [u8; 4] = *b"GNF1";
@@ -600,17 +600,14 @@ mod tests {
         for end in 0..envelope.len() - 1 {
             assert!(decode(&envelope[..end]).is_err());
         }
-        for version in [b"GNR1", b"GNR2", b"GNR3"] {
-            envelope[..4].copy_from_slice(version);
-            assert!(decode(&envelope).is_err());
-        }
+        envelope[..4].copy_from_slice(b"GNR2");
+        assert!(decode(&envelope).is_err());
         envelope[..4].copy_from_slice(&OPEN);
         envelope[4] = 4;
         assert!(decode(&envelope).is_err());
     }
 
-    /// An advert carries its sender's routed identity; the previous layout,
-    /// without one, is refused by its magic.
+    /// An advert carries its sender's routed identity.
     #[test]
     fn advert_roundtrips_its_identity() {
         let path = [NodeId::new("a"), NodeId::new("b")];

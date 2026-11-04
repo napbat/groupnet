@@ -15,8 +15,7 @@
 //! | 15 | `n` | claimant [`NodeId`] as UTF-8 |
 //! | 15 + `n` | 4 | CRC-32 (IEEE) of bytes `0..15 + n` |
 //!
-//! The version byte is the migration hook a persisted format keeps: a future
-//! layout bumps it and teaches [`FileGrantStore::load`] to read both.
+//! The version byte is 1. A decoder refuses any version other than 1.
 //!
 //! # Write protocol
 //!

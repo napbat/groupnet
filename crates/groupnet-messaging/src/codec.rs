@@ -16,7 +16,7 @@ pub const DEFAULT_MAX_TIMEOUT_MS: u64 = 30_000;
 /// Default terminal duplicate retention, longer than the default retry window.
 pub const DEFAULT_DEDUP_RETENTION_MS: u64 = 60_000;
 
-const MAGIC: [u8; 4] = *b"GNA2";
+const MAGIC: [u8; 4] = *b"GNA1";
 
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -704,7 +704,7 @@ mod tests {
             Err(EncodeError::RetryHorizonMismatch)
         );
         let mut old_version = data(&packet(Delivery::BestEffort, 0, None, b"")).unwrap();
-        old_version[..4].copy_from_slice(b"GNA1");
+        old_version[..4].copy_from_slice(b"GNA2");
         assert_eq!(decode(&old_version), Err(DecodeError::UnknownVersion));
         let mut malformed = data(&packet(Delivery::Applied, 1, None, b"")).unwrap();
         let offset = size_of::<Header>() + 2;

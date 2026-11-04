@@ -17,7 +17,7 @@ fn typed_headers_preserve_network_layout_and_unaligned_views() {
         authenticated: 1,
         sequence: U64::new(0x0102_0304_0506_0708),
     };
-    assert_eq!(header.as_bytes(), &[2, 1, 1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(header.as_bytes(), &[1, 1, 1, 2, 3, 4, 5, 6, 7, 8]);
     let mut unaligned = [0; 11];
     unaligned[1..].copy_from_slice(header.as_bytes());
     assert_eq!(
@@ -128,6 +128,15 @@ async fn keyed_frames_do_not_downgrade() {
     let (mut writer, mut reader) = tokio::io::duplex(256);
     write(&mut writer, &None, &Message::Ping).await.unwrap();
     assert!(read(&mut reader, &auth(Some(&key))).await.is_err());
+}
+
+#[tokio::test]
+async fn a_frame_of_another_version_is_refused() {
+    let (mut writer, mut reader) = tokio::io::duplex(256);
+    let mut frame = vec![0, 0, 0, 11, VERSION + 1, 0];
+    frame.extend_from_slice(&[0; 9]);
+    writer.write_all(&frame).await.unwrap();
+    assert!(read(&mut reader, &None).await.is_err());
 }
 
 #[test]

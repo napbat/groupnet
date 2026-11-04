@@ -8,8 +8,8 @@ use zerocopy::{
 };
 
 /// Tunnel protocol version: the first byte of every reliability packet and the
-/// digit of the authenticated preamble. Bump it whenever a kind or field changes.
-pub(super) const VERSION: u8 = 3;
+/// digit of the authenticated preamble. It stays 1 until the first deployment.
+pub(super) const VERSION: u8 = 1;
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -219,7 +219,7 @@ mod tests {
         let mut bytes = [0; HEADER];
         Packet::stamp(fields(Kind::Ack, 1), &mut bytes);
         assert!(Packet::decode(Bytes::copy_from_slice(&bytes)).is_some());
-        for version in [0, VERSION - 1, VERSION + 1] {
+        for version in [VERSION - 1, VERSION + 1] {
             bytes[0] = version;
             assert!(Packet::decode(Bytes::copy_from_slice(&bytes)).is_none());
         }

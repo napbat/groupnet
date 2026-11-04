@@ -326,7 +326,7 @@ fn typed_envelope_preserves_gnp4_bytes_and_decodes_unaligned_storage() {
     let mut storage = [0; MAX_PACKET + 1];
     let mut buffer = [0; MAX_PACKET];
     let length = encode_mode(packet(Body::Hello { nonce: [3; 16] }), None, &mut buffer).unwrap();
-    let mut expected = Vec::from(&b"GNP4\x01\x05alpha"[..]);
+    let mut expected = Vec::from(&b"GNP1\x01\x05alpha"[..]);
     expected.extend_from_slice(&[2; 16]);
     expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 7]);
     expected.extend_from_slice(&[3; 16]);
@@ -349,7 +349,7 @@ fn typed_envelope_preserves_gnp4_bytes_and_decodes_unaligned_storage() {
 
 #[test]
 fn typed_integer_fields_keep_big_endian_wire_bytes() {
-    let header_length = b"GNP4\x03\x05alpha".len() + std::mem::size_of::<SessionHeader>();
+    let header_length = b"GNP1\x03\x05alpha".len() + std::mem::size_of::<SessionHeader>();
     let mut buffer = [0; MAX_PACKET];
     let register = Body::Register {
         nonce: [3; 16],

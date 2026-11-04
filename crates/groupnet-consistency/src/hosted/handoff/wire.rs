@@ -88,8 +88,8 @@ const MAGIC: [u8; 4] = *b"GNHO";
 
 /// The protocol version. Peers upgrade together, so this only guards against a
 /// mis-deployed peer: a frame stamped with anything else is refused loudly as
-/// [`HandoffError::Protocol`], with no negotiation. Bump it whenever a frame
-/// body changes.
+/// [`HandoffError::Protocol`], with no negotiation. It stays 1 until the first
+/// deployment.
 const VERSION: u8 = 1;
 
 const KIND_REQUEST: u8 = 1;
