@@ -15,8 +15,13 @@
 //!   grants two claimants one epoch, and the remaining majority elects a host
 //!   after each leave.
 //! * **Q-RES-minority — [`dst_quorum_a_resign_that_misses_two_voters_waits_for_their_promise`].**
-//!   The resign reaches only two voters of five. The successor needs one of
-//!   the two others, so it hosts only after the promise of one of them ends.
+//!   The resign and each copy reach only two voters of five. The successor
+//!   needs one of the two others, so it hosts only after the promise of one
+//!   of them ends.
+//! * **Q-RES-again — [`dst_quorum_a_lost_resign_goes_again`].** The first
+//!   resign to two voters is lost. The node that left sends it again to the
+//!   voters that did not answer (row Q16d), so the successor hosts before
+//!   their promise ends.
 //! * **Q-RES-restart — [`dst_quorum_a_voter_that_restarts_after_the_resign_keeps_its_blackout`].**
 //!   A voter crashes right after it released its promise and restarts from
 //!   its stored grant. It applies the boot blackout and never grants the
@@ -274,16 +279,13 @@ fn settled(group: &str, size: usize, label: &str) -> (Simulation, Vec<NodeId>, N
     (sim, voters, host, epoch, now)
 }
 
-/// **Q-RES-minority.** The resign reaches only two voters of five: the links
-/// from the host to the two others drop every frame during the turn of the
-/// leave, and then heal. A successor needs a third grant, and each of the two
-/// others refuses every other claimant until its promise to the old host
-/// ends. So the successor hosts only after the earliest of those two
-/// promises ends, and the fences hold.
-#[test]
-fn dst_quorum_a_resign_that_misses_two_voters_waits_for_their_promise() {
-    let label = "Q-RES-minority";
-    let (mut sim, voters, host, epoch, now) = settled("resign-minority", 5, label);
+/// A cluster of five voters whose host left while the links from the host
+/// to two other voters dropped every frame. The links heal two latencies
+/// after the leave when `heal` is set, and stay cut otherwise. Returns the
+/// cluster, the host that left, its successor, the instant it hosts, and the
+/// earliest end of the promise of the two cut voters to the old host.
+fn missed_resign(label: &str, heal: bool) -> (Simulation, NodeId, NodeId, u64, Time) {
+    let (mut sim, voters, host, epoch, now) = settled(label, 5, label);
     let missed: Vec<NodeId> = voters
         .iter()
         .filter(|v| **v != host)
@@ -304,7 +306,9 @@ fn dst_quorum_a_resign_that_misses_two_voters_waits_for_their_promise() {
     let gone = BTreeSet::from([host.clone()]);
     let healed = now + 2 * LATENCY_MS;
     run_checked(&mut sim, now, healed, &gone, label);
-    sim.heal_all();
+    if heal {
+        sim.heal_all();
+    }
 
     // A voter's promise ends one lease after its last grant to the host.
     let promise_end = |voter: &NodeId| {
@@ -320,14 +324,49 @@ fn dst_quorum_a_resign_that_misses_two_voters_waits_for_their_promise() {
     };
     let earliest = missed.iter().map(promise_end).min().expect("two voters");
     let (successor, at) = next_host(&mut sim, healed, SETTLE_MS, &gone, label);
-    assert!(
-        Time(at) >= earliest,
-        "{label}: {successor} hosts at {at}, before the promise of {missed:?} ends at \
-         {earliest:?}"
-    );
+    sim.heal_all();
     run_checked(&mut sim, at, at + 2 * LEASE_MS, &gone, label);
     assert_sole_activator_per_epoch(&sim, label);
     assert_grants_single_valued(&sim, label);
+    (sim, host, successor, at, earliest)
+}
+
+/// **Q-RES-minority.** The resign, and each copy of it, reaches only two
+/// voters of five: the links from the host to the two others stay cut. A
+/// successor needs a third grant, and each of the two others refuses every
+/// other claimant until its promise to the old host ends. So the successor
+/// hosts only after the earliest of those two promises ends, and the fences
+/// hold.
+#[test]
+fn dst_quorum_a_resign_that_misses_two_voters_waits_for_their_promise() {
+    let label = "Q-RES-minority";
+    let (_, _, successor, at, earliest) = missed_resign(label, false);
+    assert!(
+        Time(at) >= earliest,
+        "{label}: {successor} hosts at {at}, before the promise of the cut voters ends \
+         at {earliest:?}"
+    );
+}
+
+/// **Q-RES-again.** The links to two voters drop the first resign and then
+/// heal (as a resign that the stop of the node dropped from its queue). The
+/// node that left sends the resign again to the voters that did not answer
+/// (row Q16d), so the successor hosts before the promise of those voters
+/// ends, and the node that left ends with no voter pending.
+#[test]
+fn dst_quorum_a_lost_resign_goes_again() {
+    let label = "Q-RES-again";
+    let (sim, host, successor, at, earliest) = missed_resign(label, true);
+    assert!(
+        Time(at) < earliest,
+        "{label}: {successor} hosts at {at}, not before the promise of the cut voters \
+         ends at {earliest:?}"
+    );
+    assert_eq!(
+        sim.resign_pending_of(&host),
+        Some(0),
+        "{label}: every voter answered"
+    );
 }
 
 /// **Q-RES-restart.** A voter crashes at the instant it released its promise

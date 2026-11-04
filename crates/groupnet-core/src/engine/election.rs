@@ -349,14 +349,17 @@ impl GroupEngine {
 
     /// The election's share of a tick. `anti_entropy_due` is whether *this*
     /// tick ran an anti-entropy round, which is the cadence a claim
-    /// re-broadcast and a host's state beacon ride.
+    /// re-broadcast and a host's state beacon ride. Row Q16d's resend of a
+    /// resign rides the same cadence.
     pub(super) fn election_tick(&mut self, now: Time, anti_entropy_due: bool) -> Vec<Effect> {
-        match self.election.as_ref().map(|el| el.role) {
+        let mut effects = match self.election.as_ref().map(|el| el.role) {
             Some(Role::Follower) => self.tick_follower(now, anti_entropy_due),
             Some(Role::Claimant) => self.tick_claimant(now, anti_entropy_due),
             Some(Role::Host) => self.tick_host(now, anti_entropy_due),
             None => Vec::new(), // Eventual: no election at all
-        }
+        };
+        effects.extend(self.resend_resign(anti_entropy_due));
+        effects
     }
 
     /// Row 1: open a claim when this node is the group's top-ranked live
@@ -736,6 +739,8 @@ impl GroupEngine {
     /// one that outranks ours by naming *us*, or teach back the one we hold
     /// when it outranks theirs. Equal pairs exchange nothing.
     fn on_lead_state(&mut self, from: &NodeId, epoch: u64, host: Option<&NodeId>) -> Vec<Effect> {
+        // Row Q16d: the state can answer a resign of this node.
+        self.note_resign_receipt(from, epoch, host);
         let names_self = host == Some(&self.local);
         let Some(el) = self.election.as_ref() else {
             return Vec::new();

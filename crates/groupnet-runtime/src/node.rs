@@ -325,6 +325,7 @@ impl Node {
         let (statuses_tx, statuses_rx) = watch::channel(statuses_snapshot(&engine));
         let (entries_tx, entries_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());
+        let (resign_tx, resign_rx) = watch::channel(0);
         let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
 
         // The External tier's driver half: one task per anchored group, owning
@@ -364,6 +365,7 @@ impl Node {
                 statuses: statuses_tx,
                 entries: entries_tx,
                 net_stats: net_stats_tx,
+                resign_pending: resign_tx,
                 events: events_tx.clone(),
             },
             routing,
@@ -395,6 +397,7 @@ impl Node {
                 statuses: statuses_rx,
                 entries: entries_rx,
                 net_stats: net_stats_rx,
+                resign_pending: resign_rx,
                 events: events_tx,
             },
             self.inner.messaging.group(),

@@ -393,6 +393,13 @@ impl Simulation {
             .and_then(GroupEngine::host_lease_until)
     }
 
+    /// The voters that did not answer the resign of `node` yet (row Q16d),
+    /// or `None` if `node` is not in the simulation.
+    #[must_use]
+    pub fn resign_pending_of(&self, node: &NodeId) -> Option<usize> {
+        self.engines.get(node).map(GroupEngine::resign_pending)
+    }
+
     /// Applies a local command at `node` and schedules its effects.
     ///
     /// # Errors

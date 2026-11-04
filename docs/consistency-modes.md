@@ -706,8 +706,16 @@ refine the sketch above and are now contract:
   resign leaves only after the host demoted itself, a leaving node never
   claims or counts a grant again, and no voter re-grants the resigned pair.
   Nothing is persisted: a voter that restarts recovers the pair and applies
-  the boot blackout, as before. A lost resign costs only time; the promise
-  ends as it did without the row. Under `Settle` and `External` a leave sends
+  the boot blackout, as before. Each voter answers each resign with
+  `LeadState { epoch, host: None }` (row Q16d). The node that left sends the
+  resign again, on each anti-entropy round, to each voter that did not answer
+  yet; `Group::resign_pending` counts them, and `Group::resigned` resolves when
+  none is left. A node that stops after its leave waits for it: the router only
+  queues a frame, and a stop drops what is still queued. A resign that never
+  arrives costs only time; the promise ends as it did without the row. A
+  state from a pending voter at a later epoch, or at the resigned epoch
+  without this node as host, also counts as its answer. Under `Settle` and
+  `External` a leave sends
   no resign (no voter holds a promise; `External` releases at the anchor). The
   frame is a new kind, so `FRAME_VERSION` is 4 and a node of version 3 is
   refused. The leave also stamps the time of death of the leaving node's own

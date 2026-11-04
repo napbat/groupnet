@@ -186,6 +186,9 @@ pub(super) struct QuorumState {
     /// it ended when the resign arrived, and the pair is never re-granted.
     /// Cleared when a new pair is granted.
     resigned: bool,
+    /// Row Q16d: on a node that left and resigned, the epoch it resigned and
+    /// the voters that did not yet confirm the resign.
+    resigning: Option<(u64, BTreeSet<NodeId>)>,
 }
 
 /// What a voter does with one inbound claim: rows Q1, Q2 and Q3.
@@ -265,6 +268,7 @@ impl QuorumState {
                 round_grants: BTreeSet::new(),
                 round_refused: BTreeSet::new(),
                 resigned: false,
+                resigning: None,
             }),
         }
     }
