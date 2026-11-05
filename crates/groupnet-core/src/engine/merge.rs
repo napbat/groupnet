@@ -192,6 +192,7 @@ impl GroupEngine {
             }) {
                 continue;
             }
+            let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
             let m = self.members.get_mut(&self.local).expect("self present");
             if self.authored.contains(&entry.key) {
                 // Sole-author rule: never let an echo (or forgery) replace a
@@ -211,7 +212,7 @@ impl GroupEngine {
                 // A key we have NOT authored this boot, echoed at a higher
                 // version, is our own pre-restart data — adopt it verbatim.
                 m.observe_version(entry.version);
-                m.put_entry(
+                let due = m.put_entry(
                     entry.key.clone(),
                     StateEntry::adopted(
                         entry.version,
@@ -220,7 +221,9 @@ impl GroupEngine {
                         entry.tombstone,
                         now,
                     ),
+                    reap_after,
                 );
+                self.lower_deadline(due);
                 state_changed.push((self.local.clone(), entry.key));
                 self.stamp_self();
             }
@@ -237,6 +240,7 @@ impl GroupEngine {
         now: Time,
         state_changed: &mut Vec<(NodeId, String)>,
     ) -> bool {
+        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
         match self.members.get(&delta.node) {
             None => {
                 // Unknown node: adopt its liveness and state wholesale.
@@ -246,10 +250,11 @@ impl GroupEngine {
                     Status::Dead => member.dead_since = now,
                     Status::Alive => {}
                 }
+                let mut due = Time::MAX;
                 for entry in delta.entries {
                     member.observe_version(entry.version);
                     state_changed.push((delta.node.clone(), entry.key.clone()));
-                    member.put_entry(
+                    due = due.min(member.put_entry(
                         entry.key,
                         StateEntry::adopted(
                             entry.version,
@@ -258,10 +263,12 @@ impl GroupEngine {
                             entry.tombstone,
                             now,
                         ),
-                    );
+                        reap_after,
+                    ));
                 }
                 member.observe_version(delta.max_version);
                 self.members.insert(delta.node.clone(), member);
+                self.lower_deadline(due);
                 self.stamp(&delta.node);
                 true
             }
@@ -270,6 +277,7 @@ impl GroupEngine {
                 let member = self.members.get_mut(&delta.node).expect("present");
                 let high_water_before = member.max_state_version;
                 let mut adopted = false;
+                let mut due = Time::MAX;
                 if status_wins {
                     member.incarnation = delta.incarnation;
                     member.adopt_status(status, now);
@@ -296,7 +304,7 @@ impl GroupEngine {
                     if !wins {
                         continue;
                     }
-                    member.put_entry(
+                    due = due.min(member.put_entry(
                         entry.key.clone(),
                         StateEntry::adopted(
                             entry.version,
@@ -305,7 +313,8 @@ impl GroupEngine {
                             entry.tombstone,
                             now,
                         ),
-                    );
+                        reap_after,
+                    ));
                     adopted = true;
                     state_changed.push((delta.node.clone(), entry.key));
                 }
@@ -314,7 +323,9 @@ impl GroupEngine {
                 member.observe_version(delta.max_version);
                 // Anything digest-visible moved (liveness, content, or
                 // high-water): re-advertise via future delta digests.
-                if status_wins || adopted || member.max_state_version > high_water_before {
+                let moved = status_wins || adopted || member.max_state_version > high_water_before;
+                self.lower_deadline(due);
+                if moved {
                     self.stamp(&delta.node);
                 }
                 status_wins

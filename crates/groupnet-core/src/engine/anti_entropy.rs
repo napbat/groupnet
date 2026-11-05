@@ -3,6 +3,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::iter::Peekable;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::membership::{Member, StateEntry, Status};
 use crate::{NodeId, Time, wire};
@@ -183,22 +184,23 @@ impl GroupEngine {
         }
         listed.sort_unstable_by_key(rank);
         let lead = listed.len();
-        let ring: Vec<(&NodeId, &Member)> = gossipable().collect();
-        if !ring.is_empty() {
-            let start = match &peer.resume {
-                Some(after) => ring.partition_point(|(node, _)| *node <= after),
-                None => spread::index(spread::pair_hash(&self.local, to), ring.len()),
-            };
-            for step in 0..ring.len() {
-                if listed.len() >= window {
-                    break;
-                }
-                let (node, m) = ring[(start + step) % ring.len()];
-                peer.resume = Some(node.clone());
-                if listed[..lead].iter().any(|(led, _)| *led == node) {
-                    continue; // already leads the digest
-                }
-                listed.push((node, m));
+        // The rolling walk resumes after the last member the previous full
+        // digest to this peer walked past, wrapping once round the members —
+        // read straight off the member map's ranges, without collecting them.
+        let walk_gossipable = |(_, m): &(&NodeId, &Member)| self.should_gossip(m, now);
+        if let Some(after) = peer.resume.clone() {
+            let walk = self
+                .members
+                .range((Excluded(&after), Unbounded))
+                .chain(self.members.range(..=&after))
+                .filter(walk_gossipable);
+            fill_window(&mut listed, lead, window, walk, &mut peer.resume);
+        } else {
+            let len = gossipable().count();
+            if len > 0 {
+                let start = spread::index(spread::pair_hash(&self.local, to), len);
+                let walk = gossipable().skip(start).chain(gossipable().take(start));
+                fill_window(&mut listed, lead, window, walk, &mut peer.resume);
             }
         }
         let summaries = listed
@@ -265,29 +267,26 @@ impl GroupEngine {
     }
 
     /// Up to `k` distinct dissemination targets, from position `cursor`
-    /// (modulo their count) onward, wrapping. Two passes over the merged
-    /// targets — one to count, one to pick — and no copy of them.
-    pub(super) fn rotated_targets(&self, cursor: usize, k: usize) -> Vec<NodeId> {
-        let n = self.dissemination_targets().count();
+    /// (modulo their count) onward, wrapping. Indexes the cached merged
+    /// targets ([`GroupEngine::targets`]), rebuilt only after the live set or
+    /// the contacts changed, so a round costs `O(k)`.
+    pub(super) fn rotated_targets(&mut self, cursor: usize, k: usize) -> Vec<NodeId> {
+        if self.targets.is_none() {
+            self.targets = Some(self.dissemination_targets().cloned().collect());
+        }
+        let targets = self.targets.as_deref().unwrap_or_default();
+        debug_assert!(
+            targets.iter().eq(self.dissemination_targets()),
+            "the cached dissemination targets went stale"
+        );
+        let n = targets.len();
         if n == 0 {
             return Vec::new();
         }
-        let k = k.min(n);
         let first = cursor % n;
-        // Positions `first..first + k`, the part past `n` wrapping to `0..`.
-        let end = (first + k).min(n);
-        let wrapped = first + k - end;
-        let mut out = Vec::with_capacity(k);
-        let mut head = Vec::with_capacity(wrapped);
-        for (pos, node) in self.dissemination_targets().enumerate().take(end) {
-            if pos < wrapped {
-                head.push(node.clone());
-            } else if pos >= first {
-                out.push(node.clone());
-            }
-        }
-        out.extend(head);
-        out
+        (0..k.min(n))
+            .map(|i| targets[(first + i) % n].clone())
+            .collect()
     }
 
     /// Encodes one digest's `summaries` as [`wire::Kind::Digest`] frames
@@ -588,6 +587,28 @@ impl GroupEngine {
     }
 }
 
+/// Fills `listed` up to `window` from `walk`, skipping the first `lead`
+/// members already listed, and records in `resume` the last member walked
+/// past.
+fn fill_window<'a>(
+    listed: &mut Vec<(&'a NodeId, &'a Member)>,
+    lead: usize,
+    window: usize,
+    walk: impl Iterator<Item = (&'a NodeId, &'a Member)>,
+    resume: &mut Option<NodeId>,
+) {
+    for (node, m) in walk {
+        if listed.len() >= window {
+            break;
+        }
+        *resume = Some(node.clone());
+        if listed[..lead].iter().any(|(led, _)| *led == node) {
+            continue; // already leads the digest
+        }
+        listed.push((node, m));
+    }
+}
+
 /// The sorted union of two sorted, duplicate-free sequences of ids.
 struct Union<'a, A: Iterator<Item = &'a NodeId>, B: Iterator<Item = &'a NodeId>> {
     a: Peekable<A>,
@@ -628,7 +649,110 @@ impl<'a, A: Iterator<Item = &'a NodeId>, B: Iterator<Item = &'a NodeId>> Iterato
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::{Command, Config, GroupEngine, GroupId, NodeId};
+    use crate::{Command, Config, GroupEngine, GroupId, NodeId, Status, Time, wire};
+
+    fn digest(lines: &[(&str, u64, Status)]) -> Vec<u8> {
+        wire::encode(&wire::Frame {
+            kind: wire::Kind::Digest,
+            group: GroupId::new("g"),
+            target: None,
+            digest: lines
+                .iter()
+                .map(|(node, incarnation, status)| wire::NodeDigest {
+                    node: NodeId::new(*node),
+                    incarnation: *incarnation,
+                    status: status.to_wire(),
+                    max_version: 0,
+                    content_hash: 0,
+                })
+                .collect(),
+            wants: Vec::new(),
+            members: Vec::new(),
+            metadata: Vec::new(),
+            lead: None,
+        })
+    }
+
+    fn delta_with_ttl(node: &str, ttl_ms: u64) -> Vec<u8> {
+        wire::encode(&wire::Frame {
+            kind: wire::Kind::Delta,
+            group: GroupId::new("g"),
+            target: None,
+            digest: Vec::new(),
+            wants: Vec::new(),
+            members: vec![wire::MemberDelta {
+                node: NodeId::new(node),
+                incarnation: 0,
+                status: Status::Alive.to_wire(),
+                max_version: 1,
+                entries: vec![wire::EntryDelta {
+                    key: "k".into(),
+                    version: 1,
+                    ttl_ms,
+                    tombstone: false,
+                    value: b"v".to_vec(),
+                }],
+            }],
+            metadata: Vec::new(),
+            lead: None,
+        })
+    }
+
+    /// The cached deadline and dissemination targets follow every change
+    /// that moves them, between ticks: an adopted TTL entry, a suspicion and
+    /// a death learned by gossip, new discovery contacts. The cached
+    /// deadline then equals a scan of every member; the targets, a fresh
+    /// merge.
+    #[test]
+    fn the_cached_deadline_and_targets_follow_every_change() {
+        let config = Config {
+            probe_interval_ms: 1_000_000,
+            gossip_interval_ms: 1_000_000,
+            ..Config::default()
+        };
+        let suspect_ms = config.suspect_timeout_ms;
+        let dead_ms = config.dead_timeout_ms;
+        let mut e = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], config)
+            .expect("valid config");
+        e.start(Time(0));
+        let targets = |e: &mut GroupEngine| e.rotated_targets(0, 10);
+        let ids = |names: &[&str]| names.iter().map(|n| NodeId::new(*n)).collect::<Vec<_>>();
+
+        e.on_message(
+            NodeId::new("b"),
+            &digest(&[("b", 0, Status::Alive), ("c", 0, Status::Alive)]),
+            Time(5),
+        );
+        assert_eq!(targets(&mut e), ids(&["b", "c"]));
+
+        e.on_message(NodeId::new("b"), &delta_with_ttl("b", 500), Time(10));
+        assert_eq!(e.slow_deadline, e.scan_slow_deadline());
+        assert_eq!(e.next_deadline(), Time(510), "the TTL expiry is next");
+
+        e.on_message(
+            NodeId::new("b"),
+            &digest(&[("c", 0, Status::Suspect)]),
+            Time(20),
+        );
+        assert_eq!(e.slow_deadline, e.scan_slow_deadline());
+        assert_eq!(e.next_deadline(), Time(510).min(Time(20 + suspect_ms)));
+
+        e.apply(Command::SetBootstrapContacts(ids(&["z"])));
+        assert_eq!(targets(&mut e), ids(&["b", "c", "z"]));
+
+        e.on_message(
+            NodeId::new("b"),
+            &digest(&[("c", 0, Status::Dead)]),
+            Time(30),
+        );
+        assert_eq!(e.slow_deadline, e.scan_slow_deadline());
+        assert_eq!(
+            targets(&mut e),
+            ids(&["b", "z"]),
+            "a dead member is no target"
+        );
+        assert_eq!(e.next_deadline(), Time(510).min(Time(30 + 2 * dead_ms)));
+    }
 
     /// The merged, rotated selection equals the one it replaced: a sorted set
     /// of members, seeds and contacts, indexed at `(cursor + i) % n`.

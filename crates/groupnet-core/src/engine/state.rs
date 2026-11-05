@@ -103,6 +103,15 @@ pub struct GroupEngine {
     pub(super) seeds: BTreeSet<NodeId>,
     /// Replaceable, bounded discovery contacts; these do not assert membership.
     pub(super) bootstrap_contacts: BTreeSet<NodeId>,
+    /// The dissemination targets, merged and in id order, kept until the live
+    /// set or the contacts change (`None` until then): every gossip round
+    /// indexes into them.
+    pub(super) targets: Option<Vec<NodeId>>,
+    /// The earliest suspect, `Dead`-reap and entry deadline. Exact after a
+    /// tick or a live-set change; lowered by every entry write in between, so
+    /// it is never later than a scan of every member would find (it may be
+    /// earlier, which costs one spurious tick at most).
+    pub(super) slow_deadline: Time,
     pub(super) metadata: BTreeMap<String, VersionedValue>,
     pub(super) coordinator: Option<NodeId>,
     pub(super) config: Config,
@@ -195,6 +204,8 @@ impl GroupEngine {
             members,
             seeds,
             bootstrap_contacts: BTreeSet::new(),
+            targets: None,
+            slow_deadline: Time::MAX,
             metadata: BTreeMap::new(),
             coordinator: None,
             config,
@@ -617,6 +628,7 @@ impl GroupEngine {
         //    cadence for its re-broadcasts.
         effects.extend(self.election_tick(now, anti_entropy_due));
 
+        self.slow_deadline = self.scan_slow_deadline();
         effects.push(self.arm_timer());
         effects
     }
@@ -642,11 +654,32 @@ impl GroupEngine {
     /// harmless; ticking later delays only what was due.
     #[must_use]
     pub fn next_deadline(&self) -> Time {
-        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
-        let mut at = self.next_anti_entropy.min(self.next_probe);
+        debug_assert!(
+            self.slow_deadline <= self.scan_slow_deadline(),
+            "the maintained deadline fell behind a scan of the members"
+        );
+        let mut at = self
+            .next_anti_entropy
+            .min(self.next_probe)
+            .min(self.slow_deadline);
         if let Some(p) = &self.pending {
             at = at.min(p.deadline);
         }
+        // A standing claim's settle window and a host's lease are deadlines
+        // like any other: without them a driver whose timer is the gossip
+        // cadence would activate — or step down — a whole round late.
+        if let Some(deadline) = self.election.as_ref().and_then(Election::deadline) {
+            at = at.min(deadline);
+        }
+        at
+    }
+
+    /// The earliest suspect window, `Dead` reap and entry TTL or tombstone
+    /// reap, from a scan of every member and entry — what
+    /// [`slow_deadline`](Self::slow_deadline) caches.
+    pub(super) fn scan_slow_deadline(&self) -> Time {
+        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
+        let mut at = Time::MAX;
         for (node, m) in &self.members {
             if *node != self.local {
                 match m.status {
@@ -661,32 +694,32 @@ impl GroupEngine {
                 }
             }
             for e in m.entries.values() {
-                let due = if e.tombstone {
-                    e.tombstone_since.saturating_add(reap_after)
-                } else {
-                    e.expires_at
-                };
-                at = at.min(due);
+                at = at.min(e.reap_due(reap_after));
             }
         }
-        // A standing claim's settle window and a host's lease are deadlines
-        // like any other: without them a driver whose timer is the gossip
-        // cadence would activate — or step down — a whole round late.
-        if let Some(deadline) = self.election.as_ref().and_then(Election::deadline) {
-            at = at.min(deadline);
-        }
         at
+    }
+
+    /// Lowers the cached deadline to `due`, after an entry write.
+    pub(super) fn lower_deadline(&mut self, due: Time) {
+        self.slow_deadline = self.slow_deadline.min(due);
     }
 
     pub(super) fn compute_coordinator(&self) -> Option<NodeId> {
         // The coordinator is just the placement owner of the group id among live
         // members (Alive or Suspect); a Dead node is never a candidate. Same
         // HA-hash the public `placement` API exposes.
-        let live: BTreeSet<NodeId> = self.members().cloned().collect();
-        placement::owner(self.group.as_str(), &live)
+        placement::owner_among(self.group.as_str(), self.members())
     }
 
+    /// Re-derives the coordinator after the live set may have changed. Every
+    /// path that changes a member's liveness or adds a member passes through
+    /// here, so it also drops what depends on the live set: the cached
+    /// dissemination targets, and the cached deadline (re-scanned: a new
+    /// suspect or `Dead` member brings it forward).
     pub(super) fn recompute_coordinator(&mut self) -> Vec<Effect> {
+        self.targets = None;
+        self.slow_deadline = self.scan_slow_deadline();
         let next = self.compute_coordinator();
         if next == self.coordinator {
             return Vec::new();

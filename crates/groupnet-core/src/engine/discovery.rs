@@ -32,6 +32,7 @@ impl GroupEngine {
             }
         }
         self.bootstrap_contacts = contacts;
+        self.targets = None;
         self.nudge_anti_entropy();
     }
 }

@@ -105,14 +105,18 @@ pub fn owners(key: &str, members: &BTreeMap<NodeId, u32>, replicas: usize) -> Ve
 /// `1`, but without allocating.
 #[must_use]
 pub fn owner(key: &str, members: &BTreeSet<NodeId>) -> Option<NodeId> {
+    owner_among(key, members.iter())
+}
+
+/// [`owner`] over any distinct `members`, each scored once — what the
+/// engine's derived coordinator uses without first collecting a set.
+pub(crate) fn owner_among<'a>(
+    key: &str,
+    members: impl Iterator<Item = &'a NodeId>,
+) -> Option<NodeId> {
     members
-        .iter()
-        .max_by(|a, b| {
-            token_score(key, a, 0)
-                .cmp(&token_score(key, b, 0))
-                // tie: smaller id wins (matches `owners`' ascending-id tiebreak)
-                .then_with(|| b.cmp(a))
-        })
+        // tie: smaller id wins (matches `owners`' ascending-id tiebreak)
+        .max_by_key(|node| (token_score(key, node, 0), std::cmp::Reverse(*node)))
         .cloned()
 }
 

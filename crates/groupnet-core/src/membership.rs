@@ -123,6 +123,17 @@ impl StateEntry {
     pub(crate) fn expired(&self, now: Time) -> bool {
         !self.tombstone && now >= self.expires_at
     }
+
+    /// When this entry next needs a tick: its TTL expiry, or for a tombstone
+    /// its reap `reap_after` after it was tombstoned ([`Time::MAX`] for a
+    /// live entry without a TTL).
+    pub(crate) fn reap_due(&self, reap_after: u64) -> Time {
+        if self.tombstone {
+            self.tombstone_since.saturating_add(reap_after)
+        } else {
+            self.expires_at
+        }
+    }
 }
 
 /// One member's record, as this node currently sees it: SWIM liveness plus the
@@ -235,9 +246,14 @@ impl Member {
     }
 
     /// Stores `entry` under `key`, invalidating the cached content hash.
-    pub(crate) fn put_entry(&mut self, key: String, entry: StateEntry) {
+    /// Returns when the entry next needs a tick ([`StateEntry::reap_due`]),
+    /// which the engine folds into its cached deadline.
+    #[must_use]
+    pub(crate) fn put_entry(&mut self, key: String, entry: StateEntry, reap_after: u64) -> Time {
+        let due = entry.reap_due(reap_after);
         self.entries.insert(key, entry);
         self.entries_changed();
+        due
     }
 
     /// Invalidates the cached content hash after an in-place entry change.
