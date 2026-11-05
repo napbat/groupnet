@@ -146,12 +146,18 @@ impl Shared {
     }
 
     fn announce(&self) {
-        self.refresh_reachable();
         let mut table = self.table.lock().expect("router table poisoned");
         table.candidates.retain(|_, choices| {
             choices.retain(|_, entry| entry.updated.elapsed() < self.config.route_ttl);
             !choices.is_empty()
         });
+        // Once per announcement, the index is rebuilt from the whole table:
+        // cheap at this cadence, and it picks up a session admission that
+        // lapsed before its neighbor-change event arrived.
+        table.reach_rebuild(self.config.route_ttl, Instant::now());
+        if table.reach_take_changed() {
+            self.publish_reachable(&table);
+        }
         let mut routes = vec![AdvertisedRoute {
             path: vec![self.local.clone()],
             frame: self.advert(0, std::slice::from_ref(&self.local)),
@@ -195,20 +201,14 @@ impl Shared {
         frame.into()
     }
 
-    pub(super) fn refresh_reachable(&self) {
-        let table = self.table.lock().expect("router table poisoned");
-        let mut peers: Vec<_> = table
-            .candidates
-            .keys()
-            .filter(|id| table.route(id, self.config.route_ttl).is_some())
-            .cloned()
-            .collect();
-        peers.sort();
+    /// Publishes the reachable set from the table's index, waking watchers
+    /// only when it differs from what they last saw.
+    fn publish_reachable(&self, table: &Table) {
         self.reachable.send_if_modified(|current| {
-            if current.as_ref() == &peers {
+            if current.iter().eq(table.reachable()) {
                 return false;
             }
-            *current = Arc::new(peers);
+            *current = Arc::new(table.reachable().cloned().collect());
             true
         });
     }
@@ -227,6 +227,7 @@ impl Shared {
             });
             !choices.is_empty()
         });
+        table.reach_rebuild(self.config.route_ttl, Instant::now());
         drop(table);
         self.announce();
     }
@@ -274,7 +275,7 @@ pub(super) async fn drive(shared: Arc<Shared>, mut events: mpsc::Receiver<Event>
             _ = clock.tick() => shared.announce(),
             event = events.recv() => match event {
                 Some(Event::Neighbors(link)) => shared.neighbors_changed(link),
-                Some(Event::Down(link)) => { shared.table.lock().expect("router table poisoned").remove(link); shared.announce(); }
+                Some(Event::Down(link)) => { shared.table.lock().expect("router table poisoned").remove(link, shared.config.route_ttl); shared.announce(); }
                 Some(Event::Announce) => shared.announce(),
                 None => break,
             },
@@ -388,7 +389,7 @@ impl Shared {
         }
     }
 
-    fn learn(
+    pub(super) fn learn(
         &self,
         link: TransportId,
         neighbor: NodeId,
@@ -418,6 +419,7 @@ impl Shared {
         let mut full_path = Vec::with_capacity(path.len() + 1);
         full_path.push(self.local.clone());
         full_path.extend(path);
+        let now = Instant::now();
         table
             .candidates
             .entry(destination.clone())
@@ -426,18 +428,23 @@ impl Shared {
                 (link, neighbor.clone()),
                 Candidate {
                     route: Route {
-                        destination,
+                        destination: destination.clone(),
                         next_hop: neighbor,
                         transport: link,
                         cost,
                         path: full_path,
                     },
-                    updated: Instant::now(),
+                    updated: now,
                     session,
                 },
             );
-        drop(table);
-        self.refresh_reachable();
+        // Only this destination's candidates changed: re-examine it alone,
+        // and drop whatever lapsed since, instead of rebuilding the set.
+        table.reach_expire(now);
+        table.reach_refresh(&destination, self.config.route_ttl, now);
+        if table.reach_take_changed() {
+            self.publish_reachable(&table);
+        }
     }
 }
 

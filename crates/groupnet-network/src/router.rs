@@ -7,6 +7,7 @@ mod freshness;
 mod packet;
 mod pool;
 mod protocol;
+mod reach;
 mod replay;
 mod routing;
 mod seal;
@@ -32,6 +33,9 @@ mod outbound_tests;
 
 #[cfg(test)]
 mod seal_tests;
+
+#[cfg(test)]
+mod reach_tests;
 
 use routing::{InboundState, drive};
 
@@ -110,6 +114,12 @@ struct Table {
     links: HashMap<TransportId, Link>,
     next_link: usize,
     candidates: HashMap<NodeId, HashMap<(TransportId, NodeId), Candidate>>,
+    /// The destinations with a live route, maintained per advert.
+    reach: reach::Reach,
+    /// Destinations whose candidate routes a reachability refresh examined,
+    /// across the table's life — the work the refresh tests bound.
+    #[cfg(test)]
+    reach_visits: u64,
 }
 
 impl Table {
@@ -138,7 +148,9 @@ impl Table {
             })
     }
 
-    fn remove(&mut self, id: TransportId) {
+    /// Unregisters a link, drops every route through it and rebuilds the
+    /// reachable index, so no lookup ever counts a route over a gone link.
+    fn remove(&mut self, id: TransportId, ttl: Duration) {
         if let Some(link) = self.links.remove(&id) {
             link.cancel.cancel();
         }
@@ -146,6 +158,7 @@ impl Table {
             choices.retain(|(link, _), _| *link != id);
             !choices.is_empty()
         });
+        self.reach_rebuild(ttl, Instant::now());
     }
 }
 
@@ -462,12 +475,12 @@ impl Router {
     /// # Panics
     /// Panics if an earlier panic poisoned the internal table.
     pub fn remove_transport(&self, transport: TransportId) {
-        self.inner
-            .shared
+        let shared = &self.inner.shared;
+        shared
             .table
             .lock()
             .expect("router table poisoned")
-            .remove(transport);
+            .remove(transport, shared.config.route_ttl);
         let _ = self.inner.shared.events.try_send(Event::Announce);
     }
 
