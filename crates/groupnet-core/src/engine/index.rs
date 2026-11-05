@@ -9,6 +9,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::membership::{Member, Status};
 use crate::{NodeId, Time, placement};
@@ -35,7 +36,16 @@ pub(super) struct Index {
     /// Stamped members by `(liveness_since, changed_at)`: a full digest's
     /// liveness news is the top of it, newest first.
     pub(super) news: BTreeSet<(Time, u64, NodeId)>,
+    /// Members forgotten, by the change stamp they were forgotten at — the
+    /// latest [`FORGOTTEN_KEPT`] — for readers that mirror the roster.
+    pub(super) forgotten: BTreeMap<u64, NodeId>,
+    /// The stamp of the latest record dropped from `forgotten` (0 = none):
+    /// a reader at or after it has seen every one it needs.
+    pub(super) forgotten_floor: u64,
 }
+
+/// How many forgotten members [`Index::forgotten`] keeps for readers.
+const FORGOTTEN_KEPT: usize = 4_096;
 
 impl GroupEngine {
     /// Logical milliseconds after which a `Dead` tombstone or an entry
@@ -123,7 +133,8 @@ impl GroupEngine {
             .insert((m.liveness_since, stamp, node.clone()));
     }
 
-    /// Removes `node` from the member map and from every index.
+    /// Removes `node` from the member map and from every index, and records
+    /// it as forgotten at a fresh change stamp.
     pub(super) fn forget(&mut self, node: &NodeId) -> Option<Member> {
         let m = self.members.remove(node)?;
         if m.filed.due != Time::MAX {
@@ -140,7 +151,50 @@ impl GroupEngine {
                 .remove(&(m.filed.liveness, m.changed_at, node.clone()));
         }
         self.digest_peers.remove(node);
+        self.change_clock += 1;
+        self.index.forgotten.insert(self.change_clock, node.clone());
+        if self.index.forgotten.len() > FORGOTTEN_KEPT
+            && let Some((stamp, _)) = self.index.forgotten.pop_first()
+        {
+            self.index.forgotten_floor = stamp;
+        }
         Some(m)
+    }
+
+    /// The change clock: it advances whenever a member's record changes —
+    /// liveness, incarnation, entries or version high-water — and whenever a
+    /// member is forgotten. A reader that mirrors the roster keeps the value
+    /// it last read and asks [`members_changed_since`](Self::members_changed_since)
+    /// and [`members_forgotten_since`](Self::members_forgotten_since) for
+    /// what moved after it.
+    #[must_use]
+    pub fn change_clock(&self) -> u64 {
+        self.change_clock
+    }
+
+    /// The known members whose record changed after change-clock `since`,
+    /// in the order they last changed: `O(log N)` plus one step per member.
+    /// Each is listed once however often it changed.
+    pub fn members_changed_since(&self, since: u64) -> impl Iterator<Item = &NodeId> {
+        self.index
+            .changed
+            .range((Excluded(since), Unbounded))
+            .map(|(_, node)| node)
+    }
+
+    /// The members forgotten (their `Dead` tombstone reaped) after
+    /// change-clock `since` — a member learned again since then is listed
+    /// too, and is known again. `None` when the record of forgotten members
+    /// no longer reaches back to `since`: it keeps the latest
+    /// 4,096, and a reader that far behind re-reads the whole roster.
+    #[must_use]
+    pub fn members_forgotten_since(&self, since: u64) -> Option<impl Iterator<Item = &NodeId>> {
+        (since >= self.index.forgotten_floor).then(|| {
+            self.index
+                .forgotten
+                .range((Excluded(since), Unbounded))
+                .map(|(_, node)| node)
+        })
     }
 
     /// `node` entered (`live`) or left the live set: patch it into or out

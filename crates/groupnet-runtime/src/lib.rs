@@ -101,6 +101,7 @@ mod group;
 pub mod messaging;
 mod network;
 mod node;
+mod pmap;
 mod routing;
 mod seeds;
 mod store;

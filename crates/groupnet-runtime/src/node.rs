@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use crate::anchor::{AnchorTask, anchor_task};
 use crate::driver::{
     CloseReport, EVENTS_CAPACITY, Event, Grants, GroupTask, GroupViews, INBOX_CAPACITY,
-    NodeEntriesSnapshot, Publishers, UnfinishedGrant, group_task, statuses_snapshot,
+    NodeEntriesSnapshot, Publishers, UnfinishedGrant, Views, group_task,
 };
 use crate::group::{Group, Leadership};
 use crate::routing::Routing;
@@ -320,10 +320,10 @@ impl Node {
         let (lead_tx, lead_rx) =
             watch::channel(Leadership::observed(epoch, host.cloned(), &self.inner.id));
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
-        let initial_members: Arc<[NodeId]> = engine.members().cloned().collect();
-        let (members_tx, members_rx) = watch::channel(initial_members);
-        let (statuses_tx, statuses_rx) = watch::channel(statuses_snapshot(&engine));
-        let (entries_tx, entries_rx) = watch::channel(Arc::new(BTreeMap::new()));
+        let views = Views::new(&engine);
+        let (members_tx, members_rx) = watch::channel(views.members());
+        let (statuses_tx, statuses_rx) = watch::channel(views.statuses());
+        let (entries_tx, entries_rx) = watch::channel(views.entries());
         let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());
         let (resign_tx, resign_rx) = watch::channel(0);
         let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
@@ -366,6 +366,7 @@ impl Node {
                 resign_pending: resign_tx,
                 events: events_tx.clone(),
             },
+            views,
             routing,
             store,
             anchor_prompts,

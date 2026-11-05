@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use groupnet_core::{Command, Effect, GroupEngine, GroupId, NetStats, NodeId, Status, Time};
+use groupnet_core::{Command, Effect, GroupEngine, GroupId, NetStats, NodeId, Time};
 use groupnet_transport::Transport;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -19,6 +19,7 @@ use crate::group::{
 
 mod durability;
 mod entry_inspection;
+mod views;
 use durability::Durability;
 pub(crate) use durability::Grants;
 pub use durability::{CloseReport, UnfinishedGrant};
@@ -84,35 +85,7 @@ pub(crate) fn coordinator_key(group: &GroupId) -> String {
 /// A published, read-only snapshot of a group's metadata.
 pub(crate) type MetaSnapshot = Arc<BTreeMap<String, String>>;
 
-/// A published, read-only snapshot of a group's live members (id order).
-pub(crate) type MembersSnapshot = Arc<[NodeId]>;
-
-/// A published, read-only snapshot of every known member's status (Alive/Suspect,
-/// plus not-yet-reaped Dead tombstones), so readers can route *around* a suspected
-/// peer that [`MembersSnapshot`] (the not-`Dead` set) still lists.
-///
-/// Each status carries the engine-logical [`Time`] this observer has held it
-/// continuously since, so a reader can turn a status into a *duration* —
-/// see [`Group::status_held_for`](crate::Group::status_held_for).
-pub(crate) type StatusesSnapshot = Arc<BTreeMap<NodeId, (Status, Time)>>;
-
-/// Collects the engine's whole status roster, stamps and all, into the shape
-/// [`StatusesSnapshot`] publishes. One place, so the boot snapshot in
-/// `node.rs` and the per-change republish below can never drift apart.
-pub(crate) fn statuses_snapshot(engine: &GroupEngine) -> StatusesSnapshot {
-    Arc::new(
-        engine
-            .member_statuses_since()
-            .map(|(n, s, since)| (n.clone(), (s, since)))
-            .collect(),
-    )
-}
-
-/// A published, read-only snapshot of every node's keyed app-defined state
-/// (live entries only — tombstoned/expired keys are absent). Two-level
-/// `Arc` sharing keeps updates incremental: a state change rebuilds only the
-/// changed node's inner map; the outer map is pointer-cloned per publish.
-pub(crate) type NodeEntriesSnapshot = Arc<BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>>>;
+pub(crate) use views::{AllEntries, MembersSnapshot, NodeEntriesSnapshot, StatusesSnapshot, Views};
 
 /// An event delivered to a group actor: either a decoded network frame or a
 /// local command from the [`Group`](crate::Group) handle.
@@ -377,6 +350,9 @@ pub(crate) struct GroupTask<T: Transport> {
     pub transport: Arc<T>,
     /// The `watch`/`broadcast` senders this group publishes through.
     pub publishers: Publishers,
+    /// The member views the `publishers` were seeded from, kept by the actor
+    /// so each later publish writes only what changed.
+    pub views: Views,
     /// When this group's coordinator becomes us, announce it into the routing
     /// group through this channel. `None` for the routing group itself.
     pub routing: Option<mpsc::Sender<Event>>,
@@ -420,6 +396,7 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) -> Option<Unfin
         mut inbox,
         transport,
         publishers,
+        mut views,
         routing,
         store,
         anchor_prompts,
@@ -456,10 +433,6 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) -> Option<Unfin
     // The coordinator we last published to the routing table.
     let mut announced_coordinator: Option<NodeId> = None;
     announce_coordinator(&engine, routing.as_ref(), &mut announced_coordinator);
-
-    // The entries snapshot, maintained incrementally: only nodes named in a
-    // NodeStateChanged effect rebuild their (Arc-shared) inner map.
-    let mut entries_master: BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>> = BTreeMap::new();
 
     loop {
         // Checked before every turn, and not only raced in the `select!`
@@ -512,7 +485,7 @@ pub(crate) async fn group_task<T: Transport>(task: GroupTask<T>) -> Option<Unfin
             &publishers,
             routing.as_ref(),
             &mut announced_coordinator,
-            &mut entries_master,
+            &mut views,
             &effects,
         );
         if let Some(MutationCompletion {
@@ -545,12 +518,18 @@ fn tick_at(start: Instant, deadline: Time, last_tick: Option<Time>) -> Instant {
 const FAR_FUTURE: Duration = Duration::from_hours(24 * 365 * 30);
 
 /// Republishes all readable views before the matching edge notifications.
+///
+/// The member views are incremental: [`Views::update`] writes only the
+/// members the engine's change clock names and the nodes this batch's
+/// `NodeStateChanged` effects name, each into a persistent map, and a view
+/// is sent only when it changed — `O(k log N)` for `k` changed members,
+/// nothing when none did.
 fn publish_actor_views(
     engine: &GroupEngine,
     publishers: &Publishers,
     routing: Option<&mpsc::Sender<Event>>,
     announced_coordinator: &mut Option<NodeId>,
-    entries_master: &mut BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>>,
+    views: &mut Views,
     effects: &[Effect],
 ) {
     let meta_dirty = effects
@@ -559,10 +538,10 @@ fn publish_actor_views(
     let members_dirty = effects
         .iter()
         .any(|e| matches!(e, Effect::MembershipChanged));
-    let touched: BTreeSet<NodeId> = effects
+    let touched: BTreeSet<&NodeId> = effects
         .iter()
         .filter_map(|e| match e {
-            Effect::NodeStateChanged { node, .. } => Some(node.clone()),
+            Effect::NodeStateChanged { node, .. } => Some(node),
             _ => None,
         })
         .collect();
@@ -581,13 +560,19 @@ fn publish_actor_views(
         *current = pending;
         changed
     });
+    let changed = views.update(engine, touched.into_iter());
+    if changed.members {
+        let _ = publishers.members.send(views.members());
+    }
+    if changed.statuses {
+        let _ = publishers.statuses.send(views.statuses());
+    }
     if members_dirty {
-        let snapshot: MembersSnapshot = engine.members().cloned().collect();
-        let _ = publishers.members.send(snapshot);
-        let _ = publishers.statuses.send(statuses_snapshot(engine));
         announce_coordinator(engine, routing, announced_coordinator);
     }
-    republish_entries(engine, publishers, touched, members_dirty, entries_master);
+    if changed.entries {
+        let _ = publishers.entries.send(views.entries());
+    }
     let stats = engine.net_stats();
     publishers.net_stats.send_if_modified(|current| {
         let changed = *current != stats;
@@ -597,45 +582,6 @@ fn publish_actor_views(
         changed
     });
     emit_events(&publishers.events, effects);
-}
-
-/// Maintains and republishes the per-node entries snapshot for one batch.
-///
-/// Incremental on purpose: only the nodes an effect actually named rebuild
-/// their (`Arc`-shared) inner map, so a publish costs one pointer clone per
-/// untouched node. `members_dirty` additionally sweeps out anything membership
-/// has reaped, which is the one way an entry leaves the master map without an
-/// effect naming it.
-fn republish_entries(
-    engine: &GroupEngine,
-    publishers: &Publishers,
-    touched: BTreeSet<NodeId>,
-    members_dirty: bool,
-    master: &mut BTreeMap<NodeId, Arc<BTreeMap<String, Vec<u8>>>>,
-) {
-    if !touched.is_empty() {
-        for node in touched {
-            let entries: BTreeMap<String, Vec<u8>> = engine
-                .node_entries(&node)
-                .map(|(k, v)| (k.to_owned(), v.to_vec()))
-                .collect();
-            if entries.is_empty() {
-                master.remove(&node);
-            } else {
-                master.insert(node, Arc::new(entries));
-            }
-        }
-        let _ = publishers.entries.send(Arc::new(master.clone()));
-    }
-    if members_dirty {
-        // Drop reaped members' state from the snapshot.
-        let live: BTreeSet<NodeId> = engine.member_statuses().map(|(n, _)| n.clone()).collect();
-        let before = master.len();
-        master.retain(|node, _| live.contains(node));
-        if master.len() != before {
-            let _ = publishers.entries.send(Arc::new(master.clone()));
-        }
-    }
 }
 
 /// Forwards the engine's change effects onto the bounded event stream (a full

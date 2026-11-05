@@ -424,3 +424,51 @@ fn indexed_digests_match_the_old_builder() {
         "too few digests compared: {compared:?}"
     );
 }
+
+/// A reader of the change clock learns every member that changed and every
+/// one forgotten after its clock — until it falls more than the kept
+/// forgotten members behind, which it is told instead of missing them.
+#[test]
+fn forgotten_members_are_reported_until_the_record_runs_out() {
+    let config = Config::default();
+    let reap = 2 * config.dead_timeout_ms;
+    let mut e =
+        GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], config).expect("valid config");
+    let dead = |count: u64| -> Vec<wire::NodeDigest> {
+        (0..count)
+            .map(|i| wire::NodeDigest {
+                node: NodeId::new(format!("d{i:05}")),
+                incarnation: 0,
+                status: Status::Dead.to_wire(),
+                max_version: 0,
+                content_hash: 0,
+            })
+            .collect()
+    };
+    let before = e.change_clock();
+    e.merge_digest_liveness(&dead(10), Time(1));
+    assert_eq!(e.members_changed_since(before).count(), 10);
+    let learned = e.change_clock();
+    e.on_tick(Time(1 + reap));
+    assert_eq!(
+        e.members_changed_since(learned).count(),
+        0,
+        "a reap is no change"
+    );
+    let gone: Vec<&NodeId> = e
+        .members_forgotten_since(learned)
+        .expect("within the record")
+        .collect();
+    assert_eq!(gone, dead(10).iter().map(|d| &d.node).collect::<Vec<_>>());
+
+    let behind = e.change_clock();
+    e.merge_digest_liveness(&dead(5_000), Time(2 + reap));
+    e.on_tick(Time(2 + 2 * reap));
+    assert_eq!(e.members().count(), 1, "all reaped");
+    assert!(
+        e.members_forgotten_since(behind).is_none(),
+        "the record ran out"
+    );
+    let now = e.change_clock();
+    assert_eq!(e.members_forgotten_since(now).map(Iterator::count), Some(0));
+}
