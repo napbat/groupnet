@@ -533,19 +533,12 @@ impl GroupEngine {
     /// see [`Election::beacon_cursor`] for why sharing one starves peers rather
     /// than rotating past them.
     fn beacon_targets(&mut self) -> Vec<NodeId> {
-        let candidates = self.dissemination_targets();
-        let n = candidates.len();
-        if n == 0 {
-            return Vec::new();
-        }
-        let k = self.config.gossip_fanout.get().min(n);
         let start = self.election.as_ref().map_or(0, |el| el.beacon_cursor);
+        let out = self.rotated_targets(start, self.config.gossip_fanout.get());
         if let Some(el) = self.election.as_mut() {
-            el.beacon_cursor = start.wrapping_add(k);
+            el.beacon_cursor = start.wrapping_add(out.len());
         }
-        (0..k)
-            .map(|i| candidates[(start + i) % n].clone())
-            .collect()
+        out
     }
 
     /// Row 4's activation: take the epoch, arm the lease, tell the world.

@@ -109,7 +109,10 @@ fn discovery_contacts_are_bounded_and_do_not_replace_static_seeds() {
         vec![admitted]
     );
     local.apply(Command::SetBootstrapContacts(Vec::new()));
-    assert_eq!(local.dissemination_targets(), vec![static_seed]);
+    assert_eq!(
+        local.dissemination_targets().cloned().collect::<Vec<_>>(),
+        vec![static_seed]
+    );
 }
 
 fn exchange(engines: &mut [GroupEngine; 2], now: Time) {

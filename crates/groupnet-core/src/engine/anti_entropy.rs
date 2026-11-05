@@ -1,8 +1,8 @@
 //! Digest/delta anti-entropy: windowed full digests, per-peer delta digests,
 //! reconciliation, and eager push.
 
-use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::cmp::{Ordering, Reverse};
+use std::iter::Peekable;
 
 use crate::membership::{Member, StateEntry, Status};
 use crate::{NodeId, Time, wire};
@@ -160,18 +160,28 @@ impl GroupEngine {
 
         // Lead: the local member, then hot liveness news, then the freshest
         // changes, at most half the window — the rest is the rolling walk's,
-        // so it always advances.
+        // so it always advances. Under churn nearly every member changed, so
+        // the lead is selected (linear) before it is sorted; `changed_at` is
+        // unique per member, so this is the full sort's first half-window.
         let hot_ms = self.liveness_hot_ms();
-        listed.sort_unstable_by_key(|(node, m)| {
+        let rank = |entry: &(&NodeId, &Member)| {
+            let (node, m) = *entry;
             let hot = now.0.saturating_sub(m.liveness_since.0) < hot_ms;
             (
-                **node != self.local,
+                *node != self.local,
                 !hot,
                 Reverse(if hot { m.liveness_since } else { Time::ZERO }),
                 Reverse(m.changed_at),
             )
-        });
-        listed.truncate(window / 2);
+        };
+        let lead_cap = window / 2;
+        if lead_cap == 0 {
+            listed.clear();
+        } else if listed.len() > lead_cap {
+            listed.select_nth_unstable_by_key(lead_cap - 1, rank);
+            listed.truncate(lead_cap);
+        }
+        listed.sort_unstable_by_key(rank);
         let lead = listed.len();
         let ring: Vec<(&NodeId, &Member)> = gossipable().collect();
         if !ring.is_empty() {
@@ -249,17 +259,34 @@ impl GroupEngine {
     /// Picks `gossip_fanout` distinct peers, rotating a cursor so every
     /// peer is covered over successive rounds.
     pub(super) fn select_fanout_targets(&mut self) -> Vec<NodeId> {
-        let candidates = self.dissemination_targets();
-        let n = candidates.len();
+        let out = self.rotated_targets(self.gossip_cursor, self.config.gossip_fanout.get());
+        self.gossip_cursor = self.gossip_cursor.wrapping_add(out.len());
+        out
+    }
+
+    /// Up to `k` distinct dissemination targets, from position `cursor`
+    /// (modulo their count) onward, wrapping. Two passes over the merged
+    /// targets — one to count, one to pick — and no copy of them.
+    pub(super) fn rotated_targets(&self, cursor: usize, k: usize) -> Vec<NodeId> {
+        let n = self.dissemination_targets().count();
         if n == 0 {
             return Vec::new();
         }
-        let k = self.config.gossip_fanout.get().min(n);
+        let k = k.min(n);
+        let first = cursor % n;
+        // Positions `first..first + k`, the part past `n` wrapping to `0..`.
+        let end = (first + k).min(n);
+        let wrapped = first + k - end;
         let mut out = Vec::with_capacity(k);
-        for i in 0..k {
-            out.push(candidates[(self.gossip_cursor + i) % n].clone());
+        let mut head = Vec::with_capacity(wrapped);
+        for (pos, node) in self.dissemination_targets().enumerate().take(end) {
+            if pos < wrapped {
+                head.push(node.clone());
+            } else if pos >= first {
+                out.push(node.clone());
+            }
         }
-        self.gossip_cursor = self.gossip_cursor.wrapping_add(k);
+        out.extend(head);
         out
     }
 
@@ -531,11 +558,14 @@ impl GroupEngine {
         }))
     }
 
-    pub(super) fn dissemination_targets(&self) -> Vec<NodeId> {
-        let mut set: BTreeSet<NodeId> = self.probe_candidates().cloned().collect();
-        set.extend(self.seeds.iter().cloned());
-        set.extend(self.bootstrap_contacts.iter().cloned());
-        set.into_iter().collect()
+    /// Every peer a round may target, in id order and each once: the live
+    /// members other than us, the seeds and the discovery contacts. A merge of
+    /// the three sorted sets, so a round neither copies nor sorts them.
+    pub(super) fn dissemination_targets(&self) -> impl Iterator<Item = &NodeId> {
+        Union::new(
+            Union::new(self.probe_candidates(), self.seeds.iter()),
+            self.bootstrap_contacts.iter(),
+        )
     }
 
     /// A `Dead` member is summarized in digests only until `dead_timeout`
@@ -555,5 +585,81 @@ impl GroupEngine {
                     .saturating_add(self.config.dead_timeout_ms);
         }
         !e.expired(now)
+    }
+}
+
+/// The sorted union of two sorted, duplicate-free sequences of ids.
+struct Union<'a, A: Iterator<Item = &'a NodeId>, B: Iterator<Item = &'a NodeId>> {
+    a: Peekable<A>,
+    b: Peekable<B>,
+}
+
+impl<'a, A: Iterator<Item = &'a NodeId>, B: Iterator<Item = &'a NodeId>> Union<'a, A, B> {
+    fn new(a: A, b: B) -> Self {
+        Self {
+            a: a.peekable(),
+            b: b.peekable(),
+        }
+    }
+}
+
+impl<'a, A: Iterator<Item = &'a NodeId>, B: Iterator<Item = &'a NodeId>> Iterator
+    for Union<'a, A, B>
+{
+    type Item = &'a NodeId;
+
+    fn next(&mut self) -> Option<&'a NodeId> {
+        match (self.a.peek(), self.b.peek()) {
+            (Some(x), Some(y)) => match x.cmp(y) {
+                Ordering::Less => self.a.next(),
+                Ordering::Greater => self.b.next(),
+                Ordering::Equal => {
+                    self.b.next();
+                    self.a.next()
+                }
+            },
+            (Some(_), None) => self.a.next(),
+            (None, _) => self.b.next(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::{Command, Config, GroupEngine, GroupId, NodeId};
+
+    /// The merged, rotated selection equals the one it replaced: a sorted set
+    /// of members, seeds and contacts, indexed at `(cursor + i) % n`.
+    #[test]
+    fn rotated_targets_match_a_sorted_set_indexed_round_robin() {
+        let id = |s: &str| NodeId::new(s);
+        let seeds = ["b", "d", "x", "z"].map(id);
+        let mut e = GroupEngine::new(GroupId::new("g"), id("m"), seeds.clone(), Config::default())
+            .expect("valid config");
+        for peer in ["a", "b", "c", "q", "m2"] {
+            e.apply(Command::AddPeer(id(peer)));
+        }
+        e.apply(Command::SetBootstrapContacts(
+            ["c", "y", "z", "aa"].map(id).to_vec(),
+        ));
+        let mut all: BTreeSet<NodeId> = e.probe_candidates().cloned().collect();
+        all.extend(seeds);
+        all.extend(e.bootstrap_contacts.iter().cloned());
+        let all: Vec<NodeId> = all.into_iter().collect();
+        assert_eq!(e.dissemination_targets().cloned().collect::<Vec<_>>(), all);
+        for cursor in [0, 1, 5, 9, 10, 11, usize::MAX - 3, usize::MAX] {
+            for k in 1..=all.len() + 2 {
+                let expected: Vec<NodeId> = (0..k.min(all.len()))
+                    .map(|i| all[(cursor % all.len() + i) % all.len()].clone())
+                    .collect();
+                assert_eq!(
+                    e.rotated_targets(cursor, k),
+                    expected,
+                    "cursor {cursor} k {k}"
+                );
+            }
+        }
     }
 }
