@@ -239,8 +239,9 @@ fn detection_window_is_monotone_in_members() {
 /// The reason every step is charged the silent price: over one pass of the
 /// ring, with `F` *other* members gone quiet at the same moment, the
 /// detector's worst path to a verdict is `(members - 2 - F)·(i + t)` live
-/// steps, `F·(i + 2t)` steps stalled behind a silent peer's direct miss
-/// *and* its indirect re-arm, the target's own `i + 2t` slot, and `s`. The
+/// steps, `F·(i + 3t)` steps stalled behind a silent peer's direct miss
+/// (`t`) *and* its indirect round (`2t`, two round trips), the target's own
+/// `i + 3t` slot, and `s`. The
 /// window must cover every `F`, not only the `F = 0` single-failure case —
 /// the pre-fix formula covered it only up to `F = 1`.
 ///
@@ -269,7 +270,7 @@ fn window_covers_a_one_pass_ring_with_any_number_of_silent_members() {
             // silent too (`members - 2`).
             for silent in 0..=members - 2 {
                 let worst =
-                    (members - 2 - silent) * (i + t) + silent * (i + 2 * t) + (i + 2 * t) + s;
+                    (members - 2 - silent) * (i + t) + silent * (i + 3 * t) + (i + 3 * t) + s;
                 assert!(
                     window >= worst,
                     "{members}-node window {window} is under the {worst}ms worst case \
@@ -308,8 +309,8 @@ fn two_node_window_covers_one_probe_plus_suspicion() {
 #[test]
 fn default_window_is_sane_at_realistic_cluster_sizes() {
     let cfg = Config::default();
-    // 2 · (100 + 2·50) + 500
-    assert_eq!(cfg.detection_window_ms(3), 900);
+    // 2 · (100 + 3·50) + 500
+    assert_eq!(cfg.detection_window_ms(3), 1_000);
     assert!(
         (500..2_000).contains(&cfg.detection_window_ms(2)),
         "a 2-node window should be sub-2s, got {}",

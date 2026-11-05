@@ -54,7 +54,8 @@ impl GroupEngine {
         self.config.dead_timeout_ms.saturating_mul(2)
     }
 
-    /// When `node`'s liveness next needs a tick: a suspect's window, a
+    /// When `node`'s liveness next needs a tick: a suspect's window or its
+    /// next accusation, a
     /// `Dead` tombstone's reap. Never for the local node, which is neither
     /// declared dead nor reaped by itself.
     pub(super) fn liveness_due(&self, node: &NodeId, m: &Member) -> Time {
@@ -63,9 +64,7 @@ impl GroupEngine {
         }
         match m.status {
             Status::Alive => Time::MAX,
-            Status::Suspect => m
-                .suspect_since
-                .saturating_add(self.config.suspect_timeout_ms),
+            Status::Suspect => m.suspect_due.min(m.accuse_at),
             Status::Dead => m.dead_since.saturating_add(self.reap_after()),
         }
     }

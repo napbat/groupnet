@@ -38,8 +38,8 @@ fn rng(seed: u64) -> SplitMix64 {
 /// [`HostedConfig`]'s sizing rule is `lease_ms < detection_window_ms(members) +
 /// claim_settle_ms` — the deposed host has stepped down before anyone else can
 /// step up. The smallest cluster built here is three nodes, where
-/// `detection_window_ms(3)` is `2·(50 + 2·40) + 120` = 380ms, so the bound is
-/// 580ms and the 400ms lease sits well inside it; larger clusters only widen
+/// `detection_window_ms(3)` is `2·(50 + 3·40) + 120` = 460ms, so the bound is
+/// 660ms and the 400ms lease sits well inside it; larger clusters only widen
 /// the margin. `dead_timeout_ms` is 1s (tombstones reaped at 2s), short enough
 /// that a chaos run's tombstones are all reaped inside the final settle.
 fn cfg() -> Config {

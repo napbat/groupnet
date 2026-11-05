@@ -128,7 +128,8 @@ fn dst_detection_window_holds_when_probes_straddle_a_slot() {
 /// re-arm after it both hold the one outstanding-probe slot, and the whole
 /// ring waits behind it.
 ///
-/// This is what the window's per-step `2 · probe_timeout` term is for. The
+/// This is what the window's per-step `3 · probe_timeout` term (a direct
+/// miss, then the indirect round's two round trips) is for. The
 /// timings are deliberately the unforgiving ones — `probe_timeout` over
 /// `probe_interval`, so a miss costs more than a slot, and a suspicion window
 /// long enough that the first victim is still in the probe ring (still

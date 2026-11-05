@@ -61,7 +61,7 @@ const GOSSIP_MS: u64 = 15;
 
 /// A host's authority after its last confirmed renewal round, and — in the
 /// storage-free posture these tests run — also the boot blackout a voter sits
-/// out before it will grant a new claimant. Comfortably under the 900 ms
+/// out before it will grant a new claimant. Comfortably under the 1,000 ms
 /// detection window the default probe timings give a group of three.
 const LEASE_MS: u64 = 600;
 

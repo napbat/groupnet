@@ -30,7 +30,11 @@ use groupnet_sim::{Simulation, SplitMix64};
 
 /// How long a host's authority survives its last successful renewal — and,
 /// under Quorum, the claim window, the boot guard and the grant blackout too.
-const LEASE_MS: u64 = 400;
+/// Over `detection_window_ms(3)` (460ms) by more than the budget's hop and
+/// round terms, so the Q-budget's `max(detection, lease)` is bound by the
+/// lease at n = 3: with detection alone, seed 0 has no host 564ms after the
+/// crash.
+const LEASE_MS: u64 = 600;
 /// The anti-entropy / gossip cadence, which is also the renewal-round cadence.
 const GOSSIP_INTERVAL_MS: u64 = 60;
 
@@ -446,7 +450,7 @@ const HOP_MS: u64 = MAX_LATENCY_MS + MAX_JITTER_MS;
 ///   is at most one `LEASE_MS` after the crash (a promise is renewed on every
 ///   grant, and the last one a dead host collected was at or before it died).
 ///   **The `max` is load-bearing at n = 3**, where `detection_window_ms(3)` is
-///   `2·(50 + 2·40) + 120` = **380ms — under the 400ms lease**. A budget stated
+///   `2·(50 + 3·40) + 120` = **460ms — under the 600ms lease**. A budget stated
 ///   as detection alone would be short there, and short by a *promise*, which
 ///   is the one wait a Settle failover does not pay at all.
 /// * **`HOP_MS` — the renewal claim already in flight.** The promise term above

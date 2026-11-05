@@ -187,6 +187,17 @@ pub(crate) struct Member {
     /// When *this* node first observed the member as `Suspect` (for the suspicion
     /// timeout). Only meaningful while `status == Suspect`.
     pub(crate) suspect_since: Time,
+    /// When this observer declares a `Suspect` member `Dead` unless it
+    /// refutes first. Only meaningful while `status == Suspect`.
+    pub(crate) suspect_due: Time,
+    /// When this observer next tells a `Suspect` member it is suspected —
+    /// the accusation it answers with its refutation — and so asks it again
+    /// ([`Time::MAX`] while it is not suspected): a refutation one lost frame
+    /// would otherwise hold back until gossip reaches the member.
+    pub(crate) accuse_at: Time,
+    /// Whether this observer's own probe found the member silent, rather
+    /// than only gossip saying so. Only meaningful while `status == Suspect`.
+    pub(crate) suspected_here: bool,
     /// When *this* node first observed the member as `Dead` (for gossip TTL and
     /// reaping). Only meaningful while `status == Dead`.
     pub(crate) dead_since: Time,
@@ -241,6 +252,9 @@ impl Member {
             status,
             status_since: now,
             suspect_since: Time::ZERO,
+            suspect_due: Time::MAX,
+            accuse_at: Time::MAX,
+            suspected_here: false,
             dead_since: Time::ZERO,
             liveness_since: now,
             entries: BTreeMap::new(),
@@ -269,9 +283,40 @@ impl Member {
     /// touches them.
     pub(crate) fn adopt_status(&mut self, status: Status, now: Time) {
         self.liveness_since = now;
+        if status != Status::Suspect {
+            // A refuted or dead member is no longer accused.
+            self.accuse_at = Time::MAX;
+            self.suspected_here = false;
+        }
         if self.status != status {
             self.status = status;
             self.status_since = now;
+        }
+    }
+
+    /// Starts the suspicion timer for this observer's own probe finding the
+    /// member silent at `now` (accused at once by the caller): `Dead` after
+    /// `window` ms unless refuted, the accusation repeated from `now +
+    /// every`.
+    pub(crate) fn suspect_here(&mut self, now: Time, window: u64, every: u64) {
+        self.suspect_since = now;
+        self.suspect_due = now.saturating_add(window);
+        self.accuse_at = now.saturating_add(every);
+        self.suspected_here = true;
+    }
+
+    /// Starts the suspicion timer for a suspicion heard through gossip at
+    /// `now`: `Dead` after `heard` ms, the member first accused after `own`
+    /// ms — when this observer's own window would have run out. An observer
+    /// whose own probe found the member silent keeps its own `own` window,
+    /// since its evidence still stands.
+    pub(crate) fn hear_suspicion(&mut self, now: Time, heard: u64, own: u64) {
+        self.suspect_since = now;
+        if self.suspected_here {
+            self.suspect_due = now.saturating_add(own);
+        } else {
+            self.suspect_due = now.saturating_add(heard);
+            self.accuse_at = now.saturating_add(own);
         }
     }
 

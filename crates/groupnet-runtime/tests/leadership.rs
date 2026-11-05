@@ -58,7 +58,7 @@ const GOSSIP_MS: u64 = 15;
 const CLAIM_SETTLE_MS: u64 = 150;
 
 /// A host's authority after its last renewal. Must stay under
-/// `detection_window_ms(3) + CLAIM_SETTLE_MS` = `900 + 150` at the default
+/// `detection_window_ms(3) + CLAIM_SETTLE_MS` = `1000 + 150` at the default
 /// detector timings, so a deposed host has stepped down before anyone else can
 /// step up.
 const LEASE_MS: u64 = 600;
