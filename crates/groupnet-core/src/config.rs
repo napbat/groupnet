@@ -377,11 +377,20 @@ pub struct Config {
     pub gossip_interval_ms: u64,
     /// How often to probe a member for liveness. Must be nonzero.
     pub probe_interval_ms: u64,
-    /// How long to wait for a probe ack before escalating / suspecting. Must
-    /// be nonzero.
+    /// How long to wait for a direct probe's ack before escalating to
+    /// indirect probes — one round trip. The indirect probes that follow
+    /// make two round trips (to the probers, and theirs to the target), so
+    /// they get twice this before the target is suspected; a suspecter
+    /// repeats its accusation to the suspect every `probe_timeout_ms` until
+    /// it refutes. Must be nonzero.
     pub probe_timeout_ms: u64,
-    /// How long a member may stay `Suspect` before it is declared `Dead`.
-    /// Must be nonzero.
+    /// How long a member this node's own probe found silent may stay
+    /// `Suspect` before it is declared `Dead`. A suspicion this node only
+    /// heard through gossip stands this long plus the rounds liveness news
+    /// needs to cross the group (`⌊log2 N⌋ + 2` gossip rounds), and the node
+    /// asks the member itself once this much has passed: the suspecter's
+    /// `Dead` verdict reaches it well within that if the suspicion was real,
+    /// and the refutation if it was not. Must be nonzero.
     pub suspect_timeout_ms: u64,
     /// How long a `Dead` tombstone (member *or* per-key entry) is gossiped. After
     /// this it stops being re-advertised; after `2×` it is reaped. This window is
@@ -512,7 +521,7 @@ impl Config {
     /// # The bound
     ///
     /// ```text
-    /// (members - 1) · (probe_interval_ms + 2 · probe_timeout_ms)  // one pass of the ring
+    /// (members - 1) · (probe_interval_ms + 3 · probe_timeout_ms)  // one pass of the ring
     ///               + suspect_timeout_ms                          // Suspect -> Dead
     /// ```
     ///
@@ -540,9 +549,10 @@ impl Config {
     ///   folding under-promises whenever `probe_timeout` exceeds
     ///   `probe_interval`).
     /// * **A step that lands on another silent member** costs
-    ///   `probe_interval_ms + 2 · probe_timeout_ms` instead: that peer burns
+    ///   `probe_interval_ms + 3 · probe_timeout_ms` instead: that peer burns
     ///   its direct-miss deadline and then the indirect (`ping-req`) round
-    ///   that follows, and *both* keep the single outstanding-probe slot
+    ///   that follows — two round trips, so two probe timeouts — and *both*
+    ///   keep the single outstanding-probe slot
     ///   occupied — the whole ring waits behind it. Charging every step this
     ///   price is what pays for a concurrent failure instead of discovering
     ///   it as an overrun.
@@ -550,7 +560,7 @@ impl Config {
     ///   acked must wait for the cursor to come all the way round:
     ///   `members - 2` steps for the other peers, and one more for its own
     ///   slot — whose unanswered direct probe plus the indirect probes after
-    ///   it cost exactly the same `probe_interval_ms + 2 · probe_timeout_ms`.
+    ///   it cost exactly the same `probe_interval_ms + 3 · probe_timeout_ms`.
     ///   Folded here as `members - 1` steps at the silent price. (In a group
     ///   too small to enlist a prober the engine suspects immediately
     ///   instead, which is strictly faster.)
@@ -601,7 +611,7 @@ impl Config {
         // rather than discovered as an overrun.
         let step = self
             .probe_interval_ms
-            .saturating_add(self.probe_timeout_ms.saturating_mul(2));
+            .saturating_add(self.probe_timeout_ms.saturating_mul(3));
         peers
             .saturating_mul(step)
             .saturating_add(self.suspect_timeout_ms)

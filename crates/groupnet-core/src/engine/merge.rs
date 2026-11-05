@@ -57,11 +57,12 @@ impl GroupEngine {
         status: Status,
         now: Time,
     ) -> bool {
+        let (heard, own) = (self.heard_suspicion_ms(), self.config.suspect_timeout_ms);
         match self.members.get(node) {
             None => {
                 let mut member = Member::new(incarnation, status, now);
                 match status {
-                    Status::Suspect => member.suspect_since = now,
+                    Status::Suspect => member.hear_suspicion(now, heard, own),
                     Status::Dead => member.dead_since = now,
                     Status::Alive => {}
                 }
@@ -77,7 +78,7 @@ impl GroupEngine {
                 member.incarnation = incarnation;
                 member.adopt_status(status, now);
                 match status {
-                    Status::Suspect => member.suspect_since = now,
+                    Status::Suspect => member.hear_suspicion(now, heard, own),
                     Status::Dead => member.dead_since = now,
                     Status::Alive => {}
                 }
@@ -240,12 +241,13 @@ impl GroupEngine {
         state_changed: &mut Vec<(NodeId, String)>,
     ) -> bool {
         let reap_after = self.reap_after();
+        let (heard, own) = (self.heard_suspicion_ms(), self.config.suspect_timeout_ms);
         match self.members.get(&delta.node) {
             None => {
                 // Unknown node: adopt its liveness and state wholesale.
                 let mut member = Member::new(delta.incarnation, status, now);
                 match status {
-                    Status::Suspect => member.suspect_since = now,
+                    Status::Suspect => member.hear_suspicion(now, heard, own),
                     Status::Dead => member.dead_since = now,
                     Status::Alive => {}
                 }
@@ -278,7 +280,7 @@ impl GroupEngine {
                     member.incarnation = delta.incarnation;
                     member.adopt_status(status, now);
                     match status {
-                        Status::Suspect => member.suspect_since = now,
+                        Status::Suspect => member.hear_suspicion(now, heard, own),
                         Status::Dead => member.dead_since = now,
                         Status::Alive => {}
                     }

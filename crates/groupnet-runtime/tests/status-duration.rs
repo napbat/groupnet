@@ -68,7 +68,7 @@ async fn effective_config_and_alive_duration_are_readable_from_a_group() {
         // from here.
         assert_eq!(
             cfg.detection_window_ms(3),
-            2 * (cfg.probe_interval_ms + 2 * cfg.probe_timeout_ms) + cfg.suspect_timeout_ms
+            2 * (cfg.probe_interval_ms + 3 * cfg.probe_timeout_ms) + cfg.suspect_timeout_ms
         );
     }
 

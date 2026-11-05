@@ -67,7 +67,9 @@ impl GroupEngine {
         }
         self.pending = Some(Pending {
             target: target.clone(),
-            deadline: now.saturating_add(self.config.probe_timeout_ms),
+            // Two round trips — to the probers, and theirs to the target —
+            // so two probe timeouts.
+            deadline: now.saturating_add(self.config.probe_timeout_ms.saturating_mul(2)),
             phase: ProbePhase::Indirect,
         });
         probers
@@ -82,16 +84,52 @@ impl GroupEngine {
         }
     }
 
-    /// Marks `target` `Suspect` and tells it so directly (a one-line digest).
-    /// A live target answers with its current record, refuting first if it
-    /// must, so unless one of the two frames is lost this node stops doubting
-    /// it within a round trip rather than when gossip happens to reach it.
+    /// How long a suspicion this node only heard through gossip stands
+    /// before it turns into a death: the refutation window plus
+    /// [`liveness_hot_ms`](Self::liveness_hot_ms), the time liveness news
+    /// takes to cross the group. The suspecter's own window is the bare
+    /// `suspect_timeout`; if the suspicion was real its `Dead` verdict reaches
+    /// this node through the same gossip well before this runs out, and if
+    /// it was false the refutation does — the refutation starts later than
+    /// the suspicion and travels by other paths, so a node that heard the
+    /// suspicion early must not time it out on the suspecter's clock. Once
+    /// that clock has run out the node asks the member itself (see
+    /// [`reap_suspects`](Self::reap_suspects)), so the doubt clears within a
+    /// round trip of it rather than when gossip happens to bring the
+    /// refutation.
+    pub(super) fn heard_suspicion_ms(&self) -> u64 {
+        self.config
+            .suspect_timeout_ms
+            .saturating_add(self.liveness_hot_ms())
+    }
+
+    /// Marks `target` `Suspect` from this node's own probe and tells it so
+    /// directly (a one-line digest), repeating the accusation every
+    /// `probe_timeout` until the target refutes or the window runs out. A
+    /// live target answers with its current record, refuting first if it
+    /// must, so this node stops doubting it within a round trip — and one
+    /// lost frame only costs one more. A target this node already suspects
+    /// from gossip gets this node's own, shorter window, and the
+    /// accusations from now.
     pub(super) fn suspect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
+        let window = self.config.suspect_timeout_ms;
+        let every = self.config.probe_timeout_ms;
         let became_suspect = match self.members.get_mut(target) {
             Some(m) if m.status == Status::Alive => {
                 m.adopt_status(Status::Suspect, now);
-                m.suspect_since = now;
+                m.suspect_here(now, window, every);
                 true
+            }
+            Some(m) if m.status == Status::Suspect && !m.suspected_here => {
+                // Confirmed by our own probe: our window, and our accusation.
+                let due = m.suspect_due.min(now.saturating_add(window));
+                m.suspect_here(now, window, every);
+                m.suspect_due = due;
+                self.reindex(target);
+                return self
+                    .liveness_notice(target.clone(), target, now)
+                    .into_iter()
+                    .collect();
             }
             _ => false,
         };
@@ -109,23 +147,39 @@ impl GroupEngine {
     /// Declares suspects past their window `Dead`, telling each so directly
     /// like [`suspect`](Self::suspect) does: a live one answers with its
     /// current record, including a suspect this node only heard of through
-    /// gossip at an incarnation it has since refuted. Examines only the
-    /// members whose deadline passed.
+    /// gossip at an incarnation it has since refuted. Accuses every other
+    /// suspect whose next accusation is due — one this node's own probe
+    /// found silent, every `probe_timeout` from the first; one it heard of
+    /// through gossip, from when its own window would have run out.
+    /// Examines only the members whose deadline passed.
     pub(super) fn reap_suspects(&mut self, now: Time) -> Vec<Effect> {
-        let timeout = self.config.suspect_timeout_ms;
-        let dead: Vec<NodeId> = self
-            .due_members(now)
-            .into_iter()
-            .filter(|node| {
-                *node != self.local
-                    && self.members.get(node).is_some_and(|m| {
-                        m.status == Status::Suspect
-                            && now >= m.suspect_since.saturating_add(timeout)
-                    })
-            })
+        let due = self.due_members(now);
+        let suspect = |node: &NodeId| {
+            self.members
+                .get(node)
+                .filter(|m| *node != self.local && m.status == Status::Suspect)
+        };
+        let dead: Vec<NodeId> = due
+            .iter()
+            .filter(|node| suspect(node).is_some_and(|m| now >= m.suspect_due))
+            .cloned()
             .collect();
+        let accused: Vec<NodeId> = due
+            .iter()
+            .filter(|node| suspect(node).is_some_and(|m| now < m.suspect_due && now >= m.accuse_at))
+            .cloned()
+            .collect();
+        let mut effects = Vec::new();
+        let every = self.config.probe_timeout_ms;
+        for node in accused {
+            if let Some(m) = self.members.get_mut(&node) {
+                m.accuse_at = now.saturating_add(every);
+            }
+            self.reindex(&node);
+            effects.extend(self.liveness_notice(node.clone(), &node, now));
+        }
         if dead.is_empty() {
-            return Vec::new();
+            return effects;
         }
         for node in &dead {
             if let Some(m) = self.members.get_mut(node) {
@@ -134,7 +188,7 @@ impl GroupEngine {
             }
             self.stamp(node);
         }
-        let mut effects = vec![Effect::MembershipChanged];
+        effects.push(Effect::MembershipChanged);
         effects.extend(self.recompute_coordinator());
         for node in dead {
             effects.extend(self.liveness_notice(node.clone(), &node, now));

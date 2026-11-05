@@ -609,3 +609,189 @@ fn command_path_status_writes_stamp_from_the_latest_observed_time() {
         Some((Status::Dead, Time(900)))
     );
 }
+
+/// Timings for the lossy-suspicion tests below: probes every 100 ms, a
+/// 50 ms probe timeout, a 200 ms suspicion window, and no gossip round to
+/// get in the way.
+fn lossy_cfg() -> Config {
+    Config {
+        probe_interval_ms: 100,
+        probe_timeout_ms: 50,
+        suspect_timeout_ms: 200,
+        gossip_interval_ms: 1_000_000,
+        ..Config::default()
+    }
+}
+
+/// Whether `effects` accuse `b`: a one-line digest to `b` naming it `Suspect`.
+fn accuses_b(effects: &[Effect]) -> bool {
+    digests_to(effects, "b").iter().any(|f| {
+        matches!(&f.digest[..], [d] if d.node == NodeId::new("b")
+            && d.status == Status::Suspect.to_wire())
+    })
+}
+
+/// A suspecter whose accusation is lost repeats it every probe timeout until
+/// the suspect answers, so one lost frame no longer leaves the suspect
+/// unaware until gossip happens to reach it — the sequence that, at 200
+/// nodes under 2 % loss, let a suspicion outlive its window and kill a live
+/// member (`groupnet-sim/tests/loss-liveness.rs`). Before: one accusation,
+/// never repeated.
+#[test]
+fn a_lost_accusation_is_repeated_until_the_suspect_answers() {
+    let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], lossy_cfg())
+        .expect("valid config");
+    a.on_message(
+        NodeId::new("b"),
+        &digest_frame(vec![ndigest("b", 0, Status::Alive, 0)], vec![]),
+        Time(1),
+    );
+    a.start(Time(1));
+    a.on_tick(Time(101)); // the direct probe, which "b" never answers
+    let first = a.on_tick(Time(160)); // no prober to ask: suspect, and accuse
+    assert!(accuses_b(&first), "the first accusation (lost on the way)");
+    assert!(
+        a.next_deadline() <= Time(210),
+        "the next accusation is due by then"
+    );
+    let again = a.on_tick(Time(210));
+    assert!(
+        accuses_b(&again),
+        "the accusation is repeated a probe timeout later"
+    );
+    assert!(
+        accuses_b(&a.on_tick(Time(260))),
+        "and again until b answers"
+    );
+
+    // b answers with its refutation: the accusations stop.
+    a.on_message(
+        NodeId::new("b"),
+        &digest_frame(vec![ndigest("b", 1, Status::Alive, 0)], vec![]),
+        Time(270),
+    );
+    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Alive));
+    assert!(!accuses_b(&a.on_tick(Time(310))));
+}
+
+/// A suspicion heard only through gossip does not turn into a death on the
+/// suspecter's clock: once that clock runs out this node asks the suspect
+/// itself, and only declares it `Dead` after the rounds liveness news needs
+/// to cross the group as well — by then the suspecter's own `Dead` verdict
+/// would have arrived had the suspicion been real. Before: `Dead` the moment
+/// the suspecter's window ran out here, however far the refutation still was.
+#[test]
+fn a_suspicion_heard_through_gossip_asks_before_it_kills() {
+    let cfg = Config {
+        probe_interval_ms: 1_000_000, // no probe of our own
+        ..lossy_cfg()
+    };
+    let window = cfg.suspect_timeout_ms;
+    let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], cfg.clone())
+        .expect("valid config");
+    a.on_message(
+        NodeId::new("c"),
+        &digest_frame(
+            vec![
+                ndigest("b", 0, Status::Alive, 0),
+                ndigest("c", 0, Status::Alive, 0),
+            ],
+            vec![],
+        ),
+        Time(1),
+    );
+    a.start(Time(1));
+    a.on_message(
+        NodeId::new("c"),
+        &digest_frame(vec![ndigest("b", 0, Status::Suspect, 0)], vec![]),
+        Time(10),
+    );
+    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Suspect));
+
+    let asked = a.on_tick(Time(10 + window));
+    assert_eq!(
+        a.member_status(&NodeId::new("b")),
+        Some(Status::Suspect),
+        "a heard suspicion outlives the suspecter's window"
+    );
+    assert!(
+        accuses_b(&asked),
+        "and the suspect is asked at the end of it"
+    );
+
+    // Three members: ⌊log2 3⌋ + 2 = 3 rounds for the news to cross.
+    let heard = window + 3 * cfg.gossip_interval_ms;
+    a.on_tick(Time(10 + heard - 1));
+    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Suspect));
+    a.on_tick(Time(10 + heard));
+    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Dead));
+}
+
+/// An indirect probe is two round trips — to the prober, and its own to the
+/// target — so it gets two probe timeouts. An `IndirectAck` that took both
+/// still clears the probe. Before: one timeout, so with link latency above a
+/// quarter of it every direct miss became a suspicion.
+#[test]
+fn an_indirect_probe_gets_two_round_trips() {
+    let cfg = Config {
+        gossip_interval_ms: 1_000_000,
+        ..lossy_cfg()
+    };
+    let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], cfg.clone())
+        .expect("valid config");
+    a.on_message(
+        NodeId::new("c"),
+        &digest_frame(
+            vec![
+                ndigest("b", 0, Status::Alive, 0),
+                ndigest("c", 0, Status::Alive, 0),
+            ],
+            vec![],
+        ),
+        Time(1),
+    );
+    a.start(Time(1));
+    // Probe until the ring reaches b, then let the direct probe miss.
+    let mut now = 1;
+    let target = loop {
+        now += cfg.probe_interval_ms;
+        let probed: Vec<NodeId> = a
+            .on_tick(Time(now))
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Send { to, wire }
+                    if wire::decode(&wire).is_some_and(|f| f.kind == wire::Kind::Ping) =>
+                {
+                    Some(to)
+                }
+                _ => None,
+            })
+            .collect();
+        match probed.as_slice() {
+            [to] if *to == NodeId::new("b") => break now,
+            [to] => {
+                a.on_message(
+                    to.clone(),
+                    &probe_frame(wire::Kind::Ack, None),
+                    Time(now + 1),
+                );
+            }
+            _ => {}
+        }
+    };
+    let escalated = target + cfg.probe_timeout_ms;
+    a.on_tick(Time(escalated)); // direct miss: ask c
+    a.on_tick(Time(escalated + cfg.probe_timeout_ms)); // one timeout: not yet
+    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Alive));
+    a.on_message(
+        NodeId::new("c"),
+        &probe_frame(wire::Kind::IndirectAck, Some(NodeId::new("b"))),
+        Time(escalated + cfg.probe_timeout_ms + 30),
+    );
+    a.on_tick(Time(escalated + 2 * cfg.probe_timeout_ms));
+    assert_eq!(
+        a.member_status(&NodeId::new("b")),
+        Some(Status::Alive),
+        "the indirect ack within two round trips cleared the probe"
+    );
+}

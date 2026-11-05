@@ -256,10 +256,14 @@ serializes its local state transitions. The base Eventual mode combines:
   tombstone reaping. Membership is observer-local during failure and partition.
   Probe rings and gossip fanout start at offsets hashed per group and node,
   and indirect probers are drawn at random, so probe load spreads evenly over
-  the group. A suspecter tells its subject directly and a live subject
-  answers any doubt with its current record, so unless a frame is lost the
-  suspecter clears its doubt within a round trip; other nodes learn the
-  refutation by gossip.
+  the group. An indirect probe gets two probe timeouts, one per round trip.
+  A suspecter tells its subject directly, every probe timeout until it
+  answers, and a live subject answers any doubt with its current record, so
+  the suspecter clears its doubt within a round trip of the first accusation
+  that arrives; other nodes learn the refutation by gossip, ask the subject
+  themselves once the suspecter's window has passed, and hold a suspicion
+  they only heard of for the rounds news needs to cross the group before
+  declaring a death of their own.
 - Digest/delta anti-entropy for membership, TTL'd per-node keyed entries, and
   last-writer-wins metadata registers. A digest lists at most
   `Config::digest_window` members: per-peer deltas of recent changes, or a

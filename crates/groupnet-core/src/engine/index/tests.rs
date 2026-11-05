@@ -77,9 +77,7 @@ fn walk(e: &GroupEngine, now: Time) -> Walk {
     for (node, m) in &e.members {
         if *node != e.local {
             match m.status {
-                Status::Suspect
-                    if now >= m.suspect_since.saturating_add(e.config.suspect_timeout_ms) =>
-                {
+                Status::Suspect if now >= m.suspect_due => {
                     out.suspects.push(node.clone());
                 }
                 Status::Dead if now >= m.dead_since.saturating_add(reap_after) => {

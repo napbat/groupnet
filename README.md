@@ -1446,11 +1446,18 @@ The load-bearing facts:
   group and node ids, and indirect probers are drawn at random among live
   peers, so no member carries the group's probe traffic (64 nodes under 20%
   loss: the busiest receives 1.2× the mean indirect probe load, where
-  lowest-id probers took 31×). A node that suspects a member, or declares
-  one dead, tells it directly, and a live member answers every such doubt
-  with its current record, so unless one of the two frames is lost the doubt
-  clears at that node within a round trip rather than when gossip happens to
-  carry the refutation there.
+  lowest-id probers took 31×). An indirect probe gets two probe timeouts,
+  one per round trip it makes. A node whose own probe finds a member silent
+  tells it directly, and repeats that every probe timeout until it answers;
+  a live member answers every such doubt with its current record, so the
+  doubt clears at that node within a round trip of the first accusation
+  that arrives rather than when gossip happens to carry the refutation
+  there. A node that only heard a suspicion through gossip asks the member
+  itself once the suspecter's window has passed, and holds it `Suspect` for
+  the rounds liveness news needs to cross the group before declaring it
+  `Dead` — by then the suspecter's own verdict has reached it if the
+  suspicion was real. 200 nodes at docstore's timings under 2 % loss hold no
+  live member `Dead`, where they held up to 45 live pairs `Dead` before.
 * **A tick costs what is due, not what is known.** The engine keeps its
   members in an ordered index — by next deadline (suspect window, `Dead`
   reap, entry TTL or tombstone reap), by coordinator score while live, by
