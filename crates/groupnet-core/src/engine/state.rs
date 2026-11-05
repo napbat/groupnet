@@ -569,6 +569,7 @@ impl GroupEngine {
     /// and tombstones, and emits probe / anti-entropy rounds when due.
     pub fn on_tick(&mut self, now: Time) -> Vec<Effect> {
         self.now_hint = self.now_hint.max(now);
+        self.stats.ticks += 1;
         let mut effects = Vec::new();
 
         // 1. A probe whose window elapsed: escalate a direct miss to indirect,
@@ -621,16 +622,51 @@ impl GroupEngine {
     }
 
     pub(super) fn arm_timer(&self) -> Effect {
+        Effect::ArmTimer {
+            at: self.next_deadline(),
+        }
+    }
+
+    /// The instant by which this engine next needs [`on_tick`](Self::on_tick):
+    /// the earliest of the next probe and gossip round, an outstanding probe's
+    /// window, a suspect's refutation window, a `Dead` tombstone's or an
+    /// entry tombstone's reap, an entry's TTL expiry, and a Hosted claim's
+    /// settle window or a host's lease. A tick at that instant handles every
+    /// one of them that is due, so after a tick at `now` this is later than
+    /// `now`.
+    ///
+    /// [`on_message`](Self::on_message) and [`apply`](Self::apply) can bring it
+    /// forward (a nudged gossip round, an entry written with a short TTL)
+    /// without emitting [`Effect::ArmTimer`], so a driver that sleeps until
+    /// the deadline re-reads it after every call. Ticking early or extra is
+    /// harmless; ticking later delays only what was due.
+    #[must_use]
+    pub fn next_deadline(&self) -> Time {
+        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
         let mut at = self.next_anti_entropy.min(self.next_probe);
         if let Some(p) = &self.pending {
             at = at.min(p.deadline);
         }
-        for m in self.members.values() {
-            if m.status == Status::Suspect {
-                at = at.min(
-                    m.suspect_since
-                        .saturating_add(self.config.suspect_timeout_ms),
-                );
+        for (node, m) in &self.members {
+            if *node != self.local {
+                match m.status {
+                    Status::Suspect => {
+                        at = at.min(
+                            m.suspect_since
+                                .saturating_add(self.config.suspect_timeout_ms),
+                        );
+                    }
+                    Status::Dead => at = at.min(m.dead_since.saturating_add(reap_after)),
+                    Status::Alive => {}
+                }
+            }
+            for e in m.entries.values() {
+                let due = if e.tombstone {
+                    e.tombstone_since.saturating_add(reap_after)
+                } else {
+                    e.expires_at
+                };
+                at = at.min(due);
             }
         }
         // A standing claim's settle window and a host's lease are deadlines
@@ -639,7 +675,7 @@ impl GroupEngine {
         if let Some(deadline) = self.election.as_ref().and_then(Election::deadline) {
             at = at.min(deadline);
         }
-        Effect::ArmTimer { at }
+        at
     }
 
     pub(super) fn compute_coordinator(&self) -> Option<NodeId> {

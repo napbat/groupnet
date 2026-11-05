@@ -51,9 +51,9 @@ use tokio::task::JoinHandle;
 const SETTLE: Duration = Duration::from_secs(10);
 
 /// A brisk gossip cadence, so grant rounds, renewals and ledger republishes all
-/// happen in wall-clock milliseconds. It also sets the driver's tick period
-/// (~7 ms here), which [`LEASE_MS`] is two orders of magnitude above — the
-/// sizing rule `HostedConfig` states.
+/// happen in wall-clock milliseconds. The driver ticks at the engine's own
+/// deadlines, this round among them, and [`LEASE_MS`] is two orders of
+/// magnitude above it — the sizing rule `HostedConfig` states.
 const GOSSIP_MS: u64 = 15;
 
 /// A host's authority after its last confirmed renewal round, and — in the

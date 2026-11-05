@@ -1,6 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use groupnet_core::{Command, Config, GroupId, NetStats, NodeId, Role};
 use tokio::sync::mpsc::error::TrySendError;

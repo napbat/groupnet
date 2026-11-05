@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use groupnet_core::{Config, GroupId, NodeId};
 use groupnet_messaging::ValidMessagingConfig;
