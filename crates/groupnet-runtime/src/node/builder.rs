@@ -192,9 +192,11 @@ impl NodeBuilder {
         self
     }
 
-    /// Overrides the most member summaries one digest lists (default 64) —
-    /// see [`Config::digest_window`]. Full digests walk a rolling window over
-    /// the members, so a digest's size stays flat as the group grows.
+    /// Overrides the most member summaries one digest lists (default 64,
+    /// at least 2) — see [`Config::digest_window`]. Full digests walk a
+    /// rolling window over the members, so a digest's size stays flat as the
+    /// group grows. Stored as given; [`start`](Self::start) rejects a window
+    /// of 1.
     #[must_use]
     pub fn digest_window(mut self, members: NonZeroUsize) -> Self {
         self.config.digest_window = members;
