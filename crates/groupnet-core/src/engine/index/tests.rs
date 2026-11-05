@@ -244,7 +244,7 @@ fn tick_matches_the_walk(e: &mut GroupEngine, now: Time, seed: u64, step: u64) {
 
 /// The index-driven reaps are the full walks' over random histories, and the
 /// index equals a fresh scan after every step (`next_deadline` asserts it in
-/// debug builds; this test checks it explicitly in any build).
+/// this crate's test builds; this test also checks it explicitly).
 #[test]
 fn indexed_reaps_match_a_full_walk() {
     let config = Config {

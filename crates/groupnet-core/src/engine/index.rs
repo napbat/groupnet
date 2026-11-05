@@ -161,20 +161,28 @@ impl GroupEngine {
         Some(m)
     }
 
-    /// The change clock: it advances whenever a member's record changes —
-    /// liveness, incarnation, entries or version high-water — and whenever a
-    /// member is forgotten. A reader that mirrors the roster keeps the value
-    /// it last read and asks [`members_changed_since`](Self::members_changed_since)
-    /// and [`members_forgotten_since`](Self::members_forgotten_since) for
-    /// what moved after it.
+    /// The change clock: it advances whenever a member's digest-visible
+    /// record changes — liveness, incarnation, an entry written or adopted,
+    /// or the version high-water — and whenever a member is forgotten. A
+    /// reader that mirrors the roster keeps the value it last read and asks
+    /// [`members_changed_since`](Self::members_changed_since) and
+    /// [`members_forgotten_since`](Self::members_forgotten_since) for what
+    /// moved after it.
+    ///
+    /// It does **not** advance when a tick drops an entry: neither a TTL
+    /// expiry nor an entry tombstone's reap changes what the member's digest
+    /// line advertises. A reader that mirrors entries learns an expiry only
+    /// from its [`Effect::NodeStateChanged`](crate::Effect::NodeStateChanged);
+    /// a tombstone's reap needs nothing, since the key already read as absent.
     #[must_use]
     pub fn change_clock(&self) -> u64 {
         self.change_clock
     }
 
-    /// The known members whose record changed after change-clock `since`,
-    /// in the order they last changed: `O(log N)` plus one step per member.
-    /// Each is listed once however often it changed.
+    /// The known members whose record changed after change-clock `since`
+    /// (what advances [`change_clock`](Self::change_clock) — not a TTL
+    /// expiry), in the order they last changed: `O(log N)` plus one step per
+    /// member. Each is listed once however often it changed.
     pub fn members_changed_since(&self, since: u64) -> impl Iterator<Item = &NodeId> {
         self.index
             .changed
@@ -251,9 +259,9 @@ impl GroupEngine {
 
     /// Checks every index against a full walk of the members and their
     /// entries — what each index replaces — and the coordinator against the
-    /// placement owner of the live set. Debug builds run it on every
-    /// [`next_deadline`](Self::next_deadline).
-    #[cfg(any(test, debug_assertions))]
+    /// placement owner of the live set. This crate's test builds run it on
+    /// every [`next_deadline`](Self::next_deadline).
+    #[cfg(test)]
     pub(super) fn assert_index(&self) {
         let reap_after = self.reap_after();
         let (mut due, mut live, mut stamped) = (0, 0, 0);

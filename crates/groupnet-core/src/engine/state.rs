@@ -679,7 +679,9 @@ impl GroupEngine {
     /// harmless; ticking later delays only what was due.
     #[must_use]
     pub fn next_deadline(&self) -> Time {
-        #[cfg(debug_assertions)]
+        // This crate's own tests check the index on every call; other
+        // builds, debug ones downstream included, skip the full walk.
+        #[cfg(test)]
         self.assert_index();
         let mut at = self
             .next_anti_entropy
