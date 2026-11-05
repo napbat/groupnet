@@ -39,7 +39,7 @@ mod reach_tests;
 
 use routing::{InboundState, drive};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::sync::{
@@ -87,6 +87,9 @@ struct Queued {
 
 struct Link {
     config: LinkConfig,
+    /// `config.peers` as a set: admission runs for every received frame and
+    /// every candidate route examined, so it must not scan the peer list.
+    peers: HashSet<NodeId>,
     control: LinkControl,
     outgoing: mpsc::Sender<Queued>,
     cancel: CancellationToken,
@@ -97,7 +100,7 @@ impl Link {
     fn admits(&self, peer: &NodeId, session: Option<SessionId>) -> bool {
         match (&self.sessions, session) {
             (Some(registry), Some(id)) => registry.is_active(peer, id),
-            (None, None) => self.config.peers.contains(peer),
+            (None, None) => self.peers.contains(peer),
             _ => false,
         }
     }
@@ -120,6 +123,12 @@ struct Table {
     /// across the table's life — the work the refresh tests bound.
     #[cfg(test)]
     reach_visits: u64,
+    /// Candidate routes those refreshes examined.
+    #[cfg(test)]
+    reach_candidates: u64,
+    /// Times the reachable set was found changed and republished.
+    #[cfg(test)]
+    reach_publishes: u64,
 }
 
 impl Table {
@@ -448,6 +457,7 @@ impl Router {
         table.links.insert(
             id,
             Link {
+                peers: config.peers.iter().cloned().collect(),
                 config,
                 control,
                 outgoing: send,
@@ -520,7 +530,7 @@ impl Router {
         let table = shared.table.lock().expect("router table poisoned");
         for link in table.links.values() {
             let admitted = link.sessions.as_ref().map_or_else(
-                || link.config.peers.contains(peer),
+                || link.peers.contains(peer),
                 |sessions| {
                     sessions
                         .subscribe()

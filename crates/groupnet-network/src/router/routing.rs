@@ -420,6 +420,10 @@ impl Shared {
         full_path.push(self.local.clone());
         full_path.extend(path);
         let now = Instant::now();
+        let admitted = table
+            .links
+            .get(&link)
+            .is_some_and(|adapter| adapter.admits(&neighbor, session));
         table
             .candidates
             .entry(destination.clone())
@@ -438,10 +442,11 @@ impl Shared {
                     session,
                 },
             );
-        // Only this destination's candidates changed: re-examine it alone,
-        // and drop whatever lapsed since, instead of rebuilding the set.
+        // Only this destination's candidates changed, and the one just
+        // learned is its freshest: move its lapse alone, and drop whatever
+        // lapsed since, instead of rebuilding the set.
         table.reach_expire(now);
-        table.reach_refresh(&destination, self.config.route_ttl, now);
+        table.reach_advert(&destination, admitted, self.config.route_ttl, now);
         if table.reach_take_changed() {
             self.publish_reachable(&table);
         }

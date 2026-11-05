@@ -36,25 +36,40 @@ fn destination(i: usize) -> NodeId {
     NodeId::new(format!("d{i:03}"))
 }
 
-fn visits(shared: &Shared) -> u64 {
-    shared.table.lock().expect("router table").reach_visits
+/// Neighbors that each advertise a route to every destination, so each
+/// destination has this many candidate routes — the all-seeds shape.
+const NEIGHBORS: usize = 50;
+
+/// The work counters the reachability index keeps in tests:
+/// `(destinations examined, candidate routes examined, publishes)`.
+fn work(shared: &Shared) -> (u64, u64, u64) {
+    let table = shared.table.lock().expect("router table");
+    (
+        table.reach_visits,
+        table.reach_candidates,
+        table.reach_publishes,
+    )
 }
 
-/// With routes to 200 destinations known, one more advert for one of them
-/// examines that destination's routes only, not the whole table. Before (a
-/// full rebuild per advert): 200 destinations examined; after: 1.
+/// With 200 destinations known, each through 50 neighbors, one more
+/// steady-state advert — a destination already reachable, refreshed by one
+/// of its neighbors — examines no other destination and none of its other
+/// candidate routes, and neither copies nor republishes the reachable set.
+/// Before (5f1c9c3, a full rebuild per advert): 200 destinations examined;
+/// at ccf36c7 (per-destination refresh): 1 destination and its 50
+/// candidates; now: 0, 0. Publishes are 0 at ccf36c7 and now: only entering
+/// or leaving the set republishes it.
 #[tokio::test(start_paused = true)]
-async fn one_advert_examines_only_the_destination_it_names() -> io::Result<()> {
-    let neighbor = NodeId::new("neighbor");
+async fn a_steady_state_advert_touches_only_its_own_lapse() -> io::Result<()> {
+    let neighbors: Vec<NodeId> = (0..NEIGHBORS)
+        .map(|i| NodeId::new(format!("n{i:02}")))
+        .collect();
     let router = Router::with_config(NodeId::new("local"), config())?;
     let link = router
-        .add_link(BoundLink::new(
-            Silent,
-            LinkConfig::new(vec![neighbor.clone()]),
-        ))
+        .add_link(BoundLink::new(Silent, LinkConfig::new(neighbors.clone())))
         .await?;
     let shared = &router.inner.shared;
-    for i in 0..N {
+    let advert = |neighbor: &NodeId, i: usize| {
         shared.learn(
             link,
             neighbor.clone(),
@@ -63,22 +78,32 @@ async fn one_advert_examines_only_the_destination_it_names() -> io::Result<()> {
             1,
             vec![neighbor.clone(), destination(i)],
         );
+    };
+    for i in 0..N {
+        for neighbor in &neighbors {
+            advert(neighbor, i);
+        }
     }
     assert_eq!(router.reachable().borrow().len(), N);
-
-    let before = visits(shared);
-    shared.learn(
-        link,
-        neighbor.clone(),
-        None,
-        1,
-        1,
-        vec![neighbor.clone(), destination(N / 2)],
+    let (_, _, publishes) = work(shared);
+    assert_eq!(
+        publishes,
+        u64::try_from(N).expect("small"),
+        "one publish per destination entering the set"
     );
-    let examined = visits(shared) - before;
-    assert!(
-        examined <= 1,
-        "one advert examined {examined} destinations of {N}"
+
+    // Later than the routes it refreshes, so its lapse really moves.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let before = work(shared);
+    advert(&neighbors[7], N / 2);
+    let after = work(shared);
+    let (destinations, candidates, publishes) =
+        (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+    assert_eq!(
+        (destinations, candidates, publishes),
+        (0, 0, 0),
+        "one steady-state advert examined {destinations} destinations and \
+         {candidates} candidate routes, and republished {publishes} times"
     );
     assert_eq!(router.reachable().borrow().len(), N);
     router.close().await;

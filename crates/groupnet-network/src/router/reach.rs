@@ -18,6 +18,9 @@ use std::time::Duration;
 use groupnet_core::NodeId;
 use tokio::time::Instant;
 
+#[cfg(test)]
+use std::collections::HashMap;
+
 use super::Table;
 
 /// When a destination stops being reachable unless refreshed.
@@ -49,6 +52,7 @@ impl Table {
         #[cfg(test)]
         {
             self.reach_visits += 1;
+            self.reach_candidates += self.candidates.get(target).map_or(0, HashMap::len) as u64;
         }
         let mut latest: Option<Lapse> = None;
         for candidate in self.candidates.get(target)?.values() {
@@ -69,6 +73,43 @@ impl Table {
             }
         }
         latest
+    }
+
+    /// Updates the index after an advert refreshed one of `target`'s
+    /// candidates at `now`. That candidate is the freshest `target` has, so
+    /// when its link `admitted` it, `target` is reachable until its lapse —
+    /// no other candidate need be examined, and a destination that was
+    /// already reachable only moves its lapse (`O(log N)`, no change to the
+    /// set). Otherwise the destination is re-examined whole.
+    pub(super) fn reach_advert(
+        &mut self,
+        target: &NodeId,
+        admitted: bool,
+        ttl: Duration,
+        now: Instant,
+    ) {
+        if !admitted {
+            self.reach_refresh(target, ttl, now);
+            return;
+        }
+        let lapse = now.checked_add(ttl).map_or(Lapse::Never, Lapse::At);
+        let old = self.reach.until.get(target).copied();
+        let until = old.map_or(lapse, |old| old.max(lapse));
+        if old == Some(until) {
+            return;
+        }
+        if let Some(Lapse::At(at)) = old {
+            self.reach.lapses.remove(&(at, target.clone()));
+        }
+        if let Lapse::At(at) = until {
+            self.reach.lapses.insert((at, target.clone()));
+        }
+        if let Some(slot) = self.reach.until.get_mut(target) {
+            *slot = until;
+        } else {
+            self.reach.until.insert(target.clone(), until);
+            self.reach.changed = true;
+        }
     }
 
     /// Re-examines one destination after its candidates changed.
@@ -114,7 +155,12 @@ impl Table {
     /// Whether the set changed since the last call — so a caller publishes
     /// it only then, whichever path changed it.
     pub(super) fn reach_take_changed(&mut self) -> bool {
-        std::mem::take(&mut self.reach.changed)
+        let changed = std::mem::take(&mut self.reach.changed);
+        #[cfg(test)]
+        {
+            self.reach_publishes += u64::from(changed);
+        }
+        changed
     }
 
     /// The destinations the index would still hold once lapses up to `now`
