@@ -4,9 +4,12 @@
 
 mod anti_entropy;
 mod command;
+#[cfg(test)]
+mod cost_tests;
 mod discovery;
 mod effect;
 mod election;
+mod index;
 mod liveness;
 mod merge;
 mod spread;

@@ -9,6 +9,8 @@
 //! [`wire`](crate::wire) codec only ever moves opaque bytes and never has to
 //! know what a status *means*.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::Time;
 
 /// A member's liveness status. The variants are ordered by precedence: when two
@@ -136,6 +138,27 @@ impl StateEntry {
     }
 }
 
+/// Where the engine's index has a member filed, so a change can move it
+/// without a search: under its earliest deadline, and — while it is live —
+/// under its coordinator score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Filed {
+    /// The member's earliest deadline: its suspect window or `Dead` reap,
+    /// or its first entry TTL or tombstone reap ([`Time::MAX`] = none, not
+    /// filed).
+    pub(crate) due: Time,
+    /// The member's coordinator score while it is live (not `Dead`).
+    pub(crate) score: Option<u64>,
+}
+
+impl Filed {
+    /// Not filed anywhere.
+    const NONE: Self = Self {
+        due: Time::MAX,
+        score: None,
+    };
+}
+
 /// One member's record, as this node currently sees it: SWIM liveness plus the
 /// keyed per-node state the member authors about itself.
 ///
@@ -171,7 +194,12 @@ pub(crate) struct Member {
     pub(crate) liveness_since: Time,
     /// Keyed app-defined per-node state; each entry merged by its own version,
     /// independently of liveness.
-    pub(crate) entries: std::collections::BTreeMap<String, StateEntry>,
+    pub(crate) entries: BTreeMap<String, StateEntry>,
+    /// The keys of [`entries`](Self::entries) by when each next needs a tick
+    /// ([`StateEntry::reap_due`]); an entry that never does is not listed.
+    /// Kept by every entry write and removal here, so a tick reaps only the
+    /// entries that are due.
+    pub(crate) entry_dues: BTreeMap<Time, BTreeSet<String>>,
     /// **High-water mark** over every entry version this node has *ever* held for
     /// the member — the scalar digest summary the anti-entropy round advertises.
     ///
@@ -195,6 +223,8 @@ pub(crate) struct Member {
     /// every entry's bytes, and a digest lists up to a window of members, so
     /// recomputing it per digest dominated a busy group's CPU.
     pub(crate) hash_cache: Option<(u64, Time)>,
+    /// Where the engine's index has this member filed (engine-maintained).
+    pub(crate) filed: Filed,
 }
 
 impl Member {
@@ -209,10 +239,12 @@ impl Member {
             suspect_since: Time::ZERO,
             dead_since: Time::ZERO,
             liveness_since: now,
-            entries: std::collections::BTreeMap::new(),
+            entries: BTreeMap::new(),
+            entry_dues: BTreeMap::new(),
             max_state_version: 0,
             changed_at: 0,
             hash_cache: None,
+            filed: Filed::NONE,
         }
     }
 
@@ -245,18 +277,63 @@ impl Member {
         self.max_state_version = self.max_state_version.max(version);
     }
 
-    /// Stores `entry` under `key`, invalidating the cached content hash.
-    /// Returns when the entry next needs a tick ([`StateEntry::reap_due`]),
-    /// which the engine folds into its cached deadline.
-    #[must_use]
-    pub(crate) fn put_entry(&mut self, key: String, entry: StateEntry, reap_after: u64) -> Time {
+    /// Stores `entry` under `key`, invalidating the cached content hash and
+    /// re-listing the key under its new deadline.
+    pub(crate) fn put_entry(&mut self, key: String, entry: StateEntry, reap_after: u64) {
         let due = entry.reap_due(reap_after);
+        let old = self.entries.get(&key).map(|e| e.reap_due(reap_after));
+        if old != Some(due) {
+            let kept = old.and_then(|at| self.unlist_due(at, &key));
+            if due != Time::MAX {
+                self.entry_dues
+                    .entry(due)
+                    .or_default()
+                    .insert(kept.unwrap_or_else(|| key.clone()));
+            }
+        }
         self.entries.insert(key, entry);
         self.entries_changed();
+    }
+
+    /// Removes every entry due by `now` from the map, in key order, with the
+    /// key each was stored under.
+    pub(crate) fn take_due_entries(&mut self, now: Time) -> Vec<(String, StateEntry)> {
+        let mut keys: Vec<String> = Vec::new();
+        while let Some(first) = self.entry_dues.first_entry()
+            && *first.key() <= now
+        {
+            keys.extend(first.remove());
+        }
+        keys.sort_unstable();
+        let due: Vec<(String, StateEntry)> = keys
+            .into_iter()
+            .filter_map(|key| self.entries.remove(&key).map(|e| (key, e)))
+            .collect();
+        if !due.is_empty() {
+            self.entries_changed();
+        }
         due
     }
 
-    /// Invalidates the cached content hash after an in-place entry change.
+    /// When the first of this member's entries next needs a tick
+    /// ([`Time::MAX`] when none does).
+    pub(crate) fn next_entry_due(&self) -> Time {
+        self.entry_dues.keys().next().copied().unwrap_or(Time::MAX)
+    }
+
+    /// Takes `key` out of the deadline `at` it is listed under, returning
+    /// the stored key for reuse.
+    fn unlist_due(&mut self, at: Time, key: &str) -> Option<String> {
+        let keys = self.entry_dues.get_mut(&at)?;
+        let kept = keys.take(key);
+        if keys.is_empty() {
+            self.entry_dues.remove(&at);
+        }
+        kept
+    }
+
+    /// Invalidates the cached content hash after an in-place entry change
+    /// that leaves every entry's deadline where it was.
     pub(crate) fn entries_changed(&mut self) {
         self.hash_cache = None;
     }

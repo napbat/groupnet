@@ -75,11 +75,19 @@ impl GroupEngine {
         if targets.is_empty() {
             return Vec::new();
         }
-        self.refresh_content_hashes(now);
         let mut effects = Vec::new();
         for to in targets {
-            let (summaries, full, peer) = self.digest_for(&to, now);
+            let (listed, full, peer) = self.digest_for(&to, now);
             self.digest_peers.insert(to.clone(), peer);
+            // Only the listed members' content hashes are read: refresh
+            // those, so the next digest listing them reads the cache.
+            for node in &listed {
+                self.refresh_content_hash(node, now);
+            }
+            let summaries: Vec<wire::NodeDigest> = listed
+                .iter()
+                .filter_map(|node| self.members.get(node).map(|m| self.summary(node, m, now)))
+                .collect();
             let listed = summaries.len() as u64;
             let chunks = self.build_digest_chunks(summaries);
             self.stats.digests_built += 1;
@@ -101,15 +109,16 @@ impl GroupEngine {
         effects
     }
 
-    /// Chooses the member summaries of the next digest to `to` — at most
+    /// Chooses the members the next digest to `to` lists — at most
     /// [`Config::digest_window`](crate::Config::digest_window) of them — and
     /// returns them with whether the digest is full and the peer's updated
     /// bookkeeping.
     ///
     /// Every digest starts from the members whose summary changed since the
-    /// last digest built for this peer. A **delta** digest lists exactly
-    /// those — safe because a digest only ever triggers per-listed-member
-    /// reconciliation (absence is never interpreted).
+    /// last digest built for this peer, read off the change index. A
+    /// **delta** digest lists exactly those, in id order — safe because a
+    /// digest only ever triggers per-listed-member reconciliation (absence
+    /// is never interpreted).
     ///
     /// A peer's first digest, every `full_digest_every`-th after it, and any
     /// delta that would list more than the window are **full**. A full
@@ -132,7 +141,7 @@ impl GroupEngine {
     /// The cursor advances on build, not delivery: anything a dropped frame,
     /// or a change a full digest had no room to lead with, left out stays
     /// divergent only until the rolling window reaches it.
-    fn digest_for(&self, to: &NodeId, now: Time) -> (Vec<wire::NodeDigest>, bool, PeerDigest) {
+    fn digest_for(&self, to: &NodeId, now: Time) -> (Vec<NodeId>, bool, PeerDigest) {
         let window = self.config.digest_window.get();
         let prev = self.digest_peers.get(to);
         let visits = prev.map_or(0, |p| p.visits);
@@ -147,16 +156,19 @@ impl GroupEngine {
                 .iter()
                 .filter(|(_, m)| self.should_gossip(m, now))
         };
-        let mut listed: Vec<(&NodeId, &Member)> = gossipable()
-            .filter(|(_, m)| m.changed_at > cursor)
+        let mut listed: Vec<(&NodeId, &Member)> = self
+            .index
+            .changed
+            .range((Excluded(cursor), Unbounded))
+            .filter_map(|(_, node)| self.members.get_key_value(node))
+            .filter(|(_, m)| self.should_gossip(m, now))
             .collect();
+        self.touch(listed.len());
         let scheduled_full = visits.is_multiple_of(self.config.full_digest_every.get());
         if !scheduled_full && listed.len() <= window {
-            let summaries = listed
-                .into_iter()
-                .map(|(node, m)| self.summary(node, m, now))
-                .collect();
-            return (summaries, false, peer);
+            listed.sort_unstable_by_key(|(node, _)| *node);
+            let nodes = listed.into_iter().map(|(node, _)| node.clone()).collect();
+            return (nodes, false, peer);
         }
 
         // Lead: the local member, then hot liveness news, then the freshest
@@ -197,17 +209,16 @@ impl GroupEngine {
             fill_window(&mut listed, lead, window, walk, &mut peer.resume);
         } else {
             let len = gossipable().count();
+            self.touch(len);
             if len > 0 {
                 let start = spread::index(spread::pair_hash(&self.local, to), len);
                 let walk = gossipable().skip(start).chain(gossipable().take(start));
                 fill_window(&mut listed, lead, window, walk, &mut peer.resume);
             }
         }
-        let summaries = listed
-            .into_iter()
-            .map(|(node, m)| self.summary(node, m, now))
-            .collect();
-        (summaries, true, peer)
+        self.touch(listed.len() - lead);
+        let nodes = listed.into_iter().map(|(node, _)| node.clone()).collect();
+        (nodes, true, peer)
     }
 
     /// How long a liveness change stays hot — leads every full digest — at
@@ -272,7 +283,9 @@ impl GroupEngine {
     /// the contacts changed, so a round costs `O(k)`.
     pub(super) fn rotated_targets(&mut self, cursor: usize, k: usize) -> Vec<NodeId> {
         if self.targets.is_none() {
-            self.targets = Some(self.dissemination_targets().cloned().collect());
+            let targets: Vec<NodeId> = self.dissemination_targets().cloned().collect();
+            self.touch(targets.len());
+            self.targets = Some(targets);
         }
         let targets = self.targets.as_deref().unwrap_or_default();
         debug_assert!(
@@ -698,11 +711,11 @@ mod tests {
         })
     }
 
-    /// The cached deadline and dissemination targets follow every change
-    /// that moves them, between ticks: an adopted TTL entry, a suspicion and
-    /// a death learned by gossip, new discovery contacts. The cached
-    /// deadline then equals a scan of every member; the targets, a fresh
-    /// merge.
+    /// The deadline index and the cached dissemination targets follow every
+    /// change that moves them, between ticks: an adopted TTL entry, a
+    /// suspicion and a death learned by gossip, new discovery contacts. The
+    /// index then equals a scan of every member (`assert_index`); the
+    /// targets, a fresh merge.
     #[test]
     fn the_cached_deadline_and_targets_follow_every_change() {
         let config = Config {
@@ -726,7 +739,7 @@ mod tests {
         assert_eq!(targets(&mut e), ids(&["b", "c"]));
 
         e.on_message(NodeId::new("b"), &delta_with_ttl("b", 500), Time(10));
-        assert_eq!(e.slow_deadline, e.scan_slow_deadline());
+        e.assert_index();
         assert_eq!(e.next_deadline(), Time(510), "the TTL expiry is next");
 
         e.on_message(
@@ -734,7 +747,7 @@ mod tests {
             &digest(&[("c", 0, Status::Suspect)]),
             Time(20),
         );
-        assert_eq!(e.slow_deadline, e.scan_slow_deadline());
+        e.assert_index();
         assert_eq!(e.next_deadline(), Time(510).min(Time(20 + suspect_ms)));
 
         e.apply(Command::SetBootstrapContacts(ids(&["z"])));
@@ -745,7 +758,7 @@ mod tests {
             &digest(&[("c", 0, Status::Dead)]),
             Time(30),
         );
-        assert_eq!(e.slow_deadline, e.scan_slow_deadline());
+        e.assert_index();
         assert_eq!(
             targets(&mut e),
             ids(&["b", "z"]),

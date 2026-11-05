@@ -109,15 +109,22 @@ pub fn owner(key: &str, members: &BTreeSet<NodeId>) -> Option<NodeId> {
 }
 
 /// [`owner`] over any distinct `members`, each scored once — what the
-/// engine's derived coordinator uses without first collecting a set.
+/// engine's derived coordinator is checked against.
 pub(crate) fn owner_among<'a>(
     key: &str,
     members: impl Iterator<Item = &'a NodeId>,
 ) -> Option<NodeId> {
     members
         // tie: smaller id wins (matches `owners`' ascending-id tiebreak)
-        .max_by_key(|node| (token_score(key, node, 0), std::cmp::Reverse(*node)))
+        .max_by_key(|node| (owner_score(key, node), std::cmp::Reverse(*node)))
         .cloned()
+}
+
+/// `node`'s score for owning `key` alone: the owner is the member with the
+/// highest, the smaller id winning a tie. The engine keeps its live members
+/// ordered by it, so the coordinator is read off the top.
+pub(crate) fn owner_score(key: &str, node: &NodeId) -> u64 {
+    token_score(key, node, 0)
 }
 
 #[cfg(test)]

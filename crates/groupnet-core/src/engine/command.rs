@@ -147,7 +147,7 @@ impl GroupEngine {
             }
             Command::DeleteLocalEntry { key } => {
                 let now = self.now_hint;
-                let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
+                let reap_after = self.reap_after();
                 let Some(m) = self.members.get_mut(&self.local) else {
                     return Vec::new();
                 };
@@ -156,12 +156,11 @@ impl GroupEngine {
                 // tombstone (idempotent, and it wins over any in-flight write).
                 let version = m.max_state_version.saturating_add(1);
                 m.max_state_version = version;
-                let due = m.put_entry(
+                m.put_entry(
                     key.clone(),
                     StateEntry::adopted(version, Vec::new(), 0, true, now),
                     reap_after,
                 );
-                self.lower_deadline(due);
                 self.authored.insert(key.clone());
                 self.stamp_self();
                 self.nudge_anti_entropy_now();
@@ -241,18 +240,17 @@ impl GroupEngine {
     ) -> Vec<Effect> {
         let now = self.now_hint;
         let ttl = ttl_ms.unwrap_or(0);
-        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
+        let reap_after = self.reap_after();
         let Some(m) = self.members.get_mut(&self.local) else {
             return Vec::new();
         };
         let version = m.max_state_version.saturating_add(1);
         m.max_state_version = version;
-        let due = m.put_entry(
+        m.put_entry(
             key.to_owned(),
             StateEntry::adopted(version, value, ttl, false, now),
             reap_after,
         );
-        self.lower_deadline(due);
         self.authored.insert(key.to_owned());
         self.stamp_self();
         self.nudge_anti_entropy_now();

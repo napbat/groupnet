@@ -1,6 +1,7 @@
 //! The engine's state, construction, read accessors, and event entrypoints
 //! (`start` / `on_message` / `on_tick`).
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{Config, ConfigError, GroupMode};
@@ -9,6 +10,7 @@ use crate::{GroupId, NodeId, Time, placement, wire};
 
 use super::effect::Effect;
 use super::election::Election;
+use super::index::Index;
 use super::spread::{self, SplitMix};
 use super::stats::NetStats;
 
@@ -107,11 +109,12 @@ pub struct GroupEngine {
     /// set or the contacts change (`None` until then): every gossip round
     /// indexes into them.
     pub(super) targets: Option<Vec<NodeId>>,
-    /// The earliest suspect, `Dead`-reap and entry deadline. Exact after a
-    /// tick or a live-set change; lowered by every entry write in between, so
-    /// it is never later than a scan of every member would find (it may be
-    /// earlier, which costs one spurious tick at most).
-    pub(super) slow_deadline: Time,
+    /// The live probe candidates, in id order, kept until the live set
+    /// changes (`None` until then): every probe indexes into them.
+    pub(super) ring: Option<Vec<NodeId>>,
+    /// The ordered index over the members: who is due when, who is live by
+    /// coordinator score, and who changed when.
+    pub(super) index: Index,
     pub(super) metadata: BTreeMap<String, VersionedValue>,
     pub(super) coordinator: Option<NodeId>,
     pub(super) config: Config,
@@ -162,6 +165,10 @@ pub struct GroupEngine {
     pub(super) election: Option<Election>,
     /// Cumulative anti-entropy traffic counters.
     pub(super) stats: NetStats,
+    /// Members and entries the engine examined (test-only instrumentation:
+    /// what the tick-cost tests bound).
+    #[cfg(test)]
+    pub(super) touched: std::cell::Cell<u64>,
 }
 
 impl GroupEngine {
@@ -205,7 +212,8 @@ impl GroupEngine {
             seeds,
             bootstrap_contacts: BTreeSet::new(),
             targets: None,
-            slow_deadline: Time::MAX,
+            ring: None,
+            index: Index::default(),
             metadata: BTreeMap::new(),
             coordinator: None,
             config,
@@ -223,7 +231,12 @@ impl GroupEngine {
             digest_peers: BTreeMap::new(),
             election,
             stats: NetStats::default(),
+            #[cfg(test)]
+            touched: std::cell::Cell::new(0),
         };
+        engine.index.changed.insert(1, engine.local.clone());
+        let local = engine.local.clone();
+        engine.reindex(&local);
         engine.coordinator = engine.compute_coordinator();
         Ok(engine)
     }
@@ -235,20 +248,39 @@ impl GroupEngine {
     }
 
     /// Bumps the change clock and stamps `node`'s member record, so the next
-    /// delta digest to any peer re-advertises this member. Cheap enough to
-    /// call once per mutation site; over-stamping only costs a digest line.
+    /// delta digest to any peer re-advertises this member, and re-files it in
+    /// the [index](Self::reindex). Every change to a member's liveness or
+    /// entries stamps it. Cheap enough to call once per mutation site;
+    /// over-stamping only costs a digest line.
     pub(super) fn stamp(&mut self, node: &NodeId) {
         self.change_clock += 1;
         let stamp = self.change_clock;
         if let Some(m) = self.members.get_mut(node) {
+            if m.changed_at > 0 {
+                self.index.changed.remove(&m.changed_at);
+            }
             m.changed_at = stamp;
+            self.index.changed.insert(stamp, node.clone());
         }
+        self.reindex(node);
     }
 
     /// [`stamp`](Self::stamp) for the local member, avoiding a borrow clash.
     pub(super) fn stamp_self(&mut self) {
         let me = self.local.clone();
         self.stamp(&me);
+    }
+
+    /// Counts `n` members or entries examined — the test-only instrumentation
+    /// the tick-cost tests read; nothing in other builds.
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "it counts in test builds only")
+    )]
+    pub(super) fn touch(&self, n: usize) {
+        #[cfg(test)]
+        self.touched.set(self.touched.get() + n as u64);
+        let _ = n;
     }
 
     /// The group this engine belongs to.
@@ -627,8 +659,6 @@ impl GroupEngine {
         //    so it reads this tick's membership, and rides the same round
         //    cadence for its re-broadcasts.
         effects.extend(self.election_tick(now, anti_entropy_due));
-
-        self.slow_deadline = self.scan_slow_deadline();
         effects.push(self.arm_timer());
         effects
     }
@@ -654,14 +684,12 @@ impl GroupEngine {
     /// harmless; ticking later delays only what was due.
     #[must_use]
     pub fn next_deadline(&self) -> Time {
-        debug_assert!(
-            self.slow_deadline <= self.scan_slow_deadline(),
-            "the maintained deadline fell behind a scan of the members"
-        );
+        #[cfg(debug_assertions)]
+        self.assert_index();
         let mut at = self
             .next_anti_entropy
             .min(self.next_probe)
-            .min(self.slow_deadline);
+            .min(self.slow_deadline());
         if let Some(p) = &self.pending {
             at = at.min(p.deadline);
         }
@@ -674,52 +702,21 @@ impl GroupEngine {
         at
     }
 
-    /// The earliest suspect window, `Dead` reap and entry TTL or tombstone
-    /// reap, from a scan of every member and entry — what
-    /// [`slow_deadline`](Self::slow_deadline) caches.
-    pub(super) fn scan_slow_deadline(&self) -> Time {
-        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
-        let mut at = Time::MAX;
-        for (node, m) in &self.members {
-            if *node != self.local {
-                match m.status {
-                    Status::Suspect => {
-                        at = at.min(
-                            m.suspect_since
-                                .saturating_add(self.config.suspect_timeout_ms),
-                        );
-                    }
-                    Status::Dead => at = at.min(m.dead_since.saturating_add(reap_after)),
-                    Status::Alive => {}
-                }
-            }
-            for e in m.entries.values() {
-                at = at.min(e.reap_due(reap_after));
-            }
-        }
-        at
-    }
-
-    /// Lowers the cached deadline to `due`, after an entry write.
-    pub(super) fn lower_deadline(&mut self, due: Time) {
-        self.slow_deadline = self.slow_deadline.min(due);
-    }
-
+    /// The coordinator is just the placement owner of the group id among live
+    /// members (Alive or Suspect); a Dead node is never a candidate. Same
+    /// HA-hash the public `placement` API exposes, read off the top of the
+    /// live index.
     pub(super) fn compute_coordinator(&self) -> Option<NodeId> {
-        // The coordinator is just the placement owner of the group id among live
-        // members (Alive or Suspect); a Dead node is never a candidate. Same
-        // HA-hash the public `placement` API exposes.
-        placement::owner_among(self.group.as_str(), self.members())
+        self.index
+            .live
+            .last()
+            .map(|(_, Reverse(node))| node.clone())
     }
 
     /// Re-derives the coordinator after the live set may have changed. Every
     /// path that changes a member's liveness or adds a member passes through
-    /// here, so it also drops what depends on the live set: the cached
-    /// dissemination targets, and the cached deadline (re-scanned: a new
-    /// suspect or `Dead` member brings it forward).
+    /// here.
     pub(super) fn recompute_coordinator(&mut self) -> Vec<Effect> {
-        self.targets = None;
-        self.slow_deadline = self.scan_slow_deadline();
         let next = self.compute_coordinator();
         if next == self.coordinator {
             return Vec::new();

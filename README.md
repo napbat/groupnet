@@ -1451,6 +1451,15 @@ The load-bearing facts:
   with its current record, so unless one of the two frames is lost the doubt
   clears at that node within a round trip rather than when gossip happens to
   carry the refutation there.
+* **A tick costs what is due, not what is known.** The engine keeps its
+  members in an ordered index — by next deadline (suspect window, `Dead`
+  reap, entry TTL or tombstone reap), by coordinator score while live, and
+  by last change — updated in `O(log N)` on every liveness change and entry
+  write. A tick reaps only the members and entries whose deadline passed, a
+  delta digest reads only the members changed since its peer's cursor, and
+  the coordinator is read off the top of the live set. A quiet 1,000-member
+  group with 4,000 entries examines at most two digest windows (128 members)
+  per tick, where a walk of every member and entry cost about 20,000.
 * Groups within a fabric are cheap and independent: the intended shape for a
   big system is many small shard groups (replica sets) plus one membership
   fabric per cell, with an authoritative store owning cross-cell placement.

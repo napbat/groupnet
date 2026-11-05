@@ -35,7 +35,6 @@ impl GroupEngine {
             return false;
         };
         self.incarnation = ni;
-        self.stamp_self();
         // A refutation carries no clock of its own — it is triggered by the
         // frame being merged — so it stamps from the freshest time the engine
         // has been told about, which is that frame's.
@@ -44,6 +43,7 @@ impl GroupEngine {
             m.incarnation = ni;
             m.adopt_status(Status::Alive, now);
         }
+        self.stamp_self();
         true
     }
 
@@ -192,7 +192,7 @@ impl GroupEngine {
             }) {
                 continue;
             }
-            let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
+            let reap_after = self.reap_after();
             let m = self.members.get_mut(&self.local).expect("self present");
             if self.authored.contains(&entry.key) {
                 // Sole-author rule: never let an echo (or forgery) replace a
@@ -212,7 +212,7 @@ impl GroupEngine {
                 // A key we have NOT authored this boot, echoed at a higher
                 // version, is our own pre-restart data — adopt it verbatim.
                 m.observe_version(entry.version);
-                let due = m.put_entry(
+                m.put_entry(
                     entry.key.clone(),
                     StateEntry::adopted(
                         entry.version,
@@ -223,7 +223,6 @@ impl GroupEngine {
                     ),
                     reap_after,
                 );
-                self.lower_deadline(due);
                 state_changed.push((self.local.clone(), entry.key));
                 self.stamp_self();
             }
@@ -240,7 +239,7 @@ impl GroupEngine {
         now: Time,
         state_changed: &mut Vec<(NodeId, String)>,
     ) -> bool {
-        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
+        let reap_after = self.reap_after();
         match self.members.get(&delta.node) {
             None => {
                 // Unknown node: adopt its liveness and state wholesale.
@@ -250,11 +249,10 @@ impl GroupEngine {
                     Status::Dead => member.dead_since = now,
                     Status::Alive => {}
                 }
-                let mut due = Time::MAX;
                 for entry in delta.entries {
                     member.observe_version(entry.version);
                     state_changed.push((delta.node.clone(), entry.key.clone()));
-                    due = due.min(member.put_entry(
+                    member.put_entry(
                         entry.key,
                         StateEntry::adopted(
                             entry.version,
@@ -264,11 +262,10 @@ impl GroupEngine {
                             now,
                         ),
                         reap_after,
-                    ));
+                    );
                 }
                 member.observe_version(delta.max_version);
                 self.members.insert(delta.node.clone(), member);
-                self.lower_deadline(due);
                 self.stamp(&delta.node);
                 true
             }
@@ -277,7 +274,6 @@ impl GroupEngine {
                 let member = self.members.get_mut(&delta.node).expect("present");
                 let high_water_before = member.max_state_version;
                 let mut adopted = false;
-                let mut due = Time::MAX;
                 if status_wins {
                     member.incarnation = delta.incarnation;
                     member.adopt_status(status, now);
@@ -304,7 +300,7 @@ impl GroupEngine {
                     if !wins {
                         continue;
                     }
-                    due = due.min(member.put_entry(
+                    member.put_entry(
                         entry.key.clone(),
                         StateEntry::adopted(
                             entry.version,
@@ -314,7 +310,7 @@ impl GroupEngine {
                             now,
                         ),
                         reap_after,
-                    ));
+                    );
                     adopted = true;
                     state_changed.push((delta.node.clone(), entry.key));
                 }
@@ -324,7 +320,6 @@ impl GroupEngine {
                 // Anything digest-visible moved (liveness, content, or
                 // high-water): re-advertise via future delta digests.
                 let moved = status_wins || adopted || member.max_state_version > high_water_before;
-                self.lower_deadline(due);
                 if moved {
                     self.stamp(&delta.node);
                 }
@@ -380,6 +375,7 @@ impl GroupEngine {
     /// it stops holding: the earliest future moment an advertised entry's TTL
     /// expires or an advertised tombstone stops being gossiped.
     fn compute_content_hash(&self, m: &Member, now: Time) -> (u64, Time) {
+        self.touch(m.entries.len());
         let mut h: u64 = 0;
         let mut until = Time::MAX;
         for (key, e) in &m.entries {
@@ -399,21 +395,6 @@ impl GroupEngine {
             h = fnv1a(h, &e.value);
         }
         (h, until)
-    }
-
-    /// Refreshes every member's cached content hash that is missing or past
-    /// its validity, so the digests built next read it instead of folding
-    /// every entry again.
-    pub(super) fn refresh_content_hashes(&mut self, now: Time) {
-        let stale: Vec<NodeId> = self
-            .members
-            .iter()
-            .filter(|(_, m)| m.hash_cache.is_none_or(|(_, until)| now >= until))
-            .map(|(node, _)| node.clone())
-            .collect();
-        for node in stale {
-            self.refresh_content_hash(&node, now);
-        }
     }
 
     /// Refreshes `node`'s cached content hash if it is missing or past its
