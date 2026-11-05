@@ -664,11 +664,12 @@ ownership; a raw router clone or group handle does not. Closing any node clone
 closes connections for all of them; dropping the last node clone initiates
 shutdown. Configure membership with `.config(...)`, `.seed(...)`,
 `.named_seeds(...)`, and the timing setters (`gossip_interval(Duration)`,
-`gossip_fanout`, `max_delta_frame_bytes`, `full_digest_every`; the counts are
-`NonZero*` values) directly on the same builder. `start()` validates the core
-`Config` first and fails with its field-specific `ConfigError` instead of
-clamping. Initialization binds listeners and starts discovery; route convergence
-remains asynchronous and can be inspected with `node.router().route_to(&peer)`.
+`gossip_fanout`, `max_delta_frame_bytes`, `full_digest_every`,
+`digest_window`; the counts are `NonZero*` values) directly on the same
+builder. `start()` validates the core `Config` first and fails with its
+field-specific `ConfigError` instead of clamping. Initialization binds
+listeners and starts discovery; route convergence remains asynchronous and can
+be inspected with `node.router().route_to(&peer)`.
 
 Configured adjacent identities are initial membership seeds. Dynamic-capable
 links can instead admit previously unknown identities through an application
@@ -1406,26 +1407,50 @@ envelope — know where you are in it:
 
 | Members per fabric | Verdict |
 |---|---|
-| ≤ ~1,000 | Comfortable at default cadences. |
-| ~1,000 – ~10,000 | Works; per-peer **delta digests** (default) keep steady-state rounds proportional to churn, not membership. Tune `full_digest_every` up and cadences down as you grow. |
+| ≤ ~1,000 | Comfortable at default cadences: a digest lists at most `digest_window` (default 64) members, and probe load is spread evenly. |
+| ~1,000 – ~10,000 | Works; per-peer **delta digests** (default) keep steady-state rounds proportional to churn, not membership, and the window keeps every digest bounded. Tune `full_digest_every` up and cadences down as you grow. |
 | beyond ~10,000 | Don't grow the fabric — **shard it into cells** and put the cell directory in an external store with conditional writes (CAS). Partial-view membership would break the full-membership contract placement depends on, so it is deliberately not on the table. |
 
 The load-bearing facts:
 
-* **Digests are the O(N) term.** A *full* digest lists every member (~40
-  bytes each). Per-peer delta digests (`full_digest_every`, default 4) list
-  only members whose summary changed since the last digest built for that
-  peer, so a quiet cluster's rounds cost near zero and a busy one's cost
-  tracks churn. The periodic full digest is the repair bound for anything a
-  dropped frame or TTL drift left divergent.
+* **Digests are bounded by the window.** A digest lists at most
+  `digest_window` members (default 64, ~40 bytes each), however large the
+  group. Per-peer delta digests (`full_digest_every`, default 4) list only
+  members whose summary changed since the last digest built for that peer,
+  so a quiet cluster's rounds cost near zero and a busy one's cost tracks
+  churn. A *full* digest leads with up to half the window of fresh changes —
+  the sender itself, then liveness news (suspicions, refutations, deaths) for
+  `⌊log2 N⌋ + 2` rounds, then the latest entry changes — and fills the rest
+  from a rolling window over the members that resumes where the previous full
+  digest to that peer stopped, so every member is listed over
+  `⌈N / ⌈window / 2⌉⌉` full digests at worst — the repair bound for anything a
+  dropped frame or TTL drift left divergent. In a large group a node meets a
+  given peer only every `N / gossip_fanout` rounds, so under steady entry
+  churn the changes since its last digest to that peer exceed the window and
+  nearly every digest is full; that is the window doing its job, not a
+  fallback. The price is cold-boot convergence from a few seeds: a node
+  learns at most one window of members per digest (300 nodes booting from
+  three seeds converge in 34 rounds at window 64, 7 with an unbounded window;
+  200 nodes that all seed each other converge in 3.5 s under entry churn). Raise
+  `digest_window` if that matters more than digest size.
 * **Watch it, don't guess.** `Group::net_stats()` exposes digests built,
-  full digests, summaries listed, delta/request frames, and anti-entropy
-  bytes. If `digest_summaries_listed / digests_built` tracks your membership
-  size instead of your churn, the fabric has outgrown its configuration.
+  full digests, summaries listed, the largest digest, digest and delta/request
+  frames, and anti-entropy bytes. If `digest_summaries_listed / digests_built`
+  sits at the window instead of tracking your churn, the fabric has outgrown
+  its configuration.
 * **Metadata registers ride every digest.** Keep the register set (routing
   table, coordinator keys) small; per-node keyed *entries* are the scalable
   bulk channel, registers are not.
-* **Probing is O(1) per node** — failure detection is never the wall.
+* **Probing is O(1) per node** — failure detection is never the wall. Each
+  node's probe ring and gossip fanout start at an offset hashed from the
+  group and node ids, and indirect probers are drawn at random among live
+  peers, so no member carries the group's probe traffic (64 nodes under 20%
+  loss: the busiest receives 1.2× the mean indirect probe load, where
+  lowest-id probers took 31×). A node that suspects a member, or declares
+  one dead, tells it directly, and a live member answers every such doubt
+  with its current record, so unless one of the two frames is lost the doubt
+  clears at that node within a round trip rather than when gossip happens to
+  carry the refutation there.
 * Groups within a fabric are cheap and independent: the intended shape for a
   big system is many small shard groups (replica sets) plus one membership
   fabric per cell, with an authoritative store owning cross-cell placement.

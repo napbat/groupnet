@@ -18,15 +18,18 @@ impl GroupEngine {
         }
         for removed in self.bootstrap_contacts.difference(&contacts) {
             if !self.seeds.contains(removed) && !self.members.contains_key(removed) {
-                self.digest_cursors.remove(removed);
-                self.digest_visits.remove(removed);
+                self.digest_peers.remove(removed);
             }
         }
         for added in contacts.difference(&self.bootstrap_contacts) {
-            // First contact after discovery or reconnect must include the full
+            // First contact after discovery or reconnect must include a full
             // digest. Later full rounds repair loss without unbounded retries.
-            self.digest_cursors.remove(added);
-            self.digest_visits.remove(added);
+            // The rolling window keeps its place, so a contact that keeps
+            // reconnecting still sees a new slice of the membership each time.
+            if let Some(peer) = self.digest_peers.get_mut(added) {
+                peer.visits = 0;
+                peer.cursor = 0;
+            }
         }
         self.bootstrap_contacts = contacts;
         self.nudge_anti_entropy();

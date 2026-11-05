@@ -254,8 +254,17 @@ serializes its local state transitions. The base Eventual mode combines:
 
 - SWIM-style direct and indirect probes, suspicion/refutation, and dead-member
   tombstone reaping. Membership is observer-local during failure and partition.
+  Probe rings and gossip fanout start at offsets hashed per group and node,
+  and indirect probers are drawn at random, so probe load spreads evenly over
+  the group. A suspecter tells its subject directly and a live subject
+  answers any doubt with its current record, so unless a frame is lost the
+  suspecter clears its doubt within a round trip; other nodes learn the
+  refutation by gossip.
 - Digest/delta anti-entropy for membership, TTL'd per-node keyed entries, and
-  last-writer-wins metadata registers.
+  last-writer-wins metadata registers. A digest lists at most
+  `Config::digest_window` members: per-peer deltas of recent changes, or a
+  rolling window over the membership led by the sender, recent liveness news
+  and the latest changes.
 - A derived coordinator selected with stable rendezvous hashing over the group
   and live member IDs (Alive or Suspect, not Dead). Equal converged views compute
   the same coordinator; different partition views can compute different ones.

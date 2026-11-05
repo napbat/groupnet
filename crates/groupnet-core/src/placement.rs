@@ -35,7 +35,7 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
 
-fn fnv1a(parts: &[&[u8]]) -> u64 {
+pub(crate) fn fnv1a(parts: &[&[u8]]) -> u64 {
     let mut h = FNV_OFFSET;
     for part in parts {
         for &byte in *part {
@@ -53,7 +53,7 @@ fn fnv1a(parts: &[&[u8]]) -> u64 {
 /// differ only by an additive step) decorrelate fully. FNV-1a alone has weak
 /// avalanche on trailing bytes, which would leave a node's tokens correlated and
 /// bias the weighted distribution toward uniform.
-fn mix64(z: u64) -> u64 {
+pub(crate) fn mix64(z: u64) -> u64 {
     let z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     let z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)

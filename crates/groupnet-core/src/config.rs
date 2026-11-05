@@ -365,8 +365,10 @@ pub struct Config {
     /// [`gossip_fanout`](Self::gossip_fanout) peers, which answer with the
     /// deltas the sender lacks and request the ones they lack. It is the
     /// group's only gossip timer: a local write or membership change brings
-    /// the next round forward (and [`eager_push`](Self::eager_push) pushes a
-    /// write at once), but the steady-state cadence is this one. A Hosted
+    /// the next round forward — to no sooner than half an interval after the
+    /// previous one, so a burst of changes cannot run a round on every tick
+    /// (and [`eager_push`](Self::eager_push) pushes a write at once) — but
+    /// the steady-state cadence is this one. A Hosted
     /// group's claims, grants and renewals ride the same round. The runtime
     /// driver sizes its tick from it alongside the probe timers. Must be
     /// nonzero.
@@ -386,13 +388,24 @@ pub struct Config {
     /// entry reaped past it (see [`GroupEngine`](crate::GroupEngine)). Must be
     /// nonzero.
     pub dead_timeout_ms: u64,
-    /// How many indirect probers to enlist when a direct probe goes unanswered.
+    /// How many indirect probers to enlist when a direct probe goes
+    /// unanswered. They are drawn at random (from a deterministic per-node
+    /// stream) among the live members other than the target, so indirect
+    /// probe load spreads evenly over the group. A member that still misses
+    /// is suspected and told so at once by a one-line digest, and so is any
+    /// suspect this node declares `Dead`. A live member answers every such
+    /// doubt — whatever incarnation it names — with its current record,
+    /// refuting first if it must, so the suspecter clears its doubt within a
+    /// round trip unless one of the two frames is lost. Nodes that heard the
+    /// suspicion only through gossip, and any lost frame, are left to gossip.
     pub indirect_probes: NonZeroUsize,
     /// How many peers each gossip round sends a digest to. A targeted pull
     /// needs far less redundancy than a blind push, so 1–2 is plenty; the
-    /// default is 2. Targets rotate round-robin so every peer is covered over
-    /// successive rounds. [`eager_push`](Self::eager_push) and a Hosted
-    /// group's election traffic use the same rotating targets.
+    /// default is 2. Targets rotate round-robin, from an offset hashed from
+    /// the group and local ids, so every peer is covered over successive
+    /// rounds and nodes (and one node's groups) do not all pick the same peers.
+    /// [`eager_push`](Self::eager_push) and a Hosted group's election traffic
+    /// use the same rotating targets.
     pub gossip_fanout: NonZeroUsize,
     /// Push a just-authored entry (or tombstone) straight to the current
     /// [`gossip_fanout`](Self::gossip_fanout) targets as an unsolicited
@@ -409,24 +422,41 @@ pub struct Config {
     /// single entry whose value alone is larger (it is sent whole rather than
     /// starved).
     pub max_delta_frame_bytes: NonZeroUsize,
-    /// Every Nth digest built for a given peer is a **full** digest (every
-    /// gossipable member listed); the digests in between are per-peer
-    /// **delta digests**, listing only members whose summary changed since
-    /// the last digest built for that peer. Delta digests make the
-    /// steady-state gossip round scale with recent churn instead of
-    /// membership size; the periodic full digest bounds how long anything a
-    /// dropped frame (or TTL-expiry drift) left divergent can stay that way.
-    /// A peer's first digest is always full. `1` disables delta digests
-    /// (every digest full — the pre-delta behaviour). Default: 4.
+    /// Every Nth digest built for a given peer is a **full** digest; the
+    /// digests in between are per-peer **delta digests**, listing only
+    /// members whose summary changed since the last digest built for that
+    /// peer. Delta digests make the steady-state gossip round scale with
+    /// recent churn instead of membership size; the periodic full digest
+    /// bounds how long anything a dropped frame (or TTL-expiry drift) left
+    /// divergent can stay that way. A peer's first digest is always full. `1`
+    /// disables delta digests (every digest full). Default: 4.
     pub full_digest_every: NonZeroU64,
+    /// The most member summaries one digest lists. A full digest leads with
+    /// up to half the window of the members whose summary changed since the
+    /// last digest to that peer — the local member first, then members whose
+    /// liveness changed within the last `⌊log2 N⌋ + 2` gossip rounds, then
+    /// the most recently changed — so suspicions, refutations and deaths
+    /// cross the group however busy the entries are. It fills the rest from a
+    /// **rolling window** over the members that resumes, digest after digest,
+    /// where the previous full digest to that peer stopped. So a peer sees
+    /// every member over `⌈N / digest_window⌉` full digests of a quiet group
+    /// and `⌈N / ⌈digest_window / 2⌉⌉` of a busy one, and a receiver that
+    /// lacks a member learns it within that many full digests from any peer
+    /// that has it. A delta digest that would list more than the window is
+    /// built full instead, so no digest's size grows with the group beyond
+    /// this window (`29 + id length` bytes per summary). A group no larger
+    /// than the window lists everyone in every full digest. At least 2 —
+    /// [`validate`](Self::validate) refuses 1, which leaves no room for the
+    /// leading half. Default: 64.
+    pub digest_window: NonZeroUsize,
     /// This group's consistency posture. Defaults to
     /// [`GroupMode::Eventual`] — metadata and membership only, no election.
     pub mode: GroupMode,
 }
 
 impl Config {
-    /// Checks every timer for a value the engine cannot run on, returning
-    /// the first violated rule.
+    /// Checks every timer and the digest window for a value the engine cannot
+    /// run on, returning the first violated rule.
     ///
     /// [`mode`](Self::mode) is not inspected: a group's posture is chosen per
     /// group and validated by whatever builds it, so overriding the mode of a
@@ -438,8 +468,9 @@ impl Config {
     /// [`ZeroGossipInterval`](ConfigError::ZeroGossipInterval),
     /// [`ZeroProbeInterval`](ConfigError::ZeroProbeInterval),
     /// [`ZeroProbeTimeout`](ConfigError::ZeroProbeTimeout),
-    /// [`ZeroSuspectTimeout`](ConfigError::ZeroSuspectTimeout) and
-    /// [`ZeroDeadTimeout`](ConfigError::ZeroDeadTimeout).
+    /// [`ZeroSuspectTimeout`](ConfigError::ZeroSuspectTimeout),
+    /// [`ZeroDeadTimeout`](ConfigError::ZeroDeadTimeout) and
+    /// [`DigestWindowTooSmall`](ConfigError::DigestWindowTooSmall).
     pub const fn validate(&self) -> Result<(), ConfigError> {
         if self.gossip_interval_ms == 0 {
             return Err(ConfigError::ZeroGossipInterval);
@@ -455,6 +486,11 @@ impl Config {
         }
         if self.dead_timeout_ms == 0 {
             return Err(ConfigError::ZeroDeadTimeout);
+        }
+        if self.digest_window.get() < 2 {
+            return Err(ConfigError::DigestWindowTooSmall {
+                digest_window: self.digest_window.get(),
+            });
         }
         Ok(())
     }
@@ -581,6 +617,9 @@ const DEFAULT_MAX_DELTA_FRAME_BYTES: NonZeroUsize = NonZeroUsize::new(60_000).un
 /// [`Config::full_digest_every`] by default.
 const DEFAULT_FULL_DIGEST_EVERY: NonZeroU64 = NonZeroU64::new(4).unwrap();
 
+/// [`Config::digest_window`] by default.
+const DEFAULT_DIGEST_WINDOW: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -594,6 +633,7 @@ impl Default for Config {
             eager_push: true,
             max_delta_frame_bytes: DEFAULT_MAX_DELTA_FRAME_BYTES,
             full_digest_every: DEFAULT_FULL_DIGEST_EVERY,
+            digest_window: DEFAULT_DIGEST_WINDOW,
             mode: GroupMode::Eventual,
         }
     }

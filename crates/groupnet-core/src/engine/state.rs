@@ -9,6 +9,7 @@ use crate::{GroupId, NodeId, Time, placement, wire};
 
 use super::effect::Effect;
 use super::election::Election;
+use super::spread::{self, SplitMix};
 use super::stats::NetStats;
 
 /// Which phase of failure detection an outstanding probe is in.
@@ -26,6 +27,19 @@ pub(super) struct Pending {
     pub(super) target: NodeId,
     pub(super) deadline: Time,
     pub(super) phase: ProbePhase,
+}
+
+/// What a node remembers about the digests it built for one peer.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PeerDigest {
+    /// Digests built for this peer so far (drives the full-digest cadence).
+    pub(super) visits: u64,
+    /// The change-clock value as of the last digest built for it.
+    pub(super) cursor: u64,
+    /// The last member this peer's rolling window walked past, so the next
+    /// full digest resumes after it. `None` until the first full digest,
+    /// which starts at an offset hashed from the pair.
+    pub(super) resume: Option<NodeId>,
 }
 
 /// A metadata value tagged with a version and its writer, resolved by
@@ -60,7 +74,9 @@ pub struct VersionedValue {
 /// `(incarnation, status, max_version)` plus the small metadata register set); a
 /// receiver compares them against its own high-water marks and either requests
 /// the gap ([`wire::Kind::DeltaRequest`]) or pushes it ([`wire::Kind::Delta`],
-/// bounded per frame — successive rounds converge the rest).
+/// bounded per frame — successive rounds converge the rest). A digest lists at
+/// most [`Config::digest_window`] members, so its size stays flat as the group
+/// grows.
 ///
 /// **Reap-horizon invariant.** A member's high-water mark only ever rises;
 /// reaping a tombstone or expiring a TTL entry drops the value but never lowers
@@ -92,12 +108,21 @@ pub struct GroupEngine {
     pub(super) config: Config,
     /// When the next periodic anti-entropy (digest) round is due.
     pub(super) next_anti_entropy: Time,
+    /// When the last anti-entropy round ran: a nudge brings the next one no
+    /// closer than half a gossip interval after it.
+    pub(super) last_round: Time,
     pub(super) next_probe: Time,
-    /// Round-robin cursor over probe candidates.
+    /// Round-robin cursor over probe candidates. Starts at an offset hashed
+    /// from the group and local ids, so nodes that start together — and one
+    /// node's groups — probe different members first.
     pub(super) probe_cursor: usize,
     /// Round-robin cursor over dissemination targets, so digest fanout rotates
-    /// across peers instead of forever favouring the lowest ids.
+    /// across peers instead of forever favouring the lowest ids. Starts at an
+    /// offset hashed from the group and local ids, like `probe_cursor`.
     pub(super) gossip_cursor: usize,
+    /// This engine's deterministic random stream (seeded from the group and
+    /// local ids): picks indirect probers.
+    pub(super) rng: SplitMix,
     /// The outstanding probe awaiting a response, if any.
     pub(super) pending: Option<Pending>,
     /// As an indirect prober: target -> the origins waiting for us to relay an
@@ -118,10 +143,8 @@ pub struct GroupEngine {
     /// so per-peer delta digests can list only "changed since I last
     /// digested to you".
     pub(super) change_clock: u64,
-    /// Per peer: the change-clock value as of the last digest built for it.
-    pub(super) digest_cursors: BTreeMap<NodeId, u64>,
-    /// Per peer: digests built for it so far (drives the full-digest cadence).
-    pub(super) digest_visits: BTreeMap<NodeId, u64>,
+    /// Per peer: digest cadence, delta cursor and rolling-window position.
+    pub(super) digest_peers: BTreeMap<NodeId, PeerDigest>,
     /// The Hosted-mode election state — `Some` exactly when
     /// [`Config::mode`](crate::Config::mode) is
     /// [`Hosted`](crate::GroupMode::Hosted). An `Eventual` group does not
@@ -163,6 +186,7 @@ impl GroupEngine {
             GroupMode::Hosted(hosted) => Some(Election::new(hosted.clone())),
             GroupMode::Eventual => None,
         };
+        let seed = spread::engine_seed(&group, &local);
         let mut engine = Self {
             group,
             local,
@@ -175,16 +199,17 @@ impl GroupEngine {
             coordinator: None,
             config,
             next_anti_entropy: Time::ZERO,
+            last_round: Time::ZERO,
             next_probe: Time::ZERO,
-            probe_cursor: 0,
-            gossip_cursor: 0,
+            probe_cursor: spread::cursor(seed),
+            gossip_cursor: spread::cursor(placement::mix64(seed)),
+            rng: SplitMix::new(seed),
             pending: None,
             relaying: BTreeMap::new(),
             now_hint: Time::ZERO,
             authored: BTreeSet::new(),
             change_clock: 1,
-            digest_cursors: BTreeMap::new(),
-            digest_visits: BTreeMap::new(),
+            digest_peers: BTreeMap::new(),
             election,
             stats: NetStats::default(),
         };

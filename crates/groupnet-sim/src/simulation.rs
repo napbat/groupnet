@@ -12,10 +12,11 @@ use crate::anchor::{AnchorEvent, AnchorModel};
 use crate::error::SimError;
 use crate::percent::Percent;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::mem::Discriminant;
 
 use groupnet_core::anchor::AnchorRecord;
-use groupnet_core::{Command, Effect, GroupEngine, NodeId, Role, Time};
+use groupnet_core::{Command, Effect, GroupEngine, NetStats, NodeId, Role, Time, wire};
 
 /// One scheduled future event in the simulation.
 struct Event {
@@ -125,6 +126,9 @@ pub struct Simulation {
     /// Largest encoded frame (`Effect::Send` payload) the sim has carried — lets a
     /// test assert every emitted frame stayed within the configured cap.
     max_frame_bytes: usize,
+    /// Frames issued per `(destination, kind)`. See
+    /// [`frames_issued_to`](Self::frames_issued_to).
+    issued: HashMap<(NodeId, Discriminant<wire::Kind>), u64>,
     /// Observed coordinator transitions, in the order the sim saw them.
     pub coordinator_log: Vec<(NodeId, Option<NodeId>)>,
     /// Observed leadership transitions — `(observer, epoch, host)` — in the
@@ -198,6 +202,7 @@ impl Simulation {
             jitter_ms: 0,
             blocked: BTreeSet::new(),
             max_frame_bytes: 0,
+            issued: HashMap::new(),
             coordinator_log: Vec::new(),
             leadership_log: Vec::new(),
             election_frames: 0,
@@ -342,6 +347,13 @@ impl Simulation {
         self.engines
             .get(node)
             .and_then(|e| e.coordinator().cloned())
+    }
+
+    /// `node`'s cumulative anti-entropy counters — see
+    /// [`GroupEngine::net_stats`] — or `None` if it is not in the simulation.
+    #[must_use]
+    pub fn net_stats_of(&self, node: &NodeId) -> Option<NetStats> {
+        self.engines.get(node).map(GroupEngine::net_stats)
     }
 
     /// The `(epoch, host)` pair `node` has adopted, or `None` if it is not in

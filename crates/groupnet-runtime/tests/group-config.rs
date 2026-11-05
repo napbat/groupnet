@@ -56,6 +56,7 @@ async fn configured_values_reach_the_group_as_given() {
     let gossip_fanout = NonZeroUsize::new(5).expect("nonzero");
     let frame = NonZeroUsize::new(1).expect("nonzero");
     let indirect = NonZeroUsize::new(7).expect("nonzero");
+    let window = NonZeroUsize::new(9).expect("nonzero");
     let node = builder(&net, "as-given")
         .config(Config {
             probe_interval_ms: 1,
@@ -67,6 +68,7 @@ async fn configured_values_reach_the_group_as_given() {
         .gossip_fanout(gossip_fanout)
         .max_delta_frame_bytes(frame)
         .full_digest_every(NonZeroU64::MIN)
+        .digest_window(window)
         .start()
         .await
         .expect("a valid config starts");
@@ -79,6 +81,7 @@ async fn configured_values_reach_the_group_as_given() {
     assert_eq!(config.gossip_fanout, gossip_fanout);
     assert_eq!(config.max_delta_frame_bytes, frame);
     assert_eq!(config.full_digest_every, NonZeroU64::MIN);
+    assert_eq!(config.digest_window, window);
     assert_eq!(
         config.suspect_timeout_ms,
         Config::default().suspect_timeout_ms

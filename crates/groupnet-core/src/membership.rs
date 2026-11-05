@@ -152,6 +152,12 @@ pub(crate) struct Member {
     /// When *this* node first observed the member as `Dead` (for gossip TTL and
     /// reaping). Only meaningful while `status == Dead`.
     pub(crate) dead_since: Time,
+    /// When *this* observer last adopted a liveness verdict for the member —
+    /// a first sighting, or a new incarnation or status that superseded the
+    /// old one. Full digests lead with members whose liveness changed
+    /// recently, so suspicions, refutations and deaths spread at epidemic
+    /// speed however busy the entries are.
+    pub(crate) liveness_since: Time,
     /// Keyed app-defined per-node state; each entry merged by its own version,
     /// independently of liveness.
     pub(crate) entries: std::collections::BTreeMap<String, StateEntry>,
@@ -169,6 +175,15 @@ pub(crate) struct Member {
     /// summary (incarnation, status, or version high-water) last changed —
     /// what per-peer delta digests filter on.
     pub(crate) changed_at: u64,
+    /// The member's [content hash](crate::GroupEngine) as last computed, with
+    /// the instant it stops being valid: the next moment an entry's TTL
+    /// expires or a tombstone stops being gossiped. `None` until computed and
+    /// after any change to [`entries`](Self::entries) — every write goes
+    /// through [`put_entry`](Self::put_entry) or
+    /// [`entries_changed`](Self::entries_changed). Computing the hash folds
+    /// every entry's bytes, and a digest lists up to a window of members, so
+    /// recomputing it per digest dominated a busy group's CPU.
+    pub(crate) hash_cache: Option<(u64, Time)>,
 }
 
 impl Member {
@@ -182,9 +197,11 @@ impl Member {
             status_since: now,
             suspect_since: Time::ZERO,
             dead_since: Time::ZERO,
+            liveness_since: now,
             entries: std::collections::BTreeMap::new(),
             max_state_version: 0,
             changed_at: 0,
+            hash_cache: None,
         }
     }
 
@@ -195,11 +212,16 @@ impl Member {
     /// which is what makes `status_since` a continuous-status stamp rather
     /// than a last-touched one.
     ///
+    /// Every caller has just resolved a verdict that superseded the old one
+    /// (a new incarnation or status), so
+    /// [`liveness_since`](Self::liveness_since) moves on every call.
+    ///
     /// The suspicion/death *timers* are the caller's: they re-arm on their own
     /// rules (a higher-incarnation suspicion legitimately restarts
     /// `suspect_since` while the status value stands still), so this never
     /// touches them.
     pub(crate) fn adopt_status(&mut self, status: Status, now: Time) {
+        self.liveness_since = now;
         if self.status != status {
             self.status = status;
             self.status_since = now;
@@ -210,6 +232,17 @@ impl Member {
     /// high-water mark (never regressing it).
     pub(crate) fn observe_version(&mut self, version: u64) {
         self.max_state_version = self.max_state_version.max(version);
+    }
+
+    /// Stores `entry` under `key`, invalidating the cached content hash.
+    pub(crate) fn put_entry(&mut self, key: String, entry: StateEntry) {
+        self.entries.insert(key, entry);
+        self.entries_changed();
+    }
+
+    /// Invalidates the cached content hash after an in-place entry change.
+    pub(crate) fn entries_changed(&mut self) {
+        self.hash_cache = None;
     }
 
     /// SWIM merge precedence: would an incoming `(incarnation, status)` override

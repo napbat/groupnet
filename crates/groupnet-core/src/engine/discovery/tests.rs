@@ -54,8 +54,39 @@ fn discovery_contacts_are_not_members_and_retry_with_bounded_fanout() {
         recipients(local.disseminate_digest(Time(4))),
         Vec::<NodeId>::new()
     );
-    assert!(local.digest_cursors.is_empty());
-    assert!(local.digest_visits.is_empty());
+    assert!(local.digest_peers.is_empty());
+}
+
+/// A member whose route drops and comes back gets a full digest again, but
+/// its rolling window keeps its place: a peer that keeps reconnecting sees a
+/// new slice of the membership each time, not the first slice over and over.
+#[test]
+fn a_reconnecting_member_keeps_its_rolling_window_place() {
+    let mut local = engine("z-local");
+    let peer = NodeId::new("a-peer");
+    local
+        .members
+        .insert(peer.clone(), Member::new(0, Status::Alive, Time::ZERO));
+    local.apply(Command::SetBootstrapContacts(vec![peer.clone()]));
+    assert_eq!(
+        recipients(local.disseminate_digest(Time(1))),
+        vec![peer.clone()]
+    );
+    let resume = local.digest_peers[&peer].resume.clone();
+    assert!(
+        resume.is_some(),
+        "the full digest walked the rolling window"
+    );
+
+    local.apply(Command::SetBootstrapContacts(Vec::new()));
+    local.apply(Command::SetBootstrapContacts(vec![peer.clone()]));
+    let state = &local.digest_peers[&peer];
+    assert_eq!(
+        (state.visits, state.cursor),
+        (0, 0),
+        "the next digest is a first contact's full one"
+    );
+    assert_eq!(state.resume, resume, "the rolling window keeps its place");
 }
 
 #[test]

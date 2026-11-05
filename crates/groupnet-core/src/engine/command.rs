@@ -138,7 +138,7 @@ impl GroupEngine {
                         writer: self.local.clone(),
                     },
                 );
-                self.nudge_anti_entropy();
+                self.nudge_anti_entropy_now();
                 vec![Effect::MetadataChanged { key, value }]
             }
             Command::SetLocalState(state) => self.set_local_entry(Self::BLOB_KEY, state, None),
@@ -155,13 +155,13 @@ impl GroupEngine {
                 // tombstone (idempotent, and it wins over any in-flight write).
                 let version = m.max_state_version.saturating_add(1);
                 m.max_state_version = version;
-                m.entries.insert(
+                m.put_entry(
                     key.clone(),
                     StateEntry::adopted(version, Vec::new(), 0, true, now),
                 );
                 self.authored.insert(key.clone());
                 self.stamp_self();
-                self.nudge_anti_entropy();
+                self.nudge_anti_entropy_now();
                 let mut effects = vec![Effect::NodeStateChanged {
                     node: self.local.clone(),
                     key,
@@ -192,7 +192,7 @@ impl GroupEngine {
                 self.stamp_self();
                 effects.push(Effect::MembershipChanged);
                 effects.extend(self.recompute_coordinator());
-                self.nudge_anti_entropy();
+                self.nudge_anti_entropy_now();
                 effects
             }
             Command::SetBootstrapContacts(contacts) => {
@@ -212,7 +212,7 @@ impl GroupEngine {
                 self.stamp(&node);
                 let mut effects = vec![Effect::MembershipChanged];
                 effects.extend(self.recompute_coordinator());
-                self.nudge_anti_entropy();
+                self.nudge_anti_entropy_now();
                 effects
             }
             // Rows X2/X3 and X4/X5 — the external anchor's whole inbound
@@ -243,13 +243,13 @@ impl GroupEngine {
         };
         let version = m.max_state_version.saturating_add(1);
         m.max_state_version = version;
-        m.entries.insert(
+        m.put_entry(
             key.to_owned(),
             StateEntry::adopted(version, value, ttl, false, now),
         );
         self.authored.insert(key.to_owned());
         self.stamp_self();
-        self.nudge_anti_entropy();
+        self.nudge_anti_entropy_now();
         let mut effects = vec![Effect::NodeStateChanged {
             node: self.local.clone(),
             key: key.to_owned(),

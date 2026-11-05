@@ -61,6 +61,161 @@ fn two_node_probe_leads_to_suspect_then_dead() {
     assert!(!a.members().any(|n| *n == NodeId::new("b")));
 }
 
+/// The digest frames in `effects` sent to `to`, decoded.
+fn digests_to(effects: &[Effect], to: &str) -> Vec<wire::Frame> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send { to: dest, wire } if *dest == NodeId::new(to) => wire::decode(wire),
+            _ => None,
+        })
+        .filter(|f| f.kind == wire::Kind::Digest)
+        .collect()
+}
+
+/// A suspecter tells its subject at once, and a live subject answers with
+/// its refutation, which clears the suspicion at the suspecter — one round
+/// trip, no gossip round in between.
+#[test]
+fn a_suspecter_tells_its_subject_and_the_refutation_answers_it() {
+    let cfg = Config {
+        probe_interval_ms: 100,
+        probe_timeout_ms: 50,
+        suspect_timeout_ms: 200,
+        gossip_interval_ms: 1_000_000,
+        ..Config::default()
+    };
+    let mut a = GroupEngine::new(GroupId::new("g"), NodeId::new("a"), [], cfg.clone())
+        .expect("valid config");
+    let mut b =
+        GroupEngine::new(GroupId::new("g"), NodeId::new("b"), [], cfg).expect("valid config");
+    a.on_message(
+        NodeId::new("b"),
+        &digest_frame(vec![ndigest("b", 0, Status::Alive, 0)], vec![]),
+        Time(1),
+    );
+    a.start(Time(1));
+    b.start(Time(1));
+
+    a.on_tick(Time(101)); // the direct probe, which "b" never answers
+    let effects = a.on_tick(Time(160)); // no prober to ask: suspect
+    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Suspect));
+    // The suspicion also nudges a gossip round; the accusation is the
+    // one-line digest naming b alone.
+    let b_suspect = |f: &wire::Frame| {
+        matches!(&f.digest[..], [d] if d.node == NodeId::new("b")
+            && d.status == Status::Suspect.to_wire())
+    };
+    let accusation = digests_to(&effects, "b")
+        .into_iter()
+        .find(b_suspect)
+        .expect("an accusation naming b Suspect");
+
+    let answer = b.on_message(NodeId::new("a"), &wire::encode(&accusation), Time(170));
+    let reply = digests_to(&answer, "a")
+        .into_iter()
+        .find(|f| {
+            matches!(&f.digest[..], [d] if d.node == NodeId::new("b")
+                && d.status == Status::Alive.to_wire() && d.incarnation == 1)
+        })
+        .expect("b answers with its refutation");
+    a.on_message(NodeId::new("b"), &wire::encode(&reply), Time(180));
+    assert_eq!(
+        a.member_status(&NodeId::new("b")),
+        Some(Status::Alive),
+        "the refutation cleared the suspicion before any gossip round"
+    );
+}
+
+/// The one-line answer to a doubt about `b` in `effects` sent to `to`: `b`'s
+/// incarnation and status code, if `b` answered.
+fn answer_to(effects: &[Effect], to: &str) -> Option<(u64, u8)> {
+    digests_to(effects, to)
+        .into_iter()
+        .find_map(|f| match &f.digest[..] {
+            [d] if d.node == NodeId::new("b") => Some((d.incarnation, d.status)),
+            _ => None,
+        })
+}
+
+/// Two suspecters accuse `b` at the same incarnation. The first makes it
+/// refute; the second is behind by then — its accusation no longer makes `b`
+/// refute — yet still gets `b`'s current record back, and so does a third
+/// that already holds `b` `Dead` at that old incarnation. Without the answer
+/// they kept doubting `b` until gossip happened to reach them.
+#[test]
+fn an_accusation_behind_the_current_incarnation_is_still_answered() {
+    let mut b = engine("b", &[]);
+    let accuse = |status| digest_frame(vec![ndigest("b", 0, status, 0)], vec![]);
+
+    let first = b.on_message(NodeId::new("a"), &accuse(Status::Suspect), Time(1));
+    assert_eq!(answer_to(&first, "a"), Some((1, Status::Alive.to_wire())));
+
+    let late = b.on_message(NodeId::new("c"), &accuse(Status::Suspect), Time(2));
+    assert_eq!(
+        answer_to(&late, "c"),
+        Some((1, Status::Alive.to_wire())),
+        "a stale accusation is answered with the current incarnation"
+    );
+    let dead = b.on_message(NodeId::new("d"), &accuse(Status::Dead), Time(3));
+    assert_eq!(answer_to(&dead, "d"), Some((1, Status::Alive.to_wire())));
+
+    // Gossip that holds b Alive asks nothing of it.
+    let alive = b.on_message(NodeId::new("e"), &accuse(Status::Alive), Time(4));
+    assert_eq!(answer_to(&alive, "e"), None);
+}
+
+/// A node that left answers no doubt about itself: it is `Dead` by its own
+/// word.
+#[test]
+fn a_node_that_left_answers_no_accusation() {
+    let mut b = engine("b", &[]);
+    b.apply(Command::Leave);
+    let doubt = digest_frame(vec![ndigest("b", 0, Status::Dead, 0)], vec![]);
+    let effects = b.on_message(NodeId::new("c"), &doubt, Time(1));
+    assert_eq!(answer_to(&effects, "c"), None);
+}
+
+/// One node in eight groups with the same 64 members starts each group's
+/// probe ring at its own offset: the offsets and the random stream are seeded
+/// from the group id and the node id together, so a node's groups do not all
+/// probe (and enlist) the same peers at the same moments.
+#[test]
+fn a_nodes_groups_probe_different_first_targets() {
+    let peers: Vec<NodeId> = (0..64).map(|i| NodeId::new(format!("p{i:02}"))).collect();
+    let firsts: BTreeSet<NodeId> = (0..8)
+        .map(|g| {
+            let mut e = GroupEngine::new(
+                GroupId::new(format!("group-{g}")),
+                NodeId::new("a"),
+                [],
+                Config::default(),
+            )
+            .expect("valid config");
+            for peer in &peers {
+                e.apply(Command::AddPeer(peer.clone()));
+            }
+            e.start(Time::ZERO);
+            e.on_tick(Time(Config::default().probe_interval_ms))
+                .into_iter()
+                .find_map(|effect| match effect {
+                    Effect::Send { to, wire: bytes }
+                        if wire::decode(&bytes).is_some_and(|f| f.kind == wire::Kind::Ping) =>
+                    {
+                        Some(to)
+                    }
+                    _ => None,
+                })
+                .expect("a first probe")
+        })
+        .collect();
+    assert!(
+        firsts.len() >= 4,
+        "eight groups probed only {} distinct first targets",
+        firsts.len()
+    );
+}
+
 #[test]
 fn direct_miss_escalates_to_indirect_before_suspecting() {
     let cfg = Config {
@@ -84,24 +239,45 @@ fn direct_miss_escalates_to_indirect_before_suspecting() {
     );
     a.start(Time(1));
 
-    a.on_tick(Time(1001)); // direct probe to first candidate (b)
+    // The ring starts at an offset hashed from our ids: read which of b and c
+    // the direct probe went to; the other one is the only possible prober.
+    let pinged: Vec<NodeId> = a
+        .on_tick(Time(1001))
+        .into_iter()
+        .filter_map(|e| match e {
+            Effect::Send { to, wire: bytes }
+                if wire::decode(&bytes).is_some_and(|f| f.kind == wire::Kind::Ping) =>
+            {
+                Some(to)
+            }
+            _ => None,
+        })
+        .collect();
+    let [target] = pinged.as_slice() else {
+        panic!("one direct probe, got {pinged:?}");
+    };
+    let prober = if *target == NodeId::new("b") {
+        NodeId::new("c")
+    } else {
+        NodeId::new("b")
+    };
     let effects = a.on_tick(Time(1100)); // direct miss -> ping-req, NOT suspect
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::Send { to, .. } if *to == NodeId::new("c"))),
-        "should ask c to probe b indirectly"
+            .any(|e| matches!(e, Effect::Send { to, .. } if *to == prober)),
+        "should ask {prober} to probe {target} indirectly"
     );
-    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Alive));
+    assert_eq!(a.member_status(target), Some(Status::Alive));
 
-    // An indirect ack keeps b alive.
+    // An indirect ack keeps the target alive.
     a.on_message(
-        NodeId::new("c"),
-        &probe_frame(wire::Kind::IndirectAck, Some(NodeId::new("b"))),
+        prober.clone(),
+        &probe_frame(wire::Kind::IndirectAck, Some(target.clone())),
         Time(1120),
     );
     a.on_tick(Time(2000));
-    assert_eq!(a.member_status(&NodeId::new("b")), Some(Status::Alive));
+    assert_eq!(a.member_status(target), Some(Status::Alive));
 }
 
 #[test]

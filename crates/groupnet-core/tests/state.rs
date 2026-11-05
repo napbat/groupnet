@@ -1,9 +1,64 @@
 //! State dissemination tests: digests, deltas, entries, eager push.
 
+use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use groupnet_core::{Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, wire};
 use groupnet_testkit::frames::*;
+
+/// The content hash `a` advertises for itself in its next digest.
+fn own_hash(a: &mut GroupEngine, now: Time) -> u64 {
+    a.on_tick(now)
+        .into_iter()
+        .filter_map(|e| match e {
+            Effect::Send { wire, .. } => wire::decode(&wire),
+            _ => None,
+        })
+        .flat_map(|f| f.digest)
+        .find(|d| d.node == NodeId::new("a"))
+        .map(|d| d.content_hash)
+        .expect("a full digest lists a")
+}
+
+/// The advertised content hash is cached between digests, yet follows every
+/// change: a write moves it, and so does a TTL expiry with no write at all.
+#[test]
+fn the_advertised_content_hash_follows_writes_and_expiry() {
+    let config = Config {
+        gossip_fanout: NonZeroUsize::MIN,
+        full_digest_every: NonZeroU64::MIN,
+        probe_interval_ms: 1_000_000,
+        ..Config::default()
+    };
+    let mut a = GroupEngine::new(
+        GroupId::new(TEST_GROUP),
+        NodeId::new("a"),
+        [NodeId::new("b")],
+        config,
+    )
+    .expect("valid config");
+    a.start(Time(0));
+    let write = |a: &mut GroupEngine, key: &str, ttl_ms| {
+        a.apply(Command::SetLocalEntry {
+            key: key.into(),
+            value: b"v".to_vec(),
+            ttl_ms,
+        });
+    };
+    write(&mut a, "lasting", None);
+    let one = own_hash(&mut a, Time(200));
+    assert_eq!(
+        own_hash(&mut a, Time(400)),
+        one,
+        "unchanged without a change"
+    );
+    write(&mut a, "brief", Some(1_000));
+    let two = own_hash(&mut a, Time(600));
+    assert_ne!(two, one, "a write moves the hash");
+    let expired = own_hash(&mut a, Time(1_600));
+    assert_ne!(expired, two, "a TTL expiry moves the hash");
+    assert_eq!(expired, one, "back to holding only the lasting entry");
+}
 
 /// Delta digests list only members changed since the last digest built
 /// for the peer; a quiet round emits nothing at all; every Nth digest is
@@ -753,5 +808,52 @@ fn restart_adopts_echoed_entries_for_unauthored_keys() {
     assert_eq!(
         a.node_entry(&NodeId::new("a"), "addr"),
         Some(&b"10.0.0.2"[..])
+    );
+}
+
+/// A node that knows 1,000 members never lists more than
+/// `Config::digest_window` of them in a digest, and its full digests' rolling
+/// windows — each starting at its own peer's offset — still list every member
+/// over a few hundred rounds.
+#[test]
+fn digests_of_a_thousand_members_stay_within_the_window() {
+    let config = Config {
+        probe_interval_ms: 1_000_000,
+        ..Config::default()
+    };
+    let window = config.digest_window.get();
+    let mut a = GroupEngine::new(GroupId::new(TEST_GROUP), NodeId::new("a"), [], config)
+        .expect("valid config");
+    let peers: Vec<NodeId> = (0..999).map(|i| NodeId::new(format!("p{i:03}"))).collect();
+    learn_peers(&mut a, &peers, Time(0));
+    a.start(Time(0));
+
+    let mut listed: BTreeSet<NodeId> = BTreeSet::new();
+    for round in 1..=600 {
+        for effect in a.on_tick(Time(round * 200)) {
+            let Effect::Send { wire, .. } = effect else {
+                continue;
+            };
+            if let Some(frame) = wire::decode(&wire).filter(|f| f.kind == wire::Kind::Digest) {
+                assert!(
+                    frame.digest.len() <= window,
+                    "{} summaries",
+                    frame.digest.len()
+                );
+                listed.extend(frame.digest.into_iter().map(|d| d.node));
+            }
+        }
+    }
+    let stats = a.net_stats();
+    assert!(stats.max_digest_summaries <= window as u64);
+    assert!(
+        stats.digests_built >= 1_000,
+        "{} digests",
+        stats.digests_built
+    );
+    assert_eq!(
+        listed.len(),
+        1_000,
+        "the rolling windows cover every member"
     );
 }

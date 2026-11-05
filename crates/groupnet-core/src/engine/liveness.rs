@@ -28,13 +28,23 @@ impl GroupEngine {
     /// A direct probe missed: enlist indirect probers instead of suspecting
     /// outright. This is what prevents a single dropped packet or one-way link
     /// from falsely killing a healthy node.
+    ///
+    /// The probers are drawn at random (from this node's deterministic
+    /// stream) among the live members other than the target, so indirect
+    /// probe load spreads over the whole group instead of landing on the
+    /// lowest ids every node would otherwise pick.
     pub(super) fn escalate_indirect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
-        let probers: Vec<NodeId> = self
-            .probe_candidates()
-            .filter(|n| **n != *target)
-            .take(self.config.indirect_probes.get())
-            .cloned()
-            .collect();
+        let mut eligible: Vec<&NodeId> = self.probe_candidates().filter(|n| *n != target).collect();
+        let k = self.config.indirect_probes.get().min(eligible.len());
+        // A partial Fisher–Yates shuffle: the first `k` slots end up a
+        // uniform random `k`-subset.
+        let mut rng = self.rng;
+        for i in 0..k {
+            let j = i + rng.below(eligible.len() - i);
+            eligible.swap(i, j);
+        }
+        let probers: Vec<NodeId> = eligible.into_iter().take(k).cloned().collect();
+        self.rng = rng;
         if probers.is_empty() {
             // No one to ask (tiny cluster) — fall back to direct suspicion.
             self.pending = None;
@@ -57,6 +67,10 @@ impl GroupEngine {
         }
     }
 
+    /// Marks `target` `Suspect` and tells it so directly (a one-line digest).
+    /// A live target answers with its current record, refuting first if it
+    /// must, so unless one of the two frames is lost this node stops doubting
+    /// it within a round trip rather than when gossip happens to reach it.
     pub(super) fn suspect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
         let became_suspect = match self.members.get_mut(target) {
             Some(m) if m.status == Status::Alive => {
@@ -72,10 +86,15 @@ impl GroupEngine {
         self.stamp(target);
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
+        effects.extend(self.liveness_notice(target.clone(), target, now));
         self.nudge_anti_entropy();
         effects
     }
 
+    /// Declares suspects past their window `Dead`, telling each so directly
+    /// like [`suspect`](Self::suspect) does: a live one answers with its
+    /// current record, including a suspect this node only heard of through
+    /// gossip at an incarnation it has since refuted.
     pub(super) fn reap_suspects(&mut self, now: Time) -> Vec<Effect> {
         let timeout = self.config.suspect_timeout_ms;
         let dead: Vec<NodeId> = self
@@ -100,6 +119,9 @@ impl GroupEngine {
         }
         let mut effects = vec![Effect::MembershipChanged];
         effects.extend(self.recompute_coordinator());
+        for node in dead {
+            effects.extend(self.liveness_notice(node.clone(), &node, now));
+        }
         self.nudge_anti_entropy();
         effects
     }
@@ -130,8 +152,7 @@ impl GroupEngine {
         }
         for node in stale {
             self.members.remove(&node);
-            self.digest_cursors.remove(&node);
-            self.digest_visits.remove(&node);
+            self.digest_peers.remove(&node);
         }
         // The live set (which never counted a Dead member) is unchanged, so
         // the coordinator cannot move — no recompute needed.
