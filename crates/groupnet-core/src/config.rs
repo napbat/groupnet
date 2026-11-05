@@ -392,15 +392,18 @@ pub struct Config {
     /// unanswered. They are drawn at random (from a deterministic per-node
     /// stream) among the live members other than the target, so indirect
     /// probe load spreads evenly over the group. A member that still misses
-    /// is suspected and told so at once by a one-line digest; a live one
-    /// refutes and answers the same way, so a false suspicion clears at its
-    /// source within a round trip.
+    /// is suspected and told so at once by a one-line digest, and so is any
+    /// suspect this node declares `Dead`. A live member answers every such
+    /// doubt — whatever incarnation it names — with its current record,
+    /// refuting first if it must, so the suspecter clears its doubt within a
+    /// round trip unless one of the two frames is lost. Nodes that heard the
+    /// suspicion only through gossip, and any lost frame, are left to gossip.
     pub indirect_probes: NonZeroUsize,
     /// How many peers each gossip round sends a digest to. A targeted pull
     /// needs far less redundancy than a blind push, so 1–2 is plenty; the
     /// default is 2. Targets rotate round-robin, from an offset hashed from
-    /// the local id, so every peer is covered over successive rounds and
-    /// nodes that start together do not all pick the same peers.
+    /// the group and local ids, so every peer is covered over successive
+    /// rounds and nodes (and one node's groups) do not all pick the same peers.
     /// [`eager_push`](Self::eager_push) and a Hosted group's election traffic
     /// use the same rotating targets.
     pub gossip_fanout: NonZeroUsize,
@@ -442,7 +445,9 @@ pub struct Config {
     /// that has it. A delta digest that would list more than the window is
     /// built full instead, so no digest's size grows with the group beyond
     /// this window (`29 + id length` bytes per summary). A group no larger
-    /// than the window lists everyone in every full digest. Default: 64.
+    /// than the window lists everyone in every full digest. At least 2 —
+    /// [`validate`](Self::validate) refuses 1, which leaves no room for the
+    /// leading half. Default: 64.
     pub digest_window: NonZeroUsize,
     /// This group's consistency posture. Defaults to
     /// [`GroupMode::Eventual`] — metadata and membership only, no election.
@@ -450,8 +455,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// Checks every timer for a value the engine cannot run on, returning
-    /// the first violated rule.
+    /// Checks every timer and the digest window for a value the engine cannot
+    /// run on, returning the first violated rule.
     ///
     /// [`mode`](Self::mode) is not inspected: a group's posture is chosen per
     /// group and validated by whatever builds it, so overriding the mode of a
@@ -463,8 +468,9 @@ impl Config {
     /// [`ZeroGossipInterval`](ConfigError::ZeroGossipInterval),
     /// [`ZeroProbeInterval`](ConfigError::ZeroProbeInterval),
     /// [`ZeroProbeTimeout`](ConfigError::ZeroProbeTimeout),
-    /// [`ZeroSuspectTimeout`](ConfigError::ZeroSuspectTimeout) and
-    /// [`ZeroDeadTimeout`](ConfigError::ZeroDeadTimeout).
+    /// [`ZeroSuspectTimeout`](ConfigError::ZeroSuspectTimeout),
+    /// [`ZeroDeadTimeout`](ConfigError::ZeroDeadTimeout) and
+    /// [`DigestWindowTooSmall`](ConfigError::DigestWindowTooSmall).
     pub const fn validate(&self) -> Result<(), ConfigError> {
         if self.gossip_interval_ms == 0 {
             return Err(ConfigError::ZeroGossipInterval);
@@ -480,6 +486,11 @@ impl Config {
         }
         if self.dead_timeout_ms == 0 {
             return Err(ConfigError::ZeroDeadTimeout);
+        }
+        if self.digest_window.get() < 2 {
+            return Err(ConfigError::DigestWindowTooSmall {
+                digest_window: self.digest_window.get(),
+            });
         }
         Ok(())
     }

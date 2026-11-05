@@ -4,16 +4,22 @@
 //! run of the same schedule stays bit-for-bit reproducible (no clock, no OS
 //! randomness, no `std` hasher).
 
-use crate::NodeId;
 use crate::placement::{fnv1a, mix64};
+use crate::{GroupId, NodeId};
 
 /// splitmix64's stream increment (the golden-ratio constant).
 const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// A stable, well-mixed hash of `node`'s id — the same on every platform and
-/// every run.
-pub(super) fn node_hash(node: &NodeId) -> u64 {
-    mix64(fnv1a(&[node.as_str().as_bytes()]))
+/// The seed of `local`'s engine for `group` — its probe and gossip offsets
+/// and its random stream: a stable, well-mixed hash of the group id and the
+/// node id together, the same on every platform and every run. With the
+/// group in it, one node's groups (often over the same members) start at
+/// different offsets and draw different indirect probers.
+pub(super) fn engine_seed(group: &GroupId, local: &NodeId) -> u64 {
+    mix64(fnv1a(&[
+        group.as_str().as_bytes(),
+        local.as_str().as_bytes(),
+    ]))
 }
 
 /// A stable, well-mixed hash of the ordered pair `(local, peer)`.
@@ -64,14 +70,16 @@ mod tests {
     #[test]
     fn hashes_are_stable_and_distinguish_ids() {
         let (a, b) = (NodeId::new("a"), NodeId::new("b"));
-        assert_eq!(node_hash(&a), node_hash(&NodeId::new("a")));
-        assert_ne!(node_hash(&a), node_hash(&b));
+        let (g, h) = (GroupId::new("g"), GroupId::new("h"));
+        assert_eq!(engine_seed(&g, &a), engine_seed(&GroupId::new("g"), &a));
+        assert_ne!(engine_seed(&g, &a), engine_seed(&g, &b));
+        assert_ne!(engine_seed(&g, &a), engine_seed(&h, &a));
         assert_ne!(pair_hash(&a, &b), pair_hash(&b, &a));
     }
 
     #[test]
     fn draws_stay_below_the_bound_and_cover_it() {
-        let mut rng = SplitMix::new(node_hash(&NodeId::new("seed")));
+        let mut rng = SplitMix::new(engine_seed(&GroupId::new("g"), &NodeId::new("seed")));
         let mut seen = [false; 7];
         for _ in 0..1_000 {
             seen[rng.below(7)] = true;

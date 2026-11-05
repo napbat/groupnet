@@ -27,6 +27,13 @@ pub enum ConfigError {
     /// [`dead_timeout_ms`](super::Config::dead_timeout_ms) is zero, so a
     /// tombstone would be reaped before it could be gossiped.
     ZeroDeadTimeout,
+    /// [`digest_window`](super::Config::digest_window) is below 2, so a full
+    /// digest would have no room for the half it leads with — the node's own
+    /// refutation and fresh liveness news — beside the rolling half.
+    DigestWindowTooSmall {
+        /// The rejected window.
+        digest_window: usize,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -37,6 +44,12 @@ impl fmt::Display for ConfigError {
             Self::ZeroProbeTimeout => "probe_timeout_ms",
             Self::ZeroSuspectTimeout => "suspect_timeout_ms",
             Self::ZeroDeadTimeout => "dead_timeout_ms",
+            Self::DigestWindowTooSmall { digest_window } => {
+                return write!(
+                    f,
+                    "group config digest_window ({digest_window}) must be at least 2"
+                );
+            }
         };
         write!(f, "group config {field} must be nonzero")
     }
@@ -117,6 +130,27 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(minimal.validate(), Ok(()));
+    }
+
+    /// A digest window of 1 leaves a full digest no room to lead with
+    /// anything, so it is refused by name; 2 is the smallest accepted.
+    #[test]
+    fn a_digest_window_below_two_is_rejected_by_name() {
+        let one = Config {
+            digest_window: std::num::NonZeroUsize::MIN,
+            ..Config::default()
+        };
+        let error = one.validate().expect_err("a window of 1 is refused");
+        assert_eq!(
+            error,
+            ConfigError::DigestWindowTooSmall { digest_window: 1 }
+        );
+        assert!(error.to_string().contains("digest_window"));
+        let two = Config {
+            digest_window: std::num::NonZeroUsize::new(2).expect("nonzero"),
+            ..Config::default()
+        };
+        assert_eq!(two.validate(), Ok(()));
     }
 
     /// The `io::Error` conversion is `InvalidInput` and wraps the typed error

@@ -15,6 +15,9 @@ const N: usize = 200;
 const ENTRIES: u64 = 12;
 /// How often the run samples every node's view.
 const SAMPLE_MS: u64 = 500;
+/// The gap between two nodes' writes: the 200 nodes' writes are spread
+/// evenly over each second, one node every 5 ms.
+const WRITE_GAP_MS: u64 = 1_000 / N as u64;
 
 /// What one run saw.
 struct Run {
@@ -87,14 +90,14 @@ fn run(loss: Percent, run_ms: u64) -> Run {
     };
     let mut now = 0;
     while now < run_ms {
-        now += SAMPLE_MS;
+        now += WRITE_GAP_MS;
         sim.run_until(Time(now));
-        // Each node re-sets one entry a second, nodes spread over the second.
+        // Each node re-sets one entry a second, at its own offset in it.
         let second = now / 1_000;
-        for (i, id) in (0u64..).zip(&ids) {
-            if (i * 1_000 / N as u64) / SAMPLE_MS == (now % 1_000) / SAMPLE_MS {
-                set_entry(&mut sim, id, second % ENTRIES, second);
-            }
+        let writer = usize::try_from((now % 1_000) / WRITE_GAP_MS).expect("below N");
+        set_entry(&mut sim, &ids[writer], second % ENTRIES, second);
+        if now % SAMPLE_MS != 0 {
+            continue;
         }
         let not_alive = status_pairs(&sim, &ids, |s| s != Some(Status::Alive));
         let unknown_or_dead = status_pairs(&sim, &ids, |s| {
@@ -119,7 +122,7 @@ fn run(loss: Percent, run_ms: u64) -> Run {
 }
 
 /// On a clean network the group converges within 4 s and, from then on,
-/// every node holds every member `Alive` at every sample. Measured: 2.5 s, no
+/// every node holds every member `Alive` at every sample. Measured: 3.5 s, no
 /// doubt after; 273ad08 had not converged by the end of the 5 s run (its
 /// digest and probe cursors all start at the same peers).
 #[test]
@@ -141,27 +144,23 @@ fn a_healthy_group_converges_fast_and_every_member_stays_alive() {
 /// its refutation, and liveness news leads every digest while it is fresh, so
 /// suspicions clear before they turn into deaths.
 ///
-/// Measured: every node knows every member, none `Dead`, at 2.5 s, and holds
-/// every member `Alive` at 5.5 s; at most 83 of the 40 000
-/// `(observer, member)` pairs doubted at a sample afterwards, at most 1
-/// `Dead`. Before, at 8b94666 (liveness news buried under entry
-/// churn in the windowed digest, no accusation): never converged in 8 s, up
-/// to 170 `Dead` pairs; at 273ad08: never converged, up to 645.
+/// Measured: every node knows every member, none `Dead`, at 4 s, and holds
+/// every member `Alive` at 6 s; at most 96 of the 40 000
+/// `(observer, member)` pairs doubted at a sample afterwards, and no live
+/// member is ever held `Dead`. Before, at 8b94666 (liveness news buried under
+/// entry churn in the windowed digest, no accusation): never converged in
+/// 8 s, up to 170 `Dead` pairs; at 273ad08: never converged, up to 645.
 #[test]
 fn false_suspicions_clear_before_they_kill_under_loss() {
     let run = run(Percent::of(4), 8_000);
     let known_at = run.known_at.expect("membership converged despite the loss");
-    assert!(known_at <= 6_000, "converged only at {known_at} ms");
+    assert!(known_at <= 5_000, "converged only at {known_at} ms");
     assert!(
-        run.worst_doubt <= 200,
+        run.worst_doubt <= 120,
         "{} pairs doubted at once after convergence",
         run.worst_doubt
     );
-    assert!(
-        run.worst_dead <= 10,
-        "{} pairs held a live member Dead",
-        run.worst_dead
-    );
+    assert_eq!(run.worst_dead, 0, "a live member was held Dead");
     assert!(
         run.largest_digest <= 64,
         "a digest listed {}",

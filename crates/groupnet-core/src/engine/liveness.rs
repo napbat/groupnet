@@ -67,9 +67,10 @@ impl GroupEngine {
         }
     }
 
-    /// Marks `target` `Suspect` and tells it so directly (a one-line digest),
-    /// so a live target refutes within a round trip — its answer comes back
-    /// the same way — rather than when gossip happens to reach it.
+    /// Marks `target` `Suspect` and tells it so directly (a one-line digest).
+    /// A live target answers with its current record, refuting first if it
+    /// must, so unless one of the two frames is lost this node stops doubting
+    /// it within a round trip rather than when gossip happens to reach it.
     pub(super) fn suspect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
         let became_suspect = match self.members.get_mut(target) {
             Some(m) if m.status == Status::Alive => {
@@ -91,7 +92,9 @@ impl GroupEngine {
     }
 
     /// Declares suspects past their window `Dead`, telling each so directly
-    /// like [`suspect`](Self::suspect) does: a live one refutes and answers.
+    /// like [`suspect`](Self::suspect) does: a live one answers with its
+    /// current record, including a suspect this node only heard of through
+    /// gossip at an incarnation it has since refuted.
     pub(super) fn reap_suspects(&mut self, now: Time) -> Vec<Effect> {
         let timeout = self.config.suspect_timeout_ms;
         let dead: Vec<NodeId> = self

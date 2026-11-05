@@ -219,10 +219,10 @@ impl GroupEngine {
 
     /// A one-line digest telling `to` how this node holds `about` — the
     /// accusation a suspecter sends its subject, and the subject's answer
-    /// carrying its refutation back. One hop each way, so a false suspicion
-    /// is refuted at the node that raised it within a round trip instead of
-    /// waiting for gossip to carry it there and back. `None` when `about` is
-    /// unknown.
+    /// carrying its current record back. One hop each way: unless a frame is
+    /// lost, the suspecter stops doubting a live subject within a round trip
+    /// instead of waiting for gossip to carry the refutation to it. `None`
+    /// when `about` is unknown.
     pub(super) fn liveness_notice(
         &mut self,
         to: NodeId,
@@ -317,8 +317,12 @@ impl GroupEngine {
 
     /// Merges a peer's digest: reconcile liveness and metadata directly, then
     /// request whatever entries we're behind on and offer whatever we're ahead
-    /// on. A digest that made us refute a suspicion of ourselves is answered
-    /// at once with our new summary, so its sender stops doubting us now.
+    /// on. A digest that doubts us — names us `Suspect` or `Dead` at any
+    /// incarnation, or made us refute — is answered at once with our current
+    /// summary. That covers a suspecter behind on our incarnation, whose
+    /// accusation no longer makes us refute: without the answer it would keep
+    /// doubting us, and reap us to `Dead`, until gossip reached it. A node
+    /// that left is `Dead` by its own word and answers nothing.
     pub(super) fn on_digest(
         &mut self,
         from: &NodeId,
@@ -326,11 +330,15 @@ impl GroupEngine {
         now: Time,
     ) -> Vec<Effect> {
         let incarnation = self.incarnation;
+        let doubted = frame
+            .digest
+            .iter()
+            .any(|d| d.node == self.local && Status::from_wire(d.status) != Some(Status::Alive));
         let mut effects = self.merge_digest_liveness(&frame.digest, now);
         for d in &frame.digest {
             self.refresh_content_hash(&d.node, now);
         }
-        if self.incarnation > incarnation {
+        if (doubted && !self.leaving) || self.incarnation > incarnation {
             let me = self.local.clone();
             effects.extend(self.liveness_notice(from.clone(), &me, now));
         }

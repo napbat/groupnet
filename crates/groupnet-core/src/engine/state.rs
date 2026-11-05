@@ -113,15 +113,15 @@ pub struct GroupEngine {
     pub(super) last_round: Time,
     pub(super) next_probe: Time,
     /// Round-robin cursor over probe candidates. Starts at an offset hashed
-    /// from the local id, so nodes that start together probe different
-    /// members first.
+    /// from the group and local ids, so nodes that start together — and one
+    /// node's groups — probe different members first.
     pub(super) probe_cursor: usize,
     /// Round-robin cursor over dissemination targets, so digest fanout rotates
     /// across peers instead of forever favouring the lowest ids. Starts at an
-    /// offset hashed from the local id, like `probe_cursor`.
+    /// offset hashed from the group and local ids, like `probe_cursor`.
     pub(super) gossip_cursor: usize,
-    /// This node's deterministic random stream (seeded from its id): picks
-    /// indirect probers.
+    /// This engine's deterministic random stream (seeded from the group and
+    /// local ids): picks indirect probers.
     pub(super) rng: SplitMix,
     /// The outstanding probe awaiting a response, if any.
     pub(super) pending: Option<Pending>,
@@ -186,7 +186,7 @@ impl GroupEngine {
             GroupMode::Hosted(hosted) => Some(Election::new(hosted.clone())),
             GroupMode::Eventual => None,
         };
-        let seed = spread::node_hash(&local);
+        let seed = spread::engine_seed(&group, &local);
         let mut engine = Self {
             group,
             local,

@@ -1431,7 +1431,7 @@ The load-bearing facts:
   fallback. The price is cold-boot convergence from a few seeds: a node
   learns at most one window of members per digest (300 nodes booting from
   three seeds converge in 34 rounds at window 64, 7 with an unbounded window;
-  200 nodes that all seed each other converge in 2.5 s under entry churn). Raise
+  200 nodes that all seed each other converge in 3.5 s under entry churn). Raise
   `digest_window` if that matters more than digest size.
 * **Watch it, don't guess.** `Group::net_stats()` exposes digests built,
   full digests, summaries listed, the largest digest, digest and delta/request
@@ -1442,14 +1442,15 @@ The load-bearing facts:
   table, coordinator keys) small; per-node keyed *entries* are the scalable
   bulk channel, registers are not.
 * **Probing is O(1) per node** — failure detection is never the wall. Each
-  node's probe ring and gossip fanout start at an offset hashed from its id,
-  and indirect probers are drawn at random among live peers, so no member
-  carries the group's probe traffic (64 nodes under 20% loss: the busiest
-  receives 1.2× the mean indirect probe load, where lowest-id probers took
-  31×). A node that suspects a member tells it directly, and the member
-  answers with its refutation, so a false suspicion clears at its source
-  within a round trip rather than when gossip happens to carry it there and
-  back.
+  node's probe ring and gossip fanout start at an offset hashed from the
+  group and node ids, and indirect probers are drawn at random among live
+  peers, so no member carries the group's probe traffic (64 nodes under 20%
+  loss: the busiest receives 1.2× the mean indirect probe load, where
+  lowest-id probers took 31×). A node that suspects a member, or declares
+  one dead, tells it directly, and a live member answers every such doubt
+  with its current record, so unless one of the two frames is lost the doubt
+  clears at that node within a round trip rather than when gossip happens to
+  carry the refutation there.
 * Groups within a fabric are cheap and independent: the intended shape for a
   big system is many small shard groups (replica sets) plus one membership
   fabric per cell, with an authoritative store owning cross-cell placement.
