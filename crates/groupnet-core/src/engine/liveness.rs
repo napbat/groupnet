@@ -150,7 +150,10 @@ impl GroupEngine {
     /// gossip at an incarnation it has since refuted. Accuses every other
     /// suspect whose next accusation is due — one this node's own probe
     /// found silent, every `probe_timeout` from the first; one it heard of
-    /// through gossip, from when its own window would have run out.
+    /// through gossip, from when its own window would have run out and then
+    /// once a gossip round — the longer window is there for the gossiped
+    /// refutation to arrive, so asking only needs to survive a lost frame,
+    /// not race the probe clock (9 asks at most at N = 200, not 36).
     /// Examines only the members whose deadline passed.
     pub(super) fn reap_suspects(&mut self, now: Time) -> Vec<Effect> {
         let due = self.due_members(now);
@@ -170,9 +173,10 @@ impl GroupEngine {
             .cloned()
             .collect();
         let mut effects = Vec::new();
-        let every = self.config.probe_timeout_ms;
+        let (own, heard) = (self.config.probe_timeout_ms, self.config.gossip_interval_ms);
         for node in accused {
             if let Some(m) = self.members.get_mut(&node) {
+                let every = if m.suspected_here { own } else { heard };
                 m.accuse_at = now.saturating_add(every);
             }
             self.reindex(&node);

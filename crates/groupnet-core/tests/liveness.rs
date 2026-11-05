@@ -718,6 +718,15 @@ fn a_suspicion_heard_through_gossip_asks_before_it_kills() {
         accuses_b(&asked),
         "and the suspect is asked at the end of it"
     );
+    // Then once a gossip round, not every probe timeout: the longer window
+    // waits for the gossiped refutation, so asking need only survive a loss.
+    let soon = a.on_tick(Time(10 + window + cfg.probe_timeout_ms));
+    assert!(
+        !accuses_b(&soon),
+        "a heard suspicion is not re-asked on the probe clock"
+    );
+    let later = a.on_tick(Time(10 + window + cfg.gossip_interval_ms));
+    assert!(accuses_b(&later), "it is re-asked a gossip round later");
 
     // Three members: ⌊log2 3⌋ + 2 = 3 rounds for the news to cross.
     let heard = window + 3 * cfg.gossip_interval_ms;

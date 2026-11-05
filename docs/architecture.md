@@ -261,7 +261,8 @@ serializes its local state transitions. The base Eventual mode combines:
   answers, and a live subject answers any doubt with its current record, so
   the suspecter clears its doubt within a round trip of the first accusation
   that arrives; other nodes learn the refutation by gossip, ask the subject
-  themselves once the suspecter's window has passed, and hold a suspicion
+  themselves once the suspecter's window has passed (then once a gossip
+  round), and hold a suspicion
   they only heard of for the rounds news needs to cross the group before
   declaring a death of their own.
 - Digest/delta anti-entropy for membership, TTL'd per-node keyed entries, and

@@ -151,7 +151,7 @@ fn run(prefix: &str) -> Run {
 /// 500 + 9 × 200 = 2,300 ms at N = 200.
 ///
 /// Measured (seeds `dsn-` / `node-` / `x`): all `Alive` at 2.8 / 1.9 /
-/// 2.9 s, no pair `Dead`, at most 47 / 33 / 49 of the 40,000 pairs doubted
+/// 2.9 s, no pair `Dead`, at most 64 / 33 / 49 of the 40,000 pairs doubted
 /// at a sample, no doubt longer than 500 ms. Before, at f4058be: never all
 /// `Alive`; up to 45 / 33 / 15 live pairs `Dead`, 668 / 706 / 749 doubted,
 /// doubts of 800 / 800 / 2,100 ms. A suspecter told its suspect once, and a

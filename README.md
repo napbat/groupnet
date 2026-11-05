@@ -1453,7 +1453,8 @@ The load-bearing facts:
   doubt clears at that node within a round trip of the first accusation
   that arrives rather than when gossip happens to carry the refutation
   there. A node that only heard a suspicion through gossip asks the member
-  itself once the suspecter's window has passed, and holds it `Suspect` for
+  itself once the suspecter's window has passed (and once a gossip round
+  after that), and holds it `Suspect` for
   the rounds liveness news needs to cross the group before declaring it
   `Dead` — by then the suspecter's own verdict has reached it if the
   suspicion was real. 200 nodes at docstore's timings under 2 % loss hold no

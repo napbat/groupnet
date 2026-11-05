@@ -388,7 +388,8 @@ pub struct Config {
     /// `Suspect` before it is declared `Dead`. A suspicion this node only
     /// heard through gossip stands this long plus the rounds liveness news
     /// needs to cross the group (`⌊log2 N⌋ + 2` gossip rounds), and the node
-    /// asks the member itself once this much has passed: the suspecter's
+    /// asks the member itself once this much has passed, and once a gossip
+    /// round after that: the suspecter's
     /// `Dead` verdict reaches it well within that if the suspicion was real,
     /// and the refutation if it was not. Must be nonzero.
     pub suspect_timeout_ms: u64,
