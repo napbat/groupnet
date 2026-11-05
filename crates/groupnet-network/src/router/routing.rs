@@ -213,7 +213,7 @@ impl Shared {
         });
     }
 
-    fn neighbors_changed(&self, id: TransportId) {
+    pub(super) fn neighbors_changed(&self, id: TransportId) {
         let mut table = self.table.lock().expect("router table poisoned");
         let Table {
             links, candidates, ..

@@ -3,6 +3,8 @@
 
 use std::num::NonZeroUsize;
 
+use groupnet_transport::admission::{AcceptedPeer, SessionLease};
+
 use super::*;
 
 /// Destinations the counting test learns routes to.
@@ -139,15 +141,81 @@ fn rebuilt(table: &Table, ttl: Duration) -> Vec<NodeId> {
     reachable
 }
 
+/// Destinations the property test learns routes to.
+const DESTINATIONS: usize = 40;
+
+/// The property test's session link: neighbors admitted by session rather
+/// than by list, with the sessions it admitted and revoked.
+struct Sessions {
+    registry: SessionRegistry,
+    link: TransportId,
+    leases: Vec<SessionLease>,
+    revoked: Vec<(NodeId, SessionId)>,
+    next: usize,
+}
+
+impl Sessions {
+    async fn attach(router: &Router) -> io::Result<Self> {
+        let registry = SessionRegistry::new(NonZeroUsize::new(4).expect("nonzero"));
+        let link = router
+            .add_link(
+                BoundLink::new(Silent, LinkConfig::new(Vec::new())).with_sessions(registry.clone()),
+            )
+            .await?;
+        Ok(Self {
+            registry,
+            link,
+            leases: Vec::new(),
+            revoked: Vec::new(),
+            next: 0,
+        })
+    }
+
+    /// An advert over the session link: from a neighbor with a live
+    /// session, or one whose session was revoked (a stale id, never
+    /// admitted). Whether one was sent.
+    fn advert(&self, shared: &Shared, draws: &mut Draws) -> bool {
+        let (neighbor, session) = if !self.leases.is_empty() && draws.below(4) != 0 {
+            let lease = &self.leases[draws.index(self.leases.len())];
+            (lease.node().clone(), lease.id())
+        } else if let Some((node, id)) = self.revoked.last() {
+            (node.clone(), *id)
+        } else {
+            return false;
+        };
+        let path = vec![neighbor.clone(), destination(draws.index(DESTINATIONS))];
+        let cost = u32::try_from(draws.below(5)).expect("small") + 1;
+        shared.learn(self.link, neighbor, Some(session), 1, cost, path);
+        true
+    }
+
+    /// A session admitted (`admit`, while there is room) or revoked, and the
+    /// `Neighbors` event it raises reaching the router.
+    fn churn(&mut self, shared: &Shared, draws: &mut Draws, admit: bool) {
+        if admit && self.leases.len() < 4 {
+            let node = NodeId::new(format!("s{}", self.next));
+            self.next += 1;
+            let lease = self.registry.try_admit(AcceptedPeer::new(node));
+            self.leases.push(lease.expect("room for the session"));
+        } else if !self.leases.is_empty() {
+            let lease = self.leases.swap_remove(draws.index(self.leases.len()));
+            self.revoked.push((lease.node().clone(), lease.id()));
+            lease.revoke();
+        }
+        shared.neighbors_changed(self.link);
+    }
+}
+
 /// Random schedules of adverts — new routes, changed costs and paths, routes
-/// over a neighbor the link does not admit, routes over a removed link —
-/// interleaved with clock jumps that lapse routes, link losses and link
-/// additions. After every step the index, once lapses are applied as the next
-/// advert applies them, equals a full rebuild from the table; after every
-/// advert the published set equals both.
+/// over a neighbor the link does not admit, routes over a removed link, and
+/// over a session link both under a live session and under a revoked or
+/// stale one — interleaved with clock jumps that lapse routes, link losses
+/// and link additions, sessions admitted and revoked, and the `Neighbors`
+/// event each such change raises. After every step the index, once lapses
+/// are applied as the next advert applies them, equals a full rebuild from
+/// the table; after every advert the published set equals both.
 #[tokio::test(start_paused = true)]
 async fn the_index_always_equals_a_full_rebuild() -> io::Result<()> {
-    const DESTINATIONS: usize = 40;
     for seed in 0..16 {
         let router = Router::with_config(NodeId::new("local"), config())?;
         let shared = &router.inner.shared;
@@ -157,8 +225,9 @@ async fn the_index_always_equals_a_full_rebuild() -> io::Result<()> {
         let mut links: Vec<(TransportId, Vec<NodeId>)> = Vec::new();
         let mut dead: Vec<TransportId> = Vec::new();
         let mut next_neighbor = 0;
+        let mut sessions = Sessions::attach(&router).await?;
         for step in 0..400 {
-            let op = match (links.len(), draws.below(10)) {
+            let op = match (links.len(), draws.below(13)) {
                 (0, _) => 9,
                 // Stay well inside `max_transports`: past six links, add none.
                 (7.., 9) => 0,
@@ -166,6 +235,8 @@ async fn the_index_always_equals_a_full_rebuild() -> io::Result<()> {
             };
             let mut advert = false;
             match op {
+                10 => advert = sessions.advert(shared, &mut draws),
+                11 | 12 => sessions.churn(shared, &mut draws, op == 11),
                 0..=5 => {
                     let (link, peers) = if !dead.is_empty() && draws.below(8) == 0 {
                         (dead[draws.index(dead.len())], Vec::new())
