@@ -825,9 +825,9 @@ mod tests {
     #[test]
     fn the_warmup_window_is_one_detection_window_plus_two_gossip_rounds() {
         let cfg = Config::default();
-        // 2 peers × (100 + 2×50) + 500 suspect = 900, + 2×200 gossip.
-        assert_eq!(cfg.detection_window_ms(3), 900);
-        assert_eq!(warmup_window(&cfg, 3), Duration::from_millis(1_300));
+        // 2 peers × (100 + 3×50) + 500 suspect = 1000, + 2×200 gossip.
+        assert_eq!(cfg.detection_window_ms(3), 1_000);
+        assert_eq!(warmup_window(&cfg, 3), Duration::from_millis(1_400));
         // A group of one has nobody to detect, so the window degenerates to
         // the refutation window plus the two rounds — still non-zero, which is
         // the point: a solo writer must not fast-resolve before it has had a
@@ -846,8 +846,8 @@ mod tests {
             gossip_interval_ms: 25,
             ..Config::default()
         };
-        // 2 × (20 + 20) + 50 = 130, + 50.
-        assert_eq!(warmup_window(&brisk, 3), Duration::from_millis(180));
+        // 2 × (20 + 3×10) + 50 = 150, + 50.
+        assert_eq!(warmup_window(&brisk, 3), Duration::from_millis(200));
         assert!(warmup_window(&brisk, 3) < warmup_window(&Config::default(), 3));
     }
 
