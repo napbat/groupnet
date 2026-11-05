@@ -20,12 +20,14 @@ impl Group {
     /// placement loops should prefer the shared [`roster`](Self::roster).
     #[must_use]
     pub fn members(&self) -> Vec<NodeId> {
-        self.members_rx.borrow().to_vec()
+        self.members_rx.borrow().roster().to_vec()
     }
 
     /// The same live-member snapshot as [`members`](Self::members), shared
     /// rather than copied: a reference-count increment on the immutable roster
-    /// the group actor last published, never a clone of its identities.
+    /// the group actor last published, never a clone of its identities. The
+    /// first reader of a published roster builds it once; every later one
+    /// shares it.
     ///
     /// Pair it with [`events`](Self::events) for change-driven reads: subscribe
     /// first, read the roster, then re-read after each
@@ -34,7 +36,7 @@ impl Group {
     /// announces, so the re-read observes at least that change.
     #[must_use]
     pub fn roster(&self) -> Arc<[NodeId]> {
-        self.members_rx.borrow().clone()
+        self.members_rx.borrow().roster()
     }
 
     /// The status ([`Status::Alive`]/`Suspect`/`Dead`) this node currently perceives

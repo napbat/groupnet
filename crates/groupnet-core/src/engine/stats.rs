@@ -1,4 +1,4 @@
-//! Anti-entropy traffic counters.
+//! Anti-entropy traffic and tick counters.
 
 /// Cumulative anti-entropy traffic counters for one engine (one node's view
 /// of one group), read via [`GroupEngine::net_stats`](crate::GroupEngine::net_stats) (the runtime exposes
@@ -8,7 +8,8 @@
 /// [`Config::digest_window`](crate::Config::digest_window) caps it either way
 /// (`max_digest_summaries` never exceeds the window). If it sits at the
 /// window, the group has outgrown its cadence or `full_digest_every` (see the
-/// README's scaling envelope).
+/// README's scaling envelope). [`ticks`](Self::ticks) counts how often the
+/// driver woke the engine, so an idle group's timer cost is visible too.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NetStats {
     /// Digests built (one per fanout target per round; delta + full).
@@ -38,4 +39,9 @@ pub struct NetStats {
     /// frames (ping/ack) are excluded — this measures the traffic that
     /// scales with state, not liveness.
     pub anti_entropy_bytes_sent: u64,
+    /// Times the engine was ticked ([`GroupEngine::on_tick`](crate::GroupEngine::on_tick)).
+    /// A driver that ticks at [`GroupEngine::next_deadline`](crate::GroupEngine::next_deadline)
+    /// keeps this at the engine's own cadence — about one tick per probe
+    /// interval in an idle group.
+    pub ticks: u64,
 }

@@ -31,7 +31,9 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::time::Instant;
 
 use groupnet_core::anchor::{AnchorRecord, AnchorTerms, ClaimPlan, ambiguous_applied};
 use groupnet_core::{Command, NodeId, Role, Time};

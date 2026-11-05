@@ -109,7 +109,10 @@ fn discovery_contacts_are_bounded_and_do_not_replace_static_seeds() {
         vec![admitted]
     );
     local.apply(Command::SetBootstrapContacts(Vec::new()));
-    assert_eq!(local.dissemination_targets(), vec![static_seed]);
+    assert_eq!(
+        local.dissemination_targets().cloned().collect::<Vec<_>>(),
+        vec![static_seed]
+    );
 }
 
 fn exchange(engines: &mut [GroupEngine; 2], now: Time) {
@@ -156,6 +159,8 @@ fn seedless_contacts_recover_while_both_engines_retain_dead_tombstones() {
     engines[1]
         .members
         .insert(a.clone(), Member::new(0, Status::Dead, Time::ZERO));
+    engines[0].reindex(&b);
+    engines[1].reindex(&a);
     engines[0].apply(Command::SetBootstrapContacts(vec![b.clone()]));
     engines[1].apply(Command::SetBootstrapContacts(vec![a.clone()]));
     assert_eq!(engines[0].member_status(&b), Some(Status::Dead));

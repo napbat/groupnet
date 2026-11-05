@@ -1,5 +1,7 @@
 //! Failure detection (probes, suspicion) and reaping.
 
+use std::collections::BTreeMap;
+
 use crate::membership::Status;
 use crate::{NodeId, Time, wire};
 
@@ -11,11 +13,12 @@ impl GroupEngine {
         if self.pending.is_some() {
             return Vec::new(); // one probe outstanding at a time
         }
-        let candidates: Vec<NodeId> = self.probe_candidates().cloned().collect();
-        if candidates.is_empty() {
+        let cursor = self.probe_cursor;
+        let ring = self.probe_ring();
+        if ring.is_empty() {
             return Vec::new();
         }
-        let target = candidates[self.probe_cursor % candidates.len()].clone();
+        let target = ring[cursor % ring.len()].clone();
         self.probe_cursor = self.probe_cursor.wrapping_add(1);
         self.pending = Some(Pending {
             target: target.clone(),
@@ -34,16 +37,28 @@ impl GroupEngine {
     /// probe load spreads over the whole group instead of landing on the
     /// lowest ids every node would otherwise pick.
     pub(super) fn escalate_indirect(&mut self, target: &NodeId, now: Time) -> Vec<Effect> {
-        let mut eligible: Vec<&NodeId> = self.probe_candidates().filter(|n| *n != target).collect();
-        let k = self.config.indirect_probes.get().min(eligible.len());
-        // A partial Fisher–Yates shuffle: the first `k` slots end up a
-        // uniform random `k`-subset.
+        let indirect = self.config.indirect_probes.get();
         let mut rng = self.rng;
+        let candidates = self.probe_ring();
+        // The eligible members are the probe ring without the target. A partial
+        // Fisher–Yates shuffle of them, recording only the slots it swapped,
+        // so the first `k` draws are a uniform random `k`-subset at `O(k)`.
+        let skip = candidates.binary_search(target).ok();
+        let eligible = candidates.len() - usize::from(skip.is_some());
+        let at = |slot: usize| match skip {
+            Some(pos) if slot >= pos => &candidates[slot + 1],
+            _ => &candidates[slot],
+        };
+        let k = indirect.min(eligible);
+        let mut swapped: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut probers: Vec<NodeId> = Vec::with_capacity(k);
         for i in 0..k {
-            let j = i + rng.below(eligible.len() - i);
-            eligible.swap(i, j);
+            let j = i + rng.below(eligible - i);
+            let here = swapped.get(&i).copied().unwrap_or(i);
+            let there = swapped.get(&j).copied().unwrap_or(j);
+            swapped.insert(j, here);
+            probers.push(at(there).clone());
         }
-        let probers: Vec<NodeId> = eligible.into_iter().take(k).cloned().collect();
         self.rng = rng;
         if probers.is_empty() {
             // No one to ask (tiny cluster) — fall back to direct suspicion.
@@ -94,18 +109,20 @@ impl GroupEngine {
     /// Declares suspects past their window `Dead`, telling each so directly
     /// like [`suspect`](Self::suspect) does: a live one answers with its
     /// current record, including a suspect this node only heard of through
-    /// gossip at an incarnation it has since refuted.
+    /// gossip at an incarnation it has since refuted. Examines only the
+    /// members whose deadline passed.
     pub(super) fn reap_suspects(&mut self, now: Time) -> Vec<Effect> {
         let timeout = self.config.suspect_timeout_ms;
         let dead: Vec<NodeId> = self
-            .members
-            .iter()
-            .filter(|(node, m)| {
-                **node != self.local
-                    && m.status == Status::Suspect
-                    && now >= m.suspect_since.saturating_add(timeout)
+            .due_members(now)
+            .into_iter()
+            .filter(|node| {
+                *node != self.local
+                    && self.members.get(node).is_some_and(|m| {
+                        m.status == Status::Suspect
+                            && now >= m.suspect_since.saturating_add(timeout)
+                    })
             })
-            .map(|(node, _)| node.clone())
             .collect();
         if dead.is_empty() {
             return Vec::new();
@@ -136,23 +153,22 @@ impl GroupEngine {
     /// would keep listing a member the engine has forgotten, until some
     /// unrelated change happened to refresh it.
     pub(super) fn reap_dead(&mut self, now: Time) -> Vec<Effect> {
-        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
+        let reap_after = self.reap_after();
         let stale: Vec<NodeId> = self
-            .members
-            .iter()
-            .filter(|(node, m)| {
-                **node != self.local
-                    && m.status == Status::Dead
-                    && now >= m.dead_since.saturating_add(reap_after)
+            .due_members(now)
+            .into_iter()
+            .filter(|node| {
+                *node != self.local
+                    && self.members.get(node).is_some_and(|m| {
+                        m.status == Status::Dead && now >= m.dead_since.saturating_add(reap_after)
+                    })
             })
-            .map(|(node, _)| node.clone())
             .collect();
         if stale.is_empty() {
             return Vec::new();
         }
         for node in stale {
-            self.members.remove(&node);
-            self.digest_peers.remove(&node);
+            self.forget(&node);
         }
         // The live set (which never counted a Dead member) is unchanged, so
         // the coordinator cannot move — no recompute needed.
@@ -166,26 +182,29 @@ impl GroupEngine {
     /// digest can never claim to be behind on — and so resurrect — a reaped
     /// version. A TTL expiry is an observable state change and emits
     /// [`Effect::NodeStateChanged`]; a tombstone reap is not (the key already
-    /// read as absent).
+    /// read as absent). Examines only the members and entries that are due.
     pub(super) fn reap_entries(&mut self, now: Time) -> Vec<Effect> {
-        let reap_after = self.config.dead_timeout_ms.saturating_mul(2);
-        let mut expired: Vec<(NodeId, String)> = Vec::new();
-        for (node, member) in &mut self.members {
-            member.entries.retain(|key, e| {
-                if e.tombstone {
-                    now < e.tombstone_since.saturating_add(reap_after)
-                } else if e.expired(now) {
-                    expired.push((node.clone(), key.clone()));
-                    false
-                } else {
-                    true
+        let mut effects = Vec::new();
+        for node in self.due_members(now) {
+            let Some(member) = self.members.get_mut(&node) else {
+                continue;
+            };
+            let due = member.take_due_entries(now);
+            if due.is_empty() {
+                continue;
+            }
+            self.touch(due.len());
+            for (key, entry) in due {
+                if !entry.tombstone {
+                    effects.push(Effect::NodeStateChanged {
+                        node: node.clone(),
+                        key,
+                    });
                 }
-            });
+            }
+            self.reindex(&node);
         }
-        expired
-            .into_iter()
-            .map(|(node, key)| Effect::NodeStateChanged { node, key })
-            .collect()
+        effects
     }
 
     /// Live members (excluding self) we may probe or gossip to.

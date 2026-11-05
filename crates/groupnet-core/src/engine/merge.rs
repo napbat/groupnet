@@ -35,7 +35,6 @@ impl GroupEngine {
             return false;
         };
         self.incarnation = ni;
-        self.stamp_self();
         // A refutation carries no clock of its own — it is triggered by the
         // frame being merged — so it stamps from the freshest time the engine
         // has been told about, which is that frame's.
@@ -44,6 +43,7 @@ impl GroupEngine {
             m.incarnation = ni;
             m.adopt_status(Status::Alive, now);
         }
+        self.stamp_self();
         true
     }
 
@@ -192,6 +192,7 @@ impl GroupEngine {
             }) {
                 continue;
             }
+            let reap_after = self.reap_after();
             let m = self.members.get_mut(&self.local).expect("self present");
             if self.authored.contains(&entry.key) {
                 // Sole-author rule: never let an echo (or forgery) replace a
@@ -220,6 +221,7 @@ impl GroupEngine {
                         entry.tombstone,
                         now,
                     ),
+                    reap_after,
                 );
                 state_changed.push((self.local.clone(), entry.key));
                 self.stamp_self();
@@ -237,6 +239,7 @@ impl GroupEngine {
         now: Time,
         state_changed: &mut Vec<(NodeId, String)>,
     ) -> bool {
+        let reap_after = self.reap_after();
         match self.members.get(&delta.node) {
             None => {
                 // Unknown node: adopt its liveness and state wholesale.
@@ -258,6 +261,7 @@ impl GroupEngine {
                             entry.tombstone,
                             now,
                         ),
+                        reap_after,
                     );
                 }
                 member.observe_version(delta.max_version);
@@ -305,6 +309,7 @@ impl GroupEngine {
                             entry.tombstone,
                             now,
                         ),
+                        reap_after,
                     );
                     adopted = true;
                     state_changed.push((delta.node.clone(), entry.key));
@@ -314,7 +319,8 @@ impl GroupEngine {
                 member.observe_version(delta.max_version);
                 // Anything digest-visible moved (liveness, content, or
                 // high-water): re-advertise via future delta digests.
-                if status_wins || adopted || member.max_state_version > high_water_before {
+                let moved = status_wins || adopted || member.max_state_version > high_water_before;
+                if moved {
                     self.stamp(&delta.node);
                 }
                 status_wins
@@ -369,6 +375,7 @@ impl GroupEngine {
     /// it stops holding: the earliest future moment an advertised entry's TTL
     /// expires or an advertised tombstone stops being gossiped.
     fn compute_content_hash(&self, m: &Member, now: Time) -> (u64, Time) {
+        self.touch(m.entries.len());
         let mut h: u64 = 0;
         let mut until = Time::MAX;
         for (key, e) in &m.entries {
@@ -388,21 +395,6 @@ impl GroupEngine {
             h = fnv1a(h, &e.value);
         }
         (h, until)
-    }
-
-    /// Refreshes every member's cached content hash that is missing or past
-    /// its validity, so the digests built next read it instead of folding
-    /// every entry again.
-    pub(super) fn refresh_content_hashes(&mut self, now: Time) {
-        let stale: Vec<NodeId> = self
-            .members
-            .iter()
-            .filter(|(_, m)| m.hash_cache.is_none_or(|(_, until)| now >= until))
-            .map(|(node, _)| node.clone())
-            .collect();
-        for node in stale {
-            self.refresh_content_hash(&node, now);
-        }
     }
 
     /// Refreshes `node`'s cached content hash if it is missing or past its

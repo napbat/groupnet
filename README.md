@@ -1451,6 +1451,25 @@ The load-bearing facts:
   with its current record, so unless one of the two frames is lost the doubt
   clears at that node within a round trip rather than when gossip happens to
   carry the refutation there.
+* **A tick costs what is due, not what is known.** The engine keeps its
+  members in an ordered index — by next deadline (suspect window, `Dead`
+  reap, entry TTL or tombstone reap), by coordinator score while live, by
+  last change and by last liveness change — updated in `O(log N)` on every
+  liveness change and entry write. A tick reaps only the members and entries
+  whose deadline passed, a delta digest reads only the members changed since
+  its peer's cursor, a full digest reads its lead off the top of the
+  liveness and change indexes, and the coordinator is read off the top of
+  the live set. A quiet 1,000-member group with 4,000 entries examines at
+  most two digest windows (128 members) per tick, where a walk of every
+  member and entry cost about 20,000; under a storm that changes every
+  member, a full digest examines 64, not 1,031.
+* **Publishing costs what changed.** A node's `Group` views (members,
+  statuses, entries) are persistent maps the group actor updates for the
+  members the engine's change clock names, so one status change in a
+  1,000-member group copies about ten member records rather than 3,000, and
+  a batch that changes nothing sends nothing. `Group::roster` and
+  `Group::all_entries` build their flat shapes once per published version,
+  for the first reader that asks.
 * Groups within a fabric are cheap and independent: the intended shape for a
   big system is many small shard groups (replica sets) plus one membership
   fabric per cell, with an authoritative store owning cross-cell placement.

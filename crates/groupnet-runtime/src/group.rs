@@ -1,6 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use groupnet_core::{Command, Config, GroupId, NetStats, NodeId, Role};
 use tokio::sync::mpsc::error::TrySendError;
@@ -8,7 +10,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::clock::core_millis;
 use crate::driver::{
-    Event, GroupEvent, GroupViews, MembersSnapshot, MetaSnapshot, NodeEntriesSnapshot,
+    AllEntries, Event, GroupEvent, GroupViews, MembersSnapshot, MetaSnapshot, NodeEntriesSnapshot,
     StatusesSnapshot,
 };
 
@@ -391,11 +393,12 @@ impl Group {
             .unwrap_or_default()
     }
 
-    /// A snapshot of every node's live state entries (the full map, one
-    /// `Arc` clone — cheap).
+    /// A snapshot of every node's live state entries as one map — built
+    /// once per published version by the first reader that asks for it, and
+    /// an `Arc` clone for every reader after that.
     #[must_use]
-    pub fn all_entries(&self) -> NodeEntriesSnapshot {
-        self.entries_rx.borrow().clone()
+    pub fn all_entries(&self) -> AllEntries {
+        self.entries_rx.borrow().all()
     }
 
     /// Cumulative anti-entropy traffic counters for this group on this node.

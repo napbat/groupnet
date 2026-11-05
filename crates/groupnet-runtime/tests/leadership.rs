@@ -48,14 +48,13 @@ use tokio::sync::broadcast::error::RecvError;
 const SETTLE: Duration = Duration::from_secs(8);
 
 /// A brisk gossip cadence, so convergence and detection happen in wall-clock
-/// milliseconds. It also sets the driver's tick period: the driver ticks at
-/// half the tightest configured deadline, i.e. `15 / 2 = 7ms` here, which both
-/// election durations below are more than an order of magnitude above — the
-/// sizing rule [`HostedConfig`] states.
+/// milliseconds. The driver ticks at the engine's own deadlines, this round
+/// among them, and both election durations below are more than an order of
+/// magnitude above it — the sizing rule [`HostedConfig`] states.
 const GOSSIP_MS: u64 = 15;
 
-/// How long a claim must stand before its claimant activates — ~20 driver
-/// ticks and ~10 gossip rounds, so peers get a real chance to answer.
+/// How long a claim must stand before its claimant activates — ~10 gossip
+/// rounds, so peers get a real chance to answer.
 const CLAIM_SETTLE_MS: u64 = 150;
 
 /// A host's authority after its last renewal. Must stay under

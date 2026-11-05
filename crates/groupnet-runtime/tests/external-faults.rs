@@ -49,9 +49,9 @@ use tokio::sync::broadcast::error::RecvError;
 const SETTLE: Duration = Duration::from_secs(12);
 
 /// A brisk gossip cadence, so anchor rounds and renewals happen in wall-clock
-/// milliseconds. It also sets the driver's tick period (half the tightest
-/// deadline, i.e. ~7ms here), which [`LEASE_MS`] is two orders of magnitude
-/// above — the sizing rule `HostedConfig` states.
+/// milliseconds. The driver ticks at the engine's own deadlines, this round
+/// among them, and [`LEASE_MS`] is two orders of magnitude above it — the
+/// sizing rule `HostedConfig` states.
 const GOSSIP_MS: u64 = 15;
 
 /// The record's TTL **and** the engine lease — one knob by design, because the

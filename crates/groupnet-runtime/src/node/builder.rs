@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use groupnet_core::{Config, GroupId, NodeId};
 use groupnet_messaging::ValidMessagingConfig;
@@ -190,9 +192,11 @@ impl NodeBuilder {
         self
     }
 
-    /// Overrides the most member summaries one digest lists (default 64) —
-    /// see [`Config::digest_window`]. Full digests walk a rolling window over
-    /// the members, so a digest's size stays flat as the group grows.
+    /// Overrides the most member summaries one digest lists (default 64,
+    /// at least 2) — see [`Config::digest_window`]. Full digests walk a
+    /// rolling window over the members, so a digest's size stays flat as the
+    /// group grows. Stored as given; [`start`](Self::start) rejects a window
+    /// of 1.
     #[must_use]
     pub fn digest_window(mut self, members: NonZeroUsize) -> Self {
         self.config.digest_window = members;

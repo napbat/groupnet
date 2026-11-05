@@ -147,6 +147,7 @@ impl GroupEngine {
             }
             Command::DeleteLocalEntry { key } => {
                 let now = self.now_hint;
+                let reap_after = self.reap_after();
                 let Some(m) = self.members.get_mut(&self.local) else {
                     return Vec::new();
                 };
@@ -158,6 +159,7 @@ impl GroupEngine {
                 m.put_entry(
                     key.clone(),
                     StateEntry::adopted(version, Vec::new(), 0, true, now),
+                    reap_after,
                 );
                 self.authored.insert(key.clone());
                 self.stamp_self();
@@ -238,6 +240,7 @@ impl GroupEngine {
     ) -> Vec<Effect> {
         let now = self.now_hint;
         let ttl = ttl_ms.unwrap_or(0);
+        let reap_after = self.reap_after();
         let Some(m) = self.members.get_mut(&self.local) else {
             return Vec::new();
         };
@@ -246,6 +249,7 @@ impl GroupEngine {
         m.put_entry(
             key.to_owned(),
             StateEntry::adopted(version, value, ttl, false, now),
+            reap_after,
         );
         self.authored.insert(key.to_owned());
         self.stamp_self();

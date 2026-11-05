@@ -1,17 +1,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use groupnet_core::{Config, GroupEngine, GroupId, GroupMode, NodeId};
 use groupnet_network::{Network, Router};
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::anchor::{AnchorTask, anchor_task};
 use crate::driver::{
     CloseReport, EVENTS_CAPACITY, Event, Grants, GroupTask, GroupViews, INBOX_CAPACITY,
-    NodeEntriesSnapshot, Publishers, UnfinishedGrant, group_task, statuses_snapshot,
+    NodeEntriesSnapshot, Publishers, UnfinishedGrant, Views, group_task,
 };
 use crate::group::{Group, Leadership};
 use crate::routing::Routing;
@@ -320,10 +320,10 @@ impl Node {
         let (lead_tx, lead_rx) =
             watch::channel(Leadership::observed(epoch, host.cloned(), &self.inner.id));
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
-        let initial_members: Arc<[NodeId]> = engine.members().cloned().collect();
-        let (members_tx, members_rx) = watch::channel(initial_members);
-        let (statuses_tx, statuses_rx) = watch::channel(statuses_snapshot(&engine));
-        let (entries_tx, entries_rx) = watch::channel(Arc::new(BTreeMap::new()));
+        let views = Views::new(&engine);
+        let (members_tx, members_rx) = watch::channel(views.members());
+        let (statuses_tx, statuses_rx) = watch::channel(views.statuses());
+        let (entries_tx, entries_rx) = watch::channel(views.entries());
         let (net_stats_tx, net_stats_rx) = watch::channel(groupnet_core::NetStats::default());
         let (resign_tx, resign_rx) = watch::channel(0);
         let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
@@ -351,8 +351,6 @@ impl Node {
             }));
             prompt_tx
         });
-
-        let tick_period = group_tick_period(&config);
         let actor = tokio::spawn(group_task(GroupTask {
             engine,
             inbox: rx,
@@ -368,11 +366,11 @@ impl Node {
                 resign_pending: resign_tx,
                 events: events_tx.clone(),
             },
+            views,
             routing,
             store,
             anchor_prompts,
             start: self.inner.start,
-            tick_period,
             closed: self.inner.transport.cancellation(),
         }));
         let mut actors = self.inner.actors.lock().expect("actors mutex poisoned");
@@ -403,17 +401,6 @@ impl Node {
             self.inner.messaging.group(),
         )
     }
-}
-
-fn group_tick_period(config: &groupnet_core::Config) -> Duration {
-    // Service the tightest engine deadline at twice its cadence. The engine is
-    // idempotent under early ticks, so oversampling bounds failure-detector lag.
-    const TICKS_PER_DEADLINE: u64 = 2;
-    let tightest_deadline_ms = config
-        .gossip_interval_ms
-        .min(config.probe_interval_ms)
-        .min(config.probe_timeout_ms);
-    Duration::from_millis((tightest_deadline_ms / TICKS_PER_DEADLINE).max(1))
 }
 
 /// Keeps the transport's address book fed with gossiped `~addr`

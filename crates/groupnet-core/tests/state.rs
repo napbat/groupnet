@@ -466,10 +466,10 @@ fn a_newer_version_rearms_the_lapse_instant() {
 /// (d) The author's own copy expires on the author's engine.
 ///
 /// `set_local_entry` goes through the same `StateEntry::adopted`, and
-/// `reap_entries` walks every member including self — so the author is not a
-/// privileged replica that keeps serving a key past its own lease. If it were,
-/// a writer's lapse bound would hold for every node except the one most likely
-/// to be asked.
+/// `reap_entries` reaps every member's due entries, self's included — so the
+/// author is not a privileged replica that keeps serving a key past its own
+/// lease. If it were, a writer's lapse bound would hold for every node except
+/// the one most likely to be asked.
 #[test]
 fn an_authors_own_entry_lapses_on_its_own_engine() {
     let a_id = NodeId::new("a");

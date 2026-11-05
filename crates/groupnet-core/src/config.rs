@@ -50,12 +50,14 @@ pub enum GroupMode {
 /// # Sizing
 ///
 /// Both durations here are in the engine's *logical* milliseconds, and both
-/// must be **much larger than the driver's tick period** — the engine only
-/// observes time when it is ticked, so a deadline finer than the tick is
-/// rounded up to it. The runtime driver ticks at half the tightest configured
-/// detector deadline; a lease or settle window near that period would expire
-/// a whole tick late (or, worse, be indistinguishable from zero). Prefer at
-/// least an order of magnitude above the tick period.
+/// must be **much larger than the driver's tick granularity** — the engine
+/// only observes time when it is ticked, so a deadline finer than the tick is
+/// rounded up to it. The runtime driver ticks at
+/// [`GroupEngine::next_deadline`](crate::GroupEngine::next_deadline), which
+/// includes the settle deadline and the lease expiry, to the millisecond; a
+/// driver on a coarser fixed tick would expire a lease or settle window near
+/// its period a whole tick late (or, worse, make it indistinguishable from
+/// zero). Prefer at least an order of magnitude above any such period.
 ///
 /// Size them against [`Config::detection_window_ms`], which is how long it
 /// takes this observer to call a silent host dead:
@@ -370,8 +372,8 @@ pub struct Config {
     /// (and [`eager_push`](Self::eager_push) pushes a write at once) — but
     /// the steady-state cadence is this one. A Hosted
     /// group's claims, grants and renewals ride the same round. The runtime
-    /// driver sizes its tick from it alongside the probe timers. Must be
-    /// nonzero.
+    /// driver ticks at the engine's own deadlines, this round among them.
+    /// Must be nonzero.
     pub gossip_interval_ms: u64,
     /// How often to probe a member for liveness. Must be nonzero.
     pub probe_interval_ms: u64,
@@ -571,8 +573,9 @@ impl Config {
     ///   detected the failure sooner only ever shortens it.
     /// * It is in the engine's *logical* milliseconds. A driver that samples
     ///   time on a tick coarser than `probe_timeout_ms` adds up to one tick
-    ///   period per phase; the runtime driver ticks at half the tightest
-    ///   configured deadline, which the per-step slack above absorbs.
+    ///   period per phase; the runtime driver ticks at the engine's own
+    ///   deadlines ([`GroupEngine::next_deadline`](crate::GroupEngine::next_deadline)),
+    ///   so it adds no such lag.
     /// * **At most two members are silent at once** — the failure and one
     ///   more. The per-step budget above assumes the ring reaches the target
     ///   in one pass, and with three or more simultaneous silences it may not:
