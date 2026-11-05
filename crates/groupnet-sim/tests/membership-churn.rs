@@ -121,15 +121,30 @@ fn run(loss: Percent, run_ms: u64) -> Run {
     seen
 }
 
-/// On a clean network the group converges within 4 s and, from then on,
-/// every node holds every member `Alive` at every sample. Measured: 3.5 s, no
-/// doubt after; 273ad08 had not converged by the end of the 5 s run (its
-/// digest and probe cursors all start at the same peers).
+/// On a clean network the group converges within a bound the protocol
+/// sets, and from then on every node holds every member `Alive` at every
+/// sample. The bound is twice an epidemic estimate in gossip rounds: knowing
+/// nodes double each round (`⌈log2 N⌉` rounds to reach everyone), and a node
+/// then needs `⌈N / ⌈window / 2⌉⌉` full digests — each walks at least half a
+/// window of members — arriving `gossip_fanout` a round. At N = 200, window
+/// 64 and fanout 2 that is 2 × (8 + 4) rounds of 200 ms = 4.8 s. Measured:
+/// 3.5 s, no doubt after; 273ad08 had not converged by the end of the 5 s run
+/// (its digest and probe cursors all start at the same peers).
 #[test]
 fn a_healthy_group_converges_fast_and_every_member_stays_alive() {
+    let config = Config::default();
+    let half_window = config.digest_window.get().div_ceil(2);
+    let digest_rounds = N.div_ceil(half_window).div_ceil(config.gossip_fanout.get());
+    let spread_rounds = usize::try_from((N - 1).bit_width()).expect("small");
+    let rounds = u64::try_from(2 * (spread_rounds + digest_rounds)).expect("small");
+    let bound = rounds * 200; // the run's gossip interval
     let run = run(Percent::ZERO, 5_000);
+    assert!(bound < 5_000, "the run must outlast the bound ({bound} ms)");
     let alive_at = run.alive_at.expect("membership converged");
-    assert!(alive_at <= 4_000, "converged only at {alive_at} ms");
+    assert!(
+        alive_at <= bound,
+        "converged only at {alive_at} ms, above {bound} ms"
+    );
     assert_eq!(run.worst_doubt, 0, "a member left Alive in a healthy group");
     assert_eq!(run.worst_dead, 0, "a healthy member was declared Dead");
     assert!(
