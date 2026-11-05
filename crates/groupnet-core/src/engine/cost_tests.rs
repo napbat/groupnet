@@ -85,13 +85,7 @@ fn an_idle_tick_examines_only_what_is_due() {
         let before = e.touched.get();
         let effects = e.on_tick(now);
         let cost = e.touched.get() - before;
-        for effect in &effects {
-            if let Effect::Send { to, wire } = effect
-                && wire::decode(wire).is_some_and(|f| f.kind == wire::Kind::Ping)
-            {
-                e.on_message(to.clone(), &ack, now);
-            }
-        }
+        answer_pings(&mut e, &effects, &ack, now);
         if now.0 >= WARM_MS {
             costs.push(cost);
         }
@@ -105,5 +99,71 @@ fn an_idle_tick_examines_only_what_is_due() {
     assert!(
         max <= bound,
         "an idle tick examined {max} members and entries (mean {mean}), above {bound}"
+    );
+}
+
+/// Every ping answered at once, as live peers would.
+fn answer_pings(e: &mut GroupEngine, effects: &[Effect], ack: &[u8], now: Time) {
+    for effect in effects {
+        if let Effect::Send { to, wire } = effect
+            && wire::decode(wire).is_some_and(|f| f.kind == wire::Kind::Ping)
+        {
+            e.on_message(to.clone(), ack, now);
+        }
+    }
+}
+
+/// Under a liveness storm — every member's liveness changed before every
+/// round, so every member is hot news and changed since every peer's cursor
+/// — a full digest examines its lead and its window, not every member.
+///
+/// Measured over 100 rounds of 2 full digests (max / mean members examined
+/// per full digest): at f71405f, which collected every changed member to
+/// select the lead, 1,031 / 1,031 (999 changed members, then 32 walked).
+/// Reading the lead off the top of the news index, 64 / 64: 32 led, 32
+/// walked.
+#[test]
+fn a_full_digest_in_a_storm_examines_its_lead_and_window() {
+    let mut now = Time(1);
+    let mut e = crowded(now);
+    let ack = ack(e.group());
+    while now.0 < WARM_MS {
+        now = e.next_deadline().max(Time(now.0 + 1));
+        let effects = e.on_tick(now);
+        answer_pings(&mut e, &effects, &ack, now);
+    }
+    let fanout = e.config.gossip_fanout.get() as u64;
+    let mut costs: Vec<u64> = Vec::new();
+    for incarnation in 1..=100 {
+        now = Time(now.0 + e.config.gossip_interval_ms);
+        // Every peer re-asserts itself at a new incarnation: all of them
+        // changed, all of them hot.
+        let claims: Vec<wire::NodeDigest> = (1..N)
+            .map(|i| wire::NodeDigest {
+                node: id(i),
+                incarnation,
+                status: Status::Alive.to_wire(),
+                max_version: ENTRIES,
+                content_hash: 0,
+            })
+            .collect();
+        e.merge_digest_liveness(&claims, now);
+        let before = e.touched.get();
+        let effects = e.disseminate_digest(now);
+        costs.push((e.touched.get() - before) / fanout);
+        answer_pings(&mut e, &effects, &ack, now);
+    }
+    assert_eq!(e.members().count(), N, "a member was lost in the storm");
+    assert_eq!(
+        e.net_stats().digests_built,
+        e.net_stats().full_digests_built
+    );
+    let max = costs.iter().copied().max().expect("digests were measured");
+    let mean = costs.iter().sum::<u64>() / costs.len() as u64;
+    let window = e.config.digest_window.get() as u64;
+    let bound = window + window / 2 + 8;
+    assert!(
+        max <= bound,
+        "a full digest examined {max} members (mean {mean}), above {bound}"
     );
 }

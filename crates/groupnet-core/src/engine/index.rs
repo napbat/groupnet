@@ -10,7 +10,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::membership::{Filed, Member, Status};
+use crate::membership::{Member, Status};
 use crate::{NodeId, Time, placement};
 
 use super::state::GroupEngine;
@@ -29,8 +29,12 @@ pub(super) struct Index {
     /// the last (highest score, smaller id on a tie).
     pub(super) live: BTreeSet<(u64, Reverse<NodeId>)>,
     /// Members by change stamp ([`Member::changed_at`], unique per member):
-    /// a delta digest lists the range after its peer's cursor.
+    /// a delta digest lists the range after its peer's cursor, and a full
+    /// digest leads with its top.
     pub(super) changed: BTreeMap<u64, NodeId>,
+    /// Stamped members by `(liveness_since, changed_at)`: a full digest's
+    /// liveness news is the top of it, newest first.
+    pub(super) news: BTreeSet<(Time, u64, NodeId)>,
 }
 
 impl GroupEngine {
@@ -58,7 +62,7 @@ impl GroupEngine {
 
     /// Re-files `node` after its liveness or entries changed: under its
     /// earliest deadline, and under its coordinator score while it is live.
-    /// A member entering or leaving the live set also drops the cached
+    /// A member entering or leaving the live set also patches the cached
     /// probe ring and dissemination targets. [`stamp`](Self::stamp) calls
     /// this, and so does every path that changes a member without stamping
     /// it (a reap).
@@ -83,19 +87,40 @@ impl GroupEngine {
             (None, true) => {
                 let score = placement::owner_score(self.group.as_str(), node);
                 self.index.live.insert((score, Reverse(node.clone())));
-                self.live_set_changed();
+                self.live_set_changed(node, true);
                 Some(score)
             }
             (Some(score), false) => {
                 self.index.live.remove(&(score, Reverse(node.clone())));
-                self.live_set_changed();
+                self.live_set_changed(node, false);
                 None
             }
             (None, false) => None,
         };
         if let Some(m) = self.members.get_mut(node) {
-            m.filed = Filed { due, score };
+            m.filed.due = due;
+            m.filed.score = score;
         }
+    }
+
+    /// Moves `node` to change stamp `stamp` in the change index and the
+    /// liveness news, under its current `liveness_since`.
+    pub(super) fn restamp(&mut self, node: &NodeId, stamp: u64) {
+        let Some(m) = self.members.get_mut(node) else {
+            return;
+        };
+        if m.changed_at > 0 {
+            self.index.changed.remove(&m.changed_at);
+            self.index
+                .news
+                .remove(&(m.filed.liveness, m.changed_at, node.clone()));
+        }
+        m.changed_at = stamp;
+        m.filed.liveness = m.liveness_since;
+        self.index.changed.insert(stamp, node.clone());
+        self.index
+            .news
+            .insert((m.liveness_since, stamp, node.clone()));
     }
 
     /// Removes `node` from the member map and from every index.
@@ -106,20 +131,31 @@ impl GroupEngine {
         }
         if let Some(score) = m.filed.score {
             self.index.live.remove(&(score, Reverse(node.clone())));
-            self.live_set_changed();
+            self.live_set_changed(node, false);
         }
         if m.changed_at > 0 {
             self.index.changed.remove(&m.changed_at);
+            self.index
+                .news
+                .remove(&(m.filed.liveness, m.changed_at, node.clone()));
         }
         self.digest_peers.remove(node);
         Some(m)
     }
 
-    /// The live set changed: the probe ring and the dissemination targets
-    /// are rebuilt on next use.
-    fn live_set_changed(&mut self) {
-        self.ring = None;
-        self.targets = None;
+    /// `node` entered (`live`) or left the live set: patch it into or out
+    /// of the cached probe ring and dissemination targets, which stay
+    /// sorted, instead of rebuilding them.
+    fn live_set_changed(&mut self, node: &NodeId, live: bool) {
+        let candidate = live && *node != self.local;
+        let target =
+            candidate || self.seeds.contains(node) || self.bootstrap_contacts.contains(node);
+        if let Some(ring) = &mut self.ring {
+            patch_sorted(ring, node, candidate);
+        }
+        if let Some(targets) = &mut self.targets {
+            patch_sorted(targets, node, target);
+        }
     }
 
     /// The members with a deadline at or before `now`, in id order.
@@ -143,7 +179,8 @@ impl GroupEngine {
     }
 
     /// The live members other than us, in id order — the probe ring, built
-    /// on first use after the live set changed.
+    /// on first use and then patched as members enter and leave the live
+    /// set.
     pub(super) fn probe_ring(&mut self) -> &[NodeId] {
         if self.ring.is_none() {
             let ring: Vec<NodeId> = self.probe_candidates().cloned().collect();
@@ -209,6 +246,15 @@ impl GroupEngine {
                     Some(node),
                     "{node} is missing from the change index"
                 );
+                assert!(
+                    m.filed.liveness == m.liveness_since
+                        && self.index.news.contains(&(
+                            m.liveness_since,
+                            m.changed_at,
+                            node.clone()
+                        )),
+                    "{node} is missing from the liveness news"
+                );
             }
         }
         assert_eq!(
@@ -227,9 +273,26 @@ impl GroupEngine {
             "the change index holds a stale member"
         );
         assert_eq!(
+            self.index.news.len(),
+            stamped,
+            "the liveness news holds a stale member"
+        );
+        assert_eq!(
             self.compute_coordinator(),
             placement::owner_among(self.group.as_str(), self.members()),
             "the indexed coordinator is not the placement owner"
         );
+    }
+}
+
+/// Inserts `node` into, or removes it from, the sorted `list` so that it is
+/// there exactly when `present`.
+fn patch_sorted(list: &mut Vec<NodeId>, node: &NodeId, present: bool) {
+    match list.binary_search(node) {
+        Ok(at) if !present => {
+            list.remove(at);
+        }
+        Err(at) if present => list.insert(at, node.clone()),
+        _ => {}
     }
 }

@@ -1,7 +1,8 @@
 //! Digest/delta anti-entropy: windowed full digests, per-peer delta digests,
 //! reconciliation, and eager push.
 
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::iter::Peekable;
 use std::ops::Bound::{Excluded, Unbounded};
 
@@ -141,7 +142,7 @@ impl GroupEngine {
     /// The cursor advances on build, not delivery: anything a dropped frame,
     /// or a change a full digest had no room to lead with, left out stays
     /// divergent only until the rolling window reaches it.
-    fn digest_for(&self, to: &NodeId, now: Time) -> (Vec<NodeId>, bool, PeerDigest) {
+    pub(super) fn digest_for(&self, to: &NodeId, now: Time) -> (Vec<NodeId>, bool, PeerDigest) {
         let window = self.config.digest_window.get();
         let prev = self.digest_peers.get(to);
         let visits = prev.map_or(0, |p| p.visits);
@@ -156,45 +157,67 @@ impl GroupEngine {
                 .iter()
                 .filter(|(_, m)| self.should_gossip(m, now))
         };
-        let mut listed: Vec<(&NodeId, &Member)> = self
-            .index
-            .changed
-            .range((Excluded(cursor), Unbounded))
-            .filter_map(|(_, node)| self.members.get_key_value(node))
-            .filter(|(_, m)| self.should_gossip(m, now))
-            .collect();
-        self.touch(listed.len());
+        // The members changed since this peer's cursor, newest first.
+        let changed = || {
+            self.index
+                .changed
+                .range((Excluded(cursor), Unbounded))
+                .rev()
+                .filter_map(|(_, node)| self.members.get_key_value(node))
+        };
         let scheduled_full = visits.is_multiple_of(self.config.full_digest_every.get());
-        if !scheduled_full && listed.len() <= window {
-            listed.sort_unstable_by_key(|(node, _)| *node);
-            let nodes = listed.into_iter().map(|(node, _)| node.clone()).collect();
-            return (nodes, false, peer);
+        if !scheduled_full {
+            // A delta needs every change, so count them only up to one past
+            // the window: more than that makes the digest full.
+            let mut delta: Vec<(&NodeId, &Member)> = changed()
+                .inspect(|_| self.touch(1))
+                .filter(|(_, m)| self.should_gossip(m, now))
+                .take(window + 1)
+                .collect();
+            if delta.len() <= window {
+                delta.sort_unstable_by_key(|(node, _)| *node);
+                let nodes = delta.into_iter().map(|(node, _)| node.clone()).collect();
+                return (nodes, false, peer);
+            }
         }
 
-        // Lead: the local member, then hot liveness news, then the freshest
-        // changes, at most half the window — the rest is the rolling walk's,
-        // so it always advances. Under churn nearly every member changed, so
-        // the lead is selected (linear) before it is sorted; `changed_at` is
-        // unique per member, so this is the full sort's first half-window.
+        // Lead, at most half the window — the rest is the rolling walk's, so
+        // it always advances: the local member if it changed, then hot
+        // liveness news newest first (read off the top of the news index),
+        // then the freshest other changes (the top of the change index).
         let hot_ms = self.liveness_hot_ms();
-        let rank = |entry: &(&NodeId, &Member)| {
-            let (node, m) = *entry;
-            let hot = now.0.saturating_sub(m.liveness_since.0) < hot_ms;
-            (
-                *node != self.local,
-                !hot,
-                Reverse(if hot { m.liveness_since } else { Time::ZERO }),
-                Reverse(m.changed_at),
-            )
-        };
+        let hot = |m: &Member| now.0.saturating_sub(m.liveness_since.0) < hot_ms;
+        let fresh = |m: &Member| m.changed_at > cursor && self.should_gossip(m, now);
         let lead_cap = window / 2;
-        if lead_cap == 0 {
-            listed.clear();
-        } else if listed.len() > lead_cap {
-            listed.select_nth_unstable_by_key(lead_cap - 1, rank);
-            listed.truncate(lead_cap);
+        let mut listed: Vec<(&NodeId, &Member)> = Vec::with_capacity(window);
+        if lead_cap > 0 {
+            if let Some((node, m)) = self.members.get_key_value(&self.local)
+                && fresh(m)
+            {
+                listed.push((node, m));
+            }
+            for (_, _, node) in self.index.news.iter().rev() {
+                let Some((node, m)) = self.members.get_key_value(node) else {
+                    continue;
+                };
+                if listed.len() >= lead_cap || !hot(m) {
+                    break; // news only gets older from here
+                }
+                self.touch(1);
+                if *node != self.local && fresh(m) {
+                    listed.push((node, m));
+                }
+            }
+            for (node, m) in changed() {
+                if listed.len() >= lead_cap {
+                    break;
+                }
+                self.touch(1);
+                if *node != self.local && !hot(m) && self.should_gossip(m, now) {
+                    listed.push((node, m));
+                }
+            }
         }
-        listed.sort_unstable_by_key(rank);
         let lead = listed.len();
         // The rolling walk resumes after the last member the previous full
         // digest to this peer walked past, wrapping once round the members —
@@ -279,8 +302,9 @@ impl GroupEngine {
 
     /// Up to `k` distinct dissemination targets, from position `cursor`
     /// (modulo their count) onward, wrapping. Indexes the cached merged
-    /// targets ([`GroupEngine::targets`]), rebuilt only after the live set or
-    /// the contacts changed, so a round costs `O(k)`.
+    /// targets ([`GroupEngine::targets`]), patched as members enter and
+    /// leave the live set and rebuilt only after the contacts change, so a
+    /// round costs `O(k)`.
     pub(super) fn rotated_targets(&mut self, cursor: usize, k: usize) -> Vec<NodeId> {
         if self.targets.is_none() {
             let targets: Vec<NodeId> = self.dissemination_targets().cloned().collect();
@@ -610,12 +634,13 @@ fn fill_window<'a>(
     walk: impl Iterator<Item = (&'a NodeId, &'a Member)>,
     resume: &mut Option<NodeId>,
 ) {
+    let leading: BTreeSet<&NodeId> = listed[..lead].iter().map(|(node, _)| *node).collect();
     for (node, m) in walk {
         if listed.len() >= window {
             break;
         }
         *resume = Some(node.clone());
-        if listed[..lead].iter().any(|(led, _)| *led == node) {
+        if leading.contains(node) {
             continue; // already leads the digest
         }
         listed.push((node, m));

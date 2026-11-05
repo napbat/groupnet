@@ -149,6 +149,9 @@ pub(crate) struct Filed {
     pub(crate) due: Time,
     /// The member's coordinator score while it is live (not `Dead`).
     pub(crate) score: Option<u64>,
+    /// The [`liveness_since`](Member::liveness_since) the member is filed
+    /// under among the liveness news (meaningful once it is stamped).
+    pub(crate) liveness: Time,
 }
 
 impl Filed {
@@ -156,6 +159,7 @@ impl Filed {
     const NONE: Self = Self {
         due: Time::MAX,
         score: None,
+        liveness: Time::ZERO,
     };
 }
 

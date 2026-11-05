@@ -2,9 +2,15 @@
 //! liveness claims, entry writes and deletes, local commands and clock jumps,
 //! with every tick's reaps checked against a walk of every member and entry.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 
+use crate::membership::Member;
 use crate::{Command, Config, Effect, GroupEngine, GroupId, NodeId, Status, Time, wire};
+
+use super::super::spread;
+use super::super::state::PeerDigest;
 
 /// A splitmix64 stream for the schedules.
 struct Draws(u64);
@@ -281,4 +287,140 @@ fn indexed_reaps_match_a_full_walk() {
             e.assert_index();
         }
     }
+}
+
+/// The digest builder as f71405f had it: collect every member changed since
+/// the peer's cursor, select the lead from all of them, then walk the
+/// window. The oracle the index-driven builder is checked against.
+fn old_digest_for(e: &GroupEngine, to: &NodeId, now: Time) -> (Vec<NodeId>, bool, PeerDigest) {
+    let window = e.config.digest_window.get();
+    let prev = e.digest_peers.get(to);
+    let visits = prev.map_or(0, |p| p.visits);
+    let cursor = prev.map_or(0, |p| p.cursor);
+    let mut peer = PeerDigest {
+        visits: visits + 1,
+        cursor: e.change_clock,
+        resume: prev.and_then(|p| p.resume.clone()),
+    };
+    let gossipable = || e.members.iter().filter(|(_, m)| e.should_gossip(m, now));
+    let mut listed: Vec<(&NodeId, &Member)> = gossipable()
+        .filter(|(_, m)| m.changed_at > cursor)
+        .collect();
+    let ids =
+        |listed: Vec<(&NodeId, &Member)>| listed.into_iter().map(|(n, _)| n.clone()).collect();
+    if !visits.is_multiple_of(e.config.full_digest_every.get()) && listed.len() <= window {
+        return (ids(listed), false, peer);
+    }
+    let hot_ms = e.liveness_hot_ms();
+    let rank = |entry: &(&NodeId, &Member)| {
+        let (node, m) = *entry;
+        let hot = now.0.saturating_sub(m.liveness_since.0) < hot_ms;
+        (
+            *node != e.local,
+            !hot,
+            Reverse(if hot { m.liveness_since } else { Time::ZERO }),
+            Reverse(m.changed_at),
+        )
+    };
+    let lead_cap = window / 2;
+    if lead_cap == 0 {
+        listed.clear();
+    } else if listed.len() > lead_cap {
+        listed.select_nth_unstable_by_key(lead_cap - 1, rank);
+        listed.truncate(lead_cap);
+    }
+    listed.sort_unstable_by_key(rank);
+    let lead = listed.len();
+    if let Some(after) = peer.resume.clone() {
+        let walk = e
+            .members
+            .range((Excluded(&after), Unbounded))
+            .chain(e.members.range(..=&after))
+            .filter(|(_, m)| e.should_gossip(m, now));
+        old_fill(&mut listed, lead, window, walk, &mut peer.resume);
+    } else {
+        let len = gossipable().count();
+        if len > 0 {
+            let start = spread::index(spread::pair_hash(&e.local, to), len);
+            let walk = gossipable().skip(start).chain(gossipable().take(start));
+            old_fill(&mut listed, lead, window, walk, &mut peer.resume);
+        }
+    }
+    (ids(listed), true, peer)
+}
+
+/// The old builder's window fill: a linear scan of the lead per member.
+fn old_fill<'a>(
+    listed: &mut Vec<(&'a NodeId, &'a Member)>,
+    lead: usize,
+    window: usize,
+    walk: impl Iterator<Item = (&'a NodeId, &'a Member)>,
+    resume: &mut Option<NodeId>,
+) {
+    for (node, m) in walk {
+        if listed.len() >= window {
+            break;
+        }
+        *resume = Some(node.clone());
+        if listed[..lead].iter().any(|(led, _)| *led == node) {
+            continue;
+        }
+        listed.push((node, m));
+    }
+}
+
+/// The index-driven digest builder lists exactly what the old one did — the
+/// same members in the same order, full or delta, with the same peer
+/// bookkeeping — for every peer, after every step of random histories. A
+/// window of 4 keeps the lead, the window and the delta limit all binding
+/// with a dozen peers.
+#[test]
+fn indexed_digests_match_the_old_builder() {
+    let config = Config {
+        probe_interval_ms: 100,
+        probe_timeout_ms: 50,
+        suspect_timeout_ms: 300,
+        dead_timeout_ms: 1_000,
+        gossip_interval_ms: 200,
+        digest_window: std::num::NonZeroUsize::new(4).expect("nonzero"),
+        ..Config::default()
+    };
+    let mut compared = (0, 0);
+    for seed in 0..32 {
+        let mut draws = Draws(seed ^ 0xd16e);
+        let mut e = GroupEngine::new(
+            GroupId::new("g"),
+            NodeId::new("a"),
+            [peer(0)],
+            config.clone(),
+        )
+        .expect("valid config");
+        let mut now = Time(1);
+        e.start(now);
+        for i in 0..600 {
+            if draws.below(3) == 0 {
+                now = Time(now.0 + 1 + draws.below(400));
+                e.on_tick(now);
+            } else {
+                step(&mut e, &mut draws, now);
+            }
+            for to in (0..2 * PEERS).map(peer) {
+                let built = e.digest_for(&to, now);
+                assert_eq!(
+                    built,
+                    old_digest_for(&e, &to, now),
+                    "seed {seed} step {i} to {to}"
+                );
+                if built.1 {
+                    compared.1 += 1;
+                } else {
+                    compared.0 += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        compared.0 > 1_000 && compared.1 > 1_000,
+        "too few digests compared: {compared:?}"
+    );
 }

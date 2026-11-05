@@ -32,7 +32,7 @@ pub(super) struct Pending {
 }
 
 /// What a node remembers about the digests it built for one peer.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct PeerDigest {
     /// Digests built for this peer so far (drives the full-digest cadence).
     pub(super) visits: u64,
@@ -105,12 +105,13 @@ pub struct GroupEngine {
     pub(super) seeds: BTreeSet<NodeId>,
     /// Replaceable, bounded discovery contacts; these do not assert membership.
     pub(super) bootstrap_contacts: BTreeSet<NodeId>,
-    /// The dissemination targets, merged and in id order, kept until the live
-    /// set or the contacts change (`None` until then): every gossip round
-    /// indexes into them.
+    /// The dissemination targets, merged and in id order (`None` until first
+    /// used, and after the contacts change): every gossip round indexes into
+    /// them. A member entering or leaving the live set is patched in place.
     pub(super) targets: Option<Vec<NodeId>>,
-    /// The live probe candidates, in id order, kept until the live set
-    /// changes (`None` until then): every probe indexes into them.
+    /// The live probe candidates, in id order (`None` until first used),
+    /// patched as members enter and leave the live set: every probe indexes
+    /// into them.
     pub(super) ring: Option<Vec<NodeId>>,
     /// The ordered index over the members: who is due when, who is live by
     /// coordinator score, and who changed when.
@@ -191,8 +192,7 @@ impl GroupEngine {
         let mut members = BTreeMap::new();
         // Construction has no clock of its own; the local node has been Alive
         // since the origin of this engine's logical timeline.
-        let mut own = Member::new(0, Status::Alive, Time::ZERO);
-        own.changed_at = 1; // stamped at clock 1, so a first digest lists us
+        let own = Member::new(0, Status::Alive, Time::ZERO);
         members.insert(local.clone(), own);
         let seeds = seeds
             .into_iter()
@@ -234,8 +234,9 @@ impl GroupEngine {
             #[cfg(test)]
             touched: std::cell::Cell::new(0),
         };
-        engine.index.changed.insert(1, engine.local.clone());
         let local = engine.local.clone();
+        // Stamped at clock 1, so a first digest lists us.
+        engine.restamp(&local, 1);
         engine.reindex(&local);
         engine.coordinator = engine.compute_coordinator();
         Ok(engine)
@@ -255,13 +256,7 @@ impl GroupEngine {
     pub(super) fn stamp(&mut self, node: &NodeId) {
         self.change_clock += 1;
         let stamp = self.change_clock;
-        if let Some(m) = self.members.get_mut(node) {
-            if m.changed_at > 0 {
-                self.index.changed.remove(&m.changed_at);
-            }
-            m.changed_at = stamp;
-            self.index.changed.insert(stamp, node.clone());
-        }
+        self.restamp(node, stamp);
         self.reindex(node);
     }
 
