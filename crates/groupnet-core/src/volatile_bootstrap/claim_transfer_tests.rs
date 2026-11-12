@@ -379,6 +379,65 @@ fn repeated_old_renewal_cannot_extend_selected_claim_lifetime() {
     assert_ne!(engine.stage(), BootstrapStage::Transferring);
 }
 
+/// The selected-claim refresh operation a transfer tick starts.
+fn refresh(step: &BootstrapStep) -> BootstrapOperation {
+    step.effects
+        .iter()
+        .find_map(|effect| match effect {
+            BootstrapEffect::ObserveSelectedClaim { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn abandoned(step: &BootstrapStep, selected: &ClaimIdentity) -> bool {
+    step.effects.iter().any(|effect| {
+        matches!(effect, BootstrapEffect::Released { builder, reason: ReleaseReason::DonorUnavailable }
+            if builder == selected)
+    }) && step.effects.iter().any(|effect| {
+        matches!(effect, BootstrapEffect::Transfer(inner)
+            if matches!(inner.as_ref(), TransferEffect::DiscardStage { .. }))
+    })
+}
+
+/// A failed refresh read, as of a donor the source only suspects, is a
+/// missed sample: the transfer keeps running and samples again, and still
+/// ends once the claim it last observed expires.
+#[test]
+fn a_missed_refresh_keeps_the_transfer_until_the_last_claim_expires() {
+    let (mut engine, parent, selected) = ready_follower_with_wait(20);
+    engine.step(BootstrapEvent::StartTransfer {
+        op: parent,
+        selected: selected.clone(),
+    });
+    let op = refresh(&engine.step(BootstrapEvent::Tick(Time(7))));
+    let missed = engine.step(BootstrapEvent::SelectedClaimUnobserved { op });
+    assert_eq!(missed.rejection, None);
+    assert!(!abandoned(&missed, &selected));
+    assert_eq!(engine.stage(), BootstrapStage::Transferring);
+    let again = engine.step(BootstrapEvent::Tick(Time(10)));
+    refresh(&again);
+    assert_eq!(engine.stage(), BootstrapStage::Transferring);
+    let expired = engine.step(BootstrapEvent::Tick(Time(12)));
+    assert!(abandoned(&expired, &selected), "{expired:?}");
+    assert_ne!(engine.stage(), BootstrapStage::Transferring);
+}
+
+/// An absent refresh read, as of a donor that died, left or withdrew its
+/// claim, abandons the transfer at once, long before that claim's expiry.
+#[test]
+fn an_absent_refresh_abandons_the_transfer_at_once() {
+    let (mut engine, parent, selected) = ready_follower_with_wait(20);
+    engine.step(BootstrapEvent::StartTransfer {
+        op: parent,
+        selected: selected.clone(),
+    });
+    let op = refresh(&engine.step(BootstrapEvent::Tick(Time(7))));
+    let gone = engine.step(BootstrapEvent::SelectedClaimObserved { op, claim: None });
+    assert!(abandoned(&gone, &selected), "{gone:?}");
+    assert_ne!(engine.stage(), BootstrapStage::Transferring);
+}
+
 fn child_effect(engine: &mut ClaimEngine, event: TransferEvent) -> TransferEffect {
     let step = engine.step(BootstrapEvent::Transfer(Box::new(event)));
     assert_eq!(step.rejection, None);

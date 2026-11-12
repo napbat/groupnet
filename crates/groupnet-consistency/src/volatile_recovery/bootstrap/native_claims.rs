@@ -240,6 +240,16 @@ impl NativeClaimSource {
         limits: ClaimObservationLimits,
         admission: &ByteAdmission,
     ) -> Result<Admitted<ClaimSnapshot>, AdapterError> {
+        let raw = self.inspect_raw(limits, admission).await?;
+        self.converted(raw, limits, admission)
+    }
+
+    /// One bounded actor cut of the claim entry, before conversion.
+    async fn inspect_raw(
+        &self,
+        limits: ClaimObservationLimits,
+        admission: &ByteAdmission,
+    ) -> Result<Admitted<InspectedEntries>, AdapterError> {
         if !self.admission.same_pool(admission) {
             return Err(AdapterErrorKind::InvalidInput.into());
         }
@@ -254,11 +264,79 @@ impl NativeClaimSource {
             .inspect_scoped_entry(&self.key, inspection_limits, raw_budget)
             .await
             .map_err(|_| UNAVAILABLE)?;
-        let raw = raw_budget.hold(raw);
+        Ok(raw_budget.hold(raw))
+    }
+
+    /// Convert one raw cut under its own charge, retiring the raw one.
+    fn converted(
+        &self,
+        raw: Admitted<InspectedEntries>,
+        limits: ClaimObservationLimits,
+        admission: &ByteAdmission,
+    ) -> Result<Admitted<ClaimSnapshot>, AdapterError> {
         let converted_bytes = converted_charge(raw.get(), limits.max_metadata_bytes)?;
         let converted_budget = admission.reserve(AdmissionClass::Inflight, converted_bytes)?;
         let snapshot = raw.consume(|raw| self.convert(raw))?;
         Ok(converted_budget.hold(snapshot))
+    }
+
+    /// The exact `selected` claim in one raw cut. A claim whose member this
+    /// node only suspects advertises no availability, so the snapshot drops
+    /// it. Its author has not left, though: SWIM suspects a loaded peer that
+    /// then refutes. That read is a missed sample (`Unavailable`), as a
+    /// failed read is, and the worker still ends a transfer once the claim
+    /// it last observed expires. A dead or absent member, an expired entry,
+    /// and another attempt's claim read as absent.
+    fn selected_from_cut(
+        &self,
+        raw: Admitted<InspectedEntries>,
+        selected: &ClaimIdentity,
+        limits: ClaimObservationLimits,
+        admission: &ByteAdmission,
+    ) -> Result<Option<Admitted<TimedClaim>>, AdapterError> {
+        let suspected = raw.get().entries.iter().any(|entry| {
+            entry.node == selected.node
+                && entry.status == Status::Suspect
+                && entry.value.as_deref().is_some_and(|value| {
+                    self.decode(&entry.node, value)
+                        .is_ok_and(|claim| claim.identity == *selected)
+                })
+        });
+        if suspected {
+            return Err(UNAVAILABLE);
+        }
+        let snapshot = self.converted(raw, limits, admission)?;
+        let selected_claim = snapshot
+            .get()
+            .claims
+            .iter()
+            .find(|claim| claim.identity == *selected);
+        let Some(selected_claim) = selected_claim else {
+            return Ok(None);
+        };
+        let charge_bytes = charge(size_of::<TimedClaim>())?
+            .checked_add(selected.node.as_str().len())
+            .ok_or(CAPACITY)?;
+        let charge = admission.reserve(AdmissionClass::Inflight, charge_bytes)?;
+        let result = TimedClaim {
+            sampled_at: snapshot.get().sampled_at,
+            claim: selected_claim.clone(),
+        };
+        drop(snapshot);
+        Ok(Some(charge.hold(result)))
+    }
+
+    fn decode(
+        &self,
+        author: &groupnet_core::NodeId,
+        value: &[u8],
+    ) -> Result<BootstrapClaim, ClaimCodecError> {
+        decode_claim_value(
+            &self.scope,
+            self.policy,
+            ObservedEntry { author, value },
+            self.max_value_bytes.get(),
+        )
     }
 
     fn convert(&self, raw: InspectedEntries) -> Result<ClaimSnapshot, AdapterError> {
@@ -277,16 +355,7 @@ impl NativeClaimSource {
                 if remaining_ms == 0 || remaining_ms > self.policy.claim_ttl_ms {
                     return Err(MALFORMED);
                 }
-                let mut claim = decode_claim_value(
-                    &self.scope,
-                    self.policy,
-                    ObservedEntry {
-                        author: &entry.node,
-                        value: &value,
-                    },
-                    self.max_value_bytes.get(),
-                )
-                .map_err(|_| MALFORMED)?;
+                let mut claim = self.decode(&entry.node, &value).map_err(|_| MALFORMED)?;
                 claim.remaining_ms = remaining_ms;
                 if eligible {
                     claims.push(claim);
@@ -455,25 +524,8 @@ impl ClaimSource for NativeClaimSource {
         limits: ClaimObservationLimits,
         admission: &ByteAdmission,
     ) -> Result<Option<Admitted<TimedClaim>>, AdapterError> {
-        let snapshot = self.inspect(limits, admission).await?;
-        let selected_claim = snapshot
-            .get()
-            .claims
-            .iter()
-            .find(|claim| claim.identity == selected);
-        let Some(selected_claim) = selected_claim else {
-            return Ok(None);
-        };
-        let charge_bytes = charge(size_of::<TimedClaim>())?
-            .checked_add(selected.node.as_str().len())
-            .ok_or(CAPACITY)?;
-        let charge = admission.reserve(AdmissionClass::Inflight, charge_bytes)?;
-        let result = TimedClaim {
-            sampled_at: snapshot.get().sampled_at,
-            claim: selected_claim.clone(),
-        };
-        drop(snapshot);
-        Ok(Some(charge.hold(result)))
+        let raw = self.inspect_raw(limits, admission).await?;
+        self.selected_from_cut(raw, &selected, limits, admission)
     }
 }
 
@@ -504,3 +556,6 @@ fn converted_charge(
         .filter(|total| *total <= max_bytes)
         .ok_or(CAPACITY)
 }
+
+#[cfg(test)]
+mod tests;

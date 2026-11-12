@@ -143,6 +143,10 @@ pub trait ClaimSource: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Admitted<ClaimSnapshot>, AdapterError>> + Send;
 
     /// Read one exact selected claim, including its native TTL and renewal.
+    /// Absent means the claim is gone: withdrawn, replaced, expired, or held
+    /// by a member that is dead or has left. A source that holds the claim
+    /// but only suspects its member fails the read instead, so the worker
+    /// counts a missed sample rather than a departure.
     fn observe_selected_claim(
         &self,
         op: BootstrapOperation,
