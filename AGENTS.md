@@ -4,17 +4,22 @@ Instructions for any coding agent working in this repository.
 
 ## Orientation
 
-groupnet is a deterministic, leaderless-by-default coordination fabric for
-sharded distributed systems. Read `README.md` for usage,
-`docs/README.md` for the architecture and network-lifecycle guides, and
+groupnet is the network substrate for distributed applications: sharded
+clusters, hubs that admit clients, and later VPN-style overlays, around a
+deterministic, leaderless-by-default coordination fabric. Read `README.md` for
+usage, `docs/README.md` for the architecture and network-lifecycle guides,
 `docs/consistency-modes.md` for the consistency-modes design — that document
 is the **contract of record** for the Hosted-mode/consistency work and its
-Section 6 is the build order.
+Section 6 is the build order — and `docs/client-role.md`, the contract of
+record for hubs and clients (its Section 7 is the build order).
 
-Downstream consumers that must not break: **docres/shardstore** (uses
-membership, TTL'd entries, placement — liveness only) and **s3cache** (uses
-the `consistency` + `acks` tiers deeply). Their needs are documented in
-`docs/consistency-modes.md` Section 2.
+Peer lists grow at run time: a link admits peers through an `Admission`
+policy, and configured peers are seeds, never the bound of who may join.
+
+The downstream consumer today is **docstore**, which pins a revision of
+`main`. Its needs, and the needs of the cache workloads described in
+`docs/consistency-modes.md` Section 2, constrain changes to the tiers they
+use.
 
 ## Hard invariants (violating any of these is a defect, not a style choice)
 

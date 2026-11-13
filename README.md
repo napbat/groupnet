@@ -1,10 +1,14 @@
 # Groupnet
 
-A **deterministic, leaderless-by-default coordination fabric** for distributed
-systems that partition state into shard groups. Groupnet is an *engine*, not a
+The **network substrate for distributed applications**: clusters that
+partition state into shard groups, services that many clients connect to, and
+(on the roadmap) VPN-style overlays. At its center is a **deterministic,
+leaderless-by-default coordination fabric**. Groupnet is an *engine*, not a
 database: it gives you group-local membership, an implicit (derived,
 non-elected) coordinator, inter-group routing awareness, and shard-scoped
-operations. Consensus is **opt-in per group** — the Hosted mode's Quorum
+operations. Peers join at run time through application admission; configured
+peers are only seeds. A hub can admit clients that dial it and take no part in
+membership ([clients of one node](docs/client-role.md)). Consensus is **opt-in per group** — the Hosted mode's Quorum
 profile, epoch-fenced and majority-committed — while the general replicated-log
 machine (log repair, compaction, reconfiguration) is deliberately absent. You
 bring the storage and the wire.
