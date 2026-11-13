@@ -1,5 +1,6 @@
 use super::*;
 use crate::{TcpAdmissionError, TcpMsgConfigError};
+use groupnet_transport::admission::AllowedPeers;
 use groupnet_transport::framing::MAX_FRAME_BYTES;
 use groupnet_transport::link::LinkConfigError;
 use std::num::NonZeroUsize;
@@ -171,21 +172,6 @@ async fn dropping_unregistered_link_cancels_listener() {
     .expect("dropped provider released listener");
 }
 
-#[tokio::test]
-async fn configured_admission_denial_names_the_claim() {
-    let policy = ConfiguredAdmission(vec![NodeId::new("known")]);
-    let stranger = NodeId::new("stranger");
-    let error = policy
-        .admit(JoinRequest::new(&stranger, &[], None))
-        .await
-        .expect_err("unconfigured peer denied");
-    assert!(
-        matches!(&error, AdmissionError::UnknownPeer { claimed } if *claimed == stranger),
-        "{error:?}"
-    );
-    assert!(error.to_string().contains("stranger"), "{error}");
-}
-
 async fn dial_finished(transport: &TcpMsgTransport) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while transport.outbound_connections() != 0 {
@@ -210,7 +196,7 @@ async fn static_admission_rejects_unknown_and_bootstrap_recovers_late_listener()
         a_id.clone(),
         "127.0.0.1:0",
         TcpMsgConfig::default(),
-        TcpAdmission::new(Arc::new(ConfiguredAdmission(vec![b_id.clone()]))),
+        TcpAdmission::new(Arc::new(AllowedPeers::new(vec![b_id.clone()]))),
     )
     .await
     .expect("a");
@@ -224,7 +210,7 @@ async fn static_admission_rejects_unknown_and_bootstrap_recovers_late_listener()
         b_id.clone(),
         b_addr,
         TcpMsgConfig::default(),
-        TcpAdmission::new(Arc::new(ConfiguredAdmission(vec![a_id]))),
+        TcpAdmission::new(Arc::new(AllowedPeers::new(vec![a_id]))),
     )
     .await
     .expect("late b");

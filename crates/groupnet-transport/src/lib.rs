@@ -26,7 +26,7 @@
 //! | Crate | Endpoint | Construction | Default / custom config | Needs a Tokio runtime |
 //! |---|---|---|---|---|
 //! | `groupnet-transport-mem` | `Network` → `MemTransport`, `MemBulkNet` → `MemBulkTransport` | synchronous `new()` / `with_config(config)`, then `endpoint(id)` | `NetworkConfig`, `MemBulkConfig` | no: channel and duplex primitives run on any executor (a managed link's workers run on the node's runtime) |
-//! | `groupnet-transport-ipc` | `IpcTransport` | synchronous `bind(id, &address)` / `bind_with(id, &address, config)` | `IpcConfig` | yes, at bind (spawns its listener task) |
+//! | `groupnet-transport-ipc` | `IpcTransport` | synchronous `bind(id, &address)` / `bind_with(id, &address, config)`; admitted `bind_admitted(id, &address, config, admission)` / `dial_only_admitted(id, config, admission)` | `IpcConfig`, `IpcAdmission` | yes, at bind (spawns its listener task) |
 //! | `groupnet-transport-tcp` | `TcpMsgTransport`, `TcpBulkTransport` | `async` `bind(id, addr)` / `bind_with(id, addr, config)` | `TcpMsgConfig`, `TcpBulkConfig` | yes |
 //! | `groupnet-transport-udp` | `UdpTransport` | `async` `bind(id, addr)` | none (one socket) | yes |
 //!

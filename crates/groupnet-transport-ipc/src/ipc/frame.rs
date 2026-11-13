@@ -12,7 +12,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use super::MAX_FRAME;
 
 const MAGIC: [u8; 4] = *b"GNI1";
-const MAX_ID: usize = 64;
+/// Longest identity an IPC introduction or join carries, in bytes.
+pub(super) const MAX_ID: usize = 64;
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
 #[repr(C)]

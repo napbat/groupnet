@@ -16,17 +16,27 @@
 //! that hosts its workers. The `groupnet-transport` crate docs compare the
 //! construction contract of every binding.
 //!
+//! Peers grow at run time. [`IpcLink`] is always admitted: its configured
+//! peers are seeds, and any other local peer joins when the link's
+//! [`Admission`] policy accepts its claim (by default, only the configured
+//! peers). [`IpcLink::dial_only`] makes a client link without a listener.
+//! [`IpcTransport::bind_admitted`] and [`IpcTransport::dial_only_admitted`]
+//! are the transport-level forms; `docs/client-role.md` has the contract.
+//!
 //! The shared transport types these signatures name — [`QueueCapacity`]
-//! (in [`IpcConfig`]), [`PeerEndpoint`] (in [`IpcLink::new`]) and
-//! [`NodeIdError`] (in [`IpcPeerError`]) — are re-exported here.
+//! (in [`IpcConfig`]), [`PeerEndpoint`] (in [`IpcLink::new`]),
+//! [`NodeIdError`] (in [`IpcPeerError`]), [`Admission`] (in [`IpcAdmission`]),
+//! [`SessionRegistry`] (from [`IpcTransport::sessions`]) and [`BoundLink`]
+//! (from [`IpcTransport::into_bound_link`]) — are re-exported here.
 
 mod ipc;
 mod link;
 
-pub use groupnet_transport::link::PeerEndpoint;
+pub use groupnet_transport::admission::{Admission, SessionRegistry};
+pub use groupnet_transport::link::{BoundLink, PeerEndpoint};
 pub use groupnet_transport::{NodeIdError, QueueCapacity};
 pub use ipc::{
-    IpcAddress, IpcAddressError, IpcConfig, IpcConfigError, IpcPeerError, IpcSendError,
-    IpcTransport, MAX_FRAME,
+    IpcAddress, IpcAddressError, IpcAdmission, IpcAdmissionError, IpcConfig, IpcConfigError,
+    IpcConnectPeerError, IpcPeerError, IpcSendError, IpcTransport, MAX_FRAME,
 };
 pub use link::IpcLink;
