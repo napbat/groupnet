@@ -380,34 +380,71 @@ async fn write_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Rounds the simultaneous-open test may spend getting its SYNs to cross.
+    /// Linux answers a SYN that reaches a bound socket not yet in `SYN_SENT`
+    /// with a RST, so a round whose SYNs do not cross is refused at both ends,
+    /// just as the endpoint re-dials a refused tuple on its next check.
+    const ROUNDS: usize = 64;
+
+    /// Connects `socket` once both threads of a round have arrived. Arrivals
+    /// spin rather than park: a parked thread wakes only after the last
+    /// arrival has already run on, which on loopback often lets that
+    /// arrival's SYN reach a socket not yet in `SYN_SENT`.
     fn blocking_connect(
         socket: socket2::Socket,
         target: SocketAddr,
-        barrier: Arc<std::sync::Barrier>,
+        arrived: Arc<AtomicUsize>,
     ) -> tokio::task::JoinHandle<io::Result<std::net::TcpStream>> {
         tokio::task::spawn_blocking(move || {
-            barrier.wait();
+            arrived.fetch_add(1, Ordering::AcqRel);
+            while arrived.load(Ordering::Acquire) < 2 {
+                std::hint::spin_loop();
+            }
             socket.connect_timeout(&target.into(), DEADLINE)?;
             socket.set_nonblocking(true)?;
             Ok(socket.into())
         })
     }
 
-    #[tokio::test]
-    async fn simultaneous_open_retains_source_ports_and_mutual_proofs() {
-        // Separate OS threads cross a barrier with both sockets already bound;
-        // this must not serialize two loopback SYNs on one executor thread.
+    /// Connects two freshly bound sockets to each other from separate OS
+    /// threads, so the two loopback SYNs are never serialized on one executor
+    /// thread. Returns each stream with the source it was bound to, or `None`
+    /// when the kernel refused a round whose SYNs did not cross.
+    async fn crossed_open() -> Option<[(SocketAddr, TcpStream); 2]> {
         let source_socket_a = sockets::bound_socket("127.0.0.1:0".parse().unwrap()).unwrap();
         let source_socket_b = sockets::bound_socket("127.0.0.1:0".parse().unwrap()).unwrap();
         let source_a = source_socket_a.local_addr().unwrap().as_socket().unwrap();
         let source_b = source_socket_b.local_addr().unwrap().as_socket().unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let a = blocking_connect(source_socket_a, source_b, barrier.clone());
-        let b = blocking_connect(source_socket_b, source_a, barrier);
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let a = blocking_connect(source_socket_a, source_b, arrived.clone());
+        let b = blocking_connect(source_socket_b, source_a, arrived);
         let (a, b) = tokio::join!(a, b);
-        let a = TcpStream::from_std(a.unwrap().unwrap()).unwrap();
-        let b = TcpStream::from_std(b.unwrap().unwrap()).unwrap();
+        match (a.unwrap(), b.unwrap()) {
+            (Ok(a), Ok(b)) => Some([
+                (source_a, TcpStream::from_std(a).unwrap()),
+                (source_b, TcpStream::from_std(b).unwrap()),
+            ]),
+            (a, b) => {
+                for error in [a.err(), b.err()].into_iter().flatten() {
+                    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused, "{error}");
+                }
+                None
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_open_retains_source_ports_and_mutual_proofs() {
+        let mut rounds = 1;
+        let [(source_a, a), (source_b, b)] = loop {
+            if let Some(pair) = crossed_open().await {
+                break pair;
+            }
+            assert!(rounds < ROUNDS, "no SYNs crossed in {ROUNDS} rounds");
+            rounds += 1;
+        };
         let secret = random().unwrap();
         let sa = random().unwrap();
         let sb = random().unwrap();
