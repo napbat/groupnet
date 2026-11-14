@@ -8,24 +8,29 @@
 //! once — well inside the `lease_ms` boot blackout an amnesiac voter would
 //! have imposed.
 //!
-//! All waiting is a bounded poll on a predicate (`eventually_within`), never a
-//! bare sleep.
+//! The test runs on tokio's paused clock, which both the runtime's timers and
+//! its engine clock read. That clock moves only when every task is idle and no
+//! grant write is running on the blocking pool, so the re-election time it
+//! measures is the protocol's own: load slows the run down, but cannot push
+//! that time towards the blackout. All waiting is a bounded poll on a
+//! predicate (`eventually_within`), never a bare sleep.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use groupnet_core::{NodeId, RecoveredGrant, Role, VoterRoster};
 use groupnet_runtime::{FileGrantStore, Group, GroupProfile, Leadership, Node, VoterStorage};
 use groupnet_testkit::cluster::{NodeOpts, converged_within, eventually_within, spawn_mem_node};
 use groupnet_transport_mem::Network;
+use tokio::time::Instant;
 
 /// Poll budget: an election cannot open before the boot guard, and the
 /// restart additionally waits out the starved host's lease.
 const SETTLE: Duration = Duration::from_secs(8);
 
-/// A brisk gossip cadence, so grant rounds happen in wall-clock milliseconds.
+/// A brisk gossip cadence, so a lease spans many grant rounds.
 const GOSSIP_MS: u64 = 15;
 
 /// The lease, a claim's window, and the blackout an amnesiac voter sits out.
@@ -94,7 +99,7 @@ fn agreed(groups: &[&Group]) -> Option<Leadership> {
 
 /// A voter restarted from its file re-grants the incumbent without a blackout,
 /// and the file it reads back is the grant it actually made.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_voter_restarted_from_its_file_recovers_its_grant() {
     const GROUP: &str = "file-ledger-restart";
     const IDS: [&str; 3] = ["fl-a", "fl-b", "fl-c"];
@@ -184,8 +189,8 @@ async fn a_voter_restarted_from_its_file_recovers_its_grant() {
     let regained = restart_at.elapsed();
     assert!(
         regained < Duration::from_millis(LEASE_MS),
-        "re-election took {regained:?}, at or past the {LEASE_MS}ms blackout a \
-         voter without a recovered ledger would have imposed"
+        "re-election took {regained:?} on the paused clock, at or past the \
+         {LEASE_MS}ms blackout a voter without a recovered ledger would have imposed"
     );
 
     let after = host_group.leadership();
