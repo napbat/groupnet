@@ -9,7 +9,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 pub(crate) struct Address {
     pub(crate) ipc: IpcAddress,
     #[cfg(unix)]
-    directory: std::path::PathBuf,
+    pub(crate) directory: std::path::PathBuf,
 }
 
 impl Address {
