@@ -33,16 +33,18 @@
 //! registration; it always includes the stream and tunnel machinery), `bulk`
 //! (data-plane streams) and `connectivity` (native traversal under TCP/UDP
 //! links). Every selected binding carries each selected capability it supports:
-//! `bulk` is provided by `mem` and `tcp`, `connectivity` by `tcp` and `udp`, and
-//! `runtime` by every binding (its managed link). So `tcp` with `bulk` provides
-//! `TcpBulkTransport` and `mem` with `bulk` provides `MemBulkNet`.
+//! `bulk` is provided by `mem`, `tcp` and `ipc`, `connectivity` by `tcp` and
+//! `udp`, and `runtime` by every binding (its managed link). So `tcp` with
+//! `bulk` provides `TcpBulkTransport`, `mem` with `bulk` provides `MemBulkNet`
+//! and `ipc` with `bulk` provides `IpcBulkTransport`.
 //!
 //! | Feature | Adds | Implies |
 //! |---------|------|---------|
 //! | `runtime` *(default)* | `network`, `messaging`, `streams`, `runtime`; `transport::link` / `transport::admission` | `bulk` |
 //! | `mem` *(default)* | `transport::mem` | — |
 //! | `tcp` | `transport::tcp` (`TcpMsgTransport`; `TcpBulkTransport` with `bulk`; `TcpLink` with `runtime`) | — |
-//! | `udp`, `ipc` | `transport::udp`, `transport::ipc` | — |
+//! | `udp` | `transport::udp` | — |
+//! | `ipc` | `transport::ipc` (`IpcTransport`, `IpcLink`; `IpcBulkTransport` with `bulk`) | — |
 //! | `bulk` | `transport::bulk`, `transport::framing` | — |
 //! | `connectivity` | `connectivity`; native modes of `TcpLink` / `UdpLink` | — |
 //! | `dns` | `runtime::SystemResolver` | `runtime` |

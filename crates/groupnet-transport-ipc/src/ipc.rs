@@ -17,9 +17,9 @@
 mod address;
 mod admitted;
 mod config;
-mod frame;
+pub(crate) mod frame;
 mod join;
-mod platform;
+pub(crate) mod platform;
 mod runtime;
 
 use std::collections::HashMap;
@@ -574,7 +574,8 @@ impl Preflight {
     }
 }
 
-/// Why a peer cannot enter an [`IpcTransport`]'s address book.
+/// Why a peer cannot enter the address book of an [`IpcTransport`] (or, with
+/// feature `bulk`, of an `IpcBulkTransport`).
 #[derive(Debug)]
 pub enum IpcPeerError {
     /// The peer's identity is empty or longer than the 64-byte IPC bound.

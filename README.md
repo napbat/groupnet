@@ -92,7 +92,7 @@ streams only when the application asks for them.
 | [`groupnet-transport-mem`](crates/groupnet-transport-mem) | both | transport, core, tokio(sync) *(+bulk feature: transport(bulk), tokio(io-util), tokio-util(compat))* | in-process bindings (tests, examples, single-process): datagrams always, `MemBulkNet` byte streams under feature `bulk` |
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
 | [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) *(+bulk: transport(auth))* | persistent TCP messages (`TcpMsgTransport`), TCP streams (`TcpBulkTransport`, mutually authenticated under a cluster secret), and `TcpLink` registration |
-| [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | control | transport(link), core, tokio | native named pipes/Unix sockets and `IpcLink` registration |
+| [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | both | transport(link), core, tokio *(+bulk feature: transport(bulk), tokio-util(compat))* | native named pipes/Unix sockets: persistent messages (`IpcTransport`) and `IpcLink` registration; local streams (`IpcBulkTransport`, a hub admitting dial-only clients through an optional admission policy) under feature `bulk` |
 | [`groupnet-transport-punch`](crates/groupnet-transport-punch) | connectivity | transport admission/session primitives, core, tokio, ring, socket2, if-addrs | native adjacent-node UDP/TCP connections, candidate checks, rendezvous and relay; no transport or router link |
 | [`groupnet-network`](crates/groupnet-network) | both | transport(auth, bulk, link), tokio, rustls, ring | protocol-independent group-network routing (frames sealed under an optional cluster secret) and pinned end-to-end TLS streams |
 | [`groupnet-messaging`](crates/groupnet-messaging) | application packets | core, network, bytes, ring, tokio, tokio-util | static send-only `MessageProtocol`, generic receipt contexts, `Messaging` endpoint, bounded retry/deduplication |
@@ -149,7 +149,8 @@ selected capability it supports. **Bindings** choose transport crates: `mem` (de
 routing, sessions and link registration), `bulk` (data-plane streams) and
 `connectivity` (native traversal under TCP/UDP links). So `tcp` alone is the TCP
 control plane (`TcpMsgTransport`), `tcp` with `bulk` adds `TcpBulkTransport`,
-and `tcp` with `runtime` adds `TcpLink`. `rpc` implies `bulk`; `dns` adds the
+and `tcp` with `runtime` adds `TcpLink`; likewise `ipc` with `bulk` adds
+`IpcBulkTransport`. `rpc` implies `bulk`; `dns` adds the
 system seed resolver; `consistency` and its `consistency-*` tiers add
 `groupnet::consistency`; `sim` adds the simulator. The
 [facade crate docs](crates/groupnet/src/lib.rs) carry the full feature table.
@@ -1089,6 +1090,16 @@ so you gossip over UDP and replicate over TCP, independently. A managed node's
 pinned TLS streams form a data plane too: `DataPlane::new(node.clone())` shares
 the node's `Ordered` endpoint. The control-plane coordination core is untouched
 by any of it.
+
+Between processes of one host, `groupnet::transport::ipc::IpcBulkTransport`
+(features `ipc` and `bulk`) is the same data plane over named pipes or Unix
+sockets, shaped for a hub and its clients: `bind` / `bind_with` listen and admit
+clients the hub was never configured with through an optional admission policy
+(`IpcBulkConfig::admission`; without one every local peer is accepted, the
+operating system boundary being the trust boundary), while
+`IpcBulkTransport::dial_only` makes a client that registers hub addresses,
+presents an opaque credential and never listens. Handshakes are bounded in time
+and number as on TCP, and `groupnet-rpc` runs over it unchanged.
 
 ### Cluster secret
 

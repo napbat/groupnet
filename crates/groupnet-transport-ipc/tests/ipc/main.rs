@@ -19,6 +19,8 @@ use tokio::time::timeout;
 
 mod address;
 mod admission;
+#[cfg(feature = "bulk")]
+mod bulk;
 
 use address::Address;
 

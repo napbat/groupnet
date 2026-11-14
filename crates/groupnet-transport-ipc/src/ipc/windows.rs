@@ -14,7 +14,7 @@ use super::super::IpcAddress;
 use super::super::address::{IpcAddressError, MAX_PIPE_NAME};
 
 #[derive(Debug)]
-pub(in crate::ipc) enum Stream {
+pub(crate) enum Stream {
     Client(NamedPipeClient),
     Server(NamedPipeServer),
 }
@@ -59,15 +59,20 @@ impl AsyncWrite for Stream {
     }
 }
 
+/// Most connections one listener may hold at once. Windows reserves 255 as
+/// its "unlimited instances" sentinel; with two listener instances held back
+/// (the pending one and its transient replacement), 252 is the finite maximum.
+pub(crate) const MAX_SESSIONS: usize = 252;
+
 #[derive(Debug)]
-pub(in crate::ipc) struct Listener {
+pub(crate) struct Listener {
     name: String,
     pending: NamedPipeServer,
     max_instances: usize,
 }
 
 impl Listener {
-    pub(in crate::ipc) fn bind(address: &IpcAddress, max_sessions: usize) -> io::Result<Self> {
+    pub(crate) fn bind(address: &IpcAddress, max_sessions: usize) -> io::Result<Self> {
         validate_address(address)?;
         let IpcAddress::NamedPipe(name) = address;
         // Configuration reserves two finite listener instances and rejects the
@@ -80,7 +85,7 @@ impl Listener {
         })
     }
 
-    pub(in crate::ipc) async fn accept(&mut self) -> io::Result<Stream> {
+    pub(crate) async fn accept(&mut self) -> io::Result<Stream> {
         self.pending.connect().await?;
         // Reserve the next instance before releasing the connected instance,
         // leaving no namespace gap in which a second listener can take over.
@@ -101,7 +106,7 @@ fn create(name: &str, first: bool, max_instances: usize) -> io::Result<NamedPipe
         .create(name)
 }
 
-pub(in crate::ipc) fn validate_address(address: &IpcAddress) -> Result<(), IpcAddressError> {
+pub(crate) fn validate_address(address: &IpcAddress) -> Result<(), IpcAddressError> {
     let IpcAddress::NamedPipe(name) = address;
     if name.len() > MAX_PIPE_NAME {
         return Err(IpcAddressError::PipeNameTooLong { len: name.len() });
@@ -121,7 +126,7 @@ pub(in crate::ipc) fn validate_address(address: &IpcAddress) -> Result<(), IpcAd
     Ok(())
 }
 
-pub(in crate::ipc) async fn connect(address: &IpcAddress) -> io::Result<Stream> {
+pub(crate) async fn connect(address: &IpcAddress) -> io::Result<Stream> {
     validate_address(address)?;
     let IpcAddress::NamedPipe(name) = address;
     loop {

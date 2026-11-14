@@ -13,7 +13,7 @@ use super::MAX_FRAME;
 
 const MAGIC: [u8; 4] = *b"GNI1";
 /// Longest identity an IPC introduction or join carries, in bytes.
-pub(super) const MAX_ID: usize = 64;
+pub(crate) const MAX_ID: usize = 64;
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
 #[repr(C)]
@@ -29,7 +29,7 @@ struct FrameHeader {
 }
 
 /// Checks `id` against the 64-byte introduction field.
-pub(super) fn validate_id(id: &NodeId) -> Result<(), groupnet_transport::NodeIdError> {
+pub(crate) fn validate_id(id: &NodeId) -> Result<(), groupnet_transport::NodeIdError> {
     groupnet_transport::validate_node_id(id, MAX_ID)
 }
 
