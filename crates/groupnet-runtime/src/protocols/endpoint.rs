@@ -1,19 +1,21 @@
-//! A typed view over node-owned protocol state and receive ownership.
+//! A typed view over participant-owned protocol state and receive ownership.
 
-use super::{Node, PeerImplementation, ReceiveBinding, closed};
+use super::{Participant, PeerImplementation, ReceiveBinding, closed};
 use crate::messaging::{Frame, MessageContext};
 use groupnet_core::NodeId;
 use groupnet_messaging::{Bytes, MessageId, MessageProtocol};
 use groupnet_streams::SessionProtocol;
 use std::{fmt, io};
 
-/// A configured view over a node's shared protocol, not a new socket or inbox.
+/// A configured view over a participant's shared protocol, not a new socket or
+/// inbox.
 ///
-/// Every clone retains managed node lifetime and the options chosen when bound.
-/// Message endpoints share the node's existing receive owner. Session endpoints
-/// share node-wide acceptance and admission; unordered accepts select their policy.
+/// Every clone retains the managed network's lifetime and the options chosen
+/// when bound. Message endpoints share the participant's existing receive
+/// owner. Session endpoints share node-wide acceptance and admission; unordered
+/// accepts select their policy.
 pub struct Endpoint<I: PeerImplementation> {
-    node: Node,
+    participant: Participant,
     protocol: I::Protocol,
     options: I::Options,
 }
@@ -24,7 +26,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            node: self.node.clone(),
+            participant: self.participant.clone(),
             protocol: self.protocol.clone(),
             options: self.options.clone(),
         }
@@ -39,7 +41,7 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Endpoint")
-            .field("node", &self.node)
+            .field("participant", &self.participant)
             .field("protocol", &self.protocol)
             .field("options", &self.options)
             .finish()
@@ -47,9 +49,13 @@ where
 }
 
 impl<I: PeerImplementation> Endpoint<I> {
-    pub(super) fn new(node: Node, protocol: I::Protocol, options: I::Options) -> Self {
+    pub(super) fn new(
+        participant: Participant,
+        protocol: I::Protocol,
+        options: I::Options,
+    ) -> Self {
         Self {
-            node,
+            participant,
             protocol,
             options,
         }
@@ -70,10 +76,10 @@ impl<I: PeerImplementation> Endpoint<I> {
         &self.options
     }
 
-    /// The managed node retained by this endpoint.
+    /// The participant retained by this endpoint.
     #[must_use]
-    pub fn node(&self) -> &Node {
-        &self.node
+    pub fn participant(&self) -> &Participant {
+        &self.participant
     }
 }
 
@@ -84,11 +90,11 @@ where
     /// Sends owned bytes to a logical node using this endpoint's bound policy.
     ///
     /// # Errors
-    /// Returns protocol errors or `NotConnected` when the managed node closes.
+    /// Returns protocol errors or `NotConnected` when the network closes.
     pub async fn send(&self, to: &NodeId, payload: Bytes) -> io::Result<MessageId> {
         tokio::select! {
             biased;
-            () = self.node.router().cancelled() => Err(closed()),
+            () = self.participant.router().cancelled() => Err(closed()),
             result = async {
                 self.protocol.send(to, None, payload, self.options.clone()).await
             } => result,
@@ -103,14 +109,14 @@ where
     /// Establishes a concrete session using this endpoint's bound options.
     ///
     /// # Errors
-    /// Returns protocol errors or `NotConnected` when the managed node closes.
+    /// Returns protocol errors or `NotConnected` when the network closes.
     pub async fn connect(
         &self,
         to: &NodeId,
     ) -> io::Result<<I::Protocol as SessionProtocol>::Session> {
         tokio::select! {
             biased;
-            () = self.node.router().cancelled() => Err(closed()),
+            () = self.participant.router().cancelled() => Err(closed()),
             result = async { self.protocol.connect(to, self.options.clone()).await } => result,
         }
     }
@@ -120,11 +126,11 @@ where
     /// distinct policy queues within the same node-wide admission bound.
     ///
     /// # Errors
-    /// Returns policy, protocol or node shutdown errors.
+    /// Returns policy, protocol or shutdown errors.
     pub async fn accept(&self) -> io::Result<(NodeId, <I::Protocol as SessionProtocol>::Session)> {
         tokio::select! {
             biased;
-            () = self.node.router().cancelled() => Err(closed()),
+            () = self.participant.router().cancelled() => Err(closed()),
             result = async { self.protocol.accept_with_options(self.options.clone()).await } => result,
         }
     }
@@ -135,9 +141,10 @@ where
     I::Protocol: ReceiveBinding,
 {
     /// Receives owned bytes and their complete context from the protocol's
-    /// single receive owner: this node's existing inbox for [`Messages`](super::Messages).
-    /// Shares receive ownership with node receives and callbacks, never the
-    /// raw messaging worker queue the node dispatcher owns.
+    /// single receive owner: the participant's node-addressed inbox for
+    /// [`Messages`](super::Messages). Shares receive ownership with the owner's
+    /// receives and callbacks, never the raw messaging worker queue the
+    /// dispatcher owns.
     ///
     /// # Errors
     /// Returns `WouldBlock` for a competing receive owner or shutdown errors.
@@ -155,7 +162,7 @@ where
     /// # Errors
     /// Returns `WouldBlock` for a competing receive owner or shutdown errors.
     pub async fn recv_frame(&self) -> io::Result<Frame<<I::Protocol as MessageProtocol>::Receipt>> {
-        self.protocol.recv_frame(&self.node).await
+        self.protocol.recv_frame(&self.participant).await
     }
 
     /// Installs the exclusive serial buffer receiver on the protocol's receive
@@ -174,7 +181,7 @@ where
             + 'static,
         Fut: Future<Output = io::Result<()>> + Send + 'static,
     {
-        self.protocol.on_frame(&self.node, move |frame| {
+        self.protocol.on_frame(&self.participant, move |frame| {
             let (context, payload) = frame.into_parts();
             callback(context, payload)
         })
@@ -192,6 +199,6 @@ where
         F: FnMut(Frame<<I::Protocol as MessageProtocol>::Receipt>) -> Fut + Send + 'static,
         Fut: Future<Output = io::Result<()>> + Send + 'static,
     {
-        self.protocol.on_frame(&self.node, callback)
+        self.protocol.on_frame(&self.participant, callback)
     }
 }

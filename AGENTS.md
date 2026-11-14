@@ -80,7 +80,7 @@ use.
    fallback paths moved to `engine/fallback.rs`, its head evidence to
    `engine/evidence.rs`), `src/replication/session/subscription.rs` ~864 and
    `src/volatile_bootstrap/journal/tests.rs` ~897; `groupnet-runtime`'s
-   `tests/typed-protocols.rs` ~924 and `src/group/entries.rs` ~850;
+   `tests/typed-protocols.rs` ~928 and `src/group/entries.rs` ~850;
    `groupnet-sim`'s `tests/election-external-skew.rs` ~909 and
    `tests/election-quorum.rs` ~892; `groupnet-consistency`'s
    `src/lease/core.rs` ~902, `src/replication/shell.rs` ~895,
@@ -279,15 +279,17 @@ These hold in every published crate; a change that breaks one is a defect.
   single public `Endpoint<P>` and `Peer<P>` handle families, shared protocol state,
   node/group callbacks and fanout reports. `Messages`, `Ordered`, and `Unordered`
   are descriptors: `node.endpoint(implementation)` and
-  `node.peer(id, implementation)` resolve shared node resources internally and
-  bind per-operation options once, without opening a connection. Keep node-wide
+  `node.peer(id, implementation)` (and the same calls on a `Client`) resolve
+  the shared `Participant` resources internally and bind per-operation options
+  once, without opening a connection. Keep node-wide
   capacity/configuration separate from descriptor delivery/setup options.
   Public unsealed binding and message/session traits support custom static
   implementations; do not introduce a protocol enum or boxed per-call futures.
   Managed message receives always use the existing single-owner node/group inbox,
   never the raw messaging worker queue: built-in descriptors bind `ManagedProtocol`
   views that send, connect, accept and observe `closed()` but cannot receive from
-  the dispatcher's queue or shut the shared engine down (only `Node::close` does).
+  the dispatcher's queue or shut the shared engine down (only `Node::close` or
+  `Client::close` does).
   A custom message binding receives through `ReceiveBinding` over that same inbox;
   without it a binding is send-only at the handle layer. `MessageProtocol` itself is
   send-only. Ordered/unordered setup queues remain isolated, node-wide unordered

@@ -158,6 +158,10 @@ required-features = ["runtime", "tcp"]
 name = "hub"
 required-features = ["ipc", "rpc"]
 
+[[example]]
+name = "client"
+required-features = ["runtime", "ipc"]
+
 [lints]
 workspace = true
 

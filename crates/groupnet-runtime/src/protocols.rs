@@ -1,4 +1,7 @@
 //! Static protocol bindings over managed logical peers, never physical sockets.
+//!
+//! A [`Node`](crate::Node) and a [`Client`](crate::Client) bind the same
+//! handles through their shared [`Participant`].
 
 mod endpoint;
 mod implementations;
@@ -7,19 +10,20 @@ pub use endpoint::Endpoint;
 pub use implementations::{Messages, Ordered, Unordered};
 pub use managed::ManagedProtocol;
 
-use super::Node;
+use crate::Participant;
 use crate::messaging::Frame;
 use groupnet_core::NodeId;
 use groupnet_messaging::{Bytes, MessageId, MessageProtocol};
 use groupnet_streams::{OrderedProtocol, SessionProtocol, UnorderedProtocol};
 use std::{fmt, io};
 
-/// Resolves a protocol implementation and its options against a managed node.
+/// Resolves a protocol implementation and its options against a participant of
+/// a managed network (a [`Node`](crate::Node) or a [`Client`](crate::Client)).
 ///
 /// This trait is intentionally unsealed: custom selectors can resolve their own
 /// concrete message or session implementations without boxing or dynamic dispatch.
 /// Binding must not establish a connection or start per-peer workers. A built-in
-/// may initialize the node's shared protocol worker on its first binding.
+/// may initialize the participant's shared protocol worker on its first binding.
 /// Built-ins resolve to a [`ManagedProtocol`] view, which a custom
 /// implementation may wrap.
 pub trait PeerImplementation {
@@ -32,8 +36,8 @@ pub trait PeerImplementation {
     /// Resolves the shared protocol and fixes this binding's operation options.
     ///
     /// # Errors
-    /// Returns configuration, protocol initialization or node shutdown errors.
-    fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)>;
+    /// Returns configuration, protocol initialization or shutdown errors.
+    fn bind(self, participant: &Participant) -> io::Result<(Self::Protocol, Self::Options)>;
 }
 
 /// Managed receives for a [`MessageProtocol`], through one single-owner inbox.
@@ -43,13 +47,14 @@ pub trait PeerImplementation {
 /// [`Receipt`](MessageProtocol::Receipt). A message protocol that does not
 /// implement it is send-only at the handle layer.
 ///
-/// Implementations must deliver from exactly one receive owner per node, so a
-/// manual receive and an installed callback can never both take frames: the
-/// built-in [`Messages`] binding uses the node inbox ([`Node::recv_frame`],
-/// [`Node::on_frame`]), which also refuses competing owners with `WouldBlock`.
+/// Implementations must deliver from exactly one receive owner per participant,
+/// so a manual receive and an installed callback can never both take frames:
+/// the built-in [`Messages`] binding uses the node-addressed inbox
+/// ([`Participant::recv_frame`], [`Participant::on_frame`]), which also refuses
+/// competing owners with `WouldBlock`.
 /// A protocol wrapping a built-in view delegates to it; one that owns a
 /// separate router namespace owns that namespace's single receive queue.
-/// Never read a raw messaging worker queue that the node dispatcher owns.
+/// Never read a raw messaging worker queue that the dispatcher owns.
 pub trait ReceiveBinding: MessageProtocol {
     /// Exclusive callback ownership returned by [`Self::on_frame`].
     type Handle;
@@ -60,30 +65,29 @@ pub trait ReceiveBinding: MessageProtocol {
     /// Returns competing receive ownership or shutdown errors.
     fn recv_frame(
         &self,
-        node: &Node,
+        participant: &Participant,
     ) -> impl Future<Output = io::Result<Frame<Self::Receipt>>> + Send;
 
     /// Installs the exclusive serial frame receiver on the protocol's receive owner.
     ///
     /// # Errors
     /// Returns competing receive ownership or shutdown errors.
-    fn on_frame<F, Fut>(&self, node: &Node, callback: F) -> io::Result<Self::Handle>
+    fn on_frame<F, Fut>(&self, participant: &Participant, callback: F) -> io::Result<Self::Handle>
     where
         F: FnMut(Frame<Self::Receipt>) -> Fut + Send + 'static,
         Fut: Future<Output = io::Result<()>> + Send + 'static;
 }
 
-impl Node {
+impl Participant {
     fn cached_messages(&self) -> ManagedProtocol<groupnet_messaging::Messaging> {
-        ManagedProtocol::new(self.inner.messaging.sender().clone())
+        ManagedProtocol::new(self.shared.messaging.sender().clone())
     }
 
     /// Resolves the shared ordered engine with the node-wide
-    /// [`OrderedConfig`](groupnet_streams::OrderedConfig) validated at
-    /// [`NodeBuilder::start`](crate::NodeBuilder::start).
+    /// [`OrderedConfig`](groupnet_streams::OrderedConfig) validated at start.
     fn cached_ordered(&self) -> io::Result<OrderedProtocol> {
         let mut protocol = self
-            .inner
+            .shared
             .ordered
             .lock()
             .map_err(|_| io::Error::other("ordered protocol cache poisoned"))?;
@@ -92,17 +96,16 @@ impl Node {
             return Ok(protocol.clone());
         }
         let ordered =
-            OrderedProtocol::with_validated(self.tunnels()?.clone(), self.inner.ordered_config)?;
+            OrderedProtocol::with_validated(self.tunnels()?.clone(), self.shared.ordered_config)?;
         *protocol = Some(ordered.clone());
         Ok(ordered)
     }
 
     /// Resolves the shared unordered engine with the node-wide
-    /// [`UnorderedConfig`](groupnet_streams::UnorderedConfig) validated at
-    /// [`NodeBuilder::start`](crate::NodeBuilder::start).
+    /// [`UnorderedConfig`](groupnet_streams::UnorderedConfig) validated at start.
     fn cached_unordered(&self) -> io::Result<UnorderedProtocol> {
         let mut protocol = self
-            .inner
+            .shared
             .unordered
             .lock()
             .map_err(|_| io::Error::other("unordered protocol cache poisoned"))?;
@@ -113,19 +116,20 @@ impl Node {
         let unordered = UnorderedProtocol::with_validated(
             self.router(),
             self.tunnels()?.clone(),
-            self.inner.unordered_config.clone(),
+            self.shared.unordered_config.clone(),
         )?;
         *protocol = Some(unordered.clone());
         Ok(unordered)
     }
 
-    /// Binds a typed endpoint and immutable options to this node's shared protocol.
-    /// Does not open a connection, socket or per-peer worker. The first binding
-    /// may initialize a node-shared protocol worker. Message receives use this
-    /// node's existing inbox; unordered accepts match the selected delivery policy.
+    /// Binds a typed endpoint and immutable options to this participant's shared
+    /// protocol. Does not open a connection, socket or per-peer worker. The
+    /// first binding may initialize a shared protocol worker. Message receives
+    /// use the existing node-addressed inbox; unordered accepts match the
+    /// selected delivery policy.
     ///
     /// # Errors
-    /// Returns implementation binding errors or `NotConnected` after node shutdown.
+    /// Returns implementation binding errors or `NotConnected` after shutdown.
     pub fn endpoint<I: PeerImplementation>(&self, implementation: I) -> io::Result<Endpoint<I>> {
         self.ensure_protocols_open()?;
         let (protocol, options) = implementation.bind(self)?;
@@ -134,10 +138,11 @@ impl Node {
     }
 
     /// Binds a logical destination using the same shared machinery as [`Self::endpoint`].
-    /// Retains node lifetime without opening a connection, socket or per-peer worker.
+    /// Retains the network's lifetime without opening a connection, socket or
+    /// per-peer worker.
     ///
     /// # Errors
-    /// Returns implementation binding errors or `NotConnected` after node shutdown.
+    /// Returns implementation binding errors or `NotConnected` after shutdown.
     pub fn peer<I: PeerImplementation>(
         &self,
         id: NodeId,
@@ -157,13 +162,13 @@ impl Node {
     }
 
     pub(crate) fn shutdown_protocols(&self) {
-        self.inner.messaging.sender().shutdown();
-        if let Ok(ordered) = self.inner.ordered.lock()
+        self.shared.messaging.sender().shutdown();
+        if let Ok(ordered) = self.shared.ordered.lock()
             && let Some(ordered) = ordered.as_ref()
         {
             ordered.shutdown();
         }
-        if let Ok(unordered) = self.inner.unordered.lock()
+        if let Ok(unordered) = self.shared.unordered.lock()
             && let Some(unordered) = unordered.as_ref()
         {
             unordered.shutdown();
@@ -172,13 +177,13 @@ impl Node {
 
     pub(crate) async fn close_protocols(&self) {
         let ordered = self
-            .inner
+            .shared
             .ordered
             .lock()
             .ok()
             .and_then(|protocol| protocol.clone());
         let unordered = self
-            .inner
+            .shared
             .unordered
             .lock()
             .ok()
@@ -192,9 +197,10 @@ impl Node {
     }
 }
 
-/// Typed protocol binding to one logical destination, retaining managed node life.
-/// Receives remain endpoint/node-owned, not a separate per-peer inbox. Options are
-/// fixed at binding time and shared by every operation on this handle.
+/// Typed protocol binding to one logical destination, retaining the managed
+/// network's life. Receives remain endpoint-owned, not a separate per-peer
+/// inbox. Options are fixed at binding time and shared by every operation on
+/// this handle.
 pub struct Peer<I: PeerImplementation> {
     endpoint: Endpoint<I>,
     id: NodeId,
@@ -246,10 +252,10 @@ impl<I: PeerImplementation> Peer<I> {
         self.endpoint.options()
     }
 
-    /// The managed node retained by this binding.
+    /// The participant retained by this binding.
     #[must_use]
-    pub fn node(&self) -> &Node {
-        self.endpoint.node()
+    pub fn participant(&self) -> &Participant {
+        self.endpoint.participant()
     }
 }
 
@@ -259,7 +265,7 @@ where
 {
     /// Sends owned bytes using the policy fixed at binding time.
     /// # Errors
-    /// Returns protocol errors or `NotConnected` when the managed node closes.
+    /// Returns protocol errors or `NotConnected` when the network closes.
     pub async fn send(&self, payload: Bytes) -> io::Result<MessageId> {
         self.endpoint.send(&self.id, payload).await
     }
@@ -271,12 +277,12 @@ where
 {
     /// Establishes this protocol's concrete session with its bound options.
     /// # Errors
-    /// Returns protocol errors or `NotConnected` when the managed node closes.
+    /// Returns protocol errors or `NotConnected` when the network closes.
     pub async fn connect(&self) -> io::Result<<I::Protocol as SessionProtocol>::Session> {
         self.endpoint.connect(&self.id).await
     }
 }
 
 fn closed() -> io::Error {
-    io::Error::new(io::ErrorKind::NotConnected, "managed node network closed")
+    io::Error::new(io::ErrorKind::NotConnected, "managed network closed")
 }

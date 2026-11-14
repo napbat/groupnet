@@ -28,6 +28,8 @@ dns = ["tokio/net"]
 rcgen = { workspace = true }
 futures-util = { workspace = true, features = ["io"] }
 groupnet-transport-mem = { workspace = true, features = ["link"] }
+# Hubs that admit dial-only clients over native local IPC.
+groupnet-transport-ipc = { workspace = true }
 groupnet-transport-udp = { workspace = true }
 groupnet-network = { workspace = true, features = ["test-support"] }
 # The named-seed resolver's unit tests drive its schedule on a paused clock.

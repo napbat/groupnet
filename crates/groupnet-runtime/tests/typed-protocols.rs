@@ -7,9 +7,9 @@ use groupnet_runtime::messaging::{
     ReceiveHandle, SendOptions,
 };
 use groupnet_runtime::{
-    ManagedProtocol, Messages, Node, Ordered, OrderedProtocol, PeerIdentity, PeerImplementation,
-    ReceiveBinding, SessionProtocol, TlsIdentity, TunnelConfig, TunneledStream, Unordered,
-    UnorderedConfig, UnorderedConfigError, UnorderedDelivery,
+    ManagedProtocol, Messages, Node, Ordered, OrderedProtocol, Participant, PeerIdentity,
+    PeerImplementation, ReceiveBinding, SessionProtocol, TlsIdentity, TunnelConfig, TunneledStream,
+    Unordered, UnorderedConfig, UnorderedConfigError, UnorderedDelivery,
 };
 use groupnet_testkit::cluster::eventually_within;
 use groupnet_transport::{
@@ -70,17 +70,14 @@ async fn typed_message_peer_retains_node_and_existing_receive_owner() -> io::Res
     drop(node);
     assert!(!router.is_closed());
     let id = peer.send(Bytes::from_static(b"typed")).await?;
-    let (context, payload) = tokio::time::timeout(WAIT, peer.node().recv()).await??;
+    let (context, payload) = tokio::time::timeout(WAIT, peer.participant().recv()).await??;
     assert_eq!(context.id, id);
     assert_eq!(context.from, *peer.id());
     assert_eq!(context.group, None);
     assert_eq!(payload.as_ref(), b"typed");
     context.applied()?;
-    peer.node().close().await;
-    assert_eq!(
-        peer.send(Bytes::new()).await.unwrap_err().kind(),
-        io::ErrorKind::NotConnected
-    );
+    // The peer held the last ownership of the network: dropping it shuts down.
+    drop(peer);
     assert!(router.is_closed());
     Ok(())
 }
@@ -722,11 +719,14 @@ impl PeerImplementation for CustomMessages {
     type Protocol = CountingMessages;
     type Options = SendOptions;
 
-    fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
+    fn bind(self, participant: &Participant) -> io::Result<(Self::Protocol, Self::Options)> {
         self.bindings.fetch_add(1, Ordering::SeqCst);
         Ok((
             CountingMessages {
-                protocol: node.endpoint(Messages::best_effort())?.protocol().clone(),
+                protocol: participant
+                    .endpoint(Messages::best_effort())?
+                    .protocol()
+                    .clone(),
                 sends: self.sends,
             },
             SendOptions::default(),
@@ -756,17 +756,21 @@ impl MessageProtocol for CountingMessages {
 impl ReceiveBinding for CountingMessages {
     type Handle = ReceiveHandle;
 
-    async fn recv_frame(&self, node: &Node) -> io::Result<Frame<Tagged>> {
-        Ok(tagged(self.protocol.recv_frame(node).await?))
+    async fn recv_frame(&self, participant: &Participant) -> io::Result<Frame<Tagged>> {
+        Ok(tagged(self.protocol.recv_frame(participant).await?))
     }
 
-    fn on_frame<F, Fut>(&self, node: &Node, mut callback: F) -> io::Result<ReceiveHandle>
+    fn on_frame<F, Fut>(
+        &self,
+        participant: &Participant,
+        mut callback: F,
+    ) -> io::Result<ReceiveHandle>
     where
         F: FnMut(Frame<Tagged>) -> Fut + Send + 'static,
         Fut: Future<Output = io::Result<()>> + Send + 'static,
     {
         self.protocol
-            .on_frame(node, move |frame| callback(tagged(frame)))
+            .on_frame(participant, move |frame| callback(tagged(frame)))
     }
 }
 
@@ -785,10 +789,10 @@ impl PeerImplementation for CustomOrdered {
     type Protocol = CountingOrdered;
     type Options = ();
 
-    fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
+    fn bind(self, participant: &Participant) -> io::Result<(Self::Protocol, Self::Options)> {
         Ok((
             CountingOrdered {
-                protocol: node.endpoint(Ordered::new())?.protocol().clone(),
+                protocol: participant.endpoint(Ordered::new())?.protocol().clone(),
                 connects: self.connects,
             },
             (),

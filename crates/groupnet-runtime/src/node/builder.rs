@@ -7,12 +7,13 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use groupnet_core::{Config, GroupId, NodeId};
-use groupnet_messaging::ValidMessagingConfig;
-use groupnet_network::{LinkProvider, NetworkBuilder, RouterConfig, TunnelConfig};
-use groupnet_streams::{OrderedConfig, UnorderedConfig, ValidOrderedConfig, ValidUnorderedConfig};
+use groupnet_network::{LinkProvider, RouterConfig, TunnelConfig};
+use groupnet_streams::{OrderedConfig, UnorderedConfig};
 
 use super::{Inner, Node, Posture, ROUTING_GROUP, recv_loop, sync_peer_addrs};
 use crate::clock::core_millis;
+use crate::messaging::Frame;
+use crate::participant::{Settings, start_dispatcher};
 use crate::seeds::{NamedSeeds, resolve_named_seeds};
 
 /// Configures a managed [`Node`]'s protocol links, group memberships and
@@ -25,26 +26,20 @@ use crate::seeds::{NamedSeeds, resolve_named_seeds};
 /// descriptors.
 pub struct NodeBuilder {
     id: NodeId,
-    network: NetworkBuilder,
+    settings: Settings,
     seeds: Vec<NodeId>,
     config: Config,
     advertise_addr: Option<String>,
     named_seeds: Option<NamedSeeds>,
-    messaging: crate::messaging::MessagingConfig,
-    ordered: OrderedConfig,
-    unordered: UnorderedConfig,
 }
 
 impl std::fmt::Debug for NodeBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeBuilder")
             .field("id", &self.id)
-            .field("network", &self.network)
+            .field("settings", &self.settings)
             .field("seeds", &self.seeds)
             .field("named_seeds", &self.named_seeds)
-            .field("messaging", &self.messaging)
-            .field("ordered", &self.ordered)
-            .field("unordered", &self.unordered)
             .finish_non_exhaustive()
     }
 }
@@ -53,42 +48,39 @@ impl NodeBuilder {
     pub(super) fn new(id: NodeId) -> Self {
         Self {
             id,
-            network: NetworkBuilder::default(),
+            settings: Settings::default(),
             seeds: Vec::new(),
             config: Config::default(),
             advertise_addr: None,
             named_seeds: None,
-            messaging: crate::messaging::MessagingConfig::default(),
-            ordered: OrderedConfig::default(),
-            unordered: UnorderedConfig::default(),
         }
     }
 
     /// Registers one configured protocol implementation.
     #[must_use]
     pub fn link(mut self, provider: impl LinkProvider) -> Self {
-        self.network = self.network.link(provider);
+        self.settings.link(provider);
         self
     }
 
     /// Registers a heterogeneous collection of configured protocol implementations.
     #[must_use]
     pub fn links(mut self, providers: impl IntoIterator<Item = Box<dyn LinkProvider>>) -> Self {
-        self.network = self.network.links(providers);
+        self.settings.links(providers);
         self
     }
 
     /// Sets routing limits and transit policy, independently of link protocols.
     #[must_use]
     pub fn routing(mut self, config: RouterConfig) -> Self {
-        self.network = self.network.routing(config);
+        self.settings.routing(config);
         self
     }
 
     /// Enables pinned, end-to-end TLS streams over routed paths.
     #[must_use]
     pub fn tunnels(mut self, config: TunnelConfig) -> Self {
-        self.network = self.network.tunnels(config);
+        self.settings.tunnels(config);
         self
     }
 
@@ -96,7 +88,7 @@ impl NodeBuilder {
     /// [`start`](Self::start) rejects an invalid configuration.
     #[must_use]
     pub fn messaging(mut self, config: crate::messaging::MessagingConfig) -> Self {
-        self.messaging = config;
+        self.settings.messaging(config);
         self
     }
 
@@ -107,7 +99,7 @@ impl NodeBuilder {
     /// cannot change once the node runs.
     #[must_use]
     pub fn ordered(mut self, config: OrderedConfig) -> Self {
-        self.ordered = config;
+        self.settings.ordered(config);
         self
     }
 
@@ -119,7 +111,7 @@ impl NodeBuilder {
     /// protocol, which the first unordered binding initializes.
     #[must_use]
     pub fn unordered(mut self, config: UnorderedConfig) -> Self {
-        self.unordered = config;
+        self.settings.unordered(config);
         self
     }
 
@@ -247,39 +239,41 @@ impl NodeBuilder {
     /// Requires a Tokio runtime; propagates poisoned internal locks.
     pub async fn start(self) -> io::Result<Node> {
         self.config.validate()?;
-        let messaging = ValidMessagingConfig::try_from(self.messaging)?;
-        let ordered = ValidOrderedConfig::try_from(self.ordered)?;
-        let unordered = ValidUnorderedConfig::try_from(self.unordered)?;
+        let mut seeds = self.seeds;
+        seeds.extend(self.settings.peers());
+        let settings = self.settings.validate()?;
         if let Some(named) = &self.named_seeds {
             named.validate()?;
-        }
-        let mut seeds = self.seeds;
-        seeds.extend(self.network.peers());
-        if let Some(named) = &self.named_seeds {
             seeds.extend(named.nodes().cloned());
         }
-        let network = self.network.bind(self.id.clone()).await?;
-        let messaging = crate::messaging::Hub::new(network.router(), messaging)?;
+        let participant = settings.bind(self.id).await?;
         let inner = Arc::new(Inner {
-            id: self.id,
-            transport: Arc::new(network.router().clone()),
+            transport: Arc::new(participant.router().clone()),
             seeds,
             config: self.config,
-            messaging,
-            ordered_config: ordered,
-            ordered: Mutex::new(None),
-            unordered_config: unordered,
-            unordered: Mutex::new(None),
             routes: Mutex::new(HashMap::new()),
             actors: Mutex::new(Vec::new()),
             start: Instant::now(),
             routing: OnceLock::new(),
         });
         tokio::spawn(recv_loop(inner.clone()));
-        super::messaging::start_dispatcher(&inner);
+        let groups = Arc::downgrade(&inner);
+        start_dispatcher(&participant, move |frame: Frame| {
+            let Some(inner) = groups.upgrade() else {
+                let _ = frame.receipt().reject(io::ErrorKind::NotConnected);
+                return;
+            };
+            let routes = inner.routes.lock().expect("routes mutex poisoned");
+            match frame.group.as_ref().and_then(|group| routes.get(group)) {
+                Some(group) => group.deliver_application(frame),
+                None => {
+                    let _ = frame.receipt().reject(io::ErrorKind::NotFound);
+                }
+            }
+        });
         if let Some(named) = self.named_seeds {
             let router = inner.transport.clone();
-            let local = inner.id.clone();
+            let local = participant.id().clone();
             tokio::spawn(async move {
                 tokio::select! {
                     biased;
@@ -288,7 +282,7 @@ impl NodeBuilder {
                 }
             });
         }
-        let node = Node { inner, network };
+        let node = Node { inner, participant };
         // Join the reserved routing group before returning any public handle.
         // `spawn_group` pins it Eventual whatever this profile asks for.
         let routing_group = node.get_or_spawn(
@@ -301,7 +295,7 @@ impl NodeBuilder {
         }
         tokio::spawn(sync_peer_addrs(
             node.inner.transport.clone(),
-            node.inner.id.clone(),
+            node.id().clone(),
             routing_group.entries_watch(),
         ));
         let _ = node.inner.routing.set(routing_group);
