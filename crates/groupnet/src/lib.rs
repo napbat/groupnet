@@ -46,6 +46,7 @@
 //! | `udp` | `transport::udp` | — |
 //! | `ipc` | `transport::ipc` (`IpcTransport`, `IpcLink`; `IpcBulkTransport` with `bulk`) | — |
 //! | `bulk` | `transport::bulk`, `transport::framing` | — |
+//! | `tls` | with `tcp`: the TLS mode of `TcpBulkTransport` (`TcpTls`), for hubs that admit clients across a trust boundary | `bulk` |
 //! | `connectivity` | `connectivity`; native modes of `TcpLink` / `UdpLink` | — |
 //! | `dns` | `runtime::SystemResolver` | `runtime` |
 //! | `rpc` | `rpc` | `bulk` |
@@ -143,6 +144,7 @@ pub use groupnet_sim as sim;
     feature = "udp",
     feature = "connectivity",
     feature = "rpc",
+    feature = "tls",
     feature = "consistency-acks",
 ))]
 #[doc = include_str!("../../../README.md")]

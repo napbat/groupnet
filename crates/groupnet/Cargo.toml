@@ -44,6 +44,10 @@ mem = ["dep:groupnet-transport-mem"]
 # reliable streams (`TcpBulkTransport`); with `runtime`, the managed `TcpLink`.
 tcp = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
 udp = ["dep:groupnet-transport-udp"]
+# Mutually authenticated TLS 1.3 for the TCP data plane: with `tcp`, a hub
+# (`TcpBulkTransport<TcpTls>`) admits clients it was never configured with,
+# each dialing with a fresh per-connection key and pinning the hub's key.
+tls = ["bulk", "groupnet-transport-tcp?/tls"]
 # Native local IPC: the control plane (`IpcTransport`) and the managed
 # `IpcLink`; with `bulk`, also reliable local streams (`IpcBulkTransport`).
 ipc = ["dep:groupnet-transport-ipc"]
