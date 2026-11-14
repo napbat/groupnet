@@ -14,7 +14,7 @@
 //! | `messaging` | `groupnet-messaging` | opaque application frames, delivery receipts, and the messaging engine | `runtime` |
 //! | `streams` | `groupnet-streams` | ordered streams and reliable/unreliable unordered sessions | `runtime` |
 //! | `runtime` | `groupnet-runtime` | the managed `Node` / `Group` driver, typed `Endpoint` / `Peer` handles, and receive callbacks (`runtime::messaging`) | `runtime` |
-//! | `rpc` | `groupnet-rpc` | request/response calls over any data plane | `rpc` |
+//! | `rpc` | `groupnet-rpc` | request/response calls and server-push subscriptions over any data plane | `rpc` |
 //! | `consistency` | `groupnet-consistency` | write feeds, frontiers, floors, acknowledgements, leases, hosted writes, handoff, replication | `consistency`, `consistency-*` |
 //! | `sim` | `groupnet-sim` | deterministic single-threaded engine harness | `sim` |
 //!

@@ -1,4 +1,8 @@
-//! [`RpcClient`]: concurrent calls multiplexed onto one stream per peer.
+//! [`RpcClient`]: concurrent calls and subscriptions multiplexed onto one
+//! stream per peer.
+
+mod connection;
+mod subscription;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -7,26 +11,31 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use groupnet_core::NodeId;
-use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
-use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::task::AbortHandle;
-use tokio::time::{Instant, sleep_until, timeout_at};
+use groupnet_transport::bulk::{BulkTransport, DataPlane};
+use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::time::{Instant, timeout_at};
 
-use crate::codec::{Encoded, Frame, REQUEST_HEAD};
-use crate::config::{FrameLimit, MAX_TIMEOUT, RpcConfig, RpcConfigError};
-use crate::{RpcError, RpcStatus, lock, write_frames};
+use crate::codec::{Frame, REQUEST_HEAD, SUBSCRIBE_HEAD};
+use crate::config::{MAX_TIMEOUT, RpcConfig, RpcConfigError};
+use crate::{RpcError, RpcStatus, lock};
+
+use connection::{Conn, Waiting};
+use subscription::Opened;
+
+pub use subscription::Subscription;
 
 /// The calling side of the RPC layer. Cheap to clone; every clone shares the
 /// same connections.
 ///
-/// Connections are opened lazily, one per peer, on the first call to it, and
-/// reused by every later call. A connection that breaks fails each call in
-/// flight on it with [`RpcError::ConnectionLost`] and is replaced by the next
-/// call; one with no call waiting for [`RpcConfig::idle_timeout`] is closed.
-/// At most [`RpcConfig::max_peers`] destinations are tracked at once.
-/// Dropping the last clone closes every connection.
+/// Connections are opened lazily, one per peer, on the first call or
+/// subscribe to it, and reused by every later one. A connection that breaks
+/// fails each call in flight on it, and ends each subscription open on it,
+/// with [`RpcError::ConnectionLost`], and is replaced by the next call; one
+/// with no call waiting and no subscription open for
+/// [`RpcConfig::idle_timeout`] is closed. At most [`RpcConfig::max_peers`]
+/// destinations are tracked at once. Dropping the last clone closes every
+/// connection that no [`Subscription`] still uses.
 pub struct RpcClient<B: BulkTransport> {
     inner: Arc<Inner<B>>,
 }
@@ -51,40 +60,24 @@ impl<B: BulkTransport> fmt::Debug for RpcClient<B> {
 struct Inner<B: BulkTransport> {
     plane: DataPlane<B>,
     config: RpcConfig,
-    /// Admitted destinations. A peer is in use while a call holds a clone of
-    /// its `Arc`; clones are only handed out under this lock.
+    /// Admitted destinations. A peer is in use while a call or an open
+    /// subscription holds a clone of its `Arc`; clones are only handed out
+    /// under this lock.
     peers: Mutex<HashMap<NodeId, Arc<Peer>>>,
     next_id: AtomicU64,
-    shut: AtomicBool,
+    /// Shared with every [`Subscription`], which reports a connection closed
+    /// by shutdown as [`RpcError::Shutdown`].
+    shut: Arc<AtomicBool>,
 }
 
-/// One peer's slot: its call budget and its (at most one) connection.
+/// One peer's slot: its call and subscription budgets and its (at most one)
+/// connection.
 struct Peer {
     in_flight: Arc<Semaphore>,
+    subscriptions: Arc<Semaphore>,
     /// Serializes dialing, so concurrent first calls open one connection.
     dialing: tokio::sync::Mutex<()>,
     conn: Mutex<Option<Arc<Conn>>>,
-}
-
-/// One live connection: the writer's queue, the calls awaiting answers, and
-/// the task that drives both halves of the stream.
-struct Conn {
-    frames: mpsc::Sender<Encoded>,
-    calls: Arc<Calls>,
-    task: AbortHandle,
-}
-
-/// The calls awaiting an answer on one connection.
-struct Calls {
-    state: Mutex<CallsState>,
-}
-
-struct CallsState {
-    /// Set once the connection is gone; nothing registers after it.
-    closed: bool,
-    waiting: HashMap<u64, oneshot::Sender<Result<Bytes, RpcStatus>>>,
-    /// When `waiting` last became empty (or the connection opened).
-    idle_since: Instant,
 }
 
 impl<B: BulkTransport> RpcClient<B> {
@@ -116,7 +109,7 @@ impl<B: BulkTransport> RpcClient<B> {
                 config,
                 peers: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
-                shut: AtomicBool::new(false),
+                shut: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -212,13 +205,98 @@ impl<B: BulkTransport> RpcClient<B> {
         }
     }
 
+    /// Opens a subscription to `to` with `payload`: the server's subscribe
+    /// handler sends items until it ends or the returned [`Subscription`] is
+    /// dropped.
+    ///
+    /// `timeout` bounds opening only — the connect and the send of the
+    /// subscribe — and saturates like a call's; the subscription itself has
+    /// no deadline. It returns once the subscribe is sent: the server's
+    /// answer, items or a refusal, arrives through
+    /// [`Subscription::next`]. The server may send
+    /// [`RpcConfig::subscription_window`] items ahead of what the
+    /// application consumed. An open subscription keeps its connection from
+    /// idling and its destination from eviction.
+    ///
+    /// # Errors
+    /// None of them sent anything: [`TooLarge`](RpcError::TooLarge),
+    /// [`Saturated`](RpcError::Saturated),
+    /// [`TooManySubscriptions`](RpcError::TooManySubscriptions) (at
+    /// [`RpcConfig::max_subscriptions_per_peer`]),
+    /// [`Unreachable`](RpcError::Unreachable),
+    /// [`NotSent`](RpcError::NotSent) (the timeout ended first, also during
+    /// the connect) and [`Shutdown`](RpcError::Shutdown).
+    pub async fn subscribe(
+        &self,
+        to: &NodeId,
+        payload: Bytes,
+        timeout: Duration,
+    ) -> Result<Subscription, RpcError> {
+        let inner = &*self.inner;
+        if inner.is_shut() {
+            return Err(RpcError::Shutdown);
+        }
+        if payload.len() > inner.config.max_frame_bytes.body(SUBSCRIBE_HEAD) {
+            return Err(RpcError::TooLarge);
+        }
+        let timeout = timeout.min(MAX_TIMEOUT);
+        if timeout.is_zero() {
+            return Err(RpcError::NotSent);
+        }
+        let deadline = Instant::now() + timeout;
+        let peer = inner.peer(to)?;
+        let slot = match peer.subscriptions.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(TryAcquireError::NoPermits) => return Err(RpcError::TooManySubscriptions),
+            Err(TryAcquireError::Closed) => return Err(RpcError::Shutdown),
+        };
+        let window = inner.config.subscription_window;
+        loop {
+            let conn = inner.connection(to, &peer, deadline).await?;
+            let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+            // A connection that died since it was handed out has not seen
+            // this subscribe: dial again, within the same deadline.
+            let Some(events) = conn.calls.subscribe(id, window) else {
+                continue;
+            };
+            let registered = Waiting {
+                calls: &conn.calls,
+                id,
+            };
+            let frame = Frame::Subscribe {
+                id,
+                window,
+                payload: payload.clone(),
+            }
+            .encode();
+            match timeout_at(deadline, conn.frames.send(frame)).await {
+                Err(_) => return Err(RpcError::NotSent),
+                Ok(Err(_)) => continue,
+                Ok(Ok(())) => {}
+            }
+            // From here the subscription's own drop forgets and cancels it.
+            std::mem::forget(registered);
+            return Ok(Subscription::new(Opened {
+                id,
+                events,
+                window,
+                conn,
+                peer,
+                slot,
+                shut: inner.shut.clone(),
+            }));
+        }
+    }
+
     /// Closes every connection and fails every call — in flight, waiting or
-    /// future — with [`RpcError::Shutdown`]. Idempotent.
+    /// future — and every open subscription with [`RpcError::Shutdown`].
+    /// Idempotent.
     pub fn shutdown(&self) {
         self.inner.shut.store(true, Ordering::SeqCst);
         let peers: Vec<Arc<Peer>> = lock(&self.inner.peers).values().cloned().collect();
         for peer in peers {
             peer.in_flight.close();
+            peer.subscriptions.close();
             peer.close();
         }
     }
@@ -248,8 +326,9 @@ impl<B: BulkTransport> Inner<B> {
     }
 
     /// The destination's slot, admitting it under the global `max_peers`
-    /// bound. At the bound, one destination no call is using is evicted —
-    /// preferably one without a live connection, else the one idle longest.
+    /// bound. At the bound, one destination no call or subscription is using
+    /// is evicted — preferably one without a live connection, else the one
+    /// idle longest.
     fn peer(&self, to: &NodeId) -> Result<Arc<Peer>, RpcError> {
         let mut peers = lock(&self.peers);
         if let Some(peer) = peers.get(to) {
@@ -269,6 +348,7 @@ impl<B: BulkTransport> Inner<B> {
         }
         let peer = Arc::new(Peer {
             in_flight: Arc::new(Semaphore::new(self.config.max_in_flight_per_peer.get())),
+            subscriptions: Arc::new(Semaphore::new(self.config.max_subscriptions_per_peer.get())),
             dialing: tokio::sync::Mutex::new(()),
             conn: Mutex::new(None),
         });
@@ -344,192 +424,6 @@ impl Peer {
         if let Some(conn) = lock(&self.conn).take() {
             conn.close();
         }
-    }
-}
-
-impl Conn {
-    fn spawn<S>(stream: DataStream<S>, config: &RpcConfig) -> Self
-    where
-        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-    {
-        let (frames, queue) = mpsc::channel(config.max_in_flight_per_peer.get());
-        let calls = Arc::new(Calls::new());
-        let task = tokio::spawn(drive(
-            stream,
-            queue,
-            calls.clone(),
-            config.max_frame_bytes,
-            config.idle_timeout,
-        ))
-        .abort_handle();
-        Self {
-            frames,
-            calls,
-            task,
-        }
-    }
-
-    /// Tears the connection down and fails its waiting calls.
-    fn close(&self) {
-        self.task.abort();
-        self.calls.close();
-    }
-}
-
-impl Drop for Conn {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-impl Calls {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(CallsState {
-                closed: false,
-                waiting: HashMap::new(),
-                idle_since: Instant::now(),
-            }),
-        }
-    }
-
-    /// Registers call `id`, unless the connection is already gone.
-    fn register(&self, id: u64) -> Option<oneshot::Receiver<Result<Bytes, RpcStatus>>> {
-        let mut state = lock(&self.state);
-        if state.closed {
-            return None;
-        }
-        let (tx, rx) = oneshot::channel();
-        state.waiting.insert(id, tx);
-        Some(rx)
-    }
-
-    /// Hands call `id` its answer; an answer nobody waits for is discarded.
-    fn answer(&self, id: u64, answer: Result<Bytes, RpcStatus>) {
-        let waiter = lock(&self.state).remove(id);
-        if let Some(waiter) = waiter {
-            let _ = waiter.send(answer);
-        }
-    }
-
-    fn forget(&self, id: u64) {
-        lock(&self.state).remove(id);
-    }
-
-    fn is_closed(&self) -> bool {
-        lock(&self.state).closed
-    }
-
-    fn idle_since(&self) -> Instant {
-        lock(&self.state).idle_since
-    }
-
-    /// Closes the table once no call has waited on it for `idle`; otherwise
-    /// returns when to check again. Closing under the lock means no call can
-    /// register on a connection that is about to end.
-    fn close_if_idle(&self, idle: Duration) -> Option<Instant> {
-        let mut state = lock(&self.state);
-        let now = Instant::now();
-        if !state.waiting.is_empty() {
-            return Some(now + idle);
-        }
-        let due = state.idle_since + idle;
-        if now < due {
-            return Some(due);
-        }
-        state.closed = true;
-        None
-    }
-
-    /// Marks the connection gone and drops every waiter, which wakes each
-    /// with a closed channel.
-    fn close(&self) {
-        let waiting = {
-            let mut state = lock(&self.state);
-            state.closed = true;
-            std::mem::take(&mut state.waiting)
-        };
-        drop(waiting);
-    }
-}
-
-impl CallsState {
-    /// Removes a waiter, starting the idle clock when it was the last one.
-    fn remove(&mut self, id: u64) -> Option<oneshot::Sender<Result<Bytes, RpcStatus>>> {
-        let waiter = self.waiting.remove(&id);
-        if waiter.is_some() && self.waiting.is_empty() {
-            self.idle_since = Instant::now();
-        }
-        waiter
-    }
-}
-
-/// Removes a call's waiter however the call ends — answered, timed out, or
-/// abandoned by its caller.
-struct Waiting<'a> {
-    calls: &'a Calls,
-    id: u64,
-}
-
-impl Drop for Waiting<'_> {
-    fn drop(&mut self) {
-        self.calls.forget(self.id);
-    }
-}
-
-/// Closes a connection's call table when its task ends, however it ends.
-struct CloseOnExit(Arc<Calls>);
-
-impl Drop for CloseOnExit {
-    fn drop(&mut self) {
-        self.0.close();
-    }
-}
-
-/// Resolves once the connection has had no call waiting for `idle`, having
-/// closed its call table.
-async fn idle_out(calls: &Calls, idle: Duration) {
-    let mut check = calls.idle_since() + idle;
-    loop {
-        sleep_until(check).await;
-        match calls.close_if_idle(idle) {
-            Some(next) => check = next,
-            None => return,
-        }
-    }
-}
-
-/// Drives one client connection: the writer drains the request queue while
-/// the reader routes answers to their calls. Either side failing, or the
-/// connection idling out, ends both.
-async fn drive<S>(
-    stream: DataStream<S>,
-    mut queue: mpsc::Receiver<Encoded>,
-    calls: Arc<Calls>,
-    max_frame_bytes: FrameLimit,
-    idle: Duration,
-) where
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
-    let _close = CloseOnExit(calls.clone());
-    let (read_half, write_half) = stream.into_inner().split();
-    let mut reader = DataStream::new(read_half);
-    let mut writer = DataStream::new(write_half);
-    let read = async {
-        // A clean end, a read error, a malformed frame or a request from
-        // the server all end the connection.
-        while let Ok(Some(bytes)) = reader.recv_bounded(max_frame_bytes.frame_bytes()).await {
-            match Frame::decode(&bytes) {
-                Ok(Frame::Response { id, payload }) => calls.answer(id, Ok(payload)),
-                Ok(Frame::Error { id, status }) => calls.answer(id, Err(status)),
-                Ok(Frame::Request { .. }) | Err(_) => return,
-            }
-        }
-    };
-    tokio::select! {
-        () = read => {}
-        () = write_frames(&mut writer, &mut queue, max_frame_bytes) => {}
-        () = idle_out(&calls, idle) => {}
     }
 }
 

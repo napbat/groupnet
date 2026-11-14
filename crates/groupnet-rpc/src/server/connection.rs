@@ -1,5 +1,6 @@
-//! One served connection: admission bookkeeping, the bounded request reader,
-//! the per-request handler tasks and the single answer writer.
+//! One served connection: admission bookkeeping, the bounded frame reader,
+//! the per-request handler and per-subscription tasks and the single answer
+//! writer.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
+use super::subscription::{Opening, SubscribeHandler, Subscriptions};
 use crate::codec::{ERROR_HEAD, Encoded, Frame, RESPONSE_HEAD};
 use crate::config::{FrameLimit, RpcServerConfig};
 use crate::{RpcStatus, write_frames};
@@ -43,59 +45,63 @@ impl Drop for Live {
     }
 }
 
-/// How a connection's request reader ended.
+/// How a connection's frame reader ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadEnd {
-    /// A clean end, a read error, or a frame that is not a request.
+    /// A clean end, a read error, or a frame a client must not send.
     Closed,
-    /// No request and no running handler for the idle timeout.
+    /// No frame and no running handler or subscription for the idle timeout.
     Idle,
 }
 
-/// Serves one connection: requests are read and dispatched, answers flow
-/// through a single writer. Either side ending ends the connection, and with
-/// it every handler still running for it; an idle connection first writes
-/// the answers its finished handlers queued.
-pub(super) async fn serve<S, H, F>(
+/// Serves one connection: requests and subscriptions are read and
+/// dispatched, answers and items flow through a single writer. Either side
+/// ending ends the connection, and with it every handler and subscription
+/// still running for it; an idle connection first writes the answers its
+/// finished handlers queued.
+pub(super) async fn serve<T, H, F, S>(
     from: NodeId,
-    stream: DataStream<S>,
-    handler: H,
+    stream: DataStream<T>,
+    handlers: (H, S),
     config: RpcServerConfig,
     _live: Live,
 ) where
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     H: Fn(NodeId, Bytes) -> F + Clone + Send + 'static,
     F: Future<Output = Result<Bytes, RpcStatus>> + Send + 'static,
+    S: SubscribeHandler,
 {
     let (read_half, write_half) = stream.into_inner().split();
     let mut reader = DataStream::new(read_half);
     let mut writer = DataStream::new(write_half);
     let (answers, mut queue) = mpsc::channel(config.max_concurrent_per_connection.get());
     let end = tokio::select! {
-        end = read_requests(&mut reader, from, handler, config, answers) => end,
+        end = read_frames(&mut reader, from, handlers, config, answers) => end,
         () = write_frames(&mut writer, &mut queue, config.max_frame_bytes) => ReadEnd::Closed,
     };
     if end == ReadEnd::Idle {
-        // Every handler has finished and every answer sender is gone, so the
-        // writer drains the queue and returns.
+        // Every handler and subscription has finished and every answer
+        // sender is gone (a sink keeps only a weak one), so the writer drains
+        // the queue and returns.
         write_frames(&mut writer, &mut queue, config.max_frame_bytes).await;
     }
 }
 
-/// Resolves once every running handler has finished and `idle` has then
-/// passed with nothing new to do.
+/// Resolves once every running handler and subscription has finished and
+/// `idle` has then passed with nothing new to do.
 async fn idle_out(work: &mut JoinSet<()>, idle: Duration) {
     while work.join_next().await.is_some() {}
     tokio::time::sleep(idle).await;
 }
 
-/// Reads requests and spawns one bounded task per request. Returns on a
-/// clean end, a read error, any frame that is not a well-formed request, or
-/// idleness.
-async fn read_requests<R, H, F>(
+/// Reads frames until the connection ends: one bounded task per request,
+/// one task per subscription, and credit and cancels applied to their
+/// subscriptions. Returns on a clean end, a read error, any frame a client
+/// must not send (or a subscription protocol violation), or idleness.
+async fn read_frames<R, H, F, S>(
     reader: &mut DataStream<R>,
     from: NodeId,
-    handler: H,
+    (handler, subscribe): (H, S),
     config: RpcServerConfig,
     answers: mpsc::Sender<Encoded>,
 ) -> ReadEnd
@@ -103,17 +109,19 @@ where
     R: AsyncRead + Unpin,
     H: Fn(NodeId, Bytes) -> F + Clone + Send + 'static,
     F: Future<Output = Result<Bytes, RpcStatus>> + Send + 'static,
+    S: SubscribeHandler,
 {
     let permits = Arc::new(Semaphore::new(config.max_concurrent_per_connection.get()));
-    // Dropped with this future, which aborts every handler still running.
+    // Dropped with this future, which aborts every handler and subscription
+    // still running. Declared first so it drops last: the table below ends
+    // its subscriptions before their tasks are aborted.
     let mut work = JoinSet::new();
+    let subscriptions = Subscriptions::new(
+        config.max_subscriptions_per_connection.get(),
+        config.max_frame_bytes,
+    );
     loop {
         while work.try_join_next().is_some() {}
-        // Take a slot before reading, so a saturated connection stops being
-        // read and the caller feels the back-pressure.
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            return ReadEnd::Closed;
-        };
         let read = tokio::select! {
             read = reader.recv_bounded(config.max_frame_bytes.frame_bytes()) => read,
             () = idle_out(&mut work, config.idle_timeout) => return ReadEnd::Idle,
@@ -122,22 +130,65 @@ where
             return ReadEnd::Closed;
         };
         let received = Instant::now();
-        let Ok(Frame::Request {
-            id,
-            deadline_ms,
-            payload,
-        }) = Frame::decode(&bytes)
-        else {
-            return ReadEnd::Closed;
-        };
-        let deadline = received + Duration::from_millis(u64::from(deadline_ms));
-        work.spawn(answer(
-            Request {
+        let request = match Frame::decode(&bytes) {
+            Ok(Frame::Request {
+                id,
+                deadline_ms,
+                payload,
+            }) => Request {
                 from: from.clone(),
                 id,
-                deadline,
+                deadline: received + Duration::from_millis(u64::from(deadline_ms)),
                 payload,
             },
+            Ok(Frame::Subscribe {
+                id,
+                window,
+                payload,
+            }) => {
+                let opening = Opening {
+                    from: from.clone(),
+                    id,
+                    window,
+                    payload,
+                };
+                match subscriptions.open(opening, &subscribe, &answers, &mut work) {
+                    Err(_violation) => return ReadEnd::Closed,
+                    Ok(None) => {}
+                    // The writer is gone only when the connection is; nobody
+                    // to tell.
+                    Ok(Some(refusal)) => {
+                        let _ = answers.send(refusal).await;
+                    }
+                }
+                continue;
+            }
+            Ok(Frame::Credit { id, grant }) => {
+                if subscriptions.credit(id, grant).is_err() {
+                    return ReadEnd::Closed;
+                }
+                continue;
+            }
+            Ok(Frame::Cancel { id }) => {
+                subscriptions.cancel(id);
+                continue;
+            }
+            Ok(
+                Frame::Response { .. }
+                | Frame::Error { .. }
+                | Frame::Item { .. }
+                | Frame::End { .. },
+            )
+            | Err(_) => return ReadEnd::Closed,
+        };
+        // At the handler limit, stop reading until one finishes, so the
+        // caller feels the back-pressure. Subscriptions hold no handler slot,
+        // so this wait always ends: every call handler has a deadline.
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            return ReadEnd::Closed;
+        };
+        work.spawn(answer(
+            request,
             handler.clone(),
             answers.clone(),
             permit,

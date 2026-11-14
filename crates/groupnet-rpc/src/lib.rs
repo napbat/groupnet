@@ -1,8 +1,9 @@
 //! # groupnet-rpc
 //!
-//! Request/response calls over the data plane: an [`RpcClient`] multiplexes
-//! any number of concurrent calls onto **one** [`DataStream`] per peer, and
-//! an [`RpcServer`] answers them with an async handler.
+//! Request/response calls and server-push subscriptions over the data
+//! plane: an [`RpcClient`] multiplexes any number of concurrent calls and
+//! subscriptions onto **one** [`DataStream`] per peer, and an [`RpcServer`]
+//! answers them with async handlers.
 //!
 //! ## Ownership of the data plane
 //!
@@ -93,8 +94,66 @@
 //!
 //! A process that only calls (a client of a cluster, not a member) builds
 //! its plane on a transport that does not listen, for TCP
-//! `TcpBulkTransport::dial_only`, and runs no server: every response comes
-//! back on the stream that the client opened.
+//! `TcpBulkTransport::dial_only`, and runs no server: every response — and
+//! every subscription item — comes back on the stream that the client
+//! opened.
+//!
+//! ## Subscriptions (server push)
+//!
+//! A call answers once; a subscription answers many times. The client opens
+//! one with [`RpcClient::subscribe`] and reads it with
+//! [`Subscription::next`]; a server built with
+//! [`RpcServer::with_subscriptions`] runs its subscribe handler with a
+//! [`SubscriptionSink`] and sends items until the handler returns (`Ok(())`
+//! ends it, `Err(status)` ends it with that error) or the client drops the
+//! [`Subscription`], which cancels it and drops the handler. Subscriptions
+//! share the connection, and its single writer, with calls.
+//!
+//! Flow control is per subscription: the server may send
+//! [`RpcConfig::subscription_window`] items ahead of what the application
+//! consumed, and [`SubscriptionSink::send`] waits for credit beyond that. The
+//! client grants credit as [`next`](Subscription::next) consumes items, so a
+//! subscription nobody reads holds back only itself — never the
+//! connection's calls or its other subscriptions.
+//!
+//! ```
+//! use std::time::Duration;
+//!
+//! use groupnet_core::NodeId;
+//! use groupnet_rpc::{Bytes, DataPlane, RpcClient, RpcError, RpcServer, RpcStatus, SubscriptionSink};
+//! use groupnet_transport_mem::MemBulkNet;
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), RpcError> {
+//! let net = MemBulkNet::new();
+//! // The hub answers calls and counts down from the subscribe's first byte.
+//! let _hub = RpcServer::with_subscriptions(
+//!     |_from: NodeId, request: Bytes| async move { Ok::<_, RpcStatus>(request) },
+//!     |_from: NodeId, start: Bytes, mut sink: SubscriptionSink| async move {
+//!         let start = start.first().copied().unwrap_or(0);
+//!         for n in (1..=start).rev() {
+//!             // Waits for credit; fails once the client cancels or leaves.
+//!             if sink.send(Bytes::from(vec![n])).await.is_err() {
+//!                 break;
+//!             }
+//!         }
+//!         Ok::<(), RpcStatus>(())
+//!     },
+//! )
+//! .accept_on(DataPlane::new(net.endpoint(NodeId::new("hub"))));
+//!
+//! let client = RpcClient::new(DataPlane::new(net.endpoint(NodeId::new("client"))));
+//! let mut countdown = client
+//!     .subscribe(&NodeId::new("hub"), Bytes::from_static(&[3]), Duration::from_secs(1))
+//!     .await?;
+//! let mut seen = Vec::new();
+//! while let Some(item) = countdown.next().await {
+//!     seen.push(item?[0]);
+//! }
+//! assert_eq!(seen, [3, 2, 1]);
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! ## Wire format
 //!
@@ -102,18 +161,30 @@
 //! length prefix); its payload is a typed big-endian head — version byte,
 //! kind byte and fixed fields — followed by the body:
 //!
-//! | Kind | Fields after `version = 1`, `kind` |
-//! |------|------------------------------------|
-//! | `0` Request | `id: u64`, `deadline_ms: u32` (nonzero), payload |
-//! | `1` Response | `id: u64`, payload |
-//! | `2` Error | `id: u64`, `code: u16`, UTF-8 message |
+//! | Kind | Direction | Fields after `version = 1`, `kind` |
+//! |------|-----------|------------------------------------|
+//! | `0` Request | client → server | `id: u64`, `deadline_ms: u32` (nonzero), payload |
+//! | `1` Response | server → client | `id: u64`, payload |
+//! | `2` Error | server → client | `id: u64`, `code: u16`, UTF-8 message |
+//! | `3` Subscribe | client → server | `id: u64`, `window: u32` (nonzero), payload |
+//! | `4` Item | server → client | `id: u64`, payload |
+//! | `5` End | server → client | `id: u64` |
+//! | `6` Credit | client → server | `id: u64`, `grant: u32` (nonzero) |
+//! | `7` Cancel | client → server | `id: u64` |
 //!
 //! A request's `deadline_ms` is the caller's remaining budget when it was
 //! sent, rounded up to whole milliseconds; the server measures it from
-//! receipt, so no clocks are compared.
-//! Malformed bytes, an unknown version or kind, or a frame over the receiver's
-//! `max_frame_bytes` drop the connection that carried them — and with it, on
-//! the client, every call in flight on it ([`RpcError::ConnectionLost`]).
+//! receipt, so no clocks are compared. Calls and subscriptions share one id
+//! space per connection; an Error also ends a subscription. A server may
+//! send `window` items of a subscription before its first Credit, and
+//! `grant` more per Credit.
+//! Malformed bytes (a short head, a zero deadline, window or grant, bytes
+//! after an End, Credit or Cancel), an unknown version or kind, a frame only
+//! the other side sends, a frame over the receiver's `max_frame_bytes`, an
+//! item beyond its credit, credit beyond its window, or a Subscribe reusing
+//! a live subscription's id drop the connection that carried them — and with
+//! it, on the client, every call in flight and every subscription open on it
+//! ([`RpcError::ConnectionLost`]).
 //!
 //! ## Limits
 //!
@@ -129,25 +200,35 @@
 //!   sides, at most the data plane's
 //!   [`MAX_FRAME_BYTES`](groupnet_transport::framing::MAX_FRAME_BYTES); give
 //!   the client's [`RpcConfig`] and the server's [`RpcServerConfig`] the same
-//!   value. A request over the client's limit is refused before it is sent
-//!   ([`RpcError::TooLarge`]); a response over the server's limit is replaced
-//!   by an [`RpcStatus::RESPONSE_TOO_LARGE`] error.
+//!   value. A request or subscribe over the client's limit is refused before
+//!   it is sent ([`RpcError::TooLarge`]); a response over the server's limit
+//!   is replaced by an [`RpcStatus::RESPONSE_TOO_LARGE`] error, and an item
+//!   over it ends its subscription with that error
+//!   ([`SinkError::TooLarge`] to the handler).
 //! * A client allows `max_in_flight_per_peer` concurrent calls to each peer;
 //!   further calls wait for a slot within their own timeout.
 //! * A client tracks at most `max_peers` destinations. A call to a new one
-//!   at the limit evicts a destination no call is using (closing its
-//!   connection), or fails [`RpcError::Saturated`] if every destination is
-//!   busy.
+//!   at the limit evicts a destination no call or open subscription is using
+//!   (closing its connection), or fails [`RpcError::Saturated`] if every
+//!   destination is busy.
+//! * A client keeps at most `max_subscriptions_per_peer` subscriptions open
+//!   to each peer; one more fails [`RpcError::TooManySubscriptions`], unsent.
+//!   Each buffers at most `subscription_window` items.
 //! * A server serves at most `max_connections` connections, however they
 //!   reach it: at the limit [`RpcServer::serve`] refuses
 //!   ([`RpcServeError::AtCapacity`]), [`RpcServer::reserve`] waits, and a
 //!   [`bind`](RpcServer::bind) accept loop stops accepting until one ends.
-//! * A server runs at most `max_concurrent_per_connection` handlers per
+//! * A server runs at most `max_concurrent_per_connection` call handlers per
 //!   connection; past that it stops reading the connection, which pushes
 //!   back on the caller through the transport.
+//! * A server runs at most `max_subscriptions_per_connection` subscriptions
+//!   per connection, apart from the call handlers; one more is answered
+//!   [`RpcStatus::TOO_MANY_SUBSCRIPTIONS`] (and every subscribe to a server
+//!   without a subscribe handler [`RpcStatus::SUBSCRIPTIONS_UNSUPPORTED`]).
 //! * Idle connections are closed: by the client after its `idle_timeout`
-//!   with no call waiting, by the server after its `idle_timeout` with no
-//!   request and no handler running. Keep the server's longer than the
+//!   with no call waiting and no subscription open, by the server after its
+//!   `idle_timeout` with no frame read and no handler or subscription
+//!   running. Keep the server's longer than the
 //!   clients', so the side that knows nothing is in flight closes first.
 //!   Configured timers are bounded by [`MAX_TIMEOUT`], the wire deadline's
 //!   `u32` milliseconds; a call's timeout saturates to it — the one
@@ -166,14 +247,17 @@ use futures_util::io::AsyncWrite;
 use tokio::sync::mpsc;
 
 pub use bytes::Bytes;
-pub use client::RpcClient;
+pub use client::{RpcClient, Subscription};
 pub use config::{
     FrameLimit, FrameLimitError, MAX_TIMEOUT, RpcConfig, RpcConfigError, RpcServerConfig,
     RpcServerConfigError,
 };
 pub use groupnet_transport::QueueCapacity;
 pub use groupnet_transport::bulk::{BulkTransport, DataPlane, DataStream};
-pub use server::{RpcServeError, RpcServer, RpcServerHandle, RpcSlot};
+pub use server::{
+    NoSubscriptions, RpcServeError, RpcServer, RpcServerHandle, RpcSlot, SinkError,
+    SubscribeHandler, SubscriptionSink,
+};
 
 use codec::Encoded;
 
@@ -199,11 +283,20 @@ impl RpcStatus {
     /// The request's deadline passed before the handler answered; the server
     /// dropped the work. A client reports this as [`RpcError::Timeout`].
     pub const DEADLINE_EXCEEDED: u16 = 0xFF01;
-    /// The handler panicked.
+    /// The call or subscribe handler panicked.
     pub const HANDLER_PANICKED: u16 = 0xFF02;
-    /// The handler's response exceeded the server's `max_frame_bytes`. The
-    /// handler did run.
+    /// The handler's response, or one subscription item, exceeded the
+    /// server's `max_frame_bytes`. The handler did run; a subscription ends
+    /// with this error at the oversized item, after the items before it.
     pub const RESPONSE_TOO_LARGE: u16 = 0xFF03;
+    /// The server takes no subscriptions: it was built without a subscribe
+    /// handler ([`RpcServer::new`] rather than
+    /// [`RpcServer::with_subscriptions`]).
+    pub const SUBSCRIPTIONS_UNSUPPORTED: u16 = 0xFF04;
+    /// The connection already carries the server's
+    /// [`max_subscriptions_per_connection`](RpcServerConfig::max_subscriptions_per_connection)
+    /// live subscriptions; the subscribe handler did not run.
+    pub const TOO_MANY_SUBSCRIPTIONS: u16 = 0xFF05;
 
     /// A status with `code` and `message`.
     #[must_use]
@@ -236,32 +329,38 @@ impl fmt::Display for RpcStatus {
 
 impl Error for RpcStatus {}
 
-/// Why an [`RpcClient::call`] produced no response.
+/// Why an [`RpcClient::call`] produced no response, an
+/// [`RpcClient::subscribe`] did not open, or a [`Subscription`] ended early.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcError {
     /// No connection to the peer could be opened within the connect timeout
     /// (unregistered, refused, or silent). The request was not sent.
     Unreachable,
-    /// The call's timeout ended before the request was sent: while the call
-    /// waited for a call slot of the peer, for another call's dial, for the
-    /// connect, or for room in the connection's queue. The handler did not
-    /// run.
+    /// The timeout ended before the request (or subscribe) was sent: while
+    /// it waited for a call slot of the peer, for another call's dial, for
+    /// the connect, or for room in the connection's queue. The handler did
+    /// not run.
     NotSent,
     /// The call's timeout elapsed with the request sent, on either side. The
     /// handler may have run; a late response is discarded.
     Timeout,
-    /// The connection broke with this request sent and unanswered: the
-    /// outcome is **unknown** — the handler may or may not have run. The next
-    /// call reconnects.
+    /// The connection broke with this request sent and unanswered (or this
+    /// subscription open): the outcome is **unknown** — the handler may or
+    /// may not have run. The next call or subscribe reconnects.
     ConnectionLost,
     /// The handler (or the server on its behalf) answered with an error.
     Remote(RpcStatus),
     /// The request exceeds the client's `max_frame_bytes`; it was not sent.
     TooLarge,
     /// The client already tracks `max_peers` destinations, each with a call
-    /// in progress, so a new destination cannot be admitted; the request was
-    /// not sent.
+    /// or subscription in progress, so a new destination cannot be admitted;
+    /// the request was not sent.
     Saturated,
+    /// The client already holds
+    /// [`max_subscriptions_per_peer`](RpcConfig::max_subscriptions_per_peer)
+    /// open subscriptions to this peer; the subscribe was not sent. Dropping
+    /// a [`Subscription`] (or reading it to its end) frees its slot.
+    TooManySubscriptions,
     /// The client was shut down.
     Shutdown,
 }
@@ -276,6 +375,9 @@ impl fmt::Display for RpcError {
             Self::Remote(status) => write!(f, "remote error: {status}"),
             Self::TooLarge => f.write_str("rpc request exceeds the frame limit"),
             Self::Saturated => f.write_str("rpc client destination limit reached"),
+            Self::TooManySubscriptions => {
+                f.write_str("rpc client subscription limit for this peer reached")
+            }
             Self::Shutdown => f.write_str("rpc client shut down"),
         }
     }
