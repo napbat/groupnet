@@ -1,9 +1,10 @@
 //! Validated client and server limits: frame bounds, queue capacities,
-//! destination/connection admission and idle eviction timers.
+//! destination/connection/subscription admission, subscription credit and
+//! idle eviction timers.
 
 mod error;
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use groupnet_transport::QueueCapacity;
@@ -110,18 +111,32 @@ pub struct RpcConfig {
     /// Match the server's [`RpcServerConfig::max_frame_bytes`].
     pub max_frame_bytes: FrameLimit,
     /// Concurrent calls allowed to one peer; more wait for a slot within
-    /// their own timeout. Also the connection's request queue capacity.
+    /// their own timeout. Also the capacity of the connection's outgoing
+    /// frame queue (requests, subscribes, credit and cancels).
     pub max_in_flight_per_peer: QueueCapacity,
     /// Destinations the client tracks at once. A call to a new destination
     /// at the limit evicts one no call is using (its connection closes); if
     /// every destination has a call in progress it fails
-    /// [`Saturated`](crate::RpcError::Saturated) without being sent.
+    /// [`Saturated`](crate::RpcError::Saturated) without being sent. A
+    /// destination with an open [`Subscription`](crate::Subscription) is in
+    /// use.
     pub max_peers: QueueCapacity,
+    /// Items a server may send on one subscription before the client grants
+    /// more: the subscribe's wire `window`, and the most items one
+    /// [`Subscription`](crate::Subscription) buffers. The client grants
+    /// credit as the application consumes items, half a window (rounded
+    /// up) at a time.
+    pub subscription_window: NonZeroU32,
+    /// Subscriptions open at once to one peer; one more fails
+    /// [`TooManySubscriptions`](crate::RpcError::TooManySubscriptions)
+    /// without being sent.
+    pub max_subscriptions_per_peer: QueueCapacity,
 }
 
 impl Default for RpcConfig {
     /// 3 s to connect, 60 s idle, 16 MiB frames, 1024 calls in flight per
-    /// peer, 1024 destinations.
+    /// peer, 1024 destinations, a 32-item subscription window, 64
+    /// subscriptions per peer.
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(3),
@@ -129,12 +144,15 @@ impl Default for RpcConfig {
             max_frame_bytes: FrameLimit::DEFAULT,
             max_in_flight_per_peer: QueueCapacity::of(1024),
             max_peers: QueueCapacity::of(1024),
+            subscription_window: NonZeroU32::new(32).expect("32 is nonzero"),
+            max_subscriptions_per_peer: QueueCapacity::of(64),
         }
     }
 }
 
 impl RpcConfig {
-    /// Checks the timers; frame and queue bounds are valid by construction.
+    /// Checks the timers; frame, queue, window and subscription bounds are
+    /// valid by construction.
     ///
     /// # Errors
     /// The first violated rule, naming its field: a zero timer or one above
@@ -176,26 +194,33 @@ pub struct RpcServerConfig {
     /// How long a connection with no request read and no handler running
     /// stays open; answers already produced are written before it closes.
     /// Nonzero, at most [`MAX_TIMEOUT`]. Keep it above the clients'
-    /// [`RpcConfig::idle_timeout`].
+    /// [`RpcConfig::idle_timeout`]. A live subscription is running work: it
+    /// keeps the connection from idling.
     pub idle_timeout: Duration,
+    /// Subscriptions live at once on one connection. One more is answered
+    /// with an [`RpcStatus::TOO_MANY_SUBSCRIPTIONS`](crate::RpcStatus::TOO_MANY_SUBSCRIPTIONS)
+    /// error without running the subscribe handler; the connection stays up.
+    /// Subscriptions do not count against `max_concurrent_per_connection`.
+    pub max_subscriptions_per_connection: QueueCapacity,
 }
 
 impl Default for RpcServerConfig {
     /// 16 MiB frames, 64 concurrent handlers per connection, 1024
-    /// connections, 120 s idle.
+    /// connections, 120 s idle, 64 subscriptions per connection.
     fn default() -> Self {
         Self {
             max_frame_bytes: FrameLimit::DEFAULT,
             max_concurrent_per_connection: QueueCapacity::of(64),
             max_connections: QueueCapacity::of(1024),
             idle_timeout: Duration::from_secs(120),
+            max_subscriptions_per_connection: QueueCapacity::of(64),
         }
     }
 }
 
 impl RpcServerConfig {
-    /// Checks the idle timer; frame and queue bounds are valid by
-    /// construction.
+    /// Checks the idle timer; frame, queue and subscription bounds are valid
+    /// by construction.
     ///
     /// # Errors
     /// [`RpcServerConfigError::ZeroIdleTimeout`] or

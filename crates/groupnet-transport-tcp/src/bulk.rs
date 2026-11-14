@@ -1,59 +1,82 @@
 //! Data-plane streams over TCP: [`TcpBulkTransport`], a [`BulkTransport`] for
-//! reliable, ordered byte streams (replication, snapshot transfer).
+//! reliable, ordered byte streams (replication, snapshot transfer, RPC).
 //!
-//! A [`tokio::net::TcpStream`] is already `AsyncRead + AsyncWrite`; the only
-//! glue is `tokio_util::compat` to present it as the runtime-agnostic
-//! `futures-io` stream the trait asks for, plus a versioned identity
-//! handshake so the accepting side can attribute the connection. Both ends
-//! disable Nagle's algorithm: framed request/response traffic must not wait
-//! for delayed ACKs.
+//! The endpoint has two modes, chosen by its type parameter:
 //!
-//! Without a [`ClusterSecret`] the handshake only claims the dialer's id: any
-//! party that reaches the listener can claim any id, so such an endpoint
-//! belongs on a private network that only cluster nodes reach. With
+//! * [`TcpPlain`] (the default): cleartext streams after a versioned identity
+//!   handshake (`GNBH`), for cluster nodes on a private network;
+//! * [`TcpTls`] (feature `tls`): mutually authenticated TLS 1.3 streams for
+//!   clients a hub was never configured with, across a trust boundary (see
+//!   the mode's docs).
+//!
+//! Neither mode falls back to the other: a plain endpoint refuses a TLS
+//! handshake and a TLS endpoint refuses a plain hello.
+//!
+//! In plain mode, a [`tokio::net::TcpStream`] is already
+//! `AsyncRead + AsyncWrite`; the only glue is `tokio_util::compat` to present
+//! it as the runtime-agnostic `futures-io` stream the trait asks for. Both
+//! ends of both modes disable Nagle's algorithm: framed request/response
+//! traffic must not wait for delayed ACKs.
+//!
+//! Without a [`ClusterSecret`] the plain handshake only claims the dialer's
+//! id: any party that reaches the listener can claim any id, so such an
+//! endpoint belongs on a private network that only cluster nodes reach. With
 //! [`TcpBulkConfig::secret`] (or [`TcpBulkTransport::dial_only_with`]) both
 //! sides prove they hold the secret through a mutual challenge before any
 //! stream byte flows, and refuse a peer that holds another secret or none
 //! (see `handshake` for the wire). Refusals close the connection and count
-//! in [`TcpBulkTransport::auth_failures`]. The handshake authenticates
+//! in [`TcpBulkTransport::auth_failures`]. The plain handshake authenticates
 //! connection setup only: stream bytes after it carry no integrity protection
 //! and are not bound to the handshake, so an on-path attacker can inject into
-//! or alter RPC traffic. Keep the data plane on a private network, or use a
-//! mutually authenticated TLS mode (not yet implemented) when the network
-//! between nodes crosses a trust boundary.
+//! or alter RPC traffic. Keep a plain data plane on a private network, and use
+//! the TLS mode where the network crosses a trust boundary.
 //!
 //! Accepting is owned by a listener task: every accepted connection runs its
-//! identity handshake in its own task under [`TcpBulkConfig::handshake_timeout`],
-//! at most [`TcpBulkConfig::max_handshakes`] at once, and completed handshakes
-//! queue for [`accept`](BulkTransport::accept). A connection that stalls or
-//! fails its handshake is dropped without delaying or failing other accepts.
+//! handshake in its own task under the handshake deadline, a bounded number at
+//! once, and completed handshakes queue for [`accept`](BulkTransport::accept).
+//! A connection that stalls or fails its handshake is dropped without
+//! delaying or failing other accepts.
 //!
 //! Peer endpoints may be fixed socket addresses or bounded host:port names.
 //! Hostnames are resolved afresh on each connection so pod address churn does
 //! not change the exact `NodeId` used by the bulk protocol.
 
+mod accept;
+mod endpoint;
 mod handshake;
+#[cfg(feature = "tls")]
+mod tls;
 
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use groupnet_core::NodeId;
 use groupnet_transport::auth::ClusterSecret;
 use groupnet_transport::bulk::BulkTransport;
 use groupnet_transport::{MAX_NODE_ID_BYTES, NodeIdError, QueueCapacity, validate_node_id};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs, lookup_host};
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::time::timeout;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-use crate::handshake::check_id;
+pub use endpoint::TcpHostEndpointError;
+#[cfg(feature = "tls")]
+pub use tls::{
+    TcpTls, TcpTlsConfig, TcpTlsConfigError, TcpTlsDialConfig, TcpTlsKey, TcpTlsKeyError,
+    TcpTlsPublicKey, TcpTlsPublicKeyError, TcpTlsStream,
+};
 
-/// Accept-side bounds and the cluster secret of a [`TcpBulkTransport`].
+use crate::handshake::check_id;
+use accept::{Bounds, Listener};
+use endpoint::{PeerEndpoint, Peers};
+
+/// Default deadline for one handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Accept-side bounds and the cluster secret of a plain
+/// [`TcpBulkTransport`].
 #[derive(Clone, Debug)]
 pub struct TcpBulkConfig {
     /// Deadline for one identity handshake to complete, both on accepted
@@ -74,15 +97,15 @@ pub struct TcpBulkConfig {
     /// The secret authenticates connection setup only: bytes after the
     /// handshake carry no integrity protection and are not bound to it, so an
     /// on-path attacker can inject into or alter RPC traffic. Keep the data
-    /// plane on a private network, or use a mutually authenticated TLS mode
-    /// (not yet implemented) where it crosses a trust boundary.
+    /// plane on a private network, or use the `TcpTls` mode (feature `tls`)
+    /// where it crosses a trust boundary.
     pub secret: Option<ClusterSecret>,
 }
 
 impl Default for TcpBulkConfig {
     fn default() -> Self {
         Self {
-            handshake_timeout: Duration::from_secs(5),
+            handshake_timeout: HANDSHAKE_TIMEOUT,
             max_handshakes: QueueCapacity::of(64),
             accept_queue: QueueCapacity::of(64),
             secret: None,
@@ -126,88 +149,52 @@ impl From<TcpBulkConfigError> for io::Error {
     }
 }
 
-/// Why [`TcpBulkTransport::register_peer_host`] rejected a `host:port`
-/// endpoint. Converts into an `InvalidInput` `io::Error` that keeps this
-/// error as its inner error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TcpHostEndpointError {
-    /// The endpoint is longer than the host-endpoint bound.
-    TooLong {
-        /// The endpoint's length in bytes.
-        len: usize,
-        /// The longest endpoint accepted, in bytes.
-        max: usize,
-    },
-    /// The endpoint contains ASCII whitespace or one of `/`, `\`, `@`, `#`.
-    ForbiddenByte {
-        /// The offending byte.
-        byte: u8,
-        /// Its offset in the endpoint.
-        index: usize,
-    },
-    /// The endpoint has no `:port` suffix.
-    MissingPort,
-    /// The host before the final `:` is empty.
-    EmptyHost,
-    /// The port after the final `:` is not a decimal number from 1 to 65535.
-    InvalidPort,
-}
-
-impl std::fmt::Display for TcpHostEndpointError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooLong { len, max } => {
-                write!(
-                    f,
-                    "host endpoint is {len} bytes, above the {max}-byte bound"
-                )
-            }
-            Self::ForbiddenByte { byte, index } => write!(
-                f,
-                "host endpoint byte {byte:#04x} at offset {index} is not allowed"
-            ),
-            Self::MissingPort => f.write_str("host endpoint requires a :port suffix"),
-            Self::EmptyHost => f.write_str("host endpoint has an empty host"),
-            Self::InvalidPort => f.write_str("host endpoint port must be 1 to 65535"),
-        }
-    }
-}
-
-impl std::error::Error for TcpHostEndpointError {}
-
-impl From<TcpHostEndpointError> for io::Error {
-    fn from(error: TcpHostEndpointError) -> Self {
-        Self::new(io::ErrorKind::InvalidInput, error)
-    }
-}
-
 /// A TCP-backed data-plane transport endpoint.
 ///
-/// [`bind`](Self::bind) makes an endpoint that listens and dials.
-/// [`dial_only`](Self::dial_only) makes one that only dials: a client that
-/// calls the nodes of a cluster without being reachable itself. Dropping the
-/// endpoint cancels its listener task and every pending handshake.
+/// The mode parameter `M` fixes how connections are secured, and each mode
+/// has only its own settings:
+///
+/// * `TcpBulkTransport<TcpPlain>` (the default, written `TcpBulkTransport`):
+///   [`bind`](Self::bind) makes an endpoint that listens and dials;
+///   [`dial_only`](Self::dial_only) makes one that only dials: a client that
+///   calls the nodes of a cluster without being reachable itself.
+/// * `TcpBulkTransport<TcpTls>` (feature `tls`): `bind_tls` makes a hub that
+///   admits clients it was never configured with; `dial_only_tls` makes a
+///   client. Every connection is mutually authenticated TLS 1.3.
+///
+/// Dropping the endpoint cancels its listener task and every pending
+/// handshake.
 #[derive(Debug)]
-pub struct TcpBulkTransport {
+pub struct TcpBulkTransport<M = TcpPlain> {
     identity: Arc<Identity>,
-    listener: Option<Listener>,
-    peers: RwLock<HashMap<NodeId, PeerEndpoint>>,
+    addr: Option<SocketAddr>,
+    mode: M,
+}
+
+/// The cleartext mode of a [`TcpBulkTransport`]: the `GNBH` identity
+/// handshake, keyed by an optional [`ClusterSecret`]. Built by
+/// [`bind`](TcpBulkTransport::bind), [`bind_with`](TcpBulkTransport::bind_with),
+/// [`dial_only`](TcpBulkTransport::dial_only) and
+/// [`dial_only_with`](TcpBulkTransport::dial_only_with).
+#[derive(Debug)]
+pub struct TcpPlain {
+    secret: Option<Arc<ClusterSecret>>,
+    listener: Option<Listener<TcpStream>>,
+    peers: Peers<PeerEndpoint>,
 }
 
 /// What the dialing side and every accepted handshake of one endpoint share.
 #[derive(Debug)]
 struct Identity {
     local: NodeId,
-    secret: Option<ClusterSecret>,
     handshake_timeout: Duration,
     auth_failures: AtomicU64,
 }
 
 impl Identity {
-    fn new(local: NodeId, secret: Option<ClusterSecret>, handshake_timeout: Duration) -> Arc<Self> {
+    fn new(local: NodeId, handshake_timeout: Duration) -> Arc<Self> {
         Arc::new(Self {
             local,
-            secret,
             handshake_timeout,
             auth_failures: AtomicU64::new(0),
         })
@@ -217,34 +204,51 @@ impl Identity {
     fn refused(&self) {
         self.auth_failures.fetch_add(1, Ordering::SeqCst);
     }
-}
 
-const MAX_HOST_ENDPOINT_BYTES: usize = 320;
-const MAX_RESOLVED_ADDRESSES: usize = 8;
-
-#[derive(Clone, Debug)]
-enum PeerEndpoint {
-    Address(SocketAddr),
-    Host(String),
-}
-
-type Accepted = io::Result<(NodeId, TcpStream)>;
-
-/// The listener task and the queue of connections it has attributed.
-#[derive(Debug)]
-struct Listener {
-    addr: SocketAddr,
-    accepted: AsyncMutex<mpsc::Receiver<Accepted>>,
-    task: JoinHandle<()>,
-}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        self.task.abort();
+    /// Runs a dialed handshake under the deadline, counting a failure.
+    async fn dialed<T>(&self, handshake: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+        let dialed = timeout(self.handshake_timeout, handshake)
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "peer missed the handshake deadline",
+                ))
+            });
+        if dialed.is_err() {
+            self.refused();
+        }
+        dialed
     }
 }
 
-impl TcpBulkTransport {
+impl<M> TcpBulkTransport<M> {
+    /// Handshakes this endpoint refused or that failed since it was made:
+    /// accepted connections whose hello had another version or mode, whose
+    /// answer was wrong, whose claim was refused, or that closed or stalled
+    /// before answering, and dialed connections whose peer did not
+    /// authenticate, refused this endpoint, or missed the handshake deadline.
+    /// Each one closed its connection.
+    #[must_use]
+    pub fn auth_failures(&self) -> u64 {
+        self.identity.auth_failures.load(Ordering::SeqCst)
+    }
+
+    /// This endpoint's local node id.
+    #[must_use]
+    pub fn local_id(&self) -> &NodeId {
+        &self.identity.local
+    }
+
+    /// The address the listener was bound to (useful with an ephemeral `:0`),
+    /// cached at bind; `None` for a dial-only endpoint, which has no listener.
+    #[must_use]
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.addr
+    }
+}
+
+impl TcpBulkTransport<TcpPlain> {
     /// Binds a listening TCP socket for `local` with the default
     /// [`TcpBulkConfig`]. Register peers with
     /// [`register_peer`](Self::register_peer) before connecting out.
@@ -274,23 +278,32 @@ impl TcpBulkTransport {
         check_id(&local)?;
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
-        let (queue, accepted) = mpsc::channel(config.accept_queue.get());
-        let identity = Identity::new(local, config.secret, config.handshake_timeout);
-        let task = tokio::spawn(accept_loop(
-            listener,
-            queue,
-            config.max_handshakes,
-            config.handshake_timeout,
-            identity.clone(),
-        ));
+        let identity = Identity::new(local, config.handshake_timeout);
+        let secret = config.secret.map(Arc::new);
+        let bounds = Bounds {
+            max_handshakes: config.max_handshakes,
+            accept_queue: config.accept_queue,
+            max_connections: None,
+        };
+        let accepting = identity.clone();
+        let keyed = secret.clone();
+        let listener = Listener::spawn(listener, bounds, identity.clone(), move |sock, _, _| {
+            let identity = accepting.clone();
+            let secret = keyed.clone();
+            async move {
+                let mut sock = sock;
+                let from = handshake::accept(&mut sock, &identity.local, secret.as_deref()).await?;
+                Ok((from, sock))
+            }
+        });
         Ok(Self {
             identity,
-            listener: Some(Listener {
-                addr,
-                accepted: AsyncMutex::new(accepted),
-                task,
-            }),
-            peers: RwLock::new(HashMap::new()),
+            addr: Some(addr),
+            mode: TcpPlain {
+                secret,
+                listener: Some(listener),
+                peers: Peers::new(),
+            },
         })
     }
 
@@ -326,35 +339,14 @@ impl TcpBulkTransport {
     fn dialer(local: NodeId, secret: Option<ClusterSecret>) -> Result<Self, NodeIdError> {
         validate_node_id(&local, MAX_NODE_ID_BYTES)?;
         Ok(Self {
-            identity: Identity::new(local, secret, TcpBulkConfig::default().handshake_timeout),
-            listener: None,
-            peers: RwLock::new(HashMap::new()),
+            identity: Identity::new(local, HANDSHAKE_TIMEOUT),
+            addr: None,
+            mode: TcpPlain {
+                secret: secret.map(Arc::new),
+                listener: None,
+                peers: Peers::new(),
+            },
         })
-    }
-
-    /// Handshakes this endpoint refused or that failed since it was made:
-    /// accepted connections whose hello had another version or mode, whose
-    /// answer was wrong, or that closed or stalled before answering, and
-    /// dialed connections whose peer did not authenticate, refused this
-    /// endpoint, or missed the handshake deadline. Each one closed its
-    /// connection.
-    #[must_use]
-    pub fn auth_failures(&self) -> u64 {
-        self.identity.auth_failures.load(Ordering::SeqCst)
-    }
-
-    /// This endpoint's local node id.
-    #[must_use]
-    pub fn local_id(&self) -> &NodeId {
-        &self.identity.local
-    }
-
-    /// The address the listener was bound to (useful with an ephemeral `:0`),
-    /// cached at bind; `None` for a [`dial_only`](Self::dial_only) endpoint,
-    /// which has no listener.
-    #[must_use]
-    pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.listener.as_ref().map(|listener| listener.addr)
     }
 
     /// Teaches this endpoint that `node` listens at `addr`.
@@ -362,10 +354,7 @@ impl TcpBulkTransport {
     /// # Panics
     /// If the address book was poisoned by a panic in another thread.
     pub fn register_peer(&self, node: NodeId, addr: SocketAddr) {
-        self.peers
-            .write()
-            .expect("peers lock poisoned")
-            .insert(node, PeerEndpoint::Address(addr));
+        self.mode.peers.insert(node, PeerEndpoint::Address(addr));
     }
 
     /// Registers a bounded host:port endpoint, resolved anew on every connect.
@@ -384,184 +373,35 @@ impl TcpBulkTransport {
         node: NodeId,
         host: String,
     ) -> Result<(), TcpHostEndpointError> {
-        check_host_endpoint(&host)?;
-        self.peers
-            .write()
-            .expect("peers lock poisoned")
-            .insert(node, PeerEndpoint::Host(host));
+        self.mode.peers.insert(node, PeerEndpoint::host(host)?);
         Ok(())
     }
 }
 
-/// Checks a `host:port` endpoint for [`TcpBulkTransport::register_peer_host`].
-fn check_host_endpoint(host: &str) -> Result<(), TcpHostEndpointError> {
-    if host.len() > MAX_HOST_ENDPOINT_BYTES {
-        return Err(TcpHostEndpointError::TooLong {
-            len: host.len(),
-            max: MAX_HOST_ENDPOINT_BYTES,
-        });
-    }
-    let forbidden =
-        |byte: u8| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'@' | b'#');
-    if let Some(index) = host.bytes().position(forbidden) {
-        return Err(TcpHostEndpointError::ForbiddenByte {
-            byte: host.as_bytes()[index],
-            index,
-        });
-    }
-    let Some((name, port)) = host.rsplit_once(':') else {
-        return Err(TcpHostEndpointError::MissingPort);
-    };
-    if name.is_empty() {
-        return Err(TcpHostEndpointError::EmptyHost);
-    }
-    if port.parse::<u16>().ok().is_none_or(|port| port == 0) {
-        return Err(TcpHostEndpointError::InvalidPort);
-    }
-    Ok(())
-}
-
-impl BulkTransport for TcpBulkTransport {
+impl BulkTransport for TcpBulkTransport<TcpPlain> {
     type Error = io::Error;
     type Stream = Compat<TcpStream>;
 
     async fn connect(&self, to: &NodeId) -> io::Result<Self::Stream> {
-        // Resolve without holding the lock across the await.
-        let endpoint = self
-            .peers
-            .read()
-            .expect("peers lock poisoned")
-            .get(to)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown peer"))?;
-        let mut sock = match endpoint {
-            PeerEndpoint::Address(addr) => TcpStream::connect(addr).await?,
-            PeerEndpoint::Host(host) => {
-                let addresses = lookup_host(&host)
-                    .await?
-                    .take(MAX_RESOLVED_ADDRESSES + 1)
-                    .collect::<Vec<_>>();
-                if addresses.is_empty() || addresses.len() > MAX_RESOLVED_ADDRESSES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "resolved address count outside bound",
-                    ));
-                }
-                let mut last = None;
-                let mut connected = None;
-                for address in addresses {
-                    match TcpStream::connect(address).await {
-                        Ok(stream) => {
-                            connected = Some(stream);
-                            break;
-                        }
-                        Err(error) => last = Some(error),
-                    }
-                }
-                connected.ok_or_else(|| {
-                    last.unwrap_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "no reachable peer address")
-                    })
-                })?
-            }
-        };
-        sock.set_nodelay(true)?;
+        let mut sock = self.mode.peers.get(to)?.open().await?;
         let identity = &self.identity;
-        let dialed = timeout(
-            identity.handshake_timeout,
-            handshake::dial(&mut sock, &identity.local, to, identity.secret.as_ref()),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "peer missed the handshake deadline",
+        identity
+            .dialed(handshake::dial(
+                &mut sock,
+                &identity.local,
+                to,
+                self.mode.secret.as_deref(),
             ))
-        });
-        if let Err(error) = dialed {
-            identity.refused();
-            return Err(error);
-        }
+            .await?;
         Ok(sock.compat())
     }
 
     async fn accept(&self) -> io::Result<(NodeId, Self::Stream)> {
-        let Some(listener) = &self.listener else {
+        let Some(listener) = &self.mode.listener else {
             // A dial-only endpoint has nothing to accept.
             return std::future::pending().await;
         };
-        let (from, sock) = listener
-            .accepted
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "TCP bulk listener stopped")
-            })??;
+        let (from, sock) = listener.accept().await?;
         Ok((from, sock.compat()))
     }
-}
-
-/// Accepts connections while handshake slots are free, giving each its own
-/// deadline-bounded handshake task. Listener errors are forwarded to
-/// [`BulkTransport::accept`] as before; handshake failures only drop their own
-/// connection. Pending handshakes are owned here and cancelled with the loop.
-async fn accept_loop(
-    listener: TcpListener,
-    queue: mpsc::Sender<Accepted>,
-    max_handshakes: QueueCapacity,
-    deadline: Duration,
-    identity: Arc<Identity>,
-) {
-    let slots = Arc::new(Semaphore::new(max_handshakes.get()));
-    let mut handshakes = JoinSet::new();
-    loop {
-        while handshakes.try_join_next().is_some() {}
-        let Ok(slot) = slots.clone().acquire_owned().await else {
-            return;
-        };
-        match listener.accept().await {
-            Ok((sock, _addr)) => {
-                handshakes.spawn(attribute(
-                    sock,
-                    queue.clone(),
-                    deadline,
-                    identity.clone(),
-                    slot,
-                ));
-            }
-            Err(error) => {
-                if queue.send(Err(error)).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Attributes one accepted connection. The slot is held until the connection
-/// is queued, so stalled and unconsumed connections share one bound. A
-/// handshake that fails or misses its deadline is counted before its socket
-/// closes.
-async fn attribute(
-    mut sock: TcpStream,
-    queue: mpsc::Sender<Accepted>,
-    deadline: Duration,
-    identity: Arc<Identity>,
-    _slot: OwnedSemaphorePermit,
-) {
-    if sock.set_nodelay(true).is_err() {
-        return;
-    }
-    let accepted = timeout(
-        deadline,
-        handshake::accept(&mut sock, &identity.local, identity.secret.as_ref()),
-    )
-    .await;
-    let Ok(Ok(from)) = accepted else {
-        identity.refused();
-        return;
-    };
-    let _ = queue.send(Ok((from, sock))).await;
 }

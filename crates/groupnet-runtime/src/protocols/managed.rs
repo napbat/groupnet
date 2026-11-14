@@ -6,20 +6,21 @@ use groupnet_core::{GroupId, NodeId};
 use groupnet_messaging::{Bytes, MessageId, MessageProtocol, Messaging, MessagingConfig};
 use groupnet_streams::{OrderedProtocol, SessionProtocol, UnorderedOptions, UnorderedProtocol};
 
-use super::{Node, ReceiveBinding};
+use super::{Participant, ReceiveBinding};
 use crate::messaging::{Frame, ReceiveHandle};
 
-/// A managed view over one of a node's shared built-in protocol engines.
+/// A managed view over one of a participant's shared built-in protocol engines.
 ///
 /// [`Endpoint::protocol`](super::Endpoint::protocol) and
 /// [`Peer::protocol`](super::Peer::protocol) return this view for [`Messages`](super::Messages),
 /// [`Ordered`](super::Ordered) and [`Unordered`](super::Unordered). It forwards
 /// sends, connects and accepts through [`MessageProtocol`] and
-/// [`SessionProtocol`], receives through the node's single-owner inbox
+/// [`SessionProtocol`], receives through the participant's single-owner inbox
 /// ([`ReceiveBinding`]) and observes engine shutdown with `closed`. It never
-/// exposes the engine's raw receive queue, which the node dispatcher owns, nor
-/// its shutdown, which would stop the engine for every handle on the node; the
-/// engines stop only when the node closes.
+/// exposes the engine's raw receive queue, which the dispatcher owns, nor its
+/// shutdown, which would stop the engine for every handle on the participant;
+/// the engines stop only when the [`Node`](crate::Node) or
+/// [`Client`](crate::Client) closes.
 ///
 /// Custom [`PeerImplementation`](super::PeerImplementation)s can wrap a clone
 /// of this view to build on a built-in protocol.
@@ -78,7 +79,9 @@ impl<P: fmt::Debug> fmt::Debug for ManagedProtocol<P> {
 }
 
 impl ManagedProtocol<Messaging> {
-    /// The node-wide messaging bounds fixed at [`NodeBuilder::messaging`](crate::NodeBuilder::messaging).
+    /// The node-wide messaging bounds fixed at
+    /// [`NodeBuilder::messaging`](crate::NodeBuilder::messaging) or
+    /// [`ClientBuilder::messaging`](crate::ClientBuilder::messaging).
     #[must_use]
     pub fn config(&self) -> &MessagingConfig {
         self.engine.config()
@@ -136,16 +139,19 @@ impl<P: MessageProtocol> MessageProtocol for ManagedProtocol<P> {
 impl ReceiveBinding for ManagedProtocol<Messaging> {
     type Handle = ReceiveHandle;
 
-    fn recv_frame(&self, node: &Node) -> impl Future<Output = io::Result<Frame>> + Send {
-        node.recv_frame()
+    fn recv_frame(
+        &self,
+        participant: &Participant,
+    ) -> impl Future<Output = io::Result<Frame>> + Send {
+        participant.recv_frame()
     }
 
-    fn on_frame<F, Fut>(&self, node: &Node, callback: F) -> io::Result<ReceiveHandle>
+    fn on_frame<F, Fut>(&self, participant: &Participant, callback: F) -> io::Result<ReceiveHandle>
     where
         F: FnMut(Frame) -> Fut + Send + 'static,
         Fut: Future<Output = io::Result<()>> + Send + 'static,
     {
-        node.on_frame(callback)
+        participant.on_frame(callback)
     }
 }
 

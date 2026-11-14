@@ -1,10 +1,14 @@
 # Groupnet
 
-A **deterministic, leaderless-by-default coordination fabric** for distributed
-systems that partition state into shard groups. Groupnet is an *engine*, not a
+The **network substrate for distributed applications**: clusters that
+partition state into shard groups, services that many clients connect to, and
+(on the roadmap) VPN-style overlays. At its center is a **deterministic,
+leaderless-by-default coordination fabric**. Groupnet is an *engine*, not a
 database: it gives you group-local membership, an implicit (derived,
 non-elected) coordinator, inter-group routing awareness, and shard-scoped
-operations. Consensus is **opt-in per group** — the Hosted mode's Quorum
+operations. Peers join at run time through application admission; configured
+peers are only seeds. A hub can admit clients that dial it and take no part in
+membership ([clients of one node](docs/client-role.md)). Consensus is **opt-in per group** — the Hosted mode's Quorum
 profile, epoch-fenced and majority-committed — while the general replicated-log
 machine (log repair, compaction, reconfiguration) is deliberately absent. You
 bring the storage and the wire.
@@ -87,17 +91,17 @@ streams only when the application asks for them.
 | [`groupnet-transport`](crates/groupnet-transport) | both | core, bytes *(+framing: zerocopy, tokio I/O traits; +bulk: framing, futures-io; +link: tokio, tokio-util, futures-util; +auth: ring)* | runtime-free `Transport` and validated `QueueCapacity`, shared length-prefix `framing`, optional `BulkTransport`, shared object-safe link registration/lifecycle, and the cluster's shared `auth::ClusterSecret` |
 | [`groupnet-transport-mem`](crates/groupnet-transport-mem) | both | transport, core, tokio(sync) *(+bulk feature: transport(bulk), tokio(io-util), tokio-util(compat))* | in-process bindings (tests, examples, single-process): datagrams always, `MemBulkNet` byte streams under feature `bulk` |
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
-| [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) *(+bulk: transport(auth))* | persistent TCP messages (`TcpMsgTransport`), TCP streams (`TcpBulkTransport`, mutually authenticated under a cluster secret), and `TcpLink` registration |
-| [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | control | transport(link), core, tokio | native named pipes/Unix sockets and `IpcLink` registration |
+| [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) *(+bulk: transport(auth))* *(+tls: rustls, tokio-rustls, ring, transport(link))* | persistent TCP messages (`TcpMsgTransport`), TCP streams (`TcpBulkTransport`, mutually authenticated under a cluster secret; with feature `tls`, a TLS 1.3 hub admitting dial-only clients with per-connection keys and pinned hub keys), and `TcpLink` registration |
+| [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | both | transport(link), core, tokio *(+bulk feature: transport(bulk), tokio-util(compat))* | native named pipes/Unix sockets: persistent messages (`IpcTransport`) and `IpcLink` registration; local streams (`IpcBulkTransport`, a hub admitting dial-only clients through an optional admission policy) under feature `bulk` |
 | [`groupnet-transport-punch`](crates/groupnet-transport-punch) | connectivity | transport admission/session primitives, core, tokio, ring, socket2, if-addrs | native adjacent-node UDP/TCP connections, candidate checks, rendezvous and relay; no transport or router link |
 | [`groupnet-network`](crates/groupnet-network) | both | transport(auth, bulk, link), tokio, rustls, ring | protocol-independent group-network routing (frames sealed under an optional cluster secret) and pinned end-to-end TLS streams |
 | [`groupnet-messaging`](crates/groupnet-messaging) | application packets | core, network, bytes, ring, tokio, tokio-util | static send-only `MessageProtocol`, generic receipt contexts, `Messaging` endpoint, bounded retry/deduplication |
 | [`groupnet-streams`](crates/groupnet-streams) | sessions | core, network, transport(bulk), bytes, ring, futures-util, tokio, tokio-util | static `SessionProtocol`, shared protocol engines, authenticated session policies |
-| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), messaging, streams, network, tokio | non-generic managed `Node`, unsealed `PeerImplementation` / `ReceiveBinding`, generic `Endpoint<P>` / `Peer<P>` over restricted `ManagedProtocol` views, group actors, receive callbacks/fanout reports, and `FileGrantStore` |
-| [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
+| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), messaging, streams, network, tokio | non-generic managed `Node` and the group-less `Client` role over one shared `Participant`, unsealed `PeerImplementation` / `ReceiveBinding`, generic `Endpoint<P>` / `Peer<P>` over restricted `ManagedProtocol` views, group actors, receive callbacks/fanout reports, and `FileGrantStore` |
+| [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC and credit-bounded server-push subscriptions over the data plane: concurrent calls and subscriptions multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler and subscription limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff` or `volatile-bootstrap-bulk`)* | core, runtime, tokio(sync) *(+handoff or volatile-bootstrap-bulk feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; two opt-in pieces reach the data plane: the `handoff` tier, to pull a covering snapshot a gap cannot replay, and `volatile-bootstrap-bulk`, volatile recovery's bounded peer bootstrap transfer |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
-| [`groupnet`](crates/groupnet) | — | facade | one module per crate; `runtime`+`mem` default; binding features (`mem`, `tcp`, `udp`, `ipc`) × capability features (`runtime`, `bulk`, `connectivity`), plus `rpc`, `consistency*`, `sim` |
+| [`groupnet`](crates/groupnet) | — | facade | one module per crate; `runtime`+`mem` default; binding features (`mem`, `tcp`, `udp`, `ipc`) × capability features (`runtime`, `bulk`, `connectivity`, `tls`), plus `rpc`, `consistency*`, `sim` |
 | [`groupnet-testkit`](crates/groupnet-testkit) | — | core *(+cluster feature: runtime, transport-mem, tokio)* | shared test support: sans-IO frame fixtures + an async multi-node harness. Internal, `publish = false`, dev-dependency only |
 
 Every runtime node owns a routed network. Use
@@ -145,7 +149,9 @@ selected capability it supports. **Bindings** choose transport crates: `mem` (de
 routing, sessions and link registration), `bulk` (data-plane streams) and
 `connectivity` (native traversal under TCP/UDP links). So `tcp` alone is the TCP
 control plane (`TcpMsgTransport`), `tcp` with `bulk` adds `TcpBulkTransport`,
-and `tcp` with `runtime` adds `TcpLink`. `rpc` implies `bulk`; `dns` adds the
+and `tcp` with `runtime` adds `TcpLink`; likewise `ipc` with `bulk` adds
+`IpcBulkTransport`. `tls` (implies `bulk`) adds, with `tcp`, the TLS mode of
+`TcpBulkTransport`. `rpc` implies `bulk`; `dns` adds the
 system seed resolver; `consistency` and its `consistency-*` tiers add
 `groupnet::consistency`; `sim` adds the simulator. The
 [facade crate docs](crates/groupnet/src/lib.rs) carry the full feature table.
@@ -169,6 +175,8 @@ cargo run --example native-traversal --features udp,tcp,connectivity -- --ipv6
 cargo run --example connectivity-bridge --features tcp,connectivity  # memory A -> TCP edge B -> remote C
 cargo run --example connectivity-bridge --features tcp,connectivity -- --relay-only
 cargo run --example connectivity-bridge --features tcp,connectivity -- --upgrade
+cargo run --example hub --features ipc,rpc  # dial-only clients call a hub and receive pushed events
+cargo run --example client --features ipc  # a runtime client messages its hub node, outside its membership
 ```
 
 Five more live with the layers they exercise:
@@ -537,8 +545,10 @@ median bulk rate as a share of the TLS baseline.
 
 ### Endpoint ownership
 
-`Node` owns and caches the distinct underlying protocol engines; `Endpoint<P>`
-and `Peer<P>` are handles over that shared state, not new workers. Node-wide
+A `Node` or a `Client` owns one `Participant` (`node.participant()`), which owns
+and caches the distinct underlying protocol engines; `Endpoint<P>` and
+`Peer<P>` are handles over that shared state, not new workers, and
+`endpoint.participant()` returns it. Node-wide
 `UnorderedConfig` (fixed by `NodeBuilder::unordered`) is separate from the
 per-handle delivery/setup options selected by `Unordered`.
 `Messages::new(SendOptions)` and `Unordered::new(UnorderedOptions)` bind explicit
@@ -566,10 +576,10 @@ and accepts use the generic handles.
 Custom descriptors implement the public, unsealed `PeerImplementation` trait
 (`groupnet::runtime::PeerImplementation`). Its associated `Protocol` and
 cloneable `Options` types identify the concrete protocol engine and bound
-options; `bind(self, node: &Node)` returns that protocol/options pair as an
-`io::Result`. Custom implementations can resolve shared node resources — a
-built-in endpoint's `ManagedProtocol` view composes — and return their own
-protocol without changing `Node` or using dynamic dispatch. The protocol engine
+options; `bind(self, participant: &Participant)` returns that protocol/options
+pair as an `io::Result`. Custom implementations can resolve shared resources —
+a built-in endpoint's `ManagedProtocol` view composes — and return their own
+protocol without changing `Node` or `Client` or using dynamic dispatch. The protocol engine
 implements the unsealed `MessageProtocol` (`groupnet::messaging`) or
 `SessionProtocol` (`groupnet::streams`) contract; no per-call future boxing is
 required. `MessageProtocol` is send-only: it associates send options and a
@@ -591,6 +601,54 @@ handle can reach the raw messaging worker queue: use message endpoints,
 does not install its protocol on the remote node. Application timers decide
 continuous traffic versus periodic polling; neither requires rebuilding a peer
 or endpoint between sends.
+
+### Clients of a hub
+
+A `Client` is a participant that takes no part in membership: it binds the same
+`Endpoint<P>` / `Peer<P>` handles and node-addressed `send` / `recv` /
+`on_recv` as a `Node`, but it joins no group (not even the reserved routing
+group), gossips nothing, runs no discovery and never forwards transit traffic.
+`Client::builder(id)` offers only the settings that apply to it — links,
+routing limits, tunnels and the messaging, ordered and unordered policies — and
+`start()` refuses a `RouterConfig` with `forwarding: true` (a typed
+`ClientConfigError`). A hub is an ordinary `Node` that admits the client
+through its link admission; group-addressed frames sent to a client are
+refused. `client.close()` closes its network and releases its links, so the
+hub can admit the same identity again.
+
+```rust
+use groupnet::core::NodeId;
+use groupnet::runtime::{Client, Messages, Node};
+use groupnet::transport::Bytes;
+use groupnet::transport::admission::OpenAdmission;
+use groupnet::transport::ipc::{IpcAddress, IpcLink, PeerEndpoint};
+use std::{io, sync::Arc, time::Duration};
+
+/// A hub that admits any local peer, and a client that only dials it.
+async fn hub_and_tool(address: IpcAddress) -> io::Result<()> {
+    let hub_id = NodeId::new("hub");
+    let hub = Node::builder(hub_id.clone())
+        .link(IpcLink::new(address.clone(), Vec::new()).with_admission(Arc::new(OpenAdmission)))
+        .start()
+        .await?;
+    let tool = Client::builder(NodeId::new("tool"))
+        .link(IpcLink::dial_only(vec![PeerEndpoint::new(hub_id.clone(), address)]))
+        .start()
+        .await?;
+    let hub_peer = tool.peer(hub_id, Messages::delivered(Duration::from_secs(5)))?;
+    hub_peer.send(Bytes::from_static(b"status?")).await?;
+    let (context, _request) = hub.recv().await?;
+    context.applied()?;
+    tool.close().await;
+    hub.close().await;
+    Ok(())
+}
+```
+
+Ordered and unordered sessions between a client and its hub need
+`ClientBuilder::tunnels`, configured as for a node. See
+[clients of one node](docs/client-role.md) for the whole contract and
+`examples/client.rs` for a runnable hub and client.
 
 ### Node-owned heterogeneous connections
 
@@ -1086,6 +1144,65 @@ pinned TLS streams form a data plane too: `DataPlane::new(node.clone())` shares
 the node's `Ordered` endpoint. The control-plane coordination core is untouched
 by any of it.
 
+Between processes of one host, `groupnet::transport::ipc::IpcBulkTransport`
+(features `ipc` and `bulk`) is the same data plane over named pipes or Unix
+sockets, shaped for a hub and its clients: `bind` / `bind_with` listen and admit
+clients the hub was never configured with through an optional admission policy
+(`IpcBulkConfig::admission`; without one every local peer is accepted, the
+operating system boundary being the trust boundary), while
+`IpcBulkTransport::dial_only` makes a client that registers hub addresses,
+presents an opaque credential and never listens. Handshakes are bounded in time
+and number as on TCP, and `groupnet-rpc` runs over it unchanged.
+
+### TLS hubs and clients (feature `tls`)
+
+Across a trust boundary, `TcpBulkTransport<TcpTls>` (features `tcp` and `tls`)
+is the same data plane over mutually authenticated TLS 1.3. A hub
+(`TcpBulkTransport::bind_tls`) holds a long-lived `TcpTlsKey` and admits
+clients it was never configured with through an `Admission` policy. A client
+(`TcpBulkTransport::dial_only_tls`) pins each hub's public key with
+`register_peer` and generates a fresh key for every connection; it refuses a
+hub that presents another key before it sends its claim or credential. Inside
+TLS the client claims its id and presents its credential; the hub's policy
+judges them with the client's address, and the admitted stream is that TLS
+connection, so the claim stays bound to the client's key for the stream's life.
+A TLS endpoint and a plain one refuse each other; nothing falls back to
+cleartext.
+
+```rust
+use std::sync::Arc;
+
+use groupnet::core::NodeId;
+use groupnet::transport::admission::Admission;
+use groupnet::transport::bulk::DataPlane;
+use groupnet::transport::tcp::{
+    TcpBulkTransport, TcpTls, TcpTlsConfig, TcpTlsDialConfig, TcpTlsKey, TcpTlsPublicKey,
+};
+
+type TlsPlane = DataPlane<TcpBulkTransport<TcpTls>>;
+
+/// The hub: its long-lived key, kept in a secret store, and the application's
+/// admission policy. Clients pin `key.public_key().as_der()`.
+async fn hub(stored: Vec<u8>, policy: Arc<dyn Admission>) -> Result<TlsPlane, Box<dyn std::error::Error>> {
+    let key = TcpTlsKey::from_pkcs8_der(stored)?;
+    let config = TcpTlsConfig::new(key, policy);
+    let hub = TcpBulkTransport::bind_tls(NodeId::new("hub"), "0.0.0.0:8443", config).await?;
+    Ok(DataPlane::new(hub))
+}
+
+/// A client: the hub's address and published key, and its own credential.
+fn client(hub_key: &[u8], token: Vec<u8>) -> Result<TlsPlane, Box<dyn std::error::Error>> {
+    let config = TcpTlsDialConfig {
+        credential: token,
+        ..TcpTlsDialConfig::default()
+    };
+    let client = TcpBulkTransport::dial_only_tls(NodeId::new("tool-1"), config)?;
+    let pin = TcpTlsPublicKey::from_der(hub_key)?;
+    client.register_peer(NodeId::new("hub"), "10.0.0.1:8443".parse()?, pin);
+    Ok(DataPlane::new(client))
+}
+```
+
 ### Cluster secret
 
 By default nothing authenticates a peer: any party that reaches a node's
@@ -1161,9 +1278,8 @@ async fn start(secret: &[u8]) -> Result<(Node, TcpBulkTransport), Box<dyn std::e
   `TcpBulkTransport::auth_failures()`. A hello with any other version is refused.
   The handshake authenticates connection setup only: the stream after it has
   no integrity protection, so an attacker on the network path can inject into
-  or alter RPC bytes. Keep the data plane on a private network, or use a
-  mutually authenticated TLS mode (not yet implemented) when it crosses a
-  trust boundary.
+  or alter RPC bytes. Keep the data plane on a private network, or use the
+  TLS mode (feature `tls`, above) when it crosses a trust boundary.
 
 A keyed node refuses unkeyed peers and peers with another secret, in both
 directions; there is no fallback. The secret proves membership of the
@@ -1173,7 +1289,7 @@ encrypt between individual nodes. `ClusterSecret` keeps ring's HMAC key (its
 precomputed pad states), which is not zeroed on drop, and does not wipe the
 bytes it was built from: zero your own buffer after `ClusterSecret::new`.
 
-### Request/response RPC (feature `rpc`)
+### RPC: calls and subscriptions (feature `rpc`)
 
 For calls rather than streams — "read this key from its owner", "apply this
 write on that replica" — `groupnet::rpc` multiplexes any number of concurrent
@@ -1228,6 +1344,57 @@ RPC stream to `RpcServer::new(handler).serve(from, stream)`; the
 `RpcClient::with_config` and `RpcServer::with_config` return typed
 `RpcConfigError` / `RpcServerConfigError` values. Register peer addresses on the
 transports (`DataPlane::transport`) yourself.
+
+A **subscription** answers many times over the same connection, so a client
+that only dials still receives events. `RpcServer::with_subscriptions` (or
+`with_subscriptions_config`) adds a subscribe handler that sends items through a
+`SubscriptionSink`; `accept_on(plane)` runs its accept loop as `bind` does. The
+client reads a `Subscription` until `None` (the handler returned `Ok(())`), and
+dropping it cancels the handler:
+
+```rust
+use groupnet::core::NodeId;
+use groupnet::rpc::{RpcClient, RpcError, RpcServer, RpcServerHandle, RpcStatus, SubscriptionSink};
+use groupnet::transport::Bytes;
+use groupnet::transport::bulk::{BulkTransport, DataPlane};
+use std::time::Duration;
+
+/// Hub: echoes calls, and counts down from the subscribe's first byte.
+fn serve_countdowns<B: BulkTransport>(plane: DataPlane<B>) -> RpcServerHandle {
+    RpcServer::with_subscriptions(
+        |_from: NodeId, request: Bytes| async move { Ok::<_, RpcStatus>(request) },
+        |_from: NodeId, start: Bytes, mut sink: SubscriptionSink| async move {
+            let start = start.first().copied().ok_or_else(|| RpcStatus::new(400, "empty"))?;
+            for n in (1..=start).rev() {
+                // Waits for the client's credit; fails once it cancels or leaves.
+                if sink.send(Bytes::from(vec![n])).await.is_err() {
+                    break;
+                }
+            }
+            Ok::<(), RpcStatus>(()) // End: the client's `next` yields `None`
+        },
+    )
+    .accept_on(plane)
+}
+
+/// Client (it may dial only): items arrive on the stream it opened.
+async fn count_down<B: BulkTransport>(client: &RpcClient<B>, hub: &NodeId) -> Result<(), RpcError> {
+    let mut countdown = client
+        .subscribe(hub, Bytes::from_static(&[3]), Duration::from_secs(1))
+        .await?; // TooManySubscriptions, Unreachable, NotSent, … : nothing was sent
+    while let Some(item) = countdown.next().await {
+        println!("{}", item?[0]); // Remote(status), ConnectionLost or Shutdown end it early
+    }
+    Ok(())
+}
+```
+
+The server sends at most `RpcConfig::subscription_window` items ahead of what
+the application consumed; the client grants more as `next` consumes them, so a
+subscription nobody reads never holds back the connection's calls or other
+subscriptions. Open subscriptions keep their connection from idling on both
+sides and are bounded by `RpcConfig::max_subscriptions_per_peer` and
+`RpcServerConfig::max_subscriptions_per_connection`.
 
 ## Inter-group routing
 

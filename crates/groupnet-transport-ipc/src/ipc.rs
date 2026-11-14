@@ -5,11 +5,21 @@
 //! Windows uses local named pipes, rejects remote clients, and reserves the first
 //! pipe instance. Peer identities are trusted within this OS security boundary;
 //! this transport is not a cryptographic identity layer.
+//!
+//! A transport is static ([`IpcTransport::bind`]) or admitted
+//! ([`IpcTransport::bind_admitted`], [`IpcTransport::dial_only_admitted`]). A
+//! static transport talks to any local peer that introduces itself and leaves
+//! admission to the router's configured peer list. An admitted transport runs
+//! an [`Admission`](groupnet_transport::admission::Admission) policy on both
+//! sides of every connection and records live peers in a
+//! [`SessionRegistry`], so its peers grow and shrink at run time.
 
 mod address;
+mod admitted;
 mod config;
-mod frame;
-mod platform;
+pub(crate) mod frame;
+mod join;
+pub(crate) mod platform;
 mod runtime;
 
 use std::collections::HashMap;
@@ -22,8 +32,8 @@ use std::{error, fmt, io};
 use bytes::Bytes;
 use groupnet_core::NodeId;
 use groupnet_transport::NodeIdError;
-use groupnet_transport::admission::SessionId;
-use groupnet_transport::link::{LinkConfig, LinkFuture, LinkLifecycle};
+use groupnet_transport::admission::{SessionId, SessionRegistry};
+use groupnet_transport::link::{AdmittedInbound, LinkConfig, LinkFuture, LinkLifecycle};
 use groupnet_transport::{Inbound, Transport};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 /// Largest message accepted by the IPC framing protocol, in bytes.
 pub const MAX_FRAME: usize = 65_000;
 pub use address::IpcAddressError;
+pub use admitted::{IpcAdmission, IpcAdmissionError, IpcConnectPeerError};
 pub use config::{IpcConfig, IpcConfigError};
 
 /// A native, local-only IPC listener address.
@@ -48,6 +59,12 @@ pub enum IpcAddress {
 struct Session {
     generation: u64,
     sender: mpsc::Sender<Bytes>,
+    /// The registry generation of an admitted session, once its join
+    /// reserved the identity. Always `None` on a static transport.
+    admitted: Option<SessionId>,
+    /// Cancels a provisional outbound dial of an admitted transport; only
+    /// such an entry can be replaced by a simultaneous inbound connection.
+    provisional: Option<watch::Sender<bool>>,
 }
 
 #[derive(Debug, Default)]
@@ -80,10 +97,142 @@ struct State {
     config: IpcConfig,
     book: Mutex<Book>,
     slots: Arc<Semaphore>,
-    inbox: AsyncMutex<mpsc::Receiver<Inbound>>,
-    incoming: mpsc::Sender<Inbound>,
+    inbox: AsyncMutex<mpsc::Receiver<AdmittedInbound>>,
+    incoming: mpsc::Sender<AdmittedInbound>,
     commands: mpsc::Sender<runtime::Dial>,
     cancel: CancellationToken,
+    /// Admission state of an admitted transport; `None` for a static one.
+    admission: Option<admitted::Managed>,
+}
+
+impl State {
+    /// Whether `session` belongs to an admitted generation that is no
+    /// longer live: its connection is ending and must not take new frames.
+    fn is_stale(&self, node: &NodeId, session: &Session) -> bool {
+        match (&self.admission, session.admitted) {
+            (Some(managed), Some(id)) => !managed.sessions.is_active(node, id),
+            _ => false,
+        }
+    }
+
+    /// Queues `msg` on the session to `to`, dialing a registered address when
+    /// there is none. `None` only starts the session. Every drop is silent,
+    /// under the best-effort contract: an unknown peer, a full queue, no free
+    /// session slot, or a session that is being revoked.
+    fn enqueue<F: FnOnce() -> Bytes>(
+        &self,
+        to: &NodeId,
+        length: usize,
+        msg: Option<F>,
+    ) -> io::Result<()> {
+        let state = self;
+        if state.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        if length > MAX_FRAME {
+            return Err(IpcSendError::PayloadTooLarge {
+                len: length,
+                max: MAX_FRAME,
+            }
+            .into());
+        }
+        let mut book = state
+            .book
+            .lock()
+            .map_err(|_| io::Error::other("IPC book poisoned"))?;
+        if let Some(session) = book.sessions.get(to) {
+            if state.is_stale(to, session) {
+                return Ok(());
+            }
+            if msg.is_none() {
+                return Ok(());
+            }
+            match session.sender.try_reserve() {
+                Ok(permit) => {
+                    if let Some(msg) = msg {
+                        permit.send(msg());
+                    }
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Full(())) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(())) => {}
+            }
+            book.sessions.remove(to);
+        }
+        let Some(address) = book.peers.get(to).cloned() else {
+            return Ok(());
+        };
+        let Ok(slot) = Arc::clone(&state.slots).try_acquire_owned() else {
+            return Ok(());
+        };
+        let Ok(command) = state.commands.try_reserve() else {
+            return Ok(());
+        };
+        let (sender, frames) = mpsc::channel(state.config.session_queue.get());
+        if let Some(msg) = msg {
+            // The newly allocated queue is empty, so reservation cannot fail.
+            sender
+                .try_send(msg())
+                .map_err(|_| io::Error::other("new IPC queue unavailable"))?;
+        }
+        let generation = book.generation();
+        let (provisional, cancelled) = if state.admission.is_some() {
+            let (provisional, cancelled) = watch::channel(false);
+            (Some(provisional), Some(cancelled))
+        } else {
+            (None, None)
+        };
+        book.sessions.insert(
+            to.clone(),
+            Session {
+                generation,
+                sender,
+                admitted: None,
+                provisional,
+            },
+        );
+        command.send(runtime::Dial {
+            node: to.clone(),
+            address,
+            generation,
+            frames,
+            slot,
+            cancelled,
+        });
+        Ok(())
+    }
+
+    /// Queues an owned frame only on the admitted session of `expected`.
+    fn send_session(&self, to: &NodeId, msg: Bytes, expected: Option<SessionId>) -> io::Result<()> {
+        let state = self;
+        if state.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        if msg.len() > MAX_FRAME {
+            return Err(IpcSendError::PayloadTooLarge {
+                len: msg.len(),
+                max: MAX_FRAME,
+            }
+            .into());
+        }
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let book = state
+            .book
+            .lock()
+            .map_err(|_| io::Error::other("IPC book poisoned"))?;
+        // A queue belongs to one connection for its whole life, so a frame
+        // selected for one generation never reaches a later one.
+        if let Some(session) = book
+            .sessions
+            .get(to)
+            .filter(|session| session.admitted == Some(expected) && !state.is_stale(to, session))
+        {
+            let _ = session.sender.try_send(msg);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -138,20 +287,71 @@ impl IpcTransport {
     /// Returns `InvalidInput` carrying the [`IpcConfigError`] before binding,
     /// in addition to [`Self::bind`] errors.
     pub fn bind_with(local: NodeId, address: &IpcAddress, config: IpcConfig) -> io::Result<Self> {
-        Self::start(address, Preflight::new(local, config)?)
+        Self::start(Some(address), Preflight::new(local, config)?, None)
     }
 
-    /// Opens the listener for an already validated configuration, local
-    /// identity and initial peer book, and starts the workers.
-    pub(crate) fn start(address: &IpcAddress, preflight: Preflight) -> io::Result<Self> {
+    /// Binds an admitted listener: every connection, inbound or outbound,
+    /// runs `admission`'s policy on the remote claim, and live peers are
+    /// recorded in a [`SessionRegistry`] of at most [`IpcConfig::max_peers`]
+    /// identities. Peers the policy admits join at run time; registered
+    /// addresses are only where this endpoint dials.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` carrying the [`IpcAdmissionError`] before
+    /// binding, in addition to [`Self::bind_with`] errors.
+    pub fn bind_admitted(
+        local: NodeId,
+        address: &IpcAddress,
+        config: IpcConfig,
+        admission: IpcAdmission,
+    ) -> io::Result<Self> {
+        admission.validate()?;
+        Self::start(
+            Some(address),
+            Preflight::new(local, config)?,
+            Some(admission),
+        )
+    }
+
+    /// Starts an admitted endpoint without a listener: a client that dials
+    /// registered peers ([`Self::register_peer`], [`Self::connect_peer`]) and
+    /// is reachable only over the sessions it opened.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` carrying the [`IpcAdmissionError`],
+    /// [`IpcConfigError`] or local [`NodeIdError`] before any worker starts,
+    /// and fails without a Tokio runtime.
+    pub fn dial_only_admitted(
+        local: NodeId,
+        config: IpcConfig,
+        admission: IpcAdmission,
+    ) -> io::Result<Self> {
+        admission.validate()?;
+        Self::start(None, Preflight::new(local, config)?, Some(admission))
+    }
+
+    /// Opens the listener, when there is one, for an already validated
+    /// configuration, local identity, initial peer book and admission, and
+    /// starts the workers.
+    pub(crate) fn start(
+        address: Option<&IpcAddress>,
+        preflight: Preflight,
+        admission: Option<IpcAdmission>,
+    ) -> io::Result<Self> {
         let Preflight {
             local,
             config,
             peers,
+            seeds,
         } = preflight;
         tokio::runtime::Handle::try_current()
             .map_err(|_| io::Error::other("IPC requires a Tokio runtime"))?;
-        let listener = platform::Listener::bind(address, config.max_sessions.get())?;
+        let listener = address
+            .map(|address| platform::Listener::bind(address, config.max_sessions.get()))
+            .transpose()?;
+        let admission = admission.map(|admission| {
+            admitted::Managed::new(admission, SessionRegistry::new(config.max_peers), seeds)
+        });
         let (incoming, inbox) = mpsc::channel(config.inbound_queue.get());
         let (commands, receiver) = mpsc::channel(config.max_sessions.get());
         let (finished, done) = watch::channel(false);
@@ -167,6 +367,7 @@ impl IpcTransport {
             incoming,
             commands,
             cancel: CancellationToken::new(),
+            admission,
         });
         tokio::spawn(runtime::run(
             Arc::clone(&state),
@@ -216,6 +417,41 @@ impl IpcTransport {
         Ok(())
     }
 
+    /// Starts the join with a registered peer without sending a frame, unless
+    /// a session or a dial to it already exists. An unregistered peer is
+    /// ignored, following the best-effort send contract.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` carrying [`IpcConnectPeerError`] for a static
+    /// transport, and `BrokenPipe` once the transport is closed.
+    pub fn connect_peer(&self, node: &NodeId) -> io::Result<()> {
+        if self.handle.state.admission.is_none() {
+            return Err(IpcConnectPeerError::AdmissionNotConfigured.into());
+        }
+        self.handle.state.enqueue(node, 0, None::<fn() -> Bytes>)
+    }
+
+    /// The peers registered in the address book so far.
+    pub(crate) fn registered_peers(&self) -> Vec<NodeId> {
+        self.handle
+            .state
+            .book
+            .lock()
+            .map(|book| book.peers.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The live admitted peers of an admitted transport; `None` for a static
+    /// one. Revoking a peer here ends its connection.
+    #[must_use]
+    pub fn sessions(&self) -> Option<&SessionRegistry> {
+        self.handle
+            .state
+            .admission
+            .as_ref()
+            .map(|managed| &managed.sessions)
+    }
+
     /// Cancels listener, connection setup, reads and writes and waits for cleanup.
     ///
     /// Closing one handle closes every clone. Pending and future receives return
@@ -228,60 +464,6 @@ impl IpcTransport {
                 break;
             }
         }
-    }
-
-    fn enqueue(&self, to: &NodeId, length: usize, msg: impl FnOnce() -> Bytes) -> io::Result<()> {
-        let state = &self.handle.state;
-        if state.cancel.is_cancelled() {
-            return Err(closed());
-        }
-        if length > MAX_FRAME {
-            return Err(IpcSendError::PayloadTooLarge {
-                len: length,
-                max: MAX_FRAME,
-            }
-            .into());
-        }
-        let mut book = state
-            .book
-            .lock()
-            .map_err(|_| io::Error::other("IPC book poisoned"))?;
-        if let Some(session) = book.sessions.get(to) {
-            match session.sender.try_reserve() {
-                Ok(permit) => {
-                    permit.send(msg());
-                    return Ok(());
-                }
-                Err(mpsc::error::TrySendError::Full(())) => return Ok(()),
-                Err(mpsc::error::TrySendError::Closed(())) => {}
-            }
-            book.sessions.remove(to);
-        }
-        let Some(address) = book.peers.get(to).cloned() else {
-            return Ok(());
-        };
-        let Ok(slot) = Arc::clone(&state.slots).try_acquire_owned() else {
-            return Ok(());
-        };
-        let Ok(command) = state.commands.try_reserve() else {
-            return Ok(());
-        };
-        let (sender, frames) = mpsc::channel(state.config.session_queue.get());
-        let generation = book.generation();
-        // The newly allocated queue is empty, so reservation cannot fail.
-        sender
-            .try_send(msg())
-            .map_err(|_| io::Error::other("new IPC queue unavailable"))?;
-        book.sessions
-            .insert(to.clone(), Session { generation, sender });
-        command.send(runtime::Dial {
-            node: to.clone(),
-            address,
-            generation,
-            frames,
-            slot,
-        });
-        Ok(())
     }
 }
 
@@ -299,7 +481,11 @@ impl Transport for IpcTransport {
     type Error = io::Error;
 
     fn send(&self, to: &NodeId, msg: &[u8]) -> impl Future<Output = io::Result<()>> {
-        std::future::ready(self.enqueue(to, msg.len(), || Bytes::copy_from_slice(msg)))
+        std::future::ready(self.handle.state.enqueue(
+            to,
+            msg.len(),
+            Some(|| Bytes::copy_from_slice(msg)),
+        ))
     }
 
     fn send_owned_admitted(
@@ -308,14 +494,18 @@ impl Transport for IpcTransport {
         msg: Bytes,
         session: Option<SessionId>,
     ) -> impl Future<Output = io::Result<()>> + Send {
-        std::future::ready(if session.is_some() {
-            Ok(())
-        } else {
-            self.enqueue(to, msg.len(), || msg)
+        std::future::ready(match (&self.handle.state.admission, session) {
+            (Some(_), session) => self.handle.state.send_session(to, msg, session),
+            (None, Some(_)) => Ok(()),
+            (None, None) => self.handle.state.enqueue(to, msg.len(), Some(|| msg)),
         })
     }
 
     async fn recv(&self) -> io::Result<Inbound> {
+        self.recv_admitted().await.map(|admitted| admitted.packet)
+    }
+
+    async fn recv_admitted(&self) -> io::Result<AdmittedInbound> {
         let state = &self.handle.state;
         tokio::select! {
             biased;
@@ -337,6 +527,9 @@ pub(crate) struct Preflight {
     local: NodeId,
     config: IpcConfig,
     peers: HashMap<NodeId, IpcAddress>,
+    /// Configured link peers in their configured order, which an admitted
+    /// transport dials while they hold no session.
+    seeds: Vec<NodeId>,
 }
 
 impl Preflight {
@@ -348,6 +541,7 @@ impl Preflight {
             local,
             config,
             peers: HashMap::new(),
+            seeds: Vec::new(),
         })
     }
 
@@ -375,11 +569,13 @@ impl Preflight {
             platform::validate_address(&address).map_err(IpcPeerError::Address)?;
             preflight.peers.insert(peer.clone(), address);
         }
+        preflight.seeds.clone_from(&link.peers);
         Ok(preflight)
     }
 }
 
-/// Why a peer cannot enter an [`IpcTransport`]'s address book.
+/// Why a peer cannot enter the address book of an [`IpcTransport`] (or, with
+/// feature `bulk`, of an `IpcBulkTransport`).
 #[derive(Debug)]
 pub enum IpcPeerError {
     /// The peer's identity is empty or longer than the 64-byte IPC bound.

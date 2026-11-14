@@ -30,6 +30,12 @@ caption. Dashed arrows represent a logical relationship, feedback, or an explici
 non-guarantee as labeled. Dependency arrows mean **depends on** only in the crate
 dependency diagram; sequence arrows show message/call order, not physical timing.
 
+## Hubs and clients
+
+| Contract | Scope |
+|---|---|
+| [Clients of one node](client-role.md) | Peer lists that grow at run time, admitted IPC, dial-only clients, a data plane for clients, RPC subscriptions, and the build order |
+
 ## Consistency and source-backed replication
 
 These are the detailed design contracts, not additional layers automatically

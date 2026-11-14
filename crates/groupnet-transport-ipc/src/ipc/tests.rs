@@ -2,6 +2,13 @@ use super::*;
 use groupnet_transport::QueueCapacity;
 
 fn transport(config: IpcConfig) -> (IpcTransport, mpsc::Receiver<runtime::Dial>) {
+    transport_with(config, None)
+}
+
+fn transport_with(
+    config: IpcConfig,
+    admission: Option<admitted::Managed>,
+) -> (IpcTransport, mpsc::Receiver<runtime::Dial>) {
     config.validate().unwrap();
     let (incoming, inbox) = mpsc::channel(config.inbound_queue.get());
     let (commands, receiver) = mpsc::channel(config.max_sessions.get());
@@ -15,6 +22,7 @@ fn transport(config: IpcConfig) -> (IpcTransport, mpsc::Receiver<runtime::Dial>)
         incoming,
         commands,
         cancel: CancellationToken::new(),
+        admission,
     });
     (
         IpcTransport {
@@ -56,6 +64,8 @@ async fn owned_packets_keep_storage_and_full_queue_drops_without_copying() {
             Session {
                 generation: 1,
                 sender,
+                admitted: None,
+                provisional: None,
             },
         );
     let packet = Bytes::from(vec![0x5a; 4096]);
@@ -65,9 +75,13 @@ async fn owned_packets_keep_storage_and_full_queue_drops_without_copying() {
         .await
         .unwrap();
     transport
-        .enqueue(&remote, 1, || {
-            panic!("full queues must not allocate borrowed storage")
-        })
+        .handle
+        .state
+        .enqueue(
+            &remote,
+            1,
+            Some(|| panic!("full queues must not allocate borrowed storage")),
+        )
         .unwrap();
     let frame = frames.recv().await.unwrap();
     assert_eq!(frame.as_ptr(), pointer);
@@ -95,12 +109,22 @@ async fn setup_limit_and_session_queue_follow_configuration() {
     transport.send(&first, b"one").await.unwrap();
     transport.send(&first, b"two").await.unwrap();
     transport
-        .enqueue(&first, 1, || panic!("full session queue copied a packet"))
+        .handle
+        .state
+        .enqueue(
+            &first,
+            1,
+            Some(|| panic!("full session queue copied a packet")),
+        )
         .unwrap();
     transport
-        .enqueue(&second, 1, || {
-            panic!("exhausted setup slots copied a packet")
-        })
+        .handle
+        .state
+        .enqueue(
+            &second,
+            1,
+            Some(|| panic!("exhausted setup slots copied a packet")),
+        )
         .unwrap();
     let mut command = commands.try_recv().unwrap();
     assert_eq!(command.node, first);
@@ -143,6 +167,8 @@ async fn static_owned_send_drops_admitted_session_packets() {
             Session {
                 generation: 1,
                 sender,
+                admitted: None,
+                provisional: None,
             },
         );
     let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
@@ -163,4 +189,69 @@ async fn static_owned_send_drops_admitted_session_packets() {
         .unwrap();
     assert_eq!(frames.recv().await.unwrap(), b"static".as_slice());
     assert!(frames.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn admitted_owned_send_reaches_only_the_live_generation() {
+    use groupnet_transport::admission::{AcceptedPeer, OpenAdmission, SessionRegistry};
+
+    let registry = SessionRegistry::new(std::num::NonZeroUsize::MIN);
+    let managed = admitted::Managed::new(
+        IpcAdmission::new(Arc::new(OpenAdmission)),
+        registry.clone(),
+        Vec::new(),
+    );
+    let (transport, _commands) = transport_with(IpcConfig::default(), Some(managed));
+    let remote = NodeId::new("remote");
+    let lease = registry
+        .try_admit(AcceptedPeer::new(remote.clone()))
+        .unwrap();
+    let (sender, mut frames) = mpsc::channel(4);
+    transport
+        .handle
+        .state
+        .book
+        .lock()
+        .expect("book")
+        .sessions
+        .insert(
+            remote.clone(),
+            Session {
+                generation: 1,
+                sender,
+                admitted: Some(lease.id()),
+                provisional: None,
+            },
+        );
+    // A frame without a generation never travels on an admitted transport.
+    transport
+        .send_owned_admitted(&remote, Bytes::from_static(b"untagged"), None)
+        .await
+        .unwrap();
+    transport
+        .send_owned_admitted(&remote, Bytes::from_static(b"live"), Some(lease.id()))
+        .await
+        .unwrap();
+    assert_eq!(frames.recv().await.unwrap(), b"live".as_slice());
+    registry.revoke(&remote);
+    transport
+        .send_owned_admitted(&remote, Bytes::from_static(b"revoked"), Some(lease.id()))
+        .await
+        .unwrap();
+    // The raw send refuses the revoked session too, and dials nothing.
+    transport.send(&remote, b"raw").await.unwrap();
+    assert!(frames.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn connect_peer_needs_admission() {
+    let (transport, _commands) = transport(IpcConfig::default());
+    let error = transport.connect_peer(&NodeId::new("peer")).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<IpcConnectPeerError>()),
+        Some(&IpcConnectPeerError::AdmissionNotConfigured)
+    );
 }

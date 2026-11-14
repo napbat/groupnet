@@ -47,6 +47,28 @@
 //! # }
 //! ```
 //!
+//! A [`Client`] is the other role of a managed network: it binds the same
+//! [`Endpoint`] and [`Peer`] handles through the same [`Participant`] machinery,
+//! but joins no group (not even the reserved routing group), gossips nothing
+//! and never forwards. A hub is an ordinary [`Node`] that admits the client
+//! through its link admission:
+//!
+//! ```no_run
+//! use groupnet_core::NodeId;
+//! use groupnet_runtime::{Client, LinkProvider, Messages};
+//! use groupnet_runtime::messaging::Bytes;
+//!
+//! # async fn demo(dial_only: impl LinkProvider) -> std::io::Result<()> {
+//! let client = Client::builder(NodeId::new("tool")).link(dial_only).start().await?;
+//! client
+//!     .peer(NodeId::new("hub"), Messages::best_effort())?
+//!     .send(Bytes::from_static(b"hello"))
+//!     .await?;
+//! client.close().await;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Ordered streams are scoped by an application [`StreamProtocolId`]: each id
 //! has its own accept queue on every node, named in the stream's authenticated
 //! setup, so independent consumers run independent accept loops and never
@@ -95,18 +117,22 @@
 
 mod anchor;
 mod capability;
+mod client;
 mod clock;
 mod driver;
 mod group;
 pub mod messaging;
 mod network;
 mod node;
+mod participant;
 mod pmap;
+mod protocols;
 mod routing;
 mod seeds;
 mod store;
 
 pub use anchor::{Anchor, AnchorCas, AnchorFuture, AnchorToken, AnchorWriteIf};
+pub use client::{Client, ClientBuilder, ClientConfigError};
 pub use driver::{CloseReport, GroupEvent, UnfinishedGrant};
 pub use group::{
     BoundedRosterError, CommandRejected, EntryBudget, EntryInspectionError, EntryInspectionLimits,
@@ -125,9 +151,11 @@ pub use groupnet_streams::{
     UnorderedOptionsError, UnorderedProtocol, UnorderedSendError, UnorderedSession,
 };
 pub use groupnet_transport::NodeIdError;
-pub use node::{
-    Endpoint, GroupProfile, ManagedProtocol, Messages, Node, NodeBuilder, Ordered, Peer,
-    PeerImplementation, ReceiveBinding, Unordered,
+pub use node::{GroupProfile, Node, NodeBuilder};
+pub use participant::Participant;
+pub use protocols::{
+    Endpoint, ManagedProtocol, Messages, Ordered, Peer, PeerImplementation, ReceiveBinding,
+    Unordered,
 };
 pub use routing::Routing;
 #[cfg(feature = "dns")]

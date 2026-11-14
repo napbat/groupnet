@@ -20,6 +20,18 @@
 //!   `TcpBulkTransport::auth_failures`. Without one, any party that reaches
 //!   the listener can claim any node id: run such endpoints only on a private
 //!   network.
+//! * **`tls` — data plane across a trust boundary** (opt-in, implies `bulk`):
+//!   `TcpBulkTransport<TcpTls>` runs every stream over mutually authenticated
+//!   TLS 1.3 with RFC 7250 raw public keys. `TcpBulkTransport::bind_tls` makes
+//!   a hub with a long-lived `TcpTlsKey` that admits clients it was never
+//!   configured with through an `Admission` policy (`TcpTlsConfig`);
+//!   `TcpBulkTransport::dial_only_tls` makes a client (`TcpTlsDialConfig`)
+//!   that pins each hub's `TcpTlsPublicKey`, generates a fresh key for every
+//!   connection and presents an opaque credential inside TLS. The admitted
+//!   stream (`TcpTlsStream`) is that TLS connection, so the client's claim
+//!   stays bound to its key. The plain mode (`TcpPlain`, the default type
+//!   parameter) and the TLS mode refuse each other; nothing falls back to
+//!   cleartext.
 //! * **`link` — router registration** (opt-in): `TcpLink` admits peers through
 //!   an explicit application policy (a configured-peer allowlist by default).
 //!   Managed sessions are full-duplex, bounded, and retained while connected;
@@ -63,8 +75,9 @@
 //! The shared transport types these signatures name are re-exported at this
 //! crate's root, each with the feature that exposes it: `QueueCapacity`
 //! (`msg` or `bulk`), `NodeIdError`, `ClusterSecret` and `ClusterSecretError`
-//! (`bulk`), and `Admission`, `BoundLink`, `PeerEndpoint` and
-//! `SessionRegistry` (`link`).
+//! (`bulk`), `Admission` (`link` or `tls`), `BoundLink`, `PeerEndpoint` and
+//! `SessionRegistry` (`link`), and the `rustls` crate, whose error a
+//! `TcpTlsKeyError` carries (`tls`).
 //!
 //! [`Transport`]: groupnet_transport::Transport
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -75,18 +88,29 @@ mod handshake;
 #[cfg(feature = "bulk")]
 mod bulk;
 #[cfg(feature = "bulk")]
-pub use bulk::{TcpBulkConfig, TcpBulkConfigError, TcpBulkTransport, TcpHostEndpointError};
+pub use bulk::{
+    TcpBulkConfig, TcpBulkConfigError, TcpBulkTransport, TcpHostEndpointError, TcpPlain,
+};
+#[cfg(feature = "tls")]
+pub use bulk::{
+    TcpTls, TcpTlsConfig, TcpTlsConfigError, TcpTlsDialConfig, TcpTlsKey, TcpTlsKeyError,
+    TcpTlsPublicKey, TcpTlsPublicKeyError, TcpTlsStream,
+};
 #[cfg(feature = "bulk")]
 pub use groupnet_transport::NodeIdError;
 #[cfg(any(feature = "bulk", feature = "msg"))]
 pub use groupnet_transport::QueueCapacity;
+#[cfg(any(feature = "link", feature = "tls"))]
+pub use groupnet_transport::admission::Admission;
 #[cfg(feature = "bulk")]
 pub use groupnet_transport::auth::{ClusterSecret, ClusterSecretError};
 #[cfg(feature = "link")]
 pub use groupnet_transport::{
-    admission::{Admission, SessionRegistry},
+    admission::SessionRegistry,
     link::{BoundLink, PeerEndpoint},
 };
+#[cfg(feature = "tls")]
+pub use rustls;
 
 #[cfg(feature = "msg")]
 mod msg;

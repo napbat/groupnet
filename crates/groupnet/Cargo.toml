@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 # Features come in two kinds, joined by weak `?/` edges so that every selected
-# binding carries each selected capability it supports (bulk: mem, tcp;
+# binding carries each selected capability it supports (bulk: mem, tcp, ipc;
 # connectivity: tcp, udp; runtime: every binding):
 #
 # * bindings choose transport crates: `mem`, `tcp`, `udp`, `ipc`;
@@ -26,7 +26,10 @@ runtime = [
     "bulk", "groupnet-transport/link",
     "groupnet-transport-mem?/link", "groupnet-transport-tcp?/link", "groupnet-transport-udp?/link",
 ]
-bulk = ["groupnet-transport/bulk", "groupnet-transport-mem?/bulk", "groupnet-transport-tcp?/bulk"]
+bulk = [
+    "groupnet-transport/bulk",
+    "groupnet-transport-mem?/bulk", "groupnet-transport-tcp?/bulk", "groupnet-transport-ipc?/bulk",
+]
 connectivity = [
     "dep:groupnet-transport-punch",
     "groupnet-transport-tcp?/connectivity",
@@ -41,6 +44,12 @@ mem = ["dep:groupnet-transport-mem"]
 # reliable streams (`TcpBulkTransport`); with `runtime`, the managed `TcpLink`.
 tcp = ["dep:groupnet-transport-tcp", "groupnet-transport-tcp/msg"]
 udp = ["dep:groupnet-transport-udp"]
+# Mutually authenticated TLS 1.3 for the TCP data plane: with `tcp`, a hub
+# (`TcpBulkTransport<TcpTls>`) admits clients it was never configured with,
+# each dialing with a fresh per-connection key and pinning the hub's key.
+tls = ["bulk", "groupnet-transport-tcp?/tls"]
+# Native local IPC: the control plane (`IpcTransport`) and the managed
+# `IpcLink`; with `bulk`, also reliable local streams (`IpcBulkTransport`).
 ipc = ["dep:groupnet-transport-ipc"]
 # Request/response RPC over the data plane: concurrent calls multiplexed onto
 # one stream per peer, with deadlines, bounded frames and per-connection
@@ -148,6 +157,14 @@ required-features = ["runtime", "mem", "udp", "tcp", "connectivity"]
 [[example]]
 name = "tunnel-throughput"
 required-features = ["runtime", "tcp"]
+
+[[example]]
+name = "hub"
+required-features = ["ipc", "rpc"]
+
+[[example]]
+name = "client"
+required-features = ["runtime", "ipc"]
 
 [lints]
 workspace = true

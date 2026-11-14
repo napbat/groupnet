@@ -7,7 +7,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use groupnet_core::NodeId;
-use groupnet_transport::admission::{AcceptedPeer, Admission, AdmissionError, JoinRequest};
+use groupnet_transport::admission::{Admission, AllowedPeers};
 #[cfg(feature = "connectivity")]
 use groupnet_transport::link::LinkBindError;
 use groupnet_transport::link::{BoundLink, LinkConfig, LinkFuture, LinkProvider, PeerEndpoint};
@@ -237,7 +237,7 @@ impl LinkProvider for TcpLink<TcpDirect> {
             configured.validate_for(&local)?;
             let LinkConfig { peers, .. } = configured;
             let admission = TcpAdmission {
-                policy: admission.unwrap_or_else(|| Arc::new(ConfiguredAdmission(peers.clone()))),
+                policy: admission.unwrap_or_else(|| Arc::new(AllowedPeers::new(peers.clone()))),
                 credential,
                 config: admission_config,
             };
@@ -273,28 +273,6 @@ impl LinkProvider for TcpLink<TcpConnectivity> {
             }
             let transport = TcpMsgTransport::bind_connectivity(config).await?;
             Ok(transport.into_bound_link(cost))
-        })
-    }
-}
-
-/// The default direct-link policy: admit exactly the configured peers.
-#[derive(Debug)]
-struct ConfiguredAdmission(Vec<NodeId>);
-
-impl Admission for ConfiguredAdmission {
-    fn admit<'a>(
-        &'a self,
-        request: JoinRequest<'a>,
-    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
-        Box::pin(async move {
-            request.validate()?;
-            if self.0.contains(request.claimed) {
-                Ok(AcceptedPeer::new(request.claimed.clone()))
-            } else {
-                Err(AdmissionError::UnknownPeer {
-                    claimed: request.claimed.clone(),
-                })
-            }
         })
     }
 }

@@ -279,5 +279,38 @@ impl Admission for OpenAdmission {
     }
 }
 
+/// Admits exactly a fixed set of identities: the default policy of a link
+/// that was given configured peers and no other policy.
+#[derive(Clone, Debug, Default)]
+pub struct AllowedPeers {
+    peers: Vec<NodeId>,
+}
+
+impl AllowedPeers {
+    /// Admits the identities in `peers` and no other.
+    #[must_use]
+    pub fn new(peers: Vec<NodeId>) -> Self {
+        Self { peers }
+    }
+}
+
+impl Admission for AllowedPeers {
+    fn admit<'a>(
+        &'a self,
+        request: JoinRequest<'a>,
+    ) -> LinkFuture<'a, Result<AcceptedPeer, AdmissionError>> {
+        Box::pin(async move {
+            request.validate()?;
+            if self.peers.contains(request.claimed) {
+                Ok(AcceptedPeer::new(request.claimed.clone()))
+            } else {
+                Err(AdmissionError::UnknownPeer {
+                    claimed: request.claimed.clone(),
+                })
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;

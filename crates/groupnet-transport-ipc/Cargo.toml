@@ -1,11 +1,17 @@
 [package]
 name = "groupnet-transport-ipc"
-description = "Persistent native local IPC and router link providers for Groupnet."
+description = "Persistent native local IPC and router link providers for Groupnet, and local data-plane streams."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[features]
+# Data plane: `IpcBulkTransport`, reliable byte streams over local IPC with an
+# admission-checked identity handshake. Pulls the `bulk` trait surface and the
+# futures-io compat shim.
+bulk = ["groupnet-transport/bulk", "tokio-util/compat"]
 
 [dependencies]
 bytes.workspace = true
@@ -17,9 +23,15 @@ tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 groupnet-network.workspace = true
+groupnet-rpc.workspace = true
 ring.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
 
 [lints]
 workspace = true
+
+# Render every optional API with per-item feature badges.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -13,8 +13,8 @@
 //! | `network` | `groupnet-network` | protocol-independent routing and pinned end-to-end TLS tunnels | `runtime` |
 //! | `messaging` | `groupnet-messaging` | opaque application frames, delivery receipts, and the messaging engine | `runtime` |
 //! | `streams` | `groupnet-streams` | ordered streams and reliable/unreliable unordered sessions | `runtime` |
-//! | `runtime` | `groupnet-runtime` | the managed `Node` / `Group` driver, typed `Endpoint` / `Peer` handles, and receive callbacks (`runtime::messaging`) | `runtime` |
-//! | `rpc` | `groupnet-rpc` | request/response calls over any data plane | `rpc` |
+//! | `runtime` | `groupnet-runtime` | the managed `Node` / `Group` driver, the group-less `Client` role, typed `Endpoint` / `Peer` handles, and receive callbacks (`runtime::messaging`) | `runtime` |
+//! | `rpc` | `groupnet-rpc` | request/response calls and server-push subscriptions over any data plane | `rpc` |
 //! | `consistency` | `groupnet-consistency` | write feeds, frontiers, floors, acknowledgements, leases, hosted writes, handoff, replication | `consistency`, `consistency-*` |
 //! | `sim` | `groupnet-sim` | deterministic single-threaded engine harness | `sim` |
 //!
@@ -33,17 +33,20 @@
 //! registration; it always includes the stream and tunnel machinery), `bulk`
 //! (data-plane streams) and `connectivity` (native traversal under TCP/UDP
 //! links). Every selected binding carries each selected capability it supports:
-//! `bulk` is provided by `mem` and `tcp`, `connectivity` by `tcp` and `udp`, and
-//! `runtime` by every binding (its managed link). So `tcp` with `bulk` provides
-//! `TcpBulkTransport` and `mem` with `bulk` provides `MemBulkNet`.
+//! `bulk` is provided by `mem`, `tcp` and `ipc`, `connectivity` by `tcp` and
+//! `udp`, and `runtime` by every binding (its managed link). So `tcp` with
+//! `bulk` provides `TcpBulkTransport`, `mem` with `bulk` provides `MemBulkNet`
+//! and `ipc` with `bulk` provides `IpcBulkTransport`.
 //!
 //! | Feature | Adds | Implies |
 //! |---------|------|---------|
 //! | `runtime` *(default)* | `network`, `messaging`, `streams`, `runtime`; `transport::link` / `transport::admission` | `bulk` |
 //! | `mem` *(default)* | `transport::mem` | — |
 //! | `tcp` | `transport::tcp` (`TcpMsgTransport`; `TcpBulkTransport` with `bulk`; `TcpLink` with `runtime`) | — |
-//! | `udp`, `ipc` | `transport::udp`, `transport::ipc` | — |
+//! | `udp` | `transport::udp` | — |
+//! | `ipc` | `transport::ipc` (`IpcTransport`, `IpcLink`; `IpcBulkTransport` with `bulk`) | — |
 //! | `bulk` | `transport::bulk`, `transport::framing` | — |
+//! | `tls` | with `tcp`: the TLS mode of `TcpBulkTransport` (`TcpTls`), for hubs that admit clients across a trust boundary | `bulk` |
 //! | `connectivity` | `connectivity`; native modes of `TcpLink` / `UdpLink` | — |
 //! | `dns` | `runtime::SystemResolver` | `runtime` |
 //! | `rpc` | `rpc` | `bulk` |
@@ -139,8 +142,10 @@ pub use groupnet_sim as sim;
     feature = "mem",
     feature = "tcp",
     feature = "udp",
+    feature = "ipc",
     feature = "connectivity",
     feature = "rpc",
+    feature = "tls",
     feature = "consistency-acks",
 ))]
 #[doc = include_str!("../../../README.md")]

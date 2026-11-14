@@ -29,6 +29,16 @@ application policy work. Outbound saturation therefore cannot consume the slots
 needed to resolve simultaneous inbound dials, even at a one-slot setting. Both
 directions retain the configured handshake deadline and shutdown cancellation.
 
+Managed IPC (`IpcLink`, `IpcTransport::bind_admitted`) follows the same
+contract over local pipes and sockets. Its join is bounded by
+`IpcConfig::setup_timeout`, its pending and established connections by
+`IpcConfig::max_sessions`, and its live identities by `IpcConfig::max_peers`.
+Without an explicit policy an `IpcLink` admits exactly its configured peers
+(`AllowedPeers`, also the default of `TcpLink`). `IpcLink::dial_only` and
+`IpcTransport::dial_only_admitted` open no listener: such an endpoint is a
+client, reachable only over the sessions it opened
+([Clients of one node](client-role.md)).
+
 Bootstrap addresses identify initial contacts; they do not enumerate all future
 members. Only admitted adjacent peers enter routing. Discovery and forwarded
 membership records never independently authorize a new adjacent connection.
@@ -124,7 +134,7 @@ book already in place instead of registering the peers again. A failure is
 `InvalidInput` carrying the typed error (`LinkConfigError`, `LinkBindError`
 for a memory endpoint or native `TcpPunchConfig` / `UdpPunchConfig` built for
 another node, `TcpMsgConfigError`, `TcpAdmissionError`, `IpcConfigError`,
-`IpcPeerError` — whose `Address` variant wraps the platform's
+`IpcAdmissionError`, `IpcPeerError` — whose `Address` variant wraps the platform's
 `IpcAddressError` — the native configuration's error, or `NodeIdError`), and
 no endpoint exists. Callers preflight with the configurations' `validate()`
 and `LinkConfig::validate_for`. The router still applies its own bounds when the

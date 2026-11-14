@@ -43,7 +43,9 @@ if-addrs = "0.15"
 # Audited cryptographic primitives and TLS only; routing, discovery, reliability,
 # UDP hole-punching, IPC, and relay logic are implemented in this workspace.
 ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = [
+# 0.23.38 is the oldest release checked for RFC 7250 raw public keys, which
+# `groupnet-transport-tcp`'s `tls` data plane uses.
+rustls = { version = "0.23.38", default-features = false, features = [
     "ring",
     "std",
 ] }

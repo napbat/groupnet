@@ -48,6 +48,28 @@ fn open_is_explicit_and_checks_identity_and_credential_bounds() {
 }
 
 #[test]
+fn allowed_peers_admit_only_their_identities_and_name_a_refused_claim() {
+    let policy: &dyn Admission = &AllowedPeers::new(vec![NodeId::new("known")]);
+    let known = NodeId::new("known");
+    let accepted =
+        futures::executor::block_on(policy.admit(JoinRequest::new(&known, &[], None))).unwrap();
+    assert_eq!(accepted.node, known);
+    let stranger = NodeId::new("stranger");
+    let error = futures::executor::block_on(policy.admit(JoinRequest::new(&stranger, &[], None)))
+        .unwrap_err();
+    assert!(
+        matches!(&error, AdmissionError::UnknownPeer { claimed } if *claimed == stranger),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("stranger"), "{error}");
+    let empty = NodeId::new("");
+    assert!(matches!(
+        futures::executor::block_on(policy.admit(JoinRequest::new(&empty, &[], None))),
+        Err(AdmissionError::Request(_))
+    ));
+}
+
+#[test]
 fn admission_errors_keep_their_cause_and_map_to_socket_kinds() {
     let claimed = NodeId::new("claimed");
     let request = AdmissionError::from(JoinRequestError::Claimed(NodeIdError::Empty));

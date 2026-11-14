@@ -14,9 +14,15 @@ use groupnet_transport_ipc::{
     IpcAddress, IpcAddressError, IpcConfig, IpcConfigError, IpcLink, IpcPeerError, IpcSendError,
     IpcTransport, MAX_FRAME, NodeIdError, PeerEndpoint, QueueCapacity,
 };
-use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
+
+mod address;
+mod admission;
+#[cfg(feature = "bulk")]
+mod bulk;
+
+use address::Address;
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -26,53 +32,6 @@ type PeerCheck = fn(&IpcPeerError) -> bool;
 /// Recognizes the expected typed address rejection in a table-driven test.
 #[cfg(windows)]
 type AddressCheck = fn(&IpcAddressError) -> bool;
-
-#[derive(Debug)]
-struct Address {
-    ipc: IpcAddress,
-    #[cfg(unix)]
-    directory: std::path::PathBuf,
-}
-
-impl Address {
-    fn new() -> Self {
-        use std::fmt::Write;
-        let mut random = [0_u8; 16];
-        SystemRandom::new().fill(&mut random).unwrap();
-        let mut suffix = String::with_capacity(32);
-        for byte in random {
-            write!(suffix, "{byte:02x}").unwrap();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let directory = std::env::temp_dir().join(format!("groupnet-ipc-{suffix}"));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&directory)
-                .unwrap();
-            Self {
-                ipc: IpcAddress::Unix(directory.join("socket")),
-                directory,
-            }
-        }
-        #[cfg(windows)]
-        {
-            Self {
-                ipc: IpcAddress::NamedPipe(format!(r"\\.\pipe\groupnet-ipc-{suffix}")),
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for Address {
-    fn drop(&mut self) {
-        // Only the empty, uniquely created directory is removed. A leftover
-        // socket or unrelated replacement is deliberately not recursively erased.
-        let _ = std::fs::remove_dir(&self.directory);
-    }
-}
 
 async fn receive(transport: &IpcTransport) -> groupnet_transport::Inbound {
     timeout(DEADLINE, transport.recv()).await.unwrap().unwrap()

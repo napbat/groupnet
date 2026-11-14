@@ -1,4 +1,5 @@
-//! Managed node network access and the ordered-session adapters for bulk consumers.
+//! Managed node network access, protocol bindings and the ordered-session
+//! adapters for bulk consumers.
 
 use std::io;
 
@@ -7,14 +8,14 @@ use groupnet_network::Router;
 use groupnet_network::tunnel::{TunnelTransport, TunneledStream};
 use groupnet_transport::bulk::BulkTransport;
 
-use crate::{CloseReport, Endpoint, Node, Ordered};
+use crate::{CloseReport, Endpoint, Node, Ordered, Peer, PeerImplementation};
 
 impl Node {
     /// The node's router, including route inspection and typed adapter registration.
     /// A router clone alone does not retain the managed network's lifetime.
     #[must_use]
     pub fn router(&self) -> &Router {
-        self.network.router()
+        self.participant().router()
     }
 
     /// Accesses tunnel peer admission and revocation. Open ordered streams with
@@ -23,7 +24,31 @@ impl Node {
     /// # Errors
     /// Returns `Unsupported` for a node without configured TLS tunnels.
     pub fn tunnels(&self) -> io::Result<&TunnelTransport> {
-        self.network.tunnels()
+        self.participant().tunnels()
+    }
+
+    /// Binds a typed endpoint and immutable options to this node's shared protocol.
+    /// Does not open a connection, socket or per-peer worker. The first binding
+    /// may initialize a node-shared protocol worker. Message receives use this
+    /// node's existing inbox; unordered accepts match the selected delivery policy.
+    ///
+    /// # Errors
+    /// Returns implementation binding errors or `NotConnected` after node shutdown.
+    pub fn endpoint<I: PeerImplementation>(&self, implementation: I) -> io::Result<Endpoint<I>> {
+        self.participant().endpoint(implementation)
+    }
+
+    /// Binds a logical destination using the same shared machinery as [`Self::endpoint`].
+    /// Retains node lifetime without opening a connection, socket or per-peer worker.
+    ///
+    /// # Errors
+    /// Returns implementation binding errors or `NotConnected` after node shutdown.
+    pub fn peer<I: PeerImplementation>(
+        &self,
+        id: NodeId,
+        implementation: I,
+    ) -> io::Result<Peer<I>> {
+        self.participant().peer(id, implementation)
     }
 
     /// Closes connections across all node clones and drains owned network tasks.
@@ -41,11 +66,9 @@ impl Node {
     /// become durable after this returns; otherwise it names each write that
     /// still can.
     pub async fn close(&self) -> CloseReport {
-        self.shutdown_protocols();
-        self.network.close().await;
+        self.participant().close_network().await;
         let report = self.close_groups().await;
-        self.close_messaging().await;
-        self.close_protocols().await;
+        self.participant().close_engines().await;
         report
     }
 }

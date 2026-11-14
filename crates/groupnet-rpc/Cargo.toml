@@ -1,6 +1,6 @@
 [package]
 name = "groupnet-rpc"
-description = "Request/response RPC for Groupnet: concurrent calls multiplexed over one data-plane stream per peer."
+description = "Request/response RPC and server-push subscriptions for Groupnet: concurrent calls and subscriptions multiplexed over one data-plane stream per peer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
