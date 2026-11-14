@@ -20,8 +20,9 @@
 //! The handshake authenticates connection setup only. Bytes after it carry no
 //! integrity protection and are not bound to the handshake, so an on-path
 //! attacker can inject into or alter RPC traffic: keep the data plane on a
-//! private network, or use a mutually authenticated TLS mode (not yet
-//! implemented) where it crosses a trust boundary.
+//! private network, or use the TLS mode (feature `tls`) where it crosses a
+//! trust boundary. A TLS handshake sent to this acceptor fails its magic
+//! check, so the two modes refuse each other.
 
 use std::io;
 

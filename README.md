@@ -91,7 +91,7 @@ streams only when the application asks for them.
 | [`groupnet-transport`](crates/groupnet-transport) | both | core, bytes *(+framing: zerocopy, tokio I/O traits; +bulk: framing, futures-io; +link: tokio, tokio-util, futures-util; +auth: ring)* | runtime-free `Transport` and validated `QueueCapacity`, shared length-prefix `framing`, optional `BulkTransport`, shared object-safe link registration/lifecycle, and the cluster's shared `auth::ClusterSecret` |
 | [`groupnet-transport-mem`](crates/groupnet-transport-mem) | both | transport, core, tokio(sync) *(+bulk feature: transport(bulk), tokio(io-util), tokio-util(compat))* | in-process bindings (tests, examples, single-process): datagrams always, `MemBulkNet` byte streams under feature `bulk` |
 | [`groupnet-transport-udp`](crates/groupnet-transport-udp) | control | transport, core, tokio(net) | UDP binding over real sockets |
-| [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) *(+bulk: transport(auth))* | persistent TCP messages (`TcpMsgTransport`), TCP streams (`TcpBulkTransport`, mutually authenticated under a cluster secret), and `TcpLink` registration |
+| [`groupnet-transport-tcp`](crates/groupnet-transport-tcp) | both | transport, core, tokio(net) *(+bulk: transport(auth))* *(+tls: rustls, tokio-rustls, ring, transport(link))* | persistent TCP messages (`TcpMsgTransport`), TCP streams (`TcpBulkTransport`, mutually authenticated under a cluster secret; with feature `tls`, a TLS 1.3 hub admitting dial-only clients with per-connection keys and pinned hub keys), and `TcpLink` registration |
 | [`groupnet-transport-ipc`](crates/groupnet-transport-ipc) | both | transport(link), core, tokio *(+bulk feature: transport(bulk), tokio-util(compat))* | native named pipes/Unix sockets: persistent messages (`IpcTransport`) and `IpcLink` registration; local streams (`IpcBulkTransport`, a hub admitting dial-only clients through an optional admission policy) under feature `bulk` |
 | [`groupnet-transport-punch`](crates/groupnet-transport-punch) | connectivity | transport admission/session primitives, core, tokio, ring, socket2, if-addrs | native adjacent-node UDP/TCP connections, candidate checks, rendezvous and relay; no transport or router link |
 | [`groupnet-network`](crates/groupnet-network) | both | transport(auth, bulk, link), tokio, rustls, ring | protocol-independent group-network routing (frames sealed under an optional cluster secret) and pinned end-to-end TLS streams |
@@ -101,7 +101,7 @@ streams only when the application asks for them.
 | [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC and credit-bounded server-push subscriptions over the data plane: concurrent calls and subscriptions multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler and subscription limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff` or `volatile-bootstrap-bulk`)* | core, runtime, tokio(sync) *(+handoff or volatile-bootstrap-bulk feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; two opt-in pieces reach the data plane: the `handoff` tier, to pull a covering snapshot a gap cannot replay, and `volatile-bootstrap-bulk`, volatile recovery's bounded peer bootstrap transfer |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
-| [`groupnet`](crates/groupnet) | — | facade | one module per crate; `runtime`+`mem` default; binding features (`mem`, `tcp`, `udp`, `ipc`) × capability features (`runtime`, `bulk`, `connectivity`), plus `rpc`, `consistency*`, `sim` |
+| [`groupnet`](crates/groupnet) | — | facade | one module per crate; `runtime`+`mem` default; binding features (`mem`, `tcp`, `udp`, `ipc`) × capability features (`runtime`, `bulk`, `connectivity`, `tls`), plus `rpc`, `consistency*`, `sim` |
 | [`groupnet-testkit`](crates/groupnet-testkit) | — | core *(+cluster feature: runtime, transport-mem, tokio)* | shared test support: sans-IO frame fixtures + an async multi-node harness. Internal, `publish = false`, dev-dependency only |
 
 Every runtime node owns a routed network. Use
@@ -150,7 +150,8 @@ routing, sessions and link registration), `bulk` (data-plane streams) and
 `connectivity` (native traversal under TCP/UDP links). So `tcp` alone is the TCP
 control plane (`TcpMsgTransport`), `tcp` with `bulk` adds `TcpBulkTransport`,
 and `tcp` with `runtime` adds `TcpLink`; likewise `ipc` with `bulk` adds
-`IpcBulkTransport`. `rpc` implies `bulk`; `dns` adds the
+`IpcBulkTransport`. `tls` (implies `bulk`) adds, with `tcp`, the TLS mode of
+`TcpBulkTransport`. `rpc` implies `bulk`; `dns` adds the
 system seed resolver; `consistency` and its `consistency-*` tiers add
 `groupnet::consistency`; `sim` adds the simulator. The
 [facade crate docs](crates/groupnet/src/lib.rs) carry the full feature table.
@@ -1102,6 +1103,55 @@ operating system boundary being the trust boundary), while
 presents an opaque credential and never listens. Handshakes are bounded in time
 and number as on TCP, and `groupnet-rpc` runs over it unchanged.
 
+### TLS hubs and clients (feature `tls`)
+
+Across a trust boundary, `TcpBulkTransport<TcpTls>` (features `tcp` and `tls`)
+is the same data plane over mutually authenticated TLS 1.3. A hub
+(`TcpBulkTransport::bind_tls`) holds a long-lived `TcpTlsKey` and admits
+clients it was never configured with through an `Admission` policy. A client
+(`TcpBulkTransport::dial_only_tls`) pins each hub's public key with
+`register_peer` and generates a fresh key for every connection; it refuses a
+hub that presents another key before it sends its claim or credential. Inside
+TLS the client claims its id and presents its credential; the hub's policy
+judges them with the client's address, and the admitted stream is that TLS
+connection, so the claim stays bound to the client's key for the stream's life.
+A TLS endpoint and a plain one refuse each other; nothing falls back to
+cleartext.
+
+```rust
+use std::sync::Arc;
+
+use groupnet::core::NodeId;
+use groupnet::transport::admission::Admission;
+use groupnet::transport::bulk::DataPlane;
+use groupnet::transport::tcp::{
+    TcpBulkTransport, TcpTls, TcpTlsConfig, TcpTlsDialConfig, TcpTlsKey, TcpTlsPublicKey,
+};
+
+type TlsPlane = DataPlane<TcpBulkTransport<TcpTls>>;
+
+/// The hub: its long-lived key, kept in a secret store, and the application's
+/// admission policy. Clients pin `key.public_key().as_der()`.
+async fn hub(stored: Vec<u8>, policy: Arc<dyn Admission>) -> Result<TlsPlane, Box<dyn std::error::Error>> {
+    let key = TcpTlsKey::from_pkcs8_der(stored)?;
+    let config = TcpTlsConfig::new(key, policy);
+    let hub = TcpBulkTransport::bind_tls(NodeId::new("hub"), "0.0.0.0:8443", config).await?;
+    Ok(DataPlane::new(hub))
+}
+
+/// A client: the hub's address and published key, and its own credential.
+fn client(hub_key: &[u8], token: Vec<u8>) -> Result<TlsPlane, Box<dyn std::error::Error>> {
+    let config = TcpTlsDialConfig {
+        credential: token,
+        ..TcpTlsDialConfig::default()
+    };
+    let client = TcpBulkTransport::dial_only_tls(NodeId::new("tool-1"), config)?;
+    let pin = TcpTlsPublicKey::from_der(hub_key)?;
+    client.register_peer(NodeId::new("hub"), "10.0.0.1:8443".parse()?, pin);
+    Ok(DataPlane::new(client))
+}
+```
+
 ### Cluster secret
 
 By default nothing authenticates a peer: any party that reaches a node's
@@ -1177,9 +1227,8 @@ async fn start(secret: &[u8]) -> Result<(Node, TcpBulkTransport), Box<dyn std::e
   `TcpBulkTransport::auth_failures()`. A hello with any other version is refused.
   The handshake authenticates connection setup only: the stream after it has
   no integrity protection, so an attacker on the network path can inject into
-  or alter RPC bytes. Keep the data plane on a private network, or use a
-  mutually authenticated TLS mode (not yet implemented) when it crosses a
-  trust boundary.
+  or alter RPC bytes. Keep the data plane on a private network, or use the
+  TLS mode (feature `tls`, above) when it crosses a trust boundary.
 
 A keyed node refuses unkeyed peers and peers with another secret, in both
 directions; there is no fallback. The secret proves membership of the

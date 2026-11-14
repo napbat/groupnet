@@ -91,9 +91,61 @@ ordered, through `groupnet-rpc`.
   `TcpBulkTransport`, and `IpcBulkConfig::max_connections` bounds the accepted
   streams alive at once (the native pipe instances on Windows). A dial-only
   endpoint takes `IpcBulkDialConfig`: only the settings a dialer uses.
-- **TCP**: `TcpBulkTransport::dial_only` and `dial_only_with` already exist.
-  Admission of dynamic clients over a network (per-session keys pinned at
-  admission) is slice 6.
+- **TCP** (`groupnet-transport-tcp`): `TcpBulkTransport` has two modes, a
+  type parameter. `TcpBulkTransport<TcpPlain>` (the default) is the cleartext
+  cluster data plane: `bind`/`bind_with`, `dial_only`, `dial_only_with` (see
+  `docs/tunnels-and-security.md` for its cluster-secret handshake).
+  `TcpBulkTransport<TcpTls>` (feature `tls`) is the data plane for clients
+  over a network, section 3.1.
+
+### 3.1 TCP clients over TLS
+
+API (feature `tls`; the facade's `tls` with `tcp`):
+
+- `TcpTlsKey`: a private key. `generate()` makes an Ed25519 key;
+  `from_pkcs8_der(Vec<u8>)` loads any PKCS#8 key the ring provider signs with;
+  `secret_pkcs8_der()` returns it for storage; `public_key()` returns its
+  `TcpTlsPublicKey`.
+- `TcpTlsPublicKey`: a DER `SubjectPublicKeyInfo` (`from_der`, `as_der`,
+  `fingerprint`), compared byte for byte; at most `MAX_DER_BYTES` (1024).
+- `TcpTlsConfig::new(key, admission)`: the hub's long-lived key and its
+  mandatory policy, plus public fields `credential`, `handshake_timeout` (5s),
+  `max_handshakes` (64), `accept_queue` (64) and `max_connections` (1024);
+  `validate()` returns `TcpTlsConfigError`.
+- `TcpBulkTransport::bind_tls(local, addr, TcpTlsConfig)`: a hub. It also
+  dials, as a client does.
+- `TcpBulkTransport::dial_only_tls(local, TcpTlsDialConfig)`: a client with
+  `credential` and `handshake_timeout`; it never listens and needs no runtime
+  to be made.
+- `register_peer(node, addr, key)` and `register_peer_host(node, host, key)`:
+  an address and the pinned key together. A peer without a pin cannot be
+  registered.
+- The stream is `Compat<TcpTlsStream>`; `TcpTlsStream::peer_key()` is the
+  hub's pinned key on a dialed stream and the client's per-connection key on
+  an accepted one. An accepted stream holds one of `max_connections` until it
+  is dropped.
+
+Wire, in order:
+
+1. TLS 1.3 only (ring provider), ALPN `groupnet/tcp-bulk/1`, no resumption,
+   no early data, no SNI. Both sides authenticate with RFC 7250 raw public
+   keys. The client offers a key it generated for this connection and accepts
+   only the hub key it pinned for the dialed `NodeId`; the hub accepts any
+   client key (the TLS handshake proves possession).
+2. Client → hub, inside TLS: `GNBT`, version `1`, id, credential (each field
+   prefixed by the shared big-endian `LengthHeader`; ids 1 to 64 bytes,
+   credentials at most `MAX_CREDENTIAL_BYTES`, checked before allocation).
+3. The hub refuses its own id, runs its policy with
+   `JoinRequest { claimed, credential, remote: Some(addr) }` and requires the
+   accepted id to be the claimed one. It answers `0` and its own id
+   (length-prefixed), or `1` alone and closes.
+4. The client checks the status and that the id is the hub it dialed. Stream
+   bytes follow.
+
+The admitted stream is that TLS connection, so the client's claim is bound to
+its per-connection key for the stream's life. A TLS endpoint refuses a plain
+`GNBH` hello and a plain endpoint refuses a TLS handshake. Every refusal or
+timeout closes the connection and counts in `auth_failures`.
 
 ## 4. Server push: subscriptions
 
@@ -152,13 +204,13 @@ payloads.
 
 ### 6.1 Dynamic clients over TCP (slice 6)
 
-`TcpBulkTransport` authenticates connection setup with a shared
-`ClusterSecret` or not at all, and its stream bytes carry no integrity
-protection. A client over a network needs its own identity: the client makes a
-key pair for the session, admission binds that key to the client's credential,
-and the hub pins it for the length of the session, so the stream runs over
-mutually authenticated TLS. A network link never falls back to unauthenticated
-traffic.
+Done; section 3.1 is the contract. `TcpBulkTransport<TcpPlain>`
+authenticates connection setup with a shared `ClusterSecret` or not at all,
+and its stream bytes carry no integrity protection. A client over a network
+uses `TcpBulkTransport<TcpTls>` instead: the client makes a key for each
+connection, admission binds that connection to the client's claim and
+credential, and the stream runs over mutually authenticated TLS. A network
+endpoint never falls back to unauthenticated traffic.
 
 ### 6.2 Runtime client role (slice 7)
 
@@ -185,5 +237,5 @@ public-Internet NAT qualification (#6).
 | 3 | `IpcBulkTransport` with admission | done |
 | 4 | RPC subscriptions | done |
 | 5 | Hub example over IPC (RPC calls and a subscription from dynamic clients): `examples/hub.rs` | done |
-| 6 | Dynamic clients over TCP with per-session keys pinned at admission | open |
+| 6 | Dynamic clients over TCP with per-session keys pinned at admission: `TcpBulkTransport<TcpTls>` (section 3.1) | done |
 | 7 | Runtime client role | open |

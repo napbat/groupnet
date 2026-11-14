@@ -18,6 +18,13 @@ msg = ["groupnet-transport/framing", "tokio/rt", "tokio/sync", "tokio/time", "to
 # slices for the listener task and deadline-bounded handshakes, and the
 # shared `ClusterSecret` its handshake authenticates with.
 bulk = ["groupnet-transport/bulk", "groupnet-transport/auth", "dep:tokio-util", "tokio/rt", "tokio/sync", "tokio/time"]
+# Data plane over mutually authenticated TLS 1.3: `TcpBulkTransport<TcpTls>`,
+# where a hub with a long-lived key admits clients it was never configured
+# with through an `Admission` policy, and each client dials with a fresh key
+# per connection and pins every hub's key (RFC 7250 raw public keys). Pulls
+# rustls and tokio-rustls on ring (already the workspace's TLS stack), ring
+# itself for key generation, and the shared admission contract.
+tls = ["bulk", "groupnet-transport/link", "dep:rustls", "dep:tokio-rustls", "dep:ring"]
 # Router registration also needs the control-plane binding.
 link = ["msg", "groupnet-transport/link"]
 # Native rendezvous, candidate traversal, and relay fallback on the existing link.
@@ -32,11 +39,16 @@ bytes = { workspace = true }
 zerocopy = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["net", "io-util"] }
 tokio-util = { workspace = true, features = ["compat"], optional = true }
+ring = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 groupnet-testkit = { path = "../groupnet-testkit", features = ["cluster"] }
+# The TLS data-plane suite runs RPC calls and a subscription over it.
+groupnet-rpc.workspace = true
 
 [lints]
 workspace = true

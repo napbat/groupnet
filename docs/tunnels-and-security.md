@@ -534,8 +534,7 @@ What the secret leaves open:
   connection setup only. The bytes that follow carry no integrity protection
   and are not bound to the handshake, so an attacker on the network path can
   inject into or alter RPC traffic. Keep the data plane on a private network,
-  or use a mutually authenticated TLS mode (not yet implemented) when it
-  crosses a trust boundary.
+  or use the TLS data plane (below) when it crosses a trust boundary.
 - **Replay state lives in memory.** A receiver that restarts, or that evicted
   a sender (replay windows keep `replay_capacity / 64` origin streams; advert
   freshness keeps `max_routes × max_transports` neighbor-link pairs, least
@@ -560,6 +559,50 @@ What the secret leaves open:
   `ClusterSecret::new` neither keeps nor wipes the caller's bytes; callers
   zero their own buffer after building it.
 
+### TLS data plane for hubs and clients
+
+`TcpBulkTransport<TcpTls>` (`groupnet-transport-tcp`, feature `tls`) is the
+TCP data plane for clients a hub was never configured with, across a trust
+boundary. Every connection is TLS 1.3 (ring provider, no session resumption,
+no early data, no SNI, ALPN `groupnet/tcp-bulk/1`) with mutual authentication
+by RFC 7250 raw public keys, then an admission exchange inside TLS:
+
+1. The hub holds a long-lived `TcpTlsKey`. A client pins the hub's
+   `TcpTlsPublicKey` for the hub's `NodeId` (`register_peer`) and accepts no
+   other key: a hub that presents another key fails the TLS handshake on the
+   client (`PermissionDenied`) before the client sends anything of its own.
+2. The client generates a fresh Ed25519 key for every connection and
+   authenticates with it. The hub accepts any client key at the TLS layer; the
+   TLS handshake proves that the client holds the key it presented.
+3. Inside TLS the client sends `GNBT`, version `1`, its claimed id and its
+   credential (length-prefixed; ids at most 64 bytes, credentials at most
+   `MAX_CREDENTIAL_BYTES`, both checked before allocation). The hub's
+   `Admission` policy judges them with the client's socket address
+   (`JoinRequest::remote`); the accepted id must be the claimed one and must
+   not be the hub's own. The hub answers `0` and its id, which the client
+   checks against the hub it dialed, or `1` and closes.
+
+The handshake runs under `TcpTlsConfig::handshake_timeout`, at most
+`max_handshakes` at once; `max_connections` bounds the accepted streams alive
+at once. Every refusal or timeout closes the connection and counts in
+`auth_failures`. A TLS endpoint refuses a plain `GNBH` hello and a plain
+endpoint refuses a TLS handshake: there is no fallback in either direction.
+
+What it grants: an on-path attacker can neither read nor alter the stream, nor
+inject into it, nor learn the client's claim or credential; a party that does
+not hold the pinned hub key cannot impersonate the hub; and the admitted claim
+is bound to the client's key for the life of the stream, because the stream is
+that TLS connection. Per-connection client keys also mean that a client's
+connections cannot be linked by key.
+
+What it leaves to the application: the client's identity is exactly what the
+admission policy accepts. The per-connection key proves nothing across
+connections, so the credential (and the remote address the policy sees) is the
+whole authentication of a client; a stolen credential admits its thief. The
+hub key is a long-lived secret: whoever holds it can impersonate the hub to
+every client that pinned it, and replacing it means distributing a new pin.
+`TcpTlsKey` does not wipe its key material on drop.
+
 ## 4. What each security layer actually grants
 
 These are separate checks, not one inherited permission chain. Applications must
@@ -581,6 +624,7 @@ flowchart TB
 |---|---|
 | Plain TCP/UDP links | No inherent endpoint authentication or encryption; static configurations assume trusted peers on a private network. |
 | Cluster secret | Router frames and TCP data-plane handshakes admit only holders of the shared secret; it does not distinguish holders or encrypt. |
+| TLS data plane (`TcpTls`) | Confidentiality and integrity of every stream; the hub authenticated by its pinned key; the client's admitted claim bound to its per-connection key for the stream's life. Who a client is rests on the application's admission policy and credential. |
 | Open dynamic admission | Accepts claimed identities without ownership proof; session binding is not account authentication. |
 | Native punching fabric | Keyed mode authenticates fabric membership; explicit keyless mode does not. |
 | Pinned TLS tunnels | End-to-end endpoint identity and application-byte confidentiality across transit peers. |
