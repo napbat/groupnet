@@ -154,6 +154,10 @@ required-features = ["runtime", "mem", "udp", "tcp", "connectivity"]
 name = "tunnel-throughput"
 required-features = ["runtime", "tcp"]
 
+[[example]]
+name = "hub"
+required-features = ["ipc", "rpc"]
+
 [lints]
 workspace = true
 

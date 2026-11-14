@@ -86,8 +86,11 @@ ordered, through `groupnet-rpc`.
   and an opaque credential; the acceptor runs an optional `Admission` policy
   and answers with one status byte and its own id, which the dialer checks
   against the peer it dialed. Without a policy every local peer is accepted,
-  matching the static IPC trust model. Handshakes are bounded in time and
-  number, like `TcpBulkTransport`.
+  matching the static IPC trust model. The acceptor answers `0` and its id,
+  or `1` alone and closes. Handshakes are bounded in time and number, like
+  `TcpBulkTransport`, and `IpcBulkConfig::max_connections` bounds the accepted
+  streams alive at once (the native pipe instances on Windows). A dial-only
+  endpoint takes `IpcBulkDialConfig`: only the settings a dialer uses.
 - **TCP**: `TcpBulkTransport::dial_only` and `dial_only_with` already exist.
   Admission of dynamic clients over a network (per-session keys pinned at
   admission) is slice 6.
@@ -119,12 +122,19 @@ blocks the connection's other calls or subscriptions. An item over the frame
 limit ends the subscription with `RESPONSE_TOO_LARGE`.
 
 API shape: `RpcServer::with_subscriptions(call_handler, subscribe_handler)`
-where the subscribe handler gets the caller, the payload and a
-`SubscriptionSink` whose `send` waits for credit and fails once the client
-cancels or disconnects; returning `Ok(())` sends End, `Err(status)` sends
-Error. `RpcClient::subscribe(peer, payload, timeout)` returns a
-`Subscription` whose `next` yields items, then `None` after End, or an
-`RpcError` (`Remote`, `ConnectionLost`, `Shutdown`). Dropping it sends Cancel.
+(and `with_subscriptions_config`, then `accept_on(plane)`) where the subscribe
+handler gets the caller, the payload and a `SubscriptionSink` whose `send`
+waits for credit; returning `Ok(())` sends End, `Err(status)` sends Error. A
+Cancel or the end of the connection drops the handler's future, so a client
+that stops reading cannot pin a subscription slot.
+`RpcClient::subscribe(peer, payload, timeout)` returns once the Subscribe is
+sent — the wire has no acknowledgement, so a refusal (no subscribe handler:
+`SUBSCRIPTIONS_UNSUPPORTED`; the per-connection limit:
+`TOO_MANY_SUBSCRIPTIONS`) is the first `next`. `next` yields items, then
+`None` after End, or an `RpcError` (`Remote`, `ConnectionLost`, `Shutdown`).
+Dropping the `Subscription` sends Cancel. End, Credit and Cancel frames have an
+exact length, an item beyond the client's credit or credit beyond the window
+is a protocol breach, and each drops the connection.
 Live subscriptions keep a connection from being idle on both sides, and both
 sides bound them (`max_subscriptions_per_peer`,
 `max_subscriptions_per_connection`).
@@ -172,8 +182,8 @@ public-Internet NAT qualification (#6).
 |---|---|---|
 | 1 | This contract; charter in `README.md` and `AGENTS.md` | done |
 | 2 | IPC admission: dynamic peers, seeds, dial-only links, revocation | done |
-| 3 | `IpcBulkTransport` with admission | in progress |
-| 4 | RPC subscriptions | in progress |
-| 5 | Hub example over IPC (RPC calls and a subscription from dynamic clients) | open |
+| 3 | `IpcBulkTransport` with admission | done |
+| 4 | RPC subscriptions | done |
+| 5 | Hub example over IPC (RPC calls and a subscription from dynamic clients): `examples/hub.rs` | done |
 | 6 | Dynamic clients over TCP with per-session keys pinned at admission | open |
 | 7 | Runtime client role | open |

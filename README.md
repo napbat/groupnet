@@ -174,6 +174,7 @@ cargo run --example native-traversal --features udp,tcp,connectivity -- --ipv6
 cargo run --example connectivity-bridge --features tcp,connectivity  # memory A -> TCP edge B -> remote C
 cargo run --example connectivity-bridge --features tcp,connectivity -- --relay-only
 cargo run --example connectivity-bridge --features tcp,connectivity -- --upgrade
+cargo run --example hub --features ipc,rpc  # dial-only clients call a hub and receive pushed events
 ```
 
 Five more live with the layers they exercise:
