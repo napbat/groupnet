@@ -114,8 +114,9 @@ also cancels blocked receives and callbacks.
 
 `node.endpoint(implementation)?` creates an `Endpoint<P>` handle for a concrete
 protocol; `node.peer(id, implementation)?` creates its destination-bound
-`Peer<P>`. Both use the same public unsealed binding contract and retain managed
-node lifetime. `Messages`, `Ordered`, and `Unordered` descriptors bind their
+`Peer<P>`. Both use the same public unsealed binding contract and retain the
+managed network's lifetime through the node's `Participant`. A `Client` binds
+the same handles through its own `Participant`, without any group. `Messages`, `Ordered`, and `Unordered` descriptors bind their
 delivery/setup options once and resolve the node's shared protocol state
 internally. Creating either handle does not establish a connection, allocate a
 per-peer receive queue, or require dynamic dispatch. Node-wide capacities and

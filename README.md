@@ -97,7 +97,7 @@ streams only when the application asks for them.
 | [`groupnet-network`](crates/groupnet-network) | both | transport(auth, bulk, link), tokio, rustls, ring | protocol-independent group-network routing (frames sealed under an optional cluster secret) and pinned end-to-end TLS streams |
 | [`groupnet-messaging`](crates/groupnet-messaging) | application packets | core, network, bytes, ring, tokio, tokio-util | static send-only `MessageProtocol`, generic receipt contexts, `Messaging` endpoint, bounded retry/deduplication |
 | [`groupnet-streams`](crates/groupnet-streams) | sessions | core, network, transport(bulk), bytes, ring, futures-util, tokio, tokio-util | static `SessionProtocol`, shared protocol engines, authenticated session policies |
-| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), messaging, streams, network, tokio | non-generic managed `Node`, unsealed `PeerImplementation` / `ReceiveBinding`, generic `Endpoint<P>` / `Peer<P>` over restricted `ManagedProtocol` views, group actors, receive callbacks/fanout reports, and `FileGrantStore` |
+| [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), messaging, streams, network, tokio | non-generic managed `Node` and the group-less `Client` role over one shared `Participant`, unsealed `PeerImplementation` / `ReceiveBinding`, generic `Endpoint<P>` / `Peer<P>` over restricted `ManagedProtocol` views, group actors, receive callbacks/fanout reports, and `FileGrantStore` |
 | [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC and credit-bounded server-push subscriptions over the data plane: concurrent calls and subscriptions multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler and subscription limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff` or `volatile-bootstrap-bulk`)* | core, runtime, tokio(sync) *(+handoff or volatile-bootstrap-bulk feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; two opt-in pieces reach the data plane: the `handoff` tier, to pull a covering snapshot a gap cannot replay, and `volatile-bootstrap-bulk`, volatile recovery's bounded peer bootstrap transfer |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
@@ -176,6 +176,7 @@ cargo run --example connectivity-bridge --features tcp,connectivity  # memory A 
 cargo run --example connectivity-bridge --features tcp,connectivity -- --relay-only
 cargo run --example connectivity-bridge --features tcp,connectivity -- --upgrade
 cargo run --example hub --features ipc,rpc  # dial-only clients call a hub and receive pushed events
+cargo run --example client --features ipc  # a runtime client messages its hub node, outside its membership
 ```
 
 Five more live with the layers they exercise:
@@ -544,8 +545,10 @@ median bulk rate as a share of the TLS baseline.
 
 ### Endpoint ownership
 
-`Node` owns and caches the distinct underlying protocol engines; `Endpoint<P>`
-and `Peer<P>` are handles over that shared state, not new workers. Node-wide
+A `Node` or a `Client` owns one `Participant` (`node.participant()`), which owns
+and caches the distinct underlying protocol engines; `Endpoint<P>` and
+`Peer<P>` are handles over that shared state, not new workers, and
+`endpoint.participant()` returns it. Node-wide
 `UnorderedConfig` (fixed by `NodeBuilder::unordered`) is separate from the
 per-handle delivery/setup options selected by `Unordered`.
 `Messages::new(SendOptions)` and `Unordered::new(UnorderedOptions)` bind explicit
@@ -573,10 +576,10 @@ and accepts use the generic handles.
 Custom descriptors implement the public, unsealed `PeerImplementation` trait
 (`groupnet::runtime::PeerImplementation`). Its associated `Protocol` and
 cloneable `Options` types identify the concrete protocol engine and bound
-options; `bind(self, node: &Node)` returns that protocol/options pair as an
-`io::Result`. Custom implementations can resolve shared node resources — a
-built-in endpoint's `ManagedProtocol` view composes — and return their own
-protocol without changing `Node` or using dynamic dispatch. The protocol engine
+options; `bind(self, participant: &Participant)` returns that protocol/options
+pair as an `io::Result`. Custom implementations can resolve shared resources —
+a built-in endpoint's `ManagedProtocol` view composes — and return their own
+protocol without changing `Node` or `Client` or using dynamic dispatch. The protocol engine
 implements the unsealed `MessageProtocol` (`groupnet::messaging`) or
 `SessionProtocol` (`groupnet::streams`) contract; no per-call future boxing is
 required. `MessageProtocol` is send-only: it associates send options and a
@@ -598,6 +601,54 @@ handle can reach the raw messaging worker queue: use message endpoints,
 does not install its protocol on the remote node. Application timers decide
 continuous traffic versus periodic polling; neither requires rebuilding a peer
 or endpoint between sends.
+
+### Clients of a hub
+
+A `Client` is a participant that takes no part in membership: it binds the same
+`Endpoint<P>` / `Peer<P>` handles and node-addressed `send` / `recv` /
+`on_recv` as a `Node`, but it joins no group (not even the reserved routing
+group), gossips nothing, runs no discovery and never forwards transit traffic.
+`Client::builder(id)` offers only the settings that apply to it — links,
+routing limits, tunnels and the messaging, ordered and unordered policies — and
+`start()` refuses a `RouterConfig` with `forwarding: true` (a typed
+`ClientConfigError`). A hub is an ordinary `Node` that admits the client
+through its link admission; group-addressed frames sent to a client are
+refused. `client.close()` closes its network and releases its links, so the
+hub can admit the same identity again.
+
+```rust
+use groupnet::core::NodeId;
+use groupnet::runtime::{Client, Messages, Node};
+use groupnet::transport::Bytes;
+use groupnet::transport::admission::OpenAdmission;
+use groupnet::transport::ipc::{IpcAddress, IpcLink, PeerEndpoint};
+use std::{io, sync::Arc, time::Duration};
+
+/// A hub that admits any local peer, and a client that only dials it.
+async fn hub_and_tool(address: IpcAddress) -> io::Result<()> {
+    let hub_id = NodeId::new("hub");
+    let hub = Node::builder(hub_id.clone())
+        .link(IpcLink::new(address.clone(), Vec::new()).with_admission(Arc::new(OpenAdmission)))
+        .start()
+        .await?;
+    let tool = Client::builder(NodeId::new("tool"))
+        .link(IpcLink::dial_only(vec![PeerEndpoint::new(hub_id.clone(), address)]))
+        .start()
+        .await?;
+    let hub_peer = tool.peer(hub_id, Messages::delivered(Duration::from_secs(5)))?;
+    hub_peer.send(Bytes::from_static(b"status?")).await?;
+    let (context, _request) = hub.recv().await?;
+    context.applied()?;
+    tool.close().await;
+    hub.close().await;
+    Ok(())
+}
+```
+
+Ordered and unordered sessions between a client and its hub need
+`ClientBuilder::tunnels`, configured as for a node. See
+[clients of one node](docs/client-role.md) for the whole contract and
+`examples/client.rs` for a runnable hub and client.
 
 ### Node-owned heterogeneous connections
 

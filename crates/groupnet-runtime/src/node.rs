@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use groupnet_core::{Config, GroupEngine, GroupId, GroupMode, NodeId};
-use groupnet_network::{Network, Router};
+use groupnet_network::Router;
 use groupnet_transport::Transport;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::Participant;
 use crate::anchor::{AnchorTask, anchor_task};
 use crate::driver::{
     CloseReport, EVENTS_CAPACITY, Event, Grants, GroupTask, GroupViews, INBOX_CAPACITY,
@@ -22,31 +23,20 @@ mod builder;
 mod discovery;
 mod messaging;
 mod profile;
-mod protocols;
 pub use builder::NodeBuilder;
 pub use profile::GroupProfile;
 use profile::Posture;
-pub use protocols::{
-    Endpoint, ManagedProtocol, Messages, Ordered, Peer, PeerImplementation, ReceiveBinding,
-    Unordered,
-};
 
 /// The reserved group every node joins to disseminate the inter-group routing
 /// table. Its metadata holds `owner:<resource>` and `coord:<group>` entries.
 pub(crate) const ROUTING_GROUP: &str = "__groupnet_routing__";
 
+/// Group coordination state. It holds no network ownership: the receive and
+/// dispatch tasks retain it while they wait for packets.
 struct Inner {
-    id: NodeId,
     transport: Arc<Router>,
     seeds: Vec<NodeId>,
     config: Config,
-    messaging: crate::messaging::Hub,
-    /// Node-wide ordered-stream policy, validated at start and fixed for the node's life.
-    ordered_config: groupnet_streams::ValidOrderedConfig,
-    ordered: Mutex<Option<groupnet_streams::OrderedProtocol>>,
-    /// Node-wide unordered policy, validated at start and fixed for the node's life.
-    unordered_config: groupnet_streams::ValidUnorderedConfig,
-    unordered: Mutex<Option<groupnet_streams::UnorderedProtocol>>,
     /// Joined groups (handle + inbox). Holding the `Group` makes `join_group`
     /// idempotent: a repeat join returns the existing handle instead of
     /// spawning a second, orphaned actor for the same group.
@@ -62,26 +52,22 @@ struct Inner {
 
 /// A running Groupnet node: owns a managed network and hosts group
 /// memberships. Cheap to clone; every clone retains the network's lifetime.
+///
+/// A node is a member: it joins groups, gossips and, by default, forwards
+/// transit traffic. A [`Client`](crate::Client) shares its message and session
+/// handles but none of its group API.
+#[derive(Clone)]
 pub struct Node {
     inner: Arc<Inner>,
     // Kept on public handles, not Inner: the receive task retains Inner while
     // awaiting packets and must not keep its own network alive indefinitely.
-    pub(super) network: Network,
-}
-
-impl Clone for Node {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            network: self.network.clone(),
-        }
-    }
+    participant: Participant,
 }
 
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Node")
-            .field("id", &self.inner.id)
+            .field("id", self.id())
             .finish_non_exhaustive()
     }
 }
@@ -96,7 +82,13 @@ impl Node {
     /// This node's id.
     #[must_use]
     pub fn id(&self) -> &NodeId {
-        &self.inner.id
+        self.participant.id()
+    }
+
+    /// The node's network side, shared with every endpoint and peer it binds.
+    #[must_use]
+    pub fn participant(&self) -> &Participant {
+        &self.participant
     }
 
     /// Joins `group`, spawning its actor task, and returns a handle.
@@ -227,7 +219,7 @@ impl Node {
         // so the node config `NodeBuilder::start` validated stays valid here.
         const VALIDATED: &str = "NodeBuilder::start validated the node config, and \
                                  Config::validate does not inspect the per-group mode";
-        let (group, local) = (group.clone(), self.inner.id.clone());
+        let (group, local) = (group.clone(), self.id().clone());
         let seeds = self.inner.seeds.iter().cloned();
         match storage {
             Some(storage) => (
@@ -318,7 +310,7 @@ impl Node {
         let (coord_tx, coord_rx) = watch::channel(engine.coordinator().cloned());
         let (epoch, host) = engine.leadership();
         let (lead_tx, lead_rx) =
-            watch::channel(Leadership::observed(epoch, host.cloned(), &self.inner.id));
+            watch::channel(Leadership::observed(epoch, host.cloned(), self.id()));
         let (meta_tx, meta_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let views = Views::new(&engine);
         let (members_tx, members_rx) = watch::channel(views.members());
@@ -341,7 +333,7 @@ impl Node {
             let (prompt_tx, prompt_rx) = mpsc::channel(1);
             tokio::spawn(anchor_task(AnchorTask {
                 anchor,
-                local: self.inner.id.clone(),
+                local: self.id().clone(),
                 commands: tx.downgrade(),
                 prompts: prompt_rx,
                 leadership: lead_rx.clone(),
@@ -380,7 +372,7 @@ impl Node {
 
         Group::new(
             group,
-            self.inner.id.clone(),
+            self.id().clone(),
             // The *effective* config this group is running — the node's, with
             // this group's mode — shared with every handle to it so a consumer
             // sizes its timing windows off what is actually running.
@@ -398,7 +390,7 @@ impl Node {
                 resign_pending: resign_rx,
                 events: events_tx,
             },
-            self.inner.messaging.group(),
+            self.participant.shared.messaging.group(),
         )
     }
 }

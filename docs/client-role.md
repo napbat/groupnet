@@ -218,10 +218,49 @@ A client of the managed network keeps the `Endpoint<P>` and `Peer<P>` handle
 family (`Messages`, `Ordered`, `Unordered`) but has no group API: it joins no
 group, not even the reserved routing group, gossips nothing and forwards
 nothing. Because a setting that cannot apply in a mode must not exist in that
-mode, it is its own type (a `Client` built by the node builder's client form)
-that shares the protocol engines with `Node`, not a `Node` whose
-`join_group` fails. Its links are dial-only and admitted (section 2), and
-`RouterConfig::forwarding` is `false`.
+mode, it is its own type, `groupnet_runtime::Client`, not a `Node` whose
+`join_group` fails. Its links are normally dial-only and admitted (section 2),
+and `RouterConfig::forwarding` is `false`.
+
+API (`groupnet::runtime`):
+
+- `Client::builder(id)` returns a `ClientBuilder`, the client form of
+  `NodeBuilder`. It has only the settings that apply to a client: `link`,
+  `links`, `routing`, `tunnels`, `messaging`, `ordered` and `unordered`. No
+  seed, named seed, gossip, `Config`, group profile or address-advertisement
+  setting exists on it. `start()` validates every policy once, before any link
+  binds. The default routing configuration is `RouterConfig::default()` with
+  `forwarding: false`; a `RouterConfig` with `forwarding: true` is refused as
+  `ClientConfigError::Forwarding` (`InvalidInput`), never corrected.
+- `Client` offers `id`, `router`, `tunnels`, `endpoint`, `peer`, the
+  node-addressed `send`, `send_frame`, `recv`, `recv_frame`, `on_recv` and
+  `on_frame`, `participant` and `close`, and implements `BulkTransport` over
+  its default ordered endpoint, as `Node` does.
+- `Participant` is the network side that a `Node` and a `Client` share: the
+  identity, the owned network, the node-addressed inbox and its dispatcher, and
+  the cached messaging, ordered and unordered engines. `node.participant()` and
+  `client.participant()` return it, and every `Endpoint` and `Peer` retains it
+  (`endpoint.participant()`). `PeerImplementation::bind` and the
+  `ReceiveBinding` methods take `&Participant`, so one custom binding serves
+  both roles. A `Participant` has no close of its own.
+- A client starts no group actor, coordination receive loop, gossip, peer
+  discovery or address sync. Coordination frames that reach it stay unread in
+  the router's bounded queue. A group-addressed application frame sent to it
+  is refused as a missing group (the sender sees `PermissionDenied`, as for a
+  node that has not joined the group).
+- `Client::close()` stops the protocol engines, closes the network (every
+  link and its sessions), then waits for the messaging and session engines.
+  It returns nothing: a client has no group grants to report.
+
+A hub is an ordinary `Node`. It admits the client through its link admission
+(for example `IpcLink::new(..).with_admission(..)`), and its discovery may list
+the client as a bootstrap contact, but the client never answers group
+protocol, so it never becomes a member of any group. Ordered and unordered
+sessions between a client and its hub use the tunnel configuration
+(`ClientBuilder::tunnels`) exactly as between two nodes.
+
+Tests: `crates/groupnet-runtime/tests/client` (in-memory and IPC);
+example: `crates/groupnet/examples/client.rs`.
 
 ### 6.3 Not planned here
 
@@ -238,4 +277,4 @@ public-Internet NAT qualification (#6).
 | 4 | RPC subscriptions | done |
 | 5 | Hub example over IPC (RPC calls and a subscription from dynamic clients): `examples/hub.rs` | done |
 | 6 | Dynamic clients over TCP with per-session keys pinned at admission: `TcpBulkTransport<TcpTls>` (section 3.1) | done |
-| 7 | Runtime client role | open |
+| 7 | Runtime client role: `Client`, `ClientBuilder` and the shared `Participant` in `groupnet-runtime` | done |

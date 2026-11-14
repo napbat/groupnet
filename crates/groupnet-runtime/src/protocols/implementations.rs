@@ -1,6 +1,6 @@
-//! Configurations that resolve the node's cached concrete protocols once.
+//! Configurations that resolve a participant's cached concrete protocols once.
 
-use super::{ManagedProtocol, Node, PeerImplementation};
+use super::{ManagedProtocol, Participant, PeerImplementation};
 use groupnet_messaging::{Messaging, SendOptions};
 use groupnet_streams::{
     OrderedProtocol, StreamProtocolId, UnorderedDelivery, UnorderedOptions, UnorderedProtocol,
@@ -44,8 +44,8 @@ impl PeerImplementation for Messages {
     type Protocol = ManagedProtocol<Messaging>;
     type Options = SendOptions;
 
-    fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
-        let protocol = node.cached_messages();
+    fn bind(self, participant: &Participant) -> io::Result<(Self::Protocol, Self::Options)> {
+        let protocol = participant.cached_messages();
         protocol.config().validate_send(self.options, 0)?;
         Ok((protocol, self.options))
     }
@@ -98,15 +98,16 @@ impl PeerImplementation for Ordered {
     type Protocol = ManagedProtocol<OrderedProtocol>;
     type Options = ();
 
-    fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
-        let protocol = node.cached_ordered()?.scoped(self.protocol);
+    fn bind(self, participant: &Participant) -> io::Result<(Self::Protocol, Self::Options)> {
+        let protocol = participant.cached_ordered()?.scoped(self.protocol);
         Ok((ManagedProtocol::new(protocol), ()))
     }
 }
 
 /// Encrypted unordered messages with an explicit session delivery policy.
-/// Node-wide admission and capacity are fixed when the node starts, with
-/// [`NodeBuilder::unordered`](crate::NodeBuilder::unordered). Neither policy
+/// Node-wide admission and capacity are fixed when the node or client starts,
+/// with [`NodeBuilder::unordered`](crate::NodeBuilder::unordered) or
+/// [`ClientBuilder::unordered`](crate::ClientBuilder::unordered). Neither policy
 /// guarantees ordered delivery.
 #[derive(Clone, Debug)]
 pub struct Unordered {
@@ -140,11 +141,12 @@ impl PeerImplementation for Unordered {
     type Protocol = ManagedProtocol<UnorderedProtocol>;
     type Options = UnorderedOptions;
 
-    fn bind(self, node: &Node) -> io::Result<(Self::Protocol, Self::Options)> {
+    fn bind(self, participant: &Participant) -> io::Result<(Self::Protocol, Self::Options)> {
         // Checked against the node-wide policy before the shared engine is
         // created or cached, so an invalid descriptor starts nothing.
-        self.options.validate(&node.inner.unordered_config)?;
-        let protocol = node.cached_unordered()?;
+        self.options
+            .validate(&participant.shared.unordered_config)?;
+        let protocol = participant.cached_unordered()?;
         Ok((ManagedProtocol::new(protocol), self.options))
     }
 }
