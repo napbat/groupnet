@@ -138,12 +138,33 @@ mis-deployed client is refused with a typed I/O error (`InvalidData`) instead
 of being misread. An application that ships clients separately versions its own
 payloads.
 
-## 6. Out of scope here
+## 6. Later slices
 
-- A runtime client role (`Node` built as a client, with the managed message and
-  session descriptors) — slice 7.
-- VPN interfaces, permission-group connection policies, a WebSocket link and
-  public-Internet NAT qualification (#6).
+### 6.1 Dynamic clients over TCP (slice 6)
+
+`TcpBulkTransport` authenticates connection setup with a shared
+`ClusterSecret` or not at all, and its stream bytes carry no integrity
+protection. A client over a network needs its own identity: the client makes a
+key pair for the session, admission binds that key to the client's credential,
+and the hub pins it for the length of the session, so the stream runs over
+mutually authenticated TLS. A network link never falls back to unauthenticated
+traffic.
+
+### 6.2 Runtime client role (slice 7)
+
+A client of the managed network keeps the `Endpoint<P>` and `Peer<P>` handle
+family (`Messages`, `Ordered`, `Unordered`) but has no group API: it joins no
+group, not even the reserved routing group, gossips nothing and forwards
+nothing. Because a setting that cannot apply in a mode must not exist in that
+mode, it is its own type (a `Client` built by the node builder's client form)
+that shares the protocol engines with `Node`, not a `Node` whose
+`join_group` fails. Its links are dial-only and admitted (section 2), and
+`RouterConfig::forwarding` is `false`.
+
+### 6.3 Not planned here
+
+VPN interfaces, permission-group connection policies, a WebSocket link and
+public-Internet NAT qualification (#6).
 
 ## 7. Build order
 
