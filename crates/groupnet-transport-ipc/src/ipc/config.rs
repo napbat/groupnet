@@ -6,6 +6,9 @@ use std::{fmt, io};
 
 use groupnet_transport::QueueCapacity;
 
+#[cfg(windows)]
+use super::platform::MAX_SESSIONS as MAX_WINDOWS_SESSIONS;
+
 /// Finite operational limits for a native IPC listener.
 ///
 /// These limits never change the protocol's frame or node-ID bounds.
@@ -44,11 +47,6 @@ impl Default for IpcConfig {
         }
     }
 }
-
-/// Windows reserves 255 as its "unlimited instances" sentinel; with two
-/// listener instances held back, 252 sessions is the finite maximum.
-#[cfg(windows)]
-const MAX_WINDOWS_SESSIONS: usize = 252;
 
 impl IpcConfig {
     /// Checks the platform session limit and nonzero deadlines before any

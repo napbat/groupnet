@@ -7,4 +7,6 @@ mod native;
 #[path = "windows.rs"]
 mod native;
 
-pub(super) use native::{Listener, Stream, connect, validate_address};
+#[cfg(windows)]
+pub(crate) use native::MAX_SESSIONS;
+pub(crate) use native::{Listener, Stream, connect, validate_address};
