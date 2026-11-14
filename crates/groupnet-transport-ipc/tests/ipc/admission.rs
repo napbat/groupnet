@@ -189,12 +189,15 @@ async fn join(stream: &mut RawStream, node: &str) {
 #[tokio::test]
 async fn the_default_link_policy_admits_only_configured_peers() {
     let address = Address::new();
+    // The seed must stay valid while the link binds: on Unix its directory
+    // exists only while its `Address` lives.
+    let known_address = Address::new();
     let hub = Router::new(NodeId::new("hub")).unwrap();
     let configured = IpcLink::new(
         address.ipc.clone(),
         vec![PeerEndpoint::new(
             NodeId::new("known"),
-            Address::new().ipc.clone(),
+            known_address.ipc.clone(),
         )],
     );
     hub.add_link(
