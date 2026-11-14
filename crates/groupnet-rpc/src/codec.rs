@@ -4,19 +4,29 @@
 //! Every frame starts with the codec version byte and a kind byte; all
 //! integers are big-endian.
 //!
-//! | Kind | Layout after `version`, `kind` |
-//! |------|--------------------------------|
-//! | `0` Request | `id: u64`, `deadline_ms: u32` (nonzero), payload (rest of frame) |
-//! | `1` Response | `id: u64`, payload (rest of frame) |
-//! | `2` Error | `id: u64`, `code: u16`, UTF-8 message (rest of frame) |
+//! | Kind | Direction | Layout after `version`, `kind` |
+//! |------|-----------|--------------------------------|
+//! | `0` Request | client → server | `id: u64`, `deadline_ms: u32` (nonzero), payload (rest of frame) |
+//! | `1` Response | server → client | `id: u64`, payload (rest of frame) |
+//! | `2` Error | server → client | `id: u64`, `code: u16`, UTF-8 message (rest of frame) |
+//! | `3` Subscribe | client → server | `id: u64`, `window: u32` (nonzero), payload (rest of frame) |
+//! | `4` Item | server → client | `id: u64`, payload (rest of frame) |
+//! | `5` End | server → client | `id: u64` |
+//! | `6` Credit | client → server | `id: u64`, `grant: u32` (nonzero) |
+//! | `7` Cancel | client → server | `id: u64` |
 //!
 //! `deadline_ms` is the caller's *remaining* budget when the request was
 //! sent, so the server measures it from receipt and never compares clocks.
+//! A subscription's `window` is how many items the server may send before
+//! its first Credit; each Credit adds `grant`. Calls and subscriptions share
+//! one id space per connection; Error also ends a subscription.
 //! Decoding fails closed: a wrong version, an unknown kind, a short head, a
-//! zero deadline or a non-UTF-8 message is malformed, and the connection that
-//! carried it is dropped.
+//! zero deadline, window or grant, bytes after an End, Credit or Cancel, or
+//! a non-UTF-8 message is malformed, and the connection that carried it is
+//! dropped.
 
 use std::fmt;
+use std::num::NonZeroU32;
 
 use bytes::Bytes;
 use zerocopy::byteorder::big_endian::{U16, U32, U64};
@@ -31,8 +41,14 @@ pub(crate) const VERSION: u8 = 1;
 const KIND_REQUEST: u8 = 0;
 const KIND_RESPONSE: u8 = 1;
 const KIND_ERROR: u8 = 2;
+const KIND_SUBSCRIBE: u8 = 3;
+const KIND_ITEM: u8 = 4;
+const KIND_END: u8 = 5;
+const KIND_CREDIT: u8 = 6;
+const KIND_CANCEL: u8 = 7;
 
-/// The fields every kind starts with; alone, a response's whole head.
+/// The fields every kind starts with; alone, the whole head of a response,
+/// an item, an end and a cancel.
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct Prefix {
@@ -57,12 +73,36 @@ struct ErrorHead {
     code: U16,
 }
 
+/// A subscribe's head: the prefix and the initial credit window.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SubscribeHead {
+    prefix: Prefix,
+    window: U32,
+}
+
+/// A credit frame, whole: the prefix and the items granted.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct CreditHead {
+    prefix: Prefix,
+    grant: U32,
+}
+
 /// Head bytes of a request: version, kind, id, deadline.
 pub(crate) const REQUEST_HEAD: usize = size_of::<RequestHead>();
 /// Head bytes of a response: version, kind, id.
 pub(crate) const RESPONSE_HEAD: usize = size_of::<Prefix>();
 /// Head bytes of an error: version, kind, id, code.
 pub(crate) const ERROR_HEAD: usize = size_of::<ErrorHead>();
+/// Head bytes of a subscribe: version, kind, id, window.
+pub(crate) const SUBSCRIBE_HEAD: usize = size_of::<SubscribeHead>();
+/// Head bytes of an item: version, kind, id.
+pub(crate) const ITEM_HEAD: usize = size_of::<Prefix>();
+/// Bytes of a whole end or cancel frame: version, kind, id.
+const BARE_FRAME: usize = size_of::<Prefix>();
+/// Bytes of a whole credit frame: version, kind, id, grant.
+const CREDIT_FRAME: usize = size_of::<CreditHead>();
 
 /// One decoded RPC frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,12 +123,46 @@ pub(crate) enum Frame {
         /// The opaque response body.
         payload: Bytes,
     },
-    /// A handler's (or the server's) failure.
+    /// A handler's (or the server's) failure; ends a call or a subscription.
     Error {
-        /// The request this answers.
+        /// The request or subscription this answers.
         id: u64,
         /// What went wrong.
         status: RpcStatus,
+    },
+    /// Opens a subscription: run the subscribe handler on `payload`, sending
+    /// at most `window` items before the first credit.
+    Subscribe {
+        /// Names the subscription; unique per connection, shared with calls.
+        id: u64,
+        /// Items the server may send before it receives credit.
+        window: NonZeroU32,
+        /// The opaque subscribe body.
+        payload: Bytes,
+    },
+    /// One item of a subscription.
+    Item {
+        /// The subscription it belongs to.
+        id: u64,
+        /// The opaque item body.
+        payload: Bytes,
+    },
+    /// A subscription's handler finished: no more items follow.
+    End {
+        /// The subscription that ended.
+        id: u64,
+    },
+    /// The client consumed items: the server may send `grant` more.
+    Credit {
+        /// The subscription credited.
+        id: u64,
+        /// Further items allowed.
+        grant: NonZeroU32,
+    },
+    /// The client no longer wants the subscription.
+    Cancel {
+        /// The subscription cancelled.
+        id: u64,
     },
 }
 
@@ -100,25 +174,30 @@ pub(crate) struct Encoded {
     body: Bytes,
 }
 
-/// The fixed fields of one encoded frame, by kind.
+/// The fixed fields of one encoded frame, by layout.
 #[derive(Debug)]
 enum Head {
+    /// Response, item, end and cancel.
+    Bare(Prefix),
     Request(RequestHead),
-    Response(Prefix),
     Error(ErrorHead),
+    Subscribe(SubscribeHead),
+    Credit(CreditHead),
 }
 
 impl Encoded {
     /// The version, kind and fixed fields.
     pub(crate) fn head(&self) -> &[u8] {
         match &self.head {
+            Head::Bare(head) => head.as_bytes(),
             Head::Request(head) => head.as_bytes(),
-            Head::Response(head) => head.as_bytes(),
             Head::Error(head) => head.as_bytes(),
+            Head::Subscribe(head) => head.as_bytes(),
+            Head::Credit(head) => head.as_bytes(),
         }
     }
 
-    /// The payload or error message.
+    /// The payload or error message; empty for end, credit and cancel.
     pub(crate) fn body(&self) -> &[u8] {
         &self.body
     }
@@ -165,9 +244,7 @@ impl Frame {
                 }),
                 payload,
             ),
-            Self::Response { id, payload } => {
-                (Head::Response(Prefix::new(KIND_RESPONSE, id)), payload)
-            }
+            Self::Response { id, payload } => (Head::Bare(Prefix::new(KIND_RESPONSE, id)), payload),
             Self::Error { id, status } => (
                 Head::Error(ErrorHead {
                     prefix: Prefix::new(KIND_ERROR, id),
@@ -175,6 +252,27 @@ impl Frame {
                 }),
                 Bytes::from(status.message),
             ),
+            Self::Subscribe {
+                id,
+                window,
+                payload,
+            } => (
+                Head::Subscribe(SubscribeHead {
+                    prefix: Prefix::new(KIND_SUBSCRIBE, id),
+                    window: U32::new(window.get()),
+                }),
+                payload,
+            ),
+            Self::Item { id, payload } => (Head::Bare(Prefix::new(KIND_ITEM, id)), payload),
+            Self::End { id } => (Head::Bare(Prefix::new(KIND_END, id)), Bytes::new()),
+            Self::Credit { id, grant } => (
+                Head::Credit(CreditHead {
+                    prefix: Prefix::new(KIND_CREDIT, id),
+                    grant: U32::new(grant.get()),
+                }),
+                Bytes::new(),
+            ),
+            Self::Cancel { id } => (Head::Bare(Prefix::new(KIND_CANCEL, id)), Bytes::new()),
         };
         Encoded { head, body }
     }
@@ -219,156 +317,42 @@ impl Frame {
                     status: RpcStatus::new(head.code.get(), message),
                 })
             }
+            KIND_SUBSCRIBE => {
+                let (head, _) = SubscribeHead::ref_from_prefix(bytes)
+                    .map_err(|_| Malformed("short subscribe head"))?;
+                let window = NonZeroU32::new(head.window.get()).ok_or(Malformed("zero window"))?;
+                Ok(Self::Subscribe {
+                    id,
+                    window,
+                    payload: frame.slice(SUBSCRIBE_HEAD..),
+                })
+            }
+            KIND_ITEM => Ok(Self::Item {
+                id,
+                payload: frame.slice(ITEM_HEAD..),
+            }),
+            KIND_END => exact(bytes, BARE_FRAME).map(|()| Self::End { id }),
+            KIND_CREDIT => {
+                exact(bytes, CREDIT_FRAME)?;
+                let (head, _) = CreditHead::ref_from_prefix(bytes)
+                    .map_err(|_| Malformed("short credit frame"))?;
+                let grant = NonZeroU32::new(head.grant.get()).ok_or(Malformed("zero grant"))?;
+                Ok(Self::Credit { id, grant })
+            }
+            KIND_CANCEL => exact(bytes, BARE_FRAME).map(|()| Self::Cancel { id }),
             _ => Err(Malformed("unknown kind")),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Encodes `frame` into the contiguous bytes a data-plane frame carries.
-    fn wire(frame: Frame) -> Bytes {
-        let encoded = frame.encode();
-        let mut bytes = encoded.head().to_vec();
-        bytes.extend_from_slice(encoded.body());
-        assert_eq!(bytes.len(), encoded.len());
-        Bytes::from(bytes)
-    }
-
-    fn samples() -> Vec<Frame> {
-        vec![
-            Frame::Request {
-                id: 0,
-                deadline_ms: 1,
-                payload: Bytes::new(),
-            },
-            Frame::Request {
-                id: u64::MAX,
-                deadline_ms: u32::MAX,
-                payload: Bytes::from_static(b"request body"),
-            },
-            Frame::Response {
-                id: 7,
-                payload: Bytes::from_static(b"\x00\xffbinary"),
-            },
-            Frame::Response {
-                id: 8,
-                payload: Bytes::new(),
-            },
-            Frame::Error {
-                id: 9,
-                status: RpcStatus::new(404, "no such key: caf\u{e9}"),
-            },
-            Frame::Error {
-                id: 10,
-                status: RpcStatus::new(RpcStatus::DEADLINE_EXCEEDED, ""),
-            },
-        ]
-    }
-
-    #[test]
-    fn every_kind_round_trips() {
-        for frame in samples() {
-            assert_eq!(Frame::decode(&wire(frame.clone())), Ok(frame));
-        }
-    }
-
-    #[test]
-    fn the_layout_is_the_documented_one() {
-        // The typed heads are unaligned and padding-free: 1 + 1 + 8 (+ 4 | + 2).
-        assert_eq!((REQUEST_HEAD, RESPONSE_HEAD, ERROR_HEAD), (14, 10, 12));
-        let bytes = wire(Frame::Request {
-            id: 0x0102_0304_0506_0708,
-            deadline_ms: 0x0A0B_0C0D,
-            payload: Bytes::from_static(b"p"),
-        });
-        assert_eq!(
-            &bytes[..],
-            &[
-                VERSION, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0x0A, 0x0B, 0x0C, 0x0D, b'p'
-            ]
-        );
-        let bytes = wire(Frame::Error {
-            id: 1,
-            status: RpcStatus::new(0x0203, "m"),
-        });
-        assert_eq!(
-            &bytes[..],
-            &[VERSION, 2, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, b'm']
-        );
-    }
-
-    #[test]
-    fn every_truncated_head_is_rejected() {
-        for frame in samples() {
-            let bytes = wire(frame.clone());
-            let head = match frame {
-                Frame::Request { .. } => REQUEST_HEAD,
-                Frame::Response { .. } => RESPONSE_HEAD,
-                Frame::Error { .. } => ERROR_HEAD,
-            };
-            for cut in 0..head {
-                assert!(
-                    Frame::decode(&bytes.slice(..cut)).is_err(),
-                    "{frame:?} cut at {cut} decoded"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_foreign_version_or_kind_is_rejected() {
-        let good = wire(Frame::Response {
-            id: 1,
-            payload: Bytes::from_static(b"x"),
-        });
-        for (index, value) in [(0, VERSION + 1), (0, 0), (1, 3), (1, u8::MAX)] {
-            let mut bad = good.to_vec();
-            bad[index] = value;
-            assert!(
-                Frame::decode(&Bytes::from(bad)).is_err(),
-                "byte {index} = {value}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_zero_deadline_is_rejected() {
-        let mut bytes = wire(Frame::Request {
-            id: 1,
-            deadline_ms: 1,
-            payload: Bytes::new(),
-        })
-        .to_vec();
-        bytes[13] = 0;
-        assert_eq!(
-            Frame::decode(&Bytes::from(bytes)),
-            Err(Malformed("zero deadline"))
-        );
-    }
-
-    #[test]
-    fn a_non_utf8_error_message_is_rejected() {
-        let mut bytes = wire(Frame::Error {
-            id: 1,
-            status: RpcStatus::new(1, "ok"),
-        })
-        .to_vec();
-        bytes.push(0xFF);
-        assert!(Frame::decode(&Bytes::from(bytes)).is_err());
-    }
-
-    #[test]
-    fn a_decoded_payload_shares_the_frame_buffer() {
-        let bytes = wire(Frame::Response {
-            id: 1,
-            payload: Bytes::from_static(b"shared"),
-        });
-        let Ok(Frame::Response { payload, .. }) = Frame::decode(&bytes) else {
-            panic!("decodes");
-        };
-        assert_eq!(payload.as_ptr(), bytes[RESPONSE_HEAD..].as_ptr());
+/// Fails unless a fixed-size frame is exactly `len` bytes.
+fn exact(bytes: &[u8], len: usize) -> Result<(), Malformed> {
+    match bytes.len().cmp(&len) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less => Err(Malformed("short fixed-size frame")),
+        std::cmp::Ordering::Greater => Err(Malformed("bytes after a fixed-size frame")),
     }
 }
+
+#[cfg(test)]
+mod tests;

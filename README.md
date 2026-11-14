@@ -98,7 +98,7 @@ streams only when the application asks for them.
 | [`groupnet-messaging`](crates/groupnet-messaging) | application packets | core, network, bytes, ring, tokio, tokio-util | static send-only `MessageProtocol`, generic receipt contexts, `Messaging` endpoint, bounded retry/deduplication |
 | [`groupnet-streams`](crates/groupnet-streams) | sessions | core, network, transport(bulk), bytes, ring, futures-util, tokio, tokio-util | static `SessionProtocol`, shared protocol engines, authenticated session policies |
 | [`groupnet-runtime`](crates/groupnet-runtime) | both | core, transport(bulk, link), messaging, streams, network, tokio | non-generic managed `Node`, unsealed `PeerImplementation` / `ReceiveBinding`, generic `Endpoint<P>` / `Peer<P>` over restricted `ManagedProtocol` views, group actors, receive callbacks/fanout reports, and `FileGrantStore` |
-| [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC over the data plane: concurrent calls multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler limits |
+| [`groupnet-rpc`](crates/groupnet-rpc) | data | core, transport(bulk), bytes, futures-util(io), tokio(rt, sync, time, macros) | request/response RPC and credit-bounded server-push subscriptions over the data plane: concurrent calls and subscriptions multiplexed onto one stream per peer, deadlines, bounded frames, per-connection handler and subscription limits |
 | [`groupnet-consistency`](crates/groupnet-consistency) | — *(data, under `handoff` or `volatile-bootstrap-bulk`)* | core, runtime, tokio(sync) *(+handoff or volatile-bootstrap-bulk feature: transport(bulk), bytes, futures-util)* | session-consistency layer: per-writer sequenced write feeds (loss & restarts surface as explicit gaps) + read-your-writes frontiers; two opt-in pieces reach the data plane: the `handoff` tier, to pull a covering snapshot a gap cannot replay, and `volatile-bootstrap-bulk`, volatile recovery's bounded peer bootstrap transfer |
 | [`groupnet-sim`](crates/groupnet-sim) | — | core | deterministic simulator (virtual clock + lossy/partitioned net) |
 | [`groupnet`](crates/groupnet) | — | facade | one module per crate; `runtime`+`mem` default; binding features (`mem`, `tcp`, `udp`, `ipc`) × capability features (`runtime`, `bulk`, `connectivity`), plus `rpc`, `consistency*`, `sim` |
@@ -1188,7 +1188,7 @@ encrypt between individual nodes. `ClusterSecret` keeps ring's HMAC key (its
 precomputed pad states), which is not zeroed on drop, and does not wipe the
 bytes it was built from: zero your own buffer after `ClusterSecret::new`.
 
-### Request/response RPC (feature `rpc`)
+### RPC: calls and subscriptions (feature `rpc`)
 
 For calls rather than streams — "read this key from its owner", "apply this
 write on that replica" — `groupnet::rpc` multiplexes any number of concurrent
@@ -1243,6 +1243,57 @@ RPC stream to `RpcServer::new(handler).serve(from, stream)`; the
 `RpcClient::with_config` and `RpcServer::with_config` return typed
 `RpcConfigError` / `RpcServerConfigError` values. Register peer addresses on the
 transports (`DataPlane::transport`) yourself.
+
+A **subscription** answers many times over the same connection, so a client
+that only dials still receives events. `RpcServer::with_subscriptions` (or
+`with_subscriptions_config`) adds a subscribe handler that sends items through a
+`SubscriptionSink`; `accept_on(plane)` runs its accept loop as `bind` does. The
+client reads a `Subscription` until `None` (the handler returned `Ok(())`), and
+dropping it cancels the handler:
+
+```rust
+use groupnet::core::NodeId;
+use groupnet::rpc::{RpcClient, RpcError, RpcServer, RpcServerHandle, RpcStatus, SubscriptionSink};
+use groupnet::transport::Bytes;
+use groupnet::transport::bulk::{BulkTransport, DataPlane};
+use std::time::Duration;
+
+/// Hub: echoes calls, and counts down from the subscribe's first byte.
+fn serve_countdowns<B: BulkTransport>(plane: DataPlane<B>) -> RpcServerHandle {
+    RpcServer::with_subscriptions(
+        |_from: NodeId, request: Bytes| async move { Ok::<_, RpcStatus>(request) },
+        |_from: NodeId, start: Bytes, mut sink: SubscriptionSink| async move {
+            let start = start.first().copied().ok_or_else(|| RpcStatus::new(400, "empty"))?;
+            for n in (1..=start).rev() {
+                // Waits for the client's credit; fails once it cancels or leaves.
+                if sink.send(Bytes::from(vec![n])).await.is_err() {
+                    break;
+                }
+            }
+            Ok::<(), RpcStatus>(()) // End: the client's `next` yields `None`
+        },
+    )
+    .accept_on(plane)
+}
+
+/// Client (it may dial only): items arrive on the stream it opened.
+async fn count_down<B: BulkTransport>(client: &RpcClient<B>, hub: &NodeId) -> Result<(), RpcError> {
+    let mut countdown = client
+        .subscribe(hub, Bytes::from_static(&[3]), Duration::from_secs(1))
+        .await?; // TooManySubscriptions, Unreachable, NotSent, … : nothing was sent
+    while let Some(item) = countdown.next().await {
+        println!("{}", item?[0]); // Remote(status), ConnectionLost or Shutdown end it early
+    }
+    Ok(())
+}
+```
+
+The server sends at most `RpcConfig::subscription_window` items ahead of what
+the application consumed; the client grants more as `next` consumes them, so a
+subscription nobody reads never holds back the connection's calls or other
+subscriptions. Open subscriptions keep their connection from idling on both
+sides and are bounded by `RpcConfig::max_subscriptions_per_peer` and
+`RpcServerConfig::max_subscriptions_per_connection`.
 
 ## Inter-group routing
 
